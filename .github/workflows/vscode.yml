@@ -16,7 +16,7 @@ jobs:
     name: build .vsix + CLI .tgz
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:
           node-version: 22
@@ -29,9 +29,9 @@ jobs:
       # why jetbrains.yml (which already uses it) sailed through the same outage on the same commit.
       # Nothing else about the build changes: release.sh still drives ./gradlew, and the JDK stays the
       # runner's default, which is what this job has always used.
-      - uses: gradle/actions/setup-gradle@v4
+      - uses: gradle/actions/setup-gradle@v6
       - run: npm run release
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: claude-observatory-release
           path: release/*
