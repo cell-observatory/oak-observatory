@@ -1,6 +1,6 @@
 {
   "name": "@oak-observatory/tui",
-  "version": "0.10.0-dev.0",
+  "version": "0.10.0",
   "private": true,
   "description": "The terminal app — the observatory's third front end, beside the VS Code and JetBrains extensions.",
   "main": "dist/index.js",
@@ -9,7 +9,7 @@
     "build": "tsc -p tsconfig.json"
   },
   "dependencies": {
-    "@oak-observatory/core": "0.10.0-dev.0",
+    "@oak-observatory/core": "0.10.0",
     "@xterm/headless": "^6.0.0",
     "diff": "^9.0.0"
   },

@@ -1,6 +1,6 @@
 {
   "name": "oak-observatory",
-  "version": "0.10.0-dev.0",
+  "version": "0.10.0",
   "description": "Per-edit Keep/Undo for Claude Code and Codex, with local capture and review. No git or extra model tokens required.",
   "keywords": [
     "claude",
@@ -38,7 +38,7 @@
     "prepublishOnly": "cd ../.. && npm run build"
   },
   "devDependencies": {
-    "@oak-observatory/core": "0.10.0-dev.0",
+    "@oak-observatory/core": "0.10.0",
     "@types/node": "^26.1.2",
     "esbuild": "^0.28.1",
     "typescript": "^5.9.3"

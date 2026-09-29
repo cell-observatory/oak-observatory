@@ -1,6 +1,6 @@
 {
   "name": "oak-observatory-monorepo",
-  "version": "0.10.0-dev.0",
+  "version": "0.10.0",
   "private": true,
   "description": "Standalone, git-free, per-edit Keep/Undo for Claude Code on established and mission-critical codebases \u2014 terminal, VS Code and JetBrains, zero extra tokens.",
   "workspaces": [
