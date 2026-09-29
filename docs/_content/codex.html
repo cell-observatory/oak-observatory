@@ -1,0 +1,15 @@
+<p>OAK reads <strong>Codex</strong> native hooks and rollout logs into the shared edit store. Conversation, review and usage readers use the same evidence in the terminal and both editors.</p>
+<h2>Setup</h2>
+<pre><code>oak init --codex
+oak doctor --fix
+oak agent start --kind codex</code></pre>
+<p>Hook installation pre-trusts OAK’s exact hook commands. herdr owns the terminal; use its client to answer permissions, select models and resume conversations. Ordinary setup does not start a model turn.</p>
+<h2>Capture evidence</h2>
+<ul><li>Paired hooks record before/after file content and native tool identity when available.</li>
+<li>Rollout parsing supplies prompts, replies, reasoning, tool activity and usage.</li>
+<li>Snapshots reconcile disk changes over an interval without proving which process caused each write.</li>
+<li>Unknown before-state remains review-only. Undo refuses to invent prior content.</li></ul>
+<p><code>oak integrity --session &lt;id&gt; --json</code> reports capture gaps and unsafe historical records. Completed native records remain readable after the terminal closes.</p>
+<h2>Conversation and usage</h2>
+<p>Observatory’s conversation detail and the editors’ Feed tab read the selected transcript. Explicit replies and review comments target a live herdr pane; unavailable or blocked targets preserve the draft. Permission prompts stay in the agent terminal.</p>
+<p>Selected-session usage comes from that conversation. Account usage is measured on each machine for itself (<a href="https://github.com/cell-observatory/oak-observatory/blob/main/SECURITY.md">SECURITY.md</a> lists the account reads); missing quota or pricing remains unavailable. See <a href="https://github.com/cell-observatory/oak-observatory/blob/main/docs/CODEX-SUPPORT.md">Codex support</a> for capture limits and historical validation evidence.</p>

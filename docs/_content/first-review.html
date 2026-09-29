@@ -1,0 +1,24 @@
+<p>This walks a change from an agent's edit to a reviewed decision. If you'd rather explore with data already in place, <code>oak demo --fast</code> produces a complete session — tasks, a subagent, a workflow, and pending edits — as an isolated <code>demo-*</code> session and an <code>observatory-demo/</code> folder in the current directory; <code>oak demo --clean</code> removes both.</p>
+
+<h2>1. Let an agent work</h2>
+<p>With <a href="install.html">capture on</a>, start a Claude Code session in your project and give it a task. Every file it changes is snapshotted as it goes — you don't have to do anything to record it.</p>
+
+<h2>2. Open the observatory</h2>
+<p>Launch the <a href="tui.html">terminal app</a>:</p>
+<pre><code>oak</code></pre>
+<p>The Observatory tab lists each machine's <a href="sessions-agents.html">sessions</a> by workspace. Pin one to read its conversation beside the list, with its <a href="workflows-fleet.html">workers</a> and <a href="tasks.html">tasks</a>; <code>r</code> opens the session's <a href="edits.html#the-change-map">change map</a> and edits on the Review tab. Or open the same record in <a href="editors.html">VS Code</a> / <a href="editors.html">JetBrains</a> — a file with pending edits carries a count badge in the editor's own file tree.</p>
+
+<h2>3. Read a change</h2>
+<p>Select an <a href="edits.html">edit</a> to see its diff in the agent's own colors, paired with the reasoning it recorded nearby (<a href="observations.html">Observations</a>). Revisions of the same lines are already collapsed into one <a href="review-units.html">review unit</a>, so you read the net change, not every intermediate state.</p>
+
+<h2>4. Decide</h2>
+<p><a href="keep-undo.html">Keep</a> the ones you understand and want; <a href="keep-undo.html">Undo</a> the ones you don't — each undo is conflict-guarded, so reverting one leaves the others standing. Resolving one edit moves you to the next still awaiting review. To act on a whole scope at once, <strong>Accept</strong> or <strong>Reject</strong> a file, a task, or the session.</p>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div class="ct"><span class="ctitle">Try it on the demo</span>
+  <p>Run <code>oak demo --fast</code>, then <code>oak</code>, and practice the whole loop on the demo session before you point it at real work; <code>oak demo --clean</code> removes it afterwards.</p></div>
+</div>
+
+<h2>Where to go next</h2>
+<p>To understand what you're looking at, read <a href="sessions-agents.html">the OAK model</a>. To review inside your editor, see <a href="editors.html">VS Code</a> or <a href="editors.html">JetBrains</a>. To record agents other than Claude Code, see <a href="supported-agents.html">Supported agents</a>.</p>

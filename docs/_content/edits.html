@@ -1,0 +1,33 @@
+<p>An <strong>edit</strong> is the atom OAK captures. Everything else — the change map, the review scoreboard, the audits — is an aggregation of edits. This page covers the edit itself, the review unit it collapses into, and the map that summarizes them all.</p>
+
+<h2>The edit</h2>
+<p>An <strong>edit</strong> is one captured file change: the tool that made it, the file, the snapshots before and after, and a review status — <strong>pending</strong> until you decide, then <strong>accepted</strong> or <strong>reverted</strong>. Each edit opens as its own diff and carries its own <a href="keep-undo.html">undo</a>, including changes made by shell commands. A binary file is stored as an opaque blob and shown as a size summary. A file past the size cap — a text file over 5&nbsp;MB, or any file over 25&nbsp;MB — is recorded as an explicit skip rather than dropped.</p>
+
+<div class="callout info">
+  <span class="ico">ℹ</span>
+  <div class="ct"><span class="ctitle">Blank-only changes are not recorded</span>
+  <p>An edit whose only difference is blank lines is not captured at all — it would ask for a decision that carries no meaning.</p></div>
+</div>
+
+<h2>The review unit</h2>
+<p>The unit of review is the <strong>review unit</strong>. Agents revise the same code several times before settling, so edits to the same lines — or the same detected function — combine into one unit whose diff is the <em>net</em> change, bounded by the <a href="prompts.html">prompt</a> that produced them. A superseded intermediate state never asks for a decision, and accepting or reverting a unit acts on every edit inside it.</p>
+<p>This is why review keeps pace: five revisions of one function are one decision, not five.</p>
+
+<h2>The change map</h2>
+<p>The <strong>change map</strong> is the summary the Overview draws for whatever is in scope — the session, one agent, one workflow run, or one prompt. It has two sections:</p>
+<ul>
+  <li>The <strong>Folders strip</strong> — one tile per changed directory, ranked by lines changed and colored by review status. The top eleven show, with the rest behind a <strong>+K more</strong> tile that expands to all of them.</li>
+  <li>The <strong>Files ledger</strong> — every changed file, ranked by churn, each stamped with the exact time of its last change.</li>
+</ul>
+<p>A summary bar totals the scope and names any active filter.</p>
+
+<h3>Filter, sort, and age</h3>
+<p>The panel's toolbar narrows and orders what the ledger lists, inline — no pop-up. A <strong>search field</strong> takes a path fragment and matches it as a substring, or as a regular expression the moment the text carries regex syntax (<code>^ $ * + ? ( ) [ ] { } | \</code>); there is no mode to toggle. A <strong>filter</strong> dropdown narrows to one or more file-type buckets — Code, Tests, Config, Docs, Styles, Other — or to specific extensions, and its button names whatever is in force. A <strong>sort</strong> dropdown orders the files four ways — most recent first, oldest first, name A→Z, or name Z→A — and its button names the order in force. Each file also carries the exact time of its last change — <em>14:32:05</em> today, dated when older — so the freshest work reads at a glance. The same controls sit on the <a href="editors-overview.html">Overview</a> and <a href="editors-traces.html">Traces</a> panels in both editors and on the <a href="tui.html">terminal app</a>'s review; a filter is a view, never a decision, so it changes what you see and never what the store holds.</p>
+
+<figure><img src="media/overview-tabs.png" loading="lazy" alt="The Overview: Sessions, Workers, Workflows, Tasks, and Processes in the left nav; the change map — the Folders strip and the churn-ranked Files ledger — on the right, with a scope summary bar below"><figcaption>The change map for the selected agent: Folders strip, Files ledger, summary bar.</figcaption></figure>
+
+<div class="callout tip">
+  <span class="ico">→</span>
+  <div class="ct"><span class="ctitle">Deciding on edits</span>
+  <p>Once you can see the changes, <a href="keep-undo.html">Keep, Undo, Accept &amp; Reject</a> cover every decision — from a single review unit to a whole session.</p></div>
+</div>

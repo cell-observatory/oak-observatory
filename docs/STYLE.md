@@ -1,4 +1,4 @@
-# Writing style — Claude Observatory documentation
+# Writing style — OAK documentation
 
 Every prose surface of this project — the site in `docs/`, the READMEs, `DEMO.md`,
 `ARCHITECTURE.md` — is written for a scientific audience in a formal documentation
@@ -47,7 +47,7 @@ from retroactive edits.
 ## Diction
 
 - **X1.** Define every domain term at its first appearance on a page, then use it
-  unchanged. The canonical definitions live in `docs/concepts.html`.
+  unchanged. The canonical definitions live in `docs/what-is-oak.html`.
 - **X2.** Use exactly one term per concept. Never vary a term for style: it reads as a
   distinction being drawn.
 - **X3.** Spell out abbreviations at first use. Write *that is* and *for example*, not
@@ -77,5 +77,5 @@ heatmap), **Fleet** (never Multitasking), **Actions** (never Timeline, for the v
 axes** (Diff · File · Folder · Prompt), **undo conflict** and **live conflict** (never
 collision in prose). Per-edit review verbs are **Keep** and **Undo**; scoped review verbs
 are **Accept**, **Reject**, and **Clear**; the resulting states are **accepted** and
-**reverted**. The product is "Claude Observatory" at first mention on a page and "the
+**reverted**. The product is "OAK" at first mention on a page and "the
 observatory" thereafter.

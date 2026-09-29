@@ -1,0 +1,15 @@
+<p>A long session doesn't keep everything in view. When context runs out, the harness summarizes what came before — and later turns see that summary rather than what was actually said. <strong>Compaction</strong> is OAK's record of where that happened and how much was dropped.</p>
+
+<h2>What a compaction is</h2>
+<p>A <strong>compaction</strong> is the harness summarizing the conversation when context runs out: everything above the boundary reaches later turns as a summary rather than as what was actually said. It's a normal part of a long session — but it means the agent's later decisions rested on a compressed picture, which is worth knowing when you review them.</p>
+
+<h2>How OAK reports it</h2>
+<p>The observatory marks each boundary in the <a href="actions-view.html">Actions timeline</a>, counts them per <a href="prompts.html">prompt</a> and in <a href="stats-spotlight.html">Stats</a>, and reports each event's own drop — the context before minus the context after.</p>
+
+<div class="callout info">
+  <span class="ico">ℹ</span>
+  <div class="ct"><span class="ctitle">Per-event, not cumulative</span>
+  <p>OAK reports each compaction's own drop, never the harness's running total — which would overstate every compaction after the first. The number beside a boundary is what <em>that</em> boundary dropped.</p></div>
+</div>
+
+<p>A resumed compaction also shows up in <a href="observations.html">Observations</a>' Context section, labeled as what shaped the session — so a summary the agent inherited is visible, not invisible.</p>

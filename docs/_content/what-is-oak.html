@@ -1,0 +1,33 @@
+<p>OAK is an observatory for agentic development: it <strong>observes</strong> every edit an agent makes through local hooks that cost no tokens, lets you <strong>audit</strong> what actually changed in your codebase, and lets you <strong>keep</strong> — or undo — each change at the scope that fits the work.</p>
+<p>OAK is built for established, mission-critical codebases rather than throwaway prototypes, where a change accepted without being understood is a real liability.</p>
+
+<div class="callout tip">
+  <span class="ico">🔬</span>
+  <div class="ct"><span class="ctitle">The premise</span>
+  <p>Coding agents change code faster than anyone can read it, and a change accepted without being understood is a liability for <em>you</em>, not the agent's provider. OAK exists to make review keep pace with generation.</p></div>
+</div>
+
+<h2>How it works</h2>
+<p>OAK derives everything from two sources that cost no tokens and are invisible to the agent. The <a href="capture.html#transcript">transcript</a> the agent already writes — prompts, tool calls, results, reasoning — is read as evidence, never modified. And a local capture <a href="capture.html#hook">hook</a> snapshots each file before and after a change and appends a record to the observatory's own <a href="capture.html#store">store</a>. From those two, OAK reconstructs what you actually review.</p>
+
+<div class="callout info">
+  <span class="ico">ℹ</span>
+  <div class="ct"><span class="ctitle">No tokens, no interference</span>
+  <p>Reading happens outside the model loop. The hook prints nothing and returns immediately, so the agent's behavior and context are unchanged — and observing an agent is the default, not something you switch on.</p></div>
+</div>
+
+<h2>What you review</h2>
+<p>The record is the same for every agent: <a href="prompts.html">prompts</a> (what you asked), <a href="tasks.html">tasks</a> (the to-dos the agent set itself), <a href="actions.html">actions</a> (every tool call), and <a href="edits.html">edits</a> (each captured file change). The unit of decision is the <a href="review-units.html">review unit</a> — what an agent changed for a given prompt — so revising the same lines five times before settling asks you for <em>one</em> decision on the net change, not five.</p>
+<p>Every edit keeps its own diff and its own conflict-guarded <a href="keep-undo.html">undo</a>, so reverting one leaves the others standing.</p>
+
+<h2>One agent, or a fleet</h2>
+<p>Everything hangs off a <a href="sessions-agents.html">session</a> — one conversation with a coding agent. But work rarely stays in one session: an agent <a href="subagents-roles.html">spawns subagents</a>, a <a href="workflows-fleet.html">workflow</a> fans out a dozen at once, and siblings run in parallel <a href="worktrees.html">git worktrees</a> of the same repo. OAK correlates all of them, so a fan-out reads as a single account of who did what — path-only, never mixing one agent's file contents into another's.</p>
+
+<h2>Where you review it</h2>
+<p>The same numbers appear in three places: the <a href="tui.html">terminal app</a>, <a href="editors.html">VS Code</a>, and <a href="editors.html">JetBrains</a> IDEs. A number shown on one surface is the same number acted on everywhere — because all three render one CLI backend.</p>
+
+<div class="callout tip">
+  <span class="ico">→</span>
+  <div class="ct"><span class="ctitle">Next steps</span>
+  <p><a href="install.html">Install OAK</a>, then walk through <a href="first-review.html">your first review</a>. To understand the model first, start with <a href="sessions-agents.html">Sessions &amp; agents</a>.</p></div>
+</div>

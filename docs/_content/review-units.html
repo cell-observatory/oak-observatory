@@ -1,0 +1,17 @@
+<p>The single idea that makes review keep pace with generation: the unit of decision is not a raw file write, but <strong>what an agent changed for a given prompt</strong>. This page explains the review unit and why it's bounded the way it is.</p>
+
+<h2>Why raw edits are not the unit</h2>
+<p>Agents revise the same code several times before settling — a first attempt, a fix, a rename, a cleanup. Reviewing each raw <a href="edits.html">edit</a> would ask you to judge intermediate states that no longer exist. So OAK collapses them.</p>
+
+<h2>The review unit</h2>
+<p>The <strong>review unit</strong> combines edits to the same lines — or the same detected function — into one unit whose diff is the <em>net</em> change, bounded by the <a href="prompts.html">prompt</a> that produced them. A superseded intermediate state never asks for a decision, and accepting or reverting a unit acts on every edit inside it.</p>
+<p>The prompt boundary matters: it's what keeps one ask's churn from merging with the next ask's, so a unit always answers "what did this <em>one</em> request do to this code."</p>
+
+<div class="callout info">
+  <span class="ico">ℹ</span>
+  <div class="ct"><span class="ctitle">Two counts that legitimately differ</span>
+  <p>A revert acts on the underlying edit <em>records</em>, but review reads in <em>units</em>. So a <a href="keep-undo.html">Rewind</a> dialog names both — the records it will revert and the units they collapse to. The unit count is the one the prompt rows show.</p></div>
+</div>
+
+<h2>What comes next</h2>
+<p>Once you're deciding on units, <a href="keep-undo.html">Keep and Undo</a> act on one unit at a time, while Accept and Reject act on a whole scope. A refused revert is a <a href="conflicts.html">conflict</a>, handled explicitly rather than silently.</p>

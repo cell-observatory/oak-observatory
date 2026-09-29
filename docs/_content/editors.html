@@ -1,0 +1,40 @@
+<p>OAK ships two editor extensions — the <strong>VS Code</strong> extension and the <strong>JetBrains</strong> plugin (IntelliJ, PyCharm, WebStorm, and the rest). Both are thin renderers over the <a href="cli.html">CLI</a>, so every number matches the <a href="tui.html">terminal app</a> — one record, rendered in whichever editor you live in. The demo below is the <strong>same self-playing session as the homepage</strong> — an agent editing a Python pipeline while the observatory fills in around it; pause or step through it with the controls.</p>
+
+<style>
+  .demo-embed-wrap{margin:22px 0 6px}
+  .demo-embed{width:100%;border:0;display:block;height:1120px;overflow:hidden;background:transparent}
+  .demo-hint{text-align:center;font-family:var(--font-mono);font-size:.74rem;color:var(--faint);margin:0}
+</style>
+<div class="demo-embed-wrap">
+  <iframe id="editor-demo" class="demo-embed" title="Interactive editor demo — the same self-playing session as the homepage" scrolling="no"></iframe>
+</div>
+<p class="demo-hint">The Observatory Traces sidebar, inline review, and the Dashboards dock — all live, filling in as the agent works.</p>
+<script>
+(function(){
+  var f=document.getElementById('editor-demo'); if(!f) return;
+  function theme(){ return document.documentElement.getAttribute('data-theme') || 'system'; }
+  addEventListener('message',function(e){ if(e.data&&e.data.oakDemoHeight){ f.style.height=e.data.oakDemoHeight+'px'; } });
+  function push(){ try{ f.contentWindow.postMessage({oakTheme:theme()},'*'); }catch(_){} }
+  f.addEventListener('load',push);
+  new MutationObserver(push).observe(document.documentElement,{attributes:true,attributeFilter:['data-theme']});
+  f.src='embed-editor-demo.html#theme='+theme();
+})();
+</script>
+
+<h2>What's inside</h2>
+<ul>
+  <li><a href="editors-overview.html">The Overview panel</a> — the master-detail board: Sessions, Workers, Workflows, Tasks, and Processes, with the change map scoped by selection.</li>
+  <li><a href="editors-traces.html">The Traces sidebar</a> — every captured edit in the project tree, grouped by file, with per-row Keep and Undo.</li>
+  <li><a href="editors-inline.html">Inline review</a> — pending edits in the editor itself, and the review bar that carries the verbs.</li>
+  <li><a href="editors-stacked.html">The stacked diff view</a> — <em>Open all in editor</em> reads the pending work as one scroll, each diff with its own Keep and Undo.</li>
+  <li><a href="editors-timeline.html">The Timeline panel</a> — Feed, Prompts, Observations and Actions in one panel.</li>
+</ul>
+
+<h2>Two editors, one setting</h2>
+<p>Which review surface appears is a setting, spelled the same way where the editors overlap. JetBrains IDEs expose a floating-toolbar layer, so the review controls sit as a <strong>floating toolbar</strong> over the editor. VS Code exposes no floating-widget API, so it uses a <strong>compact bar</strong> built on a comment thread, plus a <strong>review bubble</strong> one click away. A file with pending edits carries a count badge in the editor's own project tree — and on the editor tab in VS Code.</p>
+
+<div class="callout info">
+  <span class="ico">ℹ</span>
+  <div class="ct"><span class="ctitle">Start in one, finish in the other</span>
+  <p>Because both render the same <a href="capture.html#store">store</a> through the CLI, a review can start in VS Code and finish in JetBrains, or in the <a href="tui.html">terminal</a> — every surface agrees on the same numbers and the same decisions.</p></div>
+</div>

@@ -1,0 +1,13 @@
+<p><strong>Risk</strong> is the audit of what a session did that could cause harm. Like <a href="egress.html">Egress</a>, it reports what the session <strong>exercised, never what it was permitted</strong> — an agent writes nothing to the transcript when it asks for approval, so hand-approved and auto-approved work are indistinguishable from the outside. The audit therefore states what ran.</p>
+
+<h2>What Risk flags</h2>
+<p><strong>Risk</strong> flags destructive or privileged shell commands — for example <code>rm -rf</code>, <code>git reset --hard</code>, forced pushes, <code>curl</code> piped to a shell, <code>sudo</code>, and reads or writes of credential files — as <strong>HIGH</strong> or <strong>MED</strong> rows stating the reason in plain words.</p>
+<p>It also lists the <a href="edits.html">edits</a> that landed <em>outside</em> the workspace — something no workspace-relative file list can show, and exactly the kind of change that's easy to miss.</p>
+
+<div class="callout warn">
+  <span class="ico">⚠︎</span>
+  <div class="ct"><span class="ctitle">Exercised, not permitted</span>
+  <p>A HIGH row means the command <em>ran</em>. It does not mean you failed to approve it — the transcript can't tell approved from auto-approved. The audit's job is to make sure nothing dangerous ran unseen, whatever the permission path.</p></div>
+</div>
+
+<p>Risk closes the <a href="actions-view.html">Actions view</a> alongside Egress, because both are read off the same stream of <a href="actions.html">actions</a>.</p>

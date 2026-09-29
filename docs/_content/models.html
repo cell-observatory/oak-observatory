@@ -1,0 +1,5 @@
+<p>OAK captures the native agent’s hooks and transcript. Model identity and usage are read from that evidence; model choice does not change the review store.</p>
+<h2>Native model configuration</h2>
+<p>Select a model in Claude Code or Codex, in the agent’s own terminal in the <a href="tui-herdr.html">herdr tab</a>. OAK reads the model each turn ran on from the transcript.</p>
+<h2>Local models</h2>
+<p><code>oak models</code> lists local Ollama models and the model configured for Codex. <code>oak models use &lt;name&gt;</code> updates that native configuration and verifies it with a live turn. Local model names do not imply hosted pricing; unavailable pricing stays unavailable.</p>

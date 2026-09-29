@@ -1,0 +1,19 @@
+<p><strong>Egress</strong> is the audit of where a session reached beyond the workspace. Where <a href="risk.html">Risk</a> asks "what could cause harm," Egress asks "where did data go, and where did it come from" — the reach of a session, classified by scope.</p>
+
+<h2>What Egress records</h2>
+<p><strong>Egress</strong> records where the session reached beyond the workspace: web hosts, MCP servers, network shell commands, and files read from outside the workspace.</p>
+
+<h2>Scope</h2>
+<p>Each destination carries a scope:</p>
+<ul>
+  <li><code>remote</code> — it left the machine.</li>
+  <li><code>outside</code> — it stayed on the machine but left the workspace (the JSON value is <code>local</code>).</li>
+  <li><code>unknown</code> — the destination could not be classified.</li>
+</ul>
+<p><strong>Outside is a fact about a path; unknown is an admission; the two are never merged.</strong> Collapsing them would let a genuinely unclassifiable destination hide among benign local reads.</p>
+
+<div class="callout info">
+  <span class="ico">ℹ</span>
+  <div class="ct"><span class="ctitle">Files read count as egress</span>
+  <p>Reading a file from outside the workspace is egress with <code>outside</code> scope — reach doesn't only mean the network. A credential file read is both an Egress destination and a <a href="risk.html">Risk</a> row.</p></div>
+</div>

@@ -1,0 +1,23 @@
+<p>Everything OAK shows is derived from two sources, and it writes to neither of them without your say-so. The <strong>transcript</strong> the agent already keeps, and the <strong>store</strong> the capture <strong>hook</strong> appends to. Both cost no tokens and are invisible to the agent.</p>
+
+<h2>Transcript</h2>
+<p>The <strong>transcript</strong> is the event log the agent itself writes for a session: prompts, tool calls, results, reasoning, and plan updates, one JSON record per line. The observatory reads it as evidence and never writes to it. Because the reading happens outside the model loop, it costs no tokens and is invisible to the agent.</p>
+
+<h2>Store</h2>
+<p>The <strong>store</strong> is the observatory's own record: a per-session, append-only log of <a href="edits.html">edit</a> records, plus content-addressed snapshots of each file before and after a change. It is independent of git, holds every review decision, and can be handed to a teammate as a self-contained account of what the agent did and what you decided.</p>
+
+<div class="callout info">
+  <span class="ico">ℹ</span>
+  <div class="ct"><span class="ctitle">Where it lives</span>
+  <p>The store sits under your config directory, one folder per session. <code>oak store</code> prints its location; every session's edits, snapshots, and derived caches live there. It is git-independent, so nothing you review touches your working tree until you decide.</p></div>
+</div>
+
+<h2>Hook</h2>
+<p>A <strong>hook</strong> is the local capture point. <a href="claude-code.html">Claude Code</a> invokes it before and after each file-changing tool call, and after one that fails; the hook snapshots the file and appends an edit record to the store. It prints nothing and returns immediately, so the agent's behavior and context are unchanged.</p>
+<p><code>oak init</code> installs Claude Code capture hooks, and native Codex hooks too when <code>codex</code> is on the PATH; <code>oak init --codex</code> installs the Codex hooks alone. herdr manages terminals while OAK reads the captured store and native transcripts.</p>
+
+<div class="callout warn">
+  <span class="ico">⚠︎</span>
+  <div class="ct"><span class="ctitle">Not everything is worth recording</span>
+  <p>Lockfiles, <code>dist/</code>, generated clients — a <a href="ignore.html">.observatoryignore</a> tells the hook what never to capture, in <code>.gitignore</code> syntax.</p></div>
+</div>

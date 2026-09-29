@@ -1,0 +1,41 @@
+<p>OAK ships on two channels — a <strong>stable</strong> channel of tagged releases and a rolling <strong>pre-release</strong> channel off the dev branch. Both update the same way, from one chip in the editors or one flag in the terminal. Every release's changes are in the <a href="https://github.com/cell-observatory/oak-observatory/blob/main/CHANGELOG.md">changelog</a>.</p>
+
+<h2 id="v0-10-0">0.10.0</h2>
+<p><strong>Released <time datetime="2026-09-28">2026-09-28</time></strong> · <a href="https://github.com/cell-observatory/oak-observatory/releases/tag/v0.10.0">downloads and the full release notes</a></p>
+<p>claude-observatory is now <strong>OAK</strong>: the command is <code>oak</code>, the npm package <code>oak-observatory</code>, and the repository <a href="https://github.com/cell-observatory/oak-observatory">cell-observatory/oak-observatory</a>. The terminal app now runs on <a href="https://github.com/herdrdev/herdr">herdr</a>, which OAK installs and manages. Upgrading from 0.9.5 takes two steps by hand: reinstall, because the old updaters cannot cross the rename, then run <code>oak init</code> with Claude Code closed. See <a href="install.html#upgrading-from-claude-observatory">Upgrading from claude-observatory</a>.</p>
+<ul>
+  <li><strong>herdr · Observatory · Review.</strong> The terminal app’s three tabs: herdr’s own client, where agents run in panes; a live view of every session; and the review workspace. <code>oak attach</code> hands a plain terminal to herdr, on this machine or a saved one.</li>
+  <li><strong>The Observatory.</strong> Sessions grouped by machine and herdr workspace, each with its agent, model, edits, tokens and the clock time of its last activity. A click pins a session’s conversation beside the list: your prompts in boxes on a grey ground, the replies, thinking and tool calls with their diffs, then its Workers and Tasks, coloured by state, with the finished ones folded behind one row. Drag across text to copy it; <kbd>i</kbd> replies through herdr.</li>
+  <li><strong>Other machines.</strong> <code>oak machine add</code> provisions a machine over SSH. The Review tab reviews a session on the machine that runs it, with that machine’s own <code>oak</code>, and its session picker lists every saved machine’s sessions; nothing is copied between machines.</li>
+  <li><strong>Editors.</strong> Session lists show the sessions of the machine the workspace runs on, grouped by workspace. The Timeline gains a <a href="feed.html">Feed</a> tab: the selected conversation’s prompts, replies, thinking and tool calls. A session’s store size opens its store folder, and deleting a session says what it removes: the captured edits, never the transcript.</li>
+  <li><strong>Codex.</strong> <code>oak init</code> installs capture for Codex 0.147.0 or newer beside Claude Code.</li>
+  <li><strong>Needs you.</strong> A desktop notification, an inbox and a one-key jump for every session waiting on you.</li>
+  <li><strong>Usage.</strong> <code>5h</code>, <code>wk</code> and <code>mo</code> for Claude and Codex in the terminal and both editors’ status bars, and <code>oak usage --breakdown</code>. Dollar figures priced from token counts at API list prices are marked <code>~</code>; none is a bill. The per-model weekly cap is listed in the status-bar tooltips and the Stats panels.</li>
+  <li><strong>Session titles from claude.ai.</strong> A session renamed in the Claude app or on claude.ai shows that name. OAK reads the titles from your account at most every five minutes; <code>oak titles --off</code> turns the read off.</li>
+  <li><strong>Install.</strong> Node.js 20 or newer, and <code>python3</code> on Linux and macOS. npm 12 installs with <code>--allow-scripts=node-pty</code>, and on Linux that build needs <code>make</code> and a C++ compiler; the install scripts take care of the flag.</li>
+</ul>
+
+<h2>The two channels</h2>
+<h3>Stable</h3>
+<p>Tagged releases, cut from <code>main</code> — each one a version like <code>v0.10.0</code>. The full three-OS test matrix and the end-to-end suite ran on the exact commit; the artifacts (CLI tarball, VS&nbsp;Code <code>.vsix</code>, JetBrains plugin zip) are attached to the GitHub Release; and the changelog names what changed. This is the default channel — <code>releases/latest</code> serves it, and nothing on it ever moves after it's published.</p>
+
+<h3>Pre-release</h3>
+<p>A rolling build of the <code>dev</code> branch. Every push to <code>dev</code> rebuilds all artifacts, stamps them <code>&lt;next&gt;-dev.&lt;n&gt;</code> (for example <code>0.11.0-dev.37</code>), and refreshes one GitHub release — tag <code>dev-latest</code>, marked <em>prerelease</em>, so the stable channel never sees it. You get merged features and fixes days or weeks before a tagged release, with correspondingly less soak time.</p>
+
+<div class="callout info">
+  <span class="ico">ℹ</span>
+  <div class="ct"><span class="ctitle">Real semver ordering</span>
+  <p>Every dev build is newer than the stable it forked from, and the eventual tagged release is newer than every dev build that led to it — so promotion lands as an ordinary update, never a downgrade.</p></div>
+</div>
+
+<h2>Switching &amp; updating</h2>
+<p>Both editors pin a <strong>version chip</strong> at the right edge of the Overview's toolbar. It shows the version you're running; when the channel you follow has something newer, a dot appears. Its menu lists what each surface currently has — the CLI, both editor plugins, and the status line carry independent versions — and offers <strong>Update now</strong>, which installs the newest release of your channel in one pass, then offers the reload or restart that loads it.</p>
+<p>From the terminal, the same in two commands:</p>
+<pre><code>oak version --check   # is there something newer on my channel?
+oak update            # install it — CLI, both plugins, status line</code></pre>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div class="ct"><span class="ctitle">Following a channel means matching it</span>
+  <p>A surface is refreshed whenever its version differs from the channel's newest, in either direction — so switching from pre-release back to stable steps you down to stable cleanly, not only forward.</p></div>
+</div>
