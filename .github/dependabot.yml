@@ -1,9 +1,18 @@
 # Automated dependency + GitHub Actions updates. The `github-actions` ecosystem also converts
 # tag-pinned `uses:` to commit SHAs over time (supply-chain hardening).
+#
+# TARGETED AT `dev`, not at the default branch. `main` only ever receives a promote, and a promote
+# never merges back (it would pull dev's version backwards and publish a lower pre-release than the
+# one already live). So updates opened against `main` landed where nothing is developed: dev kept
+# running `codeql-action@v4` — a floating major — while main sat on a pin, and each release branch
+# re-merged main just to carry the pins across. Opening against `dev` puts them where the work is,
+# and they reach `main` the same way every other change does. Dependabot reads THIS FILE from the
+# default branch, so it stays on `main` while pointing everything at `dev`.
 version: 2
 updates:
   - package-ecosystem: npm
     directory: /
+    target-branch: dev
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
@@ -22,10 +31,19 @@ updates:
 
   - package-ecosystem: github-actions
     directory: /
+    target-branch: dev
     schedule:
       interval: weekly
+    # One PR a week for ALL of them, the way npm's dev-dependencies already group. Ungrouped, this
+    # ecosystem is the loudest in the repo: every action moves on its own cadence (codeql-action alone
+    # went 4.37.3 -> 4.37.6 inside a week) and each bump opened, built and merged separately — a full
+    # CI matrix per one-line change to a `uses:` pin.
+    groups:
+      github-actions:
+        patterns: ['*']
 
   - package-ecosystem: gradle
     directory: /packages/jetbrains
+    target-branch: dev
     schedule:
       interval: weekly
