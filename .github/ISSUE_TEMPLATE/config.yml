@@ -1,8 +1,8 @@
 blank_issues_enabled: true
 contact_links:
   - name: 🔬 Live showcase
-    url: https://cell-observatory.github.io/claude-observatory/
+    url: https://cell-observatory.github.io/oak-observatory/
     about: See what the observatory does in the browser before filing — Edits, Diffs, Observations, Timeline, Stats, and inline review.
   - name: Contributing guide
-    url: https://github.com/cell-observatory/claude-observatory/blob/main/CONTRIBUTING.md
+    url: https://github.com/cell-observatory/oak-observatory/blob/main/CONTRIBUTING.md
     about: How to add a feature across all platforms (logic in core → CLI --json → both editors). Read this before proposing or building a feature.

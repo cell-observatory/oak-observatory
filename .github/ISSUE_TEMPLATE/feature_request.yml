@@ -1,5 +1,5 @@
 name: Feature request
-description: Propose a feature for Claude Observatory (ships across the CLI + both editors)
+description: Propose a feature for OAK (ships across the CLI + both editors)
 title: "[Feature]: "
 labels: ["enhancement"]
 body:
@@ -11,8 +11,8 @@ body:
         the JetBrains plugin — with the shared logic in `core` and exposed over the CLI `--json`
         surface. Please keep that in mind as you describe the feature.
 
-        See [CONTRIBUTING.md](https://github.com/cell-observatory/claude-observatory/blob/main/CONTRIBUTING.md)
-        and [docs/ARCHITECTURE.md](https://github.com/cell-observatory/claude-observatory/blob/main/docs/ARCHITECTURE.md).
+        See [CONTRIBUTING.md](https://github.com/cell-observatory/oak-observatory/blob/main/CONTRIBUTING.md)
+        and [docs/ARCHITECTURE.md](https://github.com/cell-observatory/oak-observatory/blob/main/docs/ARCHITECTURE.md).
 
   - type: textarea
     id: problem
@@ -59,7 +59,7 @@ body:
         Only uncheck one if there's a genuine platform-specific reason — and say why in the proposed
         solution above.
       options:
-        - label: CLI (`claude-observatory`)
+        - label: CLI (`oak`)
           required: false
         - label: VS Code extension
           required: false
@@ -74,7 +74,7 @@ body:
         If this needs new data, sketch the CLI command and the `--json` shape both editors would
         consume. Field names are a stable contract.
       placeholder: |
-        claude-observatory <command> --json
+        oak <command> --json
         → { "session": "...", "things": [ { "id": 1, "field": "..." } ] }
       render: json
     validations:

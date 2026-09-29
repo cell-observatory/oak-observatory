@@ -5,7 +5,7 @@ name: Dev pre-release
 # force-moves the `dev-latest` TAG (a tag name distinct from the branch, so refs never turn
 # ambiguous), and refreshes ONE GitHub release marked `prerelease` — which keeps it invisible to
 # `releases/latest`, i.e. to every stable-channel install. The pre-release channel
-# (`claude-observatory update --channel dev`, or the editors' version dropdown) always serves the
+# (`oak update --channel dev`, or the editors' version dropdown) always serves the
 # tip of dev. macOS/Windows coverage for dev comes from the PR runs that merged into it; this job
 # gates publishing on the ubuntu suite only.
 on:
@@ -29,6 +29,19 @@ jobs:
         with:
           node-version: 22
           cache: npm
+      - name: Refuse to publish until the GitHub repo is renamed
+        # The same gate as release.yml's. This build's updater, installers and JetBrains repository
+        # URLs all name cell-observatory/oak-observatory, which 404s until the rename; and the publish
+        # below deletes the old name's assets from dev-latest first.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          NWO="$(gh repo view --json nameWithOwner -q .nameWithOwner)"
+          if [ "$NWO" != "cell-observatory/oak-observatory" ]; then
+            echo "::error::repository is '$NWO', not cell-observatory/oak-observatory — rename the GitHub repo before pushing to dev; this build's updater, installers and JetBrains repository would 404 otherwise."
+            exit 1
+          fi
+          echo "repository is $NWO — dev build URLs will resolve"
       - name: Stamp the rolling dev version
         # <base>-dev.<run#> across every package + the lockfile + the README badge (version.mjs is
         # the single stamping tool, so `npm test`'s version:check passes on the stamped tree). The
@@ -68,27 +81,33 @@ jobs:
       # Placed here, not beside the stamp: it uses core's own comparator, and core has to be BUILT
       # first — the first version of this ran before `npm ci` and died on a missing dist. Late is fine:
       # the only thing it has to beat is the publish below, and it fails CLOSED.
-      - name: The rolling version must outrank the one already published
+      # It must outrank the newest STABLE release too: dev-channel installs move to that release at a
+      # promote, and a `0.10.0-dev.N` below a published 0.10.0 is never offered to them.
+      - name: The rolling version must outrank the published pre-release and stable release
         run: |
           node -e '
             const { execSync } = require("child_process");
             const { isNewer } = require("./packages/core/dist/index.js");
             const want = process.env.VER;
-            let live = "";
-            try {
-              const rel = JSON.parse(execSync("gh release view dev-latest --json name -q .name", { encoding: "utf8" }));
-              live = String(rel || "");
-            } catch { live = execSync("gh release view dev-latest --json name -q .name || true", { encoding: "utf8" }).trim(); }
-            const m = live.match(/\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?/);
-            if (!m) { console.log("no published pre-release to compare against — first run, allowed"); process.exit(0); }
-            const published = m[0];
-            if (!isNewer(want, published)) {
-              console.error(`::error::${want} does not outrank the published pre-release ${published}. ` +
-                `dev'"'"'s committed version has gone BACKWARDS — almost certainly a promote merged into dev ` +
-                `without re-stamping. Fix: node scripts/version.mjs <next target> on dev.`);
-              process.exit(1);
+            const published = (cmd) => {
+              let out = "";
+              try { out = execSync(cmd, { encoding: "utf8" }); } catch { /* none published yet */ }
+              return (out.match(/\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?/) || [])[0];
+            };
+            // The rolling pre-release names its version in its title; `gh release view` with no tag is the newest stable.
+            for (const [what, version, why] of [
+              ["pre-release", published("gh release view dev-latest --json name -q .name"),
+                `dev'"'"'s committed version has gone BACKWARDS — almost certainly a promote merged into dev without re-stamping.`],
+              ["stable release", published("gh release view --json tagName -q .tagName"),
+                `dev was not bumped past the release it promoted.`],
+            ]) {
+              if (!version) { console.log(`no published ${what} to compare against — allowed`); continue; }
+              if (!isNewer(want, version)) {
+                console.error(`::error::${want} does not outrank the published ${what} ${version}. ${why} Fix: node scripts/version.mjs <next target>-dev.0 on dev.`);
+                process.exit(1);
+              }
+              console.log(`${want} outranks the published ${what} ${version}`);
             }
-            console.log(`${want} outranks the published ${published}`);
           '
         env:
           GH_TOKEN: ${{ github.token }}
@@ -99,18 +118,18 @@ jobs:
           TAG="dev-latest"
           # STABLE asset names: --clobber only replaces same-named files, and the updater's
           # `.find(/\.tgz$/)` must never race a pile of stale versioned tarballs.
-          cp release/claude-observatory-*.tgz "release/claude-observatory-cli-dev.tgz"
-          cp release/claude-observatory.vsix "release/claude-observatory-vscode-dev.vsix"
-          cp packages/jetbrains/build/distributions/*.zip "release/claude-observatory-jetbrains-dev.zip"
+          cp release/oak-observatory-*.tgz "release/oak-observatory-cli-dev.tgz"
+          cp release/oak-observatory.vsix "release/oak-observatory-vscode-dev.vsix"
+          cp packages/jetbrains/build/distributions/*.zip "release/oak-observatory-jetbrains-dev.zip"
           # The pre-release channel's JetBrains repo descriptor. Subscribing an IDE to
-          #   https://github.com/cell-observatory/claude-observatory/releases/download/dev-latest/updatePlugins.xml
+          #   https://github.com/cell-observatory/oak-observatory/releases/download/dev-latest/updatePlugins.xml
           # auto-updates the plugin from the rolling build (the stable URL stays releases/latest/…).
           cat > release/updatePlugins.xml <<XML
           <?xml version="1.0" encoding="UTF-8"?>
           <plugins>
-            <plugin id="com.cell-observatory.claude-observatory" version="${VER}"
-                    url="https://github.com/cell-observatory/claude-observatory/releases/download/${TAG}/claude-observatory-jetbrains-dev.zip">
-              <name>Claude Observatory</name>
+            <plugin id="com.cell-observatory.oak-observatory" version="${VER}"
+                    url="https://github.com/cell-observatory/oak-observatory/releases/download/${TAG}/oak-observatory-jetbrains-dev.zip">
+              <name>OAK</name>
               <idea-version since-build="252"/>
             </plugin>
           </plugins>
@@ -121,13 +140,33 @@ jobs:
           if ! gh release view "$TAG" >/dev/null 2>&1; then
             gh release create "$TAG" --prerelease \
               --title "Pre-release ${VER} (rolling, from dev)" \
-              --notes "Rolling build of the \`dev\` branch — refreshed on every push. Install/follow it with \`claude-observatory update --channel dev\` or the editors' version dropdown."
+              --notes "Rolling build of the \`dev\` branch — refreshed on every push. Install/follow it with \`oak update --channel dev\` or the editors' version dropdown."
           fi
+          # Remove the pre-rename assets left on the rolling release from before the OAK rename.
+          # --clobber only replaces same-named assets, so the old claude-observatory-* trio would
+          # otherwise stay attached forever — and every updater resolves by first suffix match
+          # (assetFor / find(/\.tgz$/)), with GitHub returning assets sorted by name, so `claude-*`
+          # sorts before `oak-*` and fresh dev installs would pull the stale pre-rename artifact.
+          for stale in claude-observatory-cli-dev.tgz claude-observatory-vscode-dev.vsix claude-observatory-jetbrains-dev.zip; do
+            gh release delete-asset "$TAG" "$stale" -y 2>/dev/null || true
+          done
           gh release upload "$TAG" --clobber \
-            release/claude-observatory-cli-dev.tgz \
-            release/claude-observatory-vscode-dev.vsix \
-            release/claude-observatory-jetbrains-dev.zip \
+            release/oak-observatory-cli-dev.tgz \
+            release/oak-observatory-vscode-dev.vsix \
+            release/oak-observatory-jetbrains-dev.zip \
             release/updatePlugins.xml
           gh release edit "$TAG" --prerelease \
             --title "Pre-release ${VER} (rolling, from dev)" \
-            --notes "Rolling build of the \`dev\` branch at ${GITHUB_SHA} — refreshed on every push. Install/follow it with \`claude-observatory update --channel dev\` or the editors' version dropdown."
+            --notes "Rolling build of the \`dev\` branch at ${GITHUB_SHA} — refreshed on every push. Install/follow it with \`oak update --channel dev\` or the editors' version dropdown."
+      - name: No pre-rename asset is left on the rolling release
+        # The delete above ignores errors (an asset already gone is one). If a delete really failed,
+        # `claude-*` sorts before `oak-*`, and every updater would install the stale asset.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          LEFT="$(gh release view dev-latest --json assets -q '.assets[].name' | grep '^claude-observatory-' || true)"
+          if [ -n "$LEFT" ]; then
+            echo "::error::pre-rename assets are still attached to dev-latest, and updaters would pick them: $LEFT — delete them with gh release delete-asset."
+            exit 1
+          fi
+          echo "no pre-rename assets on dev-latest"
