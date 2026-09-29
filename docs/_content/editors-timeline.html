@@ -1,0 +1,23 @@
+<p>The <strong>Timeline</strong> panel presents the session as it unfolded — four tabs, one selector. Where the <a href="editors-overview.html">Overview</a> organizes by worktree and change, the Timeline organizes by the conversation and the agent's own actions.</p>
+
+<h2>Feed</h2>
+<p>The <a href="feed.html">Feed</a> tab is the selected conversation as it happened: your prompts on grey bands, the agent's replies as prose, its thinking folded until you open it, every tool call with the diff it produced, and the permissions it asked for — read from the native transcript and followed as it grows. Picking a worker, a workflow run, a task or a background shell in the Overview points the same tab at that thing's own activity; when the source finishes, the same view becomes its audit log. Scrolling back holds that position and offers a <kbd>↓ newest</kbd> control — shown only while the view is away from the tail — to return to it. New Session starts an agent through herdr. Review comments and quotes prepare a draft; an explicit Send submits it to a matching live pane.</p>
+<figure><img src="media/feed.png" loading="lazy" alt="The Feed tab showing a demo prompt on a grey band, the agent’s reply, a folded thought, a shell call and an edit with its diff as background bands"><figcaption>The Feed tab: the prompt, the agent's words, and what it did — one surface.</figcaption></figure>
+
+<h2>Prompts</h2>
+<p><a href="prompts.html">Prompts</a> is one row per thing you asked, in order, each printed whole with its edits, files, tokens, and duration. Selecting a prompt scopes the Overview beside it — the fleet, the tasks, and the whole change map narrow to the work that prompt caused.</p>
+
+<figure><img src="media/prompts.png" loading="lazy" alt="The Prompts tab: one row per prompt with its response"><figcaption>Prompts — the session as the conversation you had.</figcaption></figure>
+
+<h2>Observations</h2>
+<p><a href="observations.html">Observations</a> pairs each edit with the reasoning the agent recorded near it, flags notable content (debug statements, possible secrets, large deletions), and names what shaped the session in its Context section — each entry labeled by whether the transcript proves it or the file is merely present.</p>
+
+<h2>Actions</h2>
+<p><a href="actions-view.html">Actions</a> is the typed timeline of every tool call, grouped by kind, with low-signal categories collapsed and errors surfaced. It opens with any live <a href="conflicts.html">conflicts</a> and closes with the two audits — <a href="risk.html">risk</a> and <a href="egress.html">egress</a>.</p>
+
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div class="ct"><span class="ctitle">Grouped, when you want it</span>
+  <p>The Timeline can show all four of Feed, Prompts, Observations and Actions side by side, and carries its own session selector above the tabs so moving between two live conversations is one click.</p></div>
+</div>

@@ -1,0 +1,16 @@
+<p>Serious agent work spreads across git worktrees — one checkout per parallel attempt, so three agents can try the same task without stashing or branch-juggling. OAK's job is to make those parallel checkouts read as one account rather than three unrelated ones.</p>
+
+<h2>Worktree</h2>
+<p>A git <strong>worktree</strong> is a separate checkout of one repository. <a href="claude-code.html">Claude Code</a> keys its sessions by directory, so sessions in two worktrees of one repository would otherwise appear unrelated. The observatory correlates them by reading each worktree's <code>.git</code> pointer files as plain files — never by running the git binary, so it stays fast and side-effect-free.</p>
+
+<h2>Sibling</h2>
+<p>A <strong>sibling</strong> is another session in the same project — or, when the view is widened to the repository, in any of its worktrees. Siblings are how OAK presents parallel attempts: side by side, each with its own change map and review state.</p>
+
+<div class="callout warn">
+  <span class="ico">⚠︎</span>
+  <div class="ct"><span class="ctitle">Path-only correlation</span>
+  <p>When siblings touch the same file, OAK flags it as a <a href="conflicts.html">live conflict</a> — but tracking is by <em>path</em> only. File names cross between agents; file contents never do.</p></div>
+</div>
+
+<h2>The fleet ties them together</h2>
+<p>Every running agent across the repository's worktrees is unified into one board — the <a href="workflows-fleet.html">fleet</a>. That's where you watch siblings race, see which is furthest along, and catch two of them heading for the same file before they collide.</p>

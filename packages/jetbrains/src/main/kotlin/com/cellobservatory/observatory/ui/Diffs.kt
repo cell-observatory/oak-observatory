@@ -1,7 +1,9 @@
 package com.cellobservatory.observatory.ui
 
+import com.cellobservatory.observatory.core.ObservatoryCli
 import com.cellobservatory.observatory.core.StoreReader
 import com.cellobservatory.observatory.model.EditRecord
+import com.cellobservatory.observatory.model.ReviewParser
 import com.cellobservatory.observatory.services.ObserveCache
 import com.cellobservatory.observatory.services.ObservatoryService
 import com.cellobservatory.observatory.settings.ObservatorySettings
@@ -56,7 +58,7 @@ object Diffs {
         app.executeOnPooledThread {
             val before = StoreReader.readBlob(session, rec.beforeBlob)
             val after = StoreReader.readBlob(session, rec.afterBlob)
-            // Claude's reasoning rides in the diff title; Keep/Undo/Chat sit in the diff toolbar.
+            // the agent's reasoning rides in the diff title; Keep/Undo/Chat sit in the diff toolbar.
             val reason = ObserveCache.getInstance(project).payload()?.edits?.find { it.id == rec.id }?.reasoning
                 ?.lineSequence()?.firstOrNull { it.isNotBlank() }?.trim()
             app.invokeLater {
@@ -94,9 +96,9 @@ object Diffs {
      *  editor ([ReviewAllEditor]): every listed pending unit an embedded hunks-only diff with
      *  Keep/Undo/Chat on its header. The editor pages itself (ten blocks at a time, blobs read per
      *  page off the EDT — the eager build measurably froze the IDE at 2,922 units), so opening here
-     *  just hands it the SPECS. Re-opening replaces the previous "Claude changes" tab: the tab is a
+     *  just hands it the SPECS. Re-opening replaces the previous "Agent changes" tab: the tab is a
      *  snapshot, and stacking stale snapshots with live buttons multiplies wrong targets. */
-    fun showAll(project: Project, session: String, recs: List<Triple<EditRecord, String, Int>>) {
+    fun showAll(project: Project, session: String, recs: List<Triple<EditRecord, String, Int>>, title: String? = null) {
         if (recs.isEmpty()) {
             // The button only renders over a non-empty list, so an empty call means the log moved
             // between paint and click — say so rather than doing nothing.
@@ -108,7 +110,36 @@ object Diffs {
             val fem = FileEditorManager.getInstance(project)
             fem.openFiles.filterIsInstance<ReviewAllVirtualFile>().forEach { fem.closeFile(it) }
             val specs = recs.map { (rec, rel, delta) -> ReviewAllSpec(rec, rel, delta) }
-            fem.openFile(ReviewAllVirtualFile(session, specs, "Claude changes (${specs.size})"), true)
+            fem.openFile(ReviewAllVirtualFile(session, specs, title ?: "Agent changes (${specs.size})"), true)
+        }
+    }
+
+    /** The feed's edit-item opener: one FILE's changes as the stacked editor — every unit of that file, decided ones
+     *  included, since the blocks carry verdicts and their remaining verb (a pending-only scope
+     *  would open a fully decided file empty). Units and their net pairs come from the CLI's
+     *  `review` — the same source the Review panel stacks from — resolved against the SUBJECT
+     *  session's own log, which is not necessarily the reviewed session (a worker's feed). */
+    fun showFileStacked(project: Project, session: String, file: String) {
+        ApplicationManager.getApplication().executeOnPooledThread {
+            val result = ObservatoryCli.reviewJson(session, null, project.basePath)?.let { ReviewParser.parse(it) }
+            val units = result?.units?.filter { it.file == file } ?: emptyList()
+            val log = StoreReader.readLog(session)
+            val recs = units.mapNotNull { u ->
+                // Mirrors ReviewPanel.netRecord, over THIS session's log: a PENDING unit diffs as
+                // the net pair (span-first before + the unit's after); a RESOLVED unit arrives raw —
+                // core stops collapsing after keep/undo, and synthesizing here would double-count.
+                val rep = log.find { it.id == u.id } ?: return@mapNotNull null
+                val rec = if (!u.pending) rep else {
+                    val first = log.find { it.id == (u.members.firstOrNull() ?: u.id) } ?: rep
+                    if (first.id == rep.id) rep else rep.copy(beforeBlob = first.beforeBlob)
+                }
+                Triple(rec, u.rel, u.added + u.removed)
+            }
+            if (recs.isEmpty()) {
+                ReviewOps.notify(project, "Nothing to review for ${File(file).name}", NotificationType.WARNING)
+                return@executeOnPooledThread
+            }
+            showAll(project, session, recs, "${File(file).name} — ${recs.size} change(s) · stacked")
         }
     }
 

@@ -4,7 +4,7 @@ import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 
 /**
- * Kotlin mirror of core's ChangeMap view-model, parsed from `claude-observatory changemap --json`.
+ * Kotlin mirror of core's ChangeMap view-model, parsed from `oak changemap --json`.
  * Churn rollups, the worst-unreviewed-wins status precedence, module labels, and the drill-through
  * target (`maxId`) are all computed server-side in core.buildChangeMap — this plugin only renders the
  * result (no local aggregation, so VS Code and JetBrains can never disagree about the numbers).
@@ -27,6 +27,12 @@ data class ChangeMapFile(
     val status: String,
     /** Most-recent edit id — what a double-click opens. */
     val maxId: Int,
+    /** Most-recent edit time (epoch ms) — the "N min ago" column + the time sort. */
+    val maxTs: Long,
+    /** Bare lowercased extension — the extension filter key. */
+    val ext: String,
+    /** One of the six type buckets — the file-type filter key. */
+    val category: String,
     val classes: List<String>,
     val agent: Boolean,
     val risk: String?,
@@ -47,7 +53,7 @@ data class ChangeMapModule(
 
 data class ChangeMapSummary(
     val session: String,
-    /** Human-readable session name (Claude's ai-title, else the first user prompt; blank when neither) —
+    /** Human-readable session name (a rename, else its claude.ai Remote Control title, else the agent's ai-title, else the first user prompt; blank when none) —
      *  the Overview session selector + the Stats panel show this instead of the raw id. */
     val title: String?,
     val units: Int,
@@ -273,13 +279,11 @@ object ChangeMapParser {
         int(o, "errors"), int(o, "subagents"), int(o, "fleet"), int(o, "egress"),
     )
 
-    private fun ints(o: JsonObject, k: String): List<Int> =
-        (o.getAsJsonArray(k) ?: com.google.gson.JsonArray()).mapNotNull { it.takeIf { e -> !e.isJsonNull }?.asInt }
-
     private fun file(o: JsonObject) = ChangeMapFile(
         str(o, "rel") ?: "", str(o, "module") ?: "", str(o, "moduleLabel") ?: "", str(o, "file") ?: "",
         int(o, "churn"), int(o, "added"), int(o, "removed"), int(o, "cnt"), int(o, "kept"), int(o, "pending"), int(o, "undone"),
         str(o, "status") ?: "kept", int(o, "maxId"),
+        long(o, "maxTs"), str(o, "ext") ?: "", str(o, "category") ?: "other",
         strings(o, "classes"),
         bool(o, "agent"), str(o, "risk"), str(o, "reason"),
     )

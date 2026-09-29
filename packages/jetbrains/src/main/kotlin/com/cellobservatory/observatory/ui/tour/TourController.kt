@@ -27,7 +27,7 @@ import javax.swing.JComponent
  * control that does nothing. VS Code keeps its own detach — it drives the platform's own
  * move-editor-to-new-window, which works — so the two editors differ here on purpose.
  *
- * It can never be a TAB of the existing Claude Observatory window: that window's panes are `Content`s
+ * It can never be a TAB of the existing OAK window: that window's panes are `Content`s
  * and only one shows at a time, so the step that says "look at the Review list" would hide the tour
  * explaining it.
  *
@@ -49,7 +49,7 @@ class TourController(private val project: Project) : com.intellij.openapi.Dispos
     }
 
     companion object {
-        const val TOOL_WINDOW_ID = "Claude Observatory Tour"
+        const val TOOL_WINDOW_ID = "OAK Tour"
         fun getInstance(project: Project): TourController = project.service()
     }
 
@@ -206,7 +206,7 @@ class TourController(private val project: Project) : com.intellij.openapi.Dispos
                 if (project.isDisposed) return@invokeLater
                 if (full.isEmpty()) {
                     // Never open an empty tour: say why instead (an older CLI on PATH is the usual cause).
-                    onFailure("Could not read the guided tour — is the claude-observatory CLI installed and up to date?")
+                    onFailure("Could not read the guided tour — is the oak CLI installed and up to date?")
                     return@invokeLater
                 }
                 val essentialsLabel = "Essentials — ${short.size} steps"
@@ -548,7 +548,7 @@ class TourController(private val project: Project) : com.intellij.openapi.Dispos
             stop()
             com.cellobservatory.observatory.ui.ReviewOps.notify(
                 project,
-                "Claude Observatory: could not open the guided tour window, so the tour was not started.",
+                "OAK: could not open the guided tour window, so the tour was not started.",
                 com.intellij.notification.NotificationType.WARNING,
             )
             return
@@ -669,17 +669,22 @@ class TourController(private val project: Project) : com.intellij.openapi.Dispos
                 com.cellobservatory.observatory.ui.PromptsPanel.of(project)?.tourAnchor(step.anchor)
                     ?: ChangeMapPanel.of(project)?.tourAnchor(step.anchor)
             }
-            "review", "fileHistory", "actions", "observations" -> {
-                // Actions + Observations moved to the Timeline window (0.9.0); the per-edit surfaces —
-                // Review included (0.9.4) — stay in Traces. Route each tab to the window that holds it.
-                val inTimeline = step.view == "actions" || step.view == "observations"
+            "review", "fileHistory", "actions", "observations", "feed" -> {
+                // Feed, Actions and Observations belong to Timeline; Review stays in Traces.
+                val inTimeline = step.view == "actions" || step.view == "observations" || step.view == "feed"
                 val tw = mgr.getToolWindow(if (inTimeline) "Observatory Timeline" else "Observatory Traces") ?: return null
                 tw.show(null)
                 if (inTimeline) {
                     val panel = com.cellobservatory.observatory.ui.TimelinePanel.of(project)
                     panel?.selectMember(step.view)
                     // Only when the step actually names a control: an anchorless step brings the tab
-                    // forward and rings nothing, rather than outlining the whole pane.
+                    // forward and rings nothing, rather than outlining the whole pane. The feed step's
+                    // anchor is the tab body itself.
+                    if (step.view == "feed") {
+                        return if (step.anchor != null) {
+                            com.cellobservatory.observatory.ui.FeedPanel.of(project)?.tourTarget() ?: panel
+                        } else null
+                    }
                     return if (step.anchor != null) panel else null
                 }
                 if (step.view == "review") {

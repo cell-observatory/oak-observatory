@@ -1,11 +1,11 @@
 name: Pages
 
 # Publishes docs/ to GitHub Pages so the showcase renders in a browser straight from the repo:
-#   https://cell-observatory.github.io/claude-observatory/  (redirects to showcase.html)
+#   https://cell-observatory.github.io/oak-observatory/  (redirects to showcase.html)
 on:
   push:
     branches: [main]
-    paths: ['docs/**', '.github/workflows/pages.yml']
+    paths: ['docs/**', 'scripts/build-docs.mjs', 'scripts/build-editor-demo-embed.mjs', 'package.json', '.github/workflows/pages.yml']
   workflow_dispatch:
 
 permissions:
@@ -25,6 +25,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: Verify generated docs are current
+        run: |
+          node scripts/build-docs.mjs
+          # The Editors page iframes docs/embed-editor-demo.html, which is generated SEPARATELY from
+          # docs/showcase.html. Leaving it out of this gate let a homepage demo change publish while
+          # the embedded copy stayed on the previous one.
+          node scripts/build-editor-demo-embed.mjs
+          git diff --exit-code -- docs
       - uses: actions/configure-pages@v6
         with:
           enablement: true

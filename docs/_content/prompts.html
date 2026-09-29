@@ -1,0 +1,16 @@
+<p>A <strong>prompt</strong> is the spine the rest of the record hangs on. It is one turn you wrote, together with everything the agent produced while answering it — and because it follows <em>your</em> side of the conversation, it is the one grouping that covers a session completely.</p>
+
+<h2>What a prompt covers</h2>
+<p>A prompt's window runs from that turn to the next one, and work belongs to the prompt that <strong>started</strong> it: a shell launched during prompt 4 remains prompt 4's even if it exits during prompt 7. Prompts are the only grouping ordered by your side of the conversation, and they are the scope the Prompts window sets over every other view.</p>
+<p>There is one prompt selection, not one per surface: picking an ask on the nav bar's Prompt axis selects it in the Prompts list and scrolls it into view, and picking one in the list moves the axis.</p>
+
+<figure><img src="media/prompts.png" loading="lazy" alt="The Prompts window: one row per prompt, newest first, each showing its edits, files, tokens, and duration above the prompt itself, shown in full; the selected row is outlined and its response expanded beneath it"><figcaption>One row per prompt, in the order you asked. Selecting one scopes the Overview beside it.</figcaption></figure>
+
+<h2>Prompts vs tasks</h2>
+<p>Prompts and <a href="tasks.html">tasks</a> answer different questions. Prompts follow your side of the conversation and cover the session <em>completely</em>, because every edit was made while answering something. Tasks follow the agent's own plan and cover it <em>partially</em> by design, because the plan does not account for every moment of work.</p>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div class="ct"><span class="ctitle">Rewind acts on prompts</span>
+  <p>Because a prompt bounds a window of work, <a href="keep-undo.html">Rewind</a> can put the tree back to the state it had before a given ask — reverting every unreviewed edit from that ask onward, not only the ones it produced.</p></div>
+</div>

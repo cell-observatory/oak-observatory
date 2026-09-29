@@ -1,14 +1,14 @@
-// Example .devcontainer/devcontainer.json for using Claude Observatory + claude-statusline inside a
+// Example .devcontainer/devcontainer.json for using OAK + claude-statusline inside a
 // devcontainer. Copy BOTH this file and setup.sh into your project's .devcontainer/ directory and
 // adapt the marked lines. This is a starting point, not a drop-in — swap the base image/features for
 // whatever your project already uses.
 {
-  "name": "claude-observatory (example)",
+  "name": "oak (example)",
 
   // ── Adapt: use your project's own image / Dockerfile / compose service. ─────────────────────────
   "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
   "features": {
-    // The claude-observatory CLI is a Node package; ensure node/npm exist in the container.
+    // The oak CLI is a Node package; ensure node/npm exist in the container.
     "ghcr.io/devcontainers/features/node:1": { "version": "20" }
   },
 
@@ -23,24 +23,16 @@
     // hooks (settings.json), and the statusline usage cache — under one directory. Point it at the
     // persistent volume mounted below so your edit history and stats survive a container REBUILD
     // (otherwise they live on the throwaway container layer and reset to empty every rebuild).
-    "CLAUDE_CONFIG_DIR": "/opt/claude-config"
+    "CLAUDE_CONFIG_DIR": "/opt/claude-config",
+    "CODEX_HOME": "/opt/codex-config"
   },
 
   // ── Persist the config dir with a named volume. Target MUST equal CLAUDE_CONFIG_DIR above. ───────
   "mounts": [
-    "source=claude-observatory-config,target=/opt/claude-config,type=volume"
+    "source=oak-observatory-config,target=/opt/claude-config,type=volume",
+    "source=oak-codex-config,target=/opt/codex-config,type=volume"
   ],
 
-  // Provisions jq + the CLI + statusline + capture hooks inside the container. Idempotent on rebuild.
-  "postCreateCommand": "bash .devcontainer/setup.sh",
-
-  "customizations": {
-    "vscode": {
-      // This extension is distributed as a private .vsix (not on the Marketplace), so it can't be
-      // auto-installed by id here. setup.sh prints how to install the packaged .vsix into the
-      // container. If you publish it to the Marketplace or a private registry, add its id here to
-      // auto-install on rebuild, e.g. "cell-observatory.claude-observatory-vscode".
-      "extensions": []
-    }
-  }
+  // Provisions jq, python3 if missing, the CLI, herdr, statusline and capture hooks. Idempotent on rebuild.
+  "postCreateCommand": "bash .devcontainer/setup.sh"
 }

@@ -35,7 +35,7 @@ export interface TraceEdit extends EditRecord {
 
 export interface SessionTrace {
   exportedAt: string; // ISO timestamp of the export itself
-  tool: string; // "claude-observatory" + the exporting front-end's version when it supplies one
+  tool: string; // "oak" + the exporting front-end's version when it supplies one
   session: string;
   title: string; // human-readable session name ('' when the transcript has neither title nor prompt)
   root: string; // the workspace root paths are shown relative to
@@ -100,7 +100,7 @@ export function buildSessionTrace(
 
   return {
     exportedAt: new Date().toISOString(),
-    tool: 'claude-observatory' + (opts.toolVersion ? ` ${opts.toolVersion}` : ''),
+    tool: 'oak' + (opts.toolVersion ? ` ${opts.toolVersion}` : ''),
     session: sessionId,
     title: summary?.title ?? '',
     root,

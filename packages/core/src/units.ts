@@ -33,9 +33,10 @@ import { diffArrays } from 'diff';
 import { EditRecord, EditStatus, blobText as storeBlobText, logPath, readLog } from './store';
 import { canonPath } from './paths';
 import { cachedByFiles } from './fscache';
+import { contentGet, contentNote, fileMark, flushContent, pairKeyOf, persisted } from './derived';
 import { tokenizeLines } from './merge';
 import { askBoundaries, windowOf } from './asks';
-import { detectScopes, scopeAt } from './scopes';
+import { detectScopes, familyOf, scopeAt } from './scopes';
 
 /** A review unit: one decision a person is asked to make. */
 export interface ReviewUnit {
@@ -71,44 +72,161 @@ function blobText(session: string, sha: string | null): string {
 interface HopShape {
   afterAdded: Set<number>;
   beforeChanged: Set<number>;
-  keep: Map<number, number>;
+  /** before-index → after-index for every surviving line. RUN-ENCODED and looked up by binary search:
+   *  a Map per hop held ~8KB for a 3,000-line file, and a session of 8,000 hops could never keep them
+   *  all — while the walk only ever asks it about a member's few tracked lines. */
+  keep: KeepMap;
+  /** The innermost scope every produced line sits in, or null — derived ONCE, beside the diff, because
+   *  it needs the after-text this hop is otherwise the last reader of. */
+  scope: string | null;
+  /** The exact bytes of a pure deletion's / pure insertion's block, when the hop is one and the block
+   *  is small enough to keep; otherwise `blockText` re-reads the blob on demand. */
+  blockS?: string;
+  blockE?: string;
 }
 
-const hopMemo = new Map<string, HopShape>();
-// Entry count bounds nothing about BYTES: each keep-map holds one entry per surviving line, so a
-// long single-file session can retain ~8KB per hop — measured 160MB at 20k entries on a 3000-line
-// file. 4k caps the same shape near 32MB, and a cold refill is ~1ms per hop.
-const HOP_MEMO_CAP = 4000;
+interface KeepMap {
+  get(line: number): number | undefined;
+}
 
-function hopShape(session: string, beforeSha: string | null, afterSha: string | null): HopShape {
+/** `k` is triples [beforeStart, afterStart, len], ascending by beforeStart — the unchanged parts of
+ *  one Myers alignment, which is exactly what a keep-map is. */
+function keepOf(k: number[]): KeepMap {
+  const n = Math.floor(k.length / 3);
+  return {
+    get(line) {
+      let lo = 0;
+      let hi = n - 1;
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1;
+        const bs = k[mid * 3];
+        if (line < bs) hi = mid - 1;
+        else if (line >= bs + k[mid * 3 + 2]) lo = mid + 1;
+        else return k[mid * 3 + 1] + (line - bs);
+      }
+      return undefined;
+    },
+  };
+}
+
+/** A sorted set of line indices as [start, len, start, len, …] — a changed region is a few runs,
+ *  never a list of every line. */
+function encodeRuns(set: Set<number>): number[] {
+  const s = [...set].sort((x, y) => x - y);
+  const out: number[] = [];
+  for (let i = 0; i < s.length; ) {
+    let j = i;
+    while (j + 1 < s.length && s[j + 1] === s[j] + 1) j++;
+    out.push(s[i], j - i + 1);
+    i = j + 1;
+  }
+  return out;
+}
+
+function decodeRuns(runs: number[]): Set<number> {
+  const out = new Set<number>();
+  for (let i = 0; i + 1 < runs.length; i += 2) for (let k = 0; k < runs[i + 1]; k++) out.add(runs[i] + k);
+  return out;
+}
+
+/** The persisted hop — what the content store keeps under `pairKeyOf(before, after)`, so a pair
+ *  derived by ANY earlier process (a poll, an editor host, `list`) answers the next one. `f` is the
+ *  scope detector's family for the record's file: the scope name was read with that detector, and a
+ *  pair reached through a differently-named file must not inherit it. */
+interface HopRec {
+  f: string;
+  a: number[];
+  b: number[];
+  k: number[];
+  s: string | null;
+  bs?: string;
+  be?: string;
+}
+
+/** A pure block bigger than this is not persisted — `blockText` re-reads the blob for it instead. */
+const BLOCK_KEEP_MAX = 32 * 1024;
+
+const hopMemo = new Map<string, HopShape>();
+// Runs, not maps: a hop is a few hundred bytes now, so the cap is about count, not memory.
+const HOP_MEMO_CAP = 20000;
+
+function remember(key: string, value: HopShape): HopShape {
+  if (hopMemo.size >= HOP_MEMO_CAP) hopMemo.clear();
+  hopMemo.set(key, value);
+  return value;
+}
+
+function joinLines(tok: string[], lines: Set<number>): string {
+  return [...lines].sort((x, y) => x - y).map((i) => tok[i]).join('');
+}
+
+/**
+ * One record's hop: in-process memo, then the persisted content store, then the diff itself.
+ *
+ * MEASURED 2026-09-16 on a live 8,745-record session: `oak sessions --json` took 15 s on EVERY poll
+ * while the agent worked — each new record invalidated the units cache and the recompute re-read
+ * 779 MB of blobs and re-ran scope detection over every one of them (10 of the 15 s). A blob pair's
+ * diff never changes, so a hop derived once is derived forever; a recompute pays only for the pair no
+ * process has seen — the record that just landed.
+ */
+function hopShape(session: string, file: string, beforeSha: string | null, afterSha: string | null): HopShape {
   const key = `${session}|${beforeSha ?? ''}|${afterSha ?? ''}`;
   const hit = hopMemo.get(key);
   if (hit) return hit;
+  const family = familyOf(file) ?? '';
+  const pk = pairKeyOf(beforeSha, afterSha);
+  const rec = contentGet<HopRec>(session, 'hops', pk);
+  if (rec && rec.f === family && Array.isArray(rec.a) && Array.isArray(rec.b) && Array.isArray(rec.k)) {
+    return remember(key, {
+      afterAdded: decodeRuns(rec.a),
+      beforeChanged: decodeRuns(rec.b),
+      keep: keepOf(rec.k),
+      scope: typeof rec.s === 'string' ? rec.s : null,
+      ...(typeof rec.bs === 'string' ? { blockS: rec.bs } : {}),
+      ...(typeof rec.be === 'string' ? { blockE: rec.be } : {}),
+    });
+  }
   const b = tokenizeLines(blobText(session, beforeSha));
   const a = tokenizeLines(blobText(session, afterSha));
   const afterAdded = new Set<number>();
   const beforeChanged = new Set<number>();
-  const keep = new Map<number, number>();
+  const k: number[] = [];
   let ai = 0;
   let bi = 0;
   for (const part of diffArrays(b, a)) {
     if (part.added) {
-      for (let k = 0; k < part.value.length; k++) afterAdded.add(ai + k);
+      for (let i = 0; i < part.value.length; i++) afterAdded.add(ai + i);
       beforeChanged.add(bi); // a pure insertion anchors on the before-side line it sits at
       ai += part.value.length;
     } else if (part.removed) {
-      for (let k = 0; k < part.value.length; k++) beforeChanged.add(bi + k);
+      for (let i = 0; i < part.value.length; i++) beforeChanged.add(bi + i);
       bi += part.value.length;
     } else {
-      for (let k = 0; k < part.value.length; k++) keep.set(bi + k, ai + k);
+      k.push(bi, ai, part.value.length);
       ai += part.value.length;
       bi += part.value.length;
     }
   }
-  const value = { afterAdded, beforeChanged, keep };
-  if (hopMemo.size >= HOP_MEMO_CAP) hopMemo.clear();
-  hopMemo.set(key, value);
-  return value;
+  const value: HopShape = { afterAdded, beforeChanged, keep: keepOf(k), scope: scopeNameOf(session, file, afterSha, afterAdded) };
+  // The pure-hop block, kept beside the shape while small: it is what move detection compares, and
+  // reading it later means reading the whole blob again.
+  if (afterAdded.size === 0 && beforeChanged.size > 0) {
+    const t = joinLines(b, beforeChanged);
+    if (t.length <= BLOCK_KEEP_MAX) value.blockS = t;
+  } else if (afterAdded.size > 0 && beforeChanged.size === 1) {
+    const t = joinLines(a, afterAdded);
+    if (t.length <= BLOCK_KEEP_MAX) value.blockE = t;
+  }
+  contentNote<HopRec>(session, 'hops', pk, {
+    f: family,
+    a: encodeRuns(afterAdded),
+    b: encodeRuns(beforeChanged),
+    k,
+    s: value.scope,
+    ...(value.blockS !== undefined ? { bs: value.blockS } : {}),
+    ...(value.blockE !== undefined ? { be: value.blockE } : {}),
+  });
+  return remember(key, value);
 }
 
 /**
@@ -159,9 +277,9 @@ function blockText(session: string, sha: string | null, lines: Set<number>, side
   return text;
 }
 
-function scopeNameOf(session: string, rec: EditRecord, afterAdded: Set<number>): string | null {
+function scopeNameOf(session: string, file: string, afterSha: string | null, afterAdded: Set<number>): string | null {
   if (!afterAdded.size) return null;
-  const spans = scopesForBlob(session, rec.afterBlob, rec.file);
+  const spans = scopesForBlob(session, afterSha, file);
   if (!spans.length) return null;
   let name: string | null = null;
   for (const line of afterAdded) {
@@ -205,8 +323,11 @@ function runsOf(all: EditRecord[], mine: EditRecord[], boundaries: number[]): Ed
     // collapses 200 edits into ONE unit, because interleaving spans merge transitively. It is also
     // what keeps prompt attribution honest: a unit belongs to exactly one ask, so no earlier ask can
     // report zero edits for work it caused.
-    const sameTurn = prev && windowOf(boundaries, prev.ts) === windowOf(boundaries, rec.ts);
-    if (!prev || !chained || interleaved || !sameTurn) {
+    const sameTurn = prev && windowOf(boundaries, prev.ts) === windowOf(boundaries, rec.ts) &&
+      (!prev.promptId || !rec.promptId || prev.promptId === rec.promptId);
+    const sameModel = !prev || (!prev.model || !rec.model || prev.model === rec.model) &&
+      (!prev.runtime || !rec.runtime || prev.runtime === rec.runtime);
+    if (!prev || !chained || interleaved || !sameTurn || !sameModel) {
       if (cur.length) runs.push(cur);
       cur = [rec];
       continue;
@@ -269,12 +390,13 @@ function componentsOf(session: string, run: EditRecord[]): number[][] {
     return a === b || (a.length === b.length && (b + b).includes(a));
   };
   for (const rec of run) {
-    const { afterAdded, beforeChanged, keep } = hopShape(session, rec.beforeBlob, rec.afterBlob);
+    const hop = hopShape(session, rec.file, rec.beforeBlob, rec.afterBlob);
+    const { afterAdded, beforeChanged, keep } = hop;
     for (const [id, lines] of tracked) if (intersects(lines, beforeChanged)) union(id, rec.id);
 
     if (afterAdded.size === 0 && beforeChanged.size > 0) {
       // Pure deletion. tokenizeLines keeps terminators, so the join IS the block's exact bytes.
-      const text = blockText(session, rec.beforeBlob, beforeChanged, 's');
+      const text = hop.blockS ?? blockText(session, rec.beforeBlob, beforeChanged, 's');
       if (text.trim()) {
         for (const p of pureInserts) if (sameBlock(text, p.text)) union(p.id, rec.id);
         pureDeletes.push({ text, id: rec.id });
@@ -283,15 +405,16 @@ function componentsOf(session: string, run: EditRecord[]): number[][] {
       // Pure single-block insertion, proven by shape alone: every added part contributes one anchor
       // to beforeChanged and every removed part contributes its lines, so ONE entry beside added
       // lines means one insertion point and zero removals — no second tokenize needed to know it.
-      const text = blockText(session, rec.afterBlob, afterAdded, 'e');
+      const text = hop.blockE ?? blockText(session, rec.afterBlob, afterAdded, 'e');
       if (text.trim()) {
         for (const p of pureDeletes) if (sameBlock(p.text, text)) union(p.id, rec.id);
         pureInserts.push({ text, id: rec.id });
       }
     }
 
-    // The scope this record changed, read from its OWN after-text so no coordinate mapping is needed.
-    const name = scopeNameOf(session, rec, afterAdded);
+    // The scope this record changed, read from its OWN after-text so no coordinate mapping is needed —
+    // derived once with the hop and carried in it.
+    const name = hop.scope;
     if (name) {
       for (const [id, other] of scopeOf) if (other === name) union(id, rec.id);
       scopeOf.set(rec.id, name);
@@ -550,6 +673,12 @@ function computeUnits(session: string, status: EditStatus): ReviewUnit[] {
       out.push(span.cancelled ? { file, recordIds: span.ids, cancelled: true } : { file, recordIds: span.ids });
     }
   }
+  // Persist what this pass derived NOW, not only at exit: the terminal app's warm `views --serve`
+  // child and an editor host live for hours, and every other process would otherwise pay for the
+  // same hops again until they quit. Pruned to the log's pairs, exactly like the exit flush.
+  const live = new Set<string>();
+  for (const r of log) live.add(pairKeyOf(r.beforeBlob, r.afterBlob));
+  flushContent(session, 'hops', live);
   return out;
 }
 
@@ -574,9 +703,22 @@ function unitKey(session: string, status: EditStatus): string {
   return `units:${status}:${b.length}:${b.length ? b[b.length - 1] : 0}`;
 }
 
-/** Every review unit for a session at one status. Memoized on `log.jsonl` + the ask boundaries. */
+/**
+ * Every review unit for a session at one status. Memoized on `log.jsonl` + the ask boundaries —
+ * IN PROCESS and ON DISK.
+ *
+ * The in-process half was right and useless on its own: the read commands are spawned, so a
+ * dashboard poll is a fresh process and the memo is always empty. Measured on a 978-record session,
+ * this split cost 4.5s on EVERY poll (three statuses, each a full walk), and nothing about the
+ * answer had changed. The disk half is keyed by exactly the same two inputs, so it invalidates in
+ * exactly the same places; it simply survives exit.
+ */
 export function reviewUnits(session: string, status: EditStatus = 'pending'): ReviewUnit[] {
-  return cachedByFiles(unitKey(session, status), unitStamps(session), () => computeUnits(session, status));
+  return cachedByFiles(unitKey(session, status), unitStamps(session), () =>
+    persisted(session, `units-${status}`, `${unitKey(session, status)}|${fileMark(logPath(session))}`, () =>
+      computeUnits(session, status)
+    )
+  );
 }
 
 /** repId → ascending member ids — the shape the grouping layer has always returned. */
@@ -677,7 +819,7 @@ export function unitDeps(session: string): Map<number, number[]> {
         if (prev && !chained) carried.clear();
         prev = r;
         const unit = repOf(r.id);
-        const shape = hopShape(session, r.beforeBlob, r.afterBlob);
+        const shape = hopShape(session, r.file, r.beforeBlob, r.afterBlob);
         for (const [owner, lines] of carried) {
           if (owner !== unit && intersects(lines, shape.beforeChanged)) {
             let set = deps.get(unit);

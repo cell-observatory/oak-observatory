@@ -1,0 +1,24 @@
+<p>Two verb pairs cover every review decision, distinguished by <em>how much</em> they act on. Keep and Undo act on one <a href="review-units.html">review unit</a>; Accept and Reject act on a whole scope. Everywhere, the verbs mean the same thing and act on the same numbers.</p>
+
+<h2>Keep and Undo</h2>
+<p><strong>Keep</strong> and <strong>Undo</strong> act on a review unit — one decision, however many captured records it took to make it. Keep marks it accepted. Undo reverts it on disk with a position-anchored merge that preserves the edits around it — later changes to the same file stay in place.</p>
+
+<h2>Accept, Reject, and Clear</h2>
+<p><strong>Accept</strong> and <strong>Reject</strong> act on a scope — a file, a folder, a <a href="prompts.html">prompt</a>, a <a href="tasks.html">task</a>, or the whole session — by keeping or reverting every pending edit in that scope. <strong>Clear</strong> drops a scope's resolved edits from view without touching disk.</p>
+<p>The resulting edit states are <strong>accepted</strong> and <strong>reverted</strong> on every surface; the store encodes them as <code>kept</code> and <code>undone</code>.</p>
+
+<div class="callout info">
+  <span class="ico">ℹ</span>
+  <div class="ct"><span class="ctitle">Resolving one edit moves you to the next</span>
+  <p>Keeping or reverting a single edit opens the next one still awaiting review, crossing into another file when that's where it is. Bulk operations don't move you — they have no single next edit — and a resolve that didn't happen doesn't either. It's a setting in both editors, on by default.</p></div>
+</div>
+
+<h2>Rewind and Redo</h2>
+<p><strong>Rewind</strong> reverts every unreviewed edit from one of your asks <em>onward</em> — not only the edits that ask produced. That distinction is the point: rejecting a prompt mid-session undoes a base that later edits were built on, while rewinding puts the tree back to the state it had before you asked.</p>
+<p>The <strong>Redo</strong> offered on the result restores exactly what that rewind reverted, and nothing else — an edit you had rejected before the rewind stays rejected. The command-line <code>redo --from-prompt</code> is the wider verb: it re-applies every undone edit from that ask onward, including those earlier rejections.</p>
+
+<div class="callout warn">
+  <span class="ico">⚠︎</span>
+  <div class="ct"><span class="ctitle">When a revert can't apply</span>
+  <p>If a later edit genuinely overlaps the change, the undo is refused rather than corrupting the file — see <a href="conflicts.html">Conflicts</a>.</p></div>
+</div>

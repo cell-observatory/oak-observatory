@@ -1,5 +1,7 @@
 node_modules/
 packages/*/dist/
+# Written from herdr.lock by every core build (gen:herdr-lock), so it is never source.
+packages/core/src/herdr-lock.ts
 *.vsix
 *.bak
 .DS_Store
@@ -9,7 +11,7 @@ release/
 # per-user Claude Code overrides (permissions, local env). The team-shared .claude/settings.json
 # is deliberately NOT ignored — only this one is per-contributor.
 .claude/settings.local.json
-# the demo simulator's scratch workspace, created in the CWD by `claude-observatory demo`
+# the demo simulator's scratch workspace, created in the CWD by `oak demo`
 observatory-demo/
 
 # Bun compile scratch (temp artifacts from `bun build --compile`)
@@ -23,3 +25,13 @@ observatory-demo/
 # Internal working notes (review findings, comparisons). They inform the work; they are not
 # part of what the project publishes, and a link to one from the site is a 404 waiting to happen.
 docs/internal/
+
+# Machine-local editor state and scratch: .vscode/settings.json holds a per-user
+# session pin (a REAL session id — never publishable); ._* is AppleDouble sync junk; /demo is a
+# local scratch workspace predating the branch.
+.vscode/settings.json
+._*
+/demo/
+
+# Kotlin compiler/daemon session dir (e.g. packages/jetbrains/.kotlin) — generated build state, never source.
+.kotlin/

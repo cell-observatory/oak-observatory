@@ -15,8 +15,9 @@
  * This lives in core so every surface (CLI, VS Code, JetBrains) collapses identically — the editors are
  * thin renderers over the tree/keep/undo this backs.
  */
-import { EditRecord, readLog } from './store';
+import { EditRecord, readLog, uncertainCreation } from './store';
 import { cancelledMemberIds, unitGroups, unitMembersIndex } from './units';
+import { markLive, pairKeyOf } from './derived';
 
 /** Pending review units: repId → ascending member ids (what the tree/list collapse to). */
 export function pendingGroups(session: string): Map<number, number[]> {
@@ -60,12 +61,6 @@ export function groupMembers(session: string, id: number): number[] {
   return membersIndex(session).get(id) ?? [id];
 }
 
-/** The representative (most-recent) id of the group containing `id`. */
-export function groupRep(session: string, id: number): number {
-  const members = groupMembers(session, id);
-  return members[members.length - 1];
-}
-
 /**
  * The session's edits collapsed for REVIEW (in log order): each pending same-code group becomes ONE
  * synthetic record — the most-recent edit's id/tool/status/ts/afterBlob, but the earliest member's
@@ -106,7 +101,15 @@ export function reviewEdits(session: string): EditRecord[] {
       continue;
     }
     const first = byId.get(members[0]) as EditRecord;
-    out.push({ ...repRec, beforeBlob: first.beforeBlob });
+    // A unit with ANY partial member has no true net pair — its first `beforeBlob` may be null
+    // meaning "unknown", not "created" (see EditRecord.partial). The taint rides the synthetic
+    // record so every consumer (diff, undo, badges) treats the whole unit as review-only.
+    const tainted = members.some((m) => { const r = byId.get(m); return r && (r.partial || uncertainCreation(r)); });
+    out.push({ ...repRec, beforeBlob: first.beforeBlob, beforeState: first.beforeState, ...(tainted ? { partial: true as const } : {}) });
   }
+  // The synthetic pairs minted above exist only here — tell the derived stores so a flush keeps
+  // what was computed for them instead of pruning it back to the log's pairs on every pass
+  // (2026-09-16: the deltas of ~44 collapsed units re-diffed per listing, forever).
+  markLive(session, out.map((r) => pairKeyOf(r.beforeBlob, r.afterBlob)));
   return out;
 }

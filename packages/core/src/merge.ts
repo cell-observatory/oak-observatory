@@ -49,7 +49,11 @@ export interface LineChange {
 
 /** Changes base->other in base-token coordinates, via diffArrays over newline-terminated lines. */
 export function lineChanges(base: string, other: string): LineChange[] {
-  const parts = diffArrays(tokenizeLines(base), tokenizeLines(other));
+  return tokenChanges(tokenizeLines(base), tokenizeLines(other));
+}
+
+function tokenChanges(baseTok: string[], otherTok: string[]): LineChange[] {
+  const parts = diffArrays(baseTok, otherTok);
   const out: LineChange[] = [];
   let baseIdx = 0;
   let i = 0;
@@ -83,10 +87,90 @@ export function lineChanges(base: string, other: string): LineChange[] {
  * Anchoring on base line positions (not fuzzy text search) makes it safe against duplicated content;
  * zero-context change regions avoid the spurious "nearby edits" conflicts that a patch-level merge
  * produces when two edits fall within a context window of each other.
+ *
+ * A file's final newline belongs to the file, not to its last line, and it is merged that way. Merged
+ * as part of the last line, a side that dropped it left that line unterminated, and whatever the
+ * other side added after it was glued on: a redo turned `build --release` plus an appended `deploy`
+ * into `build --releasedeploy`, and an appended blank line vanished into the missing terminator. So
+ * each text's last line is terminated before the lines are merged, and the result ends with a newline
+ * when the side that changed that says so, or else when the base did.
+ *
+ * When both sides changed it, they overlap, as two sides that change one line do. Taking it from both
+ * gave that newline two owners: an undo whose only change was the newline wrote the file unchanged and
+ * reported success, and the redo after it dropped the newline a later edit had put back.
  */
 export function threeWayMerge(base: string, ours: string, theirs: string): string | null {
-  const A = lineChanges(base, ours);
-  const B = lineChanges(base, theirs);
+  const [b, o, t] = [base, ours, theirs].map((s) => (s === '' ? undefined : s.endsWith('\n'))); // an empty text has no last line
+  if (b !== undefined && o !== undefined && t !== undefined && o !== b && t !== b) return null;
+  const eol = lineEnding(base) ?? lineEnding(ours) ?? lineEnding(theirs) ?? '\n';
+  const merged = mergeLines(terminated(base, base, eol), terminated(base, ours, eol), terminated(base, theirs, eol));
+  if (merged === null || merged === '') return merged;
+  const finalNewline = o !== undefined && o !== b ? o : t !== undefined && t !== b ? t : b;
+  if (finalNewline) return merged;
+  // The last line's own terminator comes off, whichever it is. A blank last line keeps it: without it,
+  // the line is not there at all.
+  const unterminated = merged.slice(0, merged.endsWith('\r\n') ? -2 : -1);
+  return unterminated === '' || unterminated.endsWith('\n') ? merged : unterminated;
+}
+
+/**
+ * For a caller about to run `threeWayMerge(base, ours, theirs)` on many `ours`: a test that is false
+ * when that merge must refuse. Every run of lines `theirs` takes out of `base` has to be in `ours`
+ * whole, or the two sides overlap. The diff of `base` and `theirs` is paid once and each `ours` costs
+ * a text search; an `ours` that passes may still conflict.
+ */
+export function mergeGuard(base: string, theirs: string): (ours: string) => boolean {
+  const eol = lineEnding(base);
+  if (eol === undefined) return () => true; // one line: how it is terminated depends on `ours`
+  const baseTok = tokenizeLines(terminated(base, base, eol));
+  const runs = tokenChanges(baseTok, tokenizeLines(terminated(base, theirs, eol)))
+    .filter((c) => c.del > 0)
+    .map((c) => baseTok.slice(c.start, c.start + c.del).join(''));
+  return (ours) => {
+    const lines = terminated(base, ours, eol);
+    return runs.every((run) => lines.startsWith(run) || lines.includes('\n' + run));
+  };
+}
+
+/**
+ * The terminator for an unterminated last line that base does not hold (see `terminated`): `\r\n` or `\n`
+ * as the text's last terminated line ends, the line a rewritten last line most likely replaced, or
+ * undefined for one line.
+ */
+function lineEnding(s: string): string | undefined {
+  const i = s.lastIndexOf('\n');
+  return i < 0 ? undefined : i > 0 && s[i - 1] === '\r' ? '\r\n' : '\n';
+}
+
+/**
+ * The text with its last line terminated, so every line of it is a whole line. The line takes the
+ * terminator it has where `base` holds it, nearest base's end: a side that drops the final newline, or
+ * deletes the last line and drops it, leaves a line base still terminates, and that terminator makes the
+ * two equal again. One terminator for every file made that line a change of its own in a file whose lines
+ * end differently (a shebang written with `\n` above a body in `\r\n`), merged into the result. A line
+ * base does not hold takes `eol`. One that ends in a bare `\r` takes `\r\n`: with `\n` it would read as a
+ * CRLF line, and taking that terminator off again would take the `\r` with it.
+ */
+function terminated(base: string, s: string, eol: string): string {
+  if (s === '' || s.endsWith('\n')) return s;
+  if (s.endsWith('\r')) return s + '\r\n';
+  const last = s.slice(s.lastIndexOf('\n') + 1);
+  const lf = lineAt(base, last + '\n');
+  const crlf = lineAt(base, last + '\r\n');
+  return s + (lf < 0 && crlf < 0 ? eol : crlf > lf ? '\r\n' : '\n');
+}
+
+/** Where `line`, its terminator included, starts as a whole line of `text`, nearest the end; -1 if nowhere. */
+function lineAt(text: string, line: string): number {
+  const i = text.lastIndexOf('\n' + line);
+  return i >= 0 ? i + 1 : text.startsWith(line) ? 0 : -1;
+}
+
+/** The merge itself, over texts whose every line is terminated. */
+function mergeLines(base: string, ours: string, theirs: string): string | null {
+  const baseTok = tokenizeLines(base);
+  const A = tokenChanges(baseTok, tokenizeLines(ours));
+  const B = tokenChanges(baseTok, tokenizeLines(theirs));
   for (const a of A) {
     for (const b of B) {
       const a0 = a.start,
@@ -100,7 +184,6 @@ export function threeWayMerge(base: string, ours: string, theirs: string): strin
       if (overlap || bothInsertSamePoint || insertInsideReplace) return null;
     }
   }
-  const baseTok = tokenizeLines(base);
   const all = [...A, ...B].sort((x, y) => x.start - y.start || x.del - y.del);
   const res: string[] = [];
   let i = 0;

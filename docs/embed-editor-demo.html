@@ -1,0 +1,1056 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>OAK editor demo</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Space+Grotesk:wght@600;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#fbfaf9; --surface:#ffffff; --surface-2:#f5f3f0; --surface-3:#efece8;
+    --ink:#17171a; --ink-soft:#54545b; --ink-faint:#8b8a92;
+    --line:rgba(20,18,16,.10); --line-soft:rgba(20,18,16,.06);
+    --accent:#cf6440; --accent-ink:#a94e2c; --accent-soft:rgba(207,100,64,.10);
+    --pending:#a2711a; --kept:#2f7d4b; --deleted:#c0392b; --undone:#8b8a92;
+    --ed-bg:#ffffff; --ed-panel:#f7f6f4; --ed-line:rgba(20,18,16,.07); --ed-ink:#2b2b31;
+    --ed-gutter:#b7b5bd; --ed-add:rgba(47,125,75,.10); --ed-addln:#2f7d4b;
+    --ed-del:rgba(192,57,43,.09); --ed-delln:#c0392b; --ed-key:#a94e2c; --ed-fn:#2b6cb0; --ed-str:#2f7d4b;
+    --shadow:0 30px 70px -40px rgba(40,25,15,.40), 0 8px 22px -18px rgba(40,25,15,.25);
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,Roboto,Helvetica,sans-serif;
+    --mono:ui-monospace,"SF Mono","JetBrains Mono",Menlo,Consolas,monospace;
+    --col:max(1140px, 90vw);
+  }
+  @media (prefers-color-scheme:dark){:root{
+    --bg:#0e0e11; --surface:#161619; --surface-2:#1a1a1e; --surface-3:#202024;
+    --ink:#ececef; --ink-soft:#a5a4ac; --ink-faint:#76757d;
+    --line:rgba(255,255,255,.11); --line-soft:rgba(255,255,255,.06);
+    --accent:#e08a63; --accent-ink:#ef9f7c; --accent-soft:rgba(224,138,99,.14);
+    --pending:#e0b155; --kept:#79c089; --deleted:#ec8078; --undone:#76757d;
+    --ed-bg:#1b1b1f; --ed-panel:#161619; --ed-line:rgba(255,255,255,.07); --ed-ink:#d6d6db;
+    --ed-gutter:#5b5b64; --ed-add:rgba(63,185,80,.13); --ed-addln:#79c089;
+    --ed-del:rgba(248,81,73,.13); --ed-delln:#ec8078; --ed-key:#e0a06d; --ed-fn:#6aa6f0; --ed-str:#8fc99a;
+    --shadow:0 30px 70px -40px rgba(0,0,0,.8), 0 8px 22px -18px rgba(0,0,0,.6);
+  }}
+  :root[data-theme="light"]{
+    --bg:#fbfaf9;--surface:#fff;--surface-2:#f5f3f0;--surface-3:#efece8;--ink:#17171a;--ink-soft:#54545b;--ink-faint:#8b8a92;
+    --line:rgba(20,18,16,.10);--line-soft:rgba(20,18,16,.06);--accent:#cf6440;--accent-ink:#a94e2c;--accent-soft:rgba(207,100,64,.10);
+    --pending:#a2711a;--kept:#2f7d4b;--deleted:#c0392b;--undone:#8b8a92;
+    --ed-bg:#fff;--ed-panel:#f7f6f4;--ed-line:rgba(20,18,16,.07);--ed-ink:#2b2b31;--ed-gutter:#b7b5bd;
+    --ed-add:rgba(47,125,75,.10);--ed-addln:#2f7d4b;--ed-del:rgba(192,57,43,.09);--ed-delln:#c0392b;--ed-key:#a94e2c;--ed-fn:#2b6cb0;--ed-str:#2f7d4b;
+    --shadow:0 30px 70px -40px rgba(40,25,15,.40),0 8px 22px -18px rgba(40,25,15,.25);
+  }
+  :root[data-theme="dark"]{
+    --bg:#0e0e11;--surface:#161619;--surface-2:#1a1a1e;--surface-3:#202024;--ink:#ececef;--ink-soft:#a5a4ac;--ink-faint:#76757d;
+    --line:rgba(255,255,255,.11);--line-soft:rgba(255,255,255,.06);--accent:#e08a63;--accent-ink:#ef9f7c;--accent-soft:rgba(224,138,99,.14);
+    --pending:#e0b155;--kept:#79c089;--deleted:#ec8078;--undone:#76757d;
+    --ed-bg:#1b1b1f;--ed-panel:#161619;--ed-line:rgba(255,255,255,.07);--ed-ink:#d6d6db;--ed-gutter:#5b5b64;
+    --ed-add:rgba(63,185,80,.13);--ed-addln:#79c089;--ed-del:rgba(248,81,73,.13);--ed-delln:#ec8078;--ed-key:#e0a06d;--ed-fn:#6aa6f0;--ed-str:#8fc99a;
+    --shadow:0 30px 70px -40px rgba(0,0,0,.8),0 8px 22px -18px rgba(0,0,0,.6);
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html{scroll-behavior:smooth;scroll-padding-top:80px;-webkit-text-size-adjust:100%;overflow-x:clip}
+  body{background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:1.0625rem;line-height:1.62;-webkit-font-smoothing:antialiased;overflow-x:hidden}
+  .wrap{width:min(var(--col),90%);margin-inline:auto}
+  a{color:inherit;text-decoration:none}
+  h1,h2,h3{font-weight:640;letter-spacing:-.021em;line-height:1.08;text-wrap:balance;overflow-wrap:break-word}
+  .hl{color:var(--accent)}
+  .eyebrow{font-family:var(--mono);font-size:.72rem;text-transform:uppercase;letter-spacing:.2em;color:var(--accent-ink);font-weight:600}
+  .lede{color:var(--ink-soft);font-size:clamp(1.05rem,2vw,1.28rem);line-height:1.55;text-wrap:pretty}
+  code,kbd{font-family:var(--mono);font-size:.86em}
+
+  /* nav */
+  .nav{position:sticky;top:0;z-index:60;height:56px;background:color-mix(in srgb,var(--bg) 86%,transparent);backdrop-filter:saturate(1.4) blur(12px);-webkit-backdrop-filter:saturate(1.4) blur(12px);border-bottom:1px solid var(--line-soft)}
+  .nav-in{max-width:none;height:100%;display:flex;align-items:center;gap:20px;padding:0 26px}
+  .brand{display:flex;align-items:center;gap:8px;font-family:'Space Grotesk',var(--sans);font-weight:700;color:var(--ink);font-size:17px;letter-spacing:-.01em}
+  .brand .m{filter:saturate(0);font-size:1.05rem}
+  .brand .brandver{font-family:var(--mono);font-size:10.5px;font-weight:500;color:var(--ink-faint);letter-spacing:0}
+  .nav-links{display:flex;gap:4px;margin-left:8px}
+  .nav-links a{color:var(--ink-soft);font-weight:500;font-size:14px;padding:7px 12px;border-radius:8px;transition:.15s;white-space:nowrap}
+  .nav-links a:hover{color:var(--ink);background:var(--surface-2)}
+  .nav-links a[aria-current="page"]{color:var(--ink)}
+  .nav-links a.more{color:var(--accent-ink)}
+  .nav-right{margin-left:auto;display:flex;align-items:center;gap:10px}
+  .icon-btn{background:none;border:1px solid transparent;color:var(--ink-soft);font-size:16px;cursor:pointer;width:34px;height:34px;border-radius:8px;line-height:1;transition:.15s}
+  .icon-btn:hover{background:var(--surface-2);color:var(--ink)}
+  .ghost{border:1px solid var(--line);color:var(--ink);border-radius:9px;padding:6px 12px;font-size:13.5px;font-weight:500;font-family:var(--sans);cursor:pointer;transition:.15s}
+  .ghost:hover{border-color:var(--accent)}
+  .btn{display:inline-flex;align-items:center;gap:8px;border-radius:999px;padding:11px 20px;font-weight:560;font-size:.95rem;border:1px solid transparent;cursor:pointer;transition:.15s;white-space:nowrap}
+  .btn.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+  .btn.primary:hover{background:var(--accent-ink);border-color:var(--accent-ink)}
+  .btn.line{background:transparent;color:var(--ink);border-color:var(--line)}
+  .btn.line:hover{border-color:var(--ink-faint)}
+  .menu-btn{display:none}
+  /* The nav row is one non-wrapping flex line — brand, links, then the right cluster — so anything that
+     does not fit pushes the cluster past the viewport and scrolls the WHOLE page sideways. Measured at
+     +29px on every page at 320px (brand + the three right-hand buttons) and +29/+30px at 768px on the
+     six-link pages, where the links are shown but no longer fit. The ghost GitHub button is the widest
+     item and the only redundant one: GitHub is already the last entry in .links, and below 900px the ☰
+     menu reveals those, so dropping it costs no route to anything. */
+  @media (max-width:900px){ .nav-right .ghost{display:none} }
+  /* Phones: the brand version chip is the width the ☰ + theme cluster needs to stay on-screen. Drop it
+     and tighten the padding so the whole nav row fits and the page stops scrolling sideways. */
+  @media (max-width:560px){ .nav-in{padding:0 14px;gap:12px} .brand .brandver{display:none} }
+  @media (max-width:900px){
+    .menu-btn{display:inline-flex;align-items:center;justify-content:center}
+    .nav-links{display:none}
+    .nav.open .nav-links{display:flex;flex-direction:column;align-items:flex-start;position:absolute;top:56px;left:0;right:0;margin:0;padding:14px 5% 18px;gap:14px;background:var(--bg);border-bottom:1px solid var(--line);box-shadow:var(--shadow)}
+    .nav.open,.nav.open.condensed{background:var(--bg)}
+    .lede{max-width:100%}
+    .editor{overflow-x:auto}
+  }
+
+  section{padding-block:clamp(96px,14vh,190px)}
+  .center{text-align:center;margin-inline:auto}
+  .center .lede{margin-inline:auto;}
+  h2{font-size:clamp(2rem,5vw,3.4rem)}
+
+  /* hero */
+  .hero{padding-top:clamp(40px,7vw,84px);padding-bottom:clamp(60px,9vh,120px)}
+  .hero h1{font-size:clamp(2.6rem,7vw,5.2rem);margin:18px 0}
+  .hero .cta{display:flex;gap:12px;flex-wrap:wrap;margin-top:28px}
+  .hero .meta{margin-top:22px;font-family:var(--mono);font-size:.78rem;color:var(--ink-faint)}
+  .hero .verbs{margin-top:14px;font-family:var(--mono);font-weight:600;font-size:clamp(1rem,2.1vw,1.25rem);letter-spacing:.05em;color:var(--accent-ink)}
+  .hero .tagline{margin-top:7px;font-family:var(--mono);font-weight:600;font-size:clamp(1rem,2.1vw,1.25rem);letter-spacing:.02em;color:var(--accent-ink)}
+  @media (max-width:900px){.hero .lede{}}
+
+  /* editor mock (shared) */
+  .editor{background:var(--ed-bg);border:1px solid var(--line);border-radius:16px;box-shadow:var(--shadow);overflow:hidden;font-family:var(--mono);color:var(--ed-ink)}
+  .editor .bar{display:flex;align-items:center;gap:7px;height:38px;padding:0 14px;background:var(--ed-panel);border-bottom:1px solid var(--ed-line)}
+  .editor .bar .d{width:11px;height:11px;border-radius:50%}
+  .editor .bar .fn{margin-left:12px;font-size:.8rem;color:var(--ink-faint)}
+  .editor .code{padding:12px 0 6px}
+  .ln{display:flex;font-size:.82rem;line-height:1.85}
+  .ln .n{width:44px;text-align:right;padding-right:16px;color:var(--ed-gutter);flex:none;user-select:none}
+  .ln .t{white-space:pre}
+  .ln.add{background:var(--ed-add);box-shadow:inset 3px 0 0 var(--accent)}
+  .ln .star{color:var(--accent);margin-left:-13px;margin-right:5px}
+  .kw{color:var(--ed-key)}.fnm{color:var(--ed-fn)}.st{color:var(--ed-str)}
+  .lens{display:flex;gap:16px;flex-wrap:wrap;padding:6px 0 8px 44px;font-family:var(--sans);font-size:.78rem;color:var(--ink-faint)}
+  .lens .a{color:var(--ink-soft)}.lens .sp{color:var(--accent)}
+  .bubble{margin:2px 16px 16px 44px;border:1px solid var(--ed-line);border-radius:11px;overflow:hidden;background:var(--ed-panel)}
+  .bubble .bh{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:9px 14px;border-bottom:1px solid var(--ed-line);font-family:var(--sans);font-size:.8rem}
+  .bubble .bh .id{color:var(--accent);font-family:var(--mono)}
+  .bubble .bh .why{color:var(--ink-faint);font-style:italic}
+  .bubble .bh .tools{margin-left:auto;display:flex;gap:14px;color:var(--ink-soft)}
+  .bubble .diff{font-size:.8rem;line-height:1.75;padding:8px 0}
+  .bubble .diff .dl{display:block;padding:0 14px;white-space:pre}
+  .bubble .diff .ad{background:var(--ed-add);color:var(--ed-addln)}
+  .bubble .diff .c{color:var(--ink-faint)}
+  .bubble .diff .h{color:var(--ed-fn)}
+  @media (max-width:520px){.bubble .bh .tools{width:100%;margin-left:0}}
+  /* moments */
+  .moment{text-align:center}
+  .moment .lede{margin:16px auto 0;}
+  .panel{background:var(--surface);border:1px solid var(--line);border-radius:16px;box-shadow:var(--shadow);overflow:hidden;margin-top:clamp(36px,5vw,60px)}
+  .panel .scroll{overflow-x:auto}
+  .panel img{display:block;width:100%;height:auto}
+  .panel figcaption.cap{font-family:var(--mono);font-size:.68rem;color:var(--ink-faint);padding:8px 12px;text-align:center;border-top:1px solid var(--line-soft)}
+  /* install */
+  .cmd{display:flex;align-items:center;gap:12px;background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:13px 12px 13px 16px;font-family:var(--mono);font-size:.9rem;overflow-x:auto;margin:26px auto 0}
+  .cmd .pr{color:var(--accent);flex:none}
+  .cmd code{white-space:nowrap;color:var(--ink);min-width:0;overflow-x:auto}
+  .cmd .copy{margin-left:auto;flex:none;border:1px solid var(--line);background:var(--surface-2);color:var(--ink-soft);border-radius:7px;padding:5px 11px;font-family:var(--mono);font-size:.74rem;cursor:pointer;transition:.15s}
+  .cmd .copy:hover{color:var(--ink);border-color:var(--ink-faint)}
+  .install-cta{display:flex;gap:12px;flex-wrap:wrap;justify-content:center;margin-top:26px}
+  .stay-current{margin:34px auto 0;font-size:.86rem;color:var(--ink-faint)}
+  .stay-current code{font-family:var(--mono);font-size:.82em;color:var(--ink-soft);background:var(--surface);border:1px solid var(--line);border-radius:6px;padding:1px 6px}
+  .or-claude{margin:40px auto 0}
+  .or-claude .or{font-family:var(--mono);font-size:.7rem;text-transform:uppercase;letter-spacing:.18em;color:var(--ink-faint);margin-bottom:14px}
+  .promptbox{position:relative;background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:20px 20px 18px;text-align:left}
+  .promptbox p{font-size:.84rem;color:var(--ink-faint);margin:0 0 12px}
+  .promptbox .prompt{display:block;font-family:var(--mono);font-size:.8rem;line-height:1.6;color:var(--ink-soft);white-space:pre-wrap;word-break:break-word}
+  .promptbox .copy{position:absolute;top:14px;right:14px;border:1px solid var(--line);background:var(--surface-2);color:var(--ink-soft);border-radius:7px;padding:5px 11px;font-family:var(--mono);font-size:.72rem;cursor:pointer;transition:.15s}
+  .promptbox .copy:hover{color:var(--ink);border-color:var(--ink-faint)}
+
+  /* footer */
+  .foot{padding:56px 0 68px;border-top:1px solid var(--line-soft);color:var(--ink-faint)}
+  .foot .row{display:flex;flex-wrap:wrap;gap:20px 30px;align-items:center;justify-content:space-between}
+  .foot .flinks{display:flex;flex-wrap:wrap;gap:20px;font-size:.92rem}
+  .foot .flinks a{color:var(--ink-soft)} .foot .flinks a:hover{color:var(--ink)}
+  .foot .brand{font-family:'Space Grotesk',var(--sans);font-weight:700}
+  .foot .fine{font-family:var(--mono);font-size:.74rem;margin-top:16px}
+
+  /* gutter index (wide screens only) */
+  .gutter{position:fixed;left:max(20px,calc((100vw - var(--col))/2 - 52px));top:50%;transform:translateY(-50%);z-index:40;display:none;flex-direction:column;gap:15px}
+  .gutter a{font-family:var(--mono);font-size:.72rem;color:var(--ink-faint);letter-spacing:.05em;transition:color .2s;display:flex;align-items:center;gap:8px}
+  .gutter a::before{content:"";width:14px;height:1px;background:var(--line);transition:width .2s,background .2s}
+  .gutter a.is-active{color:var(--accent-ink)} .gutter a.is-active::before{width:26px;background:var(--accent)}
+  @media (min-width:1340px){.gutter{display:flex}}
+
+  /* motion */
+  .rv{opacity:0;transform:translateY(20px);transition:opacity .6s cubic-bezier(.22,.61,.36,1),transform .6s cubic-bezier(.22,.61,.36,1)}
+  .rv.in{opacity:1;transform:none}
+  /* ---- feature grid (bento: every surface at a glance) ---- */
+  .fgrid{display:grid;grid-template-columns:repeat(6,1fr);gap:clamp(12px,1.4vw,18px);margin-top:clamp(28px,4vw,44px);text-align:left}
+  .fcard{text-decoration:none;color:inherit;grid-column:span 2;display:flex;flex-direction:column;background:var(--surface);border:1px solid var(--line);border-radius:16px;box-shadow:var(--shadow);overflow:hidden;transition:border-color .18s ease,transform .18s ease}
+  .fcard:hover{border-color:var(--accent);transform:translateY(-2px)}
+  .fcard-shot{background:var(--surface-2);border-bottom:1px solid var(--line-soft);overflow:hidden}
+  .fcard:not(.full) .fcard-shot{aspect-ratio:16/10}
+  .fcard-shot img{display:block;width:100%;height:auto}
+  .fcard:not(.full) .fcard-shot img{height:100%;object-fit:cover;object-position:top left}
+  .fcard-shot .mock{border:0;height:100%}
+  .fcard-text{padding:15px 17px 17px}
+  .fcard-text .fname{display:block;font-family:var(--mono);font-size:.7rem;letter-spacing:.09em;text-transform:uppercase;color:var(--accent-ink);margin-bottom:6px}
+  .fcard-text h3{font-size:1.12rem;margin:.1em 0 .35em}
+  .fcard-text p{color:var(--ink-soft);font-size:.9rem;line-height:1.5;margin:0}
+  .fcard-text p code{font-family:var(--mono);font-size:.85em;color:var(--ink)}
+  .fcard.full{grid-column:span 6;flex-direction:row;align-items:stretch}
+  .fcard.full .fcard-shot{flex:1 1 56%;border-bottom:0;border-right:1px solid var(--line-soft);display:flex;align-items:center;justify-content:center}
+  .fcard.full .fcard-text{flex:1 1 44%;display:flex;flex-direction:column;justify-content:center;padding:clamp(22px,3vw,40px)}
+  .fcard.full .fcard-text .eyebrow{margin-bottom:8px}
+  .fcard.full .fcard-text h3{font-size:clamp(1.3rem,2.1vw,1.65rem);margin:0 0 .35em}
+  .fcard.full .fcard-text p{font-size:.98rem;line-height:1.55}
+  .fcard.full.reverse{flex-direction:row-reverse}
+  .fcard.full.reverse .fcard-shot{border-right:0;border-left:1px solid var(--line-soft)}
+  @media(max-width:900px){
+    .fgrid{grid-template-columns:repeat(2,1fr)}
+    .fcard{grid-column:span 1}
+    .fcard.full,.fcard.full.reverse{grid-column:span 2;flex-direction:column}
+    .fcard.full .fcard-shot,.fcard.full.reverse .fcard-shot{border-right:0;border-left:0;border-bottom:1px solid var(--line-soft)}
+  }
+  @media(max-width:560px){ .fgrid{grid-template-columns:1fr} .fcard,.fcard.full,.fcard.full.reverse{grid-column:span 1} }
+
+  /* shared player controls (used by the guided demo + the terminal demo) */
+  .tbtn{width:36px;height:36px;border-radius:999px;border:1px solid var(--line);background:var(--surface);color:var(--ink-soft);cursor:pointer;font-size:16px;line-height:1;display:grid;place-items:center;transition:border-color .15s,color .15s}
+  .tbtn:hover{border-color:var(--accent);color:var(--accent-ink)}
+  .tbtn:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  .dots{display:flex;gap:7px;flex-wrap:wrap;justify-content:center;max-width:min(420px,60vw)}
+  .dot{width:8px;height:8px;border-radius:999px;border:0;padding:0;background:var(--line);cursor:pointer;transition:background .2s,transform .2s}
+  .dot[aria-current="true"]{background:var(--accent);transform:scale(1.4)}
+  .dot:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
+  .tcount{font-family:var(--mono);font-size:.74rem;color:var(--ink-faint);letter-spacing:.1em;min-width:64px;text-align:center;font-variant-numeric:tabular-nums}
+
+  /* interactive terminal demo */
+  .tuid{margin-top:clamp(22px,3vw,38px)}
+  .tuid-term{background:#0d0d0f;border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow);overflow-x:auto;text-align:center}
+  /* JetBrains Mono FIRST: its box-drawing glyphs join edge-to-edge, so the frame's ─ rules render as
+     solid lines like the real terminal (a generic monospace draws ─ with side gaps → a dashed look).
+     line-height:1 for the same reason on the vertical axis: any taller line box opens a gap between
+     rows and breaks every │ pane border into dashes — a terminal's cell height IS its line height. */
+  .tuid-term pre{margin:0;padding:14px 16px;font-family:"JetBrains Mono",var(--mono);font-size:clamp(7.5px,1.28vw,12px);line-height:1;color:#cccccc;white-space:pre;letter-spacing:0;min-width:max-content;display:inline-block;text-align:left}
+  .tuid-cap{font-family:var(--mono);font-size:.76rem;color:var(--ink-faint);margin-top:14px;text-align:center;min-height:1.3em;padding:0 12px}
+  .tuid-cap b{color:var(--accent-ink);font-weight:600}
+  .tuid-ui{display:flex;align-items:center;justify-content:center;gap:14px;margin-top:12px;flex-wrap:wrap}
+
+  /* docs-style navbar search (⌘K) */
+  .nav .brand{font-family:'Space Grotesk',var(--sans);letter-spacing:-.01em}
+  .kbtn{display:inline-flex;align-items:center;gap:8px;background:var(--surface);border:1px solid var(--line);color:var(--ink-faint);border-radius:9px;padding:6px 9px;font-family:var(--sans);font-size:13px;cursor:pointer;transition:border-color .15s}
+  .kbtn:hover{border-color:var(--accent);color:var(--ink)}
+  .kbtn .kmag{font-size:14px}.kbtn .klabel{margin-right:10px}
+  .nav kbd,.kmodal kbd{font-family:var(--mono);font-size:10.5px;background:var(--surface-2);border:1px solid var(--line);border-radius:5px;padding:1px 5px;color:var(--ink-soft)}
+  @media(max-width:760px){.kbtn .klabel,.kbtn kbd{display:none}}
+  .kmodal{position:fixed;inset:0;z-index:60;display:flex;align-items:flex-start;justify-content:center;padding-top:12vh}
+  .kmodal[hidden]{display:none}
+  .kback{position:absolute;inset:0;background:rgba(0,0,0,.5);backdrop-filter:blur(3px)}
+  .kbox{position:relative;width:min(560px,92vw);background:var(--surface);border:1px solid var(--line);border-radius:14px;box-shadow:0 24px 70px rgba(0,0,0,.4);overflow:hidden}
+  #kinput{width:100%;border:0;border-bottom:1px solid var(--line-soft);background:none;color:var(--ink);font:500 16px var(--sans);padding:16px 18px;outline:none}
+  #kresults{list-style:none;margin:0;padding:8px;max-height:52vh;overflow-y:auto}
+  #kresults li{padding:9px 12px;border-radius:9px;cursor:pointer}
+  #kresults li .r-t{font-family:'Space Grotesk',var(--sans);font-weight:600;color:var(--ink);font-size:14px}
+  #kresults li .r-g{font-size:11.5px;color:var(--accent-ink);margin-left:8px}
+  #kresults li .r-d{font-size:12.5px;color:var(--ink-soft);margin-top:2px}
+  #kresults li.sel,#kresults li:hover{background:var(--accent-soft)}
+  .khint{border-top:1px solid var(--line-soft);padding:9px 14px;font-size:11.5px;color:var(--ink-faint);display:flex;gap:6px;align-items:center}
+  .mock{padding:clamp(16px,2.4vw,22px);font-family:var(--mono);font-size:.78rem;line-height:1.85;color:var(--ink-soft);background:var(--surface-2);overflow-x:auto}
+  .mock .mh{font-size:.63rem;letter-spacing:.12em;text-transform:uppercase;color:var(--ink-faint);margin-bottom:10px}
+  .mock b{color:var(--ink);font-weight:600}
+  .mock .a{color:var(--accent-ink)}
+  .mock .k{color:var(--kept)}
+  .mock .p{color:var(--pending)}
+  .mock .r{color:var(--deleted)}
+  .mock .d{color:var(--ink-faint)}
+  @media(prefers-reduced-motion:reduce){.slides{transition:none}}
+  .rv.scale{transform:translateY(22px) scale(.97);transition-duration:.75s}
+  .rv.scale.in{transform:none}
+  .hero-v{opacity:0;transform:translateY(40px) scale(.96);transition:opacity .9s cubic-bezier(.16,1,.3,1),transform .9s cubic-bezier(.16,1,.3,1);transition-delay:.12s}
+  .hero-v.in{opacity:1;transform:none}
+  .stagger>*{opacity:0;transform:translateY(16px);transition:opacity .6s ease,transform .6s ease;transition-delay:calc(var(--i,0)*80ms)}
+  .stagger.in>*{opacity:1;transform:none}
+  @media (prefers-reduced-motion:reduce){
+    html{scroll-behavior:auto}
+    .rv,.rv.scale,.hero-v,.stagger>*{opacity:1;transform:none;transition:opacity .2s ease}
+  }
+  /* ---- hero lead + shared control states ---- */
+  [hidden]{display:none!important}
+  .hero-lead{text-align:center;margin-inline:auto;position:relative}
+  .hero-lead .lede{margin-inline:auto;}
+  .hero-lead .cta{justify-content:center}
+  .tbtn.playing{color:var(--accent-ink);border-color:var(--accent)}
+  .tbtn:disabled{opacity:.35;cursor:default}
+  .tbtn:disabled:hover{border-color:var(--line);color:var(--ink-soft)}
+  /* Manifesto sections folded into the page — left-aligned essay prose, tighter than the .moment showcases */
+  .essay{padding-block:clamp(72px,11vh,140px);text-align:center}
+  .essay .eyebrow{display:block;margin-bottom:10px}
+  .essay h2{letter-spacing:-.02em;line-height:1.12;margin-bottom:16px}
+  #credits h2{font-size:clamp(1.3rem,2.5vw,1.7rem)}
+  #credits{padding-block:clamp(40px,6vh,72px)}
+  .essay p{color:var(--ink-soft);line-height:1.6;margin:0 auto 14px}
+  .essay p:last-child{margin-bottom:0}
+  .essay ul{list-style:none;margin:8px auto 0;padding:0;text-align:left}
+  .essay li{color:var(--ink-soft);line-height:1.55;margin-bottom:12px;padding-left:24px;position:relative}
+  .essay li::before{content:"—" / "";position:absolute;left:0;color:var(--accent-ink)}
+  .essay li b{color:var(--ink);font-weight:640}
+
+  /* Big screens: the column already grows via --col (66vw capped at 1560px); type follows in two
+     gentle steps so a 27–32" display gets a page, not a ribbon. px-sized chrome stays fixed — only
+     the reading measure and rem-based text scale. */
+  /* FLUID scaling, no steps: the root font tracks viewport width continuously (floor = today's 16px,
+     so anything ≤ ~1490px is pixel-identical to before; cap 24px ≈ a 32" display), and every rem-sized
+     rule — which is nearly all of this site's type, clamp() caps included — follows it. Root, not
+     body: rem resolves against html, which is why the first body-only attempt visibly moved nothing.
+     The column spans most of the width (86vw, floored at the old 1140px), and because type and column
+     scale together, characters-per-line stays roughly constant at every size. */
+  html{font-size:clamp(16px, 9px + 0.47vw, 24px)}
+  /* ---- interactive demo (moved from the demo page): the editor-mock palette + frame ---- */
+  .hero h2{font-size:clamp(2rem,5vw,3.3rem);margin:16px auto 14px}
+  /* max-width in vw (viewport-absolute), not %, so the demos' max-content children can't inflate the
+     body and then feed that back through a %-relative width — the loop that scrolled the page sideways. */
+  .wrap.wide{width:min(1420px,96%);max-width:96vw}
+  /* the IDE frame: sidebar + editor on top, the dashboards dock below — the real VS Code layout */
+  .ide{border:1px solid var(--line);border-radius:16px;box-shadow:var(--shadow);overflow:hidden;background:var(--ed-bg);margin-top:22px}
+  .ide-top{display:grid;grid-template-columns:1fr 2fr 2fr;min-width:0}
+  /* Grid items default to min-width:auto and won't shrink below their content, so a long code line
+     (min-width:max-content) inflates the track and scrolls the whole PAGE sideways on mobile. min-width:0
+     lets each column shrink so the editor's own overflow-x:auto scrolls the line instead. */
+  .ide-top>*{min-width:0}
+  @media (max-width:900px){.ide-top{grid-template-columns:1fr}.ide-top .side{display:none}}
+  .side{background:var(--ed-panel);font-family:var(--mono);font-size:.72rem;min-width:0;display:flex;flex-direction:column}
+  .side.traces{border-right:1px solid var(--ed-line)}
+  .side.agent{border-left:1px solid var(--ed-line)}
+  .side-h{padding:9px 12px;font-size:.6rem;letter-spacing:.12em;text-transform:uppercase;color:var(--ink-faint);border-bottom:1px solid var(--ed-line)}
+  .side .empty{padding:9px 12px;color:var(--ink-faint)}
+  .ln.undone{opacity:.38;background:transparent;box-shadow:none}
+  .ln.undone .t{text-decoration:line-through}
+  .cm{color:var(--ink-faint)}
+  .lens button{border:1px solid var(--line);background:var(--surface);color:var(--ink);border-radius:999px;padding:3px 12px;font-size:.78rem;font-family:var(--sans);cursor:pointer;transition:.15s}
+  .lens button:hover{border-color:var(--accent);color:var(--accent-ink)}
+  .lens button.hint{animation:pulse 1.6s ease-in-out infinite;border-color:var(--accent)}
+  @keyframes pulse{0%,100%{box-shadow:0 0 0 0 var(--accent-soft)}50%{box-shadow:0 0 0 7px var(--accent-soft)}}
+  .edchip{margin-left:auto;display:inline-flex;align-items:center;gap:5px;font-family:var(--sans);font-size:.72rem;padding:2px 9px;border-radius:999px;border:1px solid currentColor;white-space:nowrap}
+  .edchip.pending{color:var(--pending)}
+  .edchip.kept{color:var(--kept)}
+  .edchip.undone{color:var(--undone)}
+  .prompt-strip{display:flex;gap:10px;align-items:baseline;padding:9px 14px;background:var(--ed-panel);border-bottom:1px solid var(--ed-line);font-size:.78rem;font-family:var(--mono)}
+  .prompt-strip .pr{color:var(--accent);flex:none}
+  .prompt-strip .pt{color:var(--ink-soft);white-space:pre-wrap;word-break:break-word}
+  .prompt-strip .caret{display:inline-block;width:7px;height:1em;background:var(--accent);vertical-align:text-bottom;animation:blink 1s steps(1) infinite}
+  @keyframes blink{50%{opacity:0}}
+  /* dashboards dock */
+  .dockhead{display:flex;gap:14px;align-items:center;padding:6px 14px;background:var(--ed-panel);border-top:1px solid var(--ed-line);border-bottom:1px solid var(--ed-line);font-family:var(--mono);font-size:.6rem;letter-spacing:.14em;text-transform:uppercase;color:var(--ink-faint)}
+  .dock{display:grid;grid-template-columns:4fr 1fr;background:var(--line-soft);gap:1px}
+  @media (max-width:900px){.dock{grid-template-columns:1fr}}
+  /* Panes size to their content — the whole dock is visible with NO inner scrollbars. */
+  .pane{background:var(--surface);padding:0;min-height:0;font-size:.76rem;display:flex;flex-direction:column}
+  .pane .ph{background:var(--surface);display:flex;align-items:center;justify-content:space-between;gap:8px;padding:7px 12px;border-bottom:1px solid var(--line-soft);font-family:var(--mono);font-size:.62rem;letter-spacing:.12em;text-transform:uppercase;color:var(--ink-faint)}
+  .pane .ph .act{letter-spacing:0;text-transform:none}
+  .pane .body{flex:1;display:flex;flex-direction:column}
+  /* observations pane */
+  .or{padding:5px 12px;border-bottom:1px solid var(--line-soft)}
+  .or .top{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap}
+  .or .tm{font-family:var(--mono);color:var(--ink-faint);flex:none}
+  .or .of{font-family:var(--mono);color:var(--ink)}
+  .or .od{font-family:var(--mono);color:var(--ink-faint)}
+  .or .od .p{color:var(--kept)}
+  .or .od .m{color:var(--deleted)}
+  .or .ow{color:var(--ink-faint);font-style:italic}
+  .badge{font-size:.64rem;font-family:var(--mono);border:1px solid var(--line);border-radius:999px;padding:0 7px;color:var(--accent-ink)}
+  .empty{padding:9px 12px;color:var(--ink-faint)}
+  /* overview pane: toolbar strip + master-detail */
+  .ovbar{display:flex;flex-direction:column;gap:4px;padding:5px 12px;border-bottom:1px solid var(--line-soft);font-family:var(--mono);font-size:.66rem;color:var(--ink-faint)}
+  .ovbar .row{display:flex;gap:9px;align-items:center;flex-wrap:wrap}
+  .ovbar .row.split{justify-content:space-between}
+  .ovbar .g{display:flex;gap:7px;align-items:center;white-space:nowrap}
+  .ovbar .sep{width:1px;height:12px;background:var(--line)}
+  .ovbar .on{color:var(--ink-soft)}
+  /* semantic tints, matching the editors' color-coded nav bars: keep/accept green, undo/reject red, nav chevrons blue */
+  .ovbar .tk{color:var(--kept)}
+  .ovbar .tu{color:var(--deleted)}
+  .ovbar .nvb{color:#4c8bf5}
+  .ovbar .ts{color:#9a6ac2}
+  .ovbar button{border:1px solid var(--accent);background:var(--surface);color:var(--ink);border-radius:999px;padding:1px 10px;font-family:var(--sans);font-size:.72rem;cursor:pointer}
+  .ovbar button.hint{animation:pulse 1.6s ease-in-out infinite}
+  .ovwrap{display:grid;grid-template-columns:1fr 1fr;flex:1}
+  @media (max-width:640px){.ovwrap{grid-template-columns:1fr}.ovnav{display:none}}
+  .ovnav{border-right:1px solid var(--line-soft);display:flex;flex-direction:column;min-width:0}
+  /* five tabs do not fit side by side in a narrow nav column, so the row wraps rather than clipping one */
+  .ovtabs{display:flex;flex-wrap:wrap;gap:2px;padding:6px 8px;border-bottom:1px solid var(--line-soft);font-size:.68rem}
+  .ovtabs span{padding:2px 6px;border-radius:6px;color:var(--ink-faint);white-space:nowrap}
+  .ovtabs .on{background:var(--accent-soft);color:var(--accent-ink)}
+  .fr{display:flex;gap:6px;align-items:baseline;padding:4px 8px;font-family:var(--mono);font-size:.64rem;color:var(--ink-soft);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .fr .gl{flex:none;color:var(--accent)}
+  .fr .st2{flex:none}
+  .fr .st2.working{color:var(--kept)}
+  .fr .st2.done{color:var(--ink-faint)}
+  .fr.hi{animation:frhi 2.6s ease-out}
+  @keyframes frhi{0%,55%{background:var(--accent-soft)}100%{background:transparent}}
+  .fr.sub{padding-left:20px}
+  .collide{margin-top:auto;padding:5px 8px;font-size:.6rem;color:var(--ink-faint);border-top:1px solid var(--line-soft)}
+  .ovdetail{min-width:0;display:flex;flex-direction:column}
+  .strip{display:flex;height:15px;border-radius:5px;overflow:hidden;margin:9px 12px 2px;border:1px solid var(--line-soft)}
+  .strip .seg{display:grid;place-items:center;font-family:var(--mono);font-size:.56rem;color:var(--ink-soft);background:var(--accent-soft);white-space:nowrap;overflow:hidden}
+  .strip .seg:nth-child(2n){background:var(--surface-3)}
+  .lr{display:flex;gap:8px;align-items:center;padding:3px 12px}
+  .lr .sd{flex:none;width:8px;height:8px;border-radius:50%}
+  .lr .sd.pending{background:var(--pending)}
+  .lr .sd.kept{background:var(--kept)}
+  .lr .sd.undone{background:var(--undone)}
+  .lr .la{font-family:var(--mono);font-size:.62rem;color:var(--ink-faint);flex:none;width:52px;text-align:right;white-space:nowrap}
+  .lr .lf{font-family:var(--mono);color:var(--ink);flex:1 1 auto;min-width:0;overflow-wrap:anywhere}
+  .lr .lc{flex:none;font-family:var(--mono);font-size:.66rem;color:var(--ink-faint)}
+  .lr .lc .p{color:var(--kept)}
+  .lr .lc .m{color:var(--deleted)}
+  .lr .lo{flex:none;color:var(--accent-ink);font-size:.7rem}
+  .readout{padding:6px 12px;font-family:var(--mono);font-size:.64rem;color:var(--ink-faint);border-top:1px solid var(--line-soft);margin-top:auto}
+  /* stats pane */
+  .stnav{display:flex;gap:8px;align-items:baseline;padding:6px 12px;border-bottom:1px solid var(--line-soft);font-family:var(--mono);font-size:.68rem;color:var(--ink-soft)}
+  .tiles{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--line-soft)}
+  .tile{background:var(--surface);padding:8px 6px;text-align:center}
+  .tile .tv{font-family:var(--mono);font-size:1.15rem;font-weight:600}
+  .tile .tl{font-family:var(--mono);font-size:.56rem;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-faint);margin-top:2px}
+  .tile.pending .tv{color:var(--pending)}
+  .tile.kept .tv{color:var(--kept)}
+  .tile.undone .tv{color:var(--undone)}
+  .progress{height:5px;background:var(--surface-3)}
+  .progress i{display:block;height:100%;width:0;background:var(--kept);transition:width .4s ease}
+  .prognote{padding:5px 12px;font-family:var(--mono);font-size:.64rem;color:var(--ink-faint)}
+  .stblock{padding:6px 12px;border-top:1px solid var(--line-soft)}
+  .stblock .sh{font-family:var(--mono);font-size:.58rem;letter-spacing:.12em;text-transform:uppercase;color:var(--ink-faint);margin-bottom:4px}
+  .spark{width:100%;height:34px;display:block}
+  .spark polyline{fill:none;stroke:var(--accent);stroke-width:1.5}
+  .ubar{display:flex;gap:8px;align-items:center;font-family:var(--mono);font-size:.62rem;color:var(--ink-faint);padding:2px 0}
+  .ubar .ul{width:24px;flex:none}
+  .ubar .ub{flex:1;height:6px;border-radius:4px;background:var(--surface-3);overflow:hidden}
+  .ubar .ub i{display:block;height:100%;background:var(--kept)}
+  .ranges{display:flex;gap:6px;padding:7px 12px;border-top:1px solid var(--line-soft)}
+  .ranges .seg2{font-family:var(--mono);font-size:.62rem;border:1px solid var(--line);border-radius:999px;padding:1px 9px;color:var(--ink-faint)}
+  .ranges .seg2.on{border-color:var(--accent);color:var(--accent-ink)}
+  /* controls */
+  .demo-ui{margin-top:8px}
+  .narr{min-height:3.4em;font-size:1.02rem;color:var(--ink-soft);text-wrap:pretty}
+  .narr .hl{color:var(--accent-ink);font-weight:560}
+  .hintline{font-size:.85rem;color:var(--accent-ink);min-height:1.6em;margin-top:4px}
+  .ctrl{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-top:12px}
+  .cmd-note{font-family:var(--mono);font-size:.72rem;color:var(--ink-faint);margin-top:10px}
+  @media (prefers-reduced-motion:reduce){
+    html{scroll-behavior:auto}
+    .fr.hi{animation:none;background:var(--accent-soft)}
+    .lens button.hint,.ovbar button.hint{animation:none;border-color:var(--accent)}
+    .prompt-strip .caret{animation:none}
+    .progress i{transition:none}
+  }
+  /* scoped: showcase's tour/install CSS owns .editor/.ln/.lens with other meanings */
+  .ide .editor{font-family:var(--mono);color:var(--ed-ink);min-width:0}
+  .ide .editor .code{padding:12px 0 10px;min-height:120px;overflow-x:auto}
+  .ide .ln{display:flex;font-size:.82rem;line-height:1.85;min-width:max-content}
+  .ide .lens{display:flex;gap:14px;flex-wrap:wrap;align-items:center;padding:6px 12px 8px 44px;font-family:var(--sans);font-size:.78rem;color:var(--ink-faint)}
+  /* the Observatory Traces tree rows (left sidebar) */
+  .sr{display:flex;gap:7px;align-items:center;padding:2px 12px;color:var(--ink-soft);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .sr .sd{flex:none;width:8px;height:8px;border-radius:50%}
+  .sr .sd.pending{background:var(--pending)}
+  .sr .sd.kept{background:var(--kept)}
+  .sr .sd.undone{background:var(--undone)}
+  .sr .sn{overflow:hidden;text-overflow:ellipsis}
+  .sr .sc{margin-left:auto;flex:none;font-size:.64rem;color:var(--ink-faint)}
+  .sr .sc .p{color:var(--kept)}
+  .sr .sc .m{color:var(--deleted)}
+  .sr.fold{color:var(--ink-faint);padding-top:7px}
+  .sr.on{background:var(--accent-soft);color:var(--ink)}
+  /* the right sidebar: the agent session on top, the Observatory Timeline below */
+  .side-h{display:flex;align-items:baseline;justify-content:space-between;gap:8px}
+  .side-h .tabs{font-size:.58rem;letter-spacing:.02em;text-transform:none;color:var(--ed-gutter)}
+  .side-h .tabs b{color:var(--ink);font-weight:600}
+  .chat{border-bottom:1px solid var(--ed-line)}
+  .chat .prompt-strip{border-bottom:0}
+  .chat-r{padding:2px 14px 10px;font-family:var(--sans);font-size:.74rem;line-height:1.55;color:var(--ink-soft)}
+  .chat-r:empty{display:none}
+  .chat-r b{color:var(--ink)}
+  .tl{flex:1;min-height:0;max-height:420px;overflow-y:auto;display:flex;flex-direction:column}
+  .tl .or .top{flex-wrap:wrap;row-gap:1px}
+  .tl .sd{flex:none;width:7px;height:7px;border-radius:999px;display:inline-block;align-self:center}
+  .tl .sd.pending{background:var(--pending)}
+  .tl .sd.kept{background:var(--kept)}
+  .tl .sd.undone{background:var(--undone)}
+  /* the Feed tab: live while the session is still writing, an audit log once it has stopped */
+  .tl .fh{position:sticky;top:0;z-index:1;background:var(--ed-panel);display:flex;flex-wrap:wrap;gap:6px;align-items:baseline;padding:6px 12px;border-bottom:1px solid var(--line-soft);font-family:var(--mono);font-size:.62rem;color:var(--ink-faint)}
+  .tl .fh b{color:var(--ink);font-weight:600}
+  .tl .fh .live{color:var(--kept)}
+  .tl .or.band{background:var(--surface-3)}
+  .tl .or .of{overflow-wrap:anywhere}
+</style>
+<style>
+  /* embed overrides: fill the iframe, blend into the host docs page, kill homepage chrome spacing */
+  html,body{margin:0;background:transparent}
+  #stage{padding:0!important;z-index:auto!important}
+  .wrap.wide{max-width:none;margin:0;padding:10px 14px 16px}
+  .ide{cursor:default!important;margin-top:14px}
+  .rv,.stagger>*{opacity:1!important;transform:none!important}
+  /* The homepage collapses the IDE's side rails below 900px; the docs content column is ~780px, so
+     keep all three rails down to there and only collapse on a genuinely narrow viewport. */
+  @media (max-width:900px){ .ide-top{grid-template-columns:1fr 2fr 2fr} .ide-top .side{display:flex} }
+  @media (max-width:660px){ .ide-top{grid-template-columns:1fr} .ide-top .side{display:none} }
+</style>
+</head>
+<body class="embed-demo">
+<section style="padding-top:6px;padding-bottom:0;position:relative;z-index:41" id="stage">
+  <div class="wrap wide">
+    <div class="demo-ui" aria-label="Demo narration and controls">
+      <p class="narr" id="narr" aria-live="polite"></p>
+      <p class="hintline" id="hint" aria-live="polite"></p>
+      <div class="ctrl">
+        <button class="tbtn" id="dback" aria-label="Previous step">←</button>
+        <div class="dots" id="ddots" role="group" aria-label="Demo steps"></div>
+        <button class="tbtn" id="dnext" aria-label="Next step">→</button>
+        <span class="tcount" id="dcount"></span>
+        <button class="tbtn" id="dplay" aria-label="Pause or resume the autoplay">❚❚</button>
+        <button class="tbtn" id="drestart" aria-label="Restart the demo" title="Restart">↺</button>
+        <span class="tcount" id="dtransport" style="min-width:auto;color:var(--ink-faint)">Auto-playing — click ❚❚ to pause</span>
+      </div>
+    </div>
+
+    <div class="ide" aria-label="Simulated editor: the Observatory Traces sidebar on the left, the file in the middle, the agent session and Observatory Timeline on the right, and the Observatory Dashboards dock below">
+      <div class="ide-top">
+        <aside class="side traces" aria-label="Observatory Traces sidebar (simulated)">
+          <div class="side-h"><span>Observatory Traces</span></div>
+          <div id="side-tree"></div>
+        </aside>
+        <div class="editor">
+          <div class="bar">
+            <span class="d" style="background:#ff5f57"></span><span class="d" style="background:#febc2e"></span><span class="d" style="background:#28c840"></span>
+            <span class="fn" id="ed-fn">src/features.py</span>
+            <span class="edchip pending" id="ed-chip" hidden></span>
+          </div>
+          <div class="code" id="ed-code"></div>
+        </div>
+        <aside class="side agent" aria-label="agent session and Observatory Timeline (simulated)">
+          <div class="side-h"><span>agent session</span></div>
+          <div class="chat">
+            <div class="prompt-strip"><span class="pr">&#10095;</span><span class="pt" id="ed-prompt"></span><span class="caret" id="ed-caret" hidden></span></div>
+            <div class="chat-r" id="ch-reply"></div>
+          </div>
+          <div class="side-h"><span>Observatory Timeline</span><span class="tabs"><b>Feed</b> &middot; Prompts &middot; Observations &middot; Actions</span></div>
+          <div class="tl" id="tl"></div>
+        </aside>
+      </div>
+
+      <div class="dockhead"><span>Observatory Dashboards</span></div>
+      <div class="dock">
+        <section class="pane" aria-label="Overview panel (simulated)">
+          <div class="ph"><span>Overview</span></div>
+          <div class="ovbar" id="ovbar"></div>
+          <div class="ovwrap">
+            <div class="ovnav">
+              <div class="ovtabs"><span title="Sessions on this machine, grouped by workspace. This workspace is first; select a session to review its conversation and edits.">Sessions 1</span><span class="on" id="wk-tab">Workers 1</span><span id="wf-tab">Workflows 0</span><span id="tk-tab" title="the agent's own numbered task list. An edit joins a task only if it was captured while that task was in progress; anything outside those windows stays unassigned.">Tasks</span><span id="pr-tab" title="Background shells this session launched with run_in_background — state, runtime and output volume. Shell ids are the harness's own; a transcript records no OS process id.">Processes</span></div>
+              <div id="fleet"></div>
+            </div>
+            <div class="ovdetail">
+              <div class="strip" id="ov-strip" hidden></div>
+              <div id="ov-ledger"></div>
+              <div class="readout" id="ov-readout"></div>
+            </div>
+          </div>
+        </section>
+
+        <section class="pane" aria-label="Stats panel (simulated)">
+          <div class="ph"><span>Stats</span></div>
+          <div class="stnav">🔬 demo-session</div>
+          <div class="stblock"><div class="sh">Edits</div>
+            <div class="tiles">
+              <div class="tile pending"><div class="tv" id="st-p">0</div><div class="tl">pending</div></div>
+              <div class="tile kept"><div class="tv" id="st-k">0</div><div class="tl">accepted</div></div>
+              <div class="tile undone"><div class="tv" id="st-u">0</div><div class="tl">reverted</div></div>
+            </div>
+            <div class="progress"><i id="st-fill"></i></div>
+            <div class="prognote" id="st-note">0 of 0 reviewed</div>
+          </div>
+          <div class="stblock"><div class="sh">Session tokens</div>
+            <div class="tiles">
+              <div class="tile"><div class="tv" id="tk-in">0</div><div class="tl">input</div></div>
+              <div class="tile"><div class="tv" id="tk-out">0</div><div class="tl">output</div></div>
+              <div class="tile"><div class="tv" id="tk-cached">0</div><div class="tl">cached · <span id="tk-hit">—</span> hit</div></div>
+            </div>
+          </div>
+          <div class="stblock"><div class="sh">Tokens</div>
+            <svg class="spark" id="tok-spark" viewBox="0 0 120 34" preserveAspectRatio="none" aria-hidden="true"><polyline id="tok-line" points=""></polyline></svg>
+            <div class="ranges"><span class="seg2 on">Today</span><span class="seg2">7 days</span><span class="seg2">30 days</span></div>
+          </div>
+          <div class="stblock"><div class="sh">Usage</div>
+            <div class="ubar"><span class="ul">ctx</span><span class="ub"><i style="width:12%"></i></span><span>12%</span></div>
+            <div class="ubar"><span class="ul">5h</span><span class="ub"><i style="width:34%"></i></span><span>34%</span></div>
+            <div class="ubar"><span class="ul">wk</span><span class="ub"><i style="width:61%"></i></span><span>61%</span></div>
+          </div>
+        </section>
+      </div>
+    </div>
+    <noscript><p class="lede" style="margin-top:20px">This demo needs JavaScript. <a href="first-review.html" style="color:var(--accent-ink);text-decoration:underline">Your first review</a> walks through the same steps.</p></noscript>
+  </div>
+</section>
+<script>
+  // ---- the detailed scripted demo ----------------------------------------------------------------
+  // A SHORTENED version of the bundled `oak demo` scenario
+  // (packages/core/src/demo.ts): a Python training pipeline gains scaling + validation + tests +
+  // docs, then the visitor reviews it. The bundled scenario goes further — three prompts, six
+  // tasks, nine edits, a sibling agent, a deletion, a failed call and a write outside the
+  // workspace — and the lede above says so rather than letting this page imply it is the whole of it.
+  // State is DERIVED per step from (edits landed, gate decisions), so Back/Restart/dot-jumps always
+  // re-render consistently. Autoplays by default; gates wait for the visitor's click.
+  (function(){
+    var reduce=window.matchMedia&&window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    var esc=function(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;');};
+    var PROMPT='Add feature scaling and dataset validation to the training pipeline, then bring in tests and docs.';
+    function L(n,t,c){return {n:n,t:t,c:c||''};}
+    var SEED=[
+      L(1,'<span class="kw">from</span> statistics <span class="kw">import</span> mean'),
+      L(2,''),
+      L(3,''),
+      L(4,'<span class="kw">def</span> <span class="fnm">summarize</span>(values):'),
+      L(5,'    <span class="kw">return</span> {<span class="st">"count"</span>: len(values), <span class="st">"mean"</span>: mean(values)}'),
+    ];
+    var EDITS=[
+      {id:1,file:'src/features.py',module:'src',plus:6,minus:1,agent:null,time:'14:42',
+       why:'Adding scale() — z-score standardization so features share a range before training.',
+       lensAt:0,
+       code:[
+        L(1,'<span class="kw">from</span> statistics <span class="kw">import</span> mean, stdev','add'),
+        L(2,''),
+        L(3,''),
+        L(4,'<span class="kw">def</span> <span class="fnm">summarize</span>(values):'),
+        L(5,'    <span class="kw">return</span> {<span class="st">"count"</span>: len(values), <span class="st">"mean"</span>: mean(values)}'),
+        L(6,'','add'),
+        L(7,'','add'),
+        L(8,'<span class="kw">def</span> <span class="fnm">scale</span>(values):','add'),
+        L(9,'    mu, sigma = mean(values), stdev(values)','add'),
+        L(10,'    <span class="kw">return</span> [(v - mu) / sigma <span class="kw">for</span> v <span class="kw">in</span> values]','add'),
+       ]},
+      {id:2,file:'src/train.py',module:'src',plus:3,minus:2,agent:null,time:'14:43',
+       why:'Scaling the features in the training entrypoint before they reach the model.',
+       lensAt:0,
+       code:[
+        L(1,'<span class="kw">from</span> features <span class="kw">import</span> summarize, scale','add'),
+        L(2,''),
+        L(3,'features = <span class="fnm">scale</span>([1.0, 2.0, 3.0])','add'),
+        L(4,'<span class="fnm">print</span>(<span class="fnm">summarize</span>(features))','add'),
+       ]},
+      {id:3,file:'src/models/dataset.py',module:'src/models',plus:7,minus:0,agent:null,time:'14:45',
+       why:'Adding Dataset.validate() — matching feature/label lengths and a non-empty check, returned as {ok, error}.',
+       lensAt:4,
+       code:[
+        L(1,'<span class="kw">class</span> <span class="fnm">Dataset</span>:'),
+        L(2,'    <span class="kw">def</span> <span class="fnm">__init__</span>(self, features, labels):'),
+        L(3,'        self.features = features'),
+        L(4,'        self.labels = labels'),
+        L(5,'','add'),
+        L(6,'    <span class="kw">def</span> <span class="fnm">validate</span>(self):','add'),
+        L(7,'        <span class="kw">if</span> len(self.features) != len(self.labels):','add'),
+        L(8,'            <span class="kw">return</span> {<span class="st">"ok"</span>: <span class="kw">False</span>, <span class="st">"error"</span>: <span class="st">"length mismatch"</span>}','add'),
+        L(9,'        <span class="kw">if not</span> self.features:','add'),
+        L(10,'            <span class="kw">return</span> {<span class="st">"ok"</span>: <span class="kw">False</span>, <span class="st">"error"</span>: <span class="st">"empty dataset"</span>}','add'),
+        L(11,'        <span class="kw">return</span> {<span class="st">"ok"</span>: <span class="kw">True</span>}','add'),
+       ]},
+      {id:4,file:'tests/test_pipeline.py',module:'tests',plus:12,minus:0,agent:'subagent',time:'14:46',
+       why:'Covering scale, summarize, and both validate branches.',
+       lensAt:0,
+       code:[
+        L(1,'<span class="kw">import</span> sys, pathlib','add'),
+        L(2,'','add'),
+        L(3,'sys.path.insert(0, str(pathlib.<span class="fnm">Path</span>(__file__).resolve().parents[1] / <span class="st">"src"</span>))','add'),
+        L(4,'<span class="kw">from</span> features <span class="kw">import</span> scale, summarize','add'),
+        L(5,'<span class="kw">from</span> models.dataset <span class="kw">import</span> Dataset','add'),
+        L(6,'','add'),
+        L(7,'scaled = <span class="fnm">scale</span>([1.0, 2.0, 3.0])','add'),
+        L(8,'<span class="kw">assert</span> abs(sum(scaled)) &lt; 1e-9','add'),
+        L(9,'<span class="kw">assert</span> <span class="fnm">summarize</span>(scaled)[<span class="st">"count"</span>] == 3','add'),
+        L(10,'<span class="kw">assert</span> <span class="fnm">Dataset</span>([[1.0]], [0]).validate()[<span class="st">"ok"</span>] <span class="kw">is True</span>','add'),
+        L(11,'<span class="kw">assert</span> <span class="fnm">Dataset</span>([[1.0]], []).validate()[<span class="st">"ok"</span>] <span class="kw">is False</span>','add'),
+        L(12,'<span class="fnm">print</span>(<span class="st">"pipeline tests: all assertions pass"</span>)','add'),
+       ]},
+      {id:5,file:'docs/USAGE.md',module:'docs',plus:12,minus:0,agent:'workflow',time:'14:48',
+       why:'Documenting the public API with runnable examples.',
+       lensAt:0,
+       code:[
+        L(1,'<span class="fnm"># Pipeline usage</span>','add'),
+        L(2,'','add'),
+        L(3,'<span class="st">```python</span>','add'),
+        L(4,'<span class="kw">from</span> features <span class="kw">import</span> scale, summarize','add'),
+        L(5,'<span class="fnm">summarize</span>(<span class="fnm">scale</span>([1.0, 2.0, 3.0]))  <span class="cm"># {"count": 3, "mean": 0.0}</span>','add'),
+        L(6,'<span class="st">```</span>','add'),
+        L(7,'','add'),
+        L(8,'Validate a dataset before training:','add'),
+        L(9,'','add'),
+        L(10,'<span class="st">```python</span>','add'),
+        L(11,'<span class="fnm">Dataset</span>(features, labels).validate()  <span class="cm"># {"ok": True} | {"ok": False, "error": ...}</span>','add'),
+        L(12,'<span class="st">```</span>','add'),
+       ]},
+    ];
+    // the agent's own numbered tasks, with the edits captured while each was in progress.
+    var TASKS=[
+      {title:'Add feature scaling to the pipeline',edits:[1,2]},
+      {title:'Validate the training dataset',edits:[3]},
+      {title:'Tests and docs',edits:[4,5]},
+    ];
+    var STEPS=[
+      {ed:'seed',landed:0,typing:true,
+       narr:'You send the agent a prompt. The observatory sits beside the session — hooks, not a wrapper — and records what happens, at zero extra tokens. The Observatory Traces sidebar on the left tracks each file the agent touches; on the right sit the agent session and the Observatory Timeline, whose Feed tab reads the conversation as it happens: your prompt, the agent’s replies, and every tool call. Below, the Observatory Dashboards dock holds the Overview and Stats.'},
+      {ed:'seed',landed:0,plan:true,
+       narr:'the agent plans three to-dos and opens the matching numbered task list. Attribution is strict: an edit joins a task only if it was captured while that task was in progress. Anything outside those windows stays unassigned.'},
+      {ed:1,landed:1,
+       narr:'Task one adds feature scaling. Its first edit becomes a reviewable entry: an inline lens over the changed lines, a timeline entry carrying the agent’s reasoning, and a churn-ranked ledger row in the Overview detail.'},
+      {ed:2,landed:2,
+       narr:'A second edit wires scaling into the training entrypoint and completes task one. Both of its edits stay pending until you review them, and the Tasks tab badge tracks completion as each strict span closes. The nav bar carries four review axes — Diff, File, Folder, and Prompt — and its counters track where you are.'},
+      {ed:3,landed:3,
+       narr:'Task two adds dataset validation. The Folders strip apportions the churn across src and src/models — tests and docs join it as those edits land. Commands the agent runs are recorded too: two backgrounded shells — a test watcher and a docs preview — land in the Feed, and the Processes tab picks them up, one still running.'},
+      {ed:4,landed:4,
+       narr:'Task three is tests and docs. the agent hands the test-writing to a subagent, and a second agent working this repository from a sibling worktree joins the board — the Workers nav now tracks all three at once, each newcomer highlighted as it lands. The subagent’s edit is attributed to it in the timeline and reviewed exactly like any other.'},
+      {ed:5,landed:5,
+       narr:'A workflow run writes the documentation, one level above the subagents — the Workflows tab picks it up, and the run lands highlighted under the fleet with its tasks inline: outline and write complete, review still going. The Feed reads what the selected row is doing, straight from the file it writes: it is marked live while that source is still writing, and becomes an audit log once it has finished. Five edits are now pending across the three tasks.'},
+      {ed:1,landed:5,gate:'keep',hint:'Click ✓ Keep on the lens in the editor.',
+       narr:'Review the first edit: the scaling function is correct — <span class="hl">keep it</span>. Keeping one edit resolves it and nothing else.'},
+      {ed:2,landed:5,gate:'undo',hint:'Click ✗ Undo on the lens in the editor.',
+       narr:'The entrypoint wiring is not wanted — <span class="hl">undo only this edit</span>. The revert is surgical: a position-anchored line merge, so every other pending change stays exactly as the agent left it.'},
+      {ed:2,landed:5,gate:'acceptall',hint:'Click ✓ Accept All in the Overview toolbar.',
+       narr:'Sweep the rest in one motion: <span class="hl">Accept All</span> resolves everything still pending. Accept Prompt narrows the same sweep to the work one prompt caused; in the editor, picking that prompt in the Prompts window scopes the whole Overview to it.'},
+      {ed:1,landed:5,recap:true,
+       narr:'That is the whole loop: every edit tracked with its reasoning, reviewed one at a time or by file, folder, or prompt, and resolved without git. The plan is complete, the session has stopped writing, and its feed is now an audit log rather than a live tail. Run the same session in your own editor below — it goes further than this page, and the tour drives the panels for you — or start with <a href="first-review.html" style="color:var(--accent-ink);text-decoration:underline">your first review</a>.'},
+    ];
+    var N=STEPS.length;
+    var el=function(id){return document.getElementById(id);};
+    var step=0, resolved={}, timer=null, playing=false, typeTimer=null, advanceTok=0;
+    // Gate countdown: the visitor can act, and if they do not, the action applies itself when the
+    // timer runs out — the walkthrough never stalls.
+    var gateTimer=null, gateLeft=0, armedStep=-1;
+    var GATE_SECONDS=reduce?3:9;
+
+    function statusOf(id,s,res){
+      var afterKeep=s>7||(s===7&&res[7]), afterUndo=s>8||(s===8&&res[8]), afterAll=s>9||(s===9&&res[9]);
+      if(id===1) return afterKeep?'kept':'pending';
+      if(id===2) return afterUndo?'undone':'pending';
+      return afterAll?'kept':'pending';
+    }
+    function landedEdits(s){return EDITS.slice(0,STEPS[s].landed);}
+
+    function render(){
+      var st=STEPS[step], res=resolved;
+      el('narr').innerHTML=st.narr;
+      if(st.gate&&!res[step]){
+        if(armedStep!==step){ armedStep=step; armGate(); }
+        updateHint();
+      }else{ clearGateTimer(); if(armedStep===step) armedStep=-1; el('hint').textContent=''; }
+      el('dcount').textContent=('0'+(step+1)).slice(-2)+' / '+('0'+N).slice(-2);
+      // The transport label depends on WHICH step you are on, not only on playing/paused — so it has to
+      // be recomputed here. Setting it only from stopPlay/startPlay left it reading "click ▸ to resume"
+      // on a finished demo, because the pause happened one step before the end.
+      setTransport();
+      // A finished walkthrough has nothing to resume: leaving ▸ live let it announce "Auto-playing" for
+      // 3.6s while nothing moved. ↺ is the control that applies here, and the transport line says so.
+      el('dplay').disabled=step===N-1;
+      el('dback').disabled=step===0;
+      // Next is never disabled by a gate — it SKIPS it, exactly as the editors' tours relabel Next to
+      // "Skip". Disabling it left the only way forward on a control inside an aria-hidden mock toolbar.
+      el('dnext').disabled=step===N-1;
+      el('dnext').setAttribute('aria-label', (!!st.gate&&!res[step]) ? 'Skip this step' : 'Next step');
+      var dots=el('ddots');
+      if(!dots.childElementCount){
+        STEPS.forEach(function(_,k){
+          var d=document.createElement('button');
+          d.className='dot';d.type='button';d.setAttribute('aria-label','Step '+(k+1));
+          d.addEventListener('click',function(){stopPlay();go(k);});
+          dots.appendChild(d);
+        });
+      }
+      [].slice.call(dots.children).forEach(function(d,j){d.setAttribute('aria-current',j===step?'true':'false');});
+
+      // ---- editor ----
+      var ed=st.ed, lines, fn, chip=null, lens=null;
+      if(ed==='seed'){fn='src/features.py';lines=SEED;}
+      else{
+        var e=EDITS[ed-1];fn=e.file;
+        var status=statusOf(e.id,step,res);
+        lines=e.code.map(function(l){return {n:l.n,t:l.t,c:l.c==='add'&&status==='undone'?'undone':l.c};});
+        chip=status;
+        lens={e:e,status:status,gated:st.gate==='keep'||st.gate==='undo'};
+      }
+      el('ed-fn').textContent=fn;
+      var chipEl=el('ed-chip');
+      if(chip){chipEl.hidden=false;chipEl.className='edchip '+chip;chipEl.textContent=chip==='pending'?'● pending':chip==='kept'?'✓ kept':'⤺ undone';}
+      else {chipEl.hidden=true;chipEl.textContent='';}
+      if(typeTimer){clearInterval(typeTimer);typeTimer=null;}
+      if(st.typing&&!reduce){
+        el('ed-prompt').textContent='';el('ed-caret').hidden=false;
+        var ti=0;
+        typeTimer=setInterval(function(){
+          ti+=2;el('ed-prompt').textContent=PROMPT.slice(0,ti);
+          if(ti>=PROMPT.length){clearInterval(typeTimer);typeTimer=null;el('ed-caret').hidden=true;}
+        },24);
+      }else{el('ed-prompt').textContent=PROMPT;el('ed-caret').hidden=true;}
+      var html='';
+      lines.forEach(function(l,ix){
+        if(lens&&ix===lens.e.lensAt){
+          html+='<div class="lens"><span class="sp">🔬 #'+lens.e.id+' +'+lens.e.plus+' −'+lens.e.minus+'</span>';
+          if(lens.gated&&!res[step]){
+            // Only the scripted action is a live button — the rest stay inert display text.
+            if(STEPS[step].gate==='keep') html+='<button id="lens-keep" class="hint">✓ Keep</button><span class="a">✗ Undo</span>';
+            else html+='<span class="a">✓ Keep</span><button id="lens-undo" class="hint">✗ Undo</button>';
+            html+='<span class="a">💬 Chat</span><span class="a">⧉ Diff</span><span class="a">⋯ Details</span>';
+          }else{
+            html+='<span class="a">✓ Keep</span><span class="a">✗ Undo</span><span class="a">💬 Chat</span><span class="a">⧉ Diff</span><span class="a">⋯ Details</span>';
+          }
+          html+='</div>';
+        }
+        var star=l.c==='add'?'<span class="star">✨</span>':l.c==='undone'?'<span class="star" style="color:var(--undone)">⤺</span>':'';
+        html+='<div class="ln '+l.c+'"><span class="n">'+l.n+'</span><span class="t">'+(star?star+l.t:l.t)+'</span></div>';
+      });
+      el('ed-code').innerHTML=html;
+      var kb=el('lens-keep'),ub=el('lens-undo');
+      if(kb)kb.addEventListener('click',function(){resolveGate();});
+      if(ub)ub.addEventListener('click',function(){resolveGate();});
+
+      // ---- agent session (mock chat) ----
+      var landed=landedEdits(step);
+      var REPLIES=[
+        '',
+        'Task 1: added scale() to src/features.py — z-score standardization, so features share a range before training.',
+        'Task 1 done — scale() is wired into the training entrypoint. On to dataset validation.',
+        'Task 2 done — Dataset.validate() checks matching feature/label lengths and rejects an empty set. Tests and docs are next.',
+        'A subagent is writing the pipeline tests while I take the docs — and a second agent is working this repo from a sibling worktree.',
+        'The write-the-docs workflow is drafting the usage docs. All five edits are in — review them at your pace.'];
+      var reply='';
+      if(st.recap) reply='All three tasks are complete — five edits across src, tests, and docs, each recorded with its reasoning.';
+      else if(st.gate&&!res[step]) reply='The edits are in — they are pending your review in the observatory.';
+      else if(landed.length) reply=REPLIES[landed.length];
+      else if(st.plan) reply='I’ll take this in three tasks: feature scaling, dataset validation, then tests and docs — opening a task list now.';
+      el('ch-reply').innerHTML=reply?'<b>Agent:</b> '+reply:'';
+      // ---- Session tokens: the session's own cumulative split, growing as the work lands ----
+      var TOK=[[1.4,0.2,18],[2.9,0.6,34],[4.1,0.9,52],[5.6,1.3,71],[7.2,1.8,88],[8.8,2.4,103]][landed.length];
+      el('tk-in').textContent=TOK[0]+'k'; el('tk-out').textContent=TOK[1]+'k'; el('tk-cached').textContent=TOK[2]+'k';
+      el('tk-hit').textContent=Math.round(100*TOK[2]/(TOK[2]+TOK[0]))+'%';
+
+      // ---- the Review list — rows GROUPED BY FILE, one row per unit, the way the panel draws it
+      // since 0.9.4 (the Edits and Diffs trees are gone; Review is the one review surface) ----
+      var sh='';
+      if(landed.length){
+        var byFile={};landed.forEach(function(e){(byFile[e.file]=byFile[e.file]||[]).push(e);});
+        Object.keys(byFile).forEach(function(f){
+          var pend=byFile[f].filter(function(e3){return statusOf(e3.id,step,res)==='pending';}).length;
+          sh+='<div class="sr fold'+(f===fn?' on':'')+'"><span class="sn">'+esc(f.split('/').pop())+'</span>'+
+              '<span class="sc">'+(pend?pend+' pending':'resolved')+'</span></div>';
+          byFile[f].forEach(function(e2){
+            var s5=statusOf(e2.id,step,res);
+            sh+='<div class="sr'+(e2.file===fn?' on':'')+'" style="padding-left:18px"><span class="sd '+s5+'"></span><span class="sn">#'+e2.id+'</span><span class="sc"><span class="p">+'+e2.plus+'</span> <span class="m">\u2212'+e2.minus+'</span></span></div>';
+          });
+        });
+      }else sh='<div class="empty">Changes appear here as the agent works.</div>';
+      el('side-tree').innerHTML=sh;
+
+      // ---- Observatory Timeline, Feed tab: the conversation as it happened, oldest first ----
+      // Your prompt on a band, the agent's replies, and every tool call with the file it acted on and
+      // the reasoning beside it. The session is the selection, so the header says LIVE while it is
+      // still writing (stamped with the newest evidence, never a realtime claim) and AUDIT LOG once it
+      // has stopped, at the recap.
+      function trow(time,kind,name,delta,body,dot,extra,cls){
+        return '<div class="or'+(cls?' '+cls:'')+'"><div class="top">'+(dot?'<span class="sd '+dot+'"></span>':'')+'<span class="tm">'+time+'</span><span class="of">'+name+'</span>'+(delta||'')+'<span class="badge">'+kind+'</span>'+(extra||'')+'</div>'+(body?'<div class="ow">'+body+'</div>':'')+'</div>';
+      }
+      var sessDone=!!st.recap;
+      var tl=[], last='14:41';
+      tl.push(trow('14:41','you','prompt','',esc(PROMPT),null,null,'band'));
+      if(st.plan||landed.length) tl.push(trow('14:41','said','the agent','','I\u2019ll take this in three tasks: feature scaling, dataset validation, then tests and docs.'));
+      landed.forEach(function(e){
+        var extra=e.agent?'<span class="badge">'+e.agent+'</span>':'';
+        var delta='<span class="od"><span class="p">+'+e.plus+'</span> <span class="m">\u2212'+e.minus+'</span></span>';
+        tl.push(trow(e.time,e.id>=4?'Write':'Edit',esc(e.file),delta,esc(e.why),statusOf(e.id,step,res),extra));
+        last=e.time;
+        if(e.id===3){
+          tl.push(trow('14:45','Bash','pytest -q --watch','','background: demo-tests'));
+          tl.push(trow('14:45','Bash','python -m http.server 8000','','background: demo-serve'));
+        }
+      });
+      if(sessDone) tl.push(trow('14:49','said','the agent','','All three tasks are complete \u2014 five edits across src, tests, and docs, each recorded with its reasoning.'));
+      var p0=0;landed.forEach(function(e){if(statusOf(e.id,step,res)==='pending')p0++;});
+      var fh='<div class="fh"><b>demo-session</b>'+(sessDone?'<span>\u25a3 audit log</span><span>\u00b7 last activity 14:49</span>'
+        :'<span class="live">\u25cf live</span><span>\u00b7 updated '+last+'</span>')+'</div>';
+      var tle=el('tl');
+      tle.innerHTML=fh+tl.join('');
+      tle.scrollTop=tle.scrollHeight; // the feed follows its tail
+
+      // ---- overview: toolbar + fleet nav + detail ----
+      // The four review axes, as the editors' nav bar groups them: Diff · File · Folder · Prompt.
+      // Icons only, verb on hover — the axes row carries no labels (the row above it does).
+      var pendingFiles=[],pendingFolders=[],curFile=fn;
+      landed.forEach(function(e){
+        if(statusOf(e.id,step,res)!=='pending')return;
+        if(pendingFiles.indexOf(e.file)<0)pendingFiles.push(e.file);
+        if(pendingFolders.indexOf(e.module)<0)pendingFolders.push(e.module);
+      });
+      var curFolder=ed==='seed'?'':EDITS[ed-1].module;
+      var fIdx=pendingFiles.indexOf(curFile), gIdx=pendingFolders.indexOf(curFolder);
+      var fileCounter=pendingFiles.length?('File '+(fIdx>=0?fIdx+1:'–')+'/'+pendingFiles.length):'';
+      var folderCounter=pendingFolders.length?('Folder '+(gIdx>=0?gIdx+1:'–')+'/'+pendingFolders.length):'';
+      var diffCounter=(ed!=='seed'&&statusOf(EDITS[ed-1].id,step,res)==='pending')?'Diff 1/1':'';
+      // The scenario is one prompt, so the Prompt axis holds a single entry while it still has work to review.
+      var promptCounter=p0?'Prompt 1/1':'';
+      var axes='';
+      if(diffCounter) axes+='<span class="g"><span class="nvb">▲</span> <span class="on">'+diffCounter+'</span> <span class="nvb">▼</span> <span class="tk" title="Keep this edit">✓</span> <span class="tu" title="Undo this edit">✗</span> <span class="nvb" title="View this edit’s diff">⧉</span></span><span class="sep"></span>';
+      if(fileCounter) axes+='<span class="g"><span class="nvb">◀</span> <span class="on">'+fileCounter+'</span> <span class="nvb">▶</span> <span class="tk" title="Accept every edit in this file">✓✓</span> <span class="tu" title="Reject every edit in this file">✗</span></span><span class="sep"></span>';
+      if(folderCounter) axes+='<span class="g"><span class="nvb">◀</span> <span class="on">'+folderCounter+'</span> <span class="nvb">▶</span> <span class="tk" title="Accept every edit in this folder">✓✓</span> <span class="tu" title="Reject every edit in this folder">✗</span></span><span class="sep"></span>';
+      if(promptCounter) axes+='<span class="g"><span class="nvb">◀</span> <span class="on">'+promptCounter+'</span> <span class="nvb">▶</span> <span class="nvb" title="Review this prompt — step its edits in order">☰</span> <span class="tk" title="Accept every edit from this prompt">✓✓</span> <span class="tu" title="Reject every edit from this prompt">✗✗</span></span>';
+      axes=axes.replace(/<span class="sep"><\/span>$/,'');
+      var bulk='<span class="g"><span class="ts">🔬 demo-session</span>';
+      if(st.gate==='acceptall'&&!res[step]) bulk+='<button id="ov-acceptall" class="hint">✓✓ Accept All</button>';
+      else bulk+='<span class="tk">✓✓ Accept All</span>';
+      bulk+='<span class="tu">✗✗ Reject All</span><span class="ts">Clear Resolved</span><span class="ts">Export</span></span>';
+      var view='<span class="g"><span class="ts">Search</span><span class="ts">Active only</span><span class="sep"></span><span class="ts">Spotlight</span><span class="ts">Refresh</span><span class="on"><span data-co-version>v0.10.0</span> ▾</span></span>';
+      var bar='<div class="row">'+axes+'</div><div class="row split">'+bulk+view+'</div>';
+      el('ovbar').innerHTML=bar;
+      var ab=el('ov-acceptall');
+      if(ab)ab.addEventListener('click',function(){resolveGate();});
+
+      var showPlan=st.plan||landed.length>0||step>1;
+      var fleetHtml='<div class="fr"><span class="gl">▶</span><span class="st2 '+(sessDone?'done':'working')+'">'+(sessDone?'● done':'● working')+'</span> you · demo/pipeline</div>';
+      if(landed.length>=4) fleetHtml+='<div class="fr'+(landed.length===4?' hi':'')+'"><span class="gl">▶</span><span class="st2 '+(sessDone?'done':'working')+'">'+(sessDone?'● done':'● working')+'</span> agent-2 · demo/pipeline-w2</div>';
+      if(landed.length>=4) fleetHtml+='<div class="fr sub'+(landed.length===4?' hi':'')+'"><span class="gl">▷</span><span class="st2 done">● done</span> general-purpose — Write pipeline tests</div>';
+      if(landed.length>=5){
+        fleetHtml+='<div class="fr'+(landed.length===5&&!sessDone?' hi':'')+'"><span class="gl">◆</span><span class="st2 working">● working</span> workflow · write-the-docs</div>';
+        fleetHtml+='<div class="fr sub'+(landed.length===5&&!sessDone?' hi':'')+'"><span class="gl">·</span>outline ✓ · write ✓ · review ●</div>';
+      }
+      el('fleet').innerHTML=fleetHtml;
+      // The nav badges, as VS Code draws them: Workers counts the agent rows listed, Workflows the runs,
+      // Tasks the numbered plan, and Processes running/total — the demo session backgrounds two shells
+      // alongside task two, a test watcher that exits 0 and a docs preview left running.
+      el('wk-tab').textContent='Workers '+(landed.length>=4?2:1);
+      el('wf-tab').textContent='Workflows '+(landed.length>=5?1:0);
+      el('tk-tab').textContent='Tasks '+(showPlan?TASKS.length:0);
+      el('pr-tab').textContent='Processes '+(landed.length>=3?'1/2':'0/0');
+
+      // The change-map detail: Folders strip, churn-ranked Files ledger, summary bar. Each ledger row ends
+      // in ⧉, which opens that file's changes stacked.
+      var strip=el('ov-strip');
+      var mods={};landed.forEach(function(e){mods[e.module]=(mods[e.module]||0)+e.plus+e.minus;});
+      var modKeys=Object.keys(mods);
+      if(modKeys.length){
+        strip.hidden=false;
+        var tot=modKeys.reduce(function(a,m){return a+mods[m];},0);
+        strip.innerHTML=modKeys.map(function(m){
+          var pct=Math.round(100*mods[m]/tot);
+          return '<span class="seg" style="width:'+pct+'%" title="'+m+' — '+pct+'% of churn">'+m+'</span>';
+        }).join('');
+      }else{strip.hidden=true;strip.innerHTML='';}
+      // The exact time of each file's last edit, left of the name — stamps, not ages (2026-08-31).
+      var ageOf=function(e){return e.time||'';};
+      el('ov-ledger').innerHTML=landed.length?landed.slice().sort(function(a,b){return (b.plus+b.minus)-(a.plus+a.minus);}).map(function(e){
+        var s2=statusOf(e.id,step,res);
+        return '<div class="lr"><span class="la">'+ageOf(e)+'</span><span class="sd '+s2+'"></span><span class="lf">'+esc(e.file)+'</span>'+
+          '<span class="lc"><span class="p">+'+e.plus+'</span> <span class="m">−'+e.minus+'</span></span>'+
+          '<span class="lo" title="Open this file’s changes stacked">⧉</span></div>';
+      }).join(''):'<div class="empty">Changed files appear here as edits land.</div>';
+      var addAll=landed.reduce(function(a,e){return a+e.plus;},0),remAll=landed.reduce(function(a,e){return a+e.minus;},0);
+      el('ov-readout').textContent=landed.length?(landed.length+' file'+(landed.length===1?'':'s')+' · +'+addAll+' −'+remAll+(p0?' · '+p0+' pending':' · reviewed clean')):'';
+
+      // ---- stats ----
+      var p=0,kk=0,u=0;
+      landed.forEach(function(e){var s3=statusOf(e.id,step,res);if(s3==='pending')p++;else if(s3==='kept')kk++;else u++;});
+      el('st-p').textContent=p;el('st-k').textContent=kk;el('st-u').textContent=u;
+      var tot2=landed.length,rev=kk+u;
+      el('st-fill').style.width=tot2?Math.round(100*rev/tot2)+'%':'0%';
+      el('st-note').textContent=rev+' of '+tot2+' reviewed'+(tot2&&rev===tot2?' — session clean':'');
+      var toks=[2,7,13,18,26,31].slice(0,landed.length+1);
+      var pts=toks.map(function(v,i2){
+        var x=toks.length>1?(i2*120/(toks.length-1)):0;
+        return x.toFixed(1)+','+(31-v*28/31).toFixed(1);
+      }).join(' ');
+      el('tok-line').setAttribute('points',pts);
+    }
+
+    function clearGateTimer(){ if(gateTimer){ clearInterval(gateTimer); gateTimer=null; } }
+    // The transport label used to be static markup that still read "Auto-playing" after you paused.
+    function setTransport(){
+      var t=el('dtransport'); if(!t) return;
+      t.textContent = (step >= N - 1 && !playing) ? 'That is the walkthrough — ↺ replays it'
+        : playing ? 'Auto-playing — click ❚❚ to pause' : 'Paused — click ▸ to resume';
+      // C6: the button's own label has to change with it, or a screen-reader user is told the same thing
+      // in every state.
+      var b=el('dplay'); if(b) b.setAttribute('aria-label', playing ? 'Pause the autoplay' : 'Resume the autoplay');
+    }
+    function updateHint(){
+      var st=STEPS[step];
+      if(!(st.gate&&!resolved[step])){ el('hint').textContent=''; return; }
+      // Paused: show what to click, but never a countdown that is not counting.
+      el('hint').textContent = playing ? (st.hint+' Applies automatically in '+gateLeft+'s.') : st.hint;
+    }
+    function armGate(){
+      clearGateTimer();
+      // Only ever armed while playing. Every transport control is `stopPlay(); go(k);` and go() → render()
+      // re-arms, so without this a paused visitor still drifted forward one step per gate.
+      if(!playing) return;
+      gateLeft=GATE_SECONDS;
+      var s=step;
+      gateTimer=setInterval(function(){
+        if(step!==s||resolved[s]){ clearGateTimer(); return; }
+        gateLeft--;
+        if(gateLeft<=0){ clearGateTimer(); resolveGate(); } else updateHint();
+      },1000);
+    }
+    function resolveGate(){
+      // Applies the scripted action (visitor click or timer expiry) — the walkthrough keeps flowing
+      // either way; the transport controls are what pause it.
+      clearGateTimer(); armedStep=-1;
+      resolved[step]=true;
+      render();
+      var tok=++advanceTok, s=step;
+      setTimeout(function(){ if(tok===advanceTok&&step===s&&resolved[s]&&s<N-1) go(s+1); }, reduce?250:1000);
+    }
+    function go(k){
+      advanceTok++;
+      clearGateTimer(); armedStep=-1;
+      var target=Math.max(0,Math.min(N-1,k));
+      if(target!==step){ delete resolved[target]; step=target; }
+      render();
+    }
+    el('dback').addEventListener('click',function(){stopPlay();go(step-1);});
+    el('dnext').addEventListener('click',function(){
+      stopPlay();
+      // Skipping an armed gate marks it resolved: the visitor said "move on", not "ask me again".
+      if(STEPS[step].gate&&!resolved[step]) resolved[step]=true;
+      go(step+1);
+    });
+    el('drestart').addEventListener('click',function(){stopPlay();resolved={};step=0;render();});
+    document.addEventListener('keydown',function(e){
+      if(e.target&&/INPUT|TEXTAREA/.test(e.target.tagName))return;
+      if(e.key==='ArrowRight'&&!el('dnext').disabled){stopPlay(); if(STEPS[step].gate&&!resolved[step]) resolved[step]=true; go(step+1);}
+      if(e.key==='ArrowLeft'&&step>0){stopPlay();go(step-1);}
+    });
+    function stopPlay(){playing=false;if(timer){clearInterval(timer);timer=null;}
+      // Invalidate any advance resolveGate() has already queued. Without this, pausing in the ~1s after
+      // clicking Keep still slid the page one step forward while the transport read "Paused".
+      advanceTok++;
+      // Pause the GATE countdown too. Clearing only the step timer left a paused demo drifting forward
+      // one step per armed gate — and there are three in a row, so it slid 7→8→9→10 on its own.
+      clearGateTimer(); updateHint();
+      el('dplay').classList.remove('playing');el('dplay').textContent='▸';setTransport();}
+    function startPlay(){
+      if(playing||step>=N-1)return; // nothing left to play through
+      playing=true;el('dplay').classList.add('playing');el('dplay').textContent='❚❚';setTransport();
+      // Resuming on a gate step re-arms its countdown, which stopPlay() cleared.
+      var st0=STEPS[step]; if(st0.gate&&!resolved[step]){ armedStep=step; armGate(); }
+      updateHint();
+      timer=setInterval(function(){
+        var st=STEPS[step];
+        if(st.gate&&!resolved[step])return; // the gate countdown owns this moment
+        if(step>=N-1){stopPlay();return;}
+        go(step+1);
+      },3600);
+    }
+    el('dplay').addEventListener('click',function(){ if(playing)stopPlay(); else startPlay(); });
+    render();
+    if(!reduce) startPlay(); else stopPlay();
+  })();
+</script>
+<script>
+  // theme sync + auto-height: the host docs page drives the theme and reads our height back.
+  (function(){
+    var root=document.documentElement;
+    function setTheme(t){ if(t==='dark'||t==='light') root.dataset.theme=t; else delete root.dataset.theme; }
+    var m=(location.hash.match(/theme=(dark|light|system)/)||[])[1]; if(m) setTheme(m);
+    addEventListener('message',function(e){ if(e.data&&e.data.oakTheme) setTheme(e.data.oakTheme); });
+    var last=0;
+    function report(){ var h=Math.ceil(document.body.getBoundingClientRect().height); if(h&&h!==last){ last=h; parent.postMessage({oakDemoHeight:h},'*'); } }
+    if('ResizeObserver'in window) new ResizeObserver(report).observe(document.body);
+    addEventListener('load',report); setInterval(report,500); report();
+  })();
+</script>
+</body></html>

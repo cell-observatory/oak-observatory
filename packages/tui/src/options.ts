@@ -15,18 +15,17 @@ import { ColorDepth, Glyphs, tint } from './glyphs';
 import {
   Prefs,
   Action,
+  DEFAULT_NOTIFY_KINDS,
   REBINDABLE,
   keyConflicts,
   ColorPref,
   GlyphPref,
   START_FOCUS,
-  START_FACE,
   SORT_KEYS,
   THEME_NAMES,
   EditorChoice,
   editorLabel,
-  parseRemoteSpec,
-} from '@claude-observatory/core';
+} from '@oak-observatory/core';
 
 /** What the runtime knows and this module cannot look up: the environment behind the fallbacks, and
  *  the editors found on this machine. Passed to `optionRows` AND `applyOption`, so the list ←→ steps
@@ -143,8 +142,8 @@ export function optionRows(p: Prefs, env: OptionEnv = {}): OptionRow[] {
       help: named
         ? `${named}. ←→ steps through the ${editors.length} editor(s) found here; enter types any command. Blank follows $VISUAL then $EDITOR.`
         : editors.length
-          ? `←→ steps through the ${editors.length} editor(s) found here; enter types any command. Blank follows $VISUAL then $EDITOR. GUI editors carry their wait flag, so \`e\` returns when you close the file.`
-          : 'What `e` runs. Blank follows $VISUAL then $EDITOR. Arguments are allowed: `code -w`.',
+          ? `←→ steps through the ${editors.length} editor(s) found here; enter types any command. Blank follows $VISUAL then $EDITOR. GUI editors open their own window — \`e\` never blinks the dashboard; terminal editors take it over until they exit.`
+          : 'What `e` runs. Blank follows $VISUAL then $EDITOR. Arguments are allowed: `emacsclient -nw`.',
       problem: p.editor || env.editor ? undefined : 'nothing to run — `e` will refuse until this or $EDITOR is set',
     },
     { kind: 'heading', id: '', label: 'DISPLAY', value: '', help: '' },
@@ -173,8 +172,8 @@ export function optionRows(p: Prefs, env: OptionEnv = {}): OptionRow[] {
       kind: 'toggle',
       id: 'syntax',
       label: 'Syntax colour',
-      value: p.syntax ? 'on' : 'off',
-      help: 'Colours a diff’s CONTEXT lines only — added and removed lines keep the review colours. Off by default.',
+      value: p.syntax === false ? 'off' : 'on',
+      help: 'Colours code the way an editor does — every line of a diff, added and removed included. The add/remove bands are the background and stay exactly as they are. On by default.',
     },
     {
       kind: 'toggle',
@@ -194,8 +193,8 @@ export function optionRows(p: Prefs, env: OptionEnv = {}): OptionRow[] {
       kind: 'choice',
       id: 'sort',
       label: 'Order the list by',
-      value: p.sort ?? 'recent',
-      help: 'How Traces is ordered. recent is newest first — the order the store hands it over in.',
+      value: p.sort ?? 'time',
+      help: 'How the change map and Traces are ordered — cycles: time (newest first), time-asc (oldest), name (A→Z), name-desc (Z→A).',
     },
     { kind: 'heading', id: '', label: 'ON OPEN', value: '', help: '' },
     {
@@ -205,33 +204,36 @@ export function optionRows(p: Prefs, env: OptionEnv = {}): OptionRow[] {
       value: p.startFocus ?? 'traces',
       help: 'Which window has the keyboard when the dashboard opens.',
     },
+    { kind: 'heading', id: '', label: 'NOTIFICATIONS', value: '', help: '' },
     {
       kind: 'toggle',
-      id: 'startFace',
-      label: 'Centre window shows',
-      value: p.startFace ?? 'auto',
-      help: 'auto opens the change map until an edit is selected, which is what a session with nothing picked always is.',
+      id: 'notify.desktop',
+      label: 'Desktop notifications',
+      value: p.notify?.desktop === false ? 'off' : 'on',
+      help: 'A native notification when an agent raises its hand — a permission prompt, a question, an input wait. Once per machine, from whichever surface sees it first.',
     },
-    { kind: 'heading', id: '', label: 'REMOTES', value: '', help: '' },
-  ];
-  // One row per configured machine, then a row to add one. Left/right turns a host off without
-  // forgetting it — a machine that is down should not have to be re-typed when it comes back.
-  (p.remotes ?? []).forEach((r, i) => {
-    rows.push({
+    {
       kind: 'toggle',
-      id: `remote:${i}`,
-      label: `  ${r.name}`,
-      value: `${r.host}${r.enabled === false ? '   (off)' : ''}`,
-      help: 'Enter to edit as “name host [configDir]”, or blank it to remove. ←→ turns it off and on. Read-only: sessions there can be browsed, never reverted from here.',
-    });
-  });
-  rows.push({
-    kind: 'text',
-    id: 'remote:new',
-    label: '  Add a machine',
-    value: '',
-    help: 'Enter, then type “name host” — host is anything ssh accepts. Key auth only: the lookup runs with BatchMode, so it fails fast instead of hanging on a password prompt.',
-  });
+      id: 'notify.sound',
+      label: 'Sound',
+      value: p.notify?.sound ? 'on' : 'off',
+      help: 'Play the system sound with the notification (one your terminal posts uses the terminal’s own sound).',
+    },
+    {
+      kind: 'toggle',
+      id: 'notify.done',
+      label: 'Also when a turn finishes',
+      value: (p.notify?.kinds ?? DEFAULT_NOTIFY_KINDS).includes('idle-done') ? 'on' : 'off',
+      help: 'Announce a finished turn too. Off by default: the panels show it; a prompt the agent cannot pass is what deserves a notification.',
+    },
+    {
+      kind: 'number',
+      id: 'notify.cooldown',
+      label: 'Cooldown',
+      value: `${p.notify?.cooldownSeconds ?? 30}s`,
+      help: 'A session that raises its hand again within this many seconds stays quiet — unless the new wait is more urgent. Steps by 5.',
+    },
+  ];
   rows.push({ kind: 'heading', id: '', label: 'KEYS', value: '', help: '' });
   for (const r of REBINDABLE) {
     const c = conflicts.find((x) => x.action === r.action);
@@ -281,20 +283,24 @@ export function applyOption(p: Prefs, id: string, dir: -1 | 1, env: OptionEnv = 
     else delete next.editor;
   } else if (id === 'color') next.color = cycle(COLORS, p.color ?? 'auto');
   else if (id === 'glyphs') next.glyphs = cycle(GLYPHS, p.glyphs ?? 'auto');
-  else if (id === 'sort') next.sort = cycle(SORT_KEYS, p.sort ?? 'recent');
+  else if (id === 'sort') next.sort = cycle(SORT_KEYS, p.sort ?? 'time');
   else if (id === 'theme') next.theme = cycle(THEME_NAMES, p.theme ?? 'default');
   else if (id === 'mouse') next.mouse = !(p.mouse === false) ? false : true;
-  else if (id === 'syntax') next.syntax = !p.syntax;
+  // ABSENT means on, so the first toggle must turn it OFF rather than re-affirming the default.
+  else if (id === 'syntax') next.syntax = p.syntax === false;
   else if (id === 'refreshSeconds') next.refreshSeconds = Math.max(1, Math.min(3600, (p.refreshSeconds ?? 3) + dir));
+  // Notifications: each toggle flips its own field and leaves the others as they were, so a reader who
+  // turned sound on does not lose it by later switching the desktop off and on.
+  else if (id === 'notify.desktop') next.notify = { ...(p.notify ?? {}), desktop: p.notify?.desktop === false };
+  else if (id === 'notify.sound') next.notify = { ...(p.notify ?? {}), sound: !p.notify?.sound };
+  else if (id === 'notify.done') {
+    const kinds = new Set(p.notify?.kinds ?? DEFAULT_NOTIFY_KINDS);
+    if (kinds.has('idle-done')) kinds.delete('idle-done');
+    else kinds.add('idle-done');
+    next.notify = { ...(p.notify ?? {}), kinds: [...kinds] };
+  } else if (id === 'notify.cooldown') next.notify = { ...(p.notify ?? {}), cooldownSeconds: Math.max(0, Math.min(3600, (p.notify?.cooldownSeconds ?? 30) + dir * 5)) };
   else if (id === 'startFocus') next.startFocus = cycle(START_FOCUS, p.startFocus ?? 'traces');
-  else if (id === 'startFace') next.startFace = cycle(START_FACE, p.startFace ?? 'auto');
-  else if (id.startsWith('remote:')) {
-    const i = Number(id.slice(7));
-    if (Number.isInteger(i) && p.remotes?.[i]) {
-      const remotes = p.remotes.map((r, k) => (k === i ? { ...r, enabled: r.enabled === false } : r));
-      next.remotes = remotes;
-    }
-  }
+  else{}
   return next;
 }
 
@@ -305,39 +311,7 @@ export function setOption(p: Prefs, id: string, value: string): Prefs {
     if (value.trim()) next.editor = value.trim();
     else delete next.editor;
     return next;
-  }
-  if (id.startsWith('remote:')) {
-    // "name host [configDir]" — one line, because a settings list that opens a form is a settings
-    // list the reader has to navigate. Blanking the line REMOVES the entry, which is the only
-    // deletion gesture here and is the same one the editor row uses to fall back to $EDITOR.
-    //
-    // Parsing and validation live in `parseRemoteSpec`, shared with the `remotes` verb and through it
-    // with both editors: these fields are interpolated into a shell on ANOTHER machine, and a second
-    // copy of that guard is a second chance to get it wrong.
-    const list = [...(p.remotes ?? [])];
-    const which = id.slice(7);
-    if (which === 'new') {
-      if (!value.trim()) return p;
-      const r = parseRemoteSpec(value);
-      // Not stored, and NOT silent: a settings screen that swallows the line you just typed leaves
-      // you retyping it and wondering. `__reject` is read by the caller and shown on the status row.
-      if ('error' in r) return { ...p, __reject: r.error } as Prefs;
-      list.push(r.remote);
-    } else {
-      const i = Number(which);
-      if (!Number.isInteger(i) || !list[i]) return p;
-      if (!value.trim()) list.splice(i, 1); // blanked → removed
-      else {
-        const r = parseRemoteSpec(value);
-        if ('error' in r) return { ...p, __reject: r.error } as Prefs;
-        list[i] = { ...r.remote, enabled: list[i].enabled }; // an edit must not silently re-enable it
-      }
-    }
-    const out: Prefs = { ...p };
-    if (list.length) out.remotes = list;
-    else delete out.remotes;
-    return out;
-  }
+  }{}
   if (id.startsWith('key:')) {
     const action = id.slice(4) as Action;
     const fallback = REBINDABLE.find((r) => r.action === action)?.fallback;

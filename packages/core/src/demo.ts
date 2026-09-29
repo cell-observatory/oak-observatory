@@ -4,7 +4,7 @@
  * logic (`handleHookPayload`), a subagent transcript, and a workflow run — so every panel in both
  * editors lights up live, exactly as it would during a real session. Two jobs:
  *
- *   1. SHOWCASE — `claude-observatory demo` in an open workspace simulates a prompt to Claude and
+ *   1. SHOWCASE — `oak demo` in an open workspace simulates a prompt to Claude and
  *      shows live changes: the Overview's change map fills task by task, the Fleet nav
  *      gains a subagent and a workflow run, Observations streams the reasoning, and Accept/Reject/
  *      task-scoped review genuinely work (the edits are real store records on real files).
@@ -30,7 +30,7 @@ import * as crypto from 'crypto';
 import * as os from 'os';
 import { projectDir, commonDir } from './session';
 import { handleHookPayload } from './capture';
-import { readLog, clearResolved, removeSession, isSafeSessionId } from './store';
+import { readLog, clearResolved, removeSession, isSafeSessionId, ensureStore, writeBlob, appendLog, allStoreSessionIds } from './store';
 import { removeUsageCursor } from './metrics';
 import { claudeConfigDir } from './paths';
 
@@ -246,7 +246,11 @@ export async function runDemo(opts: DemoOptions = {}): Promise<DemoResult> {
   // A self-ignoring .gitignore needs no change to any file the reader owns, and it survives the case
   // where cleanup cannot reclaim the folder (a buffer saved after Exit recreates one of its files,
   // and the sentinel that authorizes deletion went with the tree).
-  fs.writeFileSync(path.join(workspace, '.gitignore'), '# Claude Observatory demo — not part of your project.\n*\n');
+  fs.writeFileSync(path.join(workspace, '.gitignore'), '# OAK demo — not part of your project.\n*\n');
+  // …and un-hides itself from OAK: the Bash tree walk honours .gitignore (2026-09-23), and a demo whose
+  // Bash edits went uncaptured would demonstrate the opposite of the product. `.observatoryignore`
+  // is the stronger layer, so this re-include wins over the `*` above for OAK alone.
+  fs.writeFileSync(path.join(workspace, '.observatoryignore'), '# OAK demo — captured by OAK although git ignores it.\n!*\n');
   for (const [rel, content] of Object.entries(SEED_FILES)) {
     fs.mkdirSync(path.dirname(path.join(workspace, rel)), { recursive: true });
     fs.writeFileSync(path.join(workspace, rel), content);
@@ -929,7 +933,7 @@ export async function runDemo(opts: DemoOptions = {}): Promise<DemoResult> {
       {
         type: 'text',
         text:
-          'The pipeline scales its features, datasets are validated before training, a subagent wrote the tests, a three-phase workflow is finishing the usage docs, the legacy scaler is gone, and the profile is written outside the tree. Picking up the sparse-column follow-up the profile turned up.\n\nNext steps:\n- Take the guided tour with `claude-observatory demo --tour`, or from your editor\n- Review the pending edits in the Overview (try Accept on a whole prompt)\n- Run `python observatory-demo/tests/test_pipeline.py`\n- Remove the demo with `claude-observatory demo --clean`',
+          'The pipeline scales its features, datasets are validated before training, a subagent wrote the tests, a three-phase workflow is finishing the usage docs, the legacy scaler is gone, and the profile is written outside the tree. Picking up the sparse-column follow-up the profile turned up.\n\nNext steps:\n- Take the guided tour with `oak demo --tour`, or from your editor\n- Review the pending edits in the Overview (try Accept on a whole prompt)\n- Run `python observatory-demo/tests/test_pipeline.py`\n- Remove the demo with `oak demo --clean`',
       },
     ]);
   };
@@ -1124,6 +1128,20 @@ export function cleanDemo(opts: { cwd?: string; dir?: string } = {}): DemoCleanR
     }
   }
   const workspaces: string[] = [];
+  // Demo sessions with NO transcript — the ACP scenario's, whose whole conversation is its store
+  // sidecar. The transcript scan above can never find them, and the store's own pruner explicitly
+  // protects sidecar-holding sessions, so without this sweep `demo --clean` left an orphan
+  // `[acp-only] demo-*` row in every session picker forever. `isDemoSession` is the same gate that
+  // authorizes every other demo removal.
+  for (const id of allStoreSessionIds()) {
+    if (!isDemoSession(id) || sessions.includes(id)) continue;
+    try {
+      removeSession(id);
+      sessions.push(id);
+    } catch {
+      /* best-effort per session */
+    }
+  }
   if (fs.existsSync(path.join(candidate, MARKER))) {
     try {
       fs.rmSync(candidate, { recursive: true, force: true });

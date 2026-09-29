@@ -3,7 +3,7 @@ name: CodeQL
 # Advanced-setup code scanning, pinned to the languages that carry the security surface:
 # the TypeScript core/CLI/extension and the Actions workflows. Java/Kotlin is deliberately
 # NOT scanned — the JetBrains plugin is a thin UI front-end with its own unit tests, and the
-# CodeQL Kotlin extractor doesn't support the Kotlin 2.2 toolchain this project uses.
+# CodeQL Kotlin extractor doesn't support the Kotlin 2.4 toolchain this project uses.
 on:
   push:
     branches: [main, dev]

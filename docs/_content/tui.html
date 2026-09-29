@@ -1,0 +1,52 @@
+<p>The terminal app has three tabs: <strong>herdr · Observatory · Review</strong> (two, Observatory · Review, when it runs inside a herdr pane). Open it with <code>oak</code> to manage terminals, read conversations and decide captured edits.</p>
+
+<style>
+  .tuid-term{background:#0d0d0f;border:1px solid var(--border);border-radius:12px;overflow-x:auto;text-align:center;margin:22px 0 12px}
+  /* line-height:1 keeps every │ pane border continuous — a taller line box opens a gap between rows
+     and the borders read as dashed; a terminal's cell height is its line height. */
+  .tuid-term pre{margin:0;padding:14px 16px;font-family:var(--font-mono);font-size:clamp(7px,1vw,11.5px);line-height:1;color:#cccccc;white-space:pre;letter-spacing:0;min-width:max-content;display:inline-block;text-align:left}
+  .tuid-cap{font-family:var(--font-mono);font-size:.74rem;color:var(--faint);text-align:center;min-height:1.2em;margin:0 0 10px}
+  .tuid-ui{display:flex;align-items:center;justify-content:center;gap:12px;flex-wrap:wrap;margin:0 0 8px}
+  .tuid-ui button{width:32px;height:32px;border-radius:999px;border:1px solid var(--border);background:var(--card);color:var(--muted);cursor:pointer;font-size:15px}
+  .tuid-ui button:hover{border-color:var(--accent);color:var(--accent-ink)}
+  .tuid-dots{display:flex;gap:6px;flex-wrap:wrap;max-width:min(360px,60vw)}
+  .tuid-dots .d{width:7px;height:7px;border-radius:999px;border:0;padding:0;background:var(--border);cursor:pointer}
+  .tuid-dots .d[aria-current="true"]{background:var(--accent);transform:scale(1.4)}
+  .tuid-count{font-family:var(--font-mono);font-size:.72rem;color:var(--faint);min-width:56px;text-align:center}
+</style>
+<div class="tuid-term"><pre id="tuid-screen" aria-label="Terminal demo frame"></pre></div>
+<p class="tuid-cap" id="tuid-cap" aria-live="polite"></p>
+<div class="tuid-ui">
+  <button id="tuid-prev" aria-label="Previous frame">‹</button>
+  <div class="tuid-dots" id="tuid-dots" role="group" aria-label="Frames"></div>
+  <span class="tuid-count" id="tuid-count"></span>
+  <button id="tuid-play" aria-label="Pause or resume">❚❚</button>
+  <button id="tuid-next" aria-label="Next frame">›</button>
+</div>
+<script src="media/tui-frames.js"></script>
+<script>
+(function(){var frames=window.__OAK_TUI_FRAMES__||[],s=document.getElementById('tuid-screen');if(!s||!frames.length)return;
+var cap=document.getElementById('tuid-cap'),dots=document.getElementById('tuid-dots'),cnt=document.getElementById('tuid-count'),pb=document.getElementById('tuid-play');
+var i=0,t=null,paused=false,reduce=matchMedia('(prefers-reduced-motion: reduce)').matches,pad=function(x){return(x<10?'0':'')+x;};
+frames.forEach(function(f,k){var d=document.createElement('button');d.className='d';d.setAttribute('aria-label','Frame '+(k+1));d.onclick=function(){stop();go(k);};dots.appendChild(d);});
+function go(k){i=(k+frames.length)%frames.length;s.innerHTML=frames[i].html;cap.textContent=frames[i].cap;cnt.textContent=pad(i+1)+' / '+pad(frames.length);[].forEach.call(dots.children,function(d,j){d.setAttribute('aria-current',j===i?'true':'false');});}
+function halt(){if(t){clearInterval(t);t=null;}}function play(){if(reduce||paused||t)return;t=setInterval(function(){if(!paused)go(i+1);},2600);pb.textContent='❚❚';}function stop(){paused=true;halt();pb.textContent='▶';}
+document.getElementById('tuid-prev').onclick=function(){stop();go(i-1);};document.getElementById('tuid-next').onclick=function(){stop();go(i+1);};
+pb.onclick=function(){if(paused){paused=false;play();}else stop();};go(0);
+if('IntersectionObserver'in window)new IntersectionObserver(function(e){e.forEach(function(x){x.isIntersecting?play():halt();});},{threshold:.15}).observe(s);else play();
+})();
+</script>
+
+<h2>Launching it</h2>
+<pre><code>oak                 # the full dashboard
+oak --tab review    # open on one tab: herdr, observatory or review
+oak --session &lt;id&gt;  # pinned to one session
+oak --once          # print one plain frame and exit (for a pipe or CI)
+oak attach          # hand this terminal to herdr’s own client, with OAK in a pane</code></pre>
+
+<h2>The tabs</h2>
+<ul><li><a href="tui-herdr.html">herdr</a> runs the terminal engine’s real client, including machines and agent permissions. Its own tab bar starts agents; OAK’s outer bar keeps the three fixed tabs.</li>
+<li><a href="tui-observatory.html">Observatory</a> joins live panes and unresolved history beside a pinned native conversation, with an explicit reply composer.</li>
+<li><a href="tui-review.html">Review</a> presents captured diffs and Keep / Undo decisions.</li></ul>
+<p><kbd>ctrl+a</kbd> then <kbd>n</kbd>/<kbd>p</kbd>, or <kbd>1</kbd>–<kbd>3</kbd>, switches tabs. <kbd>ctrl+q</kbd> twice quits from any tab, including while herdr owns the keyboard; <kbd>ctrl+a</kbd> then <kbd>q</kbd> twice does the same. <kbd>ctrl+a</kbd> twice sends one <kbd>ctrl+a</kbd> to the program in the herdr tab, where Claude Code and Codex both use it to go to the start of the line; otherwise the leader takes a plain key next, so <kbd>ctrl+a</kbd> <kbd>ctrl+k</kbd> does nothing.</p>
+<p>Run <code>oak doctor --fix</code> to repair the required herdr setup. Use <code>oak machine add build-box user@host</code> to register a remote host.</p>

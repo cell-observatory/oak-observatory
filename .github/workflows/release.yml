@@ -2,7 +2,8 @@ name: Release
 
 # Cut a release by pushing a version tag:  git tag v0.2.0 && git push origin v0.2.0
 # CI re-runs the full suite, builds the share artifacts, and attaches them to a GitHub Release —
-# teammates install with `npm i -g ./claude-observatory-<ver>.tgz` and `code --install-extension *.vsix`.
+# teammates install with `npm i -g --allow-scripts=node-pty ./oak-observatory-<ver>.tgz` and
+# `code --install-extension *.vsix`.
 on:
   push:
     tags: ['v*']
@@ -36,6 +37,22 @@ jobs:
             exit 1
           fi
           echo "tag $TAG matches committed version $PKG_VER"
+      - name: Refuse to release until the GitHub repo is renamed
+        # Every updater/installer/doc URL targets cell-observatory/oak-observatory — `oak update`, the
+        # VS Code notifier's RELEASE_REPO, JB_PLUGIN_REPO_URL, the generated updatePlugins.xml URL, both
+        # install one-liners, and the README badges. If this repository still carries the OLD name at
+        # release time, all of those 404 and every 0.10.0 install ships un-updatable. Rename the GitHub
+        # repository to `oak-observatory` BEFORE pushing the tag; this gate makes a premature release
+        # impossible (fail fast, before the minutes of build below).
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          NWO="$(gh repo view --json nameWithOwner -q .nameWithOwner)"
+          if [ "$NWO" != "cell-observatory/oak-observatory" ]; then
+            echo "::error::repository is '$NWO', not cell-observatory/oak-observatory — rename the GitHub repo before tagging; the updater, installers, and docs all point at the new name and would 404 otherwise."
+            exit 1
+          fi
+          echo "repository is $NWO — release URLs will resolve"
       - run: npm ci
       - run: npm test
       - run: bash test/e2e.sh
@@ -53,37 +70,46 @@ jobs:
         run: |
           TAG="${GITHUB_REF_NAME}"
           VER="${TAG#v}"
-          cp release/claude-observatory.vsix "release/claude-observatory-vscode-${TAG}.vsix"
-          cp packages/jetbrains/build/distributions/*.zip "release/claude-observatory-jetbrains-${TAG}.zip"
+          cp release/oak-observatory.vsix "release/oak-observatory-vscode-${TAG}.vsix"
+          cp packages/jetbrains/build/distributions/*.zip "release/oak-observatory-jetbrains-${TAG}.zip"
           # JetBrains self-hosted plugin repository descriptor. IDEs subscribed to the stable URL
-          #   https://github.com/cell-observatory/claude-observatory/releases/latest/download/updatePlugins.xml
+          #   https://github.com/cell-observatory/oak-observatory/releases/latest/download/updatePlugins.xml
           # poll it for updates. It MUST be regenerated + attached every release — once this tag becomes
           # "latest", that URL serves this file, so a release without it 404s and auto-update goes silent.
           cat > release/updatePlugins.xml <<XML
           <?xml version="1.0" encoding="UTF-8"?>
           <plugins>
-            <plugin id="com.cell-observatory.claude-observatory" version="${VER}"
-                    url="https://github.com/cell-observatory/claude-observatory/releases/download/${TAG}/claude-observatory-jetbrains-${TAG}.zip">
-              <name>Claude Observatory</name>
+            <plugin id="com.cell-observatory.oak-observatory" version="${VER}"
+                    url="https://github.com/cell-observatory/oak-observatory/releases/download/${TAG}/oak-observatory-jetbrains-${TAG}.zip">
+              <name>OAK</name>
               <idea-version since-build="252"/>
             </plugin>
           </plugins>
           XML
+          # Release notes come from the hand-curated CHANGELOG section for this version — the
+          # migration and upgrade callouts live there, and old installs link users to this page.
+          # A tag with no section still releases, loudly, on generated notes.
+          awk -v ver="$VER" '$0 ~ "^## \\[" ver "\\]" {on=1; next} on && /^## \[/ {exit} on {print}' CHANGELOG.md > release/notes.md
+          if [ -s release/notes.md ]; then NOTES=(--notes-file release/notes.md); else
+            echo "::warning::no CHANGELOG section for ${VER} — falling back to generated notes"
+            NOTES=(--generate-notes)
+          fi
           gh release create "$TAG" \
-            release/claude-observatory-*.tgz \
-            "release/claude-observatory-vscode-${TAG}.vsix" \
-            "release/claude-observatory-jetbrains-${TAG}.zip" \
+            release/oak-observatory-*.tgz \
+            "release/oak-observatory-vscode-${TAG}.vsix" \
+            "release/oak-observatory-jetbrains-${TAG}.zip" \
             release/updatePlugins.xml \
-            --title "Claude Observatory ${TAG}" \
-            --generate-notes
+            --title "OAK ${TAG}" \
+            "${NOTES[@]}"
       - name: Publish CLI to npm (provenance)
         # Runs only if an NPM_TOKEN is configured; `npm test` above (version:check + lockfile) already
-        # gated this. Skips gracefully otherwise so the GitHub Release still succeeds.
+        # gated this. A missing token skips the publish but ANNOTATES the run, so a skipped publish is
+        # never silent.
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           if [ -z "${NODE_AUTH_TOKEN}" ]; then
-            echo "NPM_TOKEN not set — skipping npm publish (GitHub Release still created)."
+            echo "::warning::NPM_TOKEN not set — skipped the npm publish; the npm registry will not serve ${GITHUB_REF_NAME}."
             exit 0
           fi
           ( cd packages/cli && npm publish --provenance --access public )

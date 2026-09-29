@@ -19,7 +19,7 @@ import java.io.File
 import java.util.concurrent.TimeUnit
 
 /**
- * Drives the `claude-observatory` CLI — the backend for every store MUTATION (keep/undo/redo) and
+ * Drives the `oak` CLI — the backend for every store MUTATION (keep/undo/redo) and
  * for diff-dependent reads (locate). The undo engine's correctness lives in the CLI's TS core;
  * this plugin never reimplements it. All calls are blocking — run them on a background thread.
  */
@@ -34,28 +34,41 @@ object ObservatoryCli {
      *  and core's resolveClaudeBin). */
     fun resolveBin(): String {
         val home = System.getProperty("user.home")
-        val candidates = listOfNotNull(
-            ObservatorySettings.instance.state.observatoryBin,
-            System.getenv("CLAUDE_OBSERVATORY_BIN"),
-            "$home/.local/bin/claude-observatory",
-            "/opt/homebrew/bin/claude-observatory",
-            "/usr/local/bin/claude-observatory",
-            "$home/.npm-global/bin/claude-observatory",
-            "$home/.volta/bin/claude-observatory",
-            nvmBin(home, "claude-observatory"),
-            System.getenv("APPDATA")?.let { "$it\\npm\\claude-observatory.cmd" },
-        )
+        // Prefer the current `oak` bin; fall back to the pre-rename `claude-observatory` (still shipped
+        // as a deprecated alias) so a plugin that finds only an older CLI on disk still drives it.
+        val names = listOf("oak", "claude-observatory")
+        val candidates = buildList {
+            ObservatorySettings.instance.state.observatoryBin?.let { add(it) }
+            System.getenv("CLAUDE_OBSERVATORY_BIN")?.let { add(it) }
+            for (n in names) addAll(binCandidates(n, home) { System.getenv(it) })
+        }
         for (c in candidates) if (c.isNotBlank() && File(c).exists()) return c
-        return "claude-observatory" // PATH fallback
+        return "oak" // PATH fallback
     }
 
-    /** nvm has no stable bin dir — globals land under ~/.nvm/versions/node/<ver>/bin. */
-    private fun nvmBin(home: String, name: String): String? =
-        File("$home/.nvm/versions/node").listFiles()
-            ?.sortedByDescending { it.name }
-            ?.map { File(it, "bin/$name") }
-            ?.firstOrNull { it.exists() }
-            ?.path
+    /** Where a global install puts [name]: core's `resolveBin` list (analyze.ts), in its order, so this
+     *  plugin finds the CLI wherever VS Code does. nvm and fnm keep one bin dir per node version. */
+    internal fun binCandidates(name: String, home: String, env: (String) -> String?): List<String> = buildList {
+        fun versions(root: String): List<File> = File(root).listFiles()?.sortedByDescending { it.name } ?: emptyList()
+        add("$home/.local/bin/$name")
+        add("/opt/homebrew/bin/$name")
+        add("/usr/local/bin/$name")
+        add("/usr/bin/$name")
+        add("$home/.npm-global/bin/$name")
+        add("$home/.volta/bin/$name")
+        add("$home/.bun/bin/$name")
+        env("PNPM_HOME")?.let { add("$it/$name") }
+        add("$home/Library/pnpm/$name")
+        add("$home/.local/share/pnpm/$name")
+        add("$home/.asdf/shims/$name")
+        versions("$home/.nvm/versions/node").forEach { add(File(it, "bin/$name").path) }
+        // fnm: FNM_DIR when set, else its default root on Linux, then on macOS — the first that has versions.
+        listOfNotNull(env("FNM_DIR"), "$home/.local/share/fnm", "$home/Library/Application Support/fnm")
+            .firstOrNull { File(it, "node-versions").isDirectory }
+            ?.let { root -> versions("$root/node-versions").forEach { add(File(it, "installation/bin/$name").path) } }
+        env("APPDATA")?.let { add("$it\\npm\\$name.cmd") }
+        env("LOCALAPPDATA")?.let { add("$it\\Volta\\bin\\$name.exe"); add("$it\\pnpm\\$name.cmd") }
+    }
 
     private fun commandLine(args: List<String>, workDir: String?): GeneralCommandLine {
         // Windows: npm installs the CLI as a .cmd shim, which ProcessBuilder can't exec directly —
@@ -172,11 +185,6 @@ object ObservatoryCli {
         private fun fetch(session: String?, workDir: String?): Map<String, String?> {
             val args = buildList {
                 add("views"); add("--json")
-                // Configured machines, folded into the same batched spawn. The ssh happens in the CLI
-                // child process, never on the EDT, and the CLI caches each host for a minute — so a
-                // 3 s refresh tick asks for remotes at no cost until that minute is up. Asking here
-                // rather than on a timer of its own keeps the "one spawn per tick" promise intact.
-                add("--remote")
                 session?.takeIf { it.isNotBlank() }?.let { add("--session"); add(it) }
                 workDir?.let { add("--root"); add(it) }
             }
@@ -234,13 +242,13 @@ object ObservatoryCli {
                 } else {
                     proc.destroyForcibly()
                     tOut.join(500); tErr.join(500)
-                    CliResult(-1, outBuf.toString(), "claude-observatory timed out after ${timeoutMs}ms")
+                    CliResult(-1, outBuf.toString(), "oak timed out after ${timeoutMs}ms")
                 }
             } else {
                 val o = ExecUtil.execAndGetOutput(cmd, timeoutMs)
                 // ExecUtil signals a timeout via isTimeout, not a non-zero exit — treat it as a failure
                 // so callers don't mistake a killed run's partial output for a result.
-                if (o.isTimeout) CliResult(-1, o.stdout, "claude-observatory timed out after ${timeoutMs}ms")
+                if (o.isTimeout) CliResult(-1, o.stdout, "oak timed out after ${timeoutMs}ms")
                 else CliResult(o.exitCode, o.stdout, o.stderr)
             }
             out
@@ -251,7 +259,7 @@ object ObservatoryCli {
 
     // --- typed wrappers over the CLI's --json surface ---
 
-    /** Install the PreToolUse/PostToolUse capture hooks (non-interactive `claude-observatory init`). */
+    /** Install the PreToolUse/PostToolUse capture hooks (non-interactive `oak init`). */
     fun init(workDir: String?): CliResult = run(listOf("init"), workDir)
 
     /** Garbage-collect orphaned blobs in a session (`clean --session <id>`). */
@@ -259,6 +267,45 @@ object ObservatoryCli {
 
     /** Drop a whole session from the store (`clean --drop <id>`). */
     fun dropSession(session: String, workDir: String?): CliResult = run(listOf("clean", "--drop", session), workDir)
+
+    /** Remove a session from every picker and purge its captured edits for good (`sessions --delete <id>`),
+     *  backed by core.deleteSession. The agent's OWN transcript/rollout is left untouched — the durable
+     *  hidden-list is what keeps it gone — and `sessions --undelete <id>` lists the session again, never its
+     *  edits. [confirmedPending] is how many edits still pending review the caller's dialog named, and
+     *  [seenThrough] the newest edit id of the listing it counted from (its row's `lastEdit`): the CLI refuses
+     *  a session with more pending than that count, or with a pending edit newer than that id, so no edit
+     *  captured after the listing is purged unseen, even one that joined a change the count included. */
+    fun deleteSession(session: String, workDir: String?, confirmedPending: Int, seenThrough: Long?): CliResult =
+        run(listOf("sessions", "--delete", session) + (if (confirmedPending > 0) listOf("--force-pending", confirmedPending.toString()) else emptyList()) +
+            (if (seenThrough != null) listOf("--seen-through", seenThrough.toString()) else emptyList()) + "--json", workDir)
+
+    /** True only when [r] is the CLI saying it deleted [session] (`{"deleted": "<id>"}`). A CLI from before
+     *  `sessions --delete` (0.9.5, which the plugin still drives through its `claude-observatory` fallback)
+     *  ignores the flag and exits 0 with a listing: a success that deleted nothing. */
+    fun deletedSession(r: CliResult, session: String): Boolean = r.ok && runCatching {
+        JsonParser.parseString(r.stdout).asJsonObject.get("deleted")?.asString == session
+    }.getOrDefault(false)
+
+    /** Announce a raised hand on the desktop IF DUE (`notify --session …`, 2026-09-15): core's once-per-
+     *  machine claim and cooldown decide — the plugin cannot call core, so the row's facts go over as
+     *  flags and the SAME rule every surface uses answers. Fire-and-forget; never on the EDT. */
+    fun notifyHand(session: String, kind: String, ts: Long, title: String?, message: String, agent: String, workDir: String?): CliResult =
+        run(
+            listOf("notify", "--session", session, "--kind", kind, "--ts", ts.toString(), "--title", title ?: "", "--message", message, "--agent", agent, "--json"),
+            workDir,
+            timeoutMs = 10_000,
+        )
+
+    /** Every conversation's asks and answers, ranked (`search --json --query <text>`).
+     *  The first search builds core's per-session index, so its timeout is generous. The whole result,
+     *  so a failed run is never read as "no hits". */
+    fun search(query: String, workDir: String?): CliResult =
+        run(listOf("search", "--json", "--query", query, "--limit", "30"), workDir, timeoutMs = 120_000)
+
+    /** The next session waiting on the reader (`inbox --next [--after <id>] --json` → `{next, hand}`),
+     *  by core's ranking. The whole result, so a failed read is never read as "nobody waiting". */
+    fun inboxNext(after: String?, workDir: String?): CliResult =
+        run(listOf("inbox", "--next", "--json") + (after?.let { listOf("--after", it) } ?: emptyList()), workDir, timeoutMs = 15_000)
 
     /** Accept every pending edit in a session, then clear its records (`resolve --session <id>`).
      *  Files on disk are never touched, and the session itself is kept. */
@@ -273,6 +320,26 @@ object ObservatoryCli {
      * purpose: it must never delay the refresh that triggered it, and its failure costs a slow switch
      * rather than a broken panel — so the process is started and abandoned, never awaited.
      */
+    /** Re-gather the other machines' usage figures (fire-and-forget, warmRecent's shape) — the
+     *  status-bar refresh button's other half. */
+    /** Detached `oak usage --pull-account`: fetch the account's own usage into the statusline
+     *  cache — the numbers refresh with no claude session open. Fire-and-forget, like the gather. */
+    fun pullAccountUsage(workDir: String?) {
+        try {
+            val resolved = resolveBin()
+            val exec = if (SystemInfo.isWindows) listOf("cmd", "/c", resolved) else listOf(resolved)
+            ProcessBuilder(exec + listOf("usage", "--pull-account", "--json"))
+                .directory(workDir?.let { java.io.File(it) })
+                .redirectOutput(ProcessBuilder.Redirect.DISCARD)
+                .redirectError(ProcessBuilder.Redirect.DISCARD)
+                .start()
+        } catch (_: Exception) {
+            /* no CLI on PATH — the auto-pull from the next poll still runs */
+        }
+    }
+
+
+
     fun warmRecent(workDir: String?) {
         try {
             val resolved = resolveBin()
@@ -358,7 +425,15 @@ object ObservatoryCli {
         val units: Int? = null,
         /** The FIRST conflict's message — a named-dependent refusal must reach bulk readers too. */
         val firstConflict: String? = null,
+        /** Files rewritten whose status the store could not record: the CLI's sentence naming them and
+         *  the command that records them. Never shown as a plain success. */
+        val unrecorded: String? = null,
     )
+
+    /** The `unrecorded` report's message from a scope verb's JSON, or null (absent from older CLIs). */
+    internal fun unrecordedOf(o: com.google.gson.JsonObject): String? =
+        o.get("unrecorded")?.takeIf { it.isJsonObject }?.asJsonObject?.get("message")
+            ?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isString }?.asString
 
     private fun parseUndoScope(stdout: String): UndoScopeResult? = try {
         val o = JsonParser.parseString(stdout).asJsonObject
@@ -369,6 +444,7 @@ object ObservatoryCli {
             intList(o, "ids"),
             o.get("units")?.takeIf { it.isJsonPrimitive }?.asInt,
             firstConflict = o.get("firstConflict")?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isString }?.asString,
+            unrecorded = unrecordedOf(o),
         )
     } catch (_: Exception) {
         null
@@ -402,6 +478,8 @@ object ObservatoryCli {
         val ids: List<Int> = emptyList(),
         /** Review units, only on a `--from-prompt` restore (see [UndoScopeResult.units]). */
         val units: Int? = null,
+        /** See [UndoScopeResult.unrecorded]. */
+        val unrecorded: String? = null,
     )
 
     private fun parseRedoScope(stdout: String): RedoScopeResult? = try {
@@ -410,6 +488,7 @@ object ObservatoryCli {
             o.get("redone").asInt, o.get("conflicts").asInt, o.get("total").asInt,
             intList(o, "ids"),
             o.get("units")?.takeIf { it.isJsonPrimitive }?.asInt,
+            unrecorded = unrecordedOf(o),
         )
     } catch (_: Exception) {
         null
@@ -638,56 +717,22 @@ object ObservatoryCli {
         }
     }
 
+    /** `ignore --session <id>` — runs the sweep (core.dropIgnored) that drops records a newly-added
+     *  `.observatoryignore` now covers. A USER Refresh calls this before re-reading: adding the file fires
+     *  no capture hook, so the capture-time sweep never runs and a plain refresh (a read) leaves the
+     *  now-ignored records. Self-gating (a no-op when nothing matches). Best-effort. */
+    fun ignoreSweep(workDir: String?, session: String): Boolean {
+        if (session.isBlank()) return false
+        return run(listOf("ignore", "--session", session, "--json"), workDir).ok
+    }
+
     /** `store --move <dir>` (or `--default`). The move is the CLI's, shared with every other front end. */
-    fun storeMove(workDir: String?, dir: String?): RemoteChange {
+    fun storeMove(workDir: String?, dir: String?): ChangeResult {
         val res = run(if (dir == null) listOf("store", "--default") else listOf("store", "--move", dir), workDir)
-        return RemoteChange(if (res.ok) null else res.stderr.trim().ifBlank { "could not move the store" })
+        return ChangeResult(if (res.ok) null else res.stderr.trim().ifBlank { "could not move the store" })
     }
 
-    /** One configured machine, as `remotes --json` reports it. */
-    data class RemoteEntry(val name: String, val host: String, val configDir: String, val enabled: Boolean)
-
-    /** What a remotes mutation did, or why it refused. [error] carries the verb's own message verbatim
-     *  — inventing a friendlier one here would mean two messages for one rule. */
-    data class RemoteChange(val error: String?)
-
-    /** `remotes --json` — the machines this install looks for sessions on. Empty on any failure: a
-     *  chooser that cannot list must still open, and "none configured" is the honest reading of a CLI
-     *  too old to know the verb. */
-    fun remotes(workDir: String?): List<RemoteEntry>? {
-        val res = run(listOf("remotes", "--json"), workDir)
-        // NULL, not empty. prefs.json is written by the VS Code extension's bundled core and by the
-        // terminal dashboard, neither of which needs this CLI on PATH — so an older or missing binary
-        // would have reported "no machines configured" over a file holding several.
-        if (!res.ok) return null
-        return try {
-            val arr = JsonParser.parseString(res.stdout).asJsonObject.getAsJsonArray("remotes") ?: return emptyList()
-            arr.mapNotNull { e ->
-                val o = e.takeIf { it.isJsonObject }?.asJsonObject ?: return@mapNotNull null
-                RemoteEntry(
-                    name = o.get("name")?.takeIf { it.isJsonPrimitive }?.asString ?: return@mapNotNull null,
-                    host = o.get("host")?.takeIf { it.isJsonPrimitive }?.asString ?: "",
-                    configDir = o.get("configDir")?.takeIf { it.isJsonPrimitive }?.asString ?: "",
-                    enabled = o.get("enabled")?.takeIf { it.isJsonPrimitive }?.asBoolean ?: true,
-                )
-            }
-        } catch (_: Exception) {
-            null
-        }
-    }
-
-    /** `remotes --add "<spec>"`. Validation is the CLI's `parseRemoteSpec`, shared with the terminal's
-     *  options window, because both fields land in a shell running on ANOTHER machine. */
-    fun remoteAdd(workDir: String?, spec: String): RemoteChange {
-        val res = run(listOf("remotes", "--add", spec), workDir)
-        return RemoteChange(if (res.ok) null else res.stderr.trim().ifBlank { "could not add that machine" })
-    }
-
-    /** `remotes --remove|--enable|--disable <name>`. */
-    fun remoteChange(workDir: String?, flag: String, name: String): RemoteChange {
-        val res = run(listOf("remotes", flag, name), workDir)
-        return RemoteChange(if (res.ok) null else res.stderr.trim().ifBlank { "could not change that machine" })
-    }
+    data class ChangeResult(val error: String?)
 
     /** `sessions --json` — every store session incl. its human-readable title (0.8.6), for the chooser.
      *
@@ -774,6 +819,8 @@ object ObservatoryCli {
         val firstError: String? = null,
         /** The FIRST conflict's message — a named-dependent refusal must reach task-scoped readers too. */
         val firstConflict: String? = null,
+        /** See [UndoScopeResult.unrecorded]. */
+        val unrecorded: String? = null,
     )
 
     /** `task-undo <taskId>` — revert every PENDING edit in a task's STRICT span, newest-first.
@@ -788,6 +835,7 @@ object ObservatoryCli {
                 o.get("errors")?.takeIf { !it.isJsonNull }?.asInt ?: 0,
                 o.get("firstError")?.takeIf { !it.isJsonNull }?.asString,
                 firstConflict = o.get("firstConflict")?.takeIf { !it.isJsonNull }?.asString,
+                unrecorded = unrecordedOf(o),
             )
         } catch (_: Exception) {
             null
@@ -810,6 +858,7 @@ object ObservatoryCli {
                 o.get("errors")?.takeIf { !it.isJsonNull }?.asInt ?: 0,
                 o.get("firstError")?.takeIf { !it.isJsonNull }?.asString,
                 firstConflict = o.get("firstConflict")?.takeIf { !it.isJsonNull }?.asString,
+                unrecorded = unrecordedOf(o),
             )
         } catch (_: Exception) {
             null
@@ -928,7 +977,7 @@ object ObservatoryCli {
         return if (r.ok) r.stdout else null
     }
 
-    /** Claude's prose reply to one ask (its tool calls stripped) — the log a reviewer expands to read.
+    /** the agent's prose reply to one ask (its tool calls stripped) — the log a reviewer expands to read.
      *  Fetched on demand because it can be large. */
     fun promptResponseJson(session: String, promptId: String, workDir: String?): String? {
         val r = run(listOf("prompts", "--id", promptId, "--response", "--session", session, "--json"), workDir)
@@ -942,6 +991,8 @@ object ObservatoryCli {
      *  LIST — every diff renders in the editor, so shipping patch text here would be pure weight.
      *  Fetched on demand, like promptResponseJson — deliberately not batched: `views` hands one
      *  argument list to every view it runs, and this one's scope changes with the pick. */
+
+
     fun reviewJson(session: String, promptId: String?, workDir: String?): String? {
         val args = buildList {
             add("review")
@@ -961,7 +1012,12 @@ object ObservatoryCli {
         val args = buildList {
             add("feed"); add("--kind"); add(kind)
             if (id.isNotBlank()) { add("--id"); add(id) }
+            // --feed-limit is the feed's OWN depth channel (it outranks --limit); --limit rides along
+            // so an older CLI on PATH still honours the depth. --root scopes the read to the session's
+            // workspace — a sibling worktree's feed is unreadable without it.
+            add("--feed-limit"); add(limit.toString())
             add("--limit"); add(limit.toString())
+            workDir?.let { add("--root"); add(it) }
             add("--session"); add(session)
             add("--json")
         }
@@ -992,6 +1048,67 @@ object ObservatoryCli {
         } catch (_: Exception) {
             null
         }
+    }
+
+    /** #5 review comments: add a line comment on a pending edit through the CLI (the JVM stays out of
+     *  core). `line` 0 is a whole-edit note. Null on success, else the CLI's reason. The text rides as
+     *  ONE `--text=<text>` argument: a separate value starting with `--` (a markdown rule, "--force is
+     *  wrong here") is read by the CLI as a missing value. */
+    fun commentAdd(session: String, workDir: String?, unit: Int, line: Int, text: String): String? {
+        val args = buildList {
+            add("comment"); add("add"); add("--session"); add(session)
+            add("--edit"); add(unit.toString())
+            if (line > 0) { add("--line"); add(line.toString()) }
+            add("--text=$text")
+            workDir?.let { add("--root"); add(it) }
+        }
+        val r = run(args, workDir)
+        return if (r.ok) null else failureMessage(r.stdout, r.stderr, "`oak comment add` did not answer").removePrefix("oak: ")
+    }
+
+    data class CommentDraft(val text: String, val ids: List<String>)
+
+    /** Compose without consuming the ledger. Only an acknowledged prompt spends these exact ids. */
+    fun commentCompose(session: String, workDir: String?): CommentDraft? {
+        val r = run(listOf("comment", "compose", "--session", session, "--json"), workDir)
+        if (!r.ok) return null
+        return runCatching {
+            val o = JsonParser.parseString(r.stdout).asJsonObject
+            val text = o.get("text")?.asString.orEmpty()
+            if (text.isBlank()) null else CommentDraft(text, o.getAsJsonArray("ids")?.map { it.asString } ?: emptyList())
+        }.getOrNull()
+    }
+
+    /**
+     * Submit a draft to the session's agent through herdr (`oak prompt`). Null when it was sent, else the
+     * reason, as the CLI gave it. The draft rides as ONE `--text=<draft>` argument, since a separate value
+     * starting with `--` is read by the CLI as a missing one. The budget is the heavy one: a prompt to a
+     * saved machine makes several forwarded round trips, and a run killed mid-send may still deliver.
+     */
+    fun prompt(session: String, text: String, workDir: String?, commentIds: List<String> = emptyList()): String? {
+        val args = mutableListOf("prompt", "--session", session, "--text=$text", "--json")
+        if (commentIds.isNotEmpty()) { args.add("--comment-ids"); args.add(commentIds.joinToString(",")) }
+        val r = run(args, workDir, timeoutMs = HEAVY_TIMEOUT_MS)
+        val o = runCatching { JsonParser.parseString(r.stdout).asJsonObject }.getOrNull()
+        if (r.ok && o?.get("sent")?.takeIf { it.isJsonPrimitive }?.asBoolean == true) return null
+        if (r.stderr.startsWith("oak timed out")) return "`oak prompt` did not answer within ${HEAVY_TIMEOUT_MS / 60_000} minutes — the prompt may still have been delivered; check the session's pane before sending it again"
+        return o?.get("reason")?.takeIf { it.isJsonPrimitive }?.asString?.takeIf { it.isNotBlank() }
+            ?: failureMessage(r.stdout, r.stderr, "`oak prompt` did not answer").removePrefix("oak: ")
+    }
+
+    fun startAgent(kind: String, workDir: String?): ChangeResult {
+        val r = run(listOf("agent", "start", "--kind", kind, "--json"), workDir)
+        return ChangeResult(if (r.ok) null else r.stderr.trim().ifBlank { "could not start the agent in herdr" })
+    }
+
+    /** #6/#7: the agent's last reply as a `> ` block, for quoting/annotating in the next prompt. */
+    fun quoteLastReply(session: String, workDir: String?): String? {
+        val args = buildList {
+            add("quote"); add("--session"); add(session)
+            workDir?.let { add("--root"); add(it) }
+        }
+        val r = run(args, workDir)
+        return if (r.ok && r.stdout.isNotBlank()) r.stdout else null
     }
 
     /** Portable markdown review summary (kept/reverted per file) for export. */
@@ -1129,10 +1246,10 @@ object ObservatoryCli {
         return fallback
     }
 
-    /** Setup diagnostics as markdown. `doctor` exits 1 when there are failures but still prints, so
-     *  we take stdout regardless of the exit code. */
-    fun doctorMarkdown(workDir: String?): String? =
-        run(listOf("doctor", "--markdown"), workDir).stdout.takeIf { it.isNotBlank() }
+    /** Setup diagnostics as markdown. `doctor` exits 1 when there are failures but still prints, so the
+     *  caller takes stdout regardless of the exit code. It times forwarding to every saved herdr machine
+     *  (up to 30 s each, in turn), so it gets the heavy budget, the deadline VS Code gives it too. */
+    fun doctor(workDir: String?): CliResult = run(listOf("doctor", "--markdown"), workDir, timeoutMs = HEAVY_TIMEOUT_MS)
 
     /** `--claude-bin <path>` when the user set an explicit claude CLI path (Settings → Tools → Claude
      *  Observatory). Without this the setting is dead: a GUI-launched IDE with a stripped PATH can't
@@ -1265,7 +1382,7 @@ object ObservatoryCli {
             intList(o, "dependents"), intList(o, "closure"),
         )
     } catch (_: Exception) {
-        UndoResult(false, "error", r.stderr.ifBlank { "claude-observatory CLI not found — install it and set its path in Settings → Tools → Claude Observatory" })
+        UndoResult(false, "error", r.stderr.ifBlank { "oak CLI not found — install it and set its path in Settings → Tools → OAK" })
     }
 
     private fun parseInt(json: String, key: String): Int = try {

@@ -11,12 +11,14 @@
  */
 import * as fs from 'fs';
 import * as path from 'path';
-import { readLog, readBlob, findRecord, EditRecord, minOf, maxOf, sidecarMemo } from './store';
+import { readLog, readBlob, findRecord, EditRecord , minOf, maxOf, sidecarMemo } from './store';
 import { findTranscript } from './observe';
 import { findSubagentsDir } from './subagents';
 import { scoreCommand, CommandRisk } from './risk';
-import { cachedByFiles, readLines } from './fscache';
+import { readLines } from './fscache';
 import { taskId } from './changemap';
+import { transcriptFacts } from './derived-transcript';
+import { derivedInventory } from './derived';
 
 /** Coarse action kind, drives the timeline's icon + grouping + which rows the UI can dim/filter. */
 export type ActionCategory =
@@ -42,13 +44,23 @@ export interface ActionRecord {
   target: string;
   /** Secondary context when the tool has one (Bash description, Agent subagent_type, Grep path…). */
   detail?: string;
+  /** A shell call's FULL command (bounded at 24 lines / 2000 chars) — `target` is one flattened line
+   *  by design, and the whole thing must be readable on expand. Bash only. */
+  cmd?: string;
   /** false only when the correlated tool_result reported is_error (or the command failed). */
   ok: boolean;
   isError: boolean;
   /** Claude's reasoning (the assistant text/thinking that preceded this call), carried forward per message. */
   reasoning?: string;
+  /** WHICH of the two `reasoning` is: 'thinking' for an actual thinking block, 'text' for prose the
+   *  agent wrote to the reader. A surface that labels one as the other is lying about what it is
+   *  showing, and the two read very differently — prose is addressed to you, thinking is not. */
+  reasoningKind?: 'text' | 'thinking';
   /** For file-edit actions: the store EditRecord id this call produced, so the timeline can offer diff/keep/undo. */
   editId?: number;
+  /** DISPLAY-ONLY store id for the diff, set (by the feed) only when `editId` is null because this edit
+   *  interleaved with a subagent's on the same file. Never used for keep/undo — see FeedEntry.previewId. */
+  previewId?: number;
   /** For shell (Bash) actions: a risk score when the command is destructive / privileged / touches secrets. */
   risk?: CommandRisk;
   /** The tool_use id (correlates to its tool_result). */
@@ -146,7 +158,7 @@ export function compactLabel(ce: CompactionEvent): string {
   return parts.join(' · ');
 }
 
-const EDIT_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit']);
+const EDIT_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit', 'apply_patch']);
 
 /** Map a tool name to its coarse category. */
 export function categoryOf(tool: string): ActionCategory {
@@ -192,14 +204,29 @@ function oneLine(s: string, max = 300): string {
 }
 
 /** Best human-readable "what did this call act on" for a tool_use, plus optional secondary detail. */
-export function targetOf(tool: string, input: any): { target: string; detail?: string } {
+export function targetOf(tool: string, input: any): { target: string; detail?: string; cmd?: string } {
   const i = input && typeof input === 'object' ? input : {};
   // file_path / notebook_path are unambiguously a file; `path` is NOT (Grep/LS use it for a search dir),
   // so it is handled by the pattern/fallback branches below, not treated as the file target.
   const f = i.file_path || i.notebook_path;
   if (typeof f === 'string' && f) return { target: f, detail: undefined };
-  if (tool === 'Bash' && typeof i.command === 'string')
-    return { target: oneLine(i.command), detail: typeof i.description === 'string' ? i.description : undefined };
+  if (tool === 'Bash' && typeof i.command === 'string') {
+    const cmd = String(i.command);
+    const head = oneLine(cmd);
+    const desc = typeof i.description === 'string' ? i.description : undefined;
+    // The head row is ONE line by design — but the command must be READABLE whole on expand. It rides its
+    // own `cmd` field, BOUNDED (a giant heredoc must not bloat every poll's payload) and saying
+    // exactly how much it withheld. Its own field, never folded into `detail`: detail is the human
+    // description on every surface, and the two must stay separable.
+    const lines = cmd.trimEnd().split('\n');
+    const MAX_LINES = 24;
+    const MAX_CHARS = 2000;
+    let kept = lines.slice(0, MAX_LINES).join('\n');
+    if (kept.length > MAX_CHARS) kept = kept.slice(0, MAX_CHARS - 1) + '…';
+    const hidden = lines.length - Math.min(lines.length, MAX_LINES);
+    const body = hidden > 0 ? `${kept}\n… +${hidden} more line${hidden === 1 ? '' : 's'} (the transcript has it whole)` : kept;
+    return { target: head, detail: desc, cmd: body };
+  }
   if ((tool === 'Task' || tool === 'Agent')) {
     const desc = typeof i.description === 'string' ? i.description : typeof i.prompt === 'string' ? oneLine(i.prompt, 120) : '';
     return { target: desc || '(subagent)', detail: typeof i.subagent_type === 'string' ? i.subagent_type : undefined };
@@ -240,118 +267,171 @@ function toMs(v: unknown): number {
  */
 export function parseTranscriptActions(transcriptPath: string, opts?: { includeSidechain?: boolean }): ActionRecord[] {
   const includeSidechain = opts?.includeSidechain ?? false;
-  // Memoized per (file mtime,size) — one Overview refresh used to re-parse the same multi-MB transcript
-  // ~6× across views (the "Overview is slow" fix). Attribution (editId linking) mutates records per
-  // caller context, so hand out fresh per-record copies and keep the cached master pristine.
-  const master = cachedByFiles(`actions:${includeSidechain}`, [transcriptPath], () =>
-    parseTranscriptActionsUncached(transcriptPath, includeSidechain)
-  );
-  return master.map((a) => ({ ...a }));
+  // Attribution mutates records; the persisted facts never contain store-dependent edit IDs.
+  return transcriptFacts(transcriptPath, includeSidechain).actions.actions.map((a) => ({ ...a }));
 }
 
-function parseTranscriptActionsUncached(transcriptPath: string, includeSidechain: boolean): ActionRecord[] {
-  let lines: string[];
+/** One assistant message's own words: its prose to the reader, or its thinking — as a record of its
+ *  own rather than only the `reasoning` a later tool call carries forward. The feed lists these so a
+ *  reply that called no tool (the answer that closes a turn) is a row and not a lost message. */
+export interface ProseRecord {
+  /** ms epoch of the message's transcript line (0 if it carried no timestamp). */
+  ts: number;
+  kind: 'text' | 'thinking';
+  /** The message's text blocks joined (or its thinking blocks) — the exact string its tool calls
+   *  carry as `reasoning`, so a renderer that prints reasoning only where it CHANGES never repeats
+   *  this record under the call that follows it. */
+  text: string;
+}
+
+export interface ActionFacts {
+  actions: ActionRecord[];
+  resultErr: Map<string, boolean>;
+  byId: Map<string, number[]>;
+  lastReasoning: string;
+  lastReasoningKind: 'text' | 'thinking';
+  proseIndex: ProseIndex[];
+}
+
+export function newActionFacts(): ActionFacts {
+  return { actions: [], resultErr: new Map(), byId: new Map(), lastReasoning: '', lastReasoningKind: 'text', proseIndex: [] };
+}
+
+/** A prose row's location in the source, with no copy of its body in the shared facts. */
+export interface ProseIndex {
+  ts: number;
+  kind: 'text' | 'thinking';
+  offset: number;
+  length: number;
+}
+
+/** The same join rule for carried reasoning and prose read from an indexed line. */
+function assistantWords(o: any): { text: string; think: string } {
+  let text = '', think = '';
+  if (o?.message?.role !== 'assistant' || !Array.isArray(o.message.content)) return { text, think };
+  for (const b of o.message.content) {
+    if (b && b.type === 'text' && typeof b.text === 'string') text += (text ? '\n' : '') + b.text.trim();
+    else if (b && b.type === 'thinking') {
+      const th = typeof b.thinking === 'string' ? b.thinking : typeof b.text === 'string' ? b.text : '';
+      if (th) think += (think ? '\n' : '') + th.trim();
+    }
+  }
+  return { text, think };
+}
+
+/** Read only the selected source lines; two kinds from one message share a single read/parse. */
+export function readTranscriptProse(transcriptPath: string, index: ProseIndex[]): ProseRecord[] {
+  if (!index.length) return [];
+  let fd: number;
+  try { fd = fs.openSync(transcriptPath, 'r'); } catch { return []; }
   try {
-    lines = readLines(transcriptPath);
-  } catch {
-    return [];
-  }
-
-  const actions: ActionRecord[] = [];
-  const resultErr = new Map<string, boolean>(); // tool_use_id -> is_error
-  let lastReasoning = '';
-
-  for (const line of lines) {
-    const t = line.trim();
-    if (!t) continue;
-    let o: any;
-    try {
-      o = JSON.parse(t);
-    } catch {
-      continue;
-    }
-    // A compaction is a harness event, not a tool call: its record carries no `message` at all, so it
-    // must be read BEFORE the message gate below. It earns a timeline row because losing context is
-    // the single most consequential thing that happens to a session — everything above the boundary
-    // was summarized away, which is why later turns can "forget" earlier work.
-    if (o.isSidechain !== true || includeSidechain) {
-      const ce = parseCompactLine(o);
-      if (ce) {
-        actions.push({
-          ts: ce.ts,
-          // Not a tool name: every surface prints `tool` verbatim, and "CompactBoundary" in that slot
-          // reads as though Claude called it. The harness did this TO the session.
-          tool: 'Compaction',
-          category: 'compact',
-          target: compactLabel(ce),
-          detail: 'context compacted — earlier turns summarized',
-          ok: true,
-          isError: false,
-          compact: ce,
-        });
-        continue;
+    const lines = new Map<number, ReturnType<typeof assistantWords>>();
+    return index.map((p) => {
+      let words = lines.get(p.offset);
+      if (!words) {
+        const buf = Buffer.alloc(p.length);
+        let got = 0;
+        while (got < buf.length) {
+          const n = fs.readSync(fd, buf, got, buf.length - got, p.offset + got);
+          if (!n) break;
+          got += n;
+        }
+        try { words = assistantWords(JSON.parse(buf.subarray(0, got).toString('utf8'))); }
+        catch { words = { text: '', think: '' }; }
+        lines.set(p.offset, words);
       }
-    }
+      return { ts: p.ts, kind: p.kind, text: p.kind === 'thinking' ? words.think : words.text };
+    });
+  } finally { fs.closeSync(fd); }
+}
 
-    const msg = o.message;
-    if (!msg || !Array.isArray(msg.content)) continue;
-
-    // A subagent's own tool calls live in separate subagents/*.jsonl files (0.7.0); a legacy transcript
-    // that inlines them (isSidechain) would double-count, so skip those unless we're parsing the
-    // subagent file itself.
-    if (o.isSidechain === true && !includeSidechain) continue;
-
-    if (msg.role === 'user') {
-      for (const b of msg.content) {
-        if (b && b.type === 'tool_result' && typeof b.tool_use_id === 'string') resultErr.set(b.tool_use_id, !!b.is_error);
-      }
-      continue;
-    }
-    if (msg.role !== 'assistant') continue;
-
-    // Carry the message's reasoning forward (Claude often explains in one message, acts in the next).
-    let text = '';
-    let think = '';
-    for (const b of msg.content) {
-      if (b.type === 'text' && typeof b.text === 'string') text += (text ? '\n' : '') + b.text.trim();
-      else if (b.type === 'thinking') {
-        const th = typeof b.thinking === 'string' ? b.thinking : typeof b.text === 'string' ? b.text : '';
-        if (th) think += (think ? '\n' : '') + th.trim();
-      }
-    }
-    const reasoning = text || think;
-    if (reasoning) lastReasoning = reasoning;
-
-    const ts = toMs(o.timestamp ?? o.ts);
-    for (const b of msg.content) {
-      if (b.type !== 'tool_use' || typeof b.name !== 'string') continue;
-      const { target, detail } = targetOf(b.name, b.input);
-      // Score the FULL command (not the truncated display target) for shell actions.
-      const risk = b.name === 'Bash' && b.input && typeof b.input.command === 'string' ? scoreCommand(b.input.command) : null;
+/** Fold one record; pending calls and reasoning survive complete-line cursor boundaries. */
+export function foldActionFacts(state: ActionFacts, o: any, includeSidechain: boolean, offset: number, length: number): void {
+  const { actions, resultErr, byId } = state;
+  let { lastReasoning, lastReasoningKind } = state;
+  // A compaction is a harness event, not a tool call: its record carries no `message` at all, so it
+  // must be read BEFORE the message gate below. It earns a timeline row because losing context is
+  // the single most consequential thing that happens to a session — everything above the boundary
+  // was summarized away, which is why later turns can "forget" earlier work.
+  if (o.isSidechain !== true || includeSidechain) {
+    const ce = parseCompactLine(o);
+    if (ce) {
       actions.push({
-        ts,
-        tool: b.name,
-        category: categoryOf(b.name),
-        target,
-        detail,
-        plan: planFactsOf(b.name, b.input),
-        ok: true, // provisional — folded from resultErr below
+        ts: ce.ts,
+        // Not a tool name: every surface prints `tool` verbatim, and "CompactBoundary" in that slot
+        // reads as though Claude called it. The harness did this TO the session.
+        tool: 'Compaction',
+        category: 'compact',
+        target: compactLabel(ce),
+        detail: 'context compacted — earlier turns summarized',
+        ok: true,
         isError: false,
-        reasoning: lastReasoning || undefined,
-        risk: risk ?? undefined,
-        toolUseId: typeof b.id === 'string' ? b.id : undefined,
+        compact: ce,
       });
+      return;
     }
   }
 
-  // Fold in each call's result (transcript-order guarantees the result line came after its tool_use).
-  for (const a of actions) {
-    if (a.toolUseId && resultErr.has(a.toolUseId)) {
-      a.isError = resultErr.get(a.toolUseId)!;
-      a.ok = !a.isError;
+  const msg = o.message;
+  if (!msg || !Array.isArray(msg.content)) return;
+
+  // A subagent's own tool calls live in separate subagents/*.jsonl files (0.7.0); a legacy transcript
+  // that inlines them (isSidechain) would double-count, so skip those unless we're parsing the
+  // subagent file itself.
+  if (o.isSidechain === true && !includeSidechain) return;
+
+  if (msg.role === 'user') {
+    for (const b of msg.content) {
+      if (b && b.type === 'tool_result' && typeof b.tool_use_id === 'string') {
+        resultErr.set(b.tool_use_id, !!b.is_error);
+        for (const index of byId.get(b.tool_use_id) ?? []) {
+          actions[index].isError = !!b.is_error;
+          actions[index].ok = !b.is_error;
+        }
+      }
     }
+    return;
   }
-  return actions;
+  if (msg.role !== 'assistant') return;
+
+  // Carry the message's reasoning forward (Claude often explains in one message, acts in the next).
+  const { text, think } = assistantWords(o);
+  const reasoning = text || think;
+  if (reasoning) {
+    lastReasoning = reasoning;
+    lastReasoningKind = text ? 'text' : 'thinking';
+  }
+
+  state.lastReasoning = lastReasoning;
+  state.lastReasoningKind = lastReasoningKind;
+  const ts = toMs(o.timestamp ?? o.ts);
+  // The message's OWN words, as records: thinking first (it precedes the prose in the message, and in
+  // time), then what it said. A reply with no tool call after it was otherwise on no surface.
+  if (think) state.proseIndex.push({ ts, kind: 'thinking', offset, length });
+  if (text) state.proseIndex.push({ ts, kind: 'text', offset, length });
+  for (const b of msg.content) {
+    if (!b || b.type !== 'tool_use' || typeof b.name !== 'string') continue;
+    const { target, detail, cmd } = targetOf(b.name, b.input);
+    // Score the FULL command (not the truncated display target) for shell actions.
+    const risk = b.name === 'Bash' && b.input && typeof b.input.command === 'string' ? scoreCommand(b.input.command) : null;
+    const id = typeof b.id === 'string' ? b.id : undefined;
+    if (id) byId.set(id, [...(byId.get(id) ?? []), actions.length]);
+    actions.push({
+      ts,
+      tool: b.name,
+      category: categoryOf(b.name),
+      target,
+      detail,
+      cmd,
+      plan: planFactsOf(b.name, b.input),
+      ok: !(id && resultErr.get(id)),
+      isError: id ? resultErr.get(id) ?? false : false,
+      reasoning: lastReasoning || undefined,
+      reasoningKind: lastReasoning ? lastReasoningKind : undefined,
+      risk: risk ?? undefined,
+      toolUseId: typeof b.id === 'string' ? b.id : undefined,
+    });
+  }
 }
 
 /**
@@ -506,7 +586,7 @@ function subagentEditStreams(cwd: string, sessionId: string): EditAttributionAut
   if (!dir) return [];
   let files: string[];
   try {
-    files = fs.readdirSync(dir).filter((f) => f.startsWith('agent-') && f.endsWith('.jsonl'));
+    files = derivedInventory(`action-subagents:${dir}`, () => fs.readdirSync(dir).filter((f) => f.startsWith('agent-') && f.endsWith('.jsonl')));
   } catch {
     return [];
   }
@@ -521,7 +601,7 @@ function subagentEditStreams(cwd: string, sessionId: string): EditAttributionAut
  * record inside a subagent's action window for that file belongs to the subagent, so the main chain
  * must not consume it, and an interleaved same-file overlap leaves both sides null (unassigned).
  */
-function linkEditIds(cwd: string, sessionId: string, actions: ActionRecord[]): void {
+export function linkEditIds(cwd: string, sessionId: string, actions: ActionRecord[]): void {
   attributeEditIds(sessionId, [{ agentId: null, edits: actions }, ...subagentEditStreams(cwd, sessionId)]);
 }
 
@@ -719,7 +799,16 @@ export function agentPhaseDetail(transcriptPath: string): PhaseResult {
   const pending = new Map<string, string>(); // tool_use_id -> tool name (no tool_result seen after it)
   let lastKind: 'result' | 'assistant_end' | 'none' = 'none';
   let lastResultErr = false;
+  let nativeTurn: 'working' | 'done' | null = null;
   for (const o of objs) {
+    if (o?.runtime === 'codex' && o.type === 'system') {
+      if (o.subtype === 'task_started') { nativeTurn = 'working'; pending.clear(); lastKind = 'none'; }
+      if (o.subtype === 'task_complete' || o.subtype === 'turn_aborted') {
+        nativeTurn = 'done'; pending.clear(); lastKind = 'none';
+      }
+      continue;
+    }
+    if (o?.usageOnly) continue;
     const msg = o && o.message;
     if (!msg || !Array.isArray(msg.content)) continue;
     if (msg.role === 'assistant') {
@@ -748,6 +837,9 @@ export function agentPhaseDetail(transcriptPath: string): PhaseResult {
   const childMs = newestChildActivityMs(transcriptPath);
   const age = Date.now() - Math.max(mtimeMs, childMs);
   const childAge = childMs > 0 ? Date.now() - childMs : Infinity;
+  // Codex supplies explicit turn boundaries; quota events and old unfinished calls do not
+  // override a terminal boundary. Claude continues to use its existing structural heuristics.
+  if (nativeTurn === 'done' && childAge >= DONE_STALE_MS) return { phase: 'done', confidence: 'high' };
   // 1. A pending tool_use that blocks on the user => awaiting-input (structural).
   for (const name of pending.values()) {
     if (INPUT_TOOLS.has(name)) return { phase: 'awaiting-input', confidence: 'high' };
@@ -762,6 +854,7 @@ export function agentPhaseDetail(transcriptPath: string): PhaseResult {
   // 3. No pending tool_use.
   //    a. A trailing error result => errored (structural).
   if (lastKind === 'result' && lastResultErr) return { phase: 'errored', confidence: 'high' };
+  if (nativeTurn === 'working') return { phase: 'working', confidence: 'high' };
   //    b. A trailing (non-error) tool_result means the turn is UNFINISHED — a conversation can't end on a
   //       tool_result; it always obligates an assistant follow-up. So the agent is mid-turn (generating the
   //       next step), NOT idle. Fresh => working (structural, same as an active tool_use); long-stale =>

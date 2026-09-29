@@ -12,19 +12,19 @@ import java.io.File
 class ViewBatchTest : BasePlatformTestCase() {
 
     private fun cliOnPath(): Boolean = runCatching {
-        ProcessBuilder("claude-observatory", "--version").start().waitFor() == 0
+        ProcessBuilder("oak", "--version").start().waitFor() == 0
     }.getOrDefault(false)
 
     fun testBatchedViewsMatchTheirOwnCommands() {
         if (!cliOnPath()) {
-            println("SKIPPED ViewBatchTest: `claude-observatory` is not on PATH")
+            println("SKIPPED ViewBatchTest: `oak` is not on PATH")
             return
         }
         val home = File(System.getProperty("java.io.tmpdir"), "obs-batch-home-${System.nanoTime()}")
         val work = File(System.getProperty("java.io.tmpdir"), "obs-batch-ws-${System.nanoTime()}")
         home.mkdirs(); work.mkdirs()
         fun cli(vararg args: String): String {
-            val pb = ProcessBuilder(listOf("claude-observatory") + args).directory(work).redirectErrorStream(false)
+            val pb = ProcessBuilder(listOf("oak") + args).directory(work).redirectErrorStream(false)
             pb.environment()["HOME"] = home.absolutePath
             val p = pb.start()
             val out = p.inputStream.bufferedReader().readText()
@@ -69,7 +69,7 @@ class ViewBatchTest : BasePlatformTestCase() {
      */
     fun testTheUnbatchedPathStillAnswers() {
         if (!cliOnPath()) {
-            println("SKIPPED ViewBatchTest: `claude-observatory` is not on PATH")
+            println("SKIPPED ViewBatchTest: `oak` is not on PATH")
             return
         }
         val settings = com.cellobservatory.observatory.settings.ObservatorySettings.instance.state
@@ -80,7 +80,7 @@ class ViewBatchTest : BasePlatformTestCase() {
         try {
             settings.configDir = cfg.absolutePath
             // A real replay through the real pipeline, into the throwaway config dir.
-            val pb = ProcessBuilder("claude-observatory", "demo", "--fast").directory(work)
+            val pb = ProcessBuilder("oak", "demo", "--fast").directory(work)
             pb.environment()["CLAUDE_CONFIG_DIR"] = cfg.absolutePath
             pb.redirectErrorStream(true)
             val p = pb.start(); p.inputStream.readBytes(); p.waitFor()
@@ -91,7 +91,7 @@ class ViewBatchTest : BasePlatformTestCase() {
         } finally {
             settings.configDir = prevCfg
             runCatching {
-                val pb = ProcessBuilder("claude-observatory", "demo", "--clean").directory(work)
+                val pb = ProcessBuilder("oak", "demo", "--clean").directory(work)
                 pb.environment()["CLAUDE_CONFIG_DIR"] = cfg.absolutePath
                 pb.start().waitFor()
             }

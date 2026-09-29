@@ -23,9 +23,9 @@ CLI / VS Code / JetBrains
 - [ ] Shipped in **JetBrains** (`packages/jetbrains`)
 - [ ] Shared logic lives in **core** (`packages/core`) and is exposed via **CLI `--json`** (`packages/cli`)
 - [ ] `--json` field names are **identical** across CLI / VS Code / JetBrains (stable contract; add, don't rename)
-- [ ] 4 test suites updated as needed: core unit (`packages/core/test/core.test.js`), e2e (`test/e2e.sh`), VS Code smoke (`packages/vscode/test/smoke.test.js`), Kotlin port-fidelity (`packages/jetbrains/.../StoreReaderTest.kt` / `SessionResolverTest.kt`)
+- [ ] 4 test suites updated as needed: core unit (`packages/core/test/core.test.js`), e2e (`test/e2e.sh`), VS Code smoke (`packages/vscode/test/smoke.test.js`), Kotlin port-fidelity (`packages/jetbrains/.../StoreReaderTest.kt` / `SessionsRowsTest.kt`)
 - [ ] `node scripts/version.mjs` run (versions in lockstep)
 - [ ] Screenshots / docs updated (`scripts/render-media.mjs`, README, `docs/`)
-- [ ] One line added under `## [Unreleased]` in `CHANGELOG.md` (the promote renames that section to the release version)
+- [ ] One line added under `## [Unreleased]` in `CHANGELOG.md` (the release stamp renames that section to the release version)
 
 <!-- Platform-specific PRs are the exception — if you deliberately skip a platform, say why here. -->

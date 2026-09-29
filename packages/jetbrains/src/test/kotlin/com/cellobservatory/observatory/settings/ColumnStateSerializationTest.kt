@@ -31,6 +31,21 @@ class ColumnStateSerializationTest {
     }
 
     @Test
+    fun `a column folded under a retired Timeline member key is dropped, its neighbours kept`() {
+        // 0.10.0 renamed the Timeline's `agent` member to `conversation`, and 2026-09-23 folded
+        // Conversation into the Feed. A settings file from either era can fold a column that now names
+        // no member. Those keys are dropped on load — not transferred to the Feed, whose fold is its
+        // own — and the neighbour proves the drop touches nothing else.
+        val old = ObservatorySettings.State().apply { collapsedColumns = mutableListOf("agent", "conversation", "observations") }
+        val loaded = ObservatorySettings().apply { loadState(old) }.state
+        assertEquals(
+            "retired keys go, the neighbour stays",
+            listOf("observations"),
+            loaded.collapsedColumns,
+        )
+    }
+
+    @Test
     fun `a settings file written before these fields existed still loads`() {
         // What an older claude-observatory.xml looks like: no column state at all.
         val old = org.jdom.Element("State").apply {
@@ -41,4 +56,15 @@ class ColumnStateSerializationTest {
         assertEquals("an absent list reads as nothing folded", 0, back.collapsedColumns.size)
         assertEquals("and the value it DID carry still lands", false, back.inlineReview)
     }
+
+    @Test
+    fun `old Timeline divider indexes cannot size the new Feed column`() {
+        val state = ObservatorySettings.State().apply {
+            columnSplits = linkedMapOf("timeline:0" to 0.8f, "timeline:1" to 0.7f, "timeline-feed:0" to 0.3f, "sessions-fleet:0" to 0.4f)
+        }
+        val loaded = ObservatorySettings().apply { loadState(state) }.state
+        assertEquals(mapOf("timeline-feed:0" to 0.3f, "sessions-fleet:0" to 0.4f), loaded.columnSplits)
+        assertEquals("timeline-feed", com.cellobservatory.observatory.model.NavGrouping.TIMELINE)
+    }
+
 }

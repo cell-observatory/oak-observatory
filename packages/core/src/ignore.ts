@@ -295,7 +295,7 @@ const NOT_IGNORED: IgnoreDecision = { ignored: false, rule: null, matched: null 
  * the true set of inputs the answers depend on.
  */
 
-export function ignoreContext(opts?: { home?: string | null }): IgnoreContext {
+export function ignoreContext(opts?: { home?: string | null; gitignore?: boolean }): IgnoreContext {
   const byDir = new Map<string, IgnoreLayer[]>();
   // One decision per distinct (path, isDir) within a context. A session's log holds many edits per
   // file — 7,922 records over 3,957 files on the largest store here — and every one of them asks the
@@ -332,7 +332,12 @@ export function ignoreContext(opts?: { home?: string | null }): IgnoreContext {
     if (hit !== undefined) return hit;
     const base = dir.replace(/\/$/, '');
     const out: IgnoreLayer[] = [];
-    for (const name of [REPO_PRIVATE_IGNORE, IGNORE_FILE]) {
+    // With `gitignore`, each directory's `.gitignore` is the weakest layer it contributes — what git
+    // itself would not track is not what a person reviews, and it is where the bulk of a checkout
+    // lives (a JetBrains cache dir carried 4,427 of the 4,970 files that overflowed the Bash walk on
+    // this repo, 2026-09-23). Only the Bash tree walk asks for it; every other reader keeps the
+    // observatory rules alone.
+    for (const name of [...(opts?.gitignore ? ['.gitignore'] : []), REPO_PRIVATE_IGNORE, IGNORE_FILE]) {
       const file = base + '/' + name;
       const rules = loadFile(file, false);
       if (rules && rules.length) {

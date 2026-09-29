@@ -34,7 +34,7 @@ import javax.swing.tree.DefaultTreeModel
 import javax.swing.tree.TreeSelectionModel
 
 /**
- * File History: the ACTIVE editor's Claude edits, oldest→newest (id · time · status · reasoning).
+ * File History: the ACTIVE editor's agent edits, oldest→newest (id · time · status · reasoning).
  * Follows the selected file via FileEditorManagerListener.selectionChanged; repaints on every store
  * change (service listener) and reasoning refresh (ObserveCache). Flat — no folder/class grouping.
  * The store read-primitive: service.log().filter { it.file == storeKey(<activeFile>.path) } — absolute-path
@@ -49,7 +49,7 @@ class FileHistoryPanel(private val project: Project) : SimpleToolWindowPanel(tru
         isRootVisible = false
         showsRootHandles = false
         selectionModel.selectionMode = TreeSelectionModel.SINGLE_TREE_SELECTION
-        emptyText.text = "Open a file Claude has edited to see its history"
+        emptyText.text = "Open a file the agent has edited to see its history"
         cellRenderer = Renderer(project)
     }
 
@@ -93,8 +93,8 @@ class FileHistoryPanel(private val project: Project) : SimpleToolWindowPanel(tru
         val edits = if (file == null) emptyList()
         else service().log().filter { it.file == ClaudePaths.storeKey(file.path) }.sortedWith(compareBy({ it.ts }, { it.id }))
         tree.emptyText.text =
-            if (file == null) "Open a file Claude has edited to see its history"
-            else "No Claude edits in ${file.name}"
+            if (file == null) "Open a file the agent has edited to see its history"
+            else "No agent edits in ${file.name}"
         root.removeAllChildren()
         for (rec in edits) root.add(DefaultMutableTreeNode(rec))
         model.reload()
@@ -108,7 +108,7 @@ class FileHistoryPanel(private val project: Project) : SimpleToolWindowPanel(tru
             // Directional icons so prev/next read at a glance without hovering (they shared one Diff icon).
             action("Diff Previous Revision", AllIcons.Actions.Back) { stepRevision(-1) },
             action("Diff Next Revision", AllIcons.Actions.Forward) { stepRevision(1) },
-            action("Refresh", AllIcons.Actions.Refresh) { service().refresh() },
+            action("Refresh", AllIcons.Actions.Refresh) { service().sweepIgnoredThen { service().refresh(force = true) } },
         )
         val tb = ActionManager.getInstance().createActionToolbar("ClaudeObservatoryFileHistory", group, true)
         tb.targetComponent = tree
@@ -128,7 +128,7 @@ class FileHistoryPanel(private val project: Project) : SimpleToolWindowPanel(tru
         action("Undo", NavTint.UNDO) {
             selectedEdit()?.takeIf { !it.undone }?.let { rec -> withSession { s -> ReviewOps.undoOrRedo(project, s, rec, redo = false) } }
         },
-        action("Redo", AllIcons.Actions.Redo) {
+        action("Redo", NavTint.REDO) {
             selectedEdit()?.takeIf { it.undone }?.let { rec -> withSession { s -> ReviewOps.undoOrRedo(project, s, rec, redo = true) } }
         },
         action("Chat About Edit", NavTint.CHAT) {
@@ -136,11 +136,11 @@ class FileHistoryPanel(private val project: Project) : SimpleToolWindowPanel(tru
         },
     )
 
-    /** Step the active editor's Claude revisions in a current-vs-revision diff (parity with the
+    /** Step the active editor's agent revisions in a current-vs-revision diff (parity with the
      *  ⌥⌘[ / ⌥⌘] editor actions). Needs a text editor — the diff pane is not one. */
     private fun stepRevision(dir: Int) {
         val editor = FileEditorManager.getInstance(project).selectedTextEditor
-            ?: return ReviewOps.notify(project, "Open a file to navigate its Claude revisions")
+            ?: return ReviewOps.notify(project, "Open a file to navigate its agent revisions")
         RevisionNav.step(project, editor, dir)
     }
 

@@ -4,21 +4,42 @@ import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 
 /**
- * Kotlin mirror of core's live-feed view-model, parsed from `claude-observatory feed --json`: what ONE
+ * Kotlin mirror of core's live-feed view-model, parsed from `oak feed --json`: what ONE
  * thing in the Overview is doing — an agent, a workflow run, a task, a background shell, or the session
  * itself — as a bounded tail of the file that thing writes as it works.
  */
 data class FeedEntry(
     /** ms epoch; 0 for raw output lines, which carry no timestamp of their own. */
     val ts: Long,
-    /** 'action' | 'output' | 'reasoning'. */
+    /** 'action' | 'output' | 'reasoning' | 'permission' | 'prompt'. */
     val kind: String,
     /** The headline: a tool call, or one line of output. */
     val label: String,
-    /** Secondary context — the tool's target, or which agent produced it. */
+    /** WHAT the call acted on — the path, the command, the query. It belongs beside the verb: a row
+     *  naming only its tool ("Edit") tells a reader nothing they can act on. */
+    val target: String?,
+    /** Secondary context — which agent produced it. Never the target: that has its own field. */
     val detail: String?,
     /** false when the call reported an error; null when not applicable. */
     val ok: Boolean?,
+    /** core's tool category (edit · exec · read · search · web · agent · todo · mcp · meta · …).
+     *  `exec` is the one renderers key on: a shell call draws as a shell call, never as a tool name. */
+    val category: String?,
+    /** The tool's own secondary context (a Bash description, a Grep path) — a rail row, not the target. */
+    val note: String?,
+    /** The reasoning core carried FORWARD per message — consecutive calls share it, so a renderer
+     *  prints it only where it CHANGED. */
+    val reasoning: String?,
+    /** 'thinking' | 'text' — labels the reasoning row (thinking vs what the agent said out loud). */
+    val reasoningKind: String?,
+    /** kind 'prompt' only: the user's ask, complete — renderers wrap it. */
+    val promptText: String?,
+    /** A shell call's full, un-flattened command (`target` holds the capped one-line form). */
+    val cmd: String?,
+    /** Strict attribution to a captured edit — the id keep/undo may act on. Null when unattributed. */
+    val editId: Int?,
+    /** DISPLAY-ONLY recovery when strict attribution refused: the diff may be shown, never mutated. */
+    val previewId: Int?,
 )
 
 data class Feed(
@@ -42,6 +63,13 @@ data class Feed(
     val lastTs: Long,
     /** Set when the feed can only be partial, and why — rendered instead of a blank pane. */
     val note: String?,
+    /** The session recap, riding session-kind feeds only (the CLI merges recapOf into the payload). */
+    val recap: String?,
+    /** Where the recap came from: 'analysis' | 'title' | 'summary' | '' — labels the recap line. */
+    val recapSource: String?,
+    /** Each attributed row's bounded inline diff, by edit id: removed then added lines, and how many the
+     *  bound left out. Built where the feed is FETCHED, off the EDT — never by the renderer. */
+    val previews: Map<Int, Pair<List<String>, Int>> = emptyMap(),
 ) {
     val live: Boolean get() = mode == "live"
 }
@@ -63,6 +91,8 @@ object FeedParser {
             truncated = int(o, "truncated"),
             lastTs = long(o, "lastTs"),
             note = str(o, "note"),
+            recap = str(o, "recap"),
+            recapSource = str(o, "recapSource"),
         )
     } catch (_: Exception) {
         null
@@ -77,8 +107,17 @@ object FeedParser {
         ts = long(o, "ts"),
         kind = str(o, "kind") ?: "action",
         label = str(o, "label") ?: "",
+        target = str(o, "target"),
         detail = str(o, "detail"),
         // Absent = not applicable; only an explicit false marks a failure.
         ok = o.get("ok")?.takeIf { !it.isJsonNull }?.asBoolean,
+        category = str(o, "category"),
+        note = str(o, "note"),
+        reasoning = str(o, "reasoning"),
+        reasoningKind = str(o, "reasoningKind"),
+        promptText = str(o, "promptText"),
+        cmd = str(o, "cmd"),
+        editId = o.get("editId")?.takeIf { !it.isJsonNull }?.asInt,
+        previewId = o.get("previewId")?.takeIf { !it.isJsonNull }?.asInt,
     )
 }

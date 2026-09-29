@@ -3,4 +3,4 @@ plugins {
     // lacks one — CI's preinstalled Temurin 21 is auto-detected, so this only downloads locally.
     id("org.gradle.toolchains.foojay-resolver-convention") version "1.0.0"
 }
-rootProject.name = "claude-observatory-jetbrains"
+rootProject.name = "oak-observatory-jetbrains"

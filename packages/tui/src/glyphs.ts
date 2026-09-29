@@ -59,6 +59,10 @@ export interface Glyphs {
   pending: string;
   kept: string;
   undone: string;
+  /** Status dots for the tab strip — herdr-style: filled = live, hollow = idle, fisheye = blocked.
+   *  Same Geometric-Shapes block as `marked` (◆), which the Menlo census already clears; the census
+   *  script covers these three too. */
+  dot: { live: string; idle: string; blocked: string };
   /** The eight-level ramp for sparklines, coarsest first. */
   ramp: string[];
   /** Meter fill characters, used only when colour is unavailable. */
@@ -66,6 +70,13 @@ export interface Glyphs {
   /** The pane title-row fill. ASCII in every tier: width 1 in every locale, present in every font.
    *  This is what makes a pane's horizontal extent visible with no colour at all. */
   rule: string;
+  /** Box-drawing frame — herdr-style pane borders. Present in Menlo REGULAR but NOT Menlo Bold (the
+   *  census table above), so these are drawn NON-BOLD wherever they appear; the ASCII tier uses +/-/|. */
+  box: { h: string; v: string; tl: string; tr: string; bl: string; br: string };
+  /** Whether tree panes DRAW full boxes (herdr borders). Off by default — Menlo Bold has no box glyphs
+   *  and even the regular-Menlo corners are not yet census-confirmed; OBSERVATORY_BOXES=1 turns it on,
+   *  and a macOS font census flips the default once the corners are verified. */
+  boxes: boolean;
 }
 
 const SAFE: Glyphs = {
@@ -79,9 +90,15 @@ const SAFE: Glyphs = {
   pending: '?',
   kept: '✓',
   undone: '✗',
+  dot: { live: '●', idle: '○', blocked: '◉' },
   ramp: ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'],
   fill: { pending: '#', kept: '=', undone: '-', empty: ' ' },
-  rule: '-',
+  // Solid, not dashed. Box-drawing `─`, same glyph
+  // the borders use, so every horizontal rule in the app is one continuous solid line. The ascii tier
+  // keeps `-` (─ is not in its universal set).
+  rule: '─',
+  box: { h: '─', v: '│', tl: '┌', tr: '┐', bl: '└', br: '┘' },
+  boxes: false,
 };
 
 const ASCII: Glyphs = {
@@ -94,9 +111,12 @@ const ASCII: Glyphs = {
   pending: '?',
   kept: '+',
   undone: 'x',
+  dot: { live: '*', idle: 'o', blocked: '@' },
   ramp: ['.', '.', ':', ':', '-', '=', '+', '#'],
   fill: { pending: '#', kept: '=', undone: '-', empty: ' ' },
   rule: '-',
+  box: { h: '-', v: '|', tl: '+', tr: '+', bl: '+', br: '+' },
+  boxes: false,
 };
 
 /**
@@ -117,12 +137,29 @@ export function glyphTier(env: NodeJS.ProcessEnv = process.env, platform: string
   return 'block';
 }
 
+/**
+ * One set per (tier, boxes), built once and SHARED, so never mutate one. `rowsFor` keys its memo on
+ * the set's identity, and a new object per call made every caller that takes the default set (the
+ * cursor clamp, on every keystroke) miss that memo and rebuild the whole row list.
+ */
+const glyphSets = new Map<string, Glyphs>();
+
 export function glyphs(tier: GlyphTier = glyphTier()): Glyphs {
-  if (tier === 'ascii') return ASCII;
+  // Boxes are ON by default: every pane, the tab bar and the prompt box wear a solid outline.
+  // They are drawn NON-BOLD, so Menlo's regular box-drawing renders even in VS Code
+  // (the census found only Menlo BOLD drops them); the ascii tier boxes with +/-/|. OBSERVATORY_BOXES=0
+  // opts out for a terminal forced to a bold-only font.
+  const boxes = process.env.OBSERVATORY_BOXES !== '0';
+  const key = `${tier}:${boxes}`;
+  const known = glyphSets.get(key);
+  if (known) return known;
   // 'safe' and 'block' differ only in the ramp: block eighths are universally present but
   // East-Asian-ambiguous, so a terminal configured to draw ambiguous characters double-wide would
   // desync a sparkline. 'safe' trades the ramp's resolution for that guarantee.
-  return tier === 'safe' ? { ...SAFE, ramp: ASCII.ramp } : SAFE;
+  const base = tier === 'ascii' ? ASCII : tier === 'safe' ? { ...SAFE, ramp: ASCII.ramp } : SAFE;
+  const set = { ...base, boxes };
+  glyphSets.set(key, set);
+  return set;
 }
 
 export type StateKey = 'pending' | 'kept' | 'undone' | 'risk' | 'egress' | 'live' | 'accent' | 'agent';
@@ -140,6 +177,56 @@ export type StateKey = 'pending' | 'kept' | 'undone' | 'risk' | 'egress' | 'live
  */
 export type Swatch = { rgb: string; c256: number; c16: number; dim: boolean };
 export type Palette = Record<StateKey, Swatch>;
+
+/**
+ * SURFACES — the missing half of this palette.
+ *
+ * Everything above is a FOREGROUND. Eight hues and two hard-coded title bands is the whole visual
+ * vocabulary the frame had, which is why panes read as columns of text that happen to sit beside each
+ * other rather than as panels. Every terminal UI that reads well — btop, k9s, and herdr, whose
+ * `Palette` (src/app/state.rs) is a semantic layer over Catppuccin — separates GROUND from INK and
+ * gives the ground three or four steps.
+ *
+ *   panel     the chrome's ground: title bands, tab strips, overlays
+ *   raised    one step up: an inactive chip, a resting control
+ *   sunken    one step down: separators, the space between things
+ *   activeRow the row a pane considers current
+ *   selection the row the cursor is on
+ *
+ * Per THEME, not global: the light palette exists because the default hues wash out on white ground,
+ * and a dark panel painted under it would be worse than no panel at all.
+ */
+export type SurfaceKey = 'panel' | 'raised' | 'sunken' | 'activeRow' | 'selection';
+/** Ink that is not a STATE: the three text weights every row is built from. */
+export type InkKey = StateKey | 'text' | 'muted' | 'faint';
+export type Ground = { rgb: string; c256: number };
+export type Surfaces = Record<SurfaceKey, Ground>;
+export type Inks = Record<'text' | 'muted' | 'faint', Swatch>;
+
+const DARK_SURFACES: Surfaces = {
+  panel: { rgb: '26;29;36', c256: 234 },
+  raised: { rgb: '38;42;51', c256: 236 },
+  sunken: { rgb: '20;22;27', c256: 233 },
+  activeRow: { rgb: '31;34;41', c256: 235 },
+  selection: { rgb: '45;50;61', c256: 238 },
+};
+const LIGHT_SURFACES: Surfaces = {
+  panel: { rgb: '238;240;244', c256: 254 },
+  raised: { rgb: '226;230;236', c256: 253 },
+  sunken: { rgb: '245;246;248', c256: 255 },
+  activeRow: { rgb: '232;235;240', c256: 252 },
+  selection: { rgb: '216;221;230', c256: 251 },
+};
+const DARK_INKS: Inks = {
+  text: { rgb: '215;218;224', c256: 252, c16: 37, dim: false },
+  muted: { rgb: '154;160;170', c256: 246, c16: 37, dim: false },
+  faint: { rgb: '110;117;130', c256: 243, c16: 37, dim: true },
+};
+const LIGHT_INKS: Inks = {
+  text: { rgb: '28;32;39', c256: 236, c16: 30, dim: false },
+  muted: { rgb: '93;100;112', c256: 242, c16: 37, dim: false },
+  faint: { rgb: '140;148;160', c256: 246, c16: 37, dim: true },
+};
 
 const PALETTE: Palette = {
   pending: { rgb: '217;164;65', c256: 179, c16: 33, dim: false }, // #d9a441 amber
@@ -205,6 +292,19 @@ export const THEMES: Record<string, Palette> = {
     risk: { rgb: '245;138;7', c256: 208, c16: 33, dim: false },
     pending: { rgb: '255;209;102', c256: 221, c16: 33, dim: false },
   },
+  // For LIGHT terminal backgrounds: the default hues are tuned for dark ground and wash
+  // out on white — these are the same meanings at print-weight luminance. Auto-selected at startup
+  // from the terminal's own OSC 11 answer when no theme is chosen; an explicit pref always wins.
+  light: {
+    pending: { rgb: '154;103;0', c256: 130, c16: 33, dim: false }, // #9a6700
+    kept: { rgb: '26;127;55', c256: 28, c16: 32, dim: false }, // #1a7f37
+    undone: { rgb: '110;119;129', c256: 244, c16: 37, dim: true }, // #6e7781
+    risk: { rgb: '207;34;46', c256: 160, c16: 31, dim: false }, // #cf222e
+    egress: { rgb: '130;80;223', c256: 98, c16: 35, dim: false }, // #8250df
+    live: { rgb: '9;105;218', c256: 26, c16: 36, dim: false }, // #0969da
+    accent: { rgb: '188;82;52', c256: 130, c16: 33, dim: false }, // the coral, darkened for paper
+    agent: { rgb: '154;82;0', c256: 130, c16: 33, dim: false },
+  },
   // One hue, varied by weight. For terminals whose own theme fights a coloured UI, and for anyone who
   // wants the diff to be the only coloured thing on screen.
   mono: Object.fromEntries(
@@ -216,13 +316,31 @@ export const THEMES: Record<string, Palette> = {
 };
 export const THEME_NAMES = Object.keys(THEMES);
 
+/** Grounds and text weights per theme. Only `light` genuinely differs: colourblind changes hues, not
+ *  ground, and mono's greys are already neutral. */
+const THEME_SURFACES: Record<string, { surfaces: Surfaces; inks: Inks }> = {
+  default: { surfaces: DARK_SURFACES, inks: DARK_INKS },
+  colorblind: { surfaces: DARK_SURFACES, inks: DARK_INKS },
+  light: { surfaces: LIGHT_SURFACES, inks: LIGHT_INKS },
+  mono: { surfaces: DARK_SURFACES, inks: DARK_INKS },
+};
+
 let activePalette: Palette = PALETTE;
+let activeSurfaces = THEME_SURFACES.default;
 
 /** Choose the palette every later `tint` uses. An unknown name falls back rather than throwing: this
  *  runs on the first paint, and a hand-edited prefs file must not be able to blank the screen. */
 export function setTheme(name: string | undefined): void {
   activePalette = (name && THEMES[name]) || PALETTE;
+  activeThemeName = activePalette === PALETTE ? 'default' : (name as string);
+  activeSurfaces = THEME_SURFACES[activeThemeName] ?? THEME_SURFACES.default;
 }
+
+/** Which palette is live, by name. The statusline draws the SHIPPED bytes under the default and
+ *  re-tints under a palette the reader CHOSE — an accessibility choice outranks byte-fidelity —
+ *  so it needs to know which of the two it is in. */
+let activeThemeName = 'default';
+export const currentTheme = (): string => activeThemeName;
 
 /** Wrap `s` in this state's colour at the given depth. At 'none' the text is returned untouched. */
 export function tint(s: string, state: StateKey, depth: ColorDepth): string {
@@ -231,6 +349,112 @@ export function tint(s: string, state: StateKey, depth: ColorDepth): string {
   const open =
     depth === 'truecolor' ? `\x1b[38;2;${p.rgb}m` : depth === '256' ? `\x1b[38;5;${p.c256}m` : `\x1b[${p.c16}m`;
   return `${p.dim && depth === '16' ? '\x1b[2m' : ''}${open}${s}\x1b[0m`;
+}
+
+/**
+ * WHAT AN AGENT IS DOING, as one reading.
+ *
+ * Core already distinguishes six phases (`Phase` in actions.ts) and every surface collapsed them
+ * differently: the agent strip mapped everything that was not `working` or `done` to grey, so an
+ * agent BLOCKED ON A HUMAN — the one state that needs somebody — looked exactly like one that had
+ * finished. herdr's sidebar (src/ui/status.rs) settled on five, and the one it has that we did not
+ * surface is precisely that one.
+ *
+ * `done` vs `idle` is the READ-RECEIPT axis, orthogonal to the phase: both are finished, and the
+ * difference is whether you have looked at it yet. We adopted that bit from herdr (`doneUnseen`);
+ * this is where it finally becomes a state rather than a badge.
+ */
+export type AgentState = 'blocked' | 'working' | 'done' | 'idle' | 'errored' | 'unknown';
+
+export function agentStateOf(phase: string, o: { active?: boolean; unseen?: boolean; waiting?: boolean } = {}): AgentState {
+  if (phase === 'errored') return 'errored';
+  // BLOCKED IS STRUCTURAL. Both awaiting-* phases mean a human is the next step, and core marks the
+  // tool-driven one `high` confidence — it is not a staleness guess like idle. `waiting` is the
+  // EXACT form of the same fact (2026-09-15): the hooks' raised hand — a permission prompt, a
+  // question, an input wait — recorded by the agent itself, so it outranks any phase reading.
+  if (o.waiting || phase === 'awaiting-input' || phase === 'awaiting-permission') return 'blocked';
+  if (phase === 'working' || o.active) return 'working';
+  if (o.unseen) return 'done';
+  if (phase === 'idle' || phase === 'done') return 'idle';
+  return 'unknown';
+}
+
+/**
+ * The glyph, label and hue for a state — shape FIRST, so colour is reinforcement and never the
+ * signal. Every glyph here is width-1 in every tier and already font-verified.
+ *
+ * `marked` is borrowed for `done`, and the borrowing is deliberate rather than careless: that shape
+ * means "the reader selected this" on surfaces that list EDITS, and the surfaces that list AGENTS
+ * have no marks on them. Nothing draws both.
+ */
+export function agentStateFace(st: AgentState, g: Glyphs): { glyph: string; label: string; key: StateKey } {
+  switch (st) {
+    case 'blocked': return { glyph: g.pending, label: 'blocked', key: 'agent' };
+    case 'working': return { glyph: g.closed, label: 'working', key: 'live' };
+    case 'done': return { glyph: g.marked, label: 'done', key: 'kept' };
+    case 'idle': return { glyph: g.kept, label: 'idle', key: 'undone' };
+    case 'errored': return { glyph: g.undone, label: 'errored', key: 'risk' };
+    default: return { glyph: g.fold, label: 'unknown', key: 'undone' };
+  }
+}
+
+/** The ground and ink tables in force — exported so a renderer can ask what a surface IS rather than
+ *  hard-coding an escape, which is how two title bands ended up un-themeable. */
+export const surfaces = (): Surfaces => activeSurfaces.surfaces;
+export const inks = (): Inks => activeSurfaces.inks;
+
+/**
+ * The ground a user's own prompt sits on: the grey the claude and codex CLIs paint behind the user's
+ * turns. It opens a span; the caller pads what it covers (a pane's row, or the inside of the
+ * Observatory's prompt box) and closes it with a reset.
+ *
+ * The theme's `raised` ground under its `text` ink, so the light palette gets a light band. The ink is
+ * explicit because a terminal's default foreground belongs to the terminal, not to the theme: a light
+ * band under a light default would be unreadable. Sixteen colours use bright black, the one grey every
+ * 16-colour scheme defines. No colour means no ground; the prompt's own marker or box carries it.
+ */
+export function promptGround(depth: ColorDepth): string {
+  if (depth === 'none') return '';
+  if (depth === '16') return '\x1b[100m';
+  const g = activeSurfaces.surfaces.raised;
+  const t = activeSurfaces.inks.text;
+  return depth === 'truecolor' ? `\x1b[48;2;${g.rgb}m\x1b[38;2;${t.rgb}m` : `\x1b[48;5;${g.c256}m\x1b[38;5;${t.c256}m`;
+}
+
+/**
+ * Paint text with a ground, an ink, or both.
+ *
+ * CLOSES PER CHANNEL, which is the whole reason this exists beside `tint`. `tint` ends with
+ * `\x1b[0m` — a full reset — so a tinted word inside a background ended the background for the rest
+ * of the row; every banded row in this frame is built by hand for exactly that reason. Foreground
+ * closes with 39 and background with 49, so these nest in any order.
+ *
+ * SIXTEEN COLOURS HAVE NO GROUND WORTH USING. A background there is one of eight fixed colours that
+ * fights whatever the terminal's own theme is, so the ground degrades to REVERSE VIDEO for the two
+ * surfaces that carry meaning (the current row, the selected one) and to nothing for the three that
+ * are only depth. Shape and weight still carry everything they carried before.
+ */
+export function paint(s: string, o: { fg?: InkKey; bg?: SurfaceKey }, depth: ColorDepth): string {
+  if (depth === 'none' || (!o.fg && !o.bg)) return s;
+  let open = '';
+  let close = '';
+  if (o.bg) {
+    if (depth === '16') {
+      if (o.bg === 'selection' || o.bg === 'activeRow') { open += '\x1b[7m'; close = '\x1b[27m' + close; }
+    } else {
+      const g = activeSurfaces.surfaces[o.bg];
+      open += depth === 'truecolor' ? `\x1b[48;2;${g.rgb}m` : `\x1b[48;5;${g.c256}m`;
+      close = '\x1b[49m' + close;
+    }
+  }
+  if (o.fg) {
+    const w: Swatch =
+      o.fg === 'text' || o.fg === 'muted' || o.fg === 'faint' ? activeSurfaces.inks[o.fg] : activePalette[o.fg];
+    open += depth === 'truecolor' ? `\x1b[38;2;${w.rgb}m` : depth === '256' ? `\x1b[38;5;${w.c256}m` : `\x1b[${w.c16}m`;
+    close = '\x1b[39m' + close;
+    if (w.dim && depth === '16') { open = '\x1b[2m' + open; close = close + '\x1b[22m'; }
+  }
+  return `${open}${s}${close}`;
 }
 
 /**

@@ -1,0 +1,347 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OAK — The review tab</title>
+<meta name="description" content="The review tab brings per-edit diffs and the keep and undo verbs to the terminal.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%94%AC%3C/text%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400..700;1,9..40,400..600&family=Space+Grotesk:wght@500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#fbfaf9; --bg-2:#f5f3f0; --panel:#ffffff; --card:#f7f5f2; --code-bg:#f1eeea;
+  --ink:#17171a; --body:#3b3b42; --muted:#5c5c63; --faint:#8b8a92;
+  --accent:#cf6440; --accent-ink:#a94e2c; --accent-soft:rgba(207,100,64,.10);
+  --border:rgba(23,23,26,.12); --border-soft:rgba(23,23,26,.07);
+  --info:#2f6fd8; --tip:#cf6440; --warn:#b8791f; --sel:rgba(207,100,64,.16);
+  --font-head:'Space Grotesk',-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;
+  --font-body:'DM Sans',-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;
+  --font-mono:'JetBrains Mono',ui-monospace,'SF Mono',Menlo,Consolas,monospace;
+  --nav-h:56px; --side-w:264px; --toc-w:220px; --content-max:720px;
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --bg:#0e0e11; --bg-2:#0b0b0d; --panel:#111114; --card:#17171b; --code-bg:#1b1b20;
+  --ink:#ececef; --body:#c9c8cf; --muted:#a5a4ac; --faint:#76757d;
+  --accent:#e08a63; --accent-ink:#ef9f7c; --accent-soft:rgba(224,138,99,.14);
+  --border:rgba(255,255,255,.10); --border-soft:rgba(255,255,255,.055);
+  --info:#5b9bff; --tip:#e08a63; --warn:#d9a441; --sel:rgba(224,138,99,.22);
+}}
+:root[data-theme="dark"]{
+  --bg:#0e0e11; --bg-2:#0b0b0d; --panel:#111114; --card:#17171b; --code-bg:#1b1b20;
+  --ink:#ececef; --body:#c9c8cf; --muted:#a5a4ac; --faint:#76757d;
+  --accent:#e08a63; --accent-ink:#ef9f7c; --accent-soft:rgba(224,138,99,.14);
+  --border:rgba(255,255,255,.10); --border-soft:rgba(255,255,255,.055);
+  --info:#5b9bff; --tip:#e08a63; --warn:#d9a441; --sel:rgba(224,138,99,.22);
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth;overflow-x:clip}
+body{margin:0;background:var(--bg);color:var(--body);
+  font-family:var(--font-body);font-size:15.5px;line-height:1.7;-webkit-font-smoothing:antialiased;
+  font-optical-sizing:auto;text-rendering:optimizeLegibility;}
+::selection{background:var(--sel)}
+a{color:var(--accent);text-decoration:none}
+.skip{position:fixed;left:-999px;top:0;z-index:100;background:var(--accent);color:#fff;padding:8px 14px;border-radius:8px}
+.skip:focus{left:12px;top:10px}
+
+/* navbar */
+.nav{position:sticky;top:0;z-index:40;height:var(--nav-h);background:color-mix(in srgb,var(--bg) 86%,transparent);
+  backdrop-filter:saturate(1.4) blur(12px);border-bottom:1px solid var(--border-soft)}
+.nav-in{max-width:none;height:100%;display:flex;align-items:center;gap:20px;padding:0 26px}
+.brand{display:flex;align-items:center;gap:8px;font-family:var(--font-head);font-weight:700;color:var(--ink);font-size:17px;letter-spacing:-.01em}
+.brand .m{filter:saturate(0)}
+.brand .ver{font-family:var(--font-mono);font-size:10.5px;font-weight:500;color:var(--faint);letter-spacing:0}
+.nav-links{display:flex;gap:4px;margin-left:8px}
+.nav-links a{color:var(--muted);font-weight:500;font-size:14px;padding:7px 12px;border-radius:8px}
+.nav-links a:hover{color:var(--ink);background:var(--bg-2)}
+.nav-links a.on{color:var(--ink)}
+.nav-right{margin-left:auto;display:flex;align-items:center;gap:10px}
+.kbtn{display:inline-flex;align-items:center;gap:8px;background:var(--card);border:1px solid var(--border);
+  color:var(--faint);border-radius:9px;padding:6px 9px;font-family:var(--font-body);font-size:13px;cursor:pointer}
+.kbtn:hover{border-color:var(--accent)}
+.kbtn .kmag{font-size:14px}.kbtn .klabel{margin-right:10px}
+kbd{font-family:var(--font-mono);font-size:10.5px;background:var(--bg-2);border:1px solid var(--border);
+  border-radius:5px;padding:1px 5px;color:var(--muted)}
+.icon-btn{background:none;border:1px solid transparent;color:var(--muted);font-size:16px;cursor:pointer;
+  width:34px;height:34px;border-radius:8px;line-height:1}
+.icon-btn:hover{background:var(--bg-2);color:var(--ink)}
+#sidebtn{display:none}
+.ghost{border:1px solid var(--border);color:var(--ink);border-radius:9px;padding:6px 12px;font-size:13.5px;font-weight:500}
+.ghost:hover{border-color:var(--accent)}
+
+/* three-column layout */
+.docs{max-width:none;display:grid;
+  grid-template-columns:var(--side-w) minmax(0,1fr) var(--toc-w);gap:0;align-items:start}
+.side{position:sticky;top:var(--nav-h);height:calc(100vh - var(--nav-h));overflow-y:auto;
+  padding:22px 14px 60px 22px;border-right:1px solid var(--border-soft)}
+.side::-webkit-scrollbar{width:8px}.side::-webkit-scrollbar-thumb{background:var(--border);border-radius:8px}
+.side-search{display:flex;align-items:center;gap:8px;width:100%;background:var(--card);border:1px solid var(--border);
+  color:var(--faint);border-radius:9px;padding:8px 10px;font:500 13px var(--font-body);cursor:pointer;margin-bottom:18px}
+.side-search:hover{border-color:var(--accent)}.side-search kbd{margin-left:auto}
+.grp{margin-bottom:16px}
+.grp-h{display:block;font-family:var(--font-head);font-weight:600;font-size:12px;letter-spacing:.04em;
+  text-transform:uppercase;color:var(--faint);padding:0 8px;margin-bottom:6px}
+.side-nav ul{list-style:none;margin:0;padding:0}
+.side-nav li a{display:block;color:var(--muted);font-size:13.5px;padding:5.5px 10px;border-radius:7px;
+  border-left:2px solid transparent;margin-left:-2px}
+.side-nav li a:hover{color:var(--ink);background:var(--bg-2)}
+.side-nav li a.on{color:var(--accent-ink);background:var(--accent-soft);border-left-color:var(--accent);font-weight:600}
+
+/* content column */
+.content{min-width:0;padding:38px 56px 80px;width:100%}
+.crumb{font-family:var(--font-head);font-size:12.5px;font-weight:600;letter-spacing:.03em;text-transform:uppercase;color:var(--accent);margin-bottom:12px}
+.content h1{font-family:var(--font-head);font-weight:700;font-size:2.05rem;line-height:1.12;letter-spacing:-.02em;color:var(--ink);margin:0 0 12px}
+.deck{font-size:1.12rem;line-height:1.55;color:var(--muted);margin:0 0 8px;font-weight:400}
+.prose{margin-top:26px}
+.prose>*:first-child{margin-top:0}
+.prose p{margin:0 0 18px}
+.prose h2{font-family:var(--font-head);font-weight:600;font-size:1.42rem;letter-spacing:-.01em;color:var(--ink);
+  margin:44px 0 14px;padding-top:8px;scroll-margin-top:calc(var(--nav-h) + 18px);position:relative}
+.prose h3{font-family:var(--font-head);font-weight:600;font-size:1.12rem;color:var(--ink);
+  margin:30px 0 10px;scroll-margin-top:calc(var(--nav-h) + 18px);position:relative}
+.prose h2+p,.prose h3+p{margin-top:0}
+.anchor{position:absolute;left:-22px;width:22px;height:100%;opacity:0}
+.anchor::before{content:"#";color:var(--accent);font-weight:500}
+.prose h2:hover .anchor,.prose h3:hover .anchor{opacity:1}
+.prose a{color:var(--accent);text-decoration:underline;text-underline-offset:2px;text-decoration-color:color-mix(in srgb,var(--accent) 45%,transparent)}
+.prose a:hover{text-decoration-color:var(--accent)}
+.prose strong{color:var(--ink);font-weight:600}
+.prose ul,.prose ol{margin:0 0 18px;padding-left:22px}
+.prose li{margin:6px 0}
+.prose li::marker{color:var(--faint)}
+.prose code{font-family:var(--font-mono);font-size:.86em;background:var(--code-bg);border:1px solid var(--border-soft);
+  border-radius:5px;padding:1.5px 5px;color:var(--accent-ink)}
+.prose pre{background:var(--code-bg);border:1px solid var(--border);border-radius:11px;padding:16px 18px;
+  overflow-x:auto;margin:0 0 20px;line-height:1.6}
+.prose pre code{background:none;border:0;padding:0;font-size:13px;color:var(--body)}
+.prose blockquote{margin:0 0 18px;padding:2px 0 2px 16px;border-left:3px solid var(--border);color:var(--muted)}
+.prose hr{border:0;border-top:1px solid var(--border-soft);margin:32px 0}
+.prose img{max-width:100%;border-radius:12px;border:1px solid var(--border);display:block}
+.prose figure{margin:26px 0}
+.prose figcaption{font-size:12.5px;color:var(--faint);margin-top:9px;text-align:center}
+.prose table{width:100%;border-collapse:collapse;margin:0 0 20px;font-size:14px}
+.prose th,.prose td{border:1px solid var(--border);padding:8px 12px;text-align:left;vertical-align:top}
+.prose th{background:var(--bg-2);font-family:var(--font-head);font-weight:600;color:var(--ink);font-size:13px}
+.tbl-wrap{overflow-x:auto;margin:0 0 20px}
+.tbl-wrap table{margin:0}
+.kbdrow kbd{margin-right:2px}
+
+/* callouts (Fumadocs-style) */
+.callout{display:flex;gap:12px;background:var(--card);border:1px solid var(--border);border-left-width:3px;
+  border-radius:10px;padding:14px 16px;margin:0 0 20px}
+.callout .ico{font-size:16px;line-height:1.5;flex:none}
+.callout .ct{margin:0}
+.callout .ctitle{font-family:var(--font-head);font-weight:600;color:var(--ink);display:block;margin-bottom:2px}
+.callout.tip{border-left-color:var(--tip)}
+.callout.info{border-left-color:var(--info)}.callout.info .ico{color:var(--info)}
+.callout.warn{border-left-color:var(--warn)}.callout.warn .ico{color:var(--warn)}
+.callout p{margin:0}.callout p+p{margin-top:8px}
+
+/* prev / next */
+.prevnext{display:flex;gap:14px;margin:48px 0 0;border-top:1px solid var(--border-soft);padding-top:26px}
+.pn{flex:1;display:flex;flex-direction:column;gap:5px;border:1px solid var(--border);border-radius:12px;padding:14px 16px}
+.pn:hover{border-color:var(--accent);background:var(--bg-2)}
+.pn.next{align-items:flex-end;text-align:right}
+.pn-d{font-size:12px;color:var(--faint);font-weight:500}
+.pn-t{font-family:var(--font-head);font-weight:600;color:var(--ink);font-size:15px}
+.pn-sp{flex:1}
+.foot{display:flex;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-top:40px;padding-top:20px;
+  border-top:1px solid var(--border-soft);font-size:12.5px;color:var(--faint)}
+.foot a{color:var(--muted)}
+
+/* right TOC */
+.toc{position:sticky;top:var(--nav-h);height:calc(100vh - var(--nav-h));overflow-y:auto;padding:38px 20px 60px 6px}
+.toc-h{font-family:var(--font-head);font-weight:600;font-size:11.5px;letter-spacing:.05em;text-transform:uppercase;color:var(--faint);margin-bottom:12px}
+.toc ul{list-style:none;margin:0;padding:0;border-left:1px solid var(--border-soft)}
+.toc li a{display:block;color:var(--faint);font-size:12.75px;line-height:1.4;padding:4.5px 0 4.5px 14px;margin-left:-1px;border-left:2px solid transparent}
+.toc li.l3 a{padding-left:26px}
+.toc li a:hover{color:var(--ink)}
+.toc li a.on{color:var(--accent-ink);border-left-color:var(--accent)}
+
+/* ⌘K modal */
+.kmodal{position:fixed;inset:0;z-index:60;display:flex;align-items:flex-start;justify-content:center;padding-top:12vh}
+.kmodal[hidden]{display:none}
+.kback{position:absolute;inset:0;background:rgba(0,0,0,.5);backdrop-filter:blur(3px)}
+.kbox{position:relative;width:min(560px,92vw);background:var(--panel);border:1px solid var(--border);
+  border-radius:14px;box-shadow:0 24px 70px rgba(0,0,0,.4);overflow:hidden}
+#kinput{width:100%;border:0;border-bottom:1px solid var(--border-soft);background:none;color:var(--ink);
+  font:500 16px var(--font-body);padding:16px 18px;outline:none}
+#kresults{list-style:none;margin:0;padding:8px;max-height:52vh;overflow-y:auto}
+#kresults li{padding:9px 12px;border-radius:9px;cursor:pointer}
+#kresults li .r-t{font-family:var(--font-head);font-weight:600;color:var(--ink);font-size:14px}
+#kresults li .r-g{font-size:11.5px;color:var(--accent);margin-left:8px}
+#kresults li .r-d{font-size:12.5px;color:var(--muted);margin-top:2px}
+#kresults li.sel,#kresults li:hover{background:var(--accent-soft)}
+.khint{border-top:1px solid var(--border-soft);padding:9px 14px;font-size:11.5px;color:var(--faint);display:flex;gap:6px;align-items:center}
+.khint kbd{font-size:10px}
+
+/* responsive */
+@media (max-width:1180px){
+  .docs{grid-template-columns:var(--side-w) minmax(0,1fr)}
+  .toc{display:none}
+}
+/* Phones: drop the brand version chip and tighten padding so the sidebar toggle + theme stay on-screen. */
+@media (max-width:560px){ .nav-in{padding:0 14px;gap:12px} .brand .ver{display:none} }
+@media (max-width:900px){
+  .docs{grid-template-columns:1fr}
+  #sidebtn{display:inline-flex;align-items:center;justify-content:center}
+  .nav-links{display:none}
+  .kbtn .klabel,.kbtn kbd{display:none}
+  .side{position:fixed;top:var(--nav-h);left:0;width:min(320px,84vw);z-index:45;background:var(--panel);
+    border-right:1px solid var(--border);transform:translateX(-102%);transition:transform .18s ease}
+  .side.open{transform:none;box-shadow:0 20px 60px rgba(0,0,0,.4)}
+  .content{padding:28px 22px 70px}
+}
+@media (prefers-reduced-motion:reduce){html{scroll-behavior:auto}.side{transition:none}}
+</style>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="nav" id="nav">
+  <div class="nav-in">
+    <a class="brand" href="showcase.html"><span class="m">🔬</span> OAK <span class="ver" data-co-version>v0.10.0</span></a>
+    <nav class="nav-links" aria-label="Primary">
+      <a href="what-is-oak.html" class="on">Docs</a>
+      <a href="releases.html">Releases</a>
+      <a href="https://github.com/cell-observatory/oak-observatory">GitHub</a>
+    </nav>
+    <div class="nav-right">
+      <button class="kbtn" id="ksearch" aria-label="Search docs">
+        <span class="kmag">⌕</span><span class="klabel">Search</span><kbd>⌘K</kbd>
+      </button>
+      <button class="icon-btn" id="sidebtn" aria-label="Toggle navigation"><svg width="22" height="22" viewBox="0 0 22 22" aria-hidden="true"><path d="M2 5.5h18M2 11h18M2 16.5h18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></button>
+      <button class="icon-btn" id="theme" aria-label="Toggle theme">◐</button>
+      <a class="ghost" href="https://github.com/cell-observatory/oak-observatory">GitHub&nbsp;↗</a>
+    </div>
+  </div>
+</header>
+
+<div class="docs">
+  <aside class="side" id="side">
+    <button class="side-search" id="ksearch2"><span class="kmag">⌕</span> Search docs <kbd>⌘K</kbd></button>
+    <nav class="side-nav" aria-label="Docs">
+<div class="grp"><span class="grp-h">Start here</span><ul><li><a href="what-is-oak.html">What OAK is</a></li><li><a href="install.html">Install</a></li><li><a href="first-review.html">Your first review</a></li></ul></div>
+<div class="grp"><span class="grp-h">The OAK model</span><ul><li><a href="sessions-agents.html">Sessions &amp; agents</a></li><li><a href="worktrees.html">Worktrees &amp; siblings</a></li><li><a href="subagents-roles.html">Subagents &amp; roles</a></li><li><a href="workflows-fleet.html">Workflows &amp; the fleet</a></li></ul></div>
+<div class="grp"><span class="grp-h">What OAK records</span><ul><li><a href="prompts.html">Prompts</a></li><li><a href="tasks.html">Tasks</a></li><li><a href="actions.html">Actions</a></li><li><a href="edits.html">Edits &amp; the change map</a></li><li><a href="capture.html">Transcript, store &amp; hook</a></li></ul></div>
+<div class="grp"><span class="grp-h">The surfaces</span><ul><li><a href="observations.html">Observations</a></li><li><a href="actions-view.html">Actions view</a></li><li><a href="feed.html">Feed</a></li><li><a href="stats-spotlight.html">Stats &amp; spotlight</a></li></ul></div>
+<div class="grp"><span class="grp-h">Reviewing</span><ul><li><a href="review-units.html">The review unit</a></li><li><a href="keep-undo.html">Keep, undo, accept &amp; reject</a></li><li><a href="conflicts.html">Conflicts</a></li></ul></div>
+<div class="grp"><span class="grp-h">The audits</span><ul><li><a href="risk.html">Risk</a></li><li><a href="egress.html">Egress</a></li><li><a href="compaction.html">Compaction &amp; context</a></li></ul></div>
+<div class="grp"><span class="grp-h">Working with agents</span><ul><li><a href="supported-agents.html">Supported agents</a></li><li><a href="claude-code.html">Claude Code</a></li><li><a href="codex.html">Codex</a></li><li><a href="models.html">Models</a></li></ul></div>
+<div class="grp"><span class="grp-h">Terminal app</span><ul><li><a href="tui.html">Terminal app</a></li><li><a href="tui-herdr.html">The herdr tab</a></li><li><a href="tui-observatory.html">The observatory tab</a></li><li><a href="tui-review.html" class="on" aria-current="page">The review tab</a></li></ul></div>
+<div class="grp"><span class="grp-h">Editor extensions</span><ul><li><a href="editors.html">Editor extensions</a></li><li><a href="editors-overview.html">The Overview panel</a></li><li><a href="editors-traces.html">The Traces sidebar</a></li><li><a href="editors-inline.html">Inline review</a></li><li><a href="editors-stacked.html">The stacked diff view</a></li><li><a href="editors-timeline.html">The Timeline panel</a></li></ul></div>
+<div class="grp"><span class="grp-h">Reference</span><ul><li><a href="cli.html">CLI reference</a></li><li><a href="ignore.html">.observatoryignore</a></li><li><a href="releases.html">Releases &amp; channels</a></li></ul></div>
+    </nav>
+  </aside>
+
+  <main class="content" id="main">
+    <div class="crumb">Terminal app</div>
+    <h1>The review tab</h1>
+    <p class="deck">The review tab brings per-edit diffs and the keep and undo verbs to the terminal.</p>
+    <div class="prose">
+<p>The <strong>review tab</strong> carries the same review the editors do, in the terminal: each edit's diff in the agent's own colors, with the decision verbs one key away.</p>
+
+<h2 id="per-edit-diffs"><a class="anchor" href="#per-edit-diffs" aria-label="Link to this section"></a>Per-edit diffs</h2>
+<p>Every <a href="edits.html">edit</a> opens as its own diff — the tool that made it, the before and after, and its churn — never one session-wide diff to untangle. Revisions of the same lines are already collapsed into one <a href="review-units.html">review unit</a>, so you read the net change.</p>
+
+<figure><img src="media/tui-review.png" loading="lazy" alt="The review tab in the terminal app: a change map and the prompts that drove the session across the top, a file-grouped stack of every edit on the lower left, and on the lower right the Diff pane, which shows an edit's diff once one is selected"><figcaption>The review tab — the change map, the prompts, and every edit stacked by file; selecting an edit opens its diff in the Diff pane.</figcaption></figure>
+
+<h2 id="the-verbs"><a class="anchor" href="#the-verbs" aria-label="Link to this section"></a>The verbs</h2>
+<p>The same two verb pairs as everywhere else, on the keyboard: <a href="keep-undo.html"><strong>Keep</strong> and <strong>Undo</strong></a> act on one review unit; <strong>Accept</strong> and <strong>Reject</strong> act on a scope — a file, a task, a prompt, or the whole session.</p>
+<p>The change map acts too. A pending row carries <code>[ ✓ ]</code> keep and <code>[ ✗ ]</code> undo buttons and a reverted row <code>[ ↺ ]</code> redo, and the heading carries keep-all, undo-all and resolve; each asks its question on the same row. Map and Diff are separate panes, on <kbd>F4</kbd> and <kbd>F5</kbd>, and <kbd>F</kbd> folds or unfolds every file in Traces.</p>
+
+<h2 id="sessions-on-another-machine"><a class="anchor" href="#sessions-on-another-machine" aria-label="Link to this section"></a>Sessions on another machine</h2>
+<p>A session that runs on a saved machine is reviewed on that machine. The tab reads its review there and runs every decision there — Keep, Undo, Redo, Resolve, diffs and review comments — over SSH with that machine's own <code>oak</code>, because the edit store and the files never leave it. No store, transcript or working file is copied between machines, and the session header names the machine (<code>on build-box</code>).</p>
+<p>The session picker (<kbd>b</kbd>) lists this machine's sessions first, then each saved machine's, under that machine's name; the find palette offers them too. They come from each machine's own session list, which OAK reads in the background and refreshes about every fifteen seconds. A machine that has not answered yet, or cannot be reached, is one line in the picker that says so. The session under the <a href="tui-observatory.html">Observatory</a>’s cursor, previewed or pinned, is the one this tab shows, as is a session opened with <kbd>r</kbd>. Started outside any repo with no <code>--session</code> or <code>--root</code>, this tab opens on the session that most recently took a turn on any machine, this one or a saved one (on a machine running this version, reopening a session, as herdr does when it restores its panes, is not a turn), as the machines first answer and until you choose a session or act in the tab. <code>oak --tab review --session &lt;id&gt;</code>, with or without <code>--once</code>, reviews a session this machine does not hold on the saved machine that lists it; when none does, <code>--once</code> fails and the panes say so, naming the machines asked. While the owning machine does not answer, the panes name the failure instead of showing an empty review; a sync mirror of the session on this machine is never read in its place. Scripts reach the same machine with <code>--machine &lt;label&gt;</code> (see the <a href="cli.html">CLI reference</a>).</p>
+
+<div class="callout info">
+  <span class="ico">ℹ</span>
+  <div class="ct"><span class="ctitle">The same decisions, everywhere</span>
+  <p>A Keep in the terminal is a Keep in <a href="editors.html">VS Code and JetBrains</a> — all three render one <a href="cli.html">CLI</a> backend, so a decision made here shows up resolved in the editors, and vice versa.</p></div>
+</div>
+
+<p>Automatic remote refreshes wait at least ten seconds, or twice the last read's duration when longer. Decisions bypass this delay for their next read. An older remote CLI that cannot expand review units produces an update-required error before acting. Remote status facts remain separate from the local session catalog. Observatory also reads its conversation, metadata and edit previews on the owning machine.</p>
+
+    </div>
+    <nav class="prevnext"><a class="pn prev" href="tui-observatory.html"><span class="pn-d">← Previous</span><span class="pn-t">The observatory tab</span></a><a class="pn next" href="editors.html"><span class="pn-d">Next →</span><span class="pn-t">Editor extensions</span></a></nav>
+    <footer class="foot">
+      <span>🔬 OAK is developed in the open by the <a href="https://github.com/cell-observatory">Cell Observatory</a></span>
+      <a href="https://github.com/cell-observatory/oak-observatory">Edit on GitHub ↗</a>
+    </footer>
+  </main>
+
+  <aside class="toc"><div class="toc-h">On this page</div><ul><li class="l2"><a href="#per-edit-diffs">Per-edit diffs</a></li><li class="l2"><a href="#the-verbs">The verbs</a></li><li class="l2"><a href="#sessions-on-another-machine">Sessions on another machine</a></li></ul></aside>
+</div>
+
+<div class="kmodal" id="kmodal" hidden>
+  <div class="kback" id="kback"></div>
+  <div class="kbox" role="dialog" aria-modal="true" aria-label="Search docs">
+    <input id="kinput" type="text" placeholder="Search the docs…" autocomplete="off" spellcheck="false">
+    <ul id="kresults"></ul>
+    <div class="khint"><kbd>↑</kbd><kbd>↓</kbd> to navigate · <kbd>↵</kbd> to open · <kbd>esc</kbd> to close</div>
+  </div>
+</div>
+
+<script>window.__DOCS_INDEX__=[{"s":"what-is-oak","t":"What OAK is","g":"Start here","d":"This is the two-minute picture of what the observatory records and why."},{"s":"install","t":"Install","g":"Start here","d":"Add OAK to a machine and its editors, and switch capture on."},{"s":"first-review","t":"Your first review","g":"Start here","d":"Walk from an agent session to a reviewed, kept change in a few minutes."},{"s":"sessions-agents","t":"Sessions & agents","g":"The OAK model","d":"A session is the one conversation everything hangs off; agents are who worked inside it."},{"s":"worktrees","t":"Worktrees & siblings","g":"The OAK model","d":"OAK correlates parallel agents across the git worktrees of one repository."},{"s":"subagents-roles","t":"Subagents & roles","g":"The OAK model","d":"Subagents are the agents an agent spawns; each one carries the job it was given."},{"s":"workflows-fleet","t":"Workflows & the fleet","g":"The OAK model","d":"Workflows are scripted fan-outs, and the fleet puts every running agent on one board."},{"s":"prompts","t":"Prompts","g":"What OAK records","d":"Prompts record what you asked for — the spine the rest of the record hangs on."},{"s":"tasks","t":"Tasks","g":"What OAK records","d":"Tasks are the to-dos an agent set itself, with the edits captured under each one."},{"s":"actions","t":"Actions","g":"What OAK records","d":"Actions record every tool call an agent made, in order, with its result."},{"s":"edits","t":"Edits & the change map","g":"What OAK records","d":"Edits are the reviewable unit; the change map summarizes them all."},{"s":"capture","t":"Transcript, store & hook","g":"What OAK records","d":"The transcript and the hook-fed store are the two token-free sources everything derives from."},{"s":"observations","t":"Observations","g":"The surfaces","d":"Observations pair each edit with the reasoning recorded near it, plus flags."},{"s":"actions-view","t":"Actions view","g":"The surfaces","d":"The Actions view shows the tool-call timeline and raises the conflicts that need attention first."},{"s":"feed","t":"Feed","g":"The surfaces","d":"The feed streams what an agent is doing as it works, oldest first."},{"s":"stats-spotlight","t":"Stats & spotlight","g":"The surfaces","d":"Stats plots the review scoreboard and token usage; Spotlight highlights the changed lines."},{"s":"review-units","t":"The review unit","g":"Reviewing","d":"This page explains why the unit of decision is what an agent changed for a prompt."},{"s":"keep-undo","t":"Keep, undo, accept & reject","g":"Reviewing","d":"Two verb pairs cover every decision, separated by how much they act on."},{"s":"conflicts","t":"Conflicts","g":"Reviewing","d":"When two agents touch one file, a guarded undo protects it."},{"s":"risk","t":"Risk","g":"The audits","d":"Risk shows what a session wrote outside the workspace — exercised, not merely permitted."},{"s":"egress","t":"Egress","g":"The audits","d":"Egress shows what a session read from outside the workspace, grouped by scope."},{"s":"compaction","t":"Compaction & context","g":"The audits","d":"Compaction shows what shaped a session and where its context was silently dropped."},{"s":"supported-agents","t":"Supported agents","g":"Working with agents","d":"OAK captures native Claude Code and Codex sessions."},{"s":"claude-code","t":"Claude Code","g":"Working with agents","d":"Claude Code is the hooks-native default, observed from outside the model loop."},{"s":"codex","t":"Codex","g":"Working with agents","d":"OAK captures native Codex hooks and rollout logs."},{"s":"models","t":"Models","g":"Working with agents","d":"Capture is model-independent; this page covers running open weights under an agent."},{"s":"tui","t":"Terminal app","g":"Terminal app","d":"The terminal app puts the whole observatory in your terminal — try it, then dig into each tab."},{"s":"tui-herdr","t":"The herdr tab","g":"Terminal app","d":"The herdr tab runs the real terminal client for agents and remote machines."},{"s":"tui-observatory","t":"The observatory tab","g":"Terminal app","d":"The observatory tab lists sessions beside a detail pane: a pinned conversation, workers, tasks and review links."},{"s":"tui-review","t":"The review tab","g":"Terminal app","d":"The review tab brings per-edit diffs and the keep and undo verbs to the terminal."},{"s":"editors","t":"Editor extensions","g":"Editor extensions","d":"The VS Code extension and the JetBrains plugin render one record in two editors."},{"s":"editors-overview","t":"The Overview panel","g":"Editor extensions","d":"The Overview panel is the master-detail board: Sessions, Workers, Workflows, Tasks, and Processes."},{"s":"editors-traces","t":"The Traces sidebar","g":"Editor extensions","d":"The Traces sidebar lists every pending edit, grouped by file, with Keep and Undo on each row."},{"s":"editors-inline","t":"Inline review","g":"Editor extensions","d":"Inline review surfaces pending edits in the editor itself, under a floating review bar."},{"s":"editors-stacked","t":"The stacked diff view","g":"Editor extensions","d":"“Open all in editor” stacks every pending diff into one scroll, each with its own verbs."},{"s":"editors-timeline","t":"The Timeline panel","g":"Editor extensions","d":"The Timeline panel gathers Feed, Prompts, Observations and Actions in one place."},{"s":"cli","t":"CLI reference","g":"Reference","d":"The CLI carries every command the editors render, usable on its own."},{"s":"ignore","t":".observatoryignore","g":"Reference","d":"An .observatoryignore rule keeps matches out of capture; this page covers how stored records are swept."},{"s":"releases","t":"Releases & channels","g":"Reference","d":"OAK ships on a stable and a dev channel; this page explains how updates reach you."}];</script>
+<script>
+(function(){
+  var root=document.documentElement;
+  // theme (shared with the marketing site: same localStorage key, defaults to system)
+  var KEY='oak-theme';
+  try{var s=localStorage.getItem(KEY);if(s)root.setAttribute('data-theme',s);}catch(e){}
+  var tbtn=document.getElementById('theme');
+  if(tbtn)tbtn.addEventListener('click',function(){
+    var cur=root.getAttribute('data-theme')||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light');
+    var next=cur==='dark'?'light':'dark';root.setAttribute('data-theme',next);
+    try{localStorage.setItem(KEY,next);}catch(e){}
+  });
+  // mobile sidebar
+  var side=document.getElementById('side'),sb=document.getElementById('sidebtn');
+  if(sb)sb.addEventListener('click',function(){side.classList.toggle('open');});
+  document.addEventListener('click',function(e){
+    if(side&&side.classList.contains('open')&&!side.contains(e.target)&&!sb.contains(e.target)){side.classList.remove('open');}
+  });
+  // ⌘K jump palette
+  var idx=window.__DOCS_INDEX__||[];
+  var modal=document.getElementById('kmodal'),input=document.getElementById('kinput'),
+      results=document.getElementById('kresults'),back=document.getElementById('kback');
+  var sel=0,cur=[];
+  function open(){modal.hidden=false;input.value='';render('');input.focus();}
+  function close(){modal.hidden=true;}
+  function render(q){
+    q=q.trim().toLowerCase();
+    cur=idx.filter(function(p){return !q||(p.t+' '+p.g+' '+p.d).toLowerCase().indexOf(q)>=0;}).slice(0,8);
+    sel=0;
+    results.innerHTML=cur.map(function(p,i){
+      return '<li data-i="'+i+'"'+(i===0?' class="sel"':'')+'><div><span class="r-t">'+p.t+'</span><span class="r-g">'+p.g+'</span></div><div class="r-d">'+p.d+'</div></li>';
+    }).join('')||'<li class="r-none" style="color:var(--faint);cursor:default">No matches</li>';
+  }
+  function go(){if(cur[sel])location.href=cur[sel].s+'.html';}
+  ['ksearch','ksearch2'].forEach(function(id){var b=document.getElementById(id);if(b)b.addEventListener('click',open);});
+  if(back)back.addEventListener('click',close);
+  if(input)input.addEventListener('input',function(){render(input.value);});
+  document.addEventListener('keydown',function(e){
+    if((e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==='k'){e.preventDefault();modal.hidden?open():close();return;}
+    if(modal.hidden)return;
+    if(e.key==='Escape')close();
+    else if(e.key==='ArrowDown'){e.preventDefault();sel=Math.min(sel+1,cur.length-1);paintSel();}
+    else if(e.key==='ArrowUp'){e.preventDefault();sel=Math.max(sel-1,0);paintSel();}
+    else if(e.key==='Enter'){e.preventDefault();go();}
+  });
+  results.addEventListener('click',function(e){var li=e.target.closest('li[data-i]');if(li){sel=+li.dataset.i;go();}});
+  function paintSel(){[].forEach.call(results.children,function(li,i){li.classList.toggle('sel',i===sel);});}
+  // TOC scrollspy
+  var links=[].slice.call(document.querySelectorAll('.toc a'));
+  var heads=links.map(function(a){return document.getElementById(a.getAttribute('href').slice(1));}).filter(Boolean);
+  if(heads.length){
+    var spy=function(){
+      var y=window.scrollY+90,best=0;
+      for(var i=0;i<heads.length;i++){if(heads[i].offsetTop<=y)best=i;}
+      links.forEach(function(a,i){a.classList.toggle('on',i===best);});
+    };
+    window.addEventListener('scroll',spy,{passive:true});spy();
+  }
+})();
+</script>
+</body>
+</html>

@@ -7,7 +7,7 @@
 #
 # Then fully restart the IDE (⌘Q → reopen); a plugin's classes can't hot-swap in a running JVM.
 #
-# The INSTALL half is `claude-observatory install-extensions --jetbrains-zip`, so IDE detection lives in
+# The INSTALL half is `oak install-extensions --jetbrains-zip`, so IDE detection lives in
 # one place (the CLI) instead of being reimplemented here in bash — which also means it works on Windows
 # from PowerShell/cmd, not only from Git Bash, and never needs `unzip` there.
 set -euo pipefail
@@ -24,12 +24,13 @@ esac
 
 if [ "$MODE" != "install-only" ]; then
   echo "▸ Building the plugin…"
-  if command -v gradle >/dev/null 2>&1; then GRADLE=gradle; else GRADLE=./gradlew; fi
+  # Always the pinned wrapper (never an ambient `gradle`), matching scripts/release.sh — the wrapper
+  # provisions the exact Gradle version this build is tested against.
   JAVA_HOME="${JAVA_HOME:-$([ -d /opt/homebrew/opt/openjdk@21 ] && echo /opt/homebrew/opt/openjdk@21 || echo "")}" \
-    $GRADLE buildPlugin --console=plain -q
+    ./gradlew buildPlugin --console=plain -q
 fi
 
-ZIP=$(ls -t build/distributions/claude-observatory-jetbrains-*.zip 2>/dev/null | head -1)
+ZIP=$(ls -t build/distributions/oak-observatory-jetbrains-*.zip 2>/dev/null | head -1)
 [ -n "$ZIP" ] || { echo "no plugin zip found — build failed?" >&2; exit 1; }
 ZIP="$PWD/$ZIP"
 
@@ -42,8 +43,8 @@ fi
 # `install-extensions`, and the point of running from the repo is to use the repo.
 if [ -f "$REPO_ROOT/packages/cli/dist/index.js" ]; then
   CO=(node "$REPO_ROOT/packages/cli/dist/index.js")
-elif command -v claude-observatory >/dev/null 2>&1; then
-  CO=(claude-observatory)
+elif command -v oak >/dev/null 2>&1; then
+  CO=(oak)
 else
   echo "The plugin was built but not installed: no CLI to install it with." >&2
   echo "  Build this tree (npm run build) or install the CLI (./install.sh), then re-run --no-build," >&2

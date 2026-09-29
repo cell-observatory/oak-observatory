@@ -18,6 +18,7 @@ import java.util.concurrent.ScheduledThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import kotlin.io.path.exists
 import kotlin.io.path.isDirectory
+import kotlin.io.path.name
 import kotlin.io.path.listDirectoryEntries
 
 /**
@@ -105,8 +106,8 @@ class StoreWatcher : Disposable {
     private fun pollStamp(root: Path): Long = try {
         if (!root.exists()) 0L
         else root.listDirectoryEntries().filter { it.isDirectory() }.sumOf { dir ->
-            val logFile = dir.resolve("log.jsonl")
-            if (logFile.exists()) Files.getLastModifiedTime(logFile).toMillis() else 1L
+            dir.listDirectoryEntries().filter { p -> p.name == "log.jsonl" || p.name == "capture-events.jsonl" || p.name in listOf("attention.json", "agent.json") }
+                .sumOf { p -> runCatching { Files.getLastModifiedTime(p).toMillis() + Files.size(p) }.getOrDefault(0L) }
         }
     } catch (_: Exception) {
         0L
@@ -136,7 +137,7 @@ class StoreWatcher : Disposable {
                     val child = root.resolve(name)
                     if (child.isDirectory()) register(ws, child)
                     relevant = true // a new session's first capture must refresh too
-                } else if (name == "log.jsonl") {
+                } else if (name == "log.jsonl" || name == "capture-events.jsonl" || name in listOf("attention.json", "agent.json")) {
                     relevant = true
                 }
             }

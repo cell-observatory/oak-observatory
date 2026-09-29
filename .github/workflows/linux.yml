@@ -32,6 +32,14 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: npm
       - run: npm ci
+      # The real-binary herdr tests (its CLI parser, the Codex join over its wire, a sandboxed server)
+      # skip without herdr. Install the pinned, checksum-verified build as the installers do: no
+      # server, integrations or plugin, since the tests start a sandboxed server where they need one.
+      - name: Install the pinned herdr
+        run: |
+          npm run build:core
+          node -e "require('./packages/core/dist/herdr-install').ensureHerdr({ startServer: false, integrations: [], pluginDir: null }).then((r) => console.log('herdr', r.version, 'at', r.bin))"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       # builds core + cli + the extension bundle, then runs core unit tests + the extension smoke test.
       # Output is teed to a file and uploaded on failure, so failures are diagnosable from the artifact.
       - run: npm test 2>&1 | tee test-output.txt

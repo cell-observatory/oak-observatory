@@ -1,0 +1,15 @@
+<p>Two kinds of conflict, both handled explicitly rather than silently. An <strong>undo conflict</strong> is a revert that would corrupt later work; a <strong>live conflict</strong> is two agents editing the same file at once. OAK refuses to paper over either.</p>
+
+<h2>Undo conflict</h2>
+<p>An <strong>undo conflict</strong> is a refused revert: a later <a href="edits.html">edit</a> genuinely overlaps the change, so applying the <a href="keep-undo.html">undo</a> would corrupt it. The file is left untouched, the conflict is shown, and an explicit <code>--force</code> whole-file restore is offered instead of a silent overwrite.</p>
+
+<div class="callout info">
+  <span class="ico">ℹ</span>
+  <div class="ct"><span class="ctitle">Why refuse instead of merge?</span>
+  <p>A best-effort merge that silently mangles overlapping code is worse than a clear refusal. OAK tells you exactly what overlaps and lets you choose the whole-file restore deliberately.</p></div>
+</div>
+
+<h2>Live conflict</h2>
+<p>A <strong>live conflict</strong> is one file holding pending edits from two or more <a href="worktrees.html">siblings</a>, at least one of them active. Detection is by path only — file names cross between agents, contents never do. Live conflicts lead the <a href="actions-view.html">Actions view</a> because they need attention before the agents collide further.</p>
+
+<p>This is the failure mode that parallel agents make likely and that nothing else catches: two <a href="workflows-fleet.html">fleet</a> members converging on one file, each unaware of the other. Surfacing it early is the whole reason the fleet tracks paths across worktrees.</p>

@@ -12,6 +12,7 @@ import { detectClasses, classAt } from './classes';
 import * as crypto from 'crypto';
 import { locateEditsInCurrent } from './ranges';
 import { matchesQuery } from './filter';
+import { fileExt, fileCategory, type FileCategory } from './filetype';
 import { reviewEdits } from './groups';
 import { cancelledMemberIds } from './units';
 
@@ -25,6 +26,11 @@ export interface TreeEdit {
   afterBlob: string | null;
   added: number;
   removed: number;
+  /** Review-only (an ACP diff whose before-content never arrived): undo will REFUSE with the
+   *  stated reason, keep works. Load-bearing for any renderer — without it a partial create
+   *  renders as an ordinary new file and the reader learns the truth only from the refusal
+   *  (JetBrains consumes exactly this projection). */
+  partial?: true; // the store's own literal shape (EditRecord.partial) — never a stored `false`
 }
 export interface TreeClass {
   name: string;
@@ -35,12 +41,16 @@ export interface TreeFile {
   file: string;
   classes: TreeClass[];
   loose: TreeEdit[]; // edits not inside any detected class
+  maxTs: number; // most-recent edit time — the "N min ago" column + time sort
+  ext: string; // bare lowercased extension — the extension filter key
+  category: FileCategory; // one of the six type buckets — the file-type filter key
 }
 export interface TreeFolder {
   label: string; // may be a compacted chain like "src/utils"
   path: string; // absolute directory path (drives scoped folder Accept/Revert/Clear)
   folders: TreeFolder[];
   files: TreeFile[];
+  maxTs: number; // most-recent edit time under this folder
 }
 export interface EditTree {
   folders: TreeFolder[];
@@ -97,7 +107,12 @@ function subtree(rels: string[], prefix: string, byRel: Map<string, TreeFile>): 
       } else break;
     }
     const child = subtree(rels, p, byRel);
-    return { label, path: folderAbs(p, child), folders: child.folders, files: child.files };
+    const maxTs = Math.max(
+      0,
+      ...child.folders.map((f) => f.maxTs),
+      ...child.files.map((f) => f.maxTs)
+    );
+    return { label, path: folderAbs(p, child), folders: child.folders, files: child.files, maxTs };
   });
   const fileNodes = files.sort().map((rel) => byRel.get(rel) as TreeFile);
   return { folders, files: fileNodes };
@@ -108,11 +123,13 @@ function toEdit(session: string, rec: EditRecord): TreeEdit {
   return {
     id: rec.id, ts: rec.ts, tool: rec.tool, file: rec.file, status: rec.status,
     beforeBlob: rec.beforeBlob, afterBlob: rec.afterBlob, added: d.added, removed: d.removed,
+    ...(rec.partial ? { partial: true } : {}),
   };
 }
 
 /** Group a file's edits under the class each currently falls in (line geometry from ranges.ts). */
 function buildFile(session: string, rel: string, file: string, recs: EditRecord[], store: PlacementStore): TreeFile {
+  const meta = { maxTs: recs.reduce((m, r) => Math.max(m, r.ts || 0), 0), ext: fileExt(rel), category: fileCategory(rel) };
   let text = '';
   try {
     text = fs.readFileSync(file, 'utf8');
@@ -121,7 +138,7 @@ function buildFile(session: string, rel: string, file: string, recs: EditRecord[
   }
   const spans = text ? detectClasses(text) : [];
   if (spans.length === 0) {
-    return { rel, file, classes: [], loose: recs.map((r) => toEdit(session, r)) };
+    return { rel, file, classes: [], loose: recs.map((r) => toEdit(session, r)), ...meta };
   }
   // A blob that cannot be READ is not the same as an edit with no blob: the chain hash is over blob
   // SHAs, so a dropped blob keys identically to an intact one but places differently. In-process that
@@ -159,7 +176,7 @@ function buildFile(session: string, rel: string, file: string, recs: EditRecord[
       loose.push(toEdit(session, r));
     }
   }
-  return { rel, file, classes: [...byClass.values()], loose };
+  return { rel, file, classes: [...byClass.values()], loose, ...meta };
 }
 
 /**

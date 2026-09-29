@@ -1,0 +1,15 @@
+<p>Reviewing edits one file at a time is right when you want to weigh each on its own. Sometimes you want the whole change in front of you instead. <strong>Open all in editor</strong> — from the <a href="editors-traces.html">Traces sidebar</a> or the review toolbar — reads every pending <a href="review-units.html">review unit</a> as one concatenated scroll: each edit's diff stacked below the last, each still carrying its own <a href="keep-undo.html">Keep</a> and <a href="keep-undo.html">Undo</a>.</p>
+
+<figure><img src="media/stacked-diffs.png" loading="lazy" alt="The stacked diff view: a bar reading stacked — removed/added inline, with Spotlight on and a Side by side switch, then one block per pending edit — src/features.py, src/train.py and src/models/dataset.py — each headed by its edit number, path and churn with its own Keep and Undo, above that edit's diff, the code in syntax colours inside the green and red bands and the unchanged lines dimmed"><figcaption><em>Open all in editor</em> — every pending diff in one scroll, each with its own Keep and Undo.</figcaption></figure>
+
+<h2>Net diffs, not raw history</h2>
+<p>Each block is the unit's <strong>net</strong> change — repeated revisions of the same lines are already collapsed into one <a href="review-units.html">review unit</a>, so a line the agent rewrote five times appears once, in its final form. The block header names the file, the edit number, and its <code>+A −R</code> churn; the diff below is the agent's own, in the same colors the <a href="editors-inline.html">inline review</a> uses.</p>
+
+<h2>Decide at any scope</h2>
+<p>The verbs work exactly as they do everywhere else, gathered into one view. <strong>Keep</strong> or <strong>Undo</strong> on a block resolves that one unit and leaves the rest standing; the toolbar's <strong>Keep all</strong> / <strong>Undo all</strong> resolve the whole scroll at once. A resolved block drops out of the pending set — reflected immediately in the <a href="editors-traces.html">Traces sidebar</a> and the <a href="editors-overview.html">Overview</a>'s counts.</p>
+
+<div class="callout tip">
+  <span class="ico">🔬</span>
+  <div class="ct"><span class="ctitle">When a unit is a wall</span>
+  <p>A single unit that rewrote thousands of lines is a wall in any stacked view. OAK bounds each block to a readable window and marks where it was cut, so one enormous edit can't bury the others below it.</p></div>
+</div>

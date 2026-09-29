@@ -736,23 +736,43 @@ class PortParserTest {
         val json = """
             {"ref":{"kind":"process","id":"bpk1"},"title":"Run the suite","running":true,"mode":"live",
              "entries":[
-               {"ts":1000,"kind":"action","label":"Bash","detail":"npm test","ok":false},
+               {"ts":1000,"kind":"action","label":"Bash","target":"npm test","detail":"main agent","ok":false,
+                "category":"exec","note":"run the unit suite","cmd":"npm test 2>&1 |\ntail -5",
+                "reasoning":"the suite should pass now","reasoningKind":"thinking","editId":7,"previewId":9},
                {"ts":0,"kind":"output","label":"  ok 12 passed"},
-               {"ts":2000,"kind":"reasoning","label":"checking the failure"}
-             ],"truncated":26,"lastTs":2000,"note":null}
+               {"ts":2000,"kind":"reasoning","label":"checking the failure"},
+               {"ts":3000,"kind":"permission","label":"Write outside the workspace?"}
+             ],"truncated":26,"lastTs":3000,"note":null,
+             "recap":"Fixed the flaky suite","recapSource":"analysis"}
         """.trimIndent()
         val feed = FeedParser.parse(json)!!
         assertEquals("process", feed.kind)
         assertEquals("bpk1", feed.id) // the pane checks this before painting, so a stale tail can't show
         assertTrue(feed.live)
         assertEquals(26, feed.truncated) // said out loud — a cap must never read as completeness
-        assertEquals(2000L, feed.lastTs)
+        assertEquals(3000L, feed.lastTs)
         assertNull(feed.note)
-        assertEquals(3, feed.entries.size)
+        assertEquals(4, feed.entries.size)
         assertEquals(false, feed.entries[0].ok) // an explicit false is a failure to mark
         assertEquals(0L, feed.entries[1].ts) // raw output has no timestamp — rendered without a fake one
         assertNull(feed.entries[1].ok) // absent -> not applicable, never "failed"
         assertEquals("reasoning", feed.entries[2].kind)
+        assertEquals("permission", feed.entries[3].kind) // the row a hook-observed session can't have
+        // The 0.10.0 blob fields round-trip — and their ABSENCE stays null (entries[1] carries none).
+        val rich = feed.entries[0]
+        assertEquals("exec", rich.category)
+        assertEquals("run the unit suite", rich.note)
+        assertEquals("the suite should pass now", rich.reasoning)
+        assertEquals("thinking", rich.reasoningKind)
+        assertEquals("npm test 2>&1 |\ntail -5", rich.cmd) // the FULL command, newline intact
+        assertEquals(7, rich.editId)
+        assertEquals(9, rich.previewId)
+        val bare = feed.entries[1]
+        assertNull(bare.category); assertNull(bare.note); assertNull(bare.reasoning)
+        assertNull(bare.reasoningKind); assertNull(bare.cmd); assertNull(bare.editId); assertNull(bare.previewId)
+        // The session recap rides the payload (session-kind feeds), with its source labelled.
+        assertEquals("Fixed the flaky suite", feed.recap)
+        assertEquals("analysis", feed.recapSource)
 
         // finished source: audit, plus core's explanation of an empty feed
         val audit = FeedParser.parse(

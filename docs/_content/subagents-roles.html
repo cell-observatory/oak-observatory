@@ -1,0 +1,10 @@
+<p>An agent rarely works alone within a session. It spawns helpers — a searcher, a planner, a reviewer — each doing a slice of the job. OAK records each one as its own agent, attributes its edits to it, and labels it by the job it was given.</p>
+
+<h2>Subagent</h2>
+<p>A <strong>subagent</strong> is an agent a session spawned inside itself. It writes its own transcript (a sidechain), appears nested under its parent in the <a href="workflows-fleet.html">fleet</a>, and carries its own timeline, metrics, and role. Its edits are attributed to it and reviewed like any others — so a parent agent's change map and a subagent's stay distinct.</p>
+
+<h2>Role</h2>
+<p>A <strong>role</strong> is the job a spawn was given, not a kind of agent — <code>Explore</code>, <code>Plan</code>, <code>general-purpose</code>, <code>code-reviewer</code>, <code>fork</code>. It rides the spawning tool call as its <code>subagent_type</code>, and the observatory shows it in its own column on each subagent and <a href="workflows-fleet.html">workflow</a> row. The same model wears many roles; the role says which one this instance was asked to play — so a fan-out reads as the mix of jobs it is, rather than a list of identical agents.</p>
+
+<h2>Spawn</h2>
+<p>Start a peer agent in herdr or use <code>oak agent start --kind claude</code> or <code>codex</code>. The editors’ New Session action uses the same API. A peer you start remains distinct from a worker spawned by an existing conversation.</p>

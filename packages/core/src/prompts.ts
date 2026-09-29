@@ -20,10 +20,13 @@ import { parseWorkflows } from './workflows';
 import { groupMembers, reviewEdits } from './groups';
 import { cancelledMemberIds } from './units';
 import { lineDelta } from './format';
+import { captureEventsPath, readCaptureEvents } from './capture-events';
 import { cachedByFiles, readLines } from './fscache';
 import { EditRecord, logPath, readLog, readScopeOverrides } from './store';
 import { taskIdForSubject, taskNamings } from './tasks';
 import { askScan, toMs } from './asks';
+import { fileMark, persisted } from './derived';
+import { derivedInputsStamp } from './changemap';
 
 export interface SessionPrompt {
   /** Stable id (content+time hash) — safe to key UI state and review ops on. */
@@ -113,13 +116,15 @@ function ownerWithOverrides<T extends { id: string }>(
   overrides: Map<number, string>,
   byPromptId: Map<string, T>,
   temporal: (ts: number) => T | null
-): (rec: { id: number; ts: number }) => T | null {
+): (rec: { id: number; ts: number; promptId?: string; nativeTurnId?: string }) => T | null {
   return (rec) => {
     const want = overrides.get(rec.id);
     if (want !== undefined) {
       const target = byPromptId.get(want);
       if (target) return target;
     }
+    if (rec.promptId && byPromptId.has(rec.promptId)) return byPromptId.get(rec.promptId)!;
+    if (rec.nativeTurnId && byPromptId.has(rec.nativeTurnId)) return byPromptId.get(rec.nativeTurnId)!;
     return temporal(rec.ts);
   };
 }
@@ -135,12 +140,17 @@ function ownerWithOverrides<T extends { id: string }>(
  */
 export function promptWindows(cwd: string, sessionId: string): PromptWindow[] {
   const transcript = findTranscript(cwd, sessionId);
-  if (!transcript) return [];
-  return cachedByFiles('promptWindows', [transcript, logPath(sessionId)], () => {
+
+  if (!transcript) {
+    return hookSessionPrompts(sessionId).map((p) => ({
+      id: p.id, index: p.index, ts: p.ts, title: p.title, editIds: p.editIds, pending: p.pending,
+    }));
+  }
+  return cachedByFiles('promptWindows', [transcript, logPath(sessionId), captureEventsPath(sessionId)], () => {
     const { asks } = askScan(transcript);
     if (!asks.length) return [];
     const reqs: PromptWindow[] = asks.map((a, i) => ({
-      id: promptId(a.ts, a.text),
+      id: a.id ? a.id : promptId(a.ts, a.text),
       index: i + 1,
       ts: a.ts,
       title: a.text.length > 96 ? a.text.slice(0, 95) + '…' : a.text,
@@ -178,10 +188,84 @@ export function promptWindows(cwd: string, sessionId: string): PromptWindow[] {
 
 export function sessionPrompts(cwd: string, sessionId: string): SessionPrompt[] {
   const transcript = findTranscript(cwd, sessionId);
-  if (!transcript) return [];
-  return cachedByFiles('sessionPrompts', [transcript, logPath(sessionId)], () =>
-    sessionPromptsUncached(transcript, cwd, sessionId)
-  );
+
+
+  // prompt-scoped review serve driven sessions too (full-parity ask, 2026-08-20).
+  if (!transcript) return hookSessionPrompts(sessionId);
+  // This finished projection is reused across fresh view processes too. Its input stamp includes
+  // workflow/subagent inventories, so a child starting without a main-transcript append still moves it.
+  // 2: pasted prompts (`<pasted_content>`) became asks (2026-09-22) — a projection built before that
+  // holds none of them, and its inputs did not move.
+  const stamp = [3, cwd, fileMark(transcript), fileMark(logPath(sessionId)), fileMark(captureEventsPath(sessionId)),
+    derivedInputsStamp(cwd, sessionId, false)].join('|');
+  // v2 in the NAME as well as the stamp: an older build still running beside this one keeps its own
+  // file rather than the two rewriting one projection at each other's version on every append.
+  const name = `prompts-v3-${crypto.createHash('sha256').update(`${cwd}\0${transcript}`).digest('hex').slice(0, 16)}`;
+  return persisted(sessionId, name, stamp, () => sessionPromptsUncached(transcript, cwd, sessionId), (value) =>
+    Array.isArray(value) && value.every((p) => p && typeof p.id === 'string' && typeof p.text === 'string' &&
+      Number.isFinite(p.ts) && Array.isArray(p.editIds) && Array.isArray(p.agents) && Array.isArray(p.workflows)));
+}
+
+
+function hookSessionPrompts(sessionId: string): SessionPrompt[] {
+  return cachedByFiles('hookSessionPrompts', [captureEventsPath(sessionId), logPath(sessionId)], () => {
+    const turns = readCaptureEvents(sessionId, ['turn_start']);
+    if (!turns.length) return [];
+    const ends = readCaptureEvents(sessionId, ['turn_end']);
+    const recs = reviewEdits(sessionId);
+    let lastTs = 0;
+    for (const u of ends) if (u.ts > lastTs) lastTs = u.ts;
+    return turns.map((t, i) => {
+      const p = t.payload as { promptId?: string; prompt?: string } | undefined;
+      const text = String(p?.prompt ?? '').replace(/\s+/g, ' ').trim();
+      const id = String(p?.promptId ?? `hook-${i + 1}`);
+      const endTs = i + 1 < turns.length ? turns[i + 1].ts : 0;
+      const mine = recs.filter((r) => r.promptId === id);
+      let added = 0;
+      let removed = 0;
+      let pending = 0;
+      let kept = 0;
+      let undone = 0;
+      const files = new Set<string>();
+      const folders = new Set<string>();
+      for (const r of mine) {
+        const d = lineDelta(sessionId, r);
+        added += d.added;
+        removed += d.removed;
+        if (r.status === 'pending') pending++;
+        else if (r.status === 'kept') kept++;
+        else undone++;
+        files.add(r.file);
+        folders.add(path.dirname(r.file));
+      }
+      return {
+        id,
+        index: i + 1,
+        ts: t.ts,
+        endTs,
+        text,
+        title: text.length > 96 ? text.slice(0, 95) + '…' : text,
+        editIds: mine.map((r) => r.id),
+        edits: mine.length,
+        added,
+        removed,
+        pending,
+        kept,
+        undone,
+        files: files.size,
+        folders: folders.size,
+        tokens: 0,
+        tasks: 0,
+        actions: 0,
+        errors: 0,
+        agents: [],
+        workflows: [],
+        processes: [],
+        compactions: 0,
+        durationMs: Math.max(0, (endTs || lastTs || t.ts) - t.ts),
+      };
+    });
+  });
 }
 
 function sessionPromptsUncached(transcript: string, cwd: string, sessionId: string): SessionPrompt[] {
@@ -189,7 +273,7 @@ function sessionPromptsUncached(transcript: string, cwd: string, sessionId: stri
   if (!asks.length) return [];
 
   const reqs: SessionPrompt[] = asks.map((a, i) => ({
-    id: promptId(a.ts, a.text),
+    id: a.id ? a.id : promptId(a.ts, a.text),
     index: i + 1,
     ts: a.ts,
     endTs: i + 1 < asks.length ? asks[i + 1].ts : 0,

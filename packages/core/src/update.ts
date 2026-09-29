@@ -72,8 +72,8 @@ export interface UpdatePlan {
   /** The release the channel resolves to, and its version. */
   release: ReleaseInfo | null;
   target: string;
-  /** True when the caller asked for a channel the release list has no pre-release for, so `dev`
-   *  degraded to the stable release. Callers say "no pre-release published yet" rather than lying. */
+  /** True when `dev` resolved to the stable release: the list has no pre-release, or its newest
+   *  pre-release ranks below stable. Callers say which rather than advertise a pre-release. */
   degradedToStable: boolean;
   /** Every surface the caller declared, each with its verdict — `current` ones included, because a
    *  chip that only lists what is stale cannot tell "up to date" from "not checked". */

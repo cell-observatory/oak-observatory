@@ -235,9 +235,11 @@ export function createDecoder(): Decoder {
       return named ? [key(named)] : [{ t: 'reply', raw: `${ESC}O${f}` }];
     }
 
-    // ESC followed by an ordinary character is Alt+that.
+    // ESC followed by an ordinary character is Alt+that. A CONTROL character keeps the name the
+    // unprefixed form gets — alt+Tab arrives as ESC TAB, and returning the raw `\t` made it a
+    // different key from `tab`, so every consumer written against the name silently never fired.
     buf = buf.slice(2);
-    return [{ t: 'key', key: c1, ctrl: false, alt: true, shift: false }];
+    return [{ t: 'key', key: CTRL_NAME[c1] ?? c1, ctrl: false, alt: true, shift: false }];
   }
 
   function drain(): InputEvent[] {

@@ -1,14 +1,353 @@
 # Changelog
 
-All notable changes to Claude Observatory are recorded here, following
+All notable changes to OAK are recorded here, following
 [Keep a Changelog](https://keepachangelog.com) and [Semantic Versioning](https://semver.org).
-Per-tag release artifacts and auto-generated notes are on the
-[Releases page](https://github.com/cell-observatory/claude-observatory/releases).
+Each tagged release's artifacts are on the
+[Releases page](https://github.com/cell-observatory/oak-observatory/releases), with its section below as
+the release notes.
 
 ## [Unreleased]
 
-<!-- Every feature/fix PR into `dev` appends its line here; a promote renames this section to the
-     release version and opens a fresh one. -->
+## [0.10.0] — 2026-09-28
+
+**claude-observatory is now OAK.** The command is `oak`, the npm package is `oak-observatory`, the
+VS Code extension is `cell-observatory.oak-observatory-vscode`, the JetBrains plugin is
+`com.cell-observatory.oak-observatory`, and the repository is
+[cell-observatory/oak-observatory](https://github.com/cell-observatory/oak-observatory). The terminal
+app now runs on [herdr](https://github.com/herdrdev/herdr), which OAK installs and manages.
+
+### Upgrading from claude-observatory
+
+- **Reinstall once with the installer.** claude-observatory 0.9.5 and earlier, and the 0.10.0
+  pre-releases published under that name, cannot update themselves across the rename:
+  `claude-observatory update` stops with an npm `EEXIST` error (the old packages keep working), the
+  old VS Code extension's update notifier does not see this release, and JetBrains custom-repository
+  users are offered a new plugin id rather than an update. Run the installer, which removes the old
+  npm package first:
+  `curl -fsSL https://raw.githubusercontent.com/cell-observatory/oak-observatory/main/scripts/bootstrap.sh | bash`
+  (Windows: `irm https://raw.githubusercontent.com/cell-observatory/oak-observatory/main/install.ps1 | iex`).
+  If you install by hand, first download this release's CLI tarball, so a failed download leaves the
+  old CLI in place (npm 12 will not install the tarball from its URL):
+  `curl -fLO https://github.com/cell-observatory/oak-observatory/releases/download/v0.10.0/oak-observatory-0.10.0.tgz`
+  (in Windows PowerShell 5.1, type `curl.exe`: `curl` there is an alias of `Invoke-WebRequest`).
+  Then run `npm uninstall -g claude-observatory`, install the downloaded file with
+  `npm install -g --allow-scripts=node-pty ./oak-observatory-0.10.0.tgz`, and run `oak doctor --fix`
+  and `oak install-extensions`, which installs the renamed VS Code extension and JetBrains plugin.
+- **The new extension and plugin retire the old ones.** VS Code uninstalls
+  `cell-observatory.claude-observatory-vscode`; the JetBrains plugin disables
+  `com.cell-observatory.claude-observatory` and offers a restart. JetBrains users who subscribed to
+  the custom plugin repository should replace its URL with
+  `https://github.com/cell-observatory/oak-observatory/releases/latest/download/updatePlugins.xml`.
+- **Requirements:** Node.js 20 or newer (was 18). Linux and macOS also need `python3`, for herdr's
+  agent hooks and OAK's herdr plugin. Linux needs `make` and a C++ compiler as well (`g++`, or
+  whatever `$CXX` names): npm compiles node-pty, which the terminal app's herdr tab runs herdr in,
+  and npm 12 runs that build only when it is allowed (`--allow-scripts=node-pty`). Without node-pty
+  the herdr tab cannot start; `oak attach` works without it.
+  The installers, `oak update` and `oak doctor --fix` install the herdr version pinned in `herdr.lock`
+  (0.9.1, checksum-verified) when a machine has none or an older one; a newer herdr is left in place.
+- **Run `oak init` with Claude Code closed**, even if you ran `init` on a pre-release. It rewrites
+  the capture hooks to the new command and hooks six events beside `PreToolUse` and `PostToolUse`:
+  `PostToolUseFailure`, `Notification`, `Stop`, `PermissionRequest`, `UserPromptSubmit` and
+  `SessionEnd`. Until `PostToolUseFailure` is hooked, the file changes of a Bash command that fails
+  are not recorded. `oak doctor` names the events that are not hooked, and `oak status` shows the
+  hook count with the command to run. When `codex` is on the PATH, `oak init` installs Codex capture
+  too (`--no-codex` skips it).
+- **Unchanged:** the store (`~/.claude/claude-observatory`), prefs, editor settings
+  (`claudeObservatory.*`) and `.observatoryignore` files. `claude-observatory` remains a deprecated
+  alias of `oak`.
+- **Machines configured for SSH session listing** (`prefs.remotes`, `claude-observatory remotes`) are
+  no longer read. Add each machine again with `oak machine add <label> <ssh-target>`.
+- Saved Timeline column widths reset once in both editors, because the Timeline gains a fourth tab.
+
+### Added
+
+- **The terminal app runs on herdr.** Its tabs are **herdr · Observatory · Review**: herdr's own
+  client, where agents run in panes; a live view of every session; and the review workspace. `ctrl+a`
+  then `n`/`p` or `1`–`3` switches tabs, `--tab <id>` opens a named tab, and `ctrl+q` twice quits from
+  any tab (`ctrl+c` twice and `ctrl+a` `q` twice share the same confirmation). Inside a herdr pane the
+  bar is Observatory · Review. The herdr tab passes the program's keyboard protocol, bracketed paste,
+  focus reports, mouse, text attributes and cursor through to the terminal. The terminal app opens on
+  the tab you used last, the Observatory the first time, or the herdr tab while the machine has no
+  session yet.
+- **The Observatory.** Sessions are grouped by machine, then by herdr workspace (sessions outside
+  herdr under their project, or under "Unknown workspace" when the project is unknown), with each
+  session's pane, agent kind, model, edits, tokens and last activity. Clicking a session, or Enter,
+  pins its conversation beside the list: prompts, replies, thinking, tool calls with their captured
+  diffs, Workers and Tasks. The pinned conversation follows its newest message until you scroll back
+  (`End` or `↓ newest` returns), follows its pane when the agent restarts, and has a reply box (`i`)
+  that sends through herdr. `h` jumps to the session's herdr pane and `r` scopes the Review tab to it.
+  The Review tab shows the session under the cursor, previewed or pinned.
+  Your prompts sit in boxes like the tool calls around them, on a grey ground that follows the colour
+  theme, as the Claude Code and Codex CLIs show them. Workers and Tasks list what is still going on
+  (working or waiting workers, with their model, effort and token split; pending and in-progress
+  tasks), each marked in its state's colour with its stats in the session list's colours, under a
+  header that counts the active entries out of the total, such as `Workers · 1/3 active`; the finished
+  ones fold behind one row. A background agent counts as working until Claude Code logs it finished
+  (failed, killed or stopped reads as errored) and again once it is resumed; with no such notice, it is
+  done after it, its session and the session's other agents have all been quiet for five minutes, unless
+  it stopped on a tool call or a question, which reads as waiting. This holds in the terminal app and
+  both editors. `Shift+A` shows archived sessions.
+- **herdr tab housekeeping.** Each herdr tab is named after the session running in it unless you named
+  it yourself, and follows the session's title when it changes. A session's capture hooks and OAK's
+  Claude Code status line rename its own tab even when `oak tui` is closed; while `oak tui` runs, it
+  names the tabs of every machine. On Linux and macOS, `oak tui` also keeps a `btop` tab running a
+  system monitor (btop, bpytop or htop) in every machine's `home` workspace, and OAK's herdr plugin
+  restarts the monitor when herdr's server starts. The plugin adds an **Open in OAK** action, which
+  selects the pane's conversation in the Observatory. OAK never closes a tab. The installers,
+  `oak update` and `oak doctor --fix` set herdr's sidebar width (48–72 columns) and the gruvbox theme
+  when you have not chosen them.
+- **Other machines.** `oak machine add <label> <ssh-target>` provisions a machine (herdr, OAK in
+  `~/.local/lib/oak`, `~/.local/bin` on its PATH, the capture hooks); `oak machine list` lists them.
+  `oak attach [machine]` hands the terminal to herdr on that machine, and `oak agent start --machine
+  <label>` starts an agent there. `--machine <label>` runs `views`, `review`, `list`, `sessions`,
+  `conversation`, `feed`, `multitask`, `subagents`, `diff`, `keep`, `undo`, `redo`, `resolve`,
+  `comment`, `quote` and `ignore` on that machine over SSH, with that machine's own `oak` in the
+  session's own workspace, so the Review tab reviews a remote session where its store and files are;
+  nothing is copied between machines. The Review tab's session picker (`b`) and the find palette list
+  each saved machine's sessions under its name, read from that machine about every 15 seconds (a
+  machine that cannot be reached says so), and `oak tui --tab review --session <id>` reviews a session
+  that runs on a saved machine. Started outside any repo with no `--session` or `--root`, the Review
+  tab opens on the session that most recently took a turn on any machine, this one or a saved one (on a
+  machine running this version, a resume alone does not count), as the machines first answer and until you choose a session or act in
+  the tab. `oak sessions --json` rows carry that time as `lastTurnMs`. `OAK_MACHINE_TIMEOUT_MS` (default 120 s) and
+  `OAK_HERDR_REMOTE_TIMEOUT_MS` (default 30 s) extend the deadlines. The editors list and review the
+  sessions of the machine their workspace runs on.
+- **Codex support.** `oak init` (or `oak init --codex` alone) installs capture for Codex 0.147.0 or
+  newer and pre-trusts only OAK's own hook commands in Codex's trust store. Codex sessions appear in
+  every session list with their thread names (or the heading of the brief a prompt hands off to, a
+  long one shortened to its first phrase),
+  their rollout's workspace, model and effort, and their token usage with the cache split.
+  `oak statusline` also turns on Codex's built-in status line items, and leaves a `status_line` you
+  set alone.
+- **New commands.** `oak agent start` starts a Claude Code or Codex agent in a herdr pane; `oak prompt`
+  submits text to a session's live pane and keeps a draft when it cannot; `oak conversation` reads a
+  transcript from its tail (`--limit`, `--since <cursor>`); `oak search` searches conversations;
+  `oak integrity` reports capture gaps without rewriting records; `oak models` lists the local ollama
+  models and `oak models use <name>` switches Codex to one; `oak titles` shows or refreshes session
+  titles; `oak focus` selects a session in an attached terminal app. Plain `oak init` wires a local
+  model into Codex only when Codex has no model choice at all (no top-level `model`,
+  `model_provider` or `profile`, no `[profiles]` table, no profile `*.config.toml`); it marks the
+  lines it writes, `oak uninstall` removes exactly those, and `oak machine add` never wires one.
+- Both editors' Timeline gains a **Feed** tab, first in **Feed · Prompts · Observations · Actions**:
+  the selected session's prompts, replies, thinking, tool calls (each naming the file it acted on,
+  which opens in the editor), captured diffs and permission requests. An Overview selection shows that
+  worker's, run's, task's or shell's activity. `oak feed --json` carries the same `reasoning` rows
+  (`said`, `thinking`) in session, agent, workflow and task feeds.
+- **Review comments and quotes.** Comment on a pending edit's lines, then send the batch to the agent
+  as one prompt; quote the agent's last reply into a prompt to annotate it. Both prepare a draft that
+  is sent through herdr only when you choose, and a failed send keeps the draft: `oak comment` and
+  `oak quote`, VS Code's comment threads and commands, JetBrains' *Add Review Comment* (⌥⌘C on macOS,
+  Ctrl+Alt+C elsewhere) and *Quote Agent's Last Reply*.
+- **Needs you.** A desktop notification when a session waits on you (a permission prompt, a question,
+  an input request; a finished turn is opt-in), fired once per machine. An inbox of every waiting
+  session, most urgent first: `oak inbox`, the `i` overlay on the terminal's Review tab, a "needs
+  you" group in VS Code's session selector, and ⚠ on the waiting rows of JetBrains' Sessions tab. A
+  jump to the next one: the terminal's `h` on the Review tab, VS Code's status-bar `⚠ N` chip,
+  JetBrains' ⌥⌘I (Ctrl+Alt+I elsewhere), `oak inbox --next`. `oak notify --watch` announces from a
+  plain terminal. On macOS, OAK running in iTerm2, Ghostty, WezTerm or kitty has the terminal post the
+  notification, so it carries the terminal's name and a click brings the terminal forward. Nothing is
+  answered for you.
+- **Session titles from claude.ai.** A session renamed in the Claude app or on claude.ai under Remote
+  Control shows that title. OAK reads your account's session titles from `api.anthropic.com` with
+  Claude Code's stored login, at most every five minutes, and caches only session ids and titles;
+  `oak titles --off` (or `"remoteTitles": false`) turns it off. See SECURITY.md.
+- **Usage for both providers.** The terminal's usage line and both editors' status bars show `5h`,
+  `wk` and `mo` for Claude and for GPT (Codex) with their resets, coloured by threshold. `mo` is your
+  bill cycle, read from the account's subscription date (`oak usage --bill-day N` overrides it). The
+  account's per-model weekly cap (`Fable`) is not a status-bar item: both editors' status-bar tooltips
+  and Stats panels list it, and the shell status line keeps its `fable` segment. Usage refreshes
+  without a running Claude session: while an OAK view is open, OAK reads your account's usage from
+  `api.anthropic.com` once the last reading is a minute old, and when Claude Code's stored login has
+  expired it renews it and writes it back where Claude Code keeps it. Codex's quota comes from its own
+  reports and, with Codex's login, from `codex app-server` (see SECURITY.md). In both editors,
+  Enterprise and API-key accounts, which report no rolling limits, show their spend; an account with
+  credits shows its balance, and a stale reading says its age. The Stats panels gain `mo` and `$` rows
+  and fold per section.
+- **`oak usage --breakdown`**: tokens, cache reads and estimated dollars by week, bill-cycle month,
+  model or session, for Claude and Codex. Window spend comes from Claude Code's own cost figures;
+  month and breakdown dollars price token counts at API list prices, are marked `~`, and are never a
+  bill.
+- **VS Code opens all edits in a stacked view**, with the editor's own syntax highlighting inside the
+  added and removed bands, lines that wrap, a Keep/Undo pair per block, Spotlight, and a Side by side
+  switch to the native multi-diff. In both editors a decided block shows its verdict and offers
+  **↺ Revert** or **↻ Redo**.
+- **Reset scope**, beside Search in both editors' Overview nav bars, clears the search, folder and
+  prompt scopes at once.
+- **Store size** in both editors' session lists and pickers and in the terminal's session picker. In
+  the editors, a click on a Sessions row's size opens that session's store folder, and a store button
+  sits beside Export in the review toolbar. The folder opens in the system file manager, or, when
+  VS Code or Cursor is connected to another machine (Remote-SSH, WSL, a dev container), in a new
+  editor window on that machine. A session with no store folder yet says so.
+- **The terminal's change map acts.** Pending rows carry `[ ✓ ]` keep and `[ ✗ ]` undo buttons,
+  reverted rows `[ ↺ ]` redo, and the heading carries keep-all, undo-all and resolve; each asks its
+  question on the same row. Both editors gained scoped redo (VS Code `↻ file`; JetBrains Redo All in
+  File / in Folder).
+- **Terminal panes.** On the Observatory tab, `ctrl+a` splits, closes, zooms and swaps panes,
+  `ctrl+a v` picks what a pane shows, and dragging a pane's title moves it. Drag across text on the
+  Observatory and Review tabs to copy it exactly, as in the herdr tab: the drag highlights the text
+  it covers, stays within the pane where it began, and copies on release (OSC 52, or tmux's buffer
+  inside tmux; past OSC 52's size limit a local terminal uses the system clipboard). In the
+  Observatory, a click that does not move acts when the button is released. `ctrl+c` copies a
+  selection and `ctrl+v` pastes. The mouse pointer shows what a spot does (OSC 22). Pane borders are
+  drawn by default (`OBSERVATORY_BOXES=0` turns them off).
+- **Terminal review.** The Traces list folds each file to one row (`F` folds or unfolds all), the
+  change map groups files outside the workspace under their real paths, Map and Diff are separate
+  panes (`F4`, `F5`), and `e` opens GUI editors without suspending the terminal app.
+- **`oak undo --ids <a,b,c> --record-only`** and `oak redo --ids … --record-only` record an undo or
+  redo that already changed the files, without touching them again. When the store stays busy for
+  10 s after an undo or redo has changed files, the CLI, the terminal app and both editors name the
+  edits whose status was not recorded and show this command.
+- **`oak init --repair`** replaces duplicated hook entries, and `oak uninstall` removes the hooks
+  from every settings file OAK recorded writing.
+- **`oak sessions --delete`** hides a session and purges its stored edits; `--undelete` lists it
+  again, without the purged edits. Both editors' Sessions tabs, VS Code's session pickers and the
+  terminal's session picker offer delete.
+- **`oak doctor`** reports a herdr server started from inside a Claude Code session (its agents would
+  run as child sessions, and `git commit` in its shells would abort), times forwarding to each
+  machine and suggests SSH connection sharing when it is slow, warns when the terminal app cannot
+  spawn a PTY (on Linux naming what node-pty's build lacked: a build tool, or npm 12's
+  `--allow-scripts=node-pty`), names the most frequent capture skip reason, and says when the
+  claude.ai titles were last read.
+
+### Changed
+
+- **Session lists show the sessions of the machine the workspace is on**, grouped by workspace with
+  your own first, in both editors' session lists and pickers; a Remote-SSH, devcontainer or Gateway
+  window lists the remote machine's sessions. Transcripts copied in from another machine by a sync
+  tool are not listed as local sessions. Sessions in which nothing happened (no edit, no tokens, no
+  reply) are left out of every list unless they may still be running.
+- **Session titles follow Claude Code's order**: a rename (`/rename`, or on claude.ai) first, then the
+  claude.ai title, then Claude Code's automatic title. Titles are one line of plain text.
+- **Timestamps show the time, not an age**: in session lists, edit lists and feeds, `14:32:05` today,
+  `Aug 31 14:32` this year, `2026-08-31` before that.
+- **One icon vocabulary**: ✓ keeps and ✗ undoes or rejects in the terminal, VS Code and JetBrains.
+  Revert and redo are arrows: in VS Code a kept edit's revert is ↺ and redo is ↻; the terminal's map
+  marks redo ↺.
+- **Redo restores the decision that was reverted**: a kept edit that is reverted and redone is kept
+  again instead of pending.
+- **In the terminal app, syntax colour applies to every diff line**, added and removed included, and
+  is on by default.
+- **The change map dropped its per-file churn bars**; each row has a button that opens the file's
+  changes stacked.
+- **Binary files are captured**, up to 25 MB, and shown as a size summary; a text file over 5 MB and
+  any file over 25 MB are recorded as skipped.
+- **The Bash capture walk skips what `.gitignore` excludes** (`.observatoryignore` still decides
+  first), and it counts files before snapshotting, so a working tree over the 4,000-file cap costs no
+  blobs. A Bash command that exits with an error has its file changes recorded as that command's own
+  edits; 0.9.5 recorded them only when the next Bash command finished, and attributed them to it.
+- **The capture hook starts faster**, because `oak capture` loads only the capture code: about 45 ms
+  per hook on a Linux workstation, against 52 ms in 0.9.5.
+- **`.observatoryignore` takes effect on a Refresh** in the terminal and both editors, for this
+  machine's sessions. In the terminal it also takes effect for a session reviewed on another machine,
+  where the Refresh runs the sweep with that machine's `oak`.
+- **The status line** (installed by `oak statusline`) draws each bar as a rule under its figures,
+  wraps at the terminal width instead of being cut off, always prints `used/total` and cache reads,
+  adds a bill-cycle month segment and a `fable` segment, dedups messages across transcripts, keeps its
+  reset countdowns when Claude Code omits them, and refuses to replace another tool's status line
+  unless you pass `--force`.
+- The Overview's **Group tabs** makes one group of all five tabs.
+- `oak export` names the exporter `oak <version>` in its JSON `tool` field; it was
+  `claude-observatory <version>`.
+
+### Removed
+
+- `claude-observatory remotes` and SSH session listing (`prefs.remotes`); use `oak machine add`,
+  `oak machine list` and `--machine`, which the old `remotes` command now names instead of answering
+  "unknown command". Usage is read on each machine for itself.
+- The per-block Chat button in JetBrains' stacked review tab. Chat stays on the inline lens, the
+  review bar and the viewer toolbars.
+
+### Fixed
+
+- After a 5-hour or weekly window resets, usage no longer shows the last window's share as this one's
+  (it stood for hours after the weekly reset). Until a session or the account pull brings a fresh figure,
+  the window shows no share or token estimate, in the terminal app, both editors and `oak usage`. When the
+  status line reads the account's usage, it now keeps the account's own shares, not only the reset times,
+  and an account with no per-model weekly cap no longer empties the status line's cache.
+- The terminal app strips C1 control characters (U+0080 to U+009F) from the text it draws, as it already
+  did C0 ones, so text an agent wrote cannot move the cursor or erase what OAK drew.
+- Keys in the terminal app no longer act by accident. With the help or another overlay open, a letter
+  no longer runs its verb on the review behind it (`u` reverted an edit there). An `alt` chord, or Esc
+  and a letter typed quickly, no longer runs the letter's verb. In the herdr tab, `ctrl+a ctrl+a` sends
+  a `ctrl+a` to the program (line start in Claude Code and Codex), and the leader takes a plain key
+  next, so `ctrl+a ctrl+k` no longer ends the herdr client. The `ctrl+o` palette offers Review's
+  actions only on the Review tab, and Esc cancels a pending confirmation first.
+- The status line renders correctly on Windows. A working directory such as `C:\Users\you\code` no
+  longer cuts the first row short and hides the second (its backslashes were read as escape codes),
+  and figures read through a native `jq` or `python` under Git Bash no longer carry a stray carriage
+  return that broke the context, usage and reset countdowns.
+- A prompt pasted into Claude Code (`<pasted_content>`) is no longer dropped from prompts, asks and
+  titles.
+- Keep and undo can no longer act on another session's edit after switching sessions.
+- Redoing a change after undoing it, while a later edit to the same file stays, puts the file back as
+  it was, and an undo followed at once by a redo puts it back exactly. Both `oak redo <id>` and
+  `oak redo --ids` used to report a conflict when the change and the later edit had both added lines
+  at the same place, such as the end of the file, and a redo could put a line back on the other side
+  of lines that a later edit had added right next to it. A conflict that remains now names the later
+  edits the suggested `--force` would drop. A forced undo or redo now acts on the whole change, as
+  `oak undo <id>` does: `oak undo <id> --force` on a change made of several edits, and Force-restore
+  in VS Code and JetBrains, restore the file to its state before the whole change and mark all of its
+  edits reverted, where they restored the state before the change's last edit and left its earlier
+  edits in the file and pending; a forced redo restores every reverted edit of that change instead of
+  leaving some marked reverted. The conflict message names the edit the file goes back to.
+- Undo and redo no longer join two lines into one. When the file had lost its final newline on one
+  side of the merge and a line was added at its end on the other, the added line was glued onto the
+  last line and the undo or redo reported success: a redo turned `build --release` plus an appended
+  `deploy` into `build --releasedeploy`, and an appended blank line could disappear. The final newline
+  is now merged as a property of the file, so every line stays whole, and a change that only adds or
+  removes the final newline is undone and redone alongside later edits.
+- A keep or undo in the terminal app shows at once and no longer reappears when a slower read lands.
+- Terminal app: when a terminal loses a mouse release, the next click is handled on its own. The
+  selection still waiting for that release is dropped. Before, a seam drag or tab click that followed
+  a lost release copied text nobody had selected.
+- Diff lines that begin with `--` or `++` are no longer dropped from renders.
+- Opening `$EDITOR` from the terminal app no longer corrupts the screen, and drilling into an edit
+  no longer falls back to the map on the next refresh.
+- `oak tui --tick <s>` and the saved "Refresh every" option now set how often the terminal app
+  refreshes. Both were ignored, and the app refreshed every 3 s.
+- The Review header shows `—` for a count it has not read, instead of reporting 0 pending, 0 kept,
+  0 high risk and 0 conflicts while a read is loading or has failed. A single conflict reads
+  "1 conflict".
+- The JetBrains stacked tab renders stacked, a stale session pin no longer blanks every JetBrains
+  panel, an empty Review tree names a failed CLI fetch, and one panel that fails to build no longer
+  stops the others from painting.
+- VS Code's session selector wraps in a narrow panel instead of crushing titles.
+- VS Code: a click on a row of the Overview's Sessions list is no longer lost when a refresh arrives
+  between the press and the release. The list is rebuilt only when what it shows has changed.
+- VS Code's Observations view shows the agent's reasoning line in full and wraps it, instead of
+  cutting it at 99 characters with an ellipsis.
+- VS Code's Revert All and Redo All confirmations name a single edit in the singular ("Revert 1 edit",
+  not "Revert 1 edits").
+- JetBrains: the plugin now looks for the `oak` CLI in every location VS Code checks, including
+  `/usr/bin` and bun, pnpm, asdf and fnm installs, so an IDE started from the dock or a launcher finds
+  a CLI installed there.
+- The Bash capture's file-stat cache no longer keeps entries for files that were deleted or are now
+  excluded by `.gitignore` or `.observatoryignore`. It only grew, and every Bash command read and
+  rewrote all of it.
+- A capture's session lock is no longer taken over by another capture. Two captures that found the
+  same crashed hook's lock no longer both proceed; both used to remove the lock, and two edits could
+  then be recorded with the same id. A capture that holds the lock while the machine sleeps or its
+  clock changes keeps it: a lock's age is now read on the machine's monotonic clock, so another
+  capture no longer takes the lock over and records beside it.
+- `oak ignore --stdin` given no paths reports that none is ignored. It used to fall through to the
+  sweep and drop the session's records that match an ignore rule.
+- Running OAK from a deeply nested directory finds that directory's Claude Code sessions, in the
+  terminal, VS Code and JetBrains. Claude Code shortens a project folder name longer than 200
+  characters and appends a hash of the path; OAK looked for the full name.
+- `oak update` deletes the release files it downloads once the update succeeds; each update left
+  about 600 KB in the temporary directory.
+- On the pre-release channel, `oak update` no longer says "no pre-release published yet" when a
+  pre-release exists and the stable release outranks it.
+- Right after the status line is installed, `oak doctor` and `oak init` no longer advise installing it
+  again; doctor reports it as installed until Claude Code first draws it.
+- `oak doctor`'s "update channel persists" check tests the file the channel is stored in, inside the
+  store folder that `oak store --move` can relocate.
+- `install.ps1` parses when Windows PowerShell 5.1 runs it as a file; characters its default encoding
+  misreads broke it.
+- The curl installer (`scripts/bootstrap.sh`) verifies the CLI tarball's published sha256 before
+  installing it, as `install.ps1` and `oak update` already did.
+- JetBrains: a coalesced ×N run in Observations shows the reasoning of its newest edit, as VS Code's run
+  row does, instead of its oldest edit's. When the newest edit recorded none, the row shows none.
 
 ## [0.9.5] — 2026-08-12
 

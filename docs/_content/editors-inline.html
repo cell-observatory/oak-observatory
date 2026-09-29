@@ -1,0 +1,13 @@
+<p><strong>Inline review</strong> carries the review controls into the file itself. A pending <a href="edits.html">edit</a> appears as a tinted line with a gutter star, removed lines as ghost text, and a per-edit lens naming the edit, its churn, and its position — with the decision verbs right there.</p>
+
+<figure><img src="media/inline-review.png" loading="lazy" alt="Inline review: a tinted pending edit with a marker and Keep/Undo actions"><figcaption>A pending edit in the editor itself.</figcaption></figure>
+
+<h2>The review bar</h2>
+<p>Which surface carries the verbs depends on the editor's API. <strong>JetBrains</strong> IDEs expose a floating-toolbar layer, so the controls sit as a <strong>floating toolbar</strong> over the editor whenever the open file has edits awaiting review: Keep, Undo, Chat, View diff, the Diff counter and its steppers, the file-wide accept and reject, <a href="stats-spotlight.html#spotlight">Spotlight</a>, and Clear Resolved.</p>
+<p><strong>VS Code</strong> exposes no floating-widget API — a comment thread is the only interactive surface that can float over code. So it uses a <strong>compact bar</strong> built on exactly that: a single row of Keep, Undo, the edit and file steppers, Diff, Chat, Spotlight, and a <strong>⌄</strong> that opens the <strong>review bubble</strong> — the agent's reasoning and the diff in git's colors, one click away on Details and back on the collapse chevron.</p>
+
+<div class="callout info">
+  <span class="ico">ℹ</span>
+  <div class="ct"><span class="ctitle">Pending badges, and following the review</span>
+  <p>A file with edits awaiting review carries their count in the editor's project tree — and on the editor tab in VS Code — so unlooked-at work is visible without opening any panel. Keeping or reverting an edit opens the next one still awaiting review, crossing files when needed; it's a setting, on by default in both editors.</p></div>
+</div>

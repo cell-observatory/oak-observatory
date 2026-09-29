@@ -13,11 +13,13 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { claudeConfigDir } from './paths';
-import { projectDir, commonDir, repoKeyForSession, firstCwdLine } from './session';
+import { projectDir, commonDir, repoKeyForSession, firstCwdLine, isMirroredTranscript, isBridgePointer } from './session';
 import { readLog, isSafeSessionId, sidecarMemo } from './store';
+import { captureEventsPath } from './capture-events';
 import { cancelledMemberIds } from './units';
 import { parseTranscriptActions, agentPhaseDetail } from './actions';
 import { sessionCounts } from './observe';
+import { derivedInventory } from './derived';
 
 /** A session whose transcript mtime is within this of now is "active" (an agent is live in it). */
 export const FLEET_ACTIVE_MS = 60_000;
@@ -92,8 +94,8 @@ const FILE_CAP = 20;
  *  reads). Lets a UI decide whether to show a Fleet affordance before doing the full listSiblings parse. */
 export function projectSessionIds(cwd: string): string[] {
   try {
-    return fs
-      .readdirSync(projectDir(cwd))
+    const dir = projectDir(cwd);
+    return derivedInventory(`fleet-directory:${dir}`, () => fs.readdirSync(dir))
       .filter((n) => n.endsWith('.jsonl'))
       .map((n) => n.slice(0, -'.jsonl'.length))
       .filter(isSafeSessionId);
@@ -122,7 +124,21 @@ function buildSibling(
   } catch {
     return null;
   }
+  // The ACTIVITY clock, apart from `lastMs` (which stays the conversation clock — the fold rule
+  // and the displayed age key on it): a DRIVEN sibling's freshest evidence is its sidecar
+  // (appended per streamed chunk) or its store log (hook captures land mid-turn), and
+  // transcript-only liveness flapped working agents inactive between message boundaries — under
+  // "Active only" a flap makes the row VANISH. Two stats per sibling.
+  let liveMs = lastMs;
+  try {
+    liveMs = Math.max(liveMs, fs.statSync(captureEventsPath(id)).mtimeMs);
+  } catch {
+    /* no sidecar — the conversation clock stands */
+  }
   const log = readLog(id); // [] when the session captured no edits — still a real sibling agent
+  // The log leg reads the newest RECORD ts, not the file's mtime: records are append-only truth
+  // (a keep/undo rewrites statuses but never timestamps), so reviewing cannot fake activity.
+  for (const r of log) if (r.ts > liveMs) liveMs = r.ts;
   const distinct: string[] = [];
   const seen = new Set<string>();
   const pendingSeen = new Set<string>(); // distinct files with a PENDING edit — the live-overlap set
@@ -165,11 +181,11 @@ function buildSibling(
     return { total, high };
   });
   const counts = sessionCounts(id);
-  const phaseDetail = agentPhaseDetail(transcriptPath);
+  const phaseDetail = derivedInventory(`phase:${transcriptPath}`, () => agentPhaseDetail(transcriptPath));
   return {
     id,
     self: id === activeSessionId,
-    active: isFleetActive(lastMs, now),
+    active: isFleetActive(liveMs, now),
     lastMs,
     // DISPLAY units — the same collapse the Overview and the Sessions rows apply, so "N pending across
     // siblings" cannot disagree with the row the reader clicks into. sessionCounts is sidecar-cached on
@@ -200,7 +216,7 @@ export function listSiblings(cwd: string, activeSessionId?: string): SiblingSess
   const dir = projectDir(cwd);
   let entries: string[];
   try {
-    entries = fs.readdirSync(dir);
+    entries = derivedInventory(`fleet-directory:${dir}`, () => fs.readdirSync(dir));
   } catch {
     return [];
   }
@@ -233,7 +249,7 @@ export function listRepoSiblings(cwd: string, activeSessionId?: string): Sibling
   const root = path.join(claudeConfigDir(), 'projects');
   let projects: string[];
   try {
-    projects = fs.readdirSync(root);
+    projects = derivedInventory(`fleet-directory:${root}`, () => fs.readdirSync(root));
   } catch {
     return [];
   }
@@ -243,7 +259,7 @@ export function listRepoSiblings(cwd: string, activeSessionId?: string): Sibling
     const dir = path.join(root, proj);
     let names: string[];
     try {
-      names = fs.readdirSync(dir);
+      names = derivedInventory(`fleet-directory:${dir}`, () => fs.readdirSync(dir));
     } catch {
       continue; // not a directory / unreadable — skip
     }
@@ -252,6 +268,7 @@ export function listRepoSiblings(cwd: string, activeSessionId?: string): Sibling
       const id = name.slice(0, -'.jsonl'.length);
       if (!isSafeSessionId(id)) continue;
       const transcript = path.join(dir, name);
+      if (isMirroredTranscript(transcript).mirrored || isBridgePointer(transcript)) continue;
       const first = firstCwdLine(transcript);
       if (!first) continue; // no cwd line ⇒ can't resolve its repo; skip (never guess membership)
       if (repoKeyForSession(id, first.cwd) !== key) continue; // different (or unresolvable) repo

@@ -12,6 +12,7 @@ import * as path from 'path';
 import { readLog, logPath, allStoreSessionIds, EditRecord } from './store';
 import { cachedAnalysis } from './analyze';
 import { cachedByFiles } from './fscache';
+import { relTime } from './format';
 
 export interface FileMemory {
   edits: number; // total edits ever captured for this file (all sessions)
@@ -113,9 +114,9 @@ export function memorySummary(m: FileMemory, nowMs?: number): string {
   const pct = Math.round((m.kept / decided) * 100);
   let last = '';
   if (m.lastVerdict) {
-    const mins = Math.max(1, Math.round(((nowMs ?? Date.now()) - m.lastVerdict.ts) / 60000));
-    const ago = mins >= 1440 ? `${Math.floor(mins / 1440)}d ago` : mins >= 60 ? `${Math.floor(mins / 60)}h ago` : `${mins}m ago`;
-    last = ` · last ${m.lastVerdict.status === 'kept' ? 'accepted' : 'reverted'} ${ago}`;
+    // Exact clock stamp, not a relative age — the same initiative that replaced every "3h ago" across
+    // the surfaces (relTime returns HH:MM:SS today / "Mon D HH:MM" this year / a date beyond).
+    last = ` · last ${m.lastVerdict.status === 'kept' ? 'accepted' : 'reverted'} ${relTime(m.lastVerdict.ts, nowMs)}`;
   }
   return `${m.edits} edit${m.edits === 1 ? '' : 's'} across sessions · ${pct}% accepted${last}`;
 }

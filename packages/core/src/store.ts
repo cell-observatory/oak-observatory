@@ -62,6 +62,40 @@ export interface EditRecord {
   /** sha256 of the file AFTER the edit, or null if the edit deleted the file. */
   afterBlob: string | null;
   status: EditStatus;
+  /**
+   * Which prompt caused this edit. On the hooks path it is the harness's own `prompt_id` (Claude
+   * Code ≥2.1.196 — absent before the first user input and on older builds, and absence is
+   * tolerated like `uid`'s). On the ACP path it is the drive's per-prompt counter. Optional:
+   * records from before this field simply lack it.
+   */
+  promptId?: string;
+  /** Where this record came from. Absent means 'hook' — every record predating the ACP path. */
+  source?: 'hook' | 'acp';
+  /** The ACP session this record was ingested from, for records with source 'acp'. */
+  acpSessionId?: string;
+  /**
+   * True when the ACP agent sent only the NEW content of the file (`oldText` absent from the typed
+   * diff). LOAD-BEARING, not descriptive: such a record stores `beforeBlob: null` — which on its
+   * own means "the file did not exist", a shape whose undo DELETES the file. `partial` says the
+   * before-state is UNKNOWN rather than known-absent, so undo refuses with the stated reason and
+   * the record stays review-only. This is the lower-fidelity ACP tier made visible.
+   */
+  partial?: true;
+  toolCallId?: string;
+  nativeTurnId?: string;
+  runtime?: string;
+  provider?: string;
+  model?: string;
+  /** Exact tool evidence or a disk interval that may include other writers. */
+  provenance?: 'tool' | 'snapshot';
+  attribution?: 'correlated' | 'interval' | 'ambiguous';
+  /** The captured content is binary (a PDF, an image, a compiled asset), so it has no line diff — the
+   *  review surfaces show a byte-size summary instead. The blob store holds the exact bytes either way;
+   *  this is a render hint, and the diff renderers also detect a binary blob defensively. */
+  binary?: true;
+  captureStartMs?: number;
+  uncertainty?: string;
+  beforeState?: 'present' | 'absent' | 'unknown';
 }
 
 /** Transient record written by PreToolUse, consumed by PostToolUse. */
@@ -69,6 +103,9 @@ export interface StagingRecord {
   file: string;
   tool: string;
   beforeBlob: string | null;
+  ts?: number;
+  toolCallId?: string;
+  ambiguous?: boolean;
   /**
    * The after-snapshot, once PostToolUse has written it but BEFORE it has appended the record.
    *
@@ -218,6 +255,83 @@ function blobsDir(sessionId: string): string {
   return path.join(storeDir(sessionId), 'blobs');
 }
 
+const storeBytesCache = new Map<string, { key: string; bytes: number }>();
+/**
+ * Total on-disk bytes a session's store occupies: the append-only log, every content snapshot (blobs),
+ * and any transient staging. This is what holding a session's pending edits COSTS in storage — shown in
+ * the session picker so a reader can see it grow over time. 0 for a session with no
+ * store (a conversation that only asked and read changed nothing on disk).
+ *
+ * Cached on the store's shape — the log's size+mtime and the blobs and staging dir mtimes — so a re-list
+ * is a few stats when nothing changed and a full walk runs only after the store actually changed. Blobs
+ * are immutable and content-addressed, so their mtime moving is exactly "a snapshot was added or reaped".
+ * The total is kept in the session's `session-meta` sidecar as well as in memory: every `oak sessions`
+ * is a fresh process, and re-stating every blob of every session cost 77 ms of a 537 ms listing on one
+ * real store (13,575 blobs).
+ */
+export function storeBytes(sessionId: string): number {
+  let dir: string;
+  try {
+    dir = storeDir(sessionId);
+  } catch {
+    return 0; // an invalid id has no store
+  }
+  try {
+    const logStat = fs.statSync(path.join(dir, 'log.jsonl'));
+    const mtimeOf = (sub: string): number => {
+      try {
+        return fs.statSync(path.join(dir, sub)).mtimeMs;
+      } catch {
+        return 0; // no such dir yet — the log alone is the store
+      }
+    };
+    const key = `${logStat.size}:${logStat.mtimeMs}:${mtimeOf('blobs')}:${mtimeOf('staging')}`;
+    const hit = storeBytesCache.get(sessionId);
+    if (hit && hit.key === key) return hit.bytes;
+    const sidecar = path.join(rootDir(), 'session-meta', `${sessionId}.json`);
+    let side: Record<string, unknown> = {};
+    try {
+      const j = JSON.parse(fs.readFileSync(sidecar, 'utf8'));
+      if (j && typeof j === 'object' && !Array.isArray(j)) side = j;
+      const kept = side.storeBytes as { key?: unknown; bytes?: unknown } | undefined;
+      if (kept && kept.key === key && typeof kept.bytes === 'number' && Number.isFinite(kept.bytes)) {
+        storeBytesCache.set(sessionId, { key, bytes: kept.bytes });
+        return kept.bytes;
+      }
+    } catch {
+      /* absent or unreadable — walk */
+    }
+    let bytes = logStat.size;
+    for (const sub of ['blobs', 'staging']) {
+      try {
+        const d = path.join(dir, sub);
+        for (const f of fs.readdirSync(d)) {
+          try {
+            bytes += fs.statSync(path.join(d, f)).size;
+          } catch {
+            /* a blob reaped mid-walk — skip it */
+          }
+        }
+      } catch {
+        /* the subdir does not exist — nothing to add */
+      }
+    }
+    storeBytesCache.set(sessionId, { key, bytes });
+    try {
+      fs.mkdirSync(path.dirname(sidecar), { recursive: true, mode: 0o700 });
+      const tmp = `${sidecar}.${process.pid}.tmp`;
+      // Merge, never replace: the sidecar's title and counts halves have keys of their own.
+      fs.writeFileSync(tmp, JSON.stringify({ ...side, storeBytes: { key, bytes } }), { mode: 0o600 });
+      fs.renameSync(tmp, sidecar);
+    } catch {
+      /* a total we could not keep is a total we walk again — never an error */
+    }
+    return bytes;
+  } catch {
+    return 0; // no log.jsonl — a transcript-only session with nothing captured
+  }
+}
+
 /**
  * Is this snapshot still on disk? A `stat`, never a read.
  *
@@ -246,9 +360,19 @@ export function logPath(sessionId: string): string {
 // --- advisory lock: serializes log-MUTATING ops so the one rewrite path (clearResolved) and GC can
 // never race a concurrent capture append. Reads stay lock-free (append-only + torn-line tolerance).
 
-const LOCK_STALE_MS = 10_000; // a lock held longer than this is presumed a crashed holder → broken
-const APPEND_LOCK_BUDGET_MS = 2000; // hot capture path: cap the wait, then proceed unlocked (still atomic)
+const LOCK_STALE_MS = 10_000; // break only after this age AND evidence that the owner is dead
+/** Past this age a lock is abandoned whatever its pid says. No live holder gets here: both agents kill
+ *  a hook after 600 s (Claude Code's default hook timeout, and the one OAK writes for Codex), and the
+ *  CLI's own mutations take seconds. A pid that still answers is then a different process that reused
+ *  the number, another user's (EPERM), or one in another pid namespace. Trusting it wedged the session
+ *  for good: every capture dropped its edit and every keep or undo said the store was busy. */
+const LOCK_ABANDONED_MS = 15 * 60_000;
+const APPEND_LOCK_BUDGET_MS = 2000; // bounded wait; never mutate without ownership
 const MAINT_LOCK_BUDGET_MS = 5000; // maintenance (clearResolved / gc) can afford to wait longer
+
+export class StoreBusyError extends Error {
+  constructor() { super('Observatory store is busy; operation was not performed'); }
+}
 
 // Synchronous sleep without a busy-loop: wait on an unshared word that is never notified.
 const SLEEP_WORD = new Int32Array(new SharedArrayBuffer(4));
@@ -264,59 +388,175 @@ function lockPath(sessionId: string): string {
   return path.join(storeDir(sessionId), '.lock');
 }
 
+/** This machine's monotonic clock in ms: shared by every process on it, never stepped with the wall
+ *  clock, and (on Linux and macOS) still while the machine sleeps. */
+const monotonicMs = (): number => Number(process.hrtime.bigint() / 1_000_000n);
+
+/** What a lock or claim file holds: the owner's pid (read by waiters), a token its release checks, and
+ *  the owner's monotonic clock when it took the file. */
+function lockToken(): string {
+  return `${process.pid}:${crypto.randomUUID()}:${monotonicMs()}`;
+}
+
 /**
- * Acquire an exclusive advisory lock for a session (O_EXCL create of `.lock`). Best-effort: breaks a
- * stale lock (older than LOCK_STALE_MS, i.e. a crashed holder) and gives up after `budgetMs`, so a
- * wedged lock can never permanently block capture. Returns a release fn, or null if not acquired
- * (the caller proceeds unlocked — an append is still atomic; only cross-op ordering is lost).
+ * A lock file as a waiter finds it: 'gone' once it was released after our failed create, null while
+ * its holder may still be working, else its stat — it may be broken. A lock is broken only when its
+ * owner is not provably alive and it is older than the stale horizon, or, whatever its pid says, once
+ * it is older than any live holder can be (a reused pid answers too).
+ *
+ * Its age is the smaller of the file's age by the wall clock and by the owner's monotonic stamp. The
+ * wall age alone let a waiter break a live holder's lock after a suspend or a clock step while it was
+ * held, or when a file server's clock lags this host's. The stamp is this machine's
+ * monotonic clock, so it ages neither way; one from another boot or machine can only read younger,
+ * which delays a break (by at most the horizon), never hastens one. Locks shared between machines
+ * still depend on the file's wall-clock age: their pids cannot be checked here either.
+ *
+ * The pid is guarded: Number('') === 0 and process.kill(0, 0) signals OUR OWN group (always "alive"),
+ * and a non-numeric pid throws ERR_INVALID_ARG_TYPE (not ESRCH), so a 0-byte or garbage lock left by
+ * a crash between the create and the write read as a live owner forever.
  */
-function acquireLock(sessionId: string, budgetMs: number): (() => void) | null {
-  const p = lockPath(sessionId);
-  const deadline = Date.now() + budgetMs;
-  for (;;) {
+function staleLock(p: string): fs.Stats | 'gone' | null {
+  let st: fs.Stats;
+  try {
+    st = fs.statSync(p);
+  } catch {
+    return 'gone';
+  }
+  let ownerAlive = false, takenMs = NaN;
+  try {
+    const [pid, , taken] = fs.readFileSync(p, 'utf8').split(':').map(Number);
+    takenMs = taken;
+    if (Number.isSafeInteger(pid) && pid > 0) { process.kill(pid, 0); ownerAlive = true; }
+  } catch (e) { ownerAlive = (e as NodeJS.ErrnoException).code === 'EPERM'; }
+  const wallMs = Date.now() - st.mtimeMs, monoMs = monotonicMs() - takenMs;
+  const ageMs = monoMs >= 0 ? Math.min(wallMs, monoMs) : wallMs; // NaN (no stamp) fails the test
+  return (ageMs > LOCK_STALE_MS && !ownerAlive) || ageMs > LOCK_ABANDONED_MS ? st : null;
+}
+
+/**
+ * Remove the stale lock `judged` from `p`, and never a lock someone took since.
+ *
+ * Judging a lock and removing it are two steps. Two waiters that judged the same dead holder's lock
+ * both unlinked "it": the second unlink removed the lock the first had just taken, and both went in —
+ * two capture appends computed the same record id (21 runs in 40 with eight appenders, measured
+ * 2026-09-26; none in 100 since). Renaming the lock aside does not close that on its own: a waiter
+ * that renamed away a FRESH lock cannot put it back without a moment in which a third can take the
+ * name. So removals are serialized instead: an O_EXCL claim beside the lock, held for three syscalls,
+ * and the lock is unlinked only while it is still the file that was judged (same inode, same mtime —
+ * a fresh lock is never stale by age). Returns true when the create should be retried at once.
+ *
+ * A claim is removed only by the waiter that made it. One whose breaker died holding it is judged by
+ * the lock's own rule and then left where it is: removing it was the same judge-then-unlink, and a
+ * waiter that judged it removed the fresh claim a third had just made, so two broke the lock (duplicate
+ * record ids in 4 of 100 trials with 16 appenders, 2026-09-27). The next claim (`.break.1`, …) takes over.
+ */
+function breakStaleLock(p: string, judged: fs.Stats): boolean {
+  const token = lockToken();
+  for (let n = 0; ; n++) {
+    const claim = n ? `${p}.break.${n}` : `${p}.break`;
     try {
-      const fd = fs.openSync(p, 'wx'); // wx = O_CREAT|O_EXCL: fails if the lock already exists
-      try {
-        fs.writeSync(fd, String(process.pid));
-      } catch {
-        /* pid is advisory only */
-      }
-      fs.closeSync(fd);
-      let released = false;
-      return () => {
-        if (released) return;
-        released = true;
-        try {
-          fs.unlinkSync(p);
-        } catch {
-          /* already broken/removed */
-        }
-      };
-    } catch {
-      // Lock exists (or storeDir is missing). Break it if stale; else back off and retry.
-      let ageMs: number;
-      try {
-        ageMs = Date.now() - fs.statSync(p).mtimeMs;
-      } catch {
-        return null; // storeDir/lock unstatable — proceed unlocked
-      }
-      if (ageMs > LOCK_STALE_MS) {
-        try {
-          fs.unlinkSync(p);
-        } catch {
-          /* someone else broke it first */
-        }
-        continue;
-      }
-      if (Date.now() >= deadline) return null;
-      sleepMs(25);
+      fs.writeFileSync(claim, token, { flag: 'wx', mode: 0o600 });
+    } catch (e) {
+      const held = (e as NodeJS.ErrnoException).code === 'EEXIST' ? staleLock(claim) : null;
+      if (held && held !== 'gone') continue; // its breaker died holding it
+      return false; // another waiter is breaking the lock
+    }
+    try {
+      const now = fs.statSync(p);
+      if (now.ino !== judged.ino || now.mtimeMs !== judged.mtimeMs) return false; // taken since it was judged
+      fs.unlinkSync(p);
+      return true;
+    } catch (e) {
+      return (e as NodeJS.ErrnoException).code === 'ENOENT'; // already free; an unremovable lock waits
+    } finally {
+      releaseLockFile(claim, token);
     }
   }
 }
 
-/** Run `fn` holding the session lock (best-effort — `fn` still runs if the lock couldn't be taken). */
+/** How long an unbroken run of EPERM on Windows is taken for a lock release in progress (takeLockFile). */
+const EPERM_RELEASE_MS = 1000;
+
+/**
+ * Create the lock file `p` holding `token` (O_EXCL), waiting while someone else holds it; false once
+ * `deadline` passes. Only EEXIST is waited on: any other create error — a missing or unwritable
+ * directory, a full disk — is thrown at once, because waiting cannot change it. Both locks used to
+ * spin on it without sleeping for their whole budget (2–15 s of a core) and then report "busy".
+ *
+ * Except EPERM on Windows, which deletes a file only when its last handle closes: a lock released
+ * while another handle has it open (a waiter reading its owner, an antivirus scan) stays "delete
+ * pending" until then, and creating it meanwhile fails with EPERM. That is a release in progress, so it
+ * is waited out (an undo on the windows-latest runner reverted its file and then could not record it) —
+ * for EPERM_RELEASE_MS at most, and never past the deadline: Windows refuses an unwritable lock
+ * directory with the same EPERM, and waiting out the caller's whole budget on it cost a capture hook 15 s.
+ */
+function takeLockFile(p: string, token: string, deadline: number): boolean {
+  let refusedSince: number | undefined;
+  for (;;) {
+    let fd: number;
+    try {
+      fd = fs.openSync(p, 'wx', 0o600); // wx = O_CREAT|O_EXCL: fails if the lock already exists
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === 'EPERM' && process.platform === 'win32') {
+        refusedSince ??= Date.now();
+        if (Date.now() < deadline && Date.now() - refusedSince < EPERM_RELEASE_MS) {
+          sleepMs(25);
+          continue;
+        }
+      } else refusedSince = undefined;
+      if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
+      const stale = staleLock(p);
+      if (stale === 'gone') {
+        // Released between our create and its stat: the lock is free, so take it. Refusing here
+        // turned an ordinary handover into "store is busy", dropping a capture or a keep.
+        if (Date.now() < deadline) continue;
+      } else if (stale && breakStaleLock(p, stale)) continue;
+      if (Date.now() >= deadline) return false;
+      sleepMs(25);
+      continue;
+    }
+    try {
+      fs.writeSync(fd, token); // the owner's pid (read by waiters) and the token its release checks
+    } catch (e) {
+      fs.closeSync(fd);
+      try { fs.unlinkSync(p); } catch { /* ours, created a moment ago */ }
+      throw e;
+    }
+    fs.closeSync(fd);
+    return true;
+  }
+}
+
+/** Remove `p` only while it still holds `token`: a lock broken as abandoned belongs to its new holder. */
+function releaseLockFile(p: string, token: string): void {
+  try { if (fs.readFileSync(p, 'utf8') === token) fs.unlinkSync(p); } catch { /* already broken/removed */ }
+}
+
+/**
+ * Acquire an exclusive advisory lock for a session (O_EXCL create of `.lock`). Return a release
+ * function, or null after the bounded wait; the caller refuses the mutation if acquisition fails.
+ */
+function acquireLock(sessionId: string, budgetMs: number): (() => void) | null {
+  const p = lockPath(sessionId);
+  const token = lockToken();
+  try {
+    if (!takeLockFile(p, token, Date.now() + budgetMs)) return null;
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return null; // no storeDir — refuse the mutation
+    throw e;
+  }
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    releaseLockFile(p, token);
+  };
+}
+
+/** Run `fn` only while holding the session lock. */
 function withLock<T>(sessionId: string, budgetMs: number, fn: () => T): T {
   const release = acquireLock(sessionId, budgetMs);
+  if (!release) throw new StoreBusyError();
   try {
     return fn();
   } finally {
@@ -437,15 +677,6 @@ export function lastRecordFor(sessionId: string, file: string): EditRecord | nul
   return null;
 }
 
-export function stagingAgeMs(sessionId: string, key: string): number | null {
-  const p = path.join(stagingDir(sessionId), `${key}.json`);
-  try {
-    return Date.now() - fs.statSync(p).mtimeMs;
-  } catch {
-    return null;
-  }
-}
-
 export function deleteStaging(sessionId: string, key: string): void {
   const p = path.join(stagingDir(sessionId), `${key}.json`);
   try {
@@ -464,6 +695,40 @@ export interface BashManifest {
   /** The directory this snapshot walked. A Post that diffs its walk against a manifest of a
    *  DIFFERENT root invents changes wholesale, so the root is part of the manifest's identity. */
   root?: string;
+  toolCallId?: string;
+  excluded?: string[];
+  complete?: boolean;
+}
+
+/** A GC lease is never eligible for a Bash Post. Its owner releases only this token. */
+export function writeSnapshotLease(sessionId: string, files: Record<string, string | null>): string {
+  ensureStore(sessionId);
+  const token = `__lease__${crypto.randomUUID()}`;
+  const dest = path.join(stagingDir(sessionId), `${token}.json`);
+  const tmp = `${dest}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify({ files, pid: process.pid, ts: Date.now() }), { mode: 0o600 });
+  fs.renameSync(tmp, dest);
+  return token;
+}
+
+export function releaseSnapshotLease(sessionId: string, token: string): void {
+  if (!/^__lease__[a-zA-Z0-9-]+$/.test(token)) return;
+  try { fs.unlinkSync(path.join(stagingDir(sessionId), `${token}.json`)); } catch { /* already released */ }
+}
+
+/** Keep a consumed manifest visible to GC until the capture append has committed. */
+export function claimBashManifest(sessionId: string, root: string, toolCallId?: string): { manifest: BashManifest; release(): void } | null {
+  return withBashPreLock(sessionId, () => {
+    const hit = findBashManifest(sessionId, root, toolCallId);
+    if (!hit) return null;
+    const token = `__lease__${crypto.randomUUID()}`;
+    try { fs.renameSync(hit.path, path.join(stagingDir(sessionId), `${token}.json`)); }
+    catch { return null; }
+    const lease = path.join(stagingDir(sessionId), `${token}.json`);
+    const tmp = `${lease}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify({ ...hit.m, pid: process.pid }), { mode: 0o600 }); fs.renameSync(tmp, lease);
+    return { manifest: hit.m, release: () => releaseSnapshotLease(sessionId, token) };
+  });
 }
 
 /**
@@ -529,19 +794,51 @@ export function reapStaleManifests(sessionId: string, maxAgeMs = 24 * 60 * 60 * 
   // only, so these were invisible to every reaper — and `hasInflightCapture` counts ANY staging
   // entry, so one stray temp kept a finished session out of the collector forever.
   try {
-    names = names.concat(
-      fs.readdirSync(stagingDir(sessionId)).filter((n) => n.startsWith(BASH_MANIFEST_PREFIX) && n.endsWith('.tmp'))
-    );
+    const all = fs.readdirSync(stagingDir(sessionId));
+    // Any leftover temp from a writer that died mid-rename — a bash manifest OR a typed-staging
+    // `<key>.json.<pid>.tmp` (writeStaging) — is matched by neither `manifestFiles` (.json only) nor
+    // the typed-Pre retention rule, yet `hasInflightCapture` counts ANY staging entry, so one stray
+    // temp kept a finished session out of the collector forever. The age + owner-liveness guard below
+    // only clears genuinely abandoned ones.
+    names = names.concat(all.filter((n) => n.endsWith('.tmp') || n.startsWith('__lease__')));
   } catch {
     /* no staging dir — nothing to reap */
   }
   for (const name of names) {
     const p = path.join(stagingDir(sessionId), name);
     try {
-      if (now - fs.statSync(p).mtimeMs > maxAgeMs) fs.unlinkSync(p);
+      if (now - fs.statSync(p).mtimeMs > maxAgeMs) {
+        let live = false;
+        try { const owner = JSON.parse(fs.readFileSync(p,'utf8')).pid; if (typeof owner === 'number' && owner > 0) { process.kill(owner,0); live = true; } } catch (e) { live = (e as NodeJS.ErrnoException).code === 'EPERM'; }
+        if (!live) fs.unlinkSync(p);
+      }
     } catch {
       /* raced with another hook — fine either way */
     }
+  }
+  // A typed Pre has no durable runtime-owner liveness or failure signal. Its age cannot prove
+  // completion: retain it until the matching Post or explicit removal of the session.
+}
+
+/**
+ * Clear a session's PreToolUse before-snapshots at turn end (the `Stop` hook). A denied, failed, or
+ * interrupted Edit fires Pre but never Post, leaving its snapshot staged. Because a tool_use_id now
+ * suffixes the staging key, a SECOND edit to that file gets a different key, so `handlePre`'s
+ * overlap scan finds the abandoned entry and marks BOTH records `ambiguous` — for the rest of the
+ * session every edit of that file becomes review-only (Undo refuses) and `hasInflightCapture` never
+ * clears, so the session is never reapable. `Stop` is the terminal signal the conservative
+ * "never infer completion from age" rule was waiting for: no tool call outlives the turn, so at Stop
+ * any remaining Pre snapshot is abandoned and safe to drop. Next turn's edits capture cleanly. Bash
+ * manifests (`__bash__…`) and leases (`__lease__…`) own their own lifecycle and are left untouched.
+ * (The narrower within-turn window — a failed edit then a retry of the SAME file in the SAME turn —
+ * still needs the tool's own terminal hook; this is the cross-turn backstop.)
+ */
+export function clearAbandonedToolStaging(sessionId: string): void {
+  let names: string[];
+  try { names = fs.readdirSync(stagingDir(sessionId)); } catch { return; }
+  for (const name of names) {
+    if (!name.endsWith('.json') || name.startsWith('__')) continue;
+    try { deleteStaging(sessionId, name.slice(0, -5)); } catch { /* raced with a hook — fine */ }
   }
 }
 
@@ -626,7 +923,7 @@ function advanceUnlocked(sessionId: string, seen: Map<string, string | null>): v
 /** The oldest pending manifest taken of `root` (any root when undefined), with its path so a caller
  *  can consume it. Unparseable files are dropped as they are met — never diff against half a
  *  snapshot. */
-function findBashManifest(sessionId: string, root: string | undefined): { path: string; m: BashManifest } | null {
+function findBashManifest(sessionId: string, root: string | undefined, toolCallId?: string): { path: string; m: BashManifest } | null {
   const want = normalizeRoot(root);
   for (const name of manifestFiles(sessionId)) {
     const p = path.join(stagingDir(sessionId), name);
@@ -644,6 +941,8 @@ function findBashManifest(sessionId: string, root: string | undefined): { path: 
       continue;
     }
     if (m.root !== undefined && want !== undefined && m.root !== want) continue; // another command's tree
+    if (toolCallId !== undefined && m.toolCallId !== toolCallId) continue;
+    if (toolCallId === undefined && m.toolCallId !== undefined) continue;
     // A ROOTLESS manifest is a previous build's shared `__bash__.json`, and it matched everything —
     // including a Post in a subdirectory, whose walk then reported every file outside that directory
     // as deleted (the very mass-phantom shape described above, arriving on the first command after an
@@ -672,7 +971,7 @@ export function takeBashManifest(sessionId: string, root: string | undefined): B
   try {
     fs.unlinkSync(hit.path);
   } catch {
-    /* another Post took it first — its content is still a valid snapshot of this tree */
+    return null; // another Post owns it; this consumer has no baseline
   }
   return hit.m;
 }
@@ -822,9 +1121,16 @@ function parseLogFile(p: string): EditRecord[] {
     } catch {
       continue; // skip a partially-written line
     }
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) continue;
     // Any line with an `op` is a control op, not an edit record: fold 'status', ignore the rest
     // (e.g. 'skip' markers, read separately by readSkips).
     if ((obj as { op?: string }).op) {
+      if ((obj as { op?: string }).op === 'capture-evidence') {
+        const evidence = obj as unknown as { id: number; uid?: string; beforeBlob: string | null; tool: string; toolCallId?: string; beforeState: 'present' | 'absent' };
+        const rec = byId.get(evidence.id);
+        if (rec && rec.uid === evidence.uid) { rec.beforeBlob = evidence.beforeBlob; rec.tool = evidence.tool; rec.toolCallId = evidence.toolCallId;
+          rec.beforeState = evidence.beforeState; rec.source = 'hook'; rec.provenance = 'tool'; rec.attribution = 'correlated'; delete rec.partial; }
+      }
       if ((obj as StatusOp).op === 'status') {
         const rec = byId.get((obj as StatusOp).id);
         if (rec) rec.status = (obj as StatusOp).status;
@@ -832,6 +1138,7 @@ function parseLogFile(p: string): EditRecord[] {
       continue;
     }
     const rec = obj as EditRecord;
+    if (!Number.isSafeInteger(rec.id) || rec.id <= 0 || typeof rec.file !== 'string') continue;
     // §2.7 reconciliation: a residual unlocked append (two writers that both failed the lock) can put
     // two records on disk with the SAME display id. Deterministically re-key the LATER one (append
     // order) to a fresh id above every id seen so far, so byId / the status fold / undo targeting each
@@ -846,12 +1153,109 @@ function parseLogFile(p: string): EditRecord[] {
   return records;
 }
 
-/** Append a 'skip' marker (a real edit capture had to drop). Best-effort, under the lock. */
+/**
+ * For each id in [ids]: the status it held immediately BEFORE it LAST became 'undone' — what a redo
+ * restores. Folded from the same line walk as [parseLogFile] (including the §2.7 duplicate re-key,
+ * or a status op after a reconciled collision would mis-attribute): the record line's own baked
+ * status seeds the timeline, every status op advances it, and the value just before the latest
+ * transition INTO 'undone' is the answer. Ids with no visible transition (a log rewritten by clean,
+ * a record line baked 'undone') answer 'pending' — with the history gone there is no decision to
+ * restore. One pass however many ids, so bulk redo stays O(log), not O(ids × log).
+ */
+export function statusesBeforeUndone(sessionId: string, ids: Iterable<number>): Map<number, EditStatus> {
+  const want = new Set(ids);
+  const out = new Map<number, EditStatus>();
+  const fill = () => {
+    for (const id of want) if (!out.has(id)) out.set(id, 'pending');
+    return out;
+  };
+  if (!want.size) return out;
+  const p = logPath(sessionId);
+  if (!fs.existsSync(p)) return fill();
+  const cur = new Map<number, EditStatus>();
+  const usedIds = new Set<number>();
+  let maxId = 0;
+  for (const line of fs.readFileSync(p, 'utf8').split('\n')) {
+    const t = line.trim();
+    if (!t) continue;
+    let obj: { op?: string; id?: number; status?: EditStatus };
+    try {
+      obj = JSON.parse(t);
+    } catch {
+      continue;
+    }
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) continue;
+    if (obj.op) {
+      if (obj.op === 'status' && typeof obj.id === 'number' && obj.status) {
+        const id = obj.id;
+        if (obj.status === 'undone' && want.has(id) && cur.get(id) !== 'undone') {
+          out.set(id, cur.get(id) ?? 'pending'); // latest transition wins — keep overwriting
+        }
+        cur.set(id, obj.status);
+      }
+      continue;
+    }
+    if (typeof obj.id !== 'number') continue;
+    let id = obj.id;
+    if (usedIds.has(id)) id = maxId + 1; // §2.7 mirror — see parseLogFile
+    usedIds.add(id);
+    if (id > maxId) maxId = id;
+    cur.set(id, obj.status ?? 'pending');
+    if (obj.status === 'undone' && want.has(id)) out.delete(id); // baked-undone: history discarded
+  }
+  return fill();
+}
+
+/** Attach a later hook's before-snapshot to its ACP twin without adding a second edit. */
+export function enrichCaptureFromHook(session: string, id: number, evidence: { file: string; beforeBlob: string | null; afterBlob: string | null; tool: string; toolCallId?: string }): boolean {
+  return withBashPreLock(session, () => {
+    const rec = findRecord(session,id);
+    if (!rec || rec.source !== 'acp' || rec.status === 'undone' || rec.file !== evidence.file || rec.afterBlob !== evidence.afterBlob) return false;
+    if (rec.toolCallId && evidence.toolCallId && rec.toolCallId !== evidence.toolCallId) return false;
+    fs.appendFileSync(logPath(session),JSON.stringify({ op:'capture-evidence',id,uid:rec.uid,beforeBlob:evidence.beforeBlob,
+      tool:evidence.tool,toolCallId:evidence.toolCallId,beforeState:evidence.beforeBlob === null ? 'absent' : 'present' })+'\n',{mode:0o600});
+    return true;
+  });
+}
+
+const contentionSkipDir = (session: string): string => path.join(storeDir(session), 'capture-skips');
+
+function contentionSkips(session: string): { path: string; op: SkipOp }[] {
+  const dir = contentionSkipDir(session);
+  let names: string[];
+  try { names = fs.readdirSync(dir); } catch { return []; }
+  const out: { path: string; op: SkipOp }[] = [];
+  for (const name of names) {
+    if (!name.endsWith('.json')) continue;
+    const file = path.join(dir, name);
+    try {
+      const op = JSON.parse(fs.readFileSync(file, 'utf8')) as SkipOp;
+      if (op?.op === 'skip' && typeof op.file === 'string' && typeof op.reason === 'string' && Number.isFinite(op.ts)) out.push({ path: file, op });
+    } catch { /* only complete, atomically published diagnostics are readable */ }
+  }
+  return out;
+}
+
+/** A capture failure must remain visible even while maintenance owns the log. */
 export function appendSkip(sessionId: string, file: string, reason: string): void {
+  ensureStore(sessionId);
   const op: SkipOp = { op: 'skip', file, reason, ts: Date.now() };
-  withLock(sessionId, APPEND_LOCK_BUDGET_MS, () =>
-    fs.appendFileSync(logPath(sessionId), JSON.stringify(op) + '\n', { mode: 0o600 })
-  );
+  try {
+    withLock(sessionId, APPEND_LOCK_BUDGET_MS, () =>
+      fs.appendFileSync(logPath(sessionId), JSON.stringify(op) + '\n', { mode: 0o600 })
+    );
+  } catch (e) {
+    if (!(e instanceof StoreBusyError)) throw e;
+    // Separate immutable files cannot be overwritten by a concurrent log rewrite. No successful
+    // edit is claimed; integrity reports the gap and existing staging continues to retain bytes.
+    const dir = contentionSkipDir(sessionId);
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const dest = path.join(dir, `${crypto.randomUUID()}.json`), tmp = `${dest}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(op), { mode: 0o600 });
+    fs.renameSync(tmp, dest);
+    // Keep a diagnostic-only session discoverable; opening for append never truncates the log.
+    fs.closeSync(fs.openSync(logPath(sessionId), 'a', 0o600));
+  }
 }
 
 /**
@@ -993,8 +1397,8 @@ export function readScopeOverrides(sessionId: string): Map<number, string> {
 /** The 'skip' markers in a session's log (dropped, untracked changes). */
 export function readSkips(sessionId: string): SkipOp[] {
   const p = logPath(sessionId);
-  if (!fs.existsSync(p)) return [];
-  const out: SkipOp[] = [];
+  const out: SkipOp[] = contentionSkips(sessionId).map(({ op }) => op);
+  if (!fs.existsSync(p)) return out;
   for (const line of fs.readFileSync(p, 'utf8').split('\n')) {
     const t = line.trim();
     if (!t || t.indexOf('"skip"') === -1) continue;
@@ -1005,7 +1409,7 @@ export function readSkips(sessionId: string): SkipOp[] {
       /* skip a partial line */
     }
   }
-  return out;
+  return out.sort((a, b) => a.ts - b.ts);
 }
 
 /**
@@ -1070,9 +1474,8 @@ function makeUid(): string {
  *
  * §2.7 single-writer hazard: the display `id` is allocated INSIDE the lock (folding `nextId` into the
  * locked append) so a concurrent writer can't read the same max and collide — the common-case fix.
- * The lock is best-effort (it can give up and proceed unlocked), so each record also carries a
- * collision-proof `uid`; any residual unlocked duplicate display id is reconciled deterministically on
- * read (readLog). The store owns id allocation: any `id` on the input object is ignored.
+ * Each record also carries a collision-proof `uid`; duplicate display IDs from historical
+ * unlocked writers are reconciled deterministically on read (readLog). The store owns id allocation: any `id` on the input object is ignored.
  */
 export function appendLog(sessionId: string, rec: Omit<EditRecord, 'id' | 'uid'>): EditRecord {
   return withLock(sessionId, APPEND_LOCK_BUDGET_MS, () => {
@@ -1146,7 +1549,7 @@ export function sidecarMemo<T>(sessionId: string, field: string, stamp: string, 
  * Returns the ids that actually changed; an edit already in [status] is skipped rather than re-stated,
  * which is what keeps the log from doubling on a second Accept All.
  */
-export function setStatusMany(sessionId: string, ids: Iterable<number>, status: EditStatus): number[] {
+export function setStatusMany(sessionId: string, ids: Iterable<number>, status: EditStatus, budgetMs = MAINT_LOCK_BUDGET_MS): number[] {
   const want = new Set(ids);
   if (!want.size) return [];
   const changedRecs = readLog(sessionId).filter((r) => want.has(r.id) && r.status !== status);
@@ -1168,7 +1571,7 @@ export function setStatusMany(sessionId: string, ids: Iterable<number>, status: 
   const journal = changed.length >= 2 ? JSON.stringify(opObj) + '\n' : '';
   const payload =
     journal + changed.map((id) => JSON.stringify({ op: 'status', id, status, ts })).join('\n') + '\n';
-  withLock(sessionId, MAINT_LOCK_BUDGET_MS, () =>
+  withLock(sessionId, budgetMs, () =>
     fs.appendFileSync(logPath(sessionId), payload, { mode: 0o600 })
   );
   return changed;
@@ -1240,12 +1643,12 @@ function gcSessionCore(sessionId: string): { removed: number; bytes: number } {
     // EVERY pending Bash snapshot, not one well-known name: each Pre now writes its own manifest
     // (overlapping commands used to overwrite each other's), and a blob only a pending manifest
     // references is exactly the before-side an in-flight command is about to record against.
-    if (name.startsWith(BASH_MANIFEST_PREFIX) && name.endsWith('.json')) {
+    if ((name.startsWith(BASH_MANIFEST_PREFIX) || name.startsWith('__lease__')) && name.endsWith('.json')) {
       try {
         const m = JSON.parse(fs.readFileSync(path.join(sdir, name), 'utf8')) as BashManifest;
         if (m && m.files) for (const sha of Object.values(m.files)) if (sha) referenced.add(sha);
       } catch {
-        /* unparseable manifest — its blobs are not provably referenced */
+        return { removed: 0, bytes: 0 }; // uncertain lease: preserve blobs until staging is resolved
       }
     } else if (name.endsWith('.json')) {
       try {
@@ -1255,7 +1658,7 @@ function gcSessionCore(sessionId: string): { removed: number; bytes: number } {
         if (rec && rec.beforeBlob) referenced.add(rec.beforeBlob);
         if (rec && rec.afterBlob) referenced.add(rec.afterBlob);
       } catch {
-        /* unparseable staging record — ignore */
+        return { removed: 0, bytes: 0 }; // fail closed around an unreadable capture baseline
       }
     }
   }
@@ -1294,12 +1697,22 @@ export function gcSession(sessionId: string): { removed: number; bytes: number }
 /** Directories under the store root that are CACHES, not sessions. `clean` walks the root looking for
  *  reclaimable session husks; without this list it finds these, sees no log.jsonl, and deletes the very
  *  caches this release's speed depends on — reporting them to the reader as "pruned stub sessions". */
-const RESERVED_STORE_DIRS = new Set(['changemap-cache', 'session-meta', 'usage-cursors']);
+// Store-root directories that are NOT sessions and must never be handed to gcSession/pruneEmptySession
+// (they hold no session shape, so the stub-pruner would delete them as "empty"): the cross-file mutex
+// locks, the derived codex transcript cache (honours its own .lock), the cross-machine usage cache, and
+// the per-agent drive prefs (agent-prefs-<agent>, matched by prefix below).
+const RESERVED_STORE_DIRS = new Set([
+  'changemap-cache', 'session-meta', 'usage-cursors', '.file-locks', 'runtime-transcripts', 'remote-cache',
+]);
+/** A store-root entry that is a reserved non-session directory (exact name or a known prefix). */
+function isReservedStoreDir(id: string): boolean {
+  return RESERVED_STORE_DIRS.has(id) || id.startsWith('agent-prefs-') || id.startsWith('.');
+}
 
 export function allStoreSessionIds(): string[] {
   try {
     return fs.readdirSync(rootDir()).filter((id) => {
-      if (RESERVED_STORE_DIRS.has(id)) return false;
+      if (isReservedStoreDir(id)) return false;
       if (!isSafeSessionId(id)) return false;
       try {
         return fs.statSync(path.join(rootDir(), id)).isDirectory();
@@ -1319,8 +1732,15 @@ export function allStoreSessionIds(): string[] {
  */
 export function pruneEmptySession(sessionId: string): boolean {
   try {
+    if (isReservedStoreDir(sessionId)) return false; // not a session — never GC via the stub-pruner
     if (fs.existsSync(logPath(sessionId))) return false; // has (or had) review state — keep
     if (hasInflightCapture(sessionId)) return false;
+    // Hook lifecycle evidence and historical journals remain review state even without edits.
+    try {
+      if (fs.readdirSync(storeDir(sessionId)).some((f) => f === 'capture-events.jsonl' || (f.startsWith('acp-') && f.endsWith('.jsonl')))) return false;
+    } catch {
+      /* unreadable dir — fall through to the existing checks */
+    }
     const bdir = blobsDir(sessionId);
     if (fs.existsSync(bdir) && fs.readdirSync(bdir).length > 0) return false; // live-referenced blobs
     removeSession(sessionId);
@@ -1475,6 +1895,9 @@ export function readSweep(sessionId: string): SweptOp | null {
  *     not captured" naming the very path the reader asked never to be recorded.
  */
 export function dropIgnored(sessionId: string): { dropped: number; files: string[] } {
+  // A fully ignored first edit has no store or log to sweep. Do not turn that normal absence
+  // into a lock failure and a capture-gap diagnostic for a path the user excluded.
+  if (!fs.existsSync(logPath(sessionId))) return { dropped: 0, files: [] };
   return withLock(sessionId, MAINT_LOCK_BUDGET_MS, () => {
     const p = logPath(sessionId);
     if (!fs.existsSync(p)) return { dropped: 0, files: [] };
@@ -1519,6 +1942,11 @@ export function dropIgnored(sessionId: string): { dropped: number; files: string
     const tmp = `${p}.${process.pid}.tmp`;
     fs.writeFileSync(tmp, lines.join('\n') + '\n', { mode: 0o600 });
     fs.renameSync(tmp, p);
+    for (const entry of contentionSkips(sessionId)) {
+      if (path.isAbsolute(entry.op.file) && ctx.ignored(entry.op.file)) {
+        try { fs.unlinkSync(entry.path); } catch { /* another sweep already removed it */ }
+      }
+    }
     gcSessionCore(sessionId); // the dropped records' blobs are now unreferenced (already locked)
     return { dropped: dead.length, files };
   });
@@ -1639,6 +2067,46 @@ export function removeSession(sessionId: string): void {
   fs.rmSync(path.join(root, 'session-meta', `${sessionId}.json`), { force: true });
 }
 
+/**
+ * A durable list of sessions the user chose to remove from every picker. `removeSession` clears
+ * Observatory's OWN store data, but a session whose transcript/rollout still exists on disk (the
+ * agent's own file, which is not ours to delete) would reappear in the listings the moment it is
+ * re-scanned. This list is what keeps a deleted session gone: every session enumeration filters it.
+ */
+function hiddenSessionsPath(): string { return path.join(rootDir(), 'hidden-sessions.json'); }
+
+export function hiddenSessions(): Set<string> {
+  try {
+    const arr = JSON.parse(fs.readFileSync(hiddenSessionsPath(), 'utf8'));
+    return new Set(Array.isArray(arr) ? arr.filter((x) => typeof x === 'string') : []);
+  } catch { return new Set(); }
+}
+
+export function isSessionHidden(sessionId: string): boolean {
+  return hiddenSessions().has(sessionId);
+}
+
+function writeHidden(ids: Set<string>): void {
+  const p = hiddenSessionsPath();
+  fs.mkdirSync(rootDir(), { recursive: true });
+  const tmp = `${p}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify([...ids]), { mode: 0o600 });
+  fs.renameSync(tmp, p);
+}
+
+export function hideSession(sessionId: string): void {
+  if (!isSafeSessionId(sessionId)) throw new Error(`invalid session id: ${sessionId}`);
+  const ids = hiddenSessions();
+  if (ids.has(sessionId)) return;
+  ids.add(sessionId);
+  writeHidden(ids);
+}
+
+export function unhideSession(sessionId: string): void {
+  const ids = hiddenSessions();
+  if (ids.delete(sessionId)) writeHidden(ids);
+}
+
 /** True when `file` is the scope path itself (exact file) or lives beneath it (folder prefix). The one
  *  rule shared by every `--under` operation, so file-scope and folder-scope match identically. Both
  *  operands are drive-case-canonicalized (#43): records are served canonical, but the scope may arrive
@@ -1698,4 +2166,30 @@ export function clearResolvedIds(sessionId: string, ids: number[]): { cleared: n
     gcSessionCore(sessionId); // reclaim blobs referenced only by the removed edits (already locked)
     return { cleared: dropped.length, ids: dropped };
   });
+}
+
+/** What `withFileMutation` throws when another Observatory operation holds the file past the budget. */
+export class FileBusyError extends Error {
+  constructor() { super('Another Observatory operation is modifying this file; retry when it finishes'); }
+}
+
+/** Serialize Observatory mutations of one physical file across all sessions. External writers
+ * are still detected by content comparison; an advisory lock cannot establish model authorship. */
+export function withFileMutation<T>(file: string, action: () => T, budgetMs = 5000): T {
+  let physical = canonPath(path.resolve(file));
+  try { physical = canonPath(fs.realpathSync(physical)); }
+  catch { try { physical = path.join(fs.realpathSync(path.dirname(physical)),path.basename(physical)); } catch {} }
+  const dir=path.join(rootDir(),'.file-locks'); fs.mkdirSync(dir,{recursive:true,mode:0o700});
+  const lock=path.join(dir,pathKey(physical)), token=lockToken();
+  // The same lock rules as the session lock (takeLockFile): a missing or unwritable lock directory
+  // throws at once (on Windows, whose EPERM can also be a release in progress, within about a second),
+  // a stale lock is broken without ever removing one taken since.
+  if (!takeLockFile(lock, token, Date.now() + budgetMs)) throw new FileBusyError();
+  try { return action(); }
+  finally { releaseLockFile(lock, token); }
+}
+
+/** Legacy snapshot creations lacked proof of absence. Such records must remain review-only. */
+export function uncertainCreation(r: EditRecord): boolean {
+  return r.beforeBlob === null && r.beforeState !== 'absent' && (r.source === 'acp' || ['Bash','Shell'].includes(r.tool));
 }

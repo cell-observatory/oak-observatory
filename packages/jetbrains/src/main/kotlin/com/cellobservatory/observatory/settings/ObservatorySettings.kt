@@ -16,7 +16,7 @@ import javax.swing.JPanel
 @State(name = "ClaudeObservatorySettings", storages = [Storage("claude-observatory.xml")])
 class ObservatorySettings : PersistentStateComponent<ObservatorySettings.State> {
     class State {
-        var observatoryBin: String? = null // path to the claude-observatory CLI; empty = auto-detect
+        var observatoryBin: String? = null // path to the oak CLI; empty = auto-detect
         var claudeBin: String? = null // path to the claude CLI (opt-in Analyze); empty = auto-detect
         var configDir: String? = null // CLAUDE_CONFIG_DIR override; empty = env var, then ~/.claude
         var inlineReview: Boolean = true // inline editor overlay (lenses + line highlights)
@@ -81,6 +81,11 @@ class ObservatorySettings : PersistentStateComponent<ObservatorySettings.State> 
          */
         var overviewGroupedNav: Boolean = false
 
+        /** How the change map and Review tree are ordered — one of `time` (newest first, the default),
+         *  `time-asc` (oldest first), `name` (path A→Z), `name-desc` (Z→A). Persisted, like the other
+         *  layout choices here; an unknown value falls back to `time` on read. */
+        var overviewSort: String = "time"
+
         // The master/detail divider again, for GROUPED mode. Grouped columns need a wider nav than five
         // stacked tabs do, so reusing one value per orientation would leave the reader re-dragging the
         // divider on every toggle. Same two-orientation pairing as the plain fields above.
@@ -88,11 +93,11 @@ class ObservatorySettings : PersistentStateComponent<ObservatorySettings.State> 
         var overviewSplitNarrowGrouped: Float = 0.55f
 
         /**
-         * Fold the Timeline's three tabs — Prompts · Observations · Actions — into ONE view showing all
-         * three as columns.
+         * Fold the Timeline's four tabs — Feed · Prompts · Observations · Actions — into ONE view showing all
+         * four as columns.
          *
          * A SEPARATE flag from [overviewGroupedNav] on purpose: they are different windows of different
-         * widths, and a reader who wants the Timeline's three surfaces at once has said nothing about the
+         * widths, and a reader who wants the Timeline's four surfaces at once has said nothing about the
          * Overview's five nav tabs.
          */
         var timelineGroupedNav: Boolean = false
@@ -126,6 +131,13 @@ class ObservatorySettings : PersistentStateComponent<ObservatorySettings.State> 
     private var myState = State()
     override fun getState(): State = myState
     override fun loadState(state: State) {
+        // The Timeline's `agent` member became `conversation` in 0.10.0, and Conversation folded into
+        // the Feed (2026-09-23). A layout written before either change may still fold a column under a
+        // retired key, which now matches no member. Drop those keys on the way in rather than
+        // transferring the fold to the Feed — the Feed column keeps its own state. A new list, because
+        // the deserializer's own is not guaranteed to be mutable.
+        state.collapsedColumns = state.collapsedColumns.filterTo(ArrayList()) { it != "agent" && it != "conversation" }
+        state.columnSplits = state.columnSplits.filterKeys { !it.startsWith("timeline:") }.toMutableMap()
         myState = state
     }
 
@@ -152,7 +164,7 @@ class ObservatoryConfigurable : Configurable {
     private val revealNextOnResolve =
         JBCheckBox("After keeping or reverting one edit, open the next edit still awaiting review")
     private val overviewGroupedNav =
-        JBCheckBox("Group related tabs side by side (Sessions · Fleet / Workflows · Tasks · Processes)")
+        JBCheckBox("Group all tabs side by side (Sessions · Workers · Workflows · Tasks · Processes)")
     /** Label ⟷ stored value for the review-surface combo. A combo of raw values would put "floating" on
      *  screen, which says nothing about where the chrome appears. */
     private val surfaceLabels = linkedMapOf(
@@ -171,11 +183,11 @@ class ObservatoryConfigurable : Configurable {
         surfaceLabels.entries.firstOrNull { it.value == editorReviewSurface.item }?.key
             ?: ObservatorySettings.FLOATING
 
-    override fun getDisplayName() = "Claude Observatory"
+    override fun getDisplayName() = "OAK"
 
     override fun createComponent(): JComponent {
         panel = FormBuilder.createFormBuilder()
-            .addLabeledComponent("claude-observatory CLI path (blank = auto-detect):", observatoryBin, 1, false)
+            .addLabeledComponent("oak CLI path (blank = auto-detect):", observatoryBin, 1, false)
             .addLabeledComponent("claude CLI path for Analyze (blank = auto-detect):", claudeBin, 1, false)
             .addLabeledComponent("Claude config dir (blank = \$CLAUDE_CONFIG_DIR, then ~/.claude):", configDir, 1, false)
             .addLabeledComponent("Pinned session (blank = auto-resolve newest):", session, 1, false)

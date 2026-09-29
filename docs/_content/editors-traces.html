@@ -1,0 +1,21 @@
+<p>The <strong>Observatory Traces</strong> sidebar is the review surface that lives in the editor's own view column — a tree of every pending <a href="edits.html">edit</a>, grouped by the file it touched, with the decision <a href="keep-undo.html">verbs</a> on every row. It carries the same review the <a href="tui.html">terminal app</a> does, rendered as a tree beside your files rather than a dashboard.</p>
+
+<figure><img src="media/traces-sidebar.png" loading="lazy" alt="The Observatory Traces sidebar: a REVIEW header with a pending count, an Open-all / Keep-all / Undo-all action row, then pending edits grouped under their file paths — each file header with its own file-level Keep and Undo, each edit below it with its churn and per-edit Keep and Undo — and a folded footer for cancelled-out chains"><figcaption>The Observatory Traces sidebar — pending edits grouped by file, each row one decision.</figcaption></figure>
+
+<h2>Grouped by file</h2>
+<p>Every row is one <a href="review-units.html">review unit</a> — one piece of code, however many times the agent revised it — filed under its path. A file header carries that file's pending count and its own <strong>✓&nbsp;file</strong> / <strong>✗&nbsp;file</strong> actions, so a whole file can be accepted or reverted without opening it. Each unit beneath shows its <code>+A −R</code> churn and its per-unit <strong>✓</strong> / <strong>✗</strong>.</p>
+
+<h2>Filter and sort</h2>
+<p>The header carries inline controls: a <strong>search</strong> field (a substring, or a regular expression the moment the text carries regex syntax), a <strong>filter</strong> dropdown for the <a href="edits.html#filter-sort-and-age">file-type buckets and extensions</a> — Code, Tests, Config, Docs, Styles, Other — and a <strong>sort</strong> dropdown (four orders — newest, oldest, name A→Z, name Z→A). The filter names what it is narrowing by and the sort names the order. Each file header also shows the exact time it last changed. A filter only changes what the tree shows, never a <a href="keep-undo.html">decision</a> or the <a href="capture.html#store">store</a>.</p>
+
+<h2>Act on one, a file, or everything</h2>
+<p>The actions above the tree scope by size. <strong>Open all in editor</strong> reads the whole pending set as one <a href="editors-stacked.html">stacked diff</a>; <strong>Keep all</strong> and <strong>Undo all</strong> resolve the entire list at once. <a href="keep-undo.html">Keep and Undo</a> on a unit, or ✓&nbsp;file / ✗&nbsp;file on a header, act at exactly that scope — and every one is guarded, so an <a href="conflicts.html">edit a sibling is still touching</a> is protected.</p>
+
+<h2>Resolved rows stay visible</h2>
+<p>Resolving a unit doesn't erase it: a kept or reverted row greys out in place with a redo/undo affordance, so a decision is reversible and the history stays legible. Revision chains that net to nothing — an edit the agent wrote then took back — fold into a <strong>cancelled-out</strong> footer you can dismiss. The sidebar never asks you to review code that no longer exists.</p>
+
+<div class="callout info">
+  <span class="ico">ℹ</span>
+  <div class="ct"><span class="ctitle">One review surface, three places</span>
+  <p>The tree, the <a href="editors-inline.html">inline review</a> over the code, and the <a href="tui.html">terminal app</a>'s review tab are the same decisions on the same <a href="capture.html#store">store</a>. Resolve a unit in any one and it shows resolved in the others.</p></div>
+</div>

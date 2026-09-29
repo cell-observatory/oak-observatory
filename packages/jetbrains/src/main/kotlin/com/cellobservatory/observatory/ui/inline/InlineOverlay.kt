@@ -41,11 +41,11 @@ import javax.swing.Icon
 
 private const val MAX_INLINE_LINES = 20_000 // same guard as the VS Code overlay
 
-// Claude's signature error-stripe color — a distinct coral so Claude's edits stand out on the overview
+// the agent's signature error-stripe color — a distinct coral so the agent's edits stand out on the overview
 // ruler instead of blending into VCS markers. Parity with the VS Code CLAUDE_MARK_COLOR.
 private val CLAUDE_MARK = JBColor(Color(0xCC785C), Color(0xE0906F))
 
-// Whole-line fill on Claude's added/changed lines — a clearly visible green (light/dark) so the edited
+// Whole-line fill on the agent's added/changed lines — a clearly visible green (light/dark) so the edited
 // region reads at a glance. JBColor can't alpha-blend like VS Code, so these are solid tints picked to
 // match the strengthened VS Code ADDED_LINE_BG (rgba green @ 0.30, blended over the editor bg).
 private val ADDED_LINE_BG = JBColor(Color(0xCD, 0xE4, 0xD0), Color(0x2F, 0x47, 0x33))
@@ -92,7 +92,7 @@ internal fun anchorLines(p: Placement, lineCount: Int): List<Int> {
 }
 
 /**
- * The inline review overlay: per pending edit, a clickable "✓ Keep #N · ↩ Undo · 💬 Chat · ⧉ View diff" lens
+ * The inline review overlay: per pending edit, a clickable "✓ Keep #N · ✗ Undo · 💬 Chat · ⧉ View diff" lens
  * above its first line (block inlay — the stable API, chosen over experimental Code Vision),
  * a changed-line background + gutter action icon, and a dim " ✨ #N" end-of-line marker.
  * Placement geometry comes from PlacementsCache (CLI locate); re-renders on store changes,
@@ -109,7 +109,7 @@ class InlineOverlay(private val project: Project) : Disposable {
     private var installed = false
     private var hoverLens: LensRenderer? = null
     private var hoverInlay: Inlay<*>? = null
-    var heatmapOn = false // "file heatmap": dim unmodified lines so Claude's edits stand out
+    var heatmapOn = false // "file heatmap": dim unmodified lines so the agent's edits stand out
 
     fun install() {
         if (installed) return
@@ -151,7 +151,7 @@ class InlineOverlay(private val project: Project) : Disposable {
         // file a silent toggle reads as "the button does nothing".
         com.cellobservatory.observatory.ui.ReviewOps.notify(
             project,
-            if (heatmapOn) "Spotlight on — unedited lines dim in files with pending Claude edits"
+            if (heatmapOn) "Spotlight on — unedited lines dim in files with pending agent edits"
             else "Spotlight off",
         )
     }
@@ -218,7 +218,7 @@ class InlineOverlay(private val project: Project) : Disposable {
             val rec = pending.find { it.id == p.id } ?: continue
             val lines = p.lines.filter { it < lineCount }
             // A SUBTLE green line fill (toned down, not the default diff green) + a coral error-stripe mark
-            // per changed line, so a file Claude edited heavily doesn't drown in color. Shown for ALL edits.
+            // per changed line, so a file the agent edited heavily doesn't drown in color. Shown for ALL edits.
             for (line in lines) {
                 val h = markup.addLineHighlighter(line, HighlighterLayer.CARET_ROW - 1, TextAttributes(null, ADDED_LINE_BG, null, null, Font.PLAIN))
                 h.setErrorStripeMarkColor(CLAUDE_MARK)
@@ -261,7 +261,7 @@ class InlineOverlay(private val project: Project) : Disposable {
                 editor.document.getLineEndOffset(line), false, GhostTextRenderer(labels.joinToString("   ")),
             )?.let { ins.add(it) }
         }
-        // Heatmap: dim every UNMODIFIED line (flat grey, no syntax colors) so Claude's edits stand out.
+        // Heatmap: dim every UNMODIFIED line (flat grey, no syntax colors) so the agent's edits stand out.
         // JetBrains can't alpha-blend text, so "dim" is a muted foreground (parity with VS Code's opacity).
         // The layer must sit ABOVE HighlighterLayer.SYNTAX (2000) — a foreground at CARET_ROW-2 (998)
         // loses the merge to syntax colors and the dim never shows (the 0.8.x "Spotlight does nothing"
@@ -269,12 +269,12 @@ class InlineOverlay(private val project: Project) : Disposable {
         // The "changed" set is the added lines PLUS the deletion-anchor lines (VS Code parity): a line whose
         // only claim is that Claude deleted something there must stay bright, or Spotlight dims the very
         // thing it was toggled to find. Empty ⇒ nothing to spotlight, so dimming the whole file would say
-        // "none of this is Claude's" about a file that is entirely pending.
+        // "none of this is the agent's" about a file that is entirely pending.
         // Computed inside the guard, not above it: this runs on every debounced render, spotlight or not.
         val changed = if (!heatmapOn) emptySet() else
             placements.flatMapTo(HashSet<Int>()) { p -> p.lines.filter { it < lineCount } }
                 .also { it.addAll(ghostByLine.keys) }
-        // Empty ⇒ nothing to spotlight, and dimming everything would say "none of this is Claude's" about
+        // Empty ⇒ nothing to spotlight, and dimming everything would say "none of this is the agent's" about
         // a file that is entirely pending.
         if (heatmapOn && changed.isNotEmpty()) {
             val dimAttrs = TextAttributes(com.intellij.ui.JBColor.GRAY, null, null, null, Font.PLAIN)
@@ -351,7 +351,7 @@ class InlineOverlay(private val project: Project) : Disposable {
      * This used to assign `contentComponent.cursor` directly on every mouse move — including
      * `Cursor.getDefaultCursor()`, which is the ARROW. `handleLensHover` is registered on the global
      * event multicaster, so that ran for every motion event in every editor of the project and replaced
-     * the I-BEAM everywhere, in every file, whether or not the file had a single Claude edit in it. The
+     * the I-BEAM everywhere, in every file, whether or not the file had a single agent edit in it. The
      * platform sets the pointer first and this handler ran last, so the editor could never win it back;
      * Cmd-click link cursors and fold-region cursors went the same way. It is the loudest thing a person
      * would feel and nothing in a build or a test can see it.
@@ -418,7 +418,7 @@ private class EditGutterRenderer(
     private val rec: EditRecord,
 ) : GutterIconRenderer() {
     override fun getIcon(): Icon = com.cellobservatory.observatory.ui.Icons.Star
-    override fun getTooltipText() = "Claude edit #${rec.id} · ${rec.tool} — click to see the changes"
+    override fun getTooltipText() = "Agent edit #${rec.id} · ${rec.tool} — click to see the changes"
     override fun equals(other: Any?) = (other as? EditGutterRenderer)?.rec?.id == rec.id
     override fun hashCode() = rec.id
     override fun isNavigateAction() = true
@@ -437,7 +437,7 @@ private class EditGutterRenderer(
 
     // Left-click path: show the edit's before ⟷ after diff (the reasoning + actions now live on the
     // inline lens above the edit; right-click still opens the full Keep/Undo/Diff/Chat menu).
-    override fun getClickAction(): AnAction = object : AnAction("Claude Edit #${rec.id}") {
+    override fun getClickAction(): AnAction = object : AnAction("Agent Edit #${rec.id}") {
         override fun actionPerformed(e: AnActionEvent) = Diffs.show(project, session, rec)
     }
 }

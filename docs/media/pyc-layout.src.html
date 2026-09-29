@@ -145,7 +145,7 @@
         <span class="tools">
           <span title="Search">⌕</span><span title="Review previous">⏮</span><span title="Review next">⏭</span>
           <span class="sep">·</span>
-          <span title="Accept all" style="color:var(--green-bright)">✓</span><span title="Revert all">↩</span><span title="Toggle inline review">👁</span>
+          <span title="Accept all" style="color:var(--green-bright)">✓</span><span title="Revert all">✗✗</span><span title="Toggle inline review">👁</span>
           <span class="sep">·</span>
           <span title="Refresh">⟳</span><span title="More">⋮</span>
         </span>
@@ -158,7 +158,7 @@
         <span class="pill">Open all in editor</span><span class="pill">Keep all</span><span class="pill">Undo all</span><span class="pill">Clear resolved</span>
       </div>
       <div class="trow" style="gap:8px;font-size:11px;color:var(--dim);padding:2px 8px;border-top:1px solid var(--line);border-bottom:1px solid var(--line)">
-        <span style="color:var(--green-bright)">✓ Keep</span><span>↩ Undo</span><span>↻ Redo</span><span>💬 Chat</span><span>⇆ Diff</span>
+        <span style="color:var(--green-bright)">✓ Keep</span><span>✗ Undo</span><span>↺ Redo</span><span>💬 Chat</span><span>⇆ Diff</span>
       </div>
       <div class="tree">
         <div class="trow"><span class="arrow">▾</span><span class="tw-ic">▦</span>src</div>
@@ -182,7 +182,7 @@
         <div class="cl"><span class="gut">4</span><span class="code"><span class="k">def</span> <span class="fn">summarize</span><span class="pn">(values):</span></span></div>
         <div class="cl"><span class="gut">5</span><span class="code">    <span class="k">return</span> {<span class="str">"count"</span>: len(values), <span class="str">"mean"</span>: mean(values)}</span></div>
         <div class="cl"><span class="gut">6</span><span class="code"></span></div>
-        <div class="lens"><span class="hov">✦ #1 view changes</span><span class="a">&nbsp;&nbsp;&nbsp;&nbsp;</span><span class="a">✓ Keep</span><span class="a">&nbsp;&nbsp;&nbsp;&nbsp;</span><span class="a">↩ Undo</span><span class="a">&nbsp;&nbsp;&nbsp;&nbsp;</span><span class="a">Chat</span></div>
+        <div class="lens"><span class="hov">✦ #1&nbsp; +6 −1&nbsp; view changes</span><span class="a">&nbsp;&nbsp;&nbsp;&nbsp;</span><span class="a">✓ Keep</span><span class="a">&nbsp;&nbsp;&nbsp;&nbsp;</span><span class="a">✗ Undo</span><span class="a">&nbsp;&nbsp;&nbsp;&nbsp;</span><span class="a">❝ Chat</span><span class="a">&nbsp;&nbsp;&nbsp;&nbsp;</span><span class="a">⧉ View diff</span></div>
         <div class="cl added"><span class="gut">7</span><span class="code"></span></div>
         <div class="cl added"><span class="gut"><span class="tele">✦</span>8</span><span class="code"><span class="k">def</span> <span class="fn">scale</span><span class="pn">(values):</span></span></div>
         <div class="cl added"><span class="gut">9</span><span class="code">    mu, sigma = mean(values), stdev(values)</span></div>
@@ -200,9 +200,12 @@
         <div class="pane-h">Overview</div>
         <div style="display:flex;flex:1;min-height:0">
         <div style="flex:0 0 39%;min-width:0;border-right:1px solid var(--border);padding:2px 10px 0 12px">
-          <div style="display:flex;gap:12px;font-size:10px;margin-bottom:6px">
-            <span style="color:var(--ink);border-bottom:1.5px solid var(--blue);padding-bottom:3px">Fleet</span>
-            <span style="color:var(--faint)">Workflows</span>
+          <div style="display:flex;flex-wrap:wrap;gap:4px 12px;font-size:10px;margin-bottom:6px">
+            <span style="color:var(--faint)">Sessions 4/4</span>
+            <span style="color:var(--ink);border-bottom:1.5px solid var(--blue);padding-bottom:3px">Workers 3</span>
+            <span style="color:var(--faint)">Workflows 1</span>
+            <span style="color:var(--faint)">Tasks 2/6</span>
+            <span style="color:var(--faint)">Processes</span>
           </div>
           <div style="display:flex;align-items:center;gap:6px;font-size:11px;padding:3px 0;box-shadow:inset 2px 0 0 var(--blue);background:var(--blue-soft)">
             <span style="width:7px;height:7px;border-radius:50%;background:var(--blue);flex:none"></span>
@@ -235,10 +238,10 @@
             <span style="flex:1;background:var(--green-bright);box-shadow:inset 1px 0 0 var(--panel2);display:flex;align-items:center;justify-content:center;font-size:8.5px;color:rgba(0,0,0,.8);font-weight:600">docs</span>
           </div>
           <div style="font-size:8px;letter-spacing:.5px;text-transform:uppercase;color:var(--faint);font-weight:700;margin:0 0 3px 1px">Files</div>
-          <div style="display:flex;align-items:center;gap:7px;font-size:11px;padding:2.5px 0"><span style="width:6px;height:6px;border-radius:2px;background:var(--green-bright);flex:none"></span><span class="mono" style="color:var(--ink);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:0 1 auto;max-width:44%">USAGE.md</span><span style="font-size:8.5px;color:var(--faint)">docs</span><span style="flex:1;height:5px;border-radius:2px;background:var(--panel);overflow:hidden;min-width:14px"><span style="display:block;height:100%;width:100%;background:var(--green-bright)"></span></span><span class="mono" style="font-size:9.5px;color:var(--faint);width:36px;text-align:right">+12</span><span class="mono" style="font-size:9.5px;width:24px;text-align:right;color:var(--green-bright)">✓</span></div>
-          <div style="display:flex;align-items:center;gap:7px;font-size:11px;padding:2.5px 0"><span style="width:6px;height:6px;border-radius:2px;background:var(--green-bright);flex:none"></span><span class="mono" style="color:var(--ink);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:0 1 auto;max-width:44%">test_pipeline.py</span><span style="font-size:8.5px;color:var(--faint)">tests</span><span style="flex:1;height:5px;border-radius:2px;background:var(--panel);overflow:hidden;min-width:14px"><span style="display:block;height:100%;width:96%;background:var(--green-bright)"></span></span><span class="mono" style="font-size:9.5px;color:var(--faint);width:36px;text-align:right">+12</span><span class="mono" style="font-size:9.5px;width:24px;text-align:right;color:var(--green-bright)">✓</span></div>
-          <div style="display:flex;align-items:center;gap:7px;font-size:11px;padding:2.5px 0"><span style="width:6px;height:6px;border-radius:2px;background:var(--yellow);flex:none"></span><span class="mono" style="color:var(--ink);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:0 1 auto;max-width:44%">dataset.py</span><span style="font-size:8.5px;color:var(--faint)">src/models</span><span style="flex:1;height:5px;border-radius:2px;background:var(--panel);overflow:hidden;min-width:14px"><span style="display:block;height:100%;width:58%;background:var(--yellow)"></span></span><span class="mono" style="font-size:9.5px;color:var(--faint);width:36px;text-align:right">+7</span><span class="mono" style="font-size:9.5px;width:24px;text-align:right;color:var(--yellow)">1⧗</span></div>
-          <div style="display:flex;align-items:center;gap:7px;font-size:11px;padding:2.5px 0"><span style="width:6px;height:6px;border-radius:2px;background:var(--yellow);flex:none"></span><span class="mono" style="color:var(--ink);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:0 1 auto;max-width:44%">features.py</span><span style="font-size:8.5px;color:var(--faint)">src</span><span style="flex:1;height:5px;border-radius:2px;background:var(--panel);overflow:hidden;min-width:14px"><span style="display:block;height:100%;width:55%;background:var(--yellow)"></span></span><span class="mono" style="font-size:9.5px;color:var(--faint);width:36px;text-align:right">+6</span><span class="mono" style="font-size:9.5px;width:24px;text-align:right;color:var(--yellow)">1⧗</span></div>
+          <div style="display:flex;align-items:center;gap:7px;font-size:11px;padding:2.5px 0"><span class="mono" style="font-size:9.5px;color:var(--faint);flex:none">14:43:02</span><span style="width:6px;height:6px;border-radius:2px;background:var(--green-bright);flex:none"></span><span class="mono" style="color:var(--ink);white-space:nowrap;flex:none">USAGE.md</span><span style="font-size:8.5px;color:var(--faint);flex:1 1 auto;min-width:0">docs</span><span class="mono" style="font-size:9.5px;color:var(--faint);flex:none">+12 −0</span><span class="mono" style="font-size:9.5px;width:24px;text-align:right;flex:none;color:var(--green-bright)">✓</span><span style="font-size:10px;color:var(--blue);flex:none">⧉</span></div>
+          <div style="display:flex;align-items:center;gap:7px;font-size:11px;padding:2.5px 0"><span class="mono" style="font-size:9.5px;color:var(--faint);flex:none">14:42:31</span><span style="width:6px;height:6px;border-radius:2px;background:var(--green-bright);flex:none"></span><span class="mono" style="color:var(--ink);white-space:nowrap;flex:none">test_pipeline.py</span><span style="font-size:8.5px;color:var(--faint);flex:1 1 auto;min-width:0">tests</span><span class="mono" style="font-size:9.5px;color:var(--faint);flex:none">+12 −0</span><span class="mono" style="font-size:9.5px;width:24px;text-align:right;flex:none;color:var(--green-bright)">✓</span><span style="font-size:10px;color:var(--blue);flex:none">⧉</span></div>
+          <div style="display:flex;align-items:center;gap:7px;font-size:11px;padding:2.5px 0"><span class="mono" style="font-size:9.5px;color:var(--faint);flex:none">14:40:16</span><span style="width:6px;height:6px;border-radius:2px;background:var(--yellow);flex:none"></span><span class="mono" style="color:var(--ink);white-space:nowrap;flex:none">dataset.py</span><span style="font-size:8.5px;color:var(--faint);flex:1 1 auto;min-width:0">src/models</span><span class="mono" style="font-size:9.5px;color:var(--faint);flex:none">+7 −0</span><span class="mono" style="font-size:9.5px;width:24px;text-align:right;flex:none;color:var(--yellow)">1⧗</span><span style="font-size:10px;color:var(--blue);flex:none">⧉</span></div>
+          <div style="display:flex;align-items:center;gap:7px;font-size:11px;padding:2.5px 0"><span class="mono" style="font-size:9.5px;color:var(--faint);flex:none">14:39:02</span><span style="width:6px;height:6px;border-radius:2px;background:var(--yellow);flex:none"></span><span class="mono" style="color:var(--ink);white-space:nowrap;flex:none">features.py</span><span style="font-size:8.5px;color:var(--faint);flex:1 1 auto;min-width:0">src</span><span class="mono" style="font-size:9.5px;color:var(--faint);flex:none">+6 −1</span><span class="mono" style="font-size:9.5px;width:24px;text-align:right;flex:none;color:var(--yellow)">1⧗</span><span style="font-size:10px;color:var(--blue);flex:none">⧉</span></div>
           <div style="border-top:1px solid var(--border);margin-top:7px;padding-top:5px;font-family:var(--mono);font-size:9px;color:var(--dim)"><span style="color:var(--blue)">2 Dataset validation</span> · <span style="color:var(--yellow)">2</span> pending · <span style="color:var(--green-bright)">3</span> accepted · 4 files · 3 folders</div>
         </div>
         </div>

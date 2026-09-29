@@ -3,7 +3,7 @@
  *
  * Claude Code stores per-project transcripts at ~/.claude/projects/<mangled-cwd>/<session_id>.jsonl
  * where <mangled-cwd> is the ABSOLUTE launch cwd with every non-alphanumeric char replaced by '-'.
- * Verified: /Users/thayer/Github -> -Users-thayer-Github  (leading '/' becomes a leading '-').
+ * Verified: /Users/dev/Github -> -Users-dev-Github  (leading '/' becomes a leading '-').
  *
  * The newest .jsonl in that dir that holds a real conversation (see hasAssistantRecord) is the
  * current session. Capture never needs this (the hook payload supplies session_id directly) — it
@@ -13,7 +13,8 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { StringDecoder } from 'string_decoder';
-import { claudeConfigDir } from './paths';
+import { createHash } from 'crypto';
+import { claudeConfigDir, canonPath } from './paths';
 
 /**
  * How recently a session's transcript must have moved for it to count as MID-FLIGHT. Shared by both
@@ -22,9 +23,28 @@ import { claudeConfigDir } from './paths';
  */
 export const SESSION_BUSY_MS = 5 * 60_000;
 
-/** Mangle an absolute path the same way Claude Code names its project dirs. */
+/** Claude Code caps a project dir name at this many characters (2.1.x). */
+const SLUG_MAX = 200;
+
+/**
+ * Mangle an absolute path the same way Claude Code names its project dirs: every non-alphanumeric char
+ * becomes '-', and a name longer than SLUG_MAX keeps its first SLUG_MAX chars plus `-` and a base-36
+ * hash of the path (Claude Code 2.1.x: `Math.abs(<31-multiplier string hash>).toString(36)`).
+ */
 export function mangleCwd(cwd: string): string {
-  return cwd.replace(/[^a-zA-Z0-9]/g, '-');
+  const slug = cwd.replace(/[^a-zA-Z0-9]/g, '-');
+  if (slug.length <= SLUG_MAX) return slug;
+  let hash = 0;
+  for (let i = 0; i < cwd.length; i++) hash = ((hash << 5) - hash + cwd.charCodeAt(i)) | 0;
+  return `${slug.slice(0, SLUG_MAX)}-${Math.abs(hash).toString(36)}`;
+}
+
+/** Whether `folder` is the project dir name Claude Code gives `cwd`. A shortened name is matched on its
+ *  kept prefix and accepts any hash, so a build that hashes differently is not taken for a mirror. */
+function namesProject(folder: string, cwd: string): boolean {
+  const slug = mangleCwd(cwd);
+  if (slug.length <= SLUG_MAX) return folder === slug;
+  return folder.length > SLUG_MAX + 1 && folder.startsWith(slug.slice(0, SLUG_MAX + 1)) && /^[0-9a-z]+$/.test(folder.slice(SLUG_MAX + 1));
 }
 
 // projectDir (and everything built on it: resolveSessionId, findTranscript, the store) resolves
@@ -60,6 +80,7 @@ function newestSessionIn(dir: string): string | null {
     } catch {
       continue;
     }
+    if (isMirroredTranscript(file).mirrored || isBridgePointer(file)) continue;
     candidates.push({ id: name.slice(0, -'.jsonl'.length), mtime, file });
   }
   if (candidates.length === 0) return null;
@@ -100,26 +121,18 @@ export interface WorkspaceDir {
  * rather than an inference. Null when nothing on this machine holds it — a remote session, or a
  * transcript that has not been written yet — and every caller must treat that as "use the default".
  */
-export function sessionWorkspace(sessionId: string): string | null {
+function claudeSessionTranscript(sessionId: string): string | null {
   if (!sessionId) return null;
   const base = path.join(claudeConfigDir(), 'projects');
-  let names: string[] = [];
-  try {
-    names = fs.readdirSync(base);
-  } catch {
-    return null;
-  }
+  let names: string[]; try { names = fs.readdirSync(base); } catch { return null; }
   for (const slug of names) {
-    const p = path.join(base, slug, `${sessionId}.jsonl`);
-    try {
-      if (!fs.statSync(p).isFile()) continue;
-    } catch {
-      continue;
-    }
-    const first = firstCwdLine(p);
-    if (first?.cwd) return first.cwd;
+    const file = path.join(base, slug, `${sessionId}.jsonl`);
+    try { if (fs.statSync(file).isFile() && !isMirroredTranscript(file).mirrored && !isBridgePointer(file)) return file; } catch {}
   }
   return null;
+}
+export function sessionWorkspace(sessionId: string): string | null {
+  return sessionId ? describeSession(sessionId).cwd : null;
 }
 
 export function listWorkspaces(): WorkspaceDir[] {
@@ -144,12 +157,6 @@ export function listWorkspaces(): WorkspaceDir[] {
     else if (slug.startsWith(homeSlug + '-')) label = slug.slice(homeSlug.length + 1);
     else label = slug.replace(/^-/, '');
     if (!label) label = slug || '(root)'; // a slug that reduces to nothing still needs a name
-    // A workspace label is a DERIVED display string over an already-lossy slug, not content — and a
-    // temp-dir slug runs to a hundred characters, which wraps the row it labels and makes the whole
-    // list unreadable. Abbreviated from the FRONT, keeping the tail that distinguishes it, and marked
-    // so it never reads as the whole name.
-    const CAP = 26;
-    if (label.length > CAP) label = '…' + label.slice(-(CAP - 1));
     out.push({ slug, label, dir });
   }
   return out.sort((a, b) => a.label.localeCompare(b.label));
@@ -204,10 +211,16 @@ export function bridgeInfo(transcriptPath: string): { bridgeSessionId: string; l
  * (returns the nearest ancestor that has one).
  */
 export function resolveSessionId(cwd: string): string | null {
-  let dir = path.resolve(cwd);
+  const cx = require('./codex') as typeof import('./codex');
+  const store = require('./store') as typeof import('./store');
+  const hidden = store.hiddenSessions(); // a deleted session is never auto-resolved as the active one
+  const candidates = cx.codexSessionSources().filter((x) => !x.archived && !hidden.has(x.id)).map((x) => ({ id: x.id, cwd: canonPath(x.cwd), ts: x.mtimeMs }));
+  let dir = canonPath(path.resolve(cwd));
   for (;;) {
     const s = newestSessionIn(projectDir(dir));
-    if (s) return s;
+    const mine = candidates.filter((x) => x.cwd === dir);
+    if (s && !hidden.has(s)) { try { mine.push({ id: s, cwd: dir, ts: fs.statSync(path.join(projectDir(dir), `${s}.jsonl`)).mtimeMs }); } catch {} }
+    if (mine.length) return mine.sort((a,b) => b.ts-a.ts)[0].id;
     const parent = path.dirname(dir);
     if (parent === dir) return null;
     dir = parent;
@@ -240,6 +253,7 @@ export function newestSessionGlobal(): string | null {
       if (!name.endsWith('.jsonl')) continue;
       const file = path.join(dir, name);
       try {
+        if (isMirroredTranscript(file).mirrored || isBridgePointer(file)) continue;
         candidates.push({ id: name.slice(0, -'.jsonl'.length), mtime: fs.statSync(file).mtimeMs, file });
       } catch {
         /* raced away */
@@ -248,10 +262,13 @@ export function newestSessionGlobal(): string | null {
   }
   if (!candidates.length) return null;
   candidates.sort((a, b) => b.mtime - a.mtime);
-  for (const c of candidates.slice(0, 25)) {
+  const hidden = (require('./store') as typeof import('./store')).hiddenSessions();
+  const visible = candidates.filter((c) => !hidden.has(c.id)); // a deleted session is never auto-selected
+  if (!visible.length) return null;
+  for (const c of visible.slice(0, 25)) {
     if (hasAssistantRecord(c.file)) return c.id;
   }
-  return candidates[0].id;
+  return visible[0].id;
 }
 
 /**
@@ -389,6 +406,7 @@ function parseCwdLine(line: string): FirstCwdLine | null {
   } catch {
     return null; // tolerate non-JSON / partial lines (schema evolves)
   }
+  if (o?.type === 'session_meta') o = o.payload;
   if (o && typeof o.cwd === 'string' && o.cwd) {
     return {
       cwd: o.cwd,
@@ -533,4 +551,113 @@ export function hasAssistantRecord(transcriptPath: string): boolean {
   } finally {
     fs.closeSync(fd);
   }
+}
+
+
+interface TranscriptProvenance { cwd?: string; bridge: boolean; ino: number; size: number; mtime: number; version: 1 }
+const provenanceCache = new Map<string, TranscriptProvenance>();
+/** Persist the immutable launch identity: a finished session must not reread its body on every
+ * CLI invocation. Append-only growth retains a known cwd; a pointer is rechecked when it grows
+ * because it can gain a local reply. Replacements and truncation invalidate the sidecar. */
+function transcriptProvenance(file: string): TranscriptProvenance {
+  const empty: TranscriptProvenance = { bridge: false, ino: 0, size: 0, mtime: 0, version: 1 };
+  let st: fs.Stats; try { st = fs.statSync(file); } catch { return empty; }
+  const store = (require('./store') as typeof import('./store')).rootDir();
+  const sidecar = path.join(store, 'session-meta', 'provenance', createHash('sha256').update(path.resolve(file)).digest('hex') + '.json');
+  let old = provenanceCache.get(sidecar);
+  if (!old) { try { old = JSON.parse(fs.readFileSync(sidecar, 'utf8')); } catch {} }
+  if (old?.version === 1 && old.ino === st.ino &&
+      ((old.size === st.size && old.mtime === st.mtimeMs) || (old.cwd && !old.bridge && st.size > old.size))) return old;
+  if (old && (old.ino !== st.ino || st.size <= old.size)) { firstCwdCache.delete(file); assistantSeen.delete(file); assistantNegKey.delete(file); }
+  const value: TranscriptProvenance = { version: 1, ino: st.ino, size: st.size, mtime: st.mtimeMs,
+    cwd: firstCwdLine(file)?.cwd, bridge: bridgeInfo(file) !== null && !hasAssistantRecord(file) };
+  boundCache(provenanceCache); provenanceCache.set(sidecar, value);
+  try {
+    fs.mkdirSync(path.dirname(sidecar), { recursive: true, mode: 0o700 });
+    const tmp = `${sidecar}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(value), { mode: 0o600 }); fs.renameSync(tmp, sidecar);
+  } catch { /* read-only stores still get the in-memory result */ }
+  return value;
+}
+
+/** A copied transcript cannot establish local ownership. A mismatched Claude project slug is
+ * decisive even when the recorded directory exists here. A missing cwd alone is NOT proof: local
+ * worktrees can be pruned or drives unmounted. Foreign platform home roots, when absent here, are
+ * additional evidence (including rollouts, which have no mangled project folder).
+ */
+export function isMirroredTranscript(transcriptPath: string): { mirrored: boolean; recordedCwd?: string } {
+  const recordedCwd = transcriptProvenance(transcriptPath).cwd;
+  if (!recordedCwd) return { mirrored: false };
+  const parent = path.dirname(transcriptPath);
+  const project = path.basename(path.dirname(parent)) === 'projects';
+  const mismatch = project && !namesProject(path.basename(parent), recordedCwd)
+    && !namesProject(path.basename(parent), canonPath(recordedCwd));
+  const foreignHome = process.platform === 'darwin' ? /^\/home\//.test(recordedCwd)
+    : process.platform === 'win32' ? /^\/(?:Users|home)\//.test(recordedCwd)
+    : /^\/Users\//.test(recordedCwd);
+  const foreignDrive = process.platform !== 'win32' && /^[A-Za-z]:[\\/]/.test(recordedCwd);
+  return { mirrored: mismatch || ((foreignHome || foreignDrive) && !fs.existsSync(recordedCwd)), recordedCwd };
+}
+
+/** Bridge metadata can precede a real local conversation. Only a pointer WITHOUT an assistant
+ * reply is excluded; bookkeeping records (cost-state/mode) do not make a conversation local. */
+export function isBridgePointer(transcriptPath: string): boolean {
+  return transcriptProvenance(transcriptPath).bridge;
+}
+
+/** Readable, unambiguous workspace label, shared by every session consumer. Home-shortened and
+ *  forward-slashed, like every other path the product shows (risk.ts outsideWrites); Windows showed `~\work`. */
+export function workspaceLabel(cwd: string): string {
+  const home = os.homedir();
+  return cwd === home ? '~' : cwd.startsWith(home + path.sep) ? '~' + cwd.slice(home.length).split(path.sep).join('/') : cwd;
+}
+
+export interface SessionDescriptor {
+  session: string;
+  runtime: string;
+  nativeSessionId: string;
+  cwd: string | null;
+  provider: string | null;
+  model: string | null;
+  machine: string;
+  transcript: string | null;
+  continuation: { agentId: string; nativeSessionId: string };
+}
+
+/** Runtime identity is explicit metadata, independent of the selected model's name. */
+export function describeSession(session: string): SessionDescriptor {
+  if (!session) return { session:'', runtime:'unknown', nativeSessionId:'', cwd:null, provider:null, model:null, machine:os.hostname(), transcript:null,
+    continuation:{agentId:'unknown',nativeSessionId:''} };
+  const cx = require('./codex') as typeof import('./codex');
+  const meta = cx.readCodexAgentMeta(session);
+  const candidate = cx.findCodexRollout(session);
+  const raw = candidate && !isMirroredTranscript(candidate).mirrored ? candidate : null;
+  const source = raw ? cx.codexSessionSources().find((x) => x.file === raw) : undefined;
+  const runtime = meta || raw ? 'codex' : 'claude';
+  const rollout = raw ? cx.readCodexRollout(raw) : undefined;
+  const claudePath = /^claude(?:-acp)?$/.test(runtime) ? claudeSessionTranscript(session) : null;
+  const nativeSessionId = source?.id || session;
+  return { session, runtime, nativeSessionId, cwd: source?.cwd || meta?.cwd || (claudePath ? firstCwdLine(claudePath)?.cwd : null) || null,
+    provider: rollout?.provider || meta?.provider || null, model: rollout?.model || meta?.model || null, machine: os.hostname(), transcript: raw ?? claudePath,
+    continuation: { agentId: runtime, nativeSessionId: nativeSessionId } };
+}
+
+export function resolveSessionContinuation(session: string, requestedAgent?: string): { agentId: string; nativeSessionId?: string; cwd?: string; error?: string } {
+  const d = describeSession(session);
+  const family = (id: string): string => id === 'codex-acp' ? 'codex' : id === 'claude-acp' ? 'claude' : id;
+  // An unknown id resolves to a default (claude) runtime with no evidence behind it — a transcript,
+  // rollout, or recorded workspace. Report that as "not found" rather than the misleading
+  // "belongs to claude; cannot be resumed through <agent>" a typo'd --resume would otherwise get.
+  if (!d.transcript && !d.cwd) return { agentId: requestedAgent || d.runtime,
+    error: `No session ${session} found (no transcript, rollout, or recorded workspace). Check the id, or start a new conversation.` };
+  if (requestedAgent && family(requestedAgent) !== family(d.runtime)) return { agentId: requestedAgent,
+    error: `Session ${session} belongs to ${d.runtime}; it cannot be resumed through ${requestedAgent}. Start a new conversation explicitly to switch runtimes.` };
+  return { agentId: requestedAgent || d.runtime, nativeSessionId: d.nativeSessionId, ...(d.cwd ? { cwd: d.cwd } : {}) };
+}
+
+export function nativeSessionCommand(session: string): { command: string; args: string[]; cwd?: string; error?: string } {
+  const d = describeSession(session);
+  if (/^codex(?:-acp)?$/.test(d.runtime)) return { command: 'codex', args: ['resume', d.nativeSessionId], ...(d.cwd ? { cwd: d.cwd } : {}) };
+  if (/^claude(?:-acp)?$/.test(d.runtime)) return { command: 'claude', args: ['--resume', d.nativeSessionId], ...(d.cwd ? { cwd: d.cwd } : {}) };
+  return { command: '', args: [], error: `Native terminal continuation is unavailable for ${d.runtime}; continue it in Observatory.` };
 }

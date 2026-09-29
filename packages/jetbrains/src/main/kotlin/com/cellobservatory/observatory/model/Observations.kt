@@ -4,21 +4,21 @@ import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 
 /**
- * Kotlin mirror of core's Observations view-model, parsed from `claude-observatory observations --json`
+ * Kotlin mirror of core's Observations view-model, parsed from `oak observations --json`
  * (0.8.0 — the folded Timeline+Observations view). A session recap on top, the edit timeline as coalesced
- * same-file ×N runs (most-recent first) each edit carrying Claude's own reasoning, and the still-open next
+ * same-file ×N runs (most-recent first) each edit carrying the agent's own reasoning, and the still-open next
  * steps at the end. Every field is assembled in core — this plugin only paints, so VS Code and JetBrains
  * can never disagree.
  */
 
-/** One edit inside a coalesced run — its ±lines, review status, and Claude's reasoning for it. */
+/** One edit inside a coalesced run — its ±lines, review status, and the agent's reasoning for it. */
 data class ObservationEdit(
     val id: Int,
     val ts: Long,
     val added: Int,
     val removed: Int,
     val status: String, // pending | kept | undone
-    val reasoning: String?, // Claude's own words for this edit, null when uncorrelated
+    val reasoning: String?, // the agent's own words for this edit, null when uncorrelated
 )
 
 /** A run of adjacent same-file edits — the timeline's ×N unit, with a combined delta. */

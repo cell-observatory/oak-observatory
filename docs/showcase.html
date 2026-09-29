@@ -3,9 +3,11 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Claude Observatory — record and review what your coding agent did</title>
-<meta name="description" content="Claude Observatory records every edit a Claude Code session makes to an established and mission-critical codebase and presents it for review at the scope that fits the work, by several abstractions over what the agent changed for a given prompt. When several agents work at once — subagents, workflow runs, sessions in parallel git worktrees — their work does not blur together: every edit is correlated back to the agent that made it. Local, git-free, no extra tokens.">
+<title>OAK — record and review what your coding agent did</title>
+<meta name="description" content="OAK records every edit an agent session makes to an established and mission-critical codebase and presents it for review at the scope that fits the work, by several abstractions over what the agent changed for a given prompt. When several agents work at once — subagents, workflow runs, sessions in parallel git worktrees — their work does not blur together: every edit is correlated back to the agent that made it. Local, git-free, no extra tokens.">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%94%AC%3C/text%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Space+Grotesk:wght@600;700&display=swap" rel="stylesheet">
 <style>
   :root{
     --bg:#fbfaf9; --surface:#ffffff; --surface-2:#f5f3f0; --surface-3:#efece8;
@@ -49,7 +51,7 @@
     --shadow:0 30px 70px -40px rgba(0,0,0,.8),0 8px 22px -18px rgba(0,0,0,.6);
   }
   *{box-sizing:border-box;margin:0;padding:0}
-  html{scroll-behavior:smooth;scroll-padding-top:80px;-webkit-text-size-adjust:100%}
+  html{scroll-behavior:smooth;scroll-padding-top:80px;-webkit-text-size-adjust:100%;overflow-x:clip}
   body{background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:1.0625rem;line-height:1.62;-webkit-font-smoothing:antialiased;overflow-x:hidden}
   .wrap{width:min(var(--col),90%);margin-inline:auto}
   a{color:inherit;text-decoration:none}
@@ -60,19 +62,21 @@
   code,kbd{font-family:var(--mono);font-size:.86em}
 
   /* nav */
-  .nav{position:sticky;top:0;z-index:60;background:transparent;transition:background .25s,border-color .25s}
-  .nav.condensed{background:color-mix(in srgb,var(--bg) 80%,transparent);backdrop-filter:saturate(1.5) blur(14px);-webkit-backdrop-filter:saturate(1.5) blur(14px);border-bottom:1px solid var(--line-soft)}
-  .nav .row{display:flex;align-items:center;gap:20px;height:60px}
-  .brand{display:flex;align-items:center;gap:9px;font-weight:640;letter-spacing:-.02em;font-size:1.02rem}
-  .brand .m{font-size:1.2rem}
-  .brand .brandver{font-family:var(--mono);font-size:.7rem;font-weight:500;color:var(--ink-faint);margin-left:4px;letter-spacing:0}
-  .nav .links{display:flex;gap:26px;margin-inline:auto;font-size:.95rem;color:var(--ink-soft)}
-  .nav .links a{transition:color .15s}
-  .nav .links a{white-space:nowrap} .nav .links a:hover{color:var(--ink)} .nav .links a[aria-current="page"]{color:var(--ink);font-weight:620}
-  .nav .links a.more{color:var(--accent-ink)}
-  .nav .right{display:flex;align-items:center;gap:10px}
-  .icon-btn,.ghost{border:1px solid var(--line);background:var(--surface);color:var(--ink-soft);border-radius:999px;padding:7px 13px;font-size:.85rem;font-family:var(--mono);cursor:pointer;transition:.15s}
-  .icon-btn:hover,.ghost:hover{color:var(--ink);border-color:var(--ink-faint)}
+  .nav{position:sticky;top:0;z-index:60;height:56px;background:color-mix(in srgb,var(--bg) 86%,transparent);backdrop-filter:saturate(1.4) blur(12px);-webkit-backdrop-filter:saturate(1.4) blur(12px);border-bottom:1px solid var(--line-soft)}
+  .nav-in{max-width:none;height:100%;display:flex;align-items:center;gap:20px;padding:0 26px}
+  .brand{display:flex;align-items:center;gap:8px;font-family:'Space Grotesk',var(--sans);font-weight:700;color:var(--ink);font-size:17px;letter-spacing:-.01em}
+  .brand .m{filter:saturate(0);font-size:1.05rem}
+  .brand .brandver{font-family:var(--mono);font-size:10.5px;font-weight:500;color:var(--ink-faint);letter-spacing:0}
+  .nav-links{display:flex;gap:4px;margin-left:8px}
+  .nav-links a{color:var(--ink-soft);font-weight:500;font-size:14px;padding:7px 12px;border-radius:8px;transition:.15s;white-space:nowrap}
+  .nav-links a:hover{color:var(--ink);background:var(--surface-2)}
+  .nav-links a[aria-current="page"]{color:var(--ink)}
+  .nav-links a.more{color:var(--accent-ink)}
+  .nav-right{margin-left:auto;display:flex;align-items:center;gap:10px}
+  .icon-btn{background:none;border:1px solid transparent;color:var(--ink-soft);font-size:16px;cursor:pointer;width:34px;height:34px;border-radius:8px;line-height:1;transition:.15s}
+  .icon-btn:hover{background:var(--surface-2);color:var(--ink)}
+  .ghost{border:1px solid var(--line);color:var(--ink);border-radius:9px;padding:6px 12px;font-size:13.5px;font-weight:500;font-family:var(--sans);cursor:pointer;transition:.15s}
+  .ghost:hover{border-color:var(--accent)}
   .btn{display:inline-flex;align-items:center;gap:8px;border-radius:999px;padding:11px 20px;font-weight:560;font-size:.95rem;border:1px solid transparent;cursor:pointer;transition:.15s;white-space:nowrap}
   .btn.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
   .btn.primary:hover{background:var(--accent-ink);border-color:var(--accent-ink)}
@@ -85,11 +89,14 @@
      six-link pages, where the links are shown but no longer fit. The ghost GitHub button is the widest
      item and the only redundant one: GitHub is already the last entry in .links, and below 900px the ☰
      menu reveals those, so dropping it costs no route to anything. */
-  @media (max-width:900px){ .nav .right .ghost{display:none} }
+  @media (max-width:900px){ .nav-right .ghost{display:none} }
+  /* Phones: the brand version chip is the width the ☰ + theme cluster needs to stay on-screen. Drop it
+     and tighten the padding so the whole nav row fits and the page stops scrolling sideways. */
+  @media (max-width:560px){ .nav-in{padding:0 14px;gap:12px} .brand .brandver{display:none} }
   @media (max-width:900px){
-    .menu-btn{display:inline-flex}
-    .nav .links{display:none}
-    .nav.open .links{display:flex;flex-direction:column;align-items:flex-start;position:absolute;top:60px;left:0;right:0;margin:0;padding:14px 5% 18px;gap:14px;background:var(--bg);border-bottom:1px solid var(--line);box-shadow:var(--shadow)}
+    .menu-btn{display:inline-flex;align-items:center;justify-content:center}
+    .nav-links{display:none}
+    .nav.open .nav-links{display:flex;flex-direction:column;align-items:flex-start;position:absolute;top:56px;left:0;right:0;margin:0;padding:14px 5% 18px;gap:14px;background:var(--bg);border-bottom:1px solid var(--line);box-shadow:var(--shadow)}
     .nav.open,.nav.open.condensed{background:var(--bg)}
     .lede{max-width:100%}
     .editor{overflow-x:auto}
@@ -105,6 +112,8 @@
   .hero h1{font-size:clamp(2.6rem,7vw,5.2rem);margin:18px 0}
   .hero .cta{display:flex;gap:12px;flex-wrap:wrap;margin-top:28px}
   .hero .meta{margin-top:22px;font-family:var(--mono);font-size:.78rem;color:var(--ink-faint)}
+  .hero .verbs{margin-top:14px;font-family:var(--mono);font-weight:600;font-size:clamp(1rem,2.1vw,1.25rem);letter-spacing:.05em;color:var(--accent-ink)}
+  .hero .tagline{margin-top:7px;font-family:var(--mono);font-weight:600;font-size:clamp(1rem,2.1vw,1.25rem);letter-spacing:.02em;color:var(--accent-ink)}
   @media (max-width:900px){.hero .lede{}}
 
   /* editor mock (shared) */
@@ -142,7 +151,7 @@
   /* install */
   .cmd{display:flex;align-items:center;gap:12px;background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:13px 12px 13px 16px;font-family:var(--mono);font-size:.9rem;overflow-x:auto;margin:26px auto 0}
   .cmd .pr{color:var(--accent);flex:none}
-  .cmd code{white-space:nowrap;color:var(--ink)}
+  .cmd code{white-space:nowrap;color:var(--ink);min-width:0;overflow-x:auto}
   .cmd .copy{margin-left:auto;flex:none;border:1px solid var(--line);background:var(--surface-2);color:var(--ink-soft);border-radius:7px;padding:5px 11px;font-family:var(--mono);font-size:.74rem;cursor:pointer;transition:.15s}
   .cmd .copy:hover{color:var(--ink);border-color:var(--ink-faint)}
   .install-cta{display:flex;gap:12px;flex-wrap:wrap;justify-content:center;margin-top:26px}
@@ -161,6 +170,7 @@
   .foot .row{display:flex;flex-wrap:wrap;gap:20px 30px;align-items:center;justify-content:space-between}
   .foot .flinks{display:flex;flex-wrap:wrap;gap:20px;font-size:.92rem}
   .foot .flinks a{color:var(--ink-soft)} .foot .flinks a:hover{color:var(--ink)}
+  .foot .brand{font-family:'Space Grotesk',var(--sans);font-weight:700}
   .foot .fine{font-family:var(--mono);font-size:.74rem;margin-top:16px}
 
   /* gutter index (wide screens only) */
@@ -173,17 +183,37 @@
   /* motion */
   .rv{opacity:0;transform:translateY(20px);transition:opacity .6s cubic-bezier(.22,.61,.36,1),transform .6s cubic-bezier(.22,.61,.36,1)}
   .rv.in{opacity:1;transform:none}
-  /* ---- feature tour (slideshow) ---- */
-  .tour{margin-top:clamp(28px,4vw,44px)}
-  .tour-view{overflow:hidden;border-radius:16px}
-  .slides{display:flex;transition:transform .5s cubic-bezier(.22,.61,.36,1);will-change:transform}
-  .slide{flex:0 0 100%;min-width:0;padding:0 1px}
-  /* title and text first, the image below (centred) */
-  .slide-in{display:flex;flex-direction:column;align-items:center;text-align:center;gap:clamp(14px,2vw,22px)}
-  .slide-in>.panel{width:100%;margin-top:0}
-  .slide h3{font-size:clamp(1.15rem,2.1vw,1.55rem);margin:.1em 0 .35em}
-  .slide p{color:var(--ink-soft);font-size:.98rem;line-height:1.55;text-wrap:pretty}
-  .tour-ui{display:flex;align-items:center;justify-content:center;gap:14px;margin-bottom:20px;flex-wrap:wrap}
+  /* ---- feature grid (bento: every surface at a glance) ---- */
+  .fgrid{display:grid;grid-template-columns:repeat(6,1fr);gap:clamp(12px,1.4vw,18px);margin-top:clamp(28px,4vw,44px);text-align:left}
+  .fcard{text-decoration:none;color:inherit;grid-column:span 2;display:flex;flex-direction:column;background:var(--surface);border:1px solid var(--line);border-radius:16px;box-shadow:var(--shadow);overflow:hidden;transition:border-color .18s ease,transform .18s ease}
+  .fcard:hover{border-color:var(--accent);transform:translateY(-2px)}
+  .fcard-shot{background:var(--surface-2);border-bottom:1px solid var(--line-soft);overflow:hidden}
+  .fcard:not(.full) .fcard-shot{aspect-ratio:16/10}
+  .fcard-shot img{display:block;width:100%;height:auto}
+  .fcard:not(.full) .fcard-shot img{height:100%;object-fit:cover;object-position:top left}
+  .fcard-shot .mock{border:0;height:100%}
+  .fcard-text{padding:15px 17px 17px}
+  .fcard-text .fname{display:block;font-family:var(--mono);font-size:.7rem;letter-spacing:.09em;text-transform:uppercase;color:var(--accent-ink);margin-bottom:6px}
+  .fcard-text h3{font-size:1.12rem;margin:.1em 0 .35em}
+  .fcard-text p{color:var(--ink-soft);font-size:.9rem;line-height:1.5;margin:0}
+  .fcard-text p code{font-family:var(--mono);font-size:.85em;color:var(--ink)}
+  .fcard.full{grid-column:span 6;flex-direction:row;align-items:stretch}
+  .fcard.full .fcard-shot{flex:1 1 56%;border-bottom:0;border-right:1px solid var(--line-soft);display:flex;align-items:center;justify-content:center}
+  .fcard.full .fcard-text{flex:1 1 44%;display:flex;flex-direction:column;justify-content:center;padding:clamp(22px,3vw,40px)}
+  .fcard.full .fcard-text .eyebrow{margin-bottom:8px}
+  .fcard.full .fcard-text h3{font-size:clamp(1.3rem,2.1vw,1.65rem);margin:0 0 .35em}
+  .fcard.full .fcard-text p{font-size:.98rem;line-height:1.55}
+  .fcard.full.reverse{flex-direction:row-reverse}
+  .fcard.full.reverse .fcard-shot{border-right:0;border-left:1px solid var(--line-soft)}
+  @media(max-width:900px){
+    .fgrid{grid-template-columns:repeat(2,1fr)}
+    .fcard{grid-column:span 1}
+    .fcard.full,.fcard.full.reverse{grid-column:span 2;flex-direction:column}
+    .fcard.full .fcard-shot,.fcard.full.reverse .fcard-shot{border-right:0;border-left:0;border-bottom:1px solid var(--line-soft)}
+  }
+  @media(max-width:560px){ .fgrid{grid-template-columns:1fr} .fcard,.fcard.full,.fcard.full.reverse{grid-column:span 1} }
+
+  /* shared player controls (used by the guided demo + the terminal demo) */
   .tbtn{width:36px;height:36px;border-radius:999px;border:1px solid var(--line);background:var(--surface);color:var(--ink-soft);cursor:pointer;font-size:16px;line-height:1;display:grid;place-items:center;transition:border-color .15s,color .15s}
   .tbtn:hover{border-color:var(--accent);color:var(--accent-ink)}
   .tbtn:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
@@ -192,6 +222,38 @@
   .dot[aria-current="true"]{background:var(--accent);transform:scale(1.4)}
   .dot:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
   .tcount{font-family:var(--mono);font-size:.74rem;color:var(--ink-faint);letter-spacing:.1em;min-width:64px;text-align:center;font-variant-numeric:tabular-nums}
+
+  /* interactive terminal demo */
+  .tuid{margin-top:clamp(22px,3vw,38px)}
+  .tuid-term{background:#0d0d0f;border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow);overflow-x:auto;text-align:center}
+  /* JetBrains Mono FIRST: its box-drawing glyphs join edge-to-edge, so the frame's ─ rules render as
+     solid lines like the real terminal (a generic monospace draws ─ with side gaps → a dashed look).
+     line-height:1 for the same reason on the vertical axis: any taller line box opens a gap between
+     rows and breaks every │ pane border into dashes — a terminal's cell height IS its line height. */
+  .tuid-term pre{margin:0;padding:14px 16px;font-family:"JetBrains Mono",var(--mono);font-size:clamp(7.5px,1.28vw,12px);line-height:1;color:#cccccc;white-space:pre;letter-spacing:0;min-width:max-content;display:inline-block;text-align:left}
+  .tuid-cap{font-family:var(--mono);font-size:.76rem;color:var(--ink-faint);margin-top:14px;text-align:center;min-height:1.3em;padding:0 12px}
+  .tuid-cap b{color:var(--accent-ink);font-weight:600}
+  .tuid-ui{display:flex;align-items:center;justify-content:center;gap:14px;margin-top:12px;flex-wrap:wrap}
+
+  /* docs-style navbar search (⌘K) */
+  .nav .brand{font-family:'Space Grotesk',var(--sans);letter-spacing:-.01em}
+  .kbtn{display:inline-flex;align-items:center;gap:8px;background:var(--surface);border:1px solid var(--line);color:var(--ink-faint);border-radius:9px;padding:6px 9px;font-family:var(--sans);font-size:13px;cursor:pointer;transition:border-color .15s}
+  .kbtn:hover{border-color:var(--accent);color:var(--ink)}
+  .kbtn .kmag{font-size:14px}.kbtn .klabel{margin-right:10px}
+  .nav kbd,.kmodal kbd{font-family:var(--mono);font-size:10.5px;background:var(--surface-2);border:1px solid var(--line);border-radius:5px;padding:1px 5px;color:var(--ink-soft)}
+  @media(max-width:760px){.kbtn .klabel,.kbtn kbd{display:none}}
+  .kmodal{position:fixed;inset:0;z-index:60;display:flex;align-items:flex-start;justify-content:center;padding-top:12vh}
+  .kmodal[hidden]{display:none}
+  .kback{position:absolute;inset:0;background:rgba(0,0,0,.5);backdrop-filter:blur(3px)}
+  .kbox{position:relative;width:min(560px,92vw);background:var(--surface);border:1px solid var(--line);border-radius:14px;box-shadow:0 24px 70px rgba(0,0,0,.4);overflow:hidden}
+  #kinput{width:100%;border:0;border-bottom:1px solid var(--line-soft);background:none;color:var(--ink);font:500 16px var(--sans);padding:16px 18px;outline:none}
+  #kresults{list-style:none;margin:0;padding:8px;max-height:52vh;overflow-y:auto}
+  #kresults li{padding:9px 12px;border-radius:9px;cursor:pointer}
+  #kresults li .r-t{font-family:'Space Grotesk',var(--sans);font-weight:600;color:var(--ink);font-size:14px}
+  #kresults li .r-g{font-size:11.5px;color:var(--accent-ink);margin-left:8px}
+  #kresults li .r-d{font-size:12.5px;color:var(--ink-soft);margin-top:2px}
+  #kresults li.sel,#kresults li:hover{background:var(--accent-soft)}
+  .khint{border-top:1px solid var(--line-soft);padding:9px 14px;font-size:11.5px;color:var(--ink-faint);display:flex;gap:6px;align-items:center}
   .mock{padding:clamp(16px,2.4vw,22px);font-family:var(--mono);font-size:.78rem;line-height:1.85;color:var(--ink-soft);background:var(--surface-2);overflow-x:auto}
   .mock .mh{font-size:.63rem;letter-spacing:.12em;text-transform:uppercase;color:var(--ink-faint);margin-bottom:10px}
   .mock b{color:var(--ink);font-weight:600}
@@ -213,7 +275,7 @@
   }
   /* ---- hero lead + shared control states ---- */
   [hidden]{display:none!important}
-  .hero-lead{text-align:center;margin-inline:auto}
+  .hero-lead{text-align:center;margin-inline:auto;position:relative}
   .hero-lead .lede{margin-inline:auto;}
   .hero-lead .cta{justify-content:center}
   .tbtn.playing{color:var(--accent-ink);border-color:var(--accent)}
@@ -244,10 +306,16 @@
   html{font-size:clamp(16px, 9px + 0.47vw, 24px)}
   /* ---- interactive demo (moved from the demo page): the editor-mock palette + frame ---- */
   .hero h2{font-size:clamp(2rem,5vw,3.3rem);margin:16px auto 14px}
-  .wrap.wide{width:min(1420px,96%)}
+  /* max-width in vw (viewport-absolute), not %, so the demos' max-content children can't inflate the
+     body and then feed that back through a %-relative width — the loop that scrolled the page sideways. */
+  .wrap.wide{width:min(1420px,96%);max-width:96vw}
   /* the IDE frame: sidebar + editor on top, the dashboards dock below — the real VS Code layout */
   .ide{border:1px solid var(--line);border-radius:16px;box-shadow:var(--shadow);overflow:hidden;background:var(--ed-bg);margin-top:22px}
-  .ide-top{display:grid;grid-template-columns:1fr 2fr 2fr}
+  .ide-top{display:grid;grid-template-columns:1fr 2fr 2fr;min-width:0}
+  /* Grid items default to min-width:auto and won't shrink below their content, so a long code line
+     (min-width:max-content) inflates the track and scrolls the whole PAGE sideways on mobile. min-width:0
+     lets each column shrink so the editor's own overflow-x:auto scrolls the line instead. */
+  .ide-top>*{min-width:0}
   @media (max-width:900px){.ide-top{grid-template-columns:1fr}.ide-top .side{display:none}}
   .side{background:var(--ed-panel);font-family:var(--mono);font-size:.72rem;min-width:0;display:flex;flex-direction:column}
   .side.traces{border-right:1px solid var(--ed-line)}
@@ -289,9 +357,6 @@
   .or .od .m{color:var(--deleted)}
   .or .ow{color:var(--ink-faint);font-style:italic}
   .badge{font-size:.64rem;font-family:var(--mono);border:1px solid var(--line);border-radius:999px;padding:0 7px;color:var(--accent-ink)}
-  .nextsteps{margin-top:auto;border-top:1px solid var(--line-soft);padding:6px 12px;color:var(--ink-faint)}
-  .nextsteps .nh{font-family:var(--mono);font-size:.6rem;letter-spacing:.12em;text-transform:uppercase;margin-bottom:2px}
-  .nextsteps div{padding:1px 0}
   .empty{padding:9px 12px;color:var(--ink-faint)}
   /* overview pane: toolbar strip + master-detail */
   .ovbar{display:flex;flex-direction:column;gap:4px;padding:5px 12px;border-bottom:1px solid var(--line-soft);font-family:var(--mono);font-size:.66rem;color:var(--ink-faint)}
@@ -332,23 +397,13 @@
   .lr .sd.pending{background:var(--pending)}
   .lr .sd.kept{background:var(--kept)}
   .lr .sd.undone{background:var(--undone)}
-  .lr .lf{font-family:var(--mono);color:var(--ink);flex:none}
-  .lr .lb{flex:1;height:6px;border-radius:4px;background:var(--surface-3);overflow:hidden;min-width:22px}
-  .lr .lb i{display:block;height:100%;background:var(--accent);opacity:.55}
+  .lr .la{font-family:var(--mono);font-size:.62rem;color:var(--ink-faint);flex:none;width:52px;text-align:right;white-space:nowrap}
+  .lr .lf{font-family:var(--mono);color:var(--ink);flex:1 1 auto;min-width:0;overflow-wrap:anywhere}
   .lr .lc{flex:none;font-family:var(--mono);font-size:.66rem;color:var(--ink-faint)}
   .lr .lc .p{color:var(--kept)}
   .lr .lc .m{color:var(--deleted)}
+  .lr .lo{flex:none;color:var(--accent-ink);font-size:.7rem}
   .readout{padding:6px 12px;font-family:var(--mono);font-size:.64rem;color:var(--ink-faint);border-top:1px solid var(--line-soft);margin-top:auto}
-  /* the selected row's feed: live while its source is still writing, an audit log once it has finished */
-  .ovfeed{padding:5px 12px 7px;font-family:var(--mono);font-size:.62rem;color:var(--ink-faint);border-top:1px solid var(--line-soft);background:var(--surface-2)}
-  .ovfeed .fh{display:flex;gap:6px;align-items:baseline;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:3px}
-  .ovfeed .fh b{color:var(--ink);font-weight:600}
-  .ovfeed .fh .live{color:var(--kept)}
-  .ovfeed .fh .audit{color:var(--ink-faint)}
-  .ovfeed .fe{display:flex;gap:7px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  .ovfeed .fe .ft{flex:none;color:var(--ink-faint)}
-  .ovfeed .fe .fa{flex:none;color:var(--ink)}
-  .ovfeed .more{opacity:.75}
   /* stats pane */
   .stnav{display:flex;gap:8px;align-items:baseline;padding:6px 12px;border-bottom:1px solid var(--line-soft);font-family:var(--mono);font-size:.68rem;color:var(--ink-soft)}
   .tiles{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--line-soft)}
@@ -403,9 +458,10 @@
   .sr .sc .m{color:var(--deleted)}
   .sr.fold{color:var(--ink-faint);padding-top:7px}
   .sr.on{background:var(--accent-soft);color:var(--ink)}
-  /* the right sidebar: the Claude session on top, the Observatory Timeline below */
+  /* the right sidebar: the agent session on top, the Observatory Timeline below */
   .side-h{display:flex;align-items:baseline;justify-content:space-between;gap:8px}
   .side-h .tabs{font-size:.58rem;letter-spacing:.02em;text-transform:none;color:var(--ed-gutter)}
+  .side-h .tabs b{color:var(--ink);font-weight:600}
   .chat{border-bottom:1px solid var(--ed-line)}
   .chat .prompt-strip{border-bottom:0}
   .chat-r{padding:2px 14px 10px;font-family:var(--sans);font-size:.74rem;line-height:1.55;color:var(--ink-soft)}
@@ -417,30 +473,40 @@
   .tl .sd.pending{background:var(--pending)}
   .tl .sd.kept{background:var(--kept)}
   .tl .sd.undone{background:var(--undone)}
-  .tl .nextsteps{margin-top:auto}
+  /* the Feed tab: live while the session is still writing, an audit log once it has stopped */
+  .tl .fh{position:sticky;top:0;z-index:1;background:var(--ed-panel);display:flex;flex-wrap:wrap;gap:6px;align-items:baseline;padding:6px 12px;border-bottom:1px solid var(--line-soft);font-family:var(--mono);font-size:.62rem;color:var(--ink-faint)}
+  .tl .fh b{color:var(--ink);font-weight:600}
+  .tl .fh .live{color:var(--kept)}
+  .tl .or.band{background:var(--surface-3)}
+  .tl .or .of{overflow-wrap:anywhere}
 </style>
 </head>
 <body>
 
-<nav class="nav" id="nav">
-  <div class="wrap row">
-    <a class="brand" href="#hero"><span class="m">🔬</span> Claude Observatory <span class="brandver" data-co-version>v0.9.5</span></a>
-    <div class="links">
-      <a href="showcase.html" aria-current="page">Home</a>
-      <a href="#install">Install</a>
-      <a href="getting-started.html">Getting started</a>
-      <a href="apps.html">Apps</a>
-      <a href="concepts.html">Docs</a>
+<header class="nav" id="nav">
+  <div class="nav-in">
+    <a class="brand" href="showcase.html"><span class="m">🔬</span> OAK <span class="brandver" data-co-version>v0.10.0</span></a>
+    <nav class="nav-links" aria-label="Primary">
+      <a href="what-is-oak.html">Docs</a>
       <a href="releases.html">Releases</a>
-      <a class="more" href="https://github.com/cell-observatory/claude-observatory">GitHub</a>
-    </div>
-    <div class="right">
-      <button class="icon-btn menu-btn" id="menu" aria-label="Toggle navigation menu" aria-expanded="false">☰</button>
+      <a href="https://github.com/cell-observatory/oak-observatory">GitHub</a>
+    </nav>
+    <div class="nav-right">
+      <button class="kbtn" id="ksearch" aria-label="Search docs"><span class="kmag">⌕</span><span class="klabel">Search</span><kbd>⌘K</kbd></button>
+      <button class="icon-btn menu-btn" id="menu" aria-label="Toggle navigation menu" aria-expanded="false"><svg width="22" height="22" viewBox="0 0 22 22" aria-hidden="true"><path d="M2 5.5h18M2 11h18M2 16.5h18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></button>
       <button class="icon-btn" id="theme" aria-label="Toggle theme">◐</button>
-      <a class="ghost" href="https://github.com/cell-observatory/claude-observatory">GitHub&nbsp;↗</a>
+      <a class="ghost" href="https://github.com/cell-observatory/oak-observatory">GitHub&nbsp;↗</a>
     </div>
   </div>
-</nav>
+</header>
+<div class="kmodal" id="kmodal" hidden>
+  <div class="kback" id="kback"></div>
+  <div class="kbox" role="dialog" aria-modal="true" aria-label="Search docs">
+    <input id="kinput" type="text" placeholder="Search the docs…" autocomplete="off" spellcheck="false">
+    <ul id="kresults"></ul>
+    <div class="khint"><kbd>↑</kbd><kbd>↓</kbd> navigate · <kbd>↵</kbd> open · <kbd>esc</kbd> close</div>
+  </div>
+</div>
 
 <aside class="gutter" aria-hidden="true">
   <a href="#hero" data-spy="hero">01</a>
@@ -453,14 +519,18 @@
 <header class="hero" id="hero">
   <div class="wrap">
     <div class="stagger hero-lead">
-      <h1 style="--i:1">Claude Observatory</h1>
-      <p class="lede" style="--i:2">Coding agents change code faster than anyone can read it, and a change accepted without being understood is a liability for you, not the agent's provider. The observatory is built for established and mission-critical codebases rather than throwaway prototypes: it records every edit a Claude Code session makes, through local hooks that cost no tokens. You review at the scope that fits the work, by several abstractions over what the agent changed for a given prompt. Every edit keeps its own diff and its own conflict-guarded undo, so reverting one leaves the others standing. When several agents work at once — subagents, workflow runs, sessions in parallel git worktrees — their work does not blur together: every edit is correlated back to the agent that made it. Everything stays local and git-free, and one store serves the terminal, VS Code, and JetBrains IDEs.</p>
-      <div class="cta" style="--i:3">
+      <h1 style="--i:1">OAK</h1>
+      <p class="verbs" style="--i:3">Observe · Audit · Keep</p>
+      <p class="tagline" style="--i:4">An Observatory for Agentic Development</p>
+      <p class="lede" style="--i:5">Coding agents change code faster than anyone can read it, and a change accepted without being understood is a liability for you, not the agent's provider. The observatory is built for established and mission-critical codebases rather than throwaway prototypes: it records every edit an agent session makes, through local hooks that cost no tokens. You review at the scope that fits the work, by several abstractions over what the agent changed for a given prompt. Every edit keeps its own diff and its own conflict-guarded undo, so reverting one leaves the others standing. When several agents work at once — subagents, workflow runs, sessions in parallel git worktrees — their work does not blur together: every edit is correlated back to the agent that made it. Everything stays local and git-free, and one store serves the terminal, VS Code, and JetBrains IDEs.</p>
+      <div class="cta" style="--i:6">
         <a class="btn primary" href="#install">Get started</a>
-        <a class="btn line" href="#demo">Full interactive demo →</a>
+        <a class="btn line" href="tui.html">Terminal app →</a>
+        <a class="btn line" href="editors.html">Editor extensions →</a>
+        <a class="btn line" href="supported-agents.html">Supported agents →</a>
         <a class="btn line" href="#how">How it works</a>
       </div>
-      <div class="meta" style="--i:4">git-free · zero extra Claude tokens · terminal + VS Code + JetBrains</div>
+      <div class="meta" style="--i:7">git-free · zero extra tokens · terminal + VS Code + JetBrains</div>
     </div>
 
   </div>
@@ -481,13 +551,14 @@
     <span class="eyebrow">What sets it apart</span>
     <h2>From one edit to the whole trace</h2>
     <ul>
-      <li><b>The record is built outside the model loop.</b> Capture runs in local hooks: it costs no tokens and changes nothing about what the agent sees or the decisions it makes. Review units are derived deterministically from the exact snapshot pairs capture recorded — an exact join, never a heuristic reconcile of the working tree — and all review state is derived on read from the append-only record, so there is nothing stored to go stale. Everything stays on your machine; nothing is sent anywhere.</li>
+      <li><b>The record is built outside the model loop.</b> Capture runs in local hooks: it costs no tokens and changes nothing about what the agent sees or the decisions it makes. Review units are derived deterministically from the exact snapshot pairs capture recorded — an exact join, never a heuristic reconcile of the working tree — and all review state is derived on read from the append-only record, so there is nothing stored to go stale. Capture and review stay on your machine. The network reads OAK makes on its own — your account's usage and session titles from api.anthropic.com, the Codex quota, the saved machines it reads over SSH, and the release checks (daily from the CLI and VS Code’s update notifier, about hourly from the editors’ version chips) — are listed in <a href="https://github.com/cell-observatory/oak-observatory/blob/main/SECURITY.md">SECURITY.md</a>.</li>
       <li><b>One change, however many tries.</b> Repeated edits to the same lines, or to the same detected function, read as one review unit showing the net diff, bounded by the prompt that produced them — a superseded intermediate state never asks for a decision. The editors&rsquo; Review tab lists the session this way &mdash; scoped to one ask when a prompt is selected &mdash; and opens the diffs in the editor: one unit per row, or the whole list as a single concatenated view; the terminal&rsquo;s Review list scopes the same way. The same review scales down to a single edit or up to a task or a workflow run.</li>
       <li><b>Any edit can be reversed on its own.</b> A position-anchored merge removes one change while the edits around it stay in place. When a later edit genuinely overlaps, the undo is refused rather than applied blindly — and when the overlap is later work that built on the change, the refusal names the depending unit and offers reverting the pair as one action. No clean git state is required, and nothing is silently overwritten.</li>
       <li><b>Your own decisions are on the record too.</b> Bulk accepts and reverts are journaled with before-images, listable and reversible (<code>oplog</code>) — the reviewer's actions get the same auditability as the agent's.</li>
-      <li><b>Every edit is recorded.</b> Each text change is saved the moment the agent makes it, including the files a shell command changed. When a named file cannot be snapshotted — a binary, or one past the size cap — the record marks it an explicit skip rather than dropping it quietly. The shell walk is bounded: it skips vendor and build directories and stops at a file-count cap, so changes beneath those are not captured at all.</li>
-      <li><b>Every surface reads one store.</b> VS Code, JetBrains IDEs, and the terminal share the same local record, so review does not depend on a particular editor or on an outside service. The terminal is a two-way door: it shows the live session — Claude's own output as it works — and one key hands the terminal to <code>claude --resume</code> for that session, returning on exit.</li>
-      <li><b>Every tool call is explained.</b> The transcript the session already produced yields Claude's reasoning, a timeline of each tool call, flags on risky shell commands, and the two audits: the edits and reads that landed outside the workspace, and everywhere the session reached off the machine.</li>
+      <li><b>Every edit is recorded.</b> Each text change is saved the moment the agent makes it, including the files a shell command changed. A binary file is kept as an opaque blob and shown as a size summary. When a named file is past the size cap — a text file over 5&nbsp;MB, or any file over 25&nbsp;MB — the record marks it an explicit skip rather than dropping it quietly. The shell walk is bounded: it skips vendor and build directories and stops at a file-count cap, so changes beneath those are not captured at all.</li>
+      <li><b>Every surface reads one store.</b> VS Code, JetBrains IDEs, and the terminal share the same local record, so review does not depend on a particular editor or on an outside service. The terminal app runs the agents themselves, in herdr panes, beside a live view of every session; <code>h</code> on a session jumps to its pane.</li>
+      <li><b>Agents run in <a href="https://herdr.dev">herdr</a>, a terminal workspace manager for coding agents.</b> The terminal app&rsquo;s first tab is herdr&rsquo;s own client: you start Claude Code or Codex in herdr&rsquo;s tabs and panes, on this machine or on one you saved with <code>oak machine add</code>, which herdr reaches over SSH, and they keep running when you detach or the connection drops. <code>oak attach</code> hands a plain terminal to herdr the way <code>tmux attach</code> does. OAK installs the herdr release pinned in <code>herdr.lock</code> after checking its checksum, adds an <em>Open in OAK</em> action to herdr, names each herdr tab after the session running in it unless you named the tab yourself, and lists every session in the Observatory by machine and herdr workspace (<a href="tui-herdr.html">how the two fit together</a>).</li>
+      <li><b>Every tool call is explained.</b> The transcript the session already produced yields the agent's reasoning, a timeline of each tool call, flags on risky shell commands, and the two audits: the edits and reads that landed outside the workspace, and everywhere the session reached off the machine.</li>
       <li><b>Many agents appear in one view.</b> When several agents run in parallel across git worktrees, the observatory unifies them: who is working, on what, and where their changes conflict.</li>
     </ul>
   </div>
@@ -498,7 +569,6 @@
   <div class="wrap">
     <span class="eyebrow">Interactive demo</span>
     <h2>The full panels, <span class="hl">step by step</span></h2>
-    <p class="lede">Claude Observatory is built for established and mission-critical codebases. This is a scripted replay of its bundled demo session over a small Python training pipeline, laid out the way it sits in the editor: the file beside the Claude session and the Observatory Timeline, with the Observatory Dashboards dock below. Nothing calls a model. The review clicks are yours, and unless you have asked your system to reduce motion, each step applies itself after a short pause if you only watch. This is a shortened version: the demo bundled with the CLI and both editors runs to three prompts, six tasks and nine edits, and adds a second agent in a sibling worktree, a deletion, a failed tool call, a workflow still running and a write outside the workspace &mdash; run <code>claude-observatory demo</code>, or <b>Start Demo Mode</b> in your editor, to see it.</p>
   </div>
 </section>
 
@@ -518,7 +588,7 @@
       </div>
     </div>
 
-    <div class="ide" aria-label="Simulated editor: the Observatory Traces sidebar on the left, the file in the middle, the Claude session and Observatory Timeline on the right, and the Observatory Dashboards dock below">
+    <div class="ide" onclick="location.href='editors.html'" style="cursor:pointer" aria-label="Simulated editor: the Observatory Traces sidebar on the left, the file in the middle, the agent session and Observatory Timeline on the right, and the Observatory Dashboards dock below">
       <div class="ide-top">
         <aside class="side traces" aria-label="Observatory Traces sidebar (simulated)">
           <div class="side-h"><span>Observatory Traces</span></div>
@@ -532,13 +602,13 @@
           </div>
           <div class="code" id="ed-code"></div>
         </div>
-        <aside class="side agent" aria-label="Claude session and Observatory Timeline (simulated)">
-          <div class="side-h"><span>Claude session</span></div>
+        <aside class="side agent" aria-label="agent session and Observatory Timeline (simulated)">
+          <div class="side-h"><span>agent session</span></div>
           <div class="chat">
             <div class="prompt-strip"><span class="pr">&#10095;</span><span class="pt" id="ed-prompt"></span><span class="caret" id="ed-caret" hidden></span></div>
             <div class="chat-r" id="ch-reply"></div>
           </div>
-          <div class="side-h"><span>Observatory Timeline</span><span class="tabs">Prompts &middot; Observations</span></div>
+          <div class="side-h"><span>Observatory Timeline</span><span class="tabs"><b>Feed</b> &middot; Prompts &middot; Observations &middot; Actions</span></div>
           <div class="tl" id="tl"></div>
         </aside>
       </div>
@@ -550,14 +620,13 @@
           <div class="ovbar" id="ovbar"></div>
           <div class="ovwrap">
             <div class="ovnav">
-              <div class="ovtabs"><span class="on">Fleet</span><span id="wf-tab">Workflows</span><span id="tk-tab" title="Claude's own numbered task list. An edit joins a task only if it was captured while that task was in progress; anything outside those windows stays unassigned.">Tasks</span><span id="pr-tab" title="Background shells this session launched with run_in_background — state, runtime and output volume. Shell ids are the harness's own; a transcript records no OS process id.">Processes</span><span title="Every Claude Code session for this workspace, ordered by when its conversation was last active. Selecting a row switches the whole review to that session.">Sessions 1</span></div>
+              <div class="ovtabs"><span title="Sessions on this machine, grouped by workspace. This workspace is first; select a session to review its conversation and edits.">Sessions 1</span><span class="on" id="wk-tab">Workers 1</span><span id="wf-tab">Workflows 0</span><span id="tk-tab" title="the agent's own numbered task list. An edit joins a task only if it was captured while that task was in progress; anything outside those windows stays unassigned.">Tasks</span><span id="pr-tab" title="Background shells this session launched with run_in_background — state, runtime and output volume. Shell ids are the harness's own; a transcript records no OS process id.">Processes</span></div>
               <div id="fleet"></div>
             </div>
             <div class="ovdetail">
               <div class="strip" id="ov-strip" hidden></div>
               <div id="ov-ledger"></div>
               <div class="readout" id="ov-readout"></div>
-              <div class="ovfeed" id="ov-feed" hidden></div>
             </div>
           </div>
         </section>
@@ -593,268 +662,124 @@
         </section>
       </div>
     </div>
-    <noscript><p class="lede" style="margin-top:20px">This demo needs JavaScript. The <a href="getting-started.html" style="color:var(--accent-ink);text-decoration:underline">recorded walkthrough</a> covers the same session as GIFs.</p></noscript>
+    <noscript><p class="lede" style="margin-top:20px">This demo needs JavaScript. <a href="first-review.html" style="color:var(--accent-ink);text-decoration:underline">Your first review</a> walks through the same steps.</p></noscript>
   </div>
 </section>
+
+<section class="moment" id="tui-demo">
+  <div class="wrap rv">
+    <span class="eyebrow">The terminal app</span>
+    <h2>The whole observatory, in your terminal</h2>
+    <p class="lede">The same review lives in <code>oak</code>, in three tabs: herdr runs your terminals and agents, on this machine and on saved ones; the Observatory lists every session by machine and workspace beside its pinned conversation, workers, tasks and captured edits; and Review decides the edits. This replays the current terminal renderer on the bundled demo’s captured history.</p>
+  </div>
+  <div class="wrap">
+    <div class="tuid rv">
+      <a href="tui.html" class="tuid-term" style="display:block;text-decoration:none;cursor:pointer" aria-label="Open the terminal app docs"><pre id="tuid-screen" aria-label="Terminal demo frame"></pre></a>
+      <p class="tuid-cap" id="tuid-cap" aria-live="polite"></p>
+      <div class="tuid-ui">
+        <button class="tbtn" id="tuid-prev" type="button" aria-label="Previous frame">‹</button>
+        <div class="dots" id="tuid-dots" role="group" aria-label="Terminal demo frames"></div>
+        <span class="tcount" id="tuid-count" aria-live="polite"></span>
+        <button class="tbtn" id="tuid-play" type="button" aria-label="Pause or resume the autoplay">❚❚</button>
+        <button class="tbtn" id="tuid-next" type="button" aria-label="Next frame">›</button>
+      </div>
+    </div>
+  </div>
+</section>
+<script src="media/tui-frames.js"></script>
 
 <section class="moment" id="tour">
   <div class="wrap rv">
     <span class="eyebrow">Feature tour</span>
     <h2>Everything it does, on every surface</h2>
-    <p class="lede">The tour covers every surface, one slide at a time: inline in the editor, in the panels, in the terminal, and in both editors.</p>
+    <p class="lede">Inline in the editor, across the panels, in the terminal, and in both editors &mdash; every surface OAK gives you, at a glance.</p>
   </div>
   <div class="wrap">
-    <div class="tour rv" role="region" aria-roledescription="carousel" aria-label="Feature tour">
-      <div class="tour-ui">
-        <button class="tbtn" id="tprev" type="button" aria-label="Previous feature">‹</button>
-        <div class="dots" id="tdots" role="tablist" aria-label="Choose a feature"></div>
-        <span class="tcount" id="tcount" aria-live="polite">01 / 23</span>
-        <button class="tbtn" id="tnext" type="button" aria-label="Next feature">›</button>
-      </div>
-      <div class="tour-view">
-        <div class="slides" id="slides">
+    <div class="fgrid">
 
-          <article class="slide" role="group" aria-roledescription="slide" aria-label="Overview — master-detail multi-agent panel">
-            <div class="slide-in">
-              <div><span class="eyebrow">Overview</span><h3>Every agent and its changes in one panel</h3>
-                <p>The Overview is a master-detail panel. Its left nav has five tabs, led by <b>Sessions</b>, this workspace's recorded sessions — the one tab whose selection switches what the whole observatory reviews. Then <b>Fleet</b>, every running agent across the repository's worktrees; <b>Workflows</b>, every multi-agent run; <b>Tasks</b>, the session's numbered task list; and <b>Processes</b>, the background shells it launched. Fleet and Workflows rows show a live phase and an activity sparkline, and an interrupted run that never recorded completion is not shown as running. Selecting a row fills the right side with its change map, two labeled sections top to bottom: <b>Folders</b>, a strip of equal tiles, one per changed directory, ranked by lines changed and colored by review status; and <b>Files</b>, a churn-ranked ledger of every changed file. Clicking a Folder tile steps the nav bar's Folder axis to that folder's first pending edit; clicking a file opens its diff. A summary bar reports the pending, accepted, and reverted counts for whatever is in scope and names the picked prompt or folder filter; beneath it, the selected row's feed shows what that thing is doing.</p></div>
-              <div class="panel"><figure><img src="media/overview-tabs.png" loading="lazy" alt="The master-detail Overview: Sessions, Fleet, Workflows, Tasks, and Processes in the left nav; the selected session's change map — the Folders strip and the churn-ranked Files ledger — on the right, with a scope summary bar below"></figure></div>
-            </div>
-          </article>
+      <a class="fcard" href="edits.html">
+        <div class="fcard-shot"><img src="media/overview-tabs.png" loading="lazy" alt="The master-detail Overview: Sessions, Workers, Workflows, Tasks, and Processes in the left nav; the selected session's change map on the right"></div>
+        <div class="fcard-text"><span class="fname">Overview</span><p>Every agent and its changes live in one master-detail panel &mdash; pick a session, agent, or prompt, and its change map fills the right.</p></div>
+      </a>
 
-          <article class="slide" role="group" aria-roledescription="slide" aria-label="The fleet">
-            <div class="slide-in">
-              <div><span class="eyebrow">The fleet</span><h3>Parallel agents across worktrees</h3>
-                <p>Every running Claude session appears in one live board, including sessions in separate git worktrees of one repository, correlated without the git binary. Each row carries a live phase (working · awaiting-input · awaiting-permission · idle · done, with heuristic phases marked ~), its worktree and branch, a sparkline, ±lines, tokens · time, and risk; live file conflicts in the Actions view flag any file two agents are touching. Tracking is path-only, at zero tokens.</p></div>
-              <div class="panel"><figure><img src="media/multitasking.png" loading="lazy" alt="The fleet: one row per running agent across the repo's git worktrees — live phase, branch, sparkline, ±lines, risk, a per-row conflict count, nested subagents, and below them the file-conflicts strip this capture still shows in the Overview"><figcaption class="cap">Captured before live conflicts moved to the Actions view</figcaption></figure></div>
-            </div>
-          </article>
+      <a class="fcard" href="sessions-agents.html">
+        <div class="fcard-shot"><img src="media/sessions.png" loading="lazy" alt="The Overview's Sessions tab: sessions grouped by workspace, each row with its title, model, line counts, pending edits, tokens, duration, store size and last activity, and its conversation, resolve and delete buttons"></div>
+        <div class="fcard-text"><span class="fname">Sessions</span><p>Every session on the workspace's machine, grouped by workspace &mdash; its title, model, tokens and store size. Pick one and every panel follows.</p></div>
+      </a>
 
-          <article class="slide" role="group" aria-roledescription="slide" aria-label="Sessions">
-            <div class="slide-in">
-              <div><span class="eyebrow">Sessions</span><h3>Every session in the workspace, newest conversation first</h3>
-                <p>The Sessions tab lists each Claude Code session recorded for this workspace, led by Claude's own title for it and ordered by when its conversation was last active. Selecting a row switches what every window reviews, so a session you left yesterday is one click away. The listing is built from directory stats and cached titles rather than from the sessions' edit logs, which is why it opens at once however many edits have accumulated. For moving between conversations that are <em>both still running</em>, the Timeline carries its own selector above the Prompts list, listing only the sessions still active plus the one under review; picking one switches the whole observatory, and this tab stays the full list. The Overview's left nav can also pair its related sections side by side — Sessions beside Fleet, Workflows beside Tasks and Processes — since which conversation and who is working in it are one question.</p></div>
-              <div class="panel"><img src="media/sessions.png" loading="lazy" alt="The Sessions tab: one row per session in this workspace — the live session marked, each row showing Claude's title for the session and when its conversation was last active"></div>
-            </div>
-          </article>
+      <a class="fcard" href="editors.html">
+        <div class="fcard-shot"><img src="media/inline-review.png" loading="lazy" alt="Inline review: a tinted pending edit with a marker and Keep/Undo actions in the editor"></div>
+        <div class="fcard-text"><span class="fname">Inline review</span><p>Pending edits appear in the editor itself &mdash; a tinted line, a gutter star, and a lens with Keep, Undo, the diff, and the way to the full review.</p></div>
+      </a>
 
-          <article class="slide" role="group" aria-roledescription="slide" aria-label="Inline review">
-            <div class="slide-in">
-              <div><span class="eyebrow">Inline review</span><h3>Review directly in the editor</h3>
-                <p>Claude's pending edits appear in the editor itself: a tinted line, a gutter star, removed lines as ghost text in both editors, and a per-edit lens that names the edit, its churn and its position, then carries Keep, Undo, Chat, the diff, and the way through to the fuller review surface. Resolving one edit carries you to the next awaiting review, crossing into another file when that is where it is. A file with edits awaiting review carries their count as a badge in the editor's own project tree, and on the editor tab in VS Code.</p></div>
-              <div class="panel"><figure><img src="media/inline-review.png" loading="lazy" alt="Inline review: a tinted pending edit with a ✨ marker and Keep/Undo actions"></figure></div>
-            </div>
-          </article>
+      <a class="fcard" href="feed.html">
+        <div class="fcard-shot"><img src="media/feed.png" loading="lazy" alt="The Timeline's Feed tab: a prompt on a grey band, the agent's reply and a folded thought, then each tool call with its time, a shell call as a command, and an edit's diff as background bands"></div>
+        <div class="fcard-text"><span class="fname">Feed</span><p>The conversation as it happened &mdash; your prompts, the agent's replies and thinking, and every tool call with the diff it produced.</p></div>
+      </a>
 
-          <article class="slide" role="group" aria-roledescription="slide" aria-label="Per-edit diffs">
-            <div class="slide-in">
-              <div><span class="eyebrow">Per-edit diffs</span><h3>A dedicated diff for each edit</h3>
-                <p>Every entry opens as its own diff rather than one session-wide diff to untangle.</p></div>
-              <div class="panel"><img src="media/diffs.png" loading="lazy" alt="Per-edit diff: one edit's before and after, side by side"></div>
-            </div>
-          </article>
+      <a class="fcard" href="prompts.html">
+        <div class="fcard-shot"><img src="media/prompts.png" loading="lazy" alt="The Prompts window: one row per prompt with its response expanded"></div>
+        <div class="fcard-text"><span class="fname">Prompts</span><p>The session reads as the conversation you had, one row per ask. Select one to scope everything beside it.</p></div>
+      </a>
 
-          <article class="slide" role="group" aria-roledescription="slide" aria-label="Surgical undo and file history">
-            <div class="slide-in">
-              <div><span class="eyebrow">Surgical undo &amp; file history</span><h3>Surgical undo</h3>
-                <p>A single change can be reverted without touching later edits, and File History lists every revision a file has been through.</p></div>
-              <div class="panel"><img src="media/file-history.png" loading="lazy" alt="File History: the active file's edits, newest first"></div>
-            </div>
-          </article>
+      <a class="fcard" href="observations.html">
+        <div class="fcard-shot"><img src="media/observations.png" loading="lazy" alt="Observations: files by recent activity, each with the agent's own reasoning"></div>
+        <div class="fcard-text"><span class="fname">Observations</span><p>Observations pair the change feed with the agent's own reasoning, parsed from the transcript at zero tokens.</p></div>
+      </a>
 
-          <article class="slide" role="group" aria-roledescription="slide" aria-label="Observations">
-            <div class="slide-in">
-              <div><span class="eyebrow">Observations</span><h3>A change feed with Claude's reasoning</h3>
-                <p>The session appears as a feed of files ordered by most-recent activity; adjacent edits to the same file coalesce into one ×N run. Each entry is paired with Claude's reasoning, parsed from the transcript it already wrote, at zero extra tokens. Above the feed, a Context section names what shaped the session — skills invoked, plans written, memory read, whether it resumed from a compaction — each row marked with whether the transcript proves it or the file is merely present where Claude Code loads it.</p></div>
-              <div class="panel"><img src="media/observations.png" loading="lazy" alt="Observations: files by recent activity with adjacent same-file edits coalesced into ×N runs, each with Claude's own reasoning"></div>
-            </div>
-          </article>
+      <a class="fcard" href="editors-stacked.html">
+        <div class="fcard-shot"><img src="media/stacked-diffs.png" loading="lazy" alt="The stacked diff view: every pending edit's diff in one scroll, each with its own Keep and Undo"></div>
+        <div class="fcard-text"><span class="fname">Per-edit diffs</span><p>Every edit gets its own diff, stacked into one scroll &mdash; each with its own Keep and Undo, not one session-wide tangle.</p></div>
+      </a>
 
-          <article class="slide" role="group" aria-roledescription="slide" aria-label="Actions">
-            <div class="slide-in">
-              <div><span class="eyebrow">Actions</span><h3>A timeline of every tool call</h3>
-                <p>Every read, grep, shell command, web fetch, and subagent spawn is grouped by kind in the Observatory Timeline panel, with each category collapsed by default and errors always surfaced. Edit rows link directly to their review.</p></div>
-              <div class="panel"><div class="mock">
-                <div class="mh">Actions · Observatory Timeline</div>
-                <div>▸ Commands <span class="d">(229) ·</span> <span class="r">2 errors</span></div>
-                <div>▾ Edits <span class="d">(185)</span></div>
-                <div>&nbsp;&nbsp;src/features.py <span class="a">→ review</span></div>
-                <div>▸ To-dos <span class="d">(30)</span></div>
-              </div></div>
-            </div>
-          </article>
+      <a class="fcard" href="stats-spotlight.html">
+        <div class="fcard-shot"><img src="media/stats.png" loading="lazy" alt="Stats: the review scoreboard, token plot, and usage bars"></div>
+        <div class="fcard-text"><span class="fname">Stats</span><p>The review scoreboard &mdash; pending, accepted, reverted &mdash; sits over token and usage plots.</p></div>
+      </a>
 
-          <article class="slide" role="group" aria-roledescription="slide" aria-label="Subagent tracking">
-            <div class="slide-in">
-              <div><span class="eyebrow">Subagent tracking</span><h3>Per-subagent timelines</h3>
-                <p>Each agent Claude spawned appears nested under its parent in the Overview's Fleet tab, with per-agent metrics: duration, tokens, and tool calls. Selecting one opens its feed, so its own actions read in order.</p></div>
-              <div class="panel"><div class="mock">
-                <div class="mh">Fleet · subagents</div>
-                <div>▾ <b>code-reviewer</b> <span class="d">68 actions · 12m47s · 45k tok</span></div>
-                <div>&nbsp;&nbsp;Read src/features.py</div>
-                <div>&nbsp;&nbsp;Grep "def scale(" <span class="r">✕ error</span></div>
-                <div>▸ <b>doc-writer</b> <span class="d">21 actions · 3m02s</span></div>
-              </div></div>
-            </div>
-          </article>
+      <a class="fcard" href="stats-spotlight.html#spotlight">
+        <div class="fcard-shot"><img src="media/spotlight.png" loading="lazy" alt="Spotlight: unmodified lines dimmed so the agent's edits stand out"></div>
+        <div class="fcard-text"><span class="fname">Spotlight</span><p>Spotlight dims every line the agent didn't touch, so the changes read at full contrast.</p></div>
+      </a>
 
-          <article class="slide" role="group" aria-roledescription="slide" aria-label="Prompts">
-            <div class="slide-in">
-              <div><span class="eyebrow">Prompts</span><h3>The session, as the conversation you had</h3>
-                <p>Every other view organizes the work the way the agent saw it: worktrees, runs, its own plan, files. The Prompts window is one row per thing you asked for, in order, each with its own counts — edits, files, folders, tokens, subagents, workflow runs, tasks, and shells. The prompt is printed whole, wrapped rather than clipped, and each row expands to show Claude's reply to it. Selecting a row scopes the Overview beside it: the fleet, the runs, the tasks, the shells, and the entire change map narrow to the work that prompt caused, and the review actions retarget to it. Work belongs to the prompt that started it, not the one that was current when it finished.</p></div>
-              <div class="panel"><figure><img src="media/prompts.png" loading="lazy" alt="The Prompts window: one row per prompt, newest first, each with what it produced and then the prompt itself, shown in full; the selected row is outlined and its response expanded beneath it"><figcaption class="cap">Select a prompt to scope everything beside it</figcaption></figure></div>
-            </div>
-          </article>
+      <a class="fcard" href="conflicts.html">
+        <div class="fcard-shot"><img src="media/conflict.png" loading="lazy" alt="Conflict: undo halts and surfaces the clash rather than guessing"></div>
+        <div class="fcard-text"><span class="fname">Conflict handling</span><p>Edit the same lines and the undo stops &mdash; surfacing the clash instead of overwriting your work.</p></div>
+      </a>
 
-          <article class="slide" role="group" aria-roledescription="slide" aria-label="Processes">
-            <div class="slide-in">
-              <div><span class="eyebrow">Processes</span><h3>Background shells, after they leave the screen</h3>
-                <p>Shells started with <code>run_in_background</code> appear as their own tab, each row showing its state, how long it has run, and how much output it produced; running shells sort first. Selecting one shows its full command and a tail of that output. Shell ids are the harness's own — a transcript records no OS process id, and the agent may be running over SSH or in a devcontainer, so inferring one by scanning local processes would be wrong.</p></div>
-              <div class="panel"><div class="mock">
-                <div class="mh">Processes · 1 running · 2 total</div>
-                <div><span class="p">running</span> &nbsp;<b>demo-serve</b> <span class="d">4.8s · 62B out</span></div>
-                <div>&nbsp;&nbsp;<span class="d">Serve the docs preview</span></div>
-                <div><span class="k">exit 0</span> &nbsp;&nbsp;<b>demo-tests</b> <span class="d">2ms · 51B out</span></div>
-                <div>&nbsp;&nbsp;<span class="d">Watch the test suite</span></div>
-              </div></div>
-            </div>
-          </article>
+      <a class="fcard" href="risk.html">
+        <div class="fcard-shot"><div class="mock">
+          <div class="mh">Risk &middot; Egress</div>
+          <div><span class="r">&bull; HIGH</span> rm -rf build/ <span class="d">forced delete</span></div>
+          <div><span class="p">&bull; MED</span>&nbsp; sudo make install <span class="d">elevated</span></div>
+          <div style="margin-top:6px">Egress <span class="d">5 destinations &middot; 2 remote</span></div>
+          <div>&nbsp;&nbsp;<span class="d">outside</span> ~/.claude/CLAUDE.md</div>
+        </div></div>
+        <div class="fcard-text"><span class="fname">Risk &amp; egress</span><p>Two audits cover what ran that could harm and everywhere the session reached off-machine.</p></div>
+      </a>
 
-          <article class="slide" role="group" aria-roledescription="slide" aria-label="Live feed and audit log">
-            <div class="slide-in">
-              <div><span class="eyebrow">Live feed</span><h3>What one thing is doing, read from what it writes</h3>
-                <p>Selecting an agent, a workflow, a task, a process, or the session itself shows its activity, read from the file that thing writes. While the source is still writing, the feed is followed live and stamped with how long ago it last moved — the age of the newest evidence, not a claim of real time. Once the source has finished, the same view becomes an audit log, a record rather than a stream, and polling stops. Entries read oldest first, and a capped feed states how many earlier ones it did not show.</p></div>
-              <div class="panel"><div class="mock">
-                <div class="mh">Feed · selected row</div>
-                <div><b>Write pipeline tests</b> <span class="k">● live</span> <span class="d">· updated 4s ago · agent</span></div>
-                <div class="d">… 36 earlier entries not shown</div>
-                <div><span class="d">14:41:02</span> &nbsp;Read <span class="d">src/features.py</span></div>
-                <div><span class="d">14:41:18</span> &nbsp;Write <span class="d">tests/test_pipeline.py</span></div>
-                <div><span class="d">14:41:35</span> &nbsp;Bash <span class="d">pytest -q</span></div>
-              </div></div>
-            </div>
-          </article>
+      <a class="fcard" href="editors.html">
+        <div class="fcard-shot"><img src="media/chat.png" loading="lazy" alt="Chat handoff: a context-preloaded prompt about one edit"></div>
+        <div class="fcard-text"><span class="fname">Chat handoff</span><p>One click builds a context-preloaded prompt about an edit &mdash; a draft on the clipboard, sent to the session's agent only when you choose.</p></div>
+      </a>
 
-          <article class="slide" role="group" aria-roledescription="slide" aria-label="Risk and egress">
-            <div class="slide-in">
-              <div><span class="eyebrow">Risk &amp; egress</span><h3>Risk and egress audits</h3>
-                <p>Risk flags the shell commands that were destructive or privileged, and reports the edits that landed outside the workspace. Egress lists everywhere the session reached off the machine, and the files it read from outside the workspace — each destination scoped remote, outside, or unknown, because a local path that left the workspace is a fact and an unclassifiable destination is an admission. Both report what was exercised, never what was permitted: approval prompts are never written to the transcript.</p></div>
-              <div class="panel"><div class="mock">
-                <div class="mh">Risk · Egress</div>
-                <div><span class="r">● HIGH</span> &nbsp;rm -rf build/ <span class="d">recursive/forced delete (rm -rf)</span></div>
-                <div><span class="p">● MED</span> &nbsp;&nbsp;sudo make install <span class="d">elevated privilege (sudo/doas)</span></div>
-                <div style="margin-top:6px">Outside the workspace <span class="d">3 files · 18 edits</span></div>
-                <div style="margin-top:6px">Egress <span class="d">5 destinations · 2 remote</span></div>
-                <div>&nbsp;&nbsp;<span class="d">remote &nbsp;shell</span> curl api.example.com</div>
-                <div>&nbsp;&nbsp;<span class="d">outside file&nbsp;</span> ~/.claude/CLAUDE.md</div>
-              </div></div>
-            </div>
-          </article>
+      <a class="fcard" href="tui-observatory.html">
+        <div class="fcard-shot"><img src="media/tui-observatory.png" loading="lazy" alt="The terminal app's Observatory tab: sessions by machine and workspace on the left, the pinned conversation with its tool calls, workers and tasks on the right"></div>
+        <div class="fcard-text"><span class="fname">The terminal app</span><p>herdr, the Observatory and Review in one terminal &mdash; your agents in herdr panes beside a live view of every session.</p></div>
+      </a>
 
-          <article class="slide" role="group" aria-roledescription="slide" aria-label="Chat handoff">
-            <div class="slide-in">
-              <div><span class="eyebrow">Chat handoff</span><h3>Context-preloaded chat prompts</h3>
-                <p>One click assembles the before/after diff, Claude's reasoning, and the command and its result into a ready-to-paste prompt on your clipboard, for your own Claude session. The observatory never calls a model, so this costs zero extra tokens.</p></div>
-              <div class="panel"><img src="media/chat.png" loading="lazy" alt="Chat handoff: a context-preloaded prompt about one edit, ready to paste into your own Claude"></div>
-            </div>
-          </article>
+      <a class="fcard" href="cli.html">
+        <div class="fcard-shot"><img src="media/cli.png" loading="lazy" alt="The CLI: reviewing the agent's edits from the terminal"></div>
+        <div class="fcard-text"><span class="fname">The CLI backend</span><p>One backend serves every surface &mdash; and every view is a <code>--json</code> command.</p></div>
+      </a>
 
-          <article class="slide" role="group" aria-roledescription="slide" aria-label="Metrics">
-            <div class="slide-in">
-              <div><span class="eyebrow">Metrics</span><h3>Session metrics</h3>
-                <p>Metrics reports the session's derived numbers: line deltas, action and error counts, per-subagent duration and tokens, and how long Claude's tools took.</p></div>
-              <div class="panel"><div class="mock">
-                <div class="mh">Metrics</div>
-                <div>edits &nbsp;&nbsp;&nbsp;&nbsp;<b>185</b> &nbsp;<span class="k">+1220</span> <span class="r">−40</span> <span class="d">· 20 pending</span></div>
-                <div>actions &nbsp;&nbsp;<b>229</b> &nbsp;<span class="r">2 errors</span></div>
-                <div>latency &nbsp;&nbsp;<span class="d">median</span> <b>214ms</b> <span class="d">· p95</span> <b>1.2s</b></div>
-                <div>subagents <b>3</b> <span class="d">· 68 actions · 12m47s</span></div>
-              </div></div>
-            </div>
-          </article>
+      <a class="fcard" href="first-review.html">
+        <div class="fcard-shot"><img src="media/demo.png" loading="lazy" alt="oak demo in a terminal: the simulator narrates each beat and ends with nine pending edits and a second agent on demo/hotfix"></div>
+        <div class="fcard-text"><span class="fname">Built-in demo</span><p><code>oak demo</code> replays a scripted session through the real capture pipeline &mdash; every panel fills in live.</p></div>
+      </a>
 
-          <article class="slide" role="group" aria-roledescription="slide" aria-label="Stats">
-            <div class="slide-in">
-              <div><span class="eyebrow">Stats</span><h3>Progress, tokens, and usage</h3>
-                <p>The session's cumulative tokens — input, output, cached, and the cache hit rate — sit under its name, which also carries the model and effort level the session runs on and, when the harness has compacted the conversation, how many times and how much the last compaction dropped. Below them sit a live scoreboard of pending, accepted, and reverted edits; token plots by time window; and context and plan usage. The session is identified by name rather than by its raw id, and the 5-hour and weekly usage rows show an estimated used-of-total figure, inferred from the tokens spent divided by the percentage reported.</p></div>
-              <div class="panel"><figure><img src="media/stats.png" loading="lazy" alt="Stats: the review scoreboard, the Today / 7 days / 30 days toggle, the tokens step-line plot, and the ctx / 5h / weekly usage bars"><figcaption class="cap">Captured before the model-and-effort and compaction chips and the Session tokens row</figcaption></figure></div>
-            </div>
-          </article>
-
-          <article class="slide" role="group" aria-roledescription="slide" aria-label="Navigation bar">
-            <div class="slide-in">
-              <div><span class="eyebrow">Navigation bar</span><h3>Review controls on four surfaces</h3>
-                <p>One review bar appears on four surfaces: the status bar, the editor's title bar, a floating bar over the live edit, and the Overview panel. On the Overview it opens as two rows. The top row holds the session controls: the name of the session under review — its title or first prompt, with the raw id in the tooltip, and a label rather than a control, since the Sessions tab is where the session changes — then the session-wide Accept All, Reject All, Clear Resolved, and Export actions, and, on the right, Search, Active only, Spotlight, and Refresh. The bottom row holds four review axes that step the pending edits at four granularities. The <b>Diff</b> axis steps the open file's edits and carries Keep, Undo, Chat, and View diff, which opens a real side-by-side diff editor. The <b>File</b> axis steps changed files with Accept File and Reject File; the <b>Folder</b> axis steps changed directories, acting on only that folder's edits. The <b>Prompt</b> axis steps your own prompts, showing each one's file and edit totals with Review, Accept Prompt, Reject Prompt, and Rewind — which reverts every unreviewed edit from that ask onward, not just its own.</p></div>
-              <div class="panel"><div class="mock">
-                <div class="mh">Overview review bar · two rows</div>
-                <div><b>demo-session</b> <span class="d">·</span> Accept All · Reject All · Clear Resolved · Export <span class="d">·</span> Search · Active only · Spotlight · Refresh</div>
-                <div style="margin-top:6px">▲ Diff 1/2 ▼ <span class="d">·</span> ◀ File 1/3 ▶ <span class="d">·</span> ◀ Folder 1/2 ▶ <span class="d">·</span> ◀ Prompt 1/2 ▶ Rewind</div>
-                <div style="margin-top:6px" class="d">Below it, the left nav's tab strip: Sessions · Fleet · Workflows · Tasks · Processes, with <b>Group tabs</b> at its trailing edge</div>
-                <div class="d" style="margin-top:6px">Also on the status bar, the editor title, and the floating bar at the edit</div>
-              </div></div>
-            </div>
-          </article>
-
-          <article class="slide" role="group" aria-roledescription="slide" aria-label="The review bar in the editor">
-            <div class="slide-in">
-              <div><span class="eyebrow">In the editor</span><h3>The review bar where you are reading</h3>
-                <p>Each editor carries the controls into the file itself, in the form its API allows. JetBrains IDEs get a <b>floating toolbar</b> on the platform's own floating-toolbar layer while the open file has edits awaiting review — Keep, Undo, Chat, View diff, the Diff counter and its steppers, Accept and Reject File, Spotlight, and Clear Resolved — and a setting chooses the bar, the notification banner it replaces, both, or neither.</p>
-                <p>VS Code exposes no floating-widget API to extensions, and that has not changed: an extension cannot draw an overlay widget, and a comment thread is the only interactive surface that can float over code. What it now has is a <b>compact bar</b> built on exactly that surface — a single row of Keep, Undo, the edit and file steppers, Diff, Chat, Spotlight and a <b>⌄</b> that opens the bubble, under a live title naming the edit, its churn and its position on both axes. The full <b>review bubble</b>, with Claude's reasoning and the diff in git's colors, is the same widget in its other form, one click away on Details and back again on the collapse chevron. The setting is spelled the same in both editors and means the same thing where they overlap. Keeping or reverting one edit opens the next one still awaiting review, crossing into another file when that is where it is; bulk actions and redo never move you.</p></div>
-              <div class="panel"><div class="mock">
-                <div class="mh">The bar at the edit</div>
-                <div><span class="d">6</span> // redirect home to the activities page</div>
-                <div><span class="d">7</span> res.redirect('/activities');</div>
-                <div style="margin-top:8px" class="d">✦ Claude edit #12 · +8 −3 · Diff 2/5 · File 1/3</div>
-                <div style="margin-top:2px">✓ Keep <span class="d">·</span> ↩ Undo <span class="d">·</span> ⌃ ⌄ <span class="d">·</span> ‹ › <span class="d">·</span> ⧉ Diff <span class="d">·</span> ⋯ Details</div>
-                <div class="d" style="margin-top:6px">VS Code. In JetBrains the same row adds Chat, Accept and Reject File, Spotlight and Clear Resolved</div>
-                <div class="d" style="margin-top:2px">Resolving one carries you to the next — across files</div>
-              </div></div>
-            </div>
-          </article>
-
-          <article class="slide" role="group" aria-roledescription="slide" aria-label="Spotlight">
-            <div class="slide-in">
-              <div><span class="eyebrow">Spotlight</span><h3>A focused view of changed lines</h3>
-                <p>Spotlight dims every line Claude did not touch, so the changes read at full contrast.</p></div>
-              <div class="panel"><img src="media/spotlight.png" loading="lazy" alt="Spotlight: unmodified lines dimmed so Claude's edits stand out"></div>
-            </div>
-          </article>
-
-          <article class="slide" role="group" aria-roledescription="slide" aria-label="Conflict resolution">
-            <div class="slide-in">
-              <div><span class="eyebrow">Conflict resolution</span><h3>Conflict handling</h3>
-                <p>If you edited the same lines, the undo stops and shows the conflict instead of overwriting your work.</p></div>
-              <div class="panel"><img src="media/conflict.png" loading="lazy" alt="Conflict: undo halts and surfaces the clash rather than guessing"></div>
-            </div>
-          </article>
-
-          <article class="slide" role="group" aria-roledescription="slide" aria-label="Live demo">
-            <div class="slide-in">
-              <div><span class="eyebrow">Live demo</span><h3>The built-in demo</h3>
-                <p><code>claude-observatory demo</code> replays a scripted session through the real pipeline — a real transcript, captured edits, a subagent, a workflow, a context compaction, and two background shells — in an isolated demo session. Every panel fills in live and review works normally; <code>demo --clean</code> removes every trace. The recording below shows the Overview during a demo run.</p></div>
-              <div class="panel"><figure><img src="media/demo-live.gif" loading="lazy" alt="The demo recorded live: the Overview's Folders strip and Files ledger filling in beat by beat — a fleet agent with its subagent appears, then a workflow run"></figure></div>
-            </div>
-          </article>
-
-          <article class="slide" role="group" aria-roledescription="slide" aria-label="The CLI backend">
-            <div class="slide-in">
-              <div><span class="eyebrow">The CLI backend</span><h3>Review from the terminal</h3>
-                <p>One backend serves every surface. Decisions made in the terminal match either editor, and every view is available as a <code>--json</code> command.</p></div>
-              <div class="panel"><img src="media/cli.png" loading="lazy" alt="The CLI: reviewing Claude's edits from the terminal"></div>
-            </div>
-          </article>
-
-          <article class="slide" role="group" aria-roledescription="slide" aria-label="Cross-editor parity">
-            <div class="slide-in">
-              <div><span class="eyebrow">Cross-editor parity</span><h3>The same tool in both editors</h3>
-                <p>VS Code and JetBrains render the same model from the same backend, so a review can start in one editor and finish in the other.</p></div>
-              <div class="panel"><img src="media/layout.png" loading="lazy" alt="The observatory in VS Code: the Observatory Traces sidebar, inline review in the editor, and the bottom Observatory Dashboards panel"></div>
-            </div>
-          </article>
-
-        </div>
-      </div>
     </div>
+    <p class="lede" style="margin-top:clamp(28px,3vw,40px)">See each surface in depth in the <a href="what-is-oak.html" style="color:var(--accent-ink);text-decoration:underline">docs</a>.</p>
   </div>
 </section>
 
@@ -863,24 +788,27 @@
     <span class="eyebrow">Install</span>
     <h2>One-command install</h2>
     <p class="lede">Install once, run Claude Code, and every edit is captured for review.</p>
-    <div class="cmd"><span class="pr">$</span><code>curl -fsSL https://raw.githubusercontent.com/cell-observatory/claude-observatory/main/scripts/bootstrap.sh | bash</code><button class="copy" data-copy="curl -fsSL https://raw.githubusercontent.com/cell-observatory/claude-observatory/main/scripts/bootstrap.sh | bash">Copy</button></div>
+    <div class="cmd"><span class="pr">$</span><code>curl -fsSL https://raw.githubusercontent.com/cell-observatory/oak-observatory/main/scripts/bootstrap.sh | bash</code><button class="copy" data-copy="curl -fsSL https://raw.githubusercontent.com/cell-observatory/oak-observatory/main/scripts/bootstrap.sh | bash">Copy</button></div>
     <p class="stay-current" style="margin-top:10px;margin-bottom:0">macOS and Linux — and Windows from Git&nbsp;Bash.</p>
-    <div class="cmd" style="margin-top:14px"><span class="pr">PS&gt;</span><code>irm https://raw.githubusercontent.com/cell-observatory/claude-observatory/main/install.ps1 | iex</code><button class="copy" data-copy="irm https://raw.githubusercontent.com/cell-observatory/claude-observatory/main/install.ps1 | iex">Copy</button></div>
-    <p class="stay-current" style="margin-top:10px">Windows, native PowerShell — no bash, no WSL. Either one installs the CLI and then the extensions for whatever editors are on the machine (VS&nbsp;Code family and/or JetBrains). To follow the rolling pre-release, a piped script needs its arguments passed through: append <code>-s -- --channel dev</code> to the bash line, or run the PowerShell one as <code>&amp; ([scriptblock]::Create((irm &lt;url&gt;))) -Channel dev</code>. On Windows the bundled status line is the one part that still needs Git&nbsp;Bash and <code>jq</code> — everything else runs natively.</p>
-    <p class="stay-current" style="margin-top:22px">Then look around with no Claude session at all: <b>Claude Observatory: Start Demo Mode</b> from the VS&nbsp;Code command palette or JetBrains Find Action, or <code>claude-observatory demo</code> in the terminal. It replays a real session through the real capture pipeline and walks you through every panel; leaving removes every trace.</p>
+    <div class="cmd" style="margin-top:14px"><span class="pr">PS&gt;</span><code>irm https://raw.githubusercontent.com/cell-observatory/oak-observatory/main/install.ps1 | iex</code><button class="copy" data-copy="irm https://raw.githubusercontent.com/cell-observatory/oak-observatory/main/install.ps1 | iex">Copy</button></div>
+    <p class="stay-current" style="margin-top:10px">The Windows installer runs in native PowerShell without bash or WSL. Either installer installs the CLI, then the extensions for whatever editors are on the machine (VS&nbsp;Code family and/or JetBrains), then herdr, the terminal backend, at the version OAK pins. To follow the rolling pre-release, a piped script needs its arguments passed through: append <code>-s -- --channel dev</code> to the bash line, or run the PowerShell one as <code>&amp; ([scriptblock]::Create((irm &lt;url&gt;))) -Channel dev</code>. On Windows the bundled status line needs Git&nbsp;Bash and <code>jq</code>.</p>
+    <p class="stay-current">OAK needs Node.js 20 or newer, and <code>python3</code> on Linux and macOS. On Linux, npm compiles node-pty for the terminal app’s herdr tab, which needs <code>make</code> and a C++ compiler, and npm 12 runs that build only with <code>--allow-scripts=node-pty</code>; the installers pass it for you. To install the CLI by hand, download <code>oak-observatory-X.Y.Z.tgz</code> from a <a href="https://github.com/cell-observatory/oak-observatory/releases" style="color:var(--accent-ink);text-decoration:underline">release</a>, then run <code>npm install -g --allow-scripts=node-pty ./oak-observatory-X.Y.Z.tgz</code> and <code>oak doctor --fix</code>.</p>
+    <p class="stay-current">herdr is required on every platform. Windows support for herdr-backed pane listing, replies and agent start is untested in this release; Windows-on-ARM has no herdr build. <code>oak machine add</code> targets must be POSIX hosts.</p>
+    <p class="stay-current">Coming from <code>claude-observatory</code> 0.9.5? It is now <b>OAK</b>, and its own updater cannot cross the rename: run the install command above, which removes the old package first, then quit Claude Code and run <code>oak init</code>, which moves the capture hooks to the new command. The old command keeps working as an alias of <code>oak</code>. <a href="install.html#upgrading-from-claude-observatory" style="color:var(--accent-ink);text-decoration:underline">Upgrade notes</a>.</p>
+    <p class="stay-current" style="margin-top:22px">Then look around with no agent session at all: <b>OAK: Start Demo Mode</b> from the VS&nbsp;Code command palette or JetBrains Find Action, or <code>oak demo</code> in the terminal. It replays a scripted session through the real capture pipeline and walks you through every panel; leaving removes every trace.</p>
     <div class="install-cta">
-      <a class="btn primary" href="https://github.com/cell-observatory/claude-observatory#quickstart">Read the README</a>
-      <a class="btn line" href="getting-started.html">Getting started →</a>
+      <a class="btn primary" href="https://github.com/cell-observatory/oak-observatory#quickstart">Read the README</a>
+      <a class="btn line" href="first-review.html">Getting started →</a>
     </div>
     <div class="or-claude rv">
       <div class="or">— or install via Claude Code —</div>
       <div class="promptbox">
-        <button class="copy" data-copy="Please install Claude Observatory (github.com/cell-observatory/claude-observatory) for me: run its installer with `curl -fsSL https://raw.githubusercontent.com/cell-observatory/claude-observatory/main/scripts/bootstrap.sh | bash`, then run `claude-observatory doctor` and show me the output. Note: the capture hooks only take effect on a fresh session, so after installing, tell me to quit you, then run `claude-observatory init` in a plain terminal and relaunch you.">Copy prompt</button>
-        <p>Paste this into a Claude Code session to install everything.</p>
-        <code class="prompt">Install Claude Observatory for me — run its bootstrap installer, then `claude-observatory doctor`. The capture hooks only take effect on a fresh session, so afterward have me quit, run `claude-observatory init` in a plain terminal, and relaunch.</code>
+        <button class="copy" data-copy="Please install OAK (github.com/cell-observatory/oak-observatory) for me: run its installer with `curl -fsSL https://raw.githubusercontent.com/cell-observatory/oak-observatory/main/scripts/bootstrap.sh | bash`, then run `oak doctor` and show me the output. Note: the capture hooks only take effect on a fresh session, so after installing, tell me to quit you, then run `oak init` in a plain terminal and relaunch you.">Copy prompt</button>
+        <p>Paste this into an agent session to install everything.</p>
+        <code class="prompt">Install OAK for me — run its bootstrap installer, then `oak doctor`. The capture hooks only take effect on a fresh session, so afterward have me quit, run `oak init` in a plain terminal, and relaunch.</code>
       </div>
     </div>
-    <p class="stay-current rv">To update an existing install, re-run the command above or run <code>claude-observatory update</code> — it refreshes the CLI and both editor extensions (add <code>--check</code> to preview). Each editor can also self-update: VS Code offers a one-click <b>Update now</b>, and JetBrains auto-updates once you add the <a href="https://github.com/cell-observatory/claude-observatory/blob/main/packages/jetbrains/README.md#auto-updates">plugin repository</a>. There are two <a href="releases.html">release channels</a> — stable, and a rolling pre-release of the dev branch — switchable from the version chip on the Overview toolbar or with <code>claude-observatory update --channel dev</code>.</p>
+    <p class="stay-current rv">To update an existing install, re-run the command above or run <code>oak update</code> — it refreshes the CLI and both editor extensions (add <code>--check</code> to preview). Each editor can also self-update: VS Code offers a one-click <b>Update now</b>, and JetBrains auto-updates once you add the <a href="https://github.com/cell-observatory/oak-observatory/blob/main/packages/jetbrains/README.md#auto-updates">plugin repository</a>. There are two <a href="releases.html">release channels</a> — stable, and a rolling pre-release of the dev branch — switchable from the version chip on the Overview toolbar or with <code>oak update --channel dev</code>.</p>
   </div>
 </section>
 
@@ -889,16 +817,16 @@
     <span class="eyebrow">Run it for real</span>
     <h2>The same session, in your editor</h2>
     <p class="lede" style="margin-inline:auto;">The bundled demo replays through the real capture pipeline, in your own editor, at zero tokens. It goes further than this page: three prompts, six tasks and nine edits, a second agent holding the same file, a workflow still running, and a <b>guided tour</b> that drives the panels for you — forty-two steps, or fourteen if you are short of time.</p>
-    <div class="cmd"><span class="pr">VS&nbsp;Code</span><code>Claude Observatory: Start Demo Mode</code><button class="copy" data-copy="Claude Observatory: Start Demo Mode">Copy</button></div>
-    <p class="cmd-note">…from the command palette, the ▶ on the Review panel, or <b>Try the demo</b> in the empty panel.</p>
-    <div class="cmd"><span class="pr">JetBrains</span><code>Claude Observatory: Start Demo Mode</code><button class="copy" data-copy="Claude Observatory: Start Demo Mode">Copy</button></div>
-    <p class="cmd-note">…from Find Action (<code>⇧⌘A</code>), the ▶ on the Review panel, or the same empty-panel link.</p>
-    <div class="cmd"><span class="pr">❯</span><code>claude-observatory demo</code><button class="copy" data-copy="claude-observatory demo">Copy</button></div>
+    <div class="cmd"><span class="pr">VS&nbsp;Code</span><code>OAK: Start Demo Mode</code><button class="copy" data-copy="OAK: Start Demo Mode">Copy</button></div>
+    <p class="cmd-note">It is also available from the command palette, the ▶ on the Overview’s title bar, or <b>Try the demo</b> in the empty panel.</p>
+    <div class="cmd"><span class="pr">JetBrains</span><code>OAK: Start Demo Mode</code><button class="copy" data-copy="OAK: Start Demo Mode">Copy</button></div>
+    <p class="cmd-note">It is also available from Find Action (<code>⇧⌘A</code>), the ▶ on the Overview’s toolbar, or the same empty-panel link.</p>
+    <div class="cmd"><span class="pr">❯</span><code>oak demo</code><button class="copy" data-copy="oak demo">Copy</button></div>
     <p class="cmd-note">In the terminal — and <code>demo --tour</code> prints the tour as prose (<code>--essentials</code> or <code>--remainder</code> for either half). The tour plays itself; Next, Back or a step jump hands you the wheel. <b>Exit Demo Mode</b> removes every trace.</p>
-    <p class="cmd-note">Installation first — see <a href="#install" style="color:var(--accent-ink);text-decoration:underline">Install Claude Observatory</a>.</p>
+    <p class="cmd-note">Installation first — see <a href="#install" style="color:var(--accent-ink);text-decoration:underline">Install OAK</a>.</p>
     <div class="install-cta">
-      <a class="btn line" href="#install">Install Claude Observatory</a>
-      <a class="btn line" href="concepts.html#surfaces">Docs</a>
+      <a class="btn line" href="#install">Install OAK</a>
+      <a class="btn line" href="what-is-oak.html">Docs</a>
     </div>
   </div>
 </section>
@@ -907,26 +835,26 @@
   <div class="wrap rv">
     <span class="eyebrow">Open source</span>
     <h2>License &amp; credits</h2>
-    <p>Claude Observatory is developed in the open by the <a href="https://github.com/cell-observatory" style="color:var(--accent-ink);text-decoration:underline">Cell Observatory</a> project, licensed under <a href="https://github.com/cell-observatory/claude-observatory/blob/main/LICENSE" style="color:var(--accent-ink);text-decoration:underline">Apache-2.0</a>, with a <a href="https://github.com/cell-observatory/claude-observatory/blob/main/CODE_OF_CONDUCT.md" style="color:var(--accent-ink);text-decoration:underline">Contributor Covenant</a> code of conduct. It is built with and for <a href="https://claude.com/claude-code" style="color:var(--accent-ink);text-decoration:underline">Claude Code</a>. Adjacent work informed its direction: <a href="https://github.com/matt1398/claude-devtools" style="color:var(--accent-ink);text-decoration:underline">claude-devtools</a> on reading the on-disk transcript, <a href="https://github.com/ryoppippi/ccusage" style="color:var(--accent-ink);text-decoration:underline">ccusage</a> and <a href="https://github.com/chiphuyen/sniffly" style="color:var(--accent-ink);text-decoration:underline">sniffly</a> on local-first analytics, and the worktree-fleet tools (<a href="https://www.conductor.build/" style="color:var(--accent-ink);text-decoration:underline">Conductor</a>, <a href="https://github.com/smtg-ai/claude-squad" style="color:var(--accent-ink);text-decoration:underline">claude-squad</a>, <a href="https://github.com/BloopAI/vibe-kanban" style="color:var(--accent-ink);text-decoration:underline">vibe-kanban</a>) on running agents in parallel. <a href="https://gitbutler.com" style="color:var(--accent-ink);text-decoration:underline">GitButler</a>'s hunk-dependency model and operations log informed the dependency-aware refusals and the reviewer's operation journal. The review model itself is convergent: <a href="https://cursor.com" style="color:var(--accent-ink);text-decoration:underline">Cursor</a>, <a href="https://code.visualstudio.com/docs/copilot/copilot-edits" style="color:var(--accent-ink);text-decoration:underline">GitHub Copilot's edit mode</a> and <a href="https://zed.dev/docs/ai/agent-panel" style="color:var(--accent-ink);text-decoration:underline">Zed's agent panel</a> all arrived at baseline-plus-net-diff review, and their public behavior shaped the review-unit design; the per-language function detection follows git's own <a href="https://git-scm.com/docs/gitattributes#_defining_a_custom_hunk_header" style="color:var(--accent-ink);text-decoration:underline"><code>xfuncname</code></a> tradition. The observatory adds the layer that observes them.</p>
+    <p>OAK is developed in the open by the <a href="https://github.com/cell-observatory" style="color:var(--accent-ink);text-decoration:underline">Cell Observatory</a>, licensed under <a href="https://github.com/cell-observatory/oak-observatory/blob/main/LICENSE" style="color:var(--accent-ink);text-decoration:underline">Apache-2.0</a>, with a <a href="https://github.com/cell-observatory/oak-observatory/blob/main/CODE_OF_CONDUCT.md" style="color:var(--accent-ink);text-decoration:underline">Contributor Covenant</a> code of conduct. It is built with and for <a href="https://claude.com/claude-code" style="color:var(--accent-ink);text-decoration:underline">Claude Code</a>. Adjacent work informed its direction: <a href="https://github.com/matt1398/claude-devtools" style="color:var(--accent-ink);text-decoration:underline">claude-devtools</a> on reading the on-disk transcript, <a href="https://github.com/ryoppippi/ccusage" style="color:var(--accent-ink);text-decoration:underline">ccusage</a> and <a href="https://github.com/chiphuyen/sniffly" style="color:var(--accent-ink);text-decoration:underline">sniffly</a> on local-first analytics, and the worktree-fleet tools (<a href="https://www.conductor.build/" style="color:var(--accent-ink);text-decoration:underline">Conductor</a>, <a href="https://github.com/smtg-ai/claude-squad" style="color:var(--accent-ink);text-decoration:underline">claude-squad</a>, <a href="https://github.com/BloopAI/vibe-kanban" style="color:var(--accent-ink);text-decoration:underline">vibe-kanban</a>) on running agents in parallel. <a href="https://gitbutler.com" style="color:var(--accent-ink);text-decoration:underline">GitButler</a>'s hunk-dependency model and operations log informed the dependency-aware refusals and the reviewer's operation journal. The review model itself is convergent: <a href="https://cursor.com" style="color:var(--accent-ink);text-decoration:underline">Cursor</a>, <a href="https://code.visualstudio.com/docs/copilot/copilot-edits" style="color:var(--accent-ink);text-decoration:underline">GitHub Copilot's edit mode</a> and <a href="https://zed.dev/docs/ai/agent-panel" style="color:var(--accent-ink);text-decoration:underline">Zed's agent panel</a> all arrived at baseline-plus-net-diff review, and their public behavior shaped the review-unit design; the per-language function detection follows git's own <a href="https://git-scm.com/docs/gitattributes#_defining_a_custom_hunk_header" style="color:var(--accent-ink);text-decoration:underline"><code>xfuncname</code></a> tradition. The observatory adds the layer that observes them.</p>
   </div>
 </section>
 
 <footer class="foot" id="footer">
   <div class="wrap">
     <div class="row">
-      <span class="brand"><span class="m">🔬</span> Claude Observatory <span class="brandver" data-co-version>v0.9.5</span></span>
+      <span class="brand"><span class="m">🔬</span> OAK <span class="brandver" data-co-version>v0.10.0</span></span>
       <div class="flinks">
-        <a href="apps.html">Apps</a>
-        <a href="concepts.html">Docs</a>
+        <a href="supported-agents.html">Agents</a>
+        <a href="what-is-oak.html">Docs</a>
         <a href="releases.html">Releases</a>
-        <a href="https://github.com/cell-observatory/claude-observatory/blob/main/docs/DEMO.md">Demo</a>
-        <a href="https://github.com/cell-observatory/claude-observatory/blob/main/docs/ARCHITECTURE.md">How it works</a>
-        <a href="https://github.com/cell-observatory/claude-observatory/blob/main/docs/REMOTE.md">Remote</a>
-        <a href="https://github.com/cell-observatory/claude-observatory/blob/main/CONTRIBUTING.md">Contribute</a>
-        <a href="https://github.com/cell-observatory/claude-observatory">GitHub ↗</a>
+        <a href="https://github.com/cell-observatory/oak-observatory/blob/main/docs/DEMO.md">Demo</a>
+        <a href="https://github.com/cell-observatory/oak-observatory/blob/main/docs/ARCHITECTURE.md">How it works</a>
+        <a href="https://github.com/cell-observatory/oak-observatory/blob/main/docs/REMOTE.md">Remote</a>
+        <a href="https://github.com/cell-observatory/oak-observatory/blob/main/CONTRIBUTING.md">Contribute</a>
+        <a href="https://github.com/cell-observatory/oak-observatory">GitHub ↗</a>
       </div>
     </div>
-    <div class="fine">Apache-2.0 · git-free · zero extra Claude tokens · terminal + VS Code + JetBrains</div>
+    <div class="fine">OAK is developed in the open by the <a href="https://github.com/cell-observatory">Cell Observatory</a> · Apache-2.0 · git-free · zero extra tokens</div>
   </div>
 </footer>
 
@@ -937,7 +865,7 @@
     var els=document.querySelectorAll('[data-co-version]'); if(!els.length) return;
     function apply(v){ for(var i=0;i<els.length;i++) els[i].textContent='v'+v; }
     try{ var c=sessionStorage.getItem('co-stable'); if(c) apply(c); }catch(e){}
-    fetch('https://api.github.com/repos/cell-observatory/claude-observatory/releases/latest',{headers:{Accept:'application/vnd.github+json'}})
+    fetch('https://api.github.com/repos/cell-observatory/oak-observatory/releases/latest',{headers:{Accept:'application/vnd.github+json'}})
       .then(function(r){ return r.ok?r.json():null; })
       .then(function(rel){ if(!rel) return; var tag=String(rel.tag_name||'').replace(/^v/i,'');
         if(/^\d{1,9}\.\d{1,9}\.\d{1,9}/.test(tag)){ try{sessionStorage.setItem('co-stable',tag);}catch(e){} apply(tag); } })
@@ -945,7 +873,7 @@
   })();
   // theme toggle (remembers choice; defaults to system)
   (function(){
-    var root=document.documentElement, btn=document.getElementById('theme'), KEY='co-theme';
+    var root=document.documentElement, btn=document.getElementById('theme'), KEY='oak-theme';
     try{var s=localStorage.getItem(KEY); if(s) root.setAttribute('data-theme',s);}catch(e){}
     btn.addEventListener('click',function(){
       var cur=root.getAttribute('data-theme')||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light');
@@ -961,58 +889,40 @@
       navigator.clipboard&&navigator.clipboard.writeText(t).then(function(){b.textContent='Copied ✓';setTimeout(function(){b.textContent=old;},1400);});
     });
   });
-  // feature tour: a slideshow over every feature. Autoplays only while on screen and only if the
-  // visitor hasn't asked for reduced motion; any interaction stops it for good.
+  // interactive terminal demo — plays real frames captured from the actual `oak tui`
   (function(){
-    var track=document.getElementById('slides'); if(!track) return;
-    var slides=[].slice.call(track.children), n=slides.length;
-    var dots=document.getElementById('tdots'), count=document.getElementById('tcount');
-    var i=0, timer=null, stopped=false;
+    var frames=window.__OAK_TUI_FRAMES__||[];
+    var screen=document.getElementById('tuid-screen'); if(!screen||!frames.length) return;
+    var cap=document.getElementById('tuid-cap'), dots=document.getElementById('tuid-dots'),
+        count=document.getElementById('tuid-count'), playBtn=document.getElementById('tuid-play');
+    var i=0, timer=null, paused=false;
     var reduce=window.matchMedia&&window.matchMedia('(prefers-reduced-motion: reduce)').matches;
     var pad=function(x){return (x<10?'0':'')+x;};
-    slides.forEach(function(s,k){
-      var d=document.createElement('button');
-      d.className='dot'; d.type='button'; d.setAttribute('role','tab');
-      d.setAttribute('aria-label',(s.getAttribute('aria-label')||('Slide '+(k+1))));
-      d.addEventListener('click',function(){stop();go(k);});
+    frames.forEach(function(f,k){
+      var d=document.createElement('button'); d.className='dot'; d.type='button'; d.setAttribute('role','tab');
+      d.setAttribute('aria-label','Frame '+(k+1));
+      d.addEventListener('click',function(){ stop(); go(k); });
       dots.appendChild(d);
     });
     function go(k){
-      i=(k+n)%n;
-      track.style.transform='translateX('+(-i*100)+'%)';
-      count.textContent=pad(i+1)+' / '+pad(n);
-      [].slice.call(dots.children).forEach(function(d,j){
-        d.setAttribute('aria-current', j===i?'true':'false');
-      });
-      // keep offscreen slides out of the tab order + a11y tree
-      slides.forEach(function(s,j){ s.setAttribute('aria-hidden', j===i?'false':'true'); });
+      i=(k+frames.length)%frames.length;
+      screen.innerHTML=frames[i].html;
+      cap.textContent=frames[i].cap;
+      count.textContent=pad(i+1)+' / '+pad(frames.length);
+      [].forEach.call(dots.children,function(d,j){ d.setAttribute('aria-current', j===i?'true':'false'); });
     }
-    function stop(){ stopped=true; if(timer){clearInterval(timer);timer=null;} }
-    function play(){ if(stopped||reduce||timer) return; timer=setInterval(function(){go(i+1);},5200); }
-    document.getElementById('tprev').addEventListener('click',function(){stop();go(i-1);});
-    document.getElementById('tnext').addEventListener('click',function(){stop();go(i+1);});
-    var tour=track.closest('.tour');
-    tour.addEventListener('mouseenter',function(){ if(timer){clearInterval(timer);timer=null;} });
-    tour.addEventListener('mouseleave',play);
-    tour.addEventListener('focusin',stop);
-    tour.addEventListener('keydown',function(e){
-      if(e.key==='ArrowLeft'){stop();go(i-1);e.preventDefault();}
-      if(e.key==='ArrowRight'){stop();go(i+1);e.preventDefault();}
-    });
-    // touch swipe
-    var x0=null;
-    tour.addEventListener('touchstart',function(e){x0=e.touches[0].clientX;},{passive:true});
-    tour.addEventListener('touchend',function(e){
-      if(x0===null) return; var dx=e.changedTouches[0].clientX-x0; x0=null;
-      if(Math.abs(dx)>40){stop();go(dx<0?i+1:i-1);}
-    },{passive:true});
-    // only autoplay while the tour is actually on screen
-    if('IntersectionObserver'in window){
-      new IntersectionObserver(function(en){
-        en.forEach(function(e){ e.isIntersecting?play():(timer&&(clearInterval(timer),timer=null)); });
-      },{threshold:.35}).observe(tour);
-    }
+    function tick(){ if(!paused) go(i+1); }
+    function halt(){ if(timer){clearInterval(timer);timer=null;} }
+    function play(){ if(reduce||paused||timer) return; timer=setInterval(tick,2600); playBtn.textContent='❚❚'; }
+    function stop(){ paused=true; halt(); playBtn.textContent='▶'; }
+    document.getElementById('tuid-prev').addEventListener('click',function(){ stop(); go(i-1); });
+    document.getElementById('tuid-next').addEventListener('click',function(){ stop(); go(i+1); });
+    playBtn.addEventListener('click',function(){ if(paused){ paused=false; play(); } else { stop(); } });
     go(0);
+    var host=document.getElementById('tui-demo');
+    if('IntersectionObserver'in window){
+      new IntersectionObserver(function(en){ en.forEach(function(e){ e.isIntersecting?play():halt(); }); },{threshold:.2}).observe(host);
+    } else play();
   })();
   // scroll reveal
   (function(){
@@ -1041,12 +951,12 @@
     var nav=document.getElementById('nav'),btn=document.getElementById('menu');
     if(!nav||!btn) return;
     btn.addEventListener('click',function(){ var open=nav.classList.toggle('open'); btn.setAttribute('aria-expanded',open?'true':'false'); });
-    var ls=nav.querySelectorAll('.links a');
+    var ls=nav.querySelectorAll('.nav-links a');
     for(var i=0;i<ls.length;i++) ls[i].addEventListener('click',function(){ nav.classList.remove('open'); btn.setAttribute('aria-expanded','false'); });
   })();
 
   // ---- the detailed scripted demo ----------------------------------------------------------------
-  // A SHORTENED version of the bundled `claude-observatory demo` scenario
+  // A SHORTENED version of the bundled `oak demo` scenario
   // (packages/core/src/demo.ts): a Python training pipeline gains scaling + validation + tests +
   // docs, then the visitor reviews it. The bundled scenario goes further — three prompts, six
   // tasks, nine edits, a sibling agent, a deletion, a failed call and a write outside the
@@ -1141,7 +1051,7 @@
         L(12,'<span class="st">```</span>','add'),
        ]},
     ];
-    // Claude's own numbered tasks, with the edits captured while each was in progress.
+    // the agent's own numbered tasks, with the edits captured while each was in progress.
     var TASKS=[
       {title:'Add feature scaling to the pipeline',edits:[1,2]},
       {title:'Validate the training dataset',edits:[3]},
@@ -1149,27 +1059,27 @@
     ];
     var STEPS=[
       {ed:'seed',landed:0,typing:true,
-       narr:'You send Claude a prompt. The observatory sits beside the session — hooks, not a wrapper — and records what happens, at zero extra tokens. The Observatory Traces sidebar on the left tracks each file Claude touches; on the right sit the Claude session and the Observatory Timeline — prompts and observations as they happen. Below, the Observatory Dashboards dock holds the Overview and Stats.'},
+       narr:'You send the agent a prompt. The observatory sits beside the session — hooks, not a wrapper — and records what happens, at zero extra tokens. The Observatory Traces sidebar on the left tracks each file the agent touches; on the right sit the agent session and the Observatory Timeline, whose Feed tab reads the conversation as it happens: your prompt, the agent’s replies, and every tool call. Below, the Observatory Dashboards dock holds the Overview and Stats.'},
       {ed:'seed',landed:0,plan:true,
-       narr:'Claude plans three to-dos and opens the matching numbered task list. Attribution is strict: an edit joins a task only if it was captured while that task was in progress. Anything outside those windows stays unassigned.'},
+       narr:'the agent plans three to-dos and opens the matching numbered task list. Attribution is strict: an edit joins a task only if it was captured while that task was in progress. Anything outside those windows stays unassigned.'},
       {ed:1,landed:1,
-       narr:'Task one adds feature scaling. Its first edit becomes a reviewable entry: an inline lens over the changed lines, a timeline entry carrying Claude’s reasoning, and a churn-ranked ledger row in the Overview detail.'},
+       narr:'Task one adds feature scaling. Its first edit becomes a reviewable entry: an inline lens over the changed lines, a timeline entry carrying the agent’s reasoning, and a churn-ranked ledger row in the Overview detail.'},
       {ed:2,landed:2,
        narr:'A second edit wires scaling into the training entrypoint and completes task one. Both of its edits stay pending until you review them, and the Tasks tab badge tracks completion as each strict span closes. The nav bar carries four review axes — Diff, File, Folder, and Prompt — and its counters track where you are.'},
       {ed:3,landed:3,
-       narr:'Task two adds dataset validation. The Folders strip apportions the churn across src and src/models — tests and docs join it as those edits land. Commands Claude runs are recorded too: two backgrounded shells — a test watcher and a docs preview — land in the feed under the change map, and the Processes tab picks them up, one still running.'},
+       narr:'Task two adds dataset validation. The Folders strip apportions the churn across src and src/models — tests and docs join it as those edits land. Commands the agent runs are recorded too: two backgrounded shells — a test watcher and a docs preview — land in the Feed, and the Processes tab picks them up, one still running.'},
       {ed:4,landed:4,
-       narr:'Task three is tests and docs. Claude hands the test-writing to a subagent, and a second agent working this repository from a sibling worktree joins the board — the Fleet nav now tracks all three at once, each newcomer highlighted as it lands. The subagent’s edit is attributed to it in the timeline and reviewed exactly like any other.'},
+       narr:'Task three is tests and docs. the agent hands the test-writing to a subagent, and a second agent working this repository from a sibling worktree joins the board — the Workers nav now tracks all three at once, each newcomer highlighted as it lands. The subagent’s edit is attributed to it in the timeline and reviewed exactly like any other.'},
       {ed:5,landed:5,
-       narr:'A workflow run writes the documentation, one level above the subagents — the Workflows tab picks it up, and the run lands highlighted under the fleet with its tasks inline: outline and write complete, review still going. Under the change map, the feed reads what the selected row is doing, straight from the file it writes: it is marked live while that source is still writing, and becomes an audit log once it has finished. Five edits are now pending across the three tasks; the Next steps list at the bottom of the Observatory Timeline says what remains.'},
+       narr:'A workflow run writes the documentation, one level above the subagents — the Workflows tab picks it up, and the run lands highlighted under the fleet with its tasks inline: outline and write complete, review still going. The Feed reads what the selected row is doing, straight from the file it writes: it is marked live while that source is still writing, and becomes an audit log once it has finished. Five edits are now pending across the three tasks.'},
       {ed:1,landed:5,gate:'keep',hint:'Click ✓ Keep on the lens in the editor.',
        narr:'Review the first edit: the scaling function is correct — <span class="hl">keep it</span>. Keeping one edit resolves it and nothing else.'},
-      {ed:2,landed:5,gate:'undo',hint:'Click ↩ Undo on the lens in the editor.',
-       narr:'The entrypoint wiring is not wanted — <span class="hl">undo just this edit</span>. The revert is surgical: a position-anchored line merge, so every other pending change stays exactly as Claude left it.'},
+      {ed:2,landed:5,gate:'undo',hint:'Click ✗ Undo on the lens in the editor.',
+       narr:'The entrypoint wiring is not wanted — <span class="hl">undo only this edit</span>. The revert is surgical: a position-anchored line merge, so every other pending change stays exactly as the agent left it.'},
       {ed:2,landed:5,gate:'acceptall',hint:'Click ✓ Accept All in the Overview toolbar.',
        narr:'Sweep the rest in one motion: <span class="hl">Accept All</span> resolves everything still pending. Accept Prompt narrows the same sweep to the work one prompt caused; in the editor, picking that prompt in the Prompts window scopes the whole Overview to it.'},
       {ed:1,landed:5,recap:true,
-       narr:'That is the whole loop: every edit tracked with its reasoning, reviewed one at a time or by file, folder, or prompt, and resolved without git. The plan is complete, the session has stopped writing, and its feed is now an audit log rather than a live tail. Run the same session in your own editor below — it goes further than this page, and the tour drives the panels for you — or start with the <a href="getting-started.html" style="color:var(--accent-ink);text-decoration:underline">recorded walkthrough</a>.'},
+       narr:'That is the whole loop: every edit tracked with its reasoning, reviewed one at a time or by file, folder, or prompt, and resolved without git. The plan is complete, the session has stopped writing, and its feed is now an audit log rather than a live tail. Run the same session in your own editor below — it goes further than this page, and the tour drives the panels for you — or start with <a href="first-review.html" style="color:var(--accent-ink);text-decoration:underline">your first review</a>.'},
     ];
     var N=STEPS.length;
     var el=function(id){return document.getElementById(id);};
@@ -1247,11 +1157,11 @@
           html+='<div class="lens"><span class="sp">🔬 #'+lens.e.id+' +'+lens.e.plus+' −'+lens.e.minus+'</span>';
           if(lens.gated&&!res[step]){
             // Only the scripted action is a live button — the rest stay inert display text.
-            if(STEPS[step].gate==='keep') html+='<button id="lens-keep" class="hint">✓ Keep</button><span class="a">↩ Undo</span>';
-            else html+='<span class="a">✓ Keep</span><button id="lens-undo" class="hint">↩ Undo</button>';
+            if(STEPS[step].gate==='keep') html+='<button id="lens-keep" class="hint">✓ Keep</button><span class="a">✗ Undo</span>';
+            else html+='<span class="a">✓ Keep</span><button id="lens-undo" class="hint">✗ Undo</button>';
             html+='<span class="a">💬 Chat</span><span class="a">⧉ Diff</span><span class="a">⋯ Details</span>';
           }else{
-            html+='<span class="a">✓ Keep</span><span class="a">↩ Undo</span><span class="a">💬 Chat</span><span class="a">⧉ Diff</span><span class="a">⋯ Details</span>';
+            html+='<span class="a">✓ Keep</span><span class="a">✗ Undo</span><span class="a">💬 Chat</span><span class="a">⧉ Diff</span><span class="a">⋯ Details</span>';
           }
           html+='</div>';
         }
@@ -1263,7 +1173,7 @@
       if(kb)kb.addEventListener('click',function(){resolveGate();});
       if(ub)ub.addEventListener('click',function(){resolveGate();});
 
-      // ---- Claude session (mock chat) ----
+      // ---- agent session (mock chat) ----
       var landed=landedEdits(step);
       var REPLIES=[
         '',
@@ -1277,7 +1187,7 @@
       else if(st.gate&&!res[step]) reply='The edits are in — they are pending your review in the observatory.';
       else if(landed.length) reply=REPLIES[landed.length];
       else if(st.plan) reply='I’ll take this in three tasks: feature scaling, dataset validation, then tests and docs — opening a task list now.';
-      el('ch-reply').innerHTML=reply?'<b>Claude:</b> '+reply:'';
+      el('ch-reply').innerHTML=reply?'<b>Agent:</b> '+reply:'';
       // ---- Session tokens: the session's own cumulative split, growing as the work lands ----
       var TOK=[[1.4,0.2,18],[2.9,0.6,34],[4.1,0.9,52],[5.6,1.3,71],[7.2,1.8,88],[8.8,2.4,103]][landed.length];
       el('tk-in').textContent=TOK[0]+'k'; el('tk-out').textContent=TOK[1]+'k'; el('tk-cached').textContent=TOK[2]+'k';
@@ -1297,29 +1207,38 @@
             sh+='<div class="sr'+(e2.file===fn?' on':'')+'" style="padding-left:18px"><span class="sd '+s5+'"></span><span class="sn">#'+e2.id+'</span><span class="sc"><span class="p">+'+e2.plus+'</span> <span class="m">\u2212'+e2.minus+'</span></span></div>';
           });
         });
-      }else sh='<div class="empty">Changes appear here as Claude works.</div>';
+      }else sh='<div class="empty">Changes appear here as the agent works.</div>';
       el('side-tree').innerHTML=sh;
 
-      // ---- Observatory Timeline: prompts and observations, newest first ----
-      function trow(time,kind,name,delta,body,dot,extra){
-        return '<div class="or"><div class="top">'+(dot?'<span class="sd '+dot+'"></span>':'')+'<span class="tm">'+time+'</span><span class="of">'+name+'</span>'+(delta||'')+'<span class="badge">'+kind+'</span>'+(extra||'')+'</div>'+(body?'<div class="ow">'+body+'</div>':'')+'</div>';
+      // ---- Observatory Timeline, Feed tab: the conversation as it happened, oldest first ----
+      // Your prompt on a band, the agent's replies, and every tool call with the file it acted on and
+      // the reasoning beside it. The session is the selection, so the header says LIVE while it is
+      // still writing (stamped with the newest evidence, never a realtime claim) and AUDIT LOG once it
+      // has stopped, at the recap.
+      function trow(time,kind,name,delta,body,dot,extra,cls){
+        return '<div class="or'+(cls?' '+cls:'')+'"><div class="top">'+(dot?'<span class="sd '+dot+'"></span>':'')+'<span class="tm">'+time+'</span><span class="of">'+name+'</span>'+(delta||'')+'<span class="badge">'+kind+'</span>'+(extra||'')+'</div>'+(body?'<div class="ow">'+body+'</div>':'')+'</div>';
       }
-      var tl=[];
-      tl.push(trow('14:41','prompt','you','',esc(PROMPT)));
-      if(st.plan||landed.length) tl.push(trow('14:41','observation','Pipeline: scaling, validation, tests','','Three numbered tasks \u2014 an edit joins a task only if it was captured while that task was in progress.'));
+      var sessDone=!!st.recap;
+      var tl=[], last='14:41';
+      tl.push(trow('14:41','you','prompt','',esc(PROMPT),null,null,'band'));
+      if(st.plan||landed.length) tl.push(trow('14:41','said','the agent','','I\u2019ll take this in three tasks: feature scaling, dataset validation, then tests and docs.'));
       landed.forEach(function(e){
         var extra=e.agent?'<span class="badge">'+e.agent+'</span>':'';
-        tl.push(trow(e.time,'observation',esc(e.file.split('/').pop()),'',esc(e.why),null,extra));
+        var delta='<span class="od"><span class="p">+'+e.plus+'</span> <span class="m">\u2212'+e.minus+'</span></span>';
+        tl.push(trow(e.time,e.id>=4?'Write':'Edit',esc(e.file),delta,esc(e.why),statusOf(e.id,step,res),extra));
+        last=e.time;
+        if(e.id===3){
+          tl.push(trow('14:45','Bash','pytest -q --watch','','background: demo-tests'));
+          tl.push(trow('14:45','Bash','python -m http.server 8000','','background: demo-serve'));
+        }
       });
+      if(sessDone) tl.push(trow('14:49','said','the agent','','All three tasks are complete \u2014 five edits across src, tests, and docs, each recorded with its reasoning.'));
       var p0=0;landed.forEach(function(e){if(statusOf(e.id,step,res)==='pending')p0++;});
-      var tlh=tl.reverse().join('');
-      if(landed.length){
-        tlh+='<div class="nextsteps"><div class="nh">Next steps</div>';
-        if(p0>0) tlh+='<div>\u203a '+p0+' edit'+(p0===1?'':'s')+' still pending review \u2014 Accept or Revert them.</div>';
-        else tlh+='<div>\u203a Session reviewed clean \u2014 nothing pending.</div>';
-        tlh+='<div>\u203a Run python observatory-demo/tests/test_pipeline.py</div></div>';
-      }
-      el('tl').innerHTML=tlh;
+      var fh='<div class="fh"><b>demo-session</b>'+(sessDone?'<span>\u25a3 audit log</span><span>\u00b7 last activity 14:49</span>'
+        :'<span class="live">\u25cf live</span><span>\u00b7 updated '+last+'</span>')+'</div>';
+      var tle=el('tl');
+      tle.innerHTML=fh+tl.join('');
+      tle.scrollTop=tle.scrollHeight; // the feed follows its tail
 
       // ---- overview: toolbar + fleet nav + detail ----
       // The four review axes, as the editors' nav bar groups them: Diff · File · Folder · Prompt.
@@ -1338,23 +1257,22 @@
       // The scenario is one prompt, so the Prompt axis holds a single entry while it still has work to review.
       var promptCounter=p0?'Prompt 1/1':'';
       var axes='';
-      if(diffCounter) axes+='<span class="g"><span class="nvb">▲</span> <span class="on">'+diffCounter+'</span> <span class="nvb">▼</span> <span class="tk" title="Keep this edit">✓</span> <span class="tu" title="Undo this edit">↩</span> <span class="nvb" title="View this edit’s diff">⧉</span></span><span class="sep"></span>';
+      if(diffCounter) axes+='<span class="g"><span class="nvb">▲</span> <span class="on">'+diffCounter+'</span> <span class="nvb">▼</span> <span class="tk" title="Keep this edit">✓</span> <span class="tu" title="Undo this edit">✗</span> <span class="nvb" title="View this edit’s diff">⧉</span></span><span class="sep"></span>';
       if(fileCounter) axes+='<span class="g"><span class="nvb">◀</span> <span class="on">'+fileCounter+'</span> <span class="nvb">▶</span> <span class="tk" title="Accept every edit in this file">✓✓</span> <span class="tu" title="Reject every edit in this file">✗</span></span><span class="sep"></span>';
       if(folderCounter) axes+='<span class="g"><span class="nvb">◀</span> <span class="on">'+folderCounter+'</span> <span class="nvb">▶</span> <span class="tk" title="Accept every edit in this folder">✓✓</span> <span class="tu" title="Reject every edit in this folder">✗</span></span><span class="sep"></span>';
-      if(promptCounter) axes+='<span class="g"><span class="nvb">◀</span> <span class="on">'+promptCounter+'</span> <span class="nvb">▶</span> <span class="nvb" title="Review this prompt — step its edits in order">☰</span> <span class="tk" title="Accept every edit from this prompt">✓✓</span> <span class="tu" title="Reject every edit from this prompt">↩</span></span>';
+      if(promptCounter) axes+='<span class="g"><span class="nvb">◀</span> <span class="on">'+promptCounter+'</span> <span class="nvb">▶</span> <span class="nvb" title="Review this prompt — step its edits in order">☰</span> <span class="tk" title="Accept every edit from this prompt">✓✓</span> <span class="tu" title="Reject every edit from this prompt">✗✗</span></span>';
       axes=axes.replace(/<span class="sep"><\/span>$/,'');
       var bulk='<span class="g"><span class="ts">🔬 demo-session</span>';
       if(st.gate==='acceptall'&&!res[step]) bulk+='<button id="ov-acceptall" class="hint">✓✓ Accept All</button>';
       else bulk+='<span class="tk">✓✓ Accept All</span>';
-      bulk+='<span class="tu">↩ Reject All</span><span class="ts">Clear Resolved</span><span class="ts">Export</span></span>';
-      var view='<span class="g"><span class="ts">Search</span><span class="ts">Active only</span><span class="sep"></span><span class="ts">Spotlight</span><span class="ts">Refresh</span><span class="on"><span data-co-version>v0.9.5</span> ▾</span></span>';
+      bulk+='<span class="tu">✗✗ Reject All</span><span class="ts">Clear Resolved</span><span class="ts">Export</span></span>';
+      var view='<span class="g"><span class="ts">Search</span><span class="ts">Active only</span><span class="sep"></span><span class="ts">Spotlight</span><span class="ts">Refresh</span><span class="on"><span data-co-version>v0.10.0</span> ▾</span></span>';
       var bar='<div class="row">'+axes+'</div><div class="row split">'+bulk+view+'</div>';
       el('ovbar').innerHTML=bar;
       var ab=el('ov-acceptall');
       if(ab)ab.addEventListener('click',function(){resolveGate();});
 
       var showPlan=st.plan||landed.length>0||step>1;
-      var sessDone=!!st.recap;
       var fleetHtml='<div class="fr"><span class="gl">▶</span><span class="st2 '+(sessDone?'done':'working')+'">'+(sessDone?'● done':'● working')+'</span> you · demo/pipeline</div>';
       if(landed.length>=4) fleetHtml+='<div class="fr'+(landed.length===4?' hi':'')+'"><span class="gl">▶</span><span class="st2 '+(sessDone?'done':'working')+'">'+(sessDone?'● done':'● working')+'</span> agent-2 · demo/pipeline-w2</div>';
       if(landed.length>=4) fleetHtml+='<div class="fr sub'+(landed.length===4?' hi':'')+'"><span class="gl">▷</span><span class="st2 done">● done</span> general-purpose — Write pipeline tests</div>';
@@ -1363,16 +1281,16 @@
         fleetHtml+='<div class="fr sub'+(landed.length===5&&!sessDone?' hi':'')+'"><span class="gl">·</span>outline ✓ · write ✓ · review ●</div>';
       }
       el('fleet').innerHTML=fleetHtml;
-      el('wf-tab').textContent='Workflows'+(landed.length>=5?' 1':'');
-      // Tasks tab badge — the demo's three numbered tasks, complete once their strict spans have landed.
-      var tkDone=0;
-      if(showPlan) TASKS.forEach(function(ch){ if(ch.edits.every(function(id){return id<=landed.length;})) tkDone++; });
-      el('tk-tab').textContent=showPlan?('Tasks '+tkDone+'/3'):'Tasks';
-      // Processes tab — the demo session backgrounds two shells alongside task two: a test watcher
-      // that exits 0, and a docs preview left running. The badge is running/total, as in the editors.
-      el('pr-tab').textContent=(landed.length>=3)?'Processes 1/2':'Processes';
+      // The nav badges, as VS Code draws them: Workers counts the agent rows listed, Workflows the runs,
+      // Tasks the numbered plan, and Processes running/total — the demo session backgrounds two shells
+      // alongside task two, a test watcher that exits 0 and a docs preview left running.
+      el('wk-tab').textContent='Workers '+(landed.length>=4?2:1);
+      el('wf-tab').textContent='Workflows '+(landed.length>=5?1:0);
+      el('tk-tab').textContent='Tasks '+(showPlan?TASKS.length:0);
+      el('pr-tab').textContent='Processes '+(landed.length>=3?'1/2':'0/0');
 
-      // The change-map detail: Folders strip, churn-ranked Files ledger, summary bar, then the feed.
+      // The change-map detail: Folders strip, churn-ranked Files ledger, summary bar. Each ledger row ends
+      // in ⧉, which opens that file's changes stacked.
       var strip=el('ov-strip');
       var mods={};landed.forEach(function(e){mods[e.module]=(mods[e.module]||0)+e.plus+e.minus;});
       var modKeys=Object.keys(mods);
@@ -1384,40 +1302,16 @@
           return '<span class="seg" style="width:'+pct+'%" title="'+m+' — '+pct+'% of churn">'+m+'</span>';
         }).join('');
       }else{strip.hidden=true;strip.innerHTML='';}
-      var maxChurn=landed.reduce(function(a,e){return Math.max(a,e.plus+e.minus);},1);
+      // The exact time of each file's last edit, left of the name — stamps, not ages (2026-08-31).
+      var ageOf=function(e){return e.time||'';};
       el('ov-ledger').innerHTML=landed.length?landed.slice().sort(function(a,b){return (b.plus+b.minus)-(a.plus+a.minus);}).map(function(e){
         var s2=statusOf(e.id,step,res);
-        return '<div class="lr"><span class="sd '+s2+'"></span><span class="lf">'+esc(e.file)+'</span>'+
-          '<span class="lb"><i style="width:'+Math.round(100*(e.plus+e.minus)/maxChurn)+'%"></i></span>'+
-          '<span class="lc"><span class="p">+'+e.plus+'</span> <span class="m">−'+e.minus+'</span></span></div>';
+        return '<div class="lr"><span class="la">'+ageOf(e)+'</span><span class="sd '+s2+'"></span><span class="lf">'+esc(e.file)+'</span>'+
+          '<span class="lc"><span class="p">+'+e.plus+'</span> <span class="m">−'+e.minus+'</span></span>'+
+          '<span class="lo" title="Open this file’s changes stacked">⧉</span></div>';
       }).join(''):'<div class="empty">Changed files appear here as edits land.</div>';
       var addAll=landed.reduce(function(a,e){return a+e.plus;},0),remAll=landed.reduce(function(a,e){return a+e.minus;},0);
       el('ov-readout').textContent=landed.length?(landed.length+' file'+(landed.length===1?'':'s')+' · +'+addAll+' −'+remAll+(p0?' · '+p0+' pending':' · reviewed clean')):'';
-
-      // ---- feed ----
-      // The selected row's activity, read from the file that thing writes. Which it IS depends on the
-      // source: LIVE while it is still writing (headed with the newest evidence, never a realtime
-      // claim), an AUDIT LOG once it has finished — a record, no longer followed. The demo has the
-      // session selected, so it flips to an audit log at the recap, when the session is done.
-      var feed=el('ov-feed');
-      if(!landed.length){ feed.hidden=true; feed.innerHTML=''; }
-      else{
-        var acts=[];
-        landed.forEach(function(e){ acts.push({t:e.time,a:'Edit',x:e.file}); });
-        if(landed.length>=3){
-          acts.push({t:'14:45',a:'Bash',x:'pytest -q --watch  (background: demo-tests)'});
-          acts.push({t:'14:45',a:'Bash',x:'python -m http.server 8000  (background: demo-serve)'});
-        }
-        acts.sort(function(a,b){return a.t<b.t?-1:a.t>b.t?1:0;});
-        var TAIL=4, hidden=Math.max(0,acts.length-TAIL), tail=acts.slice(-TAIL);
-        var last=tail[tail.length-1].t;
-        feed.hidden=false;
-        feed.innerHTML='<div class="fh"><b>demo-session</b>'+
-          (sessDone?('<span class="audit">▣ audit log</span><span>· last activity '+last+' · session</span>')
-                   :('<span class="live">● live</span><span>· updated '+last+' · session</span>'))+'</div>'+
-          (hidden?('<div class="more">… '+hidden+' earlier entr'+(hidden===1?'y':'ies')+' not shown</div>'):'')+
-          tail.map(function(a){return '<div class="fe"><span class="ft">'+a.t+'</span><span class="fa">'+a.a+'</span><span>'+esc(a.x)+'</span></div>';}).join('');
-      }
 
       // ---- stats ----
       var p=0,kk=0,u=0;
@@ -1517,6 +1411,35 @@
     render();
     if(!reduce) startPlay(); else stopPlay();
   })();
+</script>
+<script>window.__DOCS_INDEX__=[{"s":"what-is-oak","t":"What OAK is","g":"Start here","d":"This is the two-minute picture of what the observatory records and why."},{"s":"install","t":"Install","g":"Start here","d":"Add OAK to a machine and its editors, and switch capture on."},{"s":"first-review","t":"Your first review","g":"Start here","d":"Walk from an agent session to a reviewed, kept change in a few minutes."},{"s":"sessions-agents","t":"Sessions & agents","g":"The OAK model","d":"A session is the one conversation everything hangs off; agents are who worked inside it."},{"s":"worktrees","t":"Worktrees & siblings","g":"The OAK model","d":"OAK correlates parallel agents across the git worktrees of one repository."},{"s":"subagents-roles","t":"Subagents & roles","g":"The OAK model","d":"Subagents are the agents an agent spawns; each one carries the job it was given."},{"s":"workflows-fleet","t":"Workflows & the fleet","g":"The OAK model","d":"Workflows are scripted fan-outs, and the fleet puts every running agent on one board."},{"s":"prompts","t":"Prompts","g":"What OAK records","d":"Prompts record what you asked for — the spine the rest of the record hangs on."},{"s":"tasks","t":"Tasks","g":"What OAK records","d":"Tasks are the to-dos an agent set itself, with the edits captured under each one."},{"s":"actions","t":"Actions","g":"What OAK records","d":"Actions record every tool call an agent made, in order, with its result."},{"s":"edits","t":"Edits & the change map","g":"What OAK records","d":"Edits are the reviewable unit; the change map summarizes them all."},{"s":"capture","t":"Transcript, store & hook","g":"What OAK records","d":"The transcript and the hook-fed store are the two token-free sources everything derives from."},{"s":"observations","t":"Observations","g":"The surfaces","d":"Observations pair each edit with the reasoning recorded near it, plus flags."},{"s":"actions-view","t":"Actions view","g":"The surfaces","d":"The Actions view shows the tool-call timeline and raises the conflicts that need attention first."},{"s":"feed","t":"Feed","g":"The surfaces","d":"The feed streams what an agent is doing as it works, oldest first."},{"s":"stats-spotlight","t":"Stats & spotlight","g":"The surfaces","d":"Stats plots the review scoreboard and token usage; Spotlight highlights the changed lines."},{"s":"review-units","t":"The review unit","g":"Reviewing","d":"This page explains why the unit of decision is what an agent changed for a prompt."},{"s":"keep-undo","t":"Keep, undo, accept & reject","g":"Reviewing","d":"Two verb pairs cover every decision, separated by how much they act on."},{"s":"conflicts","t":"Conflicts","g":"Reviewing","d":"When two agents touch one file, a guarded undo protects it."},{"s":"risk","t":"Risk","g":"The audits","d":"Risk shows what a session wrote outside the workspace — exercised, not merely permitted."},{"s":"egress","t":"Egress","g":"The audits","d":"Egress shows what a session read from outside the workspace, grouped by scope."},{"s":"compaction","t":"Compaction & context","g":"The audits","d":"Compaction shows what shaped a session and where its context was silently dropped."},{"s":"supported-agents","t":"Supported agents","g":"Working with agents","d":"OAK captures native Claude Code and Codex sessions."},{"s":"claude-code","t":"Claude Code","g":"Working with agents","d":"Claude Code is the hooks-native default, observed from outside the model loop."},{"s":"codex","t":"Codex","g":"Working with agents","d":"OAK captures native Codex hooks and rollout logs."},{"s":"models","t":"Models","g":"Working with agents","d":"Capture is model-independent; this page covers running open weights under an agent."},{"s":"tui","t":"Terminal app","g":"Terminal app","d":"The terminal app puts the whole observatory in your terminal — try it, then dig into each tab."},{"s":"tui-herdr","t":"The herdr tab","g":"Terminal app","d":"The herdr tab runs the real terminal client for agents and remote machines."},{"s":"tui-observatory","t":"The observatory tab","g":"Terminal app","d":"The observatory tab lists sessions beside a detail pane: a pinned conversation, workers, tasks and review links."},{"s":"tui-review","t":"The review tab","g":"Terminal app","d":"The review tab brings per-edit diffs and the keep and undo verbs to the terminal."},{"s":"editors","t":"Editor extensions","g":"Editor extensions","d":"The VS Code extension and the JetBrains plugin render one record in two editors."},{"s":"editors-overview","t":"The Overview panel","g":"Editor extensions","d":"The Overview panel is the master-detail board: Sessions, Workers, Workflows, Tasks, and Processes."},{"s":"editors-traces","t":"The Traces sidebar","g":"Editor extensions","d":"The Traces sidebar lists every pending edit, grouped by file, with Keep and Undo on each row."},{"s":"editors-inline","t":"Inline review","g":"Editor extensions","d":"Inline review surfaces pending edits in the editor itself, under a floating review bar."},{"s":"editors-stacked","t":"The stacked diff view","g":"Editor extensions","d":"“Open all in editor” stacks every pending diff into one scroll, each with its own verbs."},{"s":"editors-timeline","t":"The Timeline panel","g":"Editor extensions","d":"The Timeline panel gathers Feed, Prompts, Observations and Actions in one place."},{"s":"cli","t":"CLI reference","g":"Reference","d":"The CLI carries every command the editors render, usable on its own."},{"s":"ignore","t":".observatoryignore","g":"Reference","d":"An .observatoryignore rule keeps matches out of capture; this page covers how stored records are swept."},{"s":"releases","t":"Releases & channels","g":"Reference","d":"OAK ships on a stable and a dev channel; this page explains how updates reach you."}];</script>
+<script>
+(function(){
+  var idx=window.__DOCS_INDEX__||[];
+  var modal=document.getElementById('kmodal'),input=document.getElementById('kinput'),
+      results=document.getElementById('kresults'),back=document.getElementById('kback'),btn=document.getElementById('ksearch');
+  if(!modal||!btn) return;
+  var sel=0,cur=[];
+  function open(){modal.hidden=false;input.value='';render('');input.focus();}
+  function close(){modal.hidden=true;}
+  function render(q){q=q.trim().toLowerCase();
+    cur=idx.filter(function(p){return !q||(p.t+' '+p.g+' '+p.d).toLowerCase().indexOf(q)>=0;}).slice(0,8);sel=0;
+    results.innerHTML=cur.map(function(p,i){return '<li data-i="'+i+'"'+(i===0?' class="sel"':'')+'><div><span class="r-t">'+p.t+'</span><span class="r-g">'+p.g+'</span></div><div class="r-d">'+p.d+'</div></li>';}).join('')||'<li class="r-none" style="color:var(--ink-faint);cursor:default">No matches</li>';}
+  function go(){if(cur[sel])location.href=cur[sel].s+'.html';}
+  btn.addEventListener('click',open);
+  if(back)back.addEventListener('click',close);
+  input.addEventListener('input',function(){render(input.value);});
+  document.addEventListener('keydown',function(e){
+    if((e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==='k'){e.preventDefault();modal.hidden?open():close();return;}
+    if(modal.hidden)return;
+    if(e.key==='Escape')close();
+    else if(e.key==='ArrowDown'){e.preventDefault();sel=Math.min(sel+1,cur.length-1);paint();}
+    else if(e.key==='ArrowUp'){e.preventDefault();sel=Math.max(sel-1,0);paint();}
+    else if(e.key==='Enter'){e.preventDefault();go();}
+  });
+  results.addEventListener('click',function(e){var li=e.target.closest('li[data-i]');if(li){sel=+li.dataset.i;go();}});
+  function paint(){[].forEach.call(results.children,function(li,i){li.classList.toggle('sel',i===sel);});}
+})();
 </script>
 </body>
 </html>

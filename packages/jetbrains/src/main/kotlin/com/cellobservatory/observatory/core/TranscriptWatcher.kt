@@ -92,6 +92,13 @@ class TranscriptWatcher(private val project: Project) : Disposable {
                 startPollFallback()
             }
         }
+        // Codex shards by date. Poll metadata without registering an unbounded watcher tree.
+        val codexHome = Path.of(System.getenv("CODEX_HOME")?.takeIf { it.isNotBlank() } ?: System.getProperty("user.home") + "/.codex")
+        var codexStamp = codexTranscriptStamp(codexHome)
+        exec.scheduleWithFixedDelay({
+            val next = codexTranscriptStamp(codexHome)
+            if (next != codexStamp) { codexStamp = next; debounceNotify() }
+        }, POLL_MS, POLL_MS, TimeUnit.MILLISECONDS)
         kickDiscovery() // async: fold in the worktree siblings
     }
 
@@ -258,6 +265,17 @@ class TranscriptWatcher(private val project: Project) : Disposable {
                     }
                 } catch (_: Exception) {
                 }
+            }
+            return stamp
+        }
+
+        fun codexTranscriptStamp(home: Path): Long {
+            var stamp = 0L
+            for (root in listOf(home.resolve("sessions"), home.resolve("archived_sessions"))) {
+                if (!Files.isDirectory(root)) continue
+                runCatching { Files.walk(root, 6).use { paths ->
+                    paths.filter { it.name.endsWith(".jsonl") && Files.isRegularFile(it) }.forEach { stamp += fileStamp(it) }
+                } }
             }
             return stamp
         }

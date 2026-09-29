@@ -1,0 +1,20 @@
+<p>Two surfaces answer "how much" and "how far along." <strong>Stats</strong> and <strong>Metrics</strong> quantify a session; <strong>Spotlight</strong> makes a single change legible inside a heavily edited file.</p>
+
+<h2>Stats</h2>
+<p><strong>Stats</strong> reports the session's vitals and usage: the model and reasoning effort it runs on, cumulative tokens split into input, output, and cached, <a href="compaction.html">compaction</a> history, and token plots by time window. At its top is the review scoreboard — pending, accepted, and reverted counts — over a Today / 7 days / 30 days range toggle.</p>
+
+<figure><img src="media/win-stats.png" loading="lazy" alt="The Stats panel: the review scoreboard of pending, accepted and reverted counts, the Today / 7 days / 30 days range toggle, the token plot, and the context and plan-usage bars"><figcaption>Stats: the review scoreboard over token and usage plots.</figcaption></figure>
+
+<h2>Metrics</h2>
+<p><strong>Metrics</strong> reports derived numbers: line deltas, action and error counts, per-subagent duration and tokens, and tool latency. In short — <strong>Stats describes consumption; Metrics describes activity.</strong></p>
+
+<div class="callout info">
+  <span class="ico">ℹ</span>
+  <div class="ct"><span class="ctitle">Dollar figures are estimates, not a bill</span>
+  <p>The Stats <code>$</code> row, the status bar's <code>mo ~$</code> and <code>oak usage --breakdown</code> price a session's token counts at the public API list prices, and a <code>~</code> marks each such figure. A subscription is not billed per token, so none of them is a bill.</p></div>
+</div>
+
+<h2>Spotlight</h2>
+<p><strong>Spotlight</strong> dims every line the agent did not change, so the changes read at full contrast in a heavily edited file. It answers "what actually moved here" at a glance when a diff is buried in a large file.</p>
+
+<figure><img src="media/spotlight.png" loading="lazy" alt="Spotlight: a file with every unmodified line dimmed so the agent's changed lines read at full contrast"><figcaption>Spotlight, on a heavily edited file.</figcaption></figure>

@@ -1,0 +1,93 @@
+<p>Every view the editors render is a CLI command underneath. The <code>oak</code> command is the complete backend — usable on its own, scriptable, and the single source of truth both editors thin-render. Add <code>--json</code> to almost any command to get its payload as data.</p>
+
+<h2>Setup</h2>
+<div class="tbl-wrap">
+<table>
+  <thead><tr><th>Command</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>oak init</code></td><td>Install the capture <a href="capture.html#hook">hooks</a> in your user settings; <code>--project</code> writes them into this repository's <code>.claude/settings.json</code> instead.</td></tr>
+    <tr><td><code>oak install-extensions</code></td><td>Side-load the VS Code + JetBrains extensions. The VS Code one then self-updates; JetBrains updates once you add its plugin repository (the command prints the step).</td></tr>
+    <tr><td><code>oak status</code></td><td>Confirm the hook is installed and show what's captured.</td></tr>
+    <tr><td><code>oak doctor</code></td><td>Diagnose capture and configuration problems.</td></tr>
+    <tr><td><code>oak statusline</code></td><td>Install or refresh the bundled status line with the usage bars (a bash script that needs <code>jq</code>).</td></tr>
+    <tr><td><code>oak uninstall</code></td><td>Remove the capture hooks from every settings file OAK recorded writing; <code>oak init --repair</code> replaces duplicated hook entries instead.</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h2>Viewing the record</h2>
+<div class="tbl-wrap">
+<table>
+  <thead><tr><th>Command</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>oak</code> · <code>oak tui</code></td><td>The full <a href="tui.html">terminal dashboard</a>. <code>--once</code> prints one frame.</td></tr>
+    <tr><td><code>oak sessions</code></td><td>List this machine’s <a href="sessions-agents.html">sessions</a>, grouped by workspace, leaving out sessions in which nothing happened.</td></tr>
+    <tr><td><code>oak titles</code></td><td>The Remote Control titles read from claude.ai, which name sessions the way the Claude app does: when they were last read and how many are cached. <code>--refresh</code> reads now; <code>--off</code> stops the automatic read and deletes the cache; <code>--on</code> resumes it.</td></tr>
+    <tr><td><code>oak inbox</code></td><td>Every session waiting on you, most urgent first — permission prompts with their tool, questions with their options, input waits, then finished turns. <code>--next</code> names the one to jump to.</td></tr>
+    <tr><td><code>oak search</code></td><td>Every conversation on this machine, ranked — the asks you typed and the answers you got, across sessions and workspaces. Every word must appear; a hit in the ask outranks one in the answer.</td></tr>
+    <tr><td><code>oak notify</code></td><td>Desktop notifications for raised hands: <code>--watch</code> announces every hand this workspace raises from a plain terminal; <code>--message</code> pops one to check the plumbing.</td></tr>
+    <tr><td><code>oak prompts</code> · <code>oak tasklog</code></td><td>The <a href="prompts.html">prompt</a> and <a href="tasks.html">task</a> groupings.</td></tr>
+    <tr><td><code>oak changemap</code></td><td>The <a href="edits.html#the-change-map">change map</a> for a scope.</td></tr>
+    <tr><td><code>oak observations</code> · <code>oak actions</code></td><td>The <a href="observations.html">Observations</a> and <a href="actions-view.html">Actions</a> surfaces.</td></tr>
+    <tr><td><code>oak stats</code> · <code>oak metrics</code> · <code>oak usage</code></td><td>Vitals, derived numbers, and token usage. <code>oak usage --breakdown</code> splits tokens, cache reads and estimated dollars by week, bill-cycle month, model or session, for Claude and Codex; the dollars price token counts at API list prices, carry a <code>~</code>, and are never a bill.</td></tr>
+    <tr><td><code>oak integrity</code></td><td>Report capture gaps and unsafe history in a session’s records, without rewriting them.</td></tr>
+    <tr><td><code>oak fleet</code> · <code>oak feed</code></td><td>The <a href="workflows-fleet.html">fleet</a> board and a live <a href="feed.html">feed</a>.</td></tr>
+    <tr><td><code>oak risk</code> · <code>oak egress</code></td><td>The two <a href="risk.html">audits</a>.</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h2>Reviewing</h2>
+<div class="tbl-wrap">
+<table>
+  <thead><tr><th>Command</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>oak keep</code> · <code>oak undo</code></td><td><a href="keep-undo.html">Keep or undo</a> the <a href="review-units.html">review unit</a> an edit belongs to; <code>--ids</code> acts on single edits, <code>--ids … --units</code> widens each to its unit, and <code>--all</code> acts on a scope.</td></tr>
+    <tr><td><code>oak resolve</code></td><td>Accept every pending edit in a session and clear its records.</td></tr>
+    <tr><td><code>oak task-keep</code> · <code>oak task-undo</code> · <code>oak task-clear</code></td><td>Act on a <a href="tasks.html">task</a>'s strict span.</td></tr>
+    <tr><td><code>oak redo --from-prompt</code></td><td>Re-apply undone edits from a <a href="prompts.html">prompt</a> onward.</td></tr>
+    <tr><td><code>oak undo … --force</code></td><td>Restore the whole file when a surgical undo conflicts.</td></tr>
+    <tr><td><code>oak undo --ids … --record-only</code> · <code>oak redo --ids … --record-only</code></td><td>Record what an undo or redo already did on disk, without touching the files. OAK prints this command, with the edit ids, when the store stays busy after an undo or redo has changed the files.</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h2>Driving and housekeeping</h2>
+<div class="tbl-wrap">
+<table>
+  <thead><tr><th>Command</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>oak agent start --kind claude|codex</code></td><td>Start a native agent in herdr.</td></tr>
+<tr><td><code>oak attach [machine]</code></td><td>Hand this terminal to herdr, here or on a saved machine over SSH, the way <code>tmux attach</code> does.</td></tr>
+<tr><td><code>oak prompt --session &lt;id&gt; --text "…"</code></td><td>Submit text to a session’s live herdr pane. Without one, the draft stays on the clipboard and is printed.</td></tr>
+<tr><td><code>oak comment</code> · <code>oak quote</code></td><td>Draft review comments on an edit’s lines, or a quote of the agent’s last reply, as one prompt. Nothing is sent until you ask: <code>oak comment send</code> and <code>oak quote --send</code> submit through herdr, and a failed send keeps the draft.</td></tr>
+<tr><td><code>oak conversation --session &lt;id&gt; [--limit N] [--since &lt;cursor&gt;] [--machine &lt;label&gt;] --json</code></td><td>Read the native transcript as renderer-ready updates. <code>--limit</code> is the last N turns of an initial read, 50 by default, and <code>truncated</code> reports the bytes cut above them. <code>--since</code> continues from the byte cursor the previous read returned; <code>reset</code> means the transcript was replaced, so redraw rather than append. Clients without a captured-store checkpoint can request <code>--with-source</code> and return its opaque <code>source</code> as <code>--source &lt;token&gt;</code> with the next cursor to detect replacement across processes.</td></tr>
+<tr><td><code>oak machine add &lt;label&gt; &lt;ssh-target&gt;</code></td><td>Provision and register a herdr machine.</td></tr>
+<tr><td><code>oak machine list --json</code></td><td>List saved machines.</td></tr>
+<tr><td><code>oak sessions [--json]</code></td><td>List this machine’s conversations, grouped by workspace with the current workspace first. Rows include the title, edit count, tokens, duration, model and last activity. Editor windows use the CLI on their workspace host; mirrored transcripts, bridge pointers without a local conversation, and sessions in which nothing happened are excluded.</td></tr>
+<tr><td><code>oak &lt;verb&gt; … --machine &lt;label&gt;</code></td><td>Run <code>views</code>, <code>review</code>, <code>list</code>, <code>sessions</code>, <code>conversation</code>, <code>feed</code>, <code>multitask</code>, <code>subagents</code>, <code>diff</code>, <code>keep</code>, <code>undo</code>, <code>redo</code>, <code>resolve</code>, <code>comment</code>, <code>quote</code> or <code>ignore</code> on a saved machine over SSH, where the session's store and files are, with that machine's own <code>oak</code>, in the session's own workspace there. Program output and exit status come back unchanged; transport failures are named. The terminal Review tab, including <code>--once</code>, and Observatory conversations use it for a session on another machine. <code>OAK_MACHINE_TIMEOUT_MS</code> overrides the 120-second overall deadline. Remote conversations, unit expansion and <code>comment mark-sent</code> require a compatible remote CLI and fail before acting if it is too old.</td></tr>
+<tr><td><code>oak doctor --fix</code></td><td>Repair herdr (binary, integrations, plugin, missing sidebar widths and the gruvbox theme when no theme name is set), PTY helper permissions and outdated focus servers.</td></tr>
+<tr><td><code>oak focus --session &lt;id&gt; --tab observatory</code></td><td>Navigate an attached OAK terminal.</td></tr>
+    <tr><td><code>oak demo --fast</code></td><td>Produce a demo session to explore: an isolated <code>demo-*</code> session and an <code>observatory-demo/</code> folder in the current directory, both removed by <code>oak demo --clean</code>.</td></tr>
+    <tr><td><code>oak models</code></td><td>List the local Ollama <a href="models.html">models</a> and the one Codex runs; <code>oak models use &lt;name&gt;</code> switches Codex to one.</td></tr>
+    <tr><td><code>oak ignore --check &lt;path&gt;</code></td><td>Explain a <a href="ignore.html">.observatoryignore</a> decision.</td></tr>
+    <tr><td><code>oak store</code> · <code>oak clean</code></td><td>Locate the store; reap stale session data.</td></tr>
+    <tr><td><code>oak sessions --delete &lt;id&gt;</code> · <code>--undelete &lt;id&gt;</code></td><td>Hide a session from OAK and purge its captured edits; the transcript itself is not deleted. <code>--undelete</code> lists the session again, without the purged edits. Pending edits are purged only with <code>--force</code>.</td></tr>
+    <tr><td><code>oak update</code> · <code>oak version --check</code></td><td>Update OAK; check for a newer <a href="releases.html">release</a>.</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div class="ct"><span class="ctitle">Every command is a data source</span>
+  <p>Add <code>--json</code> to nearly any command for its raw payload. This is exactly what the editor extensions consume — which is why a number in VS Code, in JetBrains, and on the CLI is always the same number.</p></div>
+</div>
+
+<div class="callout info">
+  <span class="ico">ℹ</span>
+  <div class="ct"><span class="ctitle">Run <code>oak help</code> for the full list</span>
+  <p>This page covers the commands you'll reach for; <code>oak help</code> lists every user-facing command with its main flags, and <code>oak &lt;command&gt; --help</code> prints the same list.</p></div>
+</div>
+
+<p><code>oak diff &lt;id&gt; --json</code> returns <code>session</code>, <code>id</code>, <code>file</code> and an uncoloured <code>patch</code>. The same contract applies with <code>--machine</code>.</p>
