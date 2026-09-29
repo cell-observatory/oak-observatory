@@ -39,8 +39,8 @@
   },
   "devDependencies": {
     "@oak-observatory/core": "0.11.0-dev.0",
-    "@types/node": "^26.1.2",
-    "esbuild": "^0.28.1",
+    "@types/node": "^26.6.3",
+    "esbuild": "^0.28.2",
     "typescript": "^5.9.3"
   },
   "repository": {
