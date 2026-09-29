@@ -16,7 +16,7 @@ private const val WIDGET_ID = "claudeObservatoryStatus"
  *  click = review the next pending edit — parity with the VS Code status-bar item. */
 class ObservatoryStatusBarWidgetFactory : StatusBarWidgetFactory {
     override fun getId() = WIDGET_ID
-    override fun getDisplayName() = "Claude Observatory"
+    override fun getDisplayName() = "OAK"
     override fun isAvailable(project: Project) = true
     override fun createWidget(project: Project): StatusBarWidget = ObservatoryWidget(project)
     override fun canBeEnabledOn(statusBar: StatusBar) = true
@@ -48,11 +48,11 @@ private class ObservatoryWidget(private val project: Project) :
 
     override fun getTooltipText(): String {
         val c = ObservatoryService.getInstance(project).counts()
-        if (c.pending + c.kept + c.undone == 0) return "Claude Observatory — no tracked edits yet"
+        if (c.pending + c.kept + c.undone == 0) return "OAK — no tracked edits yet"
         val rate = if (c.kept + c.undone > 0) " · ${(c.kept * 100) / (c.kept + c.undone)}% accepted" else ""
         val oldest = c.oldestPendingTs?.let { " · oldest ${relTime(it)}" } ?: ""
         val action = if (c.pending > 0) "Click to review the next pending edit" else "All caught up"
-        return "Claude Observatory: ${c.pending} pending · ${c.kept} accepted · ${c.undone} reverted$rate$oldest — $action"
+        return "OAK: ${c.pending} pending · ${c.kept} accepted · ${c.undone} reverted$rate$oldest — $action"
     }
 
     override fun getClickConsumer(): Consumer<MouseEvent> = Consumer {

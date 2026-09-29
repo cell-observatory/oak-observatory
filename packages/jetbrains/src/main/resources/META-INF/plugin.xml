@@ -1,20 +1,17 @@
 <idea-plugin>
-  <id>com.cell-observatory.claude-observatory</id>
-  <name>Claude Observatory</name>
-  <vendor url="https://github.com/cell-observatory/claude-observatory">Cell Observatory</vendor>
+  <id>com.cell-observatory.oak-observatory</id>
+  <name>OAK</name>
+  <vendor url="https://github.com/cell-observatory/oak-observatory">Cell Observatory</vendor>
   <description><![CDATA[
-    Per-edit <b>Keep / Undo</b> for Claude Code — a running log of every file change Claude makes,
-    each with its own surgical undo. Git-free, zero extra Claude tokens (capture runs in local
-    hooks, outside the model loop). Built for <b>established and mission-critical codebases</b>
-    rather than throwaway prototypes.<br/><br/>
-    Requires the <code>claude-observatory</code> CLI on this machine (the plugin drives it for all
-    store mutations) and the capture hooks installed via <code>claude-observatory init</code>.
+    Per-edit <b>Keep / Undo</b> for Claude Code and Codex, with a log of captured file changes.
+    Capture runs in local hooks, outside the model loop, without git or extra model tokens.<br/><br/>
+    Requires the <code>oak</code> CLI on this machine (the plugin drives it for all
+    store mutations) and the capture hooks installed via <code>oak init</code>.
     Works in every JetBrains IDE; on Remote Development the plugin installs on the host.
   ]]></description>
 
   <!-- Platform-only: loads in PyCharm CE/Pro, IntelliJ, WebStorm, … no Python APIs used. -->
   <depends>com.intellij.modules.platform</depends>
-
   <extensions defaultExtensionNs="com.intellij">
     <!-- Stripe icons need explicit 13x13 size + palette hex colors (the IDE recolors known hex
          values per theme; `currentColor` is not supported by the platform SVG icon loader). -->
@@ -26,7 +23,7 @@
                 factoryClass="com.cellobservatory.observatory.ui.ObservatoryTimelineFactory"/>
     <!-- The guided tour's window. Declared (not registered at runtime, which invokes an override-only
          platform API) and unavailable until a tour runs — see TourToolWindowFactory. -->
-    <toolWindow id="Claude Observatory Tour" anchor="right" canCloseContents="false"
+    <toolWindow id="OAK Tour" anchor="right" canCloseContents="false"
                 icon="/icons/toolWindowObservatory.svg"
                 factoryClass="com.cellobservatory.observatory.ui.tour.TourToolWindowFactory"/>
     <!-- The "Open all in editor" tab: our own stacked review editor over a ReviewAllVirtualFile
@@ -37,75 +34,103 @@
                             implementation="com.cellobservatory.observatory.ui.ObservatoryStatusBarWidgetFactory"/>
     <statusBarWidgetFactory id="claudeObservatoryActions" order="after claudeObservatoryStatus"
                             implementation="com.cellobservatory.observatory.ui.ObservatoryActionsWidgetFactory"/>
+    <statusBarWidgetFactory id="claudeObservatoryUsage" order="after claudeObservatoryActions"
+                            implementation="com.cellobservatory.observatory.ui.ObservatoryUsageWidgetFactory"/>
     <editorNotificationProvider implementation="com.cellobservatory.observatory.ui.editor.ObservatoryEditorBanner"/>
     <!-- The floating review bar over the code. `implementation` only, with no group id: the EP consumes
          the ActionGroup INSTANCE the provider returns, so a registered <group> would be dead weight.
          Which of this and the banner appear is the `editorReviewSurface` setting (default: this one). -->
     <editorFloatingToolbarProvider
         implementation="com.cellobservatory.observatory.ui.editor.ObservatoryFloatingToolbarProvider"/>
-    <applicationConfigurable parentId="tools" id="com.cell-observatory.claude-observatory.settings"
-                             displayName="Claude Observatory"
+    <applicationConfigurable parentId="tools" id="com.cell-observatory.oak-observatory.settings"
+                             displayName="OAK"
                              instance="com.cellobservatory.observatory.settings.ObservatoryConfigurable"/>
-    <notificationGroup id="Claude Observatory" displayType="BALLOON"/>
+    <notificationGroup id="OAK" displayType="BALLOON"/>
     <projectViewNodeDecorator implementation="com.cellobservatory.observatory.ui.ObservatoryNodeDecorator"/>
     <postStartupActivity implementation="com.cellobservatory.observatory.services.ObservatoryStartup"/>
   </extensions>
 
   <actions>
-    <group id="ClaudeObservatory.Group" text="Claude Observatory" popup="false">
+    <group id="ClaudeObservatory.Group" text="OAK" popup="false">
       <action id="ClaudeObservatory.ReviewNext"
               class="com.cellobservatory.observatory.actions.ReviewNextAction"
-              text="Claude Observatory: Review Next Pending Edit"
-              description="Jump to the oldest pending Claude edit">
+              text="OAK: Review Next Pending Edit"
+              description="Jump to the oldest pending agent edit">
         <keyboard-shortcut keymap="$default" first-keystroke="ctrl alt N"/>
         <keyboard-shortcut keymap="Mac OS X 10.5+" first-keystroke="meta alt N" replace-all="true"/>
       </action>
       <action id="ClaudeObservatory.ReviewPrev"
               class="com.cellobservatory.observatory.actions.ReviewPrevAction"
-              text="Claude Observatory: Review Previous Pending Edit"
-              description="Step to the previous pending Claude edit">
+              text="OAK: Review Previous Pending Edit"
+              description="Step to the previous pending agent edit">
         <keyboard-shortcut keymap="$default" first-keystroke="ctrl alt P"/>
         <keyboard-shortcut keymap="Mac OS X 10.5+" first-keystroke="meta alt P" replace-all="true"/>
       </action>
+      <action id="ClaudeObservatory.AddReviewComment"
+              class="com.cellobservatory.observatory.actions.AddReviewCommentAction"
+              text="OAK: Add Review Comment"
+              description="Comment for the agent on the pending edit under the cursor">
+        <keyboard-shortcut keymap="$default" first-keystroke="ctrl alt C"/>
+        <keyboard-shortcut keymap="Mac OS X 10.5+" first-keystroke="meta alt C" replace-all="true"/>
+      </action>
+      <action id="ClaudeObservatory.SendReviewComments"
+              class="com.cellobservatory.observatory.actions.SendReviewCommentsAction"
+              text="OAK: Send Review Comments to Agent"
+              description="Batch unsent review comments into an editable dialog draft; Send submits it through herdr"/>
+      <action id="ClaudeObservatory.QuoteLastReply"
+              class="com.cellobservatory.observatory.actions.QuoteLastReplyAction"
+              text="OAK: Quote Agent's Last Reply into Prompt"
+              description="Quote the agent's last reply into an editable dialog draft as a &gt; block; Send submits it through herdr"/>
+      <action id="ClaudeObservatory.NextAttention"
+              class="com.cellobservatory.observatory.actions.NextAttentionAction"
+              text="OAK: Jump to the Next Session Waiting on You"
+              description="Permission prompts first, then questions, then input waits — the needs-you inbox's order">
+        <keyboard-shortcut keymap="$default" first-keystroke="ctrl alt I"/>
+        <keyboard-shortcut keymap="Mac OS X 10.5+" first-keystroke="meta alt I" replace-all="true"/>
+      </action>
+      <action id="ClaudeObservatory.SearchConversations"
+              class="com.cellobservatory.observatory.actions.SearchConversationsAction"
+              text="OAK: Search Conversations…"
+              description="Find the asks you typed and the answers you got, across every session on this machine"/>
       <action id="ClaudeObservatory.KeepAtCursor"
               class="com.cellobservatory.observatory.actions.KeepAtCursorAction"
-              text="Claude Observatory: Keep Pending Edit at Cursor"
-              description="Keep the pending Claude edit under the cursor">
+              text="OAK: Keep Pending Edit at Cursor"
+              description="Keep the pending agent edit under the cursor">
         <keyboard-shortcut keymap="$default" first-keystroke="ctrl alt Y"/>
         <keyboard-shortcut keymap="Mac OS X 10.5+" first-keystroke="meta alt Y" replace-all="true"/>
       </action>
       <action id="ClaudeObservatory.UndoAtCursor"
               class="com.cellobservatory.observatory.actions.UndoAtCursorAction"
-              text="Claude Observatory: Undo Pending Edit at Cursor"
-              description="Surgically undo the pending Claude edit under the cursor">
+              text="OAK: Undo Pending Edit at Cursor"
+              description="Surgically undo the pending agent edit under the cursor">
         <keyboard-shortcut keymap="$default" first-keystroke="ctrl alt U"/>
         <keyboard-shortcut keymap="Mac OS X 10.5+" first-keystroke="meta alt U" replace-all="true"/>
       </action>
       <action id="ClaudeObservatory.KeepOpenFile"
               class="com.cellobservatory.observatory.actions.KeepOpenFileAction"
-              text="Claude Observatory: Accept All Edits in File"
-              description="Accept every pending Claude edit in the active file">
+              text="OAK: Accept All Edits in File"
+              description="Accept every pending agent edit in the active file">
         <keyboard-shortcut keymap="$default" first-keystroke="ctrl alt K"/>
         <keyboard-shortcut keymap="Mac OS X 10.5+" first-keystroke="meta alt K" replace-all="true"/>
       </action>
       <action id="ClaudeObservatory.UndoOpenFile"
               class="com.cellobservatory.observatory.actions.UndoOpenFileAction"
-              text="Claude Observatory: Reject All Edits in File"
-              description="Revert every pending Claude edit in the active file">
+              text="OAK: Reject All Edits in File"
+              description="Revert every pending agent edit in the active file">
         <keyboard-shortcut keymap="$default" first-keystroke="ctrl alt R"/>
         <keyboard-shortcut keymap="Mac OS X 10.5+" first-keystroke="meta alt R" replace-all="true"/>
       </action>
       <action id="ClaudeObservatory.DiffPrevRevision"
               class="com.cellobservatory.observatory.actions.DiffPrevRevisionAction"
-              text="Claude Observatory: Diff Previous Revision"
-              description="Diff the current file against the state produced by the previous Claude edit">
+              text="OAK: Diff Previous Revision"
+              description="Diff the current file against the state produced by the previous agent edit">
         <keyboard-shortcut keymap="$default" first-keystroke="ctrl alt OPEN_BRACKET"/>
         <keyboard-shortcut keymap="Mac OS X 10.5+" first-keystroke="meta alt OPEN_BRACKET" replace-all="true"/>
       </action>
       <action id="ClaudeObservatory.DiffNextRevision"
               class="com.cellobservatory.observatory.actions.DiffNextRevisionAction"
-              text="Claude Observatory: Diff Next Revision"
-              description="Diff the current file against the state produced by the next Claude edit">
+              text="OAK: Diff Next Revision"
+              description="Diff the current file against the state produced by the next agent edit">
         <keyboard-shortcut keymap="$default" first-keystroke="ctrl alt CLOSE_BRACKET"/>
         <keyboard-shortcut keymap="Mac OS X 10.5+" first-keystroke="meta alt CLOSE_BRACKET" replace-all="true"/>
       </action>
@@ -113,81 +138,81 @@
            reuses the shared panel handler (ReviewOps / the service), so behavior never forks. -->
       <action id="ClaudeObservatory.SetupCheck"
               class="com.cellobservatory.observatory.actions.SetupCheckAction"
-              text="Claude Observatory: Setup Check (doctor)"
+              text="OAK: Setup Check (doctor)"
               description="Open the setup diagnostics — hooks, PATH, config, session, status line"/>
       <action id="ClaudeObservatory.ExportSummary"
               class="com.cellobservatory.observatory.actions.ExportReviewSummaryAction"
-              text="Claude Observatory: Export Review Summary"
+              text="OAK: Export Review Summary"
               description="Export a shareable markdown review summary (kept/reverted per file)"/>
       <action id="ClaudeObservatory.SwitchSession"
               class="com.cellobservatory.observatory.actions.SwitchSessionAction"
-              text="Claude Observatory: Switch Session"
+              text="OAK: Switch Session"
               description="Pick which capture session the observatory shows"/>
       <action id="ClaudeObservatory.CleanStore"
               class="com.cellobservatory.observatory.actions.CleanStoreAction"
-              text="Claude Observatory: Clean Store…"
+              text="OAK: Clean Store…"
               description="Garbage-collect orphaned blobs, or drop the whole session"/>
       <action id="ClaudeObservatory.InstallHooks"
               class="com.cellobservatory.observatory.actions.InstallHooksAction"
-              text="Claude Observatory: Install Capture Hooks"
-              description="Install the PreToolUse/PostToolUse capture hooks (claude-observatory init)"/>
+              text="OAK: Install Capture Hooks"
+              description="Install the PreToolUse/PostToolUse capture hooks (oak init)"/>
       <action id="ClaudeObservatory.AcceptAll"
               class="com.cellobservatory.observatory.actions.AcceptAllEditsAction"
-              text="Claude Observatory: Accept All Edits"
-              description="Accept every pending Claude edit in this session"/>
+              text="OAK: Accept All Edits"
+              description="Accept every pending agent edit in this session"/>
       <action id="ClaudeObservatory.RevertAll"
               class="com.cellobservatory.observatory.actions.RevertAllEditsAction"
-              text="Claude Observatory: Reject All Edits"
-              description="Revert every pending Claude edit in this session"/>
+              text="OAK: Reject All Edits"
+              description="Revert every pending agent edit in this session"/>
       <action id="ClaudeObservatory.RedoAll"
               class="com.cellobservatory.observatory.actions.RedoAllEditsAction"
-              text="Claude Observatory: Redo All Edits"
-              description="Re-apply every undone Claude edit in this session"/>
+              text="OAK: Redo All Edits"
+              description="Re-apply every undone agent edit in this session"/>
       <action id="ClaudeObservatory.ClearResolved"
               class="com.cellobservatory.observatory.actions.ClearResolvedEditsAction"
-              text="Claude Observatory: Clear Resolved Edits"
+              text="OAK: Clear Resolved Edits"
               description="Clear the resolved (kept/undone) edits from the log; pending edits are kept"/>
       <action id="ClaudeObservatory.Spotlight"
               class="com.cellobservatory.observatory.actions.SpotlightAction"
               icon="AllIcons.Actions.IntentionBulb"
-              text="Claude Observatory: Toggle Spotlight"
+              text="OAK: Toggle Spotlight"
               description="Dim the unedited lines to foreground Claude's changes"/>
       <action id="ClaudeObservatory.SearchEdits"
               class="com.cellobservatory.observatory.actions.SearchEditsAction"
-              text="Claude Observatory: Search Edits"
+              text="OAK: Search Edits"
               description="Filter the Review list and the Overview ledger by file path"/>
       <!-- Demo mode (0.8.9). Cancel is the replay's own progress-bar Cancel; Restart is the reset, and
            it is the same operation as Start because a run clears any previous demo before replaying. -->
       <action id="ClaudeObservatory.StartDemo"
               class="com.cellobservatory.observatory.actions.StartDemoAction"
               icon="AllIcons.Actions.Execute"
-              text="Claude Observatory: Start Demo Mode"
+              text="OAK: Start Demo Mode"
               description="Replay a scripted Claude session through the real pipeline, then take the guided tour"/>
       <action id="ClaudeObservatory.RestartDemo"
               class="com.cellobservatory.observatory.actions.RestartDemoAction"
               icon="AllIcons.Actions.Restart"
-              text="Claude Observatory: Restart Demo"
+              text="OAK: Restart Demo"
               description="Replay the demo from the beginning, replacing the current one"/>
       <action id="ClaudeObservatory.StartTour"
               class="com.cellobservatory.observatory.actions.StartTourAction"
-              text="Claude Observatory: Guided Tour"
+              text="OAK: Guided Tour"
               description="Walk every panel of the observatory, step by step"/>
       <action id="ClaudeObservatory.TourNext"
               class="com.cellobservatory.observatory.actions.TourNextAction"
-              text="Claude Observatory: Guided Tour — Next Step"
+              text="OAK: Guided Tour — Next Step"
               description="Advance the guided tour"/>
       <action id="ClaudeObservatory.TourBack"
               class="com.cellobservatory.observatory.actions.TourBackAction"
-              text="Claude Observatory: Guided Tour — Previous Step"
+              text="OAK: Guided Tour — Previous Step"
               description="Step the guided tour back"/>
       <action id="ClaudeObservatory.TourPlayPause"
               class="com.cellobservatory.observatory.actions.TourPlayPauseAction"
-              text="Claude Observatory: Guided Tour — Pause or Resume"
+              text="OAK: Guided Tour — Pause or Resume"
               description="Pause or resume the guided tour's autoplay"/>
       <action id="ClaudeObservatory.ExitDemo"
               class="com.cellobservatory.observatory.actions.ExitDemoAction"
               icon="AllIcons.Actions.Cancel"
-              text="Claude Observatory: Exit Demo Mode"
+              text="OAK: Exit Demo Mode"
               description="Leave demo mode and remove every trace: both sessions, the demo folder, and the report written outside the workspace"/>
     </group>
   </actions>

@@ -1,0 +1,12 @@
++- Session                                       +
+| Recover edits · laptop · + idle · Opus · 900   |
+| tokens · 4 pending                             |
+| ↗ herdr   ⌕ review                             |
+| +- You                             1970-01-01 +|
+| |Read this conversation                       ||
+| +---------------------------------------------+|
+| Workers · 0                                    |
+| Tasks · 0                                      |
+|                                                |
+|                                                |
++------------------------------------------------+

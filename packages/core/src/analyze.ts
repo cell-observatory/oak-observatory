@@ -67,7 +67,7 @@ function fnmBins(name: string): string[] {
   return [];
 }
 
-/** Best-effort location of a globally-installed bin (`claude`, `claude-observatory`) — GUI apps and
+/** Best-effort location of a globally-installed bin (`claude`, `oak`) — GUI apps and
  *  SSH-launched remote hosts often lack ~/.local/bin and the nvm/volta dirs on PATH. Shared by the
  *  CLI resolver below and the VS Code stats subprocess so the candidate list lives in exactly one place. */
 export function resolveBin(name: string, opts: { configured?: string; env?: string } = {}): string {
@@ -165,6 +165,30 @@ async function runResumeOrFresh(
   sessionId: string,
   opts: { timeoutMs?: number; claudeBin?: string }
 ): Promise<string> {
+  const { describeSession } = require('./session') as typeof import('./session');
+  const d = describeSession(sessionId);
+  if (/^codex(?:-acp)?$/.test(d.runtime)) {
+    // This action is opt-in analysis. Keep the original runtime/provider and forbid edits during it.
+    return new Promise((resolve, reject) => {
+      const child = spawnTool('codex', ['exec', '--sandbox', 'read-only', 'resume', d.nativeSessionId, '--json', '-'],
+        { cwd: d.cwd ?? process.cwd(), stdio: ['pipe','pipe','pipe'] });
+      let raw = '', err = '';
+      const timer = setTimeout(() => { child.kill('SIGTERM'); reject(new Error('Codex analysis timed out')); }, opts.timeoutMs ?? 90000);
+      child.stdout.on('data', (b) => { raw += b.toString(); }); child.stderr.on('data', (b) => { err = (err+b.toString()).slice(-16000); });
+      child.stdin.on('error', () => {});
+      child.on('error', (e) => { clearTimeout(timer); reject(e); });
+      child.on('close', (code) => {
+        clearTimeout(timer);
+        if (code !== 0) return reject(new Error(err || `Codex analysis exited ${code}`));
+        const replies: string[] = [];
+        for (const line of raw.split('\n')) { try { const e = JSON.parse(line); if (e.type === 'item.completed' && e.item?.type === 'agent_message') replies.push(e.item.text); } catch {} }
+        if (!replies.length) return reject(new Error('Codex completed without a readable analysis response'));
+        resolve(replies.join('\n\n'));
+      });
+      child.stdin.end(resumePrompt);
+    });
+  }
+  if (!/^claude(?:-acp)?$/.test(d.runtime)) throw new Error(`Analysis is unavailable for ${d.runtime}; continue with that agent in Observatory.`);
   try {
     return await runClaude(resumePrompt, { ...opts, resumeSessionId: sessionId });
   } catch {

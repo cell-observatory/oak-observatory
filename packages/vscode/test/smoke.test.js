@@ -6,15 +6,33 @@ const Module = require('module');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+require('./editor-fixes.test');
+
+// Fixtures below own their temporary HOMEs. An inherited custom config root would send the
+// extension and its real CLI children to a different store/registry than the seeded fixtures.
+delete process.env.CLAUDE_CONFIG_DIR;
+delete process.env.CODEX_HOME;
+// The CLI the extension spawns is THIS tree's, never whatever `oak` the machine has installed: with no
+// pin it resolves an installed CLI first, then PATH, so a developer machine passed on its installed build
+// while a clean CI runner, which has none, failed. The pin is the workspace's own bin link, which the root
+// `npm run build` makes (npm's install skips it while the CLI is unbuilt), so every platform runs the
+// tree's CLI the same way (a sub-test that simulates a missing CLI swaps it and restores it).
+const TREE_OAK = path.resolve(__dirname, '../../../node_modules/.bin', process.platform === 'win32' ? 'oak.cmd' : 'oak');
+process.env.CLAUDE_OBSERVATORY_BIN = TREE_OAK;
 
 const core = require('../../core/dist/index.js');
-const BUNDLE = path.resolve(__dirname, '../dist/extension.js');
+const BUNDLE = process.env.OAK_VSCODE_TEST_BUNDLE || path.resolve(__dirname, '../dist/extension.js');
 
 test('extension: three views, click commands, inline annotations, chat, status styling, undo', async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-ext-home-'));
   const ws = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-ext-ws-'));
   process.env.HOME = home;
   process.env.USERPROFILE = home; // os.homedir() reads USERPROFILE on Windows, HOME elsewhere
+  // Positive control for the pin: the tree's CLI answers through its bin link. A fresh build that left
+  // packages/cli/dist/index.js non-executable fails HERE, by name, instead of as a missing session row.
+  const treeOak = core.spawnToolSync(TREE_OAK, ['--version'], { encoding: 'utf8' });
+  assert.equal(treeOak.status, 0, `the tree's oak runs through ${TREE_OAK} — ${treeOak.error || treeOak.stderr}`);
+  assert.equal(treeOak.stdout.trim(), `oak ${require('../../cli/package.json').version}`, '…and it reports this tree’s version');
   const S = 'extSess';
 
   // seed: projects dir so resolveSessionId(ws) === S, and a store with 2 edits on one file
@@ -22,9 +40,11 @@ test('extension: three views, click commands, inline annotations, chat, status s
   fs.mkdirSync(proj, { recursive: true });
   const F = path.join(ws, 'app.txt');
   const OUT = path.join(home, 'notes', 'outside.md'); // deliberately NOT under the workspace
-  // transcript: the ai-title recap + two assistant messages whose Edit tool_uses on F carry Claude's
+  // transcript: the ai-title recap + two assistant messages whose Edit tool_uses on F carry the agent's
   // reasoning (correlated per-file to store edits #1/#2) — feeds the inline reasoning lens + blame.
   const AG = 'sa0000000001';
+  // Longer than any row is wide: shown whole, and wrapped (cut at 99 characters with …).
+  const LONG_WHY = 'Operation 2 — add a validate() method that rejects negative scales, empty inputs and NaN values before any feature scaling runs';
   fs.writeFileSync(path.join(proj, S + '.jsonl'), [
     JSON.stringify({ type: 'ai-title', aiTitle: 'Reviewing app.txt edits' }),
     // Two of the USER's asks, stamped in the same epoch-ms space as the seeded edits below (500 < 1000
@@ -39,7 +59,7 @@ test('extension: three views, click commands, inline annotations, chat, status s
       { type: 'tool_use', name: 'Edit', input: { file_path: F } },
     ] } }),
     JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [
-      { type: 'text', text: 'Operation 2 — add a validate() method' },
+      { type: 'text', text: LONG_WHY },
       { type: 'tool_use', name: 'Edit', input: { file_path: F } },
     ] } }),
     // 0.8.7: one read and one edit that land OUTSIDE the workspace — the two facts the folded footprint
@@ -101,6 +121,7 @@ test('extension: three views, click commands, inline annotations, chat, status s
   const openTabs = []; // window.tabGroups contents — exitDemo must close the demo's editors
   const infoMessages = []; // every showInformationMessage — the first-run offer must not appear here
   const warnMessages = []; // every showWarningMessage — a refusal has to SAY why, not fail silently
+  const fsWatchers = []; // every createFileSystemWatcher: { pattern, change: [its onDidChange handlers] }
   let infoPick; // what the mock reader clicks on the next showInformationMessage (undefined = dismiss)
   /**
    * The actions offered by a show*Message call, for BOTH of the API's overloads:
@@ -118,7 +139,22 @@ test('extension: three views, click commands, inline annotations, chat, status s
     return isOptions ? rest.slice(1) : rest;
   };
   const webviewPanels = []; // createWebviewPanel calls — the tour is a detachable panel
+  const changesCalls = []; // every vscode.changes (native multi-diff) invocation
   let quickPick = null; // what showQuickPick should return (the tour's track chooser)
+  const openDialogAsks = []; // every native open-dialog ask (the Feed tab's + button)
+  let openDialogAnswer; // what the dialog returns — set per test leg
+  // createQuickPick (the session switch pickers): a test sets this to `(items) => item | undefined` to
+  // choose what the picker accepts on show(); null hides it. Reset to null after each use.
+  let createQuickPickChoose = null;
+  // …and this to `(items) => ({ item, button }) | undefined` to press a ROW button first (the store
+  // folder's reveal), the way onDidTriggerItemButton fires in the real picker. Reset to null after use.
+  let createQuickPickButton = null;
+  // The two ways a store folder opens: openExternal (the OS file manager, in a local window) and the
+  // 'vscode.openFolder' command (a new window on the remote host, in a remote one). `env.remoteName`
+  // below is what tells them apart; a test sets it to model a Remote-SSH window.
+  const openExternalCalls = [];
+  let openExternalAnswer = true; // what openExternal resolves to — false models an open that failed
+  const openFolderCalls = [];
   let lensProvider = null;
   let hoverProvider = null;
   let decoProvider = null;
@@ -131,6 +167,7 @@ test('extension: three views, click commands, inline annotations, chat, status s
     configHandlers.forEach((cb) => cb({ affectsConfiguration: (k) => k === `claudeObservatory.${key}` }));
   const statusBarItems = []; // every createStatusBarItem() returns a distinct item (the nav bar has many)
   let clipboardText = '';
+  const uninstalled = []; // workbench.extensions.uninstallExtension calls — the rename's retirement
   let decoCounter = 0;
   let opened = null;
   let lastShown = null;
@@ -156,6 +193,7 @@ test('extension: three views, click commands, inline annotations, chat, status s
   class MarkdownString {
     constructor(v) { this.value = v || ''; this.isTrusted = false; this.supportThemeIcons = false; }
     appendMarkdown(s) { this.value += s; return this; }
+    appendText(s) { this.value += s.replace(/[\\`*_{}\[\]()#+.!<>-]/g, '\\$&'); return this; }
   }
   // Faithful to vscode-uri: `fsPath` LOWER-CASES a Windows drive letter (uriToFsPath with
   // keepDriveLetterCasing=false). On windows-latest this hands the extension the same skewed paths
@@ -195,7 +233,12 @@ test('extension: three views, click commands, inline annotations, chat, status s
       textDocuments: [],
       asRelativePath: (f) => path.relative(ws, typeof f === 'string' ? f : f.fsPath),
       registerTextDocumentContentProvider: (s, p) => { contentProviders[s] = p; return { dispose() {} }; },
-      createFileSystemWatcher: () => ({ onDidChange() {}, onDidCreate() {}, onDidDelete() {}, dispose() {} }),
+      // Each watcher's handlers, so a test can report a change another tool made.
+      createFileSystemWatcher: (pattern) => {
+        const w = { pattern: pattern && pattern.pattern !== undefined ? pattern.pattern : pattern, change: [] };
+        fsWatchers.push(w);
+        return { onDidChange: (f) => { w.change.push(f); }, onDidCreate() {}, onDidDelete() {}, dispose() {} };
+      },
       onDidChangeTextDocument: () => ({ dispose() {} }),
       onDidChangeConfiguration: (cb) => { configHandlers.push(cb); return { dispose() {} }; },
       // Captured so the test can FIRE a folder change: `workspaceRoot()` is folders[0], so this
@@ -216,7 +259,10 @@ test('extension: three views, click commands, inline annotations, chat, status s
         treeViewOpts[id] = opts;
         return { badge: undefined, description: undefined, onDidChangeVisibility: () => ({ dispose() {} }), dispose() {} };
       },
-      createStatusBarItem: () => { const it = { text: '', tooltip: '', command: undefined, backgroundColor: undefined, show() {}, hide() {}, dispose() {} }; statusBarItems.push(it); return it; },
+      // `visible` and `priority` are recorded because a hidden item KEEPS its last text: without
+      // them, "this window is not on the bar" is indistinguishable from "it was, a render ago",
+      // and left-to-right order (which is priority order) cannot be asserted at all.
+      createStatusBarItem: (_align, priority) => { const it = { text: '', tooltip: '', command: undefined, backgroundColor: undefined, priority, visible: false, show() { this.visible = true; }, hide() { this.visible = false; }, dispose() {} }; statusBarItems.push(it); return it; },
       setStatusBarMessage: () => ({ dispose() {} }),
       createTextEditorDecorationType: () => ({ id: ++decoCounter, dispose() {} }),
       registerFileDecorationProvider: (p) => { decoProvider = p; return { dispose() {} }; },
@@ -250,7 +296,32 @@ test('extension: three views, click commands, inline annotations, chat, status s
         return Promise.resolve(items.includes(infoPick) ? infoPick : undefined);
       },
       showInputBox: () => Promise.resolve(inputBoxValue),
+      // The Feed tab's + opens the NATIVE file dialog; the mock answers with
+      // one workspace file so the round-trip back to an @mention is testable.
+      showOpenDialog: (opts) => { openDialogAsks.push(opts || {}); return Promise.resolve(openDialogAnswer); },
       showQuickPick: (items) => Promise.resolve(quickPick === null ? undefined : items[quickPick]),
+      // The session switch pickers use createQuickPick (for per-row buttons — the store-folder reveal).
+      // The mock resolves the picker's own Promise on show(): it accepts the item `createQuickPickChoose`
+      // returns (firing onDidAccept with it as selectedItems), or hides when that is null/undefined.
+      createQuickPick: () => {
+        const cbs = { accept: [], hide: [], btn: [] };
+        const qp = {
+          items: [], selectedItems: [], activeItems: [], value: '',
+          title: '', placeholder: '', matchOnDetail: false, canSelectMany: false, busy: false,
+          onDidAccept: (f) => cbs.accept.push(f),
+          onDidHide: (f) => cbs.hide.push(f),
+          onDidTriggerItemButton: (f) => cbs.btn.push(f),
+          show: () => Promise.resolve().then(() => {
+            const pressed = createQuickPickButton ? createQuickPickButton(qp.items) : undefined;
+            if (pressed) cbs.btn.forEach((f) => f(pressed));
+            const chosen = createQuickPickChoose ? createQuickPickChoose(qp.items) : undefined;
+            if (chosen) { qp.selectedItems = [chosen]; cbs.accept.forEach((f) => f()); }
+            else cbs.hide.forEach((f) => f());
+          }),
+          hide: () => {}, dispose: () => {},
+        };
+        return qp;
+      },
       // The mock reader takes the FIRST action offered.
       showWarningMessage: (m, ...rest) => { warnMessages.push(String(m)); return Promise.resolve(actionsOf(rest)[0]); },
       // Real since VS Code 1.67 and the extension requires ^1.85, so the mock carries it: exitDemo
@@ -264,12 +335,19 @@ test('extension: three views, click commands, inline annotations, chat, status s
       registerCommand: (id, cb) => { commands[id] = cb; return { dispose() {} }; },
       executeCommand: (cmd, ...args) => {
         if (cmd === 'vscode.diff') { diffCalls.push(args); return Promise.resolve(); }
+        // The native multi-diff — recorded so the stacked tab's one side-by-side entry point is testable.
+        if (cmd === 'vscode.changes') { changesCalls.push(args); return Promise.resolve(); }
         // setContext has no registered handler in the host either — it is a message to the workbench.
         // Recording it is the only way a test can see the keys the package.json when-clauses read.
         if (cmd === 'setContext') { contextKeys[args[0]] = args[1]; return Promise.resolve(); }
+        if (cmd === 'vscode.openFolder') { openFolderCalls.push(args); return Promise.resolve(); }
+        if (cmd === 'workbench.extensions.uninstallExtension') { uninstalled.push(args[0]); return Promise.resolve(); }
         return Promise.resolve(commands[cmd] && commands[cmd](...args));
       },
     },
+    // Only the running build's id is installed, so activation must retire nothing (the pre-rename ids
+    // are driven by the retirement test at the end of this file).
+    extensions: { getExtension: (id) => (id === 'cell-observatory.oak-observatory-vscode' ? { id } : undefined) },
     comments: {
       createCommentController: (id, label) => {
         commentController = {
@@ -295,7 +373,11 @@ test('extension: three views, click commands, inline annotations, chat, status s
       registerCodeLensProvider: (sel, p) => { if (sel?.scheme !== 'claude-edit') lensProvider = p; return { dispose() {} }; },
       registerHoverProvider: (_sel, p) => { hoverProvider = p; return { dispose() {} }; },
     },
-    env: { clipboard: { writeText: (t) => { clipboardText = t; return Promise.resolve(); } } },
+    env: {
+      clipboard: { writeText: (t) => { clipboardText = t; return Promise.resolve(); } },
+      remoteName: undefined, // a local window
+      openExternal: (uri) => { openExternalCalls.push(uri); return Promise.resolve(openExternalAnswer); },
+    },
   };
   const origLoad = Module._load;
   Module._load = function (req, ...rest) {
@@ -311,6 +393,7 @@ test('extension: three views, click commands, inline annotations, chat, status s
       globalState: { get: (k, d) => (globalState.has(k) ? globalState.get(k) : d), update: (k, v) => { globalState.set(k, v); return Promise.resolve(); } },
     });
 
+    assert.deepEqual(uninstalled, [], 'an install with no pre-rename id retires nothing, and never the running build');
     // 0.9.4 (N15): the Edits and Diffs trees are GONE — Review is the one review surface; the raw
     // records stay backend-only (File History still reads them per file).
     assert.ok(!trees['claudeObservatory.edits'] && !trees['claudeObservatory.diffs'],
@@ -381,6 +464,23 @@ test('extension: three views, click commands, inline annotations, chat, status s
       'the bar entries are scoped to the diff-bar controller — never the floating review bar');
     assert.ok(!('diffEditor.codeLens' in pkg.contributes.configurationDefaults),
       'no code-lens default: the lenses are gone and nothing else here wants them on');
+
+    // #5 line comments: a SECOND controller ('claudeObservatoryReview') opens the "+" on any line of
+    // an after-doc and STORES each comment through core; "Send review comments" batches the unsent
+    // ones into one DRAFTED prompt (never auto-sent) and marks the ledger. Declared, registered, wired.
+    const extSrc = fs.readFileSync(path.resolve(__dirname, '../src/extension.ts'), 'utf8');
+    assert.match(extSrc, /createCommentController\('claudeObservatoryReview'/, 'the per-line review-comment controller exists');
+    assert.match(extSrc, /commentingRangeProvider[\s\S]{0,220}?\/after\//, 'it enables commenting ranges on after-docs — not the disabled [] of the button bar');
+    assert.match(extSrc, /core\.addComment\(session, \{ unit: id, line, text: reply\.text \}\)/, 'the reply-submit stores the typed comment through core');
+    assert.match(extSrc, /core\.composeCommentPrompt[\s\S]{0,320}?deliverChatPrompt[\s\S]{0,200}?markCommentsSent/, 'send composes → drafts (never auto-sends) → marks the ledger');
+    const ctxMenu = (pkg.contributes.menus['comments/commentThread/context'] || []).filter((m) => /claudeObservatoryReview/.test(m.when || ''));
+    assert.deepEqual(ctxMenu.map((m) => m.command), ['claudeObservatory.addReviewComment'], 'the reply button is addReviewComment, scoped to the review controller');
+    for (const { command } of pkg.contributes.commands)
+      assert.equal(typeof commands[command], 'function', `${command} is contributed and must be registered`);
+    // #6/#7: quoting the agent's last reply drafts a `> ` block into the composer (never auto-sent).
+    assert.match(extSrc, /core\.quoteAgentOutput\(session\)[\s\S]{0,700}?deliverChatPrompt/, 'quoteLastReply drafts the quoted reply into the Feed tab');
+    assert.ok((pkg.contributes.menus.commandPalette || []).some((m) => m.command === 'claudeObservatory.addReviewComment' && m.when === 'false'),
+      'the reply handler is hidden from the palette (it only makes sense from a comment thread)');
     assert.equal(pkg.contributes.configurationDefaults['diffEditor.hideUnchangedRegions.enabled'], true,
       'diffs read as hunks with expandable folds, not whole files');
     // …and a webview declared in the manifest must be REGISTERED, or it renders as an empty pane with
@@ -464,6 +564,16 @@ test('extension: three views, click commands, inline annotations, chat, status s
       const pendingOf = (s) => core.readLog(s).filter((r) => r.status === 'pending').length;
       const beforeSelf = pendingOf(S);
       assert.equal(pendingOf(OTHER), 1, 'the second session starts with a pending edit');
+      // Its one edit is named in the singular on Revert All's button ("Revert 1 edits").
+      {
+        const warn = vscode.window.showWarningMessage, offered = [];
+        vscode.window.showWarningMessage = (m, opts, ...items) => { offered.push(...items); return Promise.resolve(undefined); };
+        try { await commands['claudeObservatory.undoAll'](OTHER); } finally { vscode.window.showWarningMessage = warn; }
+        assert.deepEqual(offered, ['Revert 1 edit']);
+        assert.equal(pendingOf(OTHER), 1, 'cancelled, nothing was reverted');
+        const src = fs.readFileSync(path.resolve(__dirname, '../src/extension.ts'), 'utf8');
+        assert.match(src, /const verb = `Redo \$\{targets\.length\} edit\$\{targets\.length === 1 \? '' : 's'\}`;[\s\S]{0,400}if \(choice !== verb\) return;/, 'Redo All names its count the same way');
+      }
       await commands['claudeObservatory.keepAll'](OTHER);
       assert.equal(pendingOf(OTHER), 0, 'Accept All scoped to the OTHER session accepted its edit');
       assert.equal(pendingOf(S), beforeSelf, '…and left the reviewed session untouched');
@@ -478,7 +588,8 @@ test('extension: three views, click commands, inline annotations, chat, status s
     // 0.9.4 (N15): the collapsible trees are gone with the Edits/Diffs views — nothing left in the
     // sidebar deep enough to need Collapse All (File History is a flat list).
     // …and the palette commands that reveal each Timeline tab after a VS Code layout-persistence hide.
-    for (const c of ['showPrompts', 'showActions', 'showObservations']) {
+    // …plus the needs-you jump (2026-09-15): registered AND contributed, the same parity every palette door keeps.
+    for (const c of ['showPrompts', 'showActions', 'showObservations', 'nextAttention']) {
       assert.ok(typeof commands[`claudeObservatory.${c}`] === 'function', `${c} is registered`);
       assert.ok(pkg.contributes.commands.some((x) => x.command === `claudeObservatory.${c}`), `${c} is contributed to the palette`);
     }
@@ -554,10 +665,16 @@ test('extension: three views, click commands, inline annotations, chat, status s
       const titleFor = (c) => pkg.contributes.menus['view/title']
         .filter((e) => (e.when || '').includes('claudeObservatory.reviewList'))
         .some((e) => e.command === `claudeObservatory.${c}`);
-      for (const c of ['searchEdits', 'reviewPrev', 'reviewNext', 'keepAll', 'undoAll', 'redoAll',
+      // Search / Filter / Sort are NOT on the title bar any more — they moved into the panel's own
+      // inline toolbar (the compact search field + anchored dropdowns), so the title bar carries only
+      // the step / bulk / utility commands.
+      for (const c of ['reviewPrev', 'reviewNext', 'keepAll', 'undoAll', 'redoAll',
         'clearResolved', 'switchSession', 'refresh', 'toggleInline', 'cleanStore', 'exportSummary',
         'exportTrace', 'doctor']) {
         assert.ok(titleFor(c), `${c} is on the Review view's title bar`);
+      }
+      for (const c of ['searchEdits', 'filterMenu', 'cycleSort']) {
+        assert.ok(!titleFor(c), `${c} is NOT on the title bar — it lives in the inline toolbar now`);
       }
     }
     const rvMsgs = [];
@@ -633,6 +750,160 @@ test('extension: three views, click commands, inline annotations, chat, status s
       rvOnMsg({ type: 'ready' });
     }
 
+    // Reset scope (2026-08-19): one exit from every narrowing, as a real command — a live Search
+    // filter clears and the payload agrees. (The folder tile is webview state; the prompt scope
+    // clears through clearPromptScope, which executeCommand dispatches for real here.)
+    {
+      inputBoxValue = 'app.txt';
+      await commands['claudeObservatory.searchEdits']();
+      rvMsgs.length = 0;
+      rvOnMsg({ type: 'ready' });
+      assert.equal(rvMsgs.filter((m) => m.type === 'review').pop().data.filter, 'app.txt', 'a filter is on before the reset');
+      await commands['claudeObservatory.resetScope']();
+      rvMsgs.length = 0;
+      rvOnMsg({ type: 'ready' });
+      assert.equal(rvMsgs.filter((m) => m.type === 'review').pop().data.filter, '', 'Reset scope cleared the Search filter');
+    }
+
+    // The Review panel's opener is ONE button: stacked is the default view and
+    // the stacked tab's own bar carries the side-by-side switch — the sidebar must not offer two.
+    assert.ok(rvView.webview.html.includes('Open all in editor'), 'the sidebar offers ONE opener');
+    assert.ok(!rvView.webview.html.includes('Open all · side by side') && !rvView.webview.html.includes('Open all · stacked'),
+      '…and the two-button split is gone');
+    // Resolved rows: kept wears the ↺ revert arrow (not a second ✗), undone the ↻ redo arrow.
+    assert.ok(rvView.webview.html.includes('Revert this kept edit">↺<') && rvView.webview.html.includes('Re-apply this reverted edit">↻<'),
+      'kept rows revert with the undo arrow; undone rows redo with the forward arrow');
+
+    // The STACKED open-all view (2026-08-19): one webview of inline blocks — added/context lines
+    // classed apart (what Spotlight dims vs keeps), per-block ✓ Keep / ✗ Undo / 💬 Chat, syntax
+    // tokens INSIDE the green/red bands, wrap-not-scroll lines with a bounded per-block box, and a
+    // decided block that STAYS under its verdict with its remaining verb (kept → ↺ Revert,
+    // reverted → ↻ Redo) instead of vanishing mid-read. Seeded on its own file, restored after.
+    {
+      const sf = path.join(ws, 'stacked.js');
+      const b1 = core.writeBlob(S, Buffer.from('const one = 1;\nconst two = 2;\nconst three = 3;\n'));
+      const b2 = core.writeBlob(S, Buffer.from('const one = 1;\nconst two = 22; // more\nconst three = 3;\n'));
+      const sid = core.nextId(S);
+      core.appendLog(S, { id: sid, ts: 9500, tool: 'Edit', file: sf, beforeBlob: b1, afterBlob: b2, status: 'pending' });
+      fs.writeFileSync(sf, 'const one = 1;\nconst two = 22; // more\nconst three = 3;\n'); // on disk at `after`, so Undo/Redo rewrite cleanly
+      // A HOSTILE block in the same page: the extension is `constructor` (an Object.prototype
+      // member — the exact lookup that used to throw before the tab ever rendered) and the diff
+      // carries live HTML. Its presence proves the plain-text fallback; its content pins escaping.
+      const xf = path.join(ws, 'xss.constructor');
+      const xb1 = core.writeBlob(S, Buffer.from('safe\n'));
+      const xb2 = core.writeBlob(S, Buffer.from('safe\n<script>alert(1)</script>\n'));
+      const xid = core.nextId(S);
+      core.appendLog(S, { id: xid, ts: 9600, tool: 'Edit', file: xf, beforeBlob: xb1, afterBlob: xb2, status: 'pending' });
+      const nPanels = webviewPanels.length;
+      rvOnMsg({ type: 'openAllStacked' });
+      await new Promise((r) => setImmediate(r)); // renderStacked is async (grammar resolution) — let the first render land
+      assert.equal(webviewPanels.length, nPanels + 1, 'openAllStacked opens ONE webview panel');
+      const sp = webviewPanels[webviewPanels.length - 1];
+      assert.ok(/stacked/.test(sp.title), 'the tab is titled as the stacked view');
+      assert.ok(sp.webview.html.includes(`class="id">#${sid}<`) && sp.webview.html.includes('stacked.js'), 'the seeded edit renders as a block');
+      assert.ok(sp.webview.html.includes('body.spot .ln.ctx'), 'the Spotlight dim rule is in the page');
+      assert.ok(sp.webview.html.includes('<body class="spot">'), '…and Spotlight is ON by default (server-rendered, no flash)');
+      assert.ok(/id="spot" aria-pressed="true"/.test(sp.webview.html), '…with its toggle pressed in the bar');
+      assert.ok(sp.webview.html.includes('>Side by side<'), '…and the side-by-side switch beside it');
+      // One size for every button (the emoji-labelled ones drifted): a shared,
+      // explicit line box — and no emoji left in any button label to inflate it.
+      assert.ok(/\.bt\{[^}]*height:22px/.test(sp.webview.html), 'the buttons share one explicit size');
+      assert.ok(!/<button[^>]*>[^<]*[💡◫💬]/u.test(sp.webview.html), 'no emoji inside button labels');
+      assert.ok(/\.acts\{[^}]*gap:/.test(sp.webview.html), 'the action row spaces its own buttons (Keep/Undo touched without it)');
+      // Same line, always: the header never wraps, the action row never shrinks,
+      // the file path is the shrink absorber, and below the container threshold the .lbl words hide
+      // so the ✓/✗ glyphs alone remain instead of wrapping or clipping.
+      assert.ok(/\.blk header\{[^}]*flex-wrap:nowrap/.test(sp.webview.html), 'the block header never wraps');
+      assert.ok(/\.acts\{[^}]*flex:none/.test(sp.webview.html), 'the action row never shrinks');
+      assert.ok(/\.blk \.file\{[^}]*text-overflow:ellipsis/.test(sp.webview.html), 'the file path absorbs the shrink (full path on its tooltip)');
+      assert.ok(/@container \(max-width:\d+px\)\{\.lbl\{display:none\}\}/.test(sp.webview.html), 'narrow blocks fall back to icon-only verbs');
+      assert.ok(new RegExp('data-keep="' + sid + '"[^>]*>✓<span class="lbl"> Keep</span>').test(sp.webview.html),
+        '…because the glyph and the word are separate spans');
+      // Debug seam: CO_DUMP_STACKED=<path> writes the real rendered page for eyeball/layout probes.
+      if (process.env.CO_DUMP_STACKED) fs.writeFileSync(process.env.CO_DUMP_STACKED, sp.webview.html);
+      assert.ok(sp.webview.html.includes('class="ln ctx"') && sp.webview.html.includes('class="ln add"'),
+        'context and changed lines are classed apart — the seam Spotlight dims across');
+      // Syntax color INSIDE the bands: the band rules keep their backgrounds but no longer override
+      // the foreground, and the code is tokenized (const → keyword span, 22 → number, // more → comment).
+      assert.ok(sp.webview.html.includes('<span class="tk-k">const</span>'), 'keywords are tokenized');
+      assert.ok(sp.webview.html.includes('<span class="tk-n">22</span>'), 'numbers are tokenized');
+      assert.ok(/<span class="tk-c">\/\/ more<\/span>/.test(sp.webview.html), 'comments are tokenized');
+      assert.ok(!/\.ln\.add\{[^}]*color:/.test(sp.webview.html) && !/\.ln\.del\{[^}]*color:/.test(sp.webview.html),
+        'the add/del bands are BACKGROUNDS only — token colors survive inside them');
+      // The hostile block: it RENDERED (the prototype-member extension takes the plain-text path
+      // instead of throwing the whole tab away), and its payload is inert text, never markup.
+      assert.ok(sp.webview.html.includes(`class="id">#${xid}<`), 'a *.constructor file still renders as a block');
+      assert.ok(!sp.webview.html.includes('<script>alert(1)'), 'hostile diff content is never live markup');
+      assert.ok(sp.webview.html.includes('&lt;script&gt;alert(1)&lt;/script&gt;'), '…it is escaped text');
+      // Wrap, never a horizontal bar; a tall block scrolls inside its own box.
+      assert.ok(sp.webview.html.includes('white-space:pre-wrap') && sp.webview.html.includes('overflow-wrap:anywhere'),
+        'lines wrap to the window');
+      assert.ok(sp.webview.html.includes('max-height:60vh') && sp.webview.html.includes('overflow-y:auto'),
+        'each block box is height-bounded with its own vertical scrollbar');
+      assert.ok(!/overflow-x:\s*auto/.test(sp.webview.html), 'no horizontal scrollbar anywhere in the stacked page');
+      assert.ok(new RegExp('data-keep="' + sid + '"').test(sp.webview.html), 'the block carries its own ✓ Keep');
+      assert.ok(!sp.webview.html.includes('data-chat'), 'no per-block Chat button (dropped by request, 2026-08-20)');
+      // The one side-by-side entry point (the sidebar's second opener is gone): the stacked bar's
+      // button → the native multi-diff, fed every pending block.
+      sp.recv({ type: 'sideBySide' });
+      await new Promise((r) => setImmediate(r));
+      assert.equal(changesCalls.length, 1, 'the Side-by-side button opens the native multi-diff');
+      assert.match(String(changesCalls[0][0]), /change\(s\)/, '…titled with the scope');
+      assert.ok(changesCalls[0][1].length >= 2, '…carrying a resource triple per pending block');
+      // Decisions PATCH the one block (postMessage swaps its action row) — the document, its
+      // scroll and its Spotlight are never reloaded. The page carries the swap handler…
+      assert.ok(sp.webview.html.includes("m.type!=='acts'"), 'the page carries the acts-swap handler');
+      const lastActs = () => sp.webview.posts.filter((p) => p.type === 'acts').pop();
+      sp.recv({ type: 'keep', id: sid });
+      assert.equal(core.readLog(S).filter((r) => r.id === sid).pop().status, 'kept', 'the block Keep landed in the store');
+      let acts = lastActs();
+      assert.ok(acts && acts.id === sid && acts.done === true, 'Keep patched exactly the decided block');
+      assert.ok(/✓<span class="lbl"> kept<\/span>/.test(acts.html), 'the decided block wears its verdict');
+      // A KEPT block keeps its one remaining verb: ↺ Revert (the undo arrow; glyph + hideable word).
+      assert.ok(new RegExp('data-undo="' + sid + '"[^>]*>↺<span class="lbl"> Revert</span>').test(acts.html), 'a kept block offers ↺ Revert');
+      sp.recv({ type: 'undo', id: sid });
+      await new Promise((r) => setImmediate(r)); // undoOne is async — let the revert land and patch
+      assert.equal(core.readLog(S).filter((r) => r.id === sid).pop().status, 'undone', 'Revert on a kept block reverted it');
+      assert.equal(fs.readFileSync(sf, 'utf8'), 'const one = 1;\nconst two = 2;\nconst three = 3;\n', '…and the file is back to before');
+      acts = lastActs();
+      assert.ok(/✗<span class="lbl"> reverted<\/span>/.test(acts.html), 'the reverted block wears its verdict');
+      assert.ok(new RegExp('data-redo="' + sid + '"[^>]*>↻<span class="lbl"> Redo</span>').test(acts.html), '…and offers ↻ Redo');
+      sp.recv({ type: 'redo', id: sid });
+      await new Promise((r) => setImmediate(r)); // redoOne is async too
+      // Redo restores the PRE-REVERT decision: this block was KEPT before its
+      // revert, so redo brings the decision back with the content — never a reopened 'pending'.
+      assert.equal(core.readLog(S).filter((r) => r.id === sid).pop().status, 'kept', 'Redo restored the pre-revert decision');
+      assert.equal(fs.readFileSync(sf, 'utf8'), 'const one = 1;\nconst two = 22; // more\nconst three = 3;\n', '…and the file carries the change again');
+      acts = lastActs();
+      assert.ok(acts.done === true && new RegExp('data-undo="' + sid + '"[^>]*>↺<span class="lbl"> Revert</span>').test(acts.html),
+        'a redone kept block wears ✓ kept + ↺ Revert again');
+      core.setStatusMany(S, [sid, xid], 'kept');
+      core.clearResolvedIds(S, [sid, xid]); // restore the fixture for the assertions below
+      fs.rmSync(sf, { force: true });
+      sp.dispose(); // …and the panel ledger for the tour assertions (dispose also exercises the provider's cleared-ref path)
+      webviewPanels.pop();
+    }
+
+    // A block one line past its preview budget says "+1 more diff line".
+    {
+      const pf = path.join(ws, 'budget.txt');
+      const pid = core.nextId(S);
+      core.appendLog(S, { id: pid, ts: 9700, tool: 'Edit', file: pf, beforeBlob: core.writeBlob(S, Buffer.from('x\ny\nz\n')),
+        afterBlob: core.writeBlob(S, Buffer.from('x\nY\nz\n')), status: 'pending' });
+      fs.writeFileSync(pf, 'x\nY\nz\n');
+      configValues.openAllPreviewLines = 2; // four patch lines shown; this block has five (@@, x, -y, +Y, z)
+      rvOnMsg({ type: 'openAllStacked' });
+      await new Promise((r) => setImmediate(r));
+      const bp = webviewPanels[webviewPanels.length - 1];
+      assert.ok(bp.webview.html.includes('+1 more diff line — this block is previewed'), 'one line past the budget is "1 more diff line"');
+      delete configValues.openAllPreviewLines;
+      core.setStatusMany(S, [pid], 'kept');
+      core.clearResolvedIds(S, [pid]);
+      fs.rmSync(pf, { force: true });
+      bp.dispose();
+      webviewPanels.pop();
+    }
+
     // keepFile acts on exactly the listed pending rows of that file (raw member ids, group-safe).
     rvOnMsg({ type: 'keepFile', file: F });
     assert.ok(core.readLog(S).filter((r) => r.file === F).every((r) => r.status === 'kept'),
@@ -667,7 +938,7 @@ test('extension: three views, click commands, inline annotations, chat, status s
     assert.equal(ghost.opts.length, 0, 'no ghost text for a pure modification');
 
     // inline CodeLens = the inline menu per edit: "🔬 #N +A −R · n/m" (opens the floating review bar)
-    // + ✓ Keep · ↩ Undo · 💬 Chat · ⧉ Diff (full diff tab) · ⋯ Details (the bubble). Reasoning is NOT on
+    // + ✓ Keep · ✗ Undo · 💬 Chat · ⧉ Diff (full diff tab) · ⋯ Details (the bubble). Reasoning is NOT on
     // the CodeLens — it rides in the bubble instead.
     assert.ok(lensProvider, 'CodeLens provider registered');
     const lenses = lensProvider.provideCodeLenses(doc);
@@ -743,7 +1014,7 @@ test('extension: three views, click commands, inline annotations, chat, status s
     diffCalls.length = 0; // reset so the later openDiff test still sees exactly one diff call
 
     // Observations view (0.8.0, Timeline folded in): timeline-STYLE — a recap on top, then the edit feed
-    // with adjacent same-file edits coalesced into ×N runs (each carrying Claude's reasoning inline),
+    // with adjacent same-file edits coalesced into ×N runs (each carrying the agent's reasoning inline),
     // then a Next-steps group at the end. The two app.txt edits coalesce into one ×2 run.
     // 0.10.0: the VIEW is gone, the PROVIDER is not — the Timeline webview renders these exact rows. So
     // every assertion below still drives the shipped view-model; only where it draws changed.
@@ -762,12 +1033,13 @@ test('extension: three views, click commands, inline annotations, chat, status s
     assert.match(runItem.label, /app\.txt\s+×2/, 'run row shows the file + ×2');
     assert.match(runItem.description, /^\+\d+ −\d+/, 'run row shows the combined delta');
     assert.equal(runItem.contextValue, 'file', 'run reuses the file Keep-all/Undo-all/Clear menus');
-    // expand the run → per-edit rows, each showing Claude's reasoning inline, with Keep/Undo.
+    // expand the run → per-edit rows, each showing the agent's reasoning inline, with Keep/Undo.
     const runEdits = obsTree.getChildren(obsRun);
     assert.equal(runEdits.length, 2, 'run expands to its per-edit rows');
     const eItem = obsTree.getTreeItem(runEdits[0]);
     assert.match(eItem.label, /#\d/, 'edit row leads with #id');
-    assert.match(String(eItem.description), /Operation/, "edit row shows Claude's reasoning inline");
+    assert.match(String(eItem.description), /Operation/, "edit row shows the agent's reasoning inline");
+    assert.ok(runEdits.some((n) => String(obsTree.getTreeItem(n).description).endsWith(` · ${LONG_WHY}`)), 'a reasoning line longer than the row is shown whole, never cut with an ellipsis');
     assert.equal(eItem.contextValue, 'edit', 'per-edit rows reuse the edit context menu (Keep/Undo/Chat)');
     assert.equal(eItem.command.command, 'claudeObservatory.showObservation', 'edit row opens the combined report');
     // Next steps: the still-open to-dos + heuristic follow-ups, grouped at the end.
@@ -838,8 +1110,8 @@ test('extension: three views, click commands, inline annotations, chat, status s
     assert.equal(oGroup.label, 'Outside the workspace', 'the out-of-workspace writes get their own section, after the command groups');
     assert.equal(String(oGroup.description), '50 of 62 files · 130 edits', 'the header counts files and edits, and says the list is partial');
     assert.match(String(oGroup.tooltip), /12 file\(s\) not shown/, 'a capped list says how many rows it hid — never reads as the whole story');
-    assert.equal(String(actTree.getTreeItem({ kind: 'ogroup', writes: [{ file: '~/a.md', count: 1 }], files: 1, edits: 1 }).description), '1 files · 1 edits',
-      'an uncapped list states its size plainly (no phantom "of")');
+    assert.equal(String(actTree.getTreeItem({ kind: 'ogroup', writes: [{ file: '~/a.md', count: 1 }], files: 1, edits: 1 }).description), '1 file · 1 edit',
+      'an uncapped list states its size plainly (no phantom "of"), one of each in the singular');
     const oRow = actTree.getTreeItem({ kind: 'orow', w: { file: '~/notes/x.md', count: 3 } });
     assert.equal(oRow.label, 'x.md', 'a row names the file');
     assert.match(String(oRow.description), /~\/notes · ×3/, '…with its directory and how many edits landed there');
@@ -916,7 +1188,9 @@ test('extension: three views, click commands, inline annotations, chat, status s
       const runRow = obsRoot.rows.find((r) => /×2/.test(r.label));
       assert.ok(runRow, 'the coalesced ×2 run is a row');
       assert.equal(runRow.open, false, '…collapsed by default, exactly as the tree item said');
-      assert.deepEqual(runRow.acts.map((a) => a.v), ['keepFile', 'undoFile', 'openFile'], 'with the file-scope actions');
+      // `redoFile` joined them in 0.10.0: undoing a whole file was a one-way door in this panel,
+      // while the terminal and the per-edit row both offered redo.
+      assert.deepEqual(runRow.acts.map((a) => a.v), ['keepFile', 'undoFile', 'redoFile', 'openFile'], 'with the file-scope actions');
       assert.match(runRow.desc, /^\+\d+ −\d+/, 'and the tree item’s description, unaltered');
       // The icon sentinel: '?' means a ThemeIcon nobody mapped, which would otherwise ship as a glyph
       // that says nothing. The instrument first — a mapping table that matched everything by accident
@@ -956,12 +1230,128 @@ test('extension: three views, click commands, inline annotations, chat, status s
         assert.equal(seen.length, 1, 'a row click runs the command the tree item carried');
         assert.equal(typeof seen[0], 'number', '…with its arguments');
       }
+      // A head edit item routes to the FILE-SCOPED STACKED opener,
+      // resolved against the tab's CONNECTED session on the host.
+      {
+        const seenStacked = [];
+        tlProvider.onOpenEditFile = (s, id) => { seenStacked.push([typeof s, id]); };
+        tlMsg({ type: 'agentOpenEditFile', id: 7 });
+        tlProvider.onOpenEditFile = undefined;
+        assert.deepEqual(seenStacked, [['string', 7]], 'a head edit item opens the file-scoped stacked layout');
+      }
+      // A PER-ROW 🗑 delete on every session list/picker — same as JetBrains' Sessions
+      // pane: remove a cluttering session straight from the list without connecting to it first. Source-
+      // read like the Continue-delete above so the wiring is verified without a bundle rebuild. Every
+      // surface routes through the ONE shared body `confirmAndDeleteSession` (verbatim the Agent-tab
+      // confirm text + pinned-fallback), so the four affordances can never drift.
+      {
+        const src = fs.readFileSync(path.resolve(__dirname, '../src/extension.ts'), 'utf8');
+        // The shared body + its QuickPick trash button.
+        assert.match(src, /const deleteSessionBtn: vscode\.QuickInputButton = \{ iconPath: new vscode\.ThemeIcon\('trash'\)/,
+          'the QuickPick per-row delete uses a trash ThemeIcon button');
+        assert.match(src, /async function confirmAndDeleteSession\(id: string\): Promise<string \| null>/,
+          'the shared confirm+delete body exists');
+        assert.match(src, /confirmAndDeleteSession[\s\S]{0,1200}modal: true[\s\S]{0,300}NOT deleted[\s\S]{0,700}--undelete \$\{id\} lists the session again, without its edits/,
+          '…behind a modal confirm that says the transcript is NOT deleted and what the undelete command brings back');
+        assert.doesNotMatch(src, /[Rr]estore it any time|restore with:? +oak sessions --undelete/, 'no delete surface promises undelete restores the edits');
+        assert.match(src, /core\.deleteSession\(id, \{ confirmedPending: pending, seenThrough \}\);[\s\S]{0,300}showErrorMessage[\s\S]{0,300}pinned === id[\s\S]{0,200}sessions\[0\]\?\.id[\s\S]{0,120}pinSession/,
+          '…deletes through core.deleteSession, says so when core refuses, and re-pins the newest remaining when the pinned one is deleted');
+        // Surface B — the Overview Sessions tab rows (the direct JetBrains parity target).
+        assert.match(src, /data-sess-del="'\+esc\(r\.id\)\+'"[\s\S]{0,400}🗑<\/button>/,
+          'each Overview Sessions-tab row carries a 🗑 delete button');
+        assert.match(src, /querySelectorAll\('\[data-sess-del\]'\)[\s\S]{0,240}type:'deleteSession', id:this\.getAttribute\('data-sess-del'\)/,
+          '…which posts the deleteSession gesture with the row id');
+        assert.match(src, /m\.type === 'deleteSession' && typeof m\.id === 'string'\)\s*\n\s*void confirmAndDeleteSession\(m\.id\)/,
+          'the Overview host handler deletes through the shared body');
+        // Surface A — the Timeline top selector dropdown rows.
+        assert.match(src, /data-sdel="'\+esc\(s\.id\)\+'"[\s\S]{0,400}🗑<\/span>/,
+          'each Timeline selector row carries a 🗑 delete control');
+        assert.match(src, /closest\('\[data-sdel\]'\)[\s\S]{0,220}type:'deleteSession', id:del\.getAttribute\('data-sdel'\)/,
+          '…claimed before the row-switch so the click deletes rather than switches');
+        assert.match(src, /m\.type === 'deleteSession' && typeof m\.id === 'string' && m\.id\)[\s\S]{0,420}confirmAndDeleteSession\(id\)/,
+          'the Timeline host handler deletes through the shared body');
+        // Surface C — BOTH command-palette QuickPicks (switchSession + switchActiveSession).
+        assert.equal((src.match(/buttons: r\.storeBytes \? \[revealStoreBtn, deleteSessionBtn\] : \[deleteSessionBtn\]/g) || []).length, 2,
+          'both session QuickPicks give every row the delete button');
+        assert.equal((src.match(/e\.button !== deleteSessionBtn\) \{ revealStoreFolder\(it\.id\); return; \}[\s\S]{0,200}confirmAndDeleteSession\(it\.id\)[\s\S]{0,140}qp\.items = qp\.items\.filter/g) || []).length, 2,
+          'both QuickPicks confirm+delete on the trash button and drop the row from the live list');
+      }
+      // The delete itself, driven from a Timeline row: the confirm names the edits still pending review and
+      // says undelete lists the session again without them; the edits it named are purged with the session;
+      // an edit that lands while the confirm is open is refused, not purged unseen (the
+      // confirm promised a restore, and purged pending edits with no guard).
+      {
+        // Its own file and sessions (each with a transcript, so the listing names it as it names a real
+        // one), removed after, so no later count or file memory sees them.
+        const DF = path.join(ws, 'delete-fixture.txt');
+        const seed = (id, status) => {
+          const transcript = path.join(proj, `${id}.jsonl`);
+          if (!fs.existsSync(transcript)) fs.writeFileSync(transcript, [JSON.stringify({ type: 'ai-title', aiTitle: `Delete fixture ${id}` }),
+            JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'edited the delete fixture' }] } })].join('\n') + '\n');
+          core.ensureStore(id);
+          core.appendLog(id, { id: core.nextId(id), ts: Date.now(), tool: 'Edit', file: DF, status,
+            beforeBlob: core.writeBlob(id, Buffer.from('a\n')), afterBlob: core.writeBlob(id, Buffer.from('b\n')) });
+        };
+        const asked = [], errors = [];
+        const warn = vscode.window.showWarningMessage, err = vscode.window.showErrorMessage;
+        let whileOpen = null;
+        vscode.window.showWarningMessage = (m, opts, ...items) => { asked.push({ detail: opts.detail, items }); whileOpen?.(); return Promise.resolve(items[0]); };
+        vscode.window.showErrorMessage = (m) => { errors.push(String(m)); return Promise.resolve(undefined); };
+        const settle = async (cond) => { for (let i = 0; i < 1500 && !cond(); i++) await new Promise((r) => setTimeout(r, 10)); };
+        try {
+          seed('fixture-del-pending', 'pending'); seed('fixture-del-pending', 'pending');
+          tlMsg({ type: 'deleteSession', id: 'fixture-del-pending' });
+          await settle(() => core.isSessionHidden('fixture-del-pending'));
+          assert.equal(asked.length, 1, 'one confirm');
+          assert.match(asked[0].detail, /purges its captured edits for good\.\n\n2 of those edits are still pending review: the purge drops their before-snapshots, so OAK can no longer undo those changes\./);
+          assert.match(asked[0].detail, /\n\noak sessions --undelete fixture-del-pending lists the session again, without its edits\.$/);
+          assert.deepEqual(asked[0].items, ['Delete and purge 2 pending edits'], 'the button names what it purges');
+          assert.ok(!fs.existsSync(core.storeDir('fixture-del-pending')), 'confirmed, the session goes with the edits it named');
+          // Nothing pending when asked; the agent writes one while the confirm is open.
+          seed('fixture-del-late', 'kept');
+          whileOpen = () => seed('fixture-del-late', 'pending');
+          tlMsg({ type: 'deleteSession', id: 'fixture-del-late' });
+          await settle(() => errors.length > 0);
+          assert.deepEqual(asked[1].items, ['Delete'], 'control: nothing was pending when asked');
+          assert.match(errors[0], /^OAK: could not delete “.*” — fixture-del-late has 1 edit pending review; deleting the session would purge it for good, so it was not deleted$/);
+          assert.ok(!core.isSessionHidden('fixture-del-late') && core.readLog('fixture-del-late').length === 2, 'the edit that arrived is kept, and the session with it');
+          // Two pending when asked, and the agent writes a third while the confirm is open: the confirm named
+          // two, so the third is refused too, not purged with them.
+          seed('fixture-del-more', 'pending'); seed('fixture-del-more', 'pending');
+          whileOpen = () => seed('fixture-del-more', 'pending');
+          tlMsg({ type: 'deleteSession', id: 'fixture-del-more' });
+          await settle(() => errors.length > 1);
+          assert.deepEqual(asked[2].items, ['Delete and purge 2 pending edits'], 'control: the confirm named two');
+          assert.match(errors[1], /^OAK: could not delete “.*” — fixture-del-more has 3 edits pending review, more than the 2 this delete confirmed; deleting the session would purge the rest unseen, so it was not deleted$/);
+          assert.ok(!core.isSessionHidden('fixture-del-more') && core.readLog('fixture-del-more').length === 3, 'all three edits are kept, and the session with them');
+          // Two changes pending when asked, and the agent rewrites the lines of one of them again, in the same
+          // ask, while the confirm is open: that edit JOINS the change, so the count stays at the two the confirm
+          // named, and the delete refuses it as newer than the newest edit of the listing the confirm counted from
+          // (it was purged unseen).
+          const JF = path.join(ws, 'delete-join-fixture.py');
+          const join = (before, after) => core.appendLog('fixture-del-join', { id: core.nextId('fixture-del-join'), ts: Date.now(), tool: 'Edit', file: JF,
+            status: 'pending', promptId: 'ask-1', beforeBlob: core.writeBlob('fixture-del-join', Buffer.from(before)), afterBlob: core.writeBlob('fixture-del-join', Buffer.from(after)) });
+          seed('fixture-del-join', 'pending'); join('def f():\n    return 1\n', 'def f():\n    return 2\n');
+          whileOpen = () => join('def f():\n    return 2\n', 'def f():\n    return 3\n');
+          tlMsg({ type: 'deleteSession', id: 'fixture-del-join' });
+          await settle(() => errors.length > 2 || core.isSessionHidden('fixture-del-join'));
+          assert.deepEqual(asked[3].items, ['Delete and purge 2 pending edits'], 'control: the confirm named two');
+          assert.match(errors[2] ?? 'deleted', /^OAK: could not delete “.*” — fixture-del-join captured an edit after the listing this delete was confirmed from, still pending review; deleting the session would purge it unseen, so it was not deleted$/);
+          assert.equal(core.sessionCounts('fixture-del-join').pending, 2, 'control: the edit joined a change the confirm named, so the count did not move');
+          assert.ok(!core.isSessionHidden('fixture-del-join') && core.readLog('fixture-del-join').length === 3, 'all three edits are kept, and the session with them');
+        } finally {
+          vscode.window.showWarningMessage = warn;
+          vscode.window.showErrorMessage = err;
+          for (const id of ['fixture-del-pending', 'fixture-del-late', 'fixture-del-more', 'fixture-del-join']) { core.removeSession(id); core.unhideSession(id); fs.rmSync(path.join(proj, `${id}.jsonl`), { force: true }); }
+        }
+      }
       // A row ACTION runs its verb against the node — and a verb this row does not offer is refused,
       // which is what stops a webview naming any command it likes.
       posts.length = 0;
       tlMsg({ type: 'children', tab: 'observations', key: runRow.key });
       const editRows = posts.find((m) => m.type === 'rows' && m.parent === runRow.key).rows;
       assert.equal(editRows.length, 2, 'the run expands to its per-edit rows');
+      assert.ok(editRows.some((r) => r.desc.endsWith(` · ${LONG_WHY}`)), 'the Observations row carries the whole reasoning line, which its column wraps');
       assert.deepEqual(editRows[0].acts.map((a) => a.v), ['keep', 'undo', 'analyzeEdit', 'chatEdit', 'openFile'],
         'each edit row carries the actions its tree row had inline');
       {
@@ -997,7 +1387,8 @@ test('extension: three views, click commands, inline annotations, chat, status s
         tlProvider.refresh(true);
         tlView.visible = false;
         if (wasBin === undefined) delete process.env.CLAUDE_OBSERVATORY_BIN; else process.env.CLAUDE_OBSERVATORY_BIN = wasBin;
-        assert.ok(posts.some((m) => m.type === 'sessions'), 'the refresh ran');
+        for (let i = 0; i < 100 && !posts.some((m) => m.type === 'sessions'); i++) await new Promise(r => setTimeout(r, 10));
+        assert.ok(posts.some((m) => m.type === 'sessions'), 'the CLI listing replied asynchronously');
         assert.ok(!posts.some((m) => m.type === 'rows'), '…and built no feed for a tab that is off screen');
       }
       // A Claude-generated recap or edit analysis has to REPAINT. Dropping the provider's memo used to be
@@ -1009,6 +1400,60 @@ test('extension: three views, click commands, inline annotations, chat, status s
           'analyzing an edit repaints the window that draws the row');
         assert.match(src, /await core\.analyzeRecap\(s[\s\S]{0,500}?promptsProvider\.refresh\(true\)/,
           '…and so does refreshing the recap');
+      }
+
+      // ---- 0.10.0: the Feed carries the session conversation and Overview selections --------
+      {
+        const html = tlView.webview.html;
+        // Same dump hook as the other panels (below): the timeline page is where the Feed tab
+        // lives, and a layout probe needs ITS shipped markup too.
+        if (process.env.OBS_DUMP_HTML) {
+          fs.mkdirSync(process.env.OBS_DUMP_HTML, { recursive: true });
+          fs.writeFileSync(path.join(process.env.OBS_DUMP_HTML, 'timeline.html'), String(html));
+        }
+        assert.ok(/id="tl-pane-feed"/.test(html) && /\['feed','Feed'\]/.test(html), 'the Feed tab carries it');
+        assert.ok(!/\['conversation','Conversation'\]/.test(html) && !/id="tl-pane-conversation"/.test(html), 'the Conversation tab is gone — the Feed is the one conversation surface (2026-09-23)');
+        assert.ok(/e\.kind==='reasoning'/.test(html) && /tlf-verb agent/.test(html), 'the feed renderer draws the agent’s own words as rows (said · thinking)');
+        // The blob renderer survived the fold-in whole: verb + target, shell calls as shell calls,
+        // marks by shape, reasoning only where it changed, the full command never clipped.
+        assert.ok(/function feedEntryHtml/.test(html), 'the feed blob renderer lives on for the head');
+        assert.ok(/e\.category==='exec'/.test(html) && /tlf-verb exec/.test(html), 'a shell call renders as a shell call, from core’s category');
+        assert.ok(/e\.ok===false/.test(html) && /tlf-mark err/.test(html) && /tlf-mark pend/.test(html), 'marks render by shape: error, ok, pending permission');
+        assert.ok(/e\.reasoning && e\.reasoning!==prevReasoning/.test(html), 'reasoning renders only where it CHANGED');
+        assert.ok(/reasoningKind==='thinking'/.test(html), '…labelled thinking vs said from core’s reasoningKind');
+        assert.ok(/e\.cmd && e\.cmd!==e\.target/.test(html), 'an open exec blob shows the full multi-line command');
+        assert.ok(/e\.kind==='output'/.test(html) && /tlf-out/.test(html), 'raw output lines render monospace, with no fabricated timestamp');
+        assert.ok(/FCLOSED/.test(html), 'head blobs keep their fold set');
+        assert.ok(/id="rq-swait"/.test(html), 'the session selector carries attention');
+        assert.ok(/function shellHtml/.test(html) && /tlf-sh-prog/.test(html) && /tlf-sh-flag/.test(html) && /tlf-sh-str/.test(html) && /tlf-sh-op/.test(html),
+          'shell commands are tokenized: program, flags, strings, operators');
+        // Markdown in the prose — the core tokenizer's webview face, tables
+        // included.
+        assert.ok(/function mdSpansHtml/.test(html) && /function mdHtml/.test(html), 'the markdown renderer ships');
+        assert.ok(/function mdIsTRow/.test(html) && /tla-mdt/.test(html) && /\.tla-mdt th/.test(html),
+          'pipe rows build a real styled table');
+        assert.ok(/AGPATCH/.test(html) && /\.tlf-dl\.add/.test(html) && /\.tlf-dl\.rem/.test(html) && /\.tlf-dl\.hunk/.test(html),
+          'inline diff lines carry add/remove bands and hunk styling');
+        assert.ok(/\.tlf-dl\.add \{ background: var\(--vscode-diffEditor-insertedTextBackground/.test(html)
+          && /\.tlf-dl\.rem \{ background: var\(--vscode-diffEditor-removedTextBackground/.test(html),
+          'diff add/remove render as background bands');
+        assert.ok(/\.tlf-blob \{ border:1px solid/.test(html), 'head entries are bordered blocks');
+        assert.ok(/more line/.test(html) && /view the full diff/.test(html), 'the inline diff is bounded, with a door to the full diff');
+        assert.ok(/'agentOpenEditFile'/.test(html) && /data-openedit/.test(html), 'a head edit item opens that file’s changes stacked');
+        assert.ok(/'agentOpenEdit'/.test(html) && /data-edit/.test(html), 'a head blob with an edit id links to its diff');
+        assert.ok(/type:'openPath'/.test(html) && /data-openpath/.test(html), 'any path-like target opens the file');
+        assert.ok(!/tla-said/.test(html), 'the pinned said block is GONE — the transcript itself ends with what the agent said');
+        // Host side: the patches are built in-process; the fetch passes --root and BOTH depth flags.
+        const fb2 = fs.readFileSync(BUNDLE, 'utf8');
+        assert.ok(/coloredDiff\(session, rec, false\)/.test(fb2) && /buildFeedPatches/.test(fb2), 'the host rides bounded patches on the head payload');
+        assert.ok(/"--feed-limit"/.test(fb2) && /"--root"/.test(fb2), 'the head fetch passes --root and --feed-limit');
+        // Executable: a NON-SESSION Overview pick rides the head ref; ✕ clears it. (The view is
+        // hidden here, so the follow spawns nothing — the fetch gate is the same as ever.)
+        posts.length = 0;
+        tlProvider.followHead({ kind: 'process', id: 'bg123', label: 'test shell' });
+        assert.ok(tlProvider.headRef && tlProvider.headRef.kind === 'process' && tlProvider.headRef.id === 'bg123', 'the head follows the pick');
+        tlMsg({ type: 'agentHeadClear' });
+        assert.equal(tlProvider.headRef, null, 'the chip’s ✕ clears back to the connected session');
       }
     }
 
@@ -1034,7 +1479,34 @@ test('extension: three views, click commands, inline annotations, chat, status s
     assert.ok(scMsgs.some((m) => m.type === 'counts' && m.c.pending === 2 && m.c.kept === 0 && m.c.undone === 0),
       'stats posts the live review counts (2 pending, 0 accepted, 0 reverted)');
     assert.match(stView.webview.html, /Gathering stats/i, 'stats placeholder present until the scan returns');
-    assert.match(stView.webview.html, /id="ustale"/, 'stale-cache hint present (panel-only sessions)');
+    // 2026-09-08: the stale banner moved onto the usage section's TOOLTIP; the ↻ beside the
+    // title is the manual pull, wired through the one usageRefresh command.
+    assert.doesNotMatch(stView.webview.html, /id="ustale"/, 'the stale-cache banner is gone — its story rides the section tooltip');
+    assert.match(stView.webview.html, /id="uref"/, 'the manual refresh sits beside the Usage title');
+    assert.match(stView.webview.html, /type:'usageRefresh'/, '…and posts the refresh message');
+    // The `$` row prices the month at list prices and projects it over the whole month: both figures are
+    // estimates, and each carries `~` on either tab (the projected total had none).
+    for (const [utab, u, want] of [
+      ['claude', { monthTokens: 1200000, monthTokensTotal: 4000000, monthCost: 18, monthCostTotal: 40 }, ['~$18.00', '~$40.00']],
+      ['gpt', { gptWeekPct: 30, gptMonthTok: 900000, gptMonthTokTotal: 3000000, gptMonthCost: 12.5, gptMonthCostTotal: 41 }, ['~$12.50', '~$41.00']],
+    ]) {
+      const vm = require('node:vm');
+      const els = new Map();
+      const mk = () => ({ textContent: '', innerHTML: '', style: {}, parentElement: { style: {} }, addEventListener() {},
+        classList: { toggle() {}, add() {}, remove() {} }, querySelector: () => mk(), getAttribute: () => null, setAttribute() {},
+        getBoundingClientRect: () => ({ left: 0, top: 0, width: 100, height: 40 }) });
+      const elFor = (id) => { if (!els.has(id)) els.set(id, mk()); return els.get(id); };
+      let listener = null;
+      const sandbox = { console, setInterval: () => 0, clearInterval() {}, setTimeout: () => 0, clearTimeout() {},
+        window: { addEventListener: (t, cb) => { if (t === 'message') listener = cb; } },
+        document: { getElementById: elFor, querySelectorAll: () => [], querySelector: () => null, addEventListener() {}, body: elFor('body') },
+        acquireVsCodeApi: () => ({ postMessage() {}, getState: () => ({ utab }), setState() {} }) };
+      vm.createContext(sandbox);
+      const scripts = [...stView.webview.html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g)];
+      vm.runInContext(scripts[scripts.length - 1][1], sandbox);
+      listener({ data: { type: 'usage', u } });
+      assert.deepEqual([elFor('uc1-$').textContent, elFor('uc2-$').textContent], want, `${utab}: the $ row's spent and projected total are both marked estimates`);
+    }
     // 0.8.7: the context-per-turn chart is GONE (core no longer emits the series) — and so is its scaffolding.
     assert.ok(!/tk-fill|renderFill|class="spark"/.test(stView.webview.html), 'the context-per-turn chart and its scaffolding are removed');
     assert.match(stView.webview.html, /id="nb-model"/, 'the model / effort chip stays (it is not part of the removed chart)');
@@ -1084,18 +1556,8 @@ test('extension: three views, click commands, inline annotations, chat, status s
       '…and a draggable gutter sits between the panes');
     assert.ok(/navW:NAV_W, navH:NAV_H/.test(cmView.webview.html) && /--ov-navv/.test(cmView.webview.html),
       '…and the split is remembered per axis (a nav WIDTH side by side, a nav HEIGHT stacked)');
-    // LEFT NAV: the Fleet · Workflows sub-tabs + item list.
-    // EVERY class a webview's own script emits must have a rule in that webview's own stylesheet.
-    // These are two separate documents with two separate <style> blocks, so a rule declared in the
-    // wrong one reads perfectly in the source and paints nothing: the machine highlight shipped that
-    // way — `.mt-smc.away` sat in the Timeline shell while only the Overview emits `mt-smc`, and the
-    // Sessions tab painted every machine the same grey.
-    for (const cls of ['mt-smc', 'mt-smc.away', 'mt-smc.bridged', 'mt-smc.bad']) {
-      assert.ok(cmView.webview.html.includes('.' + cls + ' '),
-        `Overview stylesheet is missing a rule for .${cls} — the class it emits would paint nothing`);
-    }
-    assert.match(cmView.webview.html, /id="ov-navtabs"/, 'Overview: left-nav sub-tab bar present (Fleet · Workflows)');
-    assert.ok(/'Fleet'/.test(cmView.webview.html) && /'Workflows'/.test(cmView.webview.html), 'the left nav labels Fleet/Workflows');
+    assert.match(cmView.webview.html, /id="ov-navtabs"/, 'Overview: left-nav sub-tab bar present (Workers · Workflows)');
+    assert.ok(/'Workers'/.test(cmView.webview.html) && /'Workflows'/.test(cmView.webview.html), 'the left nav labels Workers/Workflows');
     assert.ok(/renderNavTabs/.test(cmView.webview.html) && /function applyPanes/.test(cmView.webview.html), 'switching a nav tab toggles panes (renderNavTabs/applyPanes)');
     assert.match(cmView.webview.html, /id="ov-fleet"/, 'Overview: the Fleet list container is present');
     assert.match(cmView.webview.html, /id="ov-workflows"/, 'Overview: the Workflows list container is present');
@@ -1239,7 +1701,7 @@ test('extension: three views, click commands, inline annotations, chat, status s
     assert.equal(rqProvider.selection, 'abc123', 'the host records the picked ask');
     rqMsgHandler({ type: 'select', id: null });
     assert.equal(rqProvider.selection, null, '…and drops it again');
-    // 0.8.7: each row expands to review Claude's reply — a caret that toggles the response, fetched
+    // 0.8.7: each row expands to review the agent's reply — a caret that toggles the response, fetched
     // lazily from the host (the prose can be large, so it never rides the list payload) and rendered
     // wrapped, never clipped. The caret must NOT change the scope selection.
     assert.ok(/class="rq-exp/.test(rqView.webview.html) && /function toggleResp/.test(rqView.webview.html), 'each row has an expand-response caret');
@@ -1252,7 +1714,7 @@ test('extension: three views, click commands, inline annotations, chat, status s
     assert.ok(!/id="ov-pane-requests"/.test(cmView.webview.html) && !/id="ov-pane-prompts"/.test(cmView.webview.html),
       'the Overview has no prompts tab (it is a window)');
     assert.ok(/var ids=\['sessions','fleet','workflows','tasks','processes'\]/.test(cmView.webview.html),
-      'the Overview’s panes are Sessions · Fleet · Workflows · Tasks · Processes — Sessions leads, since which session you are reviewing precedes every other question');
+      'the Overview’s panes are Sessions · Workers · Workflows · Tasks · Processes — Sessions leads, since which session you are reviewing precedes every other question');
     assert.ok(/NAV='sessions'/.test(cmView.webview.html), 'and the panel opens on it');
     assert.ok(/id="ov-pane-sessions"/.test(cmView.webview.html) && /function renderSessions/.test(cmView.webview.html),
       'the Sessions tab renders this workspace’s sessions');
@@ -1312,29 +1774,26 @@ test('extension: three views, click commands, inline annotations, chat, status s
     // The bottom summary names the picked ask — and since core aggregates its files/folders, it reports them.
     assert.ok(/rq\.rollup\.pending/.test(cmView.webview.html) && /\(rq\.files\|\|\[\]\)\.length/.test(cmView.webview.html),
       'the bottom summary names the ask with its own review counts, files and folders');
-    // 0.8.7 (4) the FEED pane: core's `mode` decides whether it is a live tail or a finished audit log,
-    // and only a live one keeps being fetched — on the panel's EXISTING refresh tick, never a new timer.
-    assert.match(cmView.webview.html, /id="ov-feed"/, 'Overview: the live-feed / audit-log pane is present');
-    assert.ok(/function renderFeed/.test(cmView.webview.html) && /mode==='live'/.test(cmView.webview.html) && /audit log/.test(cmView.webview.html),
-      'the pane labels itself live or audit from core’s mode');
-    assert.ok(/updated '\+ago\(f\.lastTs\)/.test(cmView.webview.html), 'a live feed shows the age of the newest evidence, never a claim of realtime');
-    assert.ok(/earlier entr/.test(cmView.webview.html), 'a truncated feed says how many earlier entries are not shown');
-    assert.ok(/e\.kind==='output'/.test(cmView.webview.html) && /ov-fout/.test(cmView.webview.html), 'raw output lines render monospace, with no fabricated timestamp');
-    assert.ok(/e\.ok===false/.test(cmView.webview.html) && /f\.note/.test(cmView.webview.html), 'failed rows are marked and core’s note explains an empty feed');
-    assert.ok(!/setInterval|setTimeout\(function\(\)\{ *vscode\.postMessage\(\{type:'feed'/.test(cmView.webview.html), 'the feed adds no polling timer of its own');
-    // 0.8.7 review (P3): one failed spawn (an older CLI on PATH) must not permanently disable the only
-    // re-fetch. Only a GOOD 'audit' answer stops the polling; an explicit Refresh always re-attempts.
+    // 0.10.0: the feed pane MOVED to the Timeline's Feed tab — the Overview must not carry it any more,
+    // and the change map takes the whole detail height. Its assertions live in the Feed-tab block below.
+    assert.ok(!/id="ov-feed"/.test(cmView.webview.html), 'Overview: the below-map feed pane is GONE (it lives in the Timeline now)');
+    assert.ok(!/function renderFeed/.test(cmView.webview.html) && !/FEEDDATA/.test(cmView.webview.html),
+      '…and none of its renderer survives in the Overview script');
+    assert.ok(/function setFeed/.test(cmView.webview.html) && /type:'feed', kind:FEED\.kind, id:FEED\.id, label:FEED\.label/.test(cmView.webview.html),
+      'the Overview still NAMES the subject (setFeed posts kind/id/label for the row highlights + the Timeline)');
+    // 0.8.7 review (P3), carried across every move (now the Feed tab's fetch): one failed
+    // spawn (an older CLI on PATH) must not permanently disable the only re-fetch. Only a GOOD
+    // 'audit' answer stops the polling; a forced refresh always re-attempts.
     const bundleSrc = fs.readFileSync(BUNDLE, 'utf8');
     assert.ok(!/feedLive/.test(bundleSrc), 'the "is it live" latch a failed fetch could never clear is gone');
-    assert.ok(/feedSettled = ok && d\.mode === "audit"/.test(bundleSrc), 'only a fetch that landed and reported audit settles the feed');
-    assert.ok(/this\.feedRef && \(force \|\| !this\.feedSettled\)/.test(bundleSrc), 'live feeds, failed fetches and an explicit Refresh all re-attempt');
-    assert.ok(/registerCommand\("claudeObservatory\.refresh", \(\) => refreshAll\(true\)\)/.test(bundleSrc), 'the Refresh command forces — a pane stuck on a failed spawn is recoverable from the UI');
-    // 0.8.7 review (P4): the pane repaints on the panel's tick, but an UNCHANGED payload must not rebuild
-    // the body (that discards scroll + selection), and a live tail follows only when it actually grew.
-    assert.ok(/function feedShell/.test(cmView.webview.html) && /if\(!host\.querySelector\('\.ov-fbody'\)\) feedShell\(host\)/.test(cmView.webview.html),
-      'the feed shell is built once per selection, not on every tick');
-    assert.ok(/if\(h===FEED_BODY\) return;/.test(cmView.webview.html), 'an identical payload skips the repaint entirely');
-    assert.ok(/if\(live && rows>FEED_ROWS\) body\.scrollTop=body\.scrollHeight;/.test(cmView.webview.html), 'a live tail is followed only when the row count GREW');
+    assert.ok(/agentFeedSettled = ok && d\.mode === "audit"/.test(bundleSrc), 'only a fetch that landed and reported audit settles the head');
+    assert.ok(/force && this\.agentFeedKey === key && this\.agentFeedSettled/.test(bundleSrc), 'live heads, failed fetches and a forced refresh all re-attempt');
+    // The Refresh command FORCES (a pane stuck on a failed spawn is recoverable from the UI) AND sweeps a
+    // newly-added `.observatoryignore` first — a USER refresh is the safe place to apply it, since adding
+    // the file fires no capture hook so the capture-time sweep never runs. Both live
+    // in the one handler now; the sweep (`dropIgnored`) precedes the forced re-read (`refreshAll(true)`).
+    assert.match(bundleSrc, /registerCommand\("claudeObservatory\.refresh", \(\) => \{[\s\S]{0,300}?core\.dropIgnored\(s\)[\s\S]{0,160}?refreshAll\(true\)/,
+      'the Refresh command sweeps .observatoryignore then forces a re-read');
     // 0.8.8: the ribbon (and its compaction anchoring) is gone — compactions live in Actions + Stats.
     assert.ok(!/afterChapterId|afterSubtaskId/.test(cmView.webview.html), 'no ribbon compaction anchoring remains (the field shipped as afterChapterId)');
     // 0.8.7: the one footprint fact worth a glance survives on the fleet row — that the session reached
@@ -1357,8 +1816,18 @@ test('extension: three views, click commands, inline annotations, chat, status s
     cmView.webview.postMessage = (m) => cmMsgs.push(m);
     cmProvider.refresh();
     assert.equal(cmMsgs.length, 0, 'a hidden Overview does not spawn the CLI or post');
-    cmMsgHandler({ type: 'feed', kind: 'process', id: 'bg123' });
-    assert.equal(cmMsgs.length, 0, 'a hidden Overview does not fetch a feed either');
+    // A feed pick no longer fetches HERE at all — it routes to whoever activate() wired as the
+    // listener (the Timeline provider). Asserted by spy: the ref crosses with kind, id AND label.
+    {
+      const crossed = [];
+      cmProvider.onFeedSelect = (ref) => crossed.push(ref);
+      cmMsgHandler({ type: 'feed', kind: 'process', id: 'bg123', label: 'test shell' });
+      cmMsgHandler({ type: 'feed' }); // the bare form = a session switch cleared the subject
+      assert.deepStrictEqual(crossed, [{ kind: 'process', id: 'bg123', label: 'test shell' }, null],
+        'a feed pick crosses to the host listener with its label; the bare form crosses as null');
+      cmProvider.onFeedSelect = undefined;
+      assert.equal(cmMsgs.length, 0, 'and the Overview itself spawns and posts nothing for it');
+    }
     cmProvider.postError();
     assert.ok(cmMsgs.some((m) => m.type === 'error'), 'a failed Overview scan posts the CLI-missing hint');
     assert.ok(typeof cmMsgHandler === 'function', 'the Overview registered a message handler');
@@ -1441,7 +1910,10 @@ test('extension: three views, click commands, inline annotations, chat, status s
     // Keep, Undo, Accept File, Reject File, Spotlight, Search — the compact step-through controls, next to
     // the session selector, each posting to the existing nav commands.
     for (const id of ['ov-fileprev', 'ov-filecount', 'ov-filenext', 'ov-diffprev', 'ov-diffcount', 'ov-diffnext',
-      'ov-navkeep', 'ov-navundo', 'ov-acceptfile', 'ov-rejectfile', 'ov-spotlight', 'ov-search']) {
+      'ov-navkeep', 'ov-navundo', 'ov-acceptfile', 'ov-rejectfile', 'ov-spotlight',
+      // the inline filter/sort chrome: a search FIELD (not a button), the filter dropdown with its
+      // state label, and the sort button with the mode in its label
+      'ov-search-input', 'ov-filterdrop', 'ov-filter-lbl', 'ov-sort-lbl']) {
       assert.ok(cmView.webview.html.includes(`id="${id}"`), `Overview title bar carries the nav-bar control ${id}`);
     }
     assert.ok(/renderNavPos/.test(cmView.webview.html), 'the Diff n/m · File i/k position counters render from the pushed NAVPOS');
@@ -1556,9 +2028,10 @@ test('extension: three views, click commands, inline annotations, chat, status s
           querySelectorAll: () => [], querySelector: () => null, body: mkEl(), documentElement: mkEl(),
         };
         const saved = []; // every vscode.setState — this panel's layout is what it persists
+        const posts = []; // every message the page posts to the host — what a click actually asks for
         const sandbox = {
           window: winStub, document: docStub, console,
-          acquireVsCodeApi: () => ({ postMessage() {}, getState: () => persisted || null, setState: (s) => saved.push(s) }),
+          acquireVsCodeApi: () => ({ postMessage: (m) => posts.push(m), getState: () => persisted || null, setState: (s) => saved.push(s) }),
           URLSearchParams, JSON, Math, Date, String, Number, Array, Object, RegExp, parseInt, parseFloat, isFinite, NaN, Infinity, undefined,
           getComputedStyle: () => ({ getPropertyValue: () => '' }),
           ResizeObserver: class { observe() {} unobserve() {} disconnect() {} },
@@ -1578,7 +2051,7 @@ test('extension: three views, click commands, inline annotations, chat, status s
           assert.ok(cb, `the stub node has a ${type} handler to fire`);
           return cb.call(node, ev || { target: node, stopPropagation() {}, preventDefault() {} });
         };
-        return { elFor, fire, saved, post: (data) => msgListener({ data }) };
+        return { elFor, fire, saved, posts, post: (data) => msgListener({ data }) };
       };
       const solo = runOverview(null);
       const elFor = solo.elFor;
@@ -1622,6 +2095,34 @@ test('extension: three views, click commands, inline annotations, chat, status s
         surfaces: [{ label: 'Extension', version: '0.9.5', reason: 'pending reload' }] } });
       assert.match(elFor('ov-vermenu').innerHTML, /Extension<\/span><span class="vm-ver">v0\.9\.5 · pending reload/, 'an installed-but-not-loaded build is named as such');
 
+      // ---- Marketplace stand-down: classify how THIS install got here, from the editor's own registry --
+      // The self-updater stands down when a marketplace manages the install, so it doesn't
+      // fight the gallery over one extension. That hinges on classifyInstallSource reading
+      // <extensionsDir>/extensions.json correctly; pin it against real fixtures. Anything it cannot
+      // read maps to 'unknown' = the pre-marketplace status quo (self-updater active).
+      {
+        const reg = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-extreg-'));
+        const ID = 'cell-observatory.oak-observatory-vscode', VER = '0.10.0-dev.0', BASE = 'cell-observatory.oak-observatory-vscode-0.10.0-dev.0';
+        const write = (entries) => fs.writeFileSync(path.join(reg, 'extensions.json'), JSON.stringify(entries));
+        // Matched by relativeLocation → gallery / vsix reported verbatim.
+        write([{ identifier: { id: ID }, version: VER, relativeLocation: BASE, metadata: { source: 'gallery', pinned: false } }]);
+        assert.equal(ext.classifyInstallSource(reg, BASE, ID, VER), 'gallery', 'a gallery-installed extension classifies as gallery');
+        write([{ identifier: { id: ID }, version: VER, relativeLocation: BASE, metadata: { source: 'vsix', pinned: true } }]);
+        assert.equal(ext.classifyInstallSource(reg, BASE, ID, VER), 'vsix', 'a sideloaded .vsix classifies as vsix');
+        // Fallback match by id+version when relativeLocation differs.
+        write([{ identifier: { id: ID }, version: VER, relativeLocation: 'somewhere-else', metadata: { source: 'gallery' } }]);
+        assert.equal(ext.classifyInstallSource(reg, BASE, ID, VER), 'gallery', 'falls back to id+version match');
+        // Fail-safe: our entry absent, unknown source, malformed JSON, missing file → unknown (= status quo).
+        write([{ identifier: { id: 'someone.else' }, version: '1.0.0', relativeLocation: 'x', metadata: { source: 'gallery' } }]);
+        assert.equal(ext.classifyInstallSource(reg, BASE, ID, VER), 'unknown', 'no matching entry → unknown');
+        write([{ identifier: { id: ID }, version: VER, relativeLocation: BASE, metadata: {} }]);
+        assert.equal(ext.classifyInstallSource(reg, BASE, ID, VER), 'unknown', 'a matched entry with no source → unknown');
+        fs.writeFileSync(path.join(reg, 'extensions.json'), 'not json{');
+        assert.equal(ext.classifyInstallSource(reg, BASE, ID, VER), 'unknown', 'malformed registry → unknown, never throws');
+        assert.equal(ext.classifyInstallSource(path.join(reg, 'nope'), BASE, ID, VER), 'unknown', 'missing registry → unknown, never throws');
+        fs.rmSync(reg, { recursive: true, force: true });
+      }
+
       // ---- 0.10.0: the grouped left nav, EXECUTED both ways -----------------------------------------
       // Five tabs or two group tabs of side-by-side columns, decided by one persisted value. Asserted by
       // running the shipped script rather than by reading its source: the hazard here is a column whose
@@ -1645,20 +2146,155 @@ test('extension: three views, click commands, inline annotations, chat, status s
       assert.equal((soloTabs.match(/class="ov-tab/g) || []).length, 5, 'ungrouped: the five member tabs, exactly as before');
       assert.doesNotMatch(soloTabs, /data-nav="g:/, 'and no group tab');
 
+      // Execute the built webview's workspace headers, zero stats, filters, folds and actions.
+      const workspacePayload = {
+        active: OVSESS,
+        sessions: [
+          { ...ovPayload(shells).sessions.sessions[0], workspace: '~/projects/app', origin: 'local' },
+          { id: 'older-local', workspace: '~/projects/app', title: 'Older local', lastActiveMs: Date.now() - 8*86400000, pending: 2, edits: 2 },
+          { id: 'other-local', workspace: '~/projects/tools', title: 'Native Codex title', agent: 'codex', lastActiveMs: Date.now(), edits: 0, tokens: 0, durationMs: 0, model: 'gpt-6' },
+          { id: 'quiet-local', workspace: '~/projects/tools', title: 'Quiet conversation', lastActiveMs: Date.now() - 2*86400000, edits: 0 },
+        ],
+      };
+      solo.post({ type: 'sessions', sessions: workspacePayload });
+      const workspaceHtml = elFor('ov-sessions').innerHTML;
+      assert.ok(workspaceHtml.indexOf('~/projects/app · 2 sessions') < workspaceHtml.indexOf('~/projects/tools · 2 sessions'));
+      assert.match(workspaceHtml, /0 edits · 0 tok · 0s/);
+      assert.match(workspaceHtml, /Native Codex title/);
+      assert.match(workspaceHtml, /1 older sessions/);
+      assert.match(workspaceHtml, /1 hidden by Active only/);
+      assert.doesNotMatch(workspaceHtml, /data-sess-switch="older-local"|data-sess-switch="quiet-local"|on build-box|mt-machine/);
+      for (const attr of ['data-sess-switch', 'data-conversation', 'data-sess-del'])
+        assert.match(workspaceHtml, new RegExp(attr+'="other-local"'), 'row actions survive grouping');
+      assert.match(elFor('ov-navtabs').innerHTML, /2\/4/);
+      const allSessions = runOverview({ activeOnly: false });
+      allSessions.post({ type: 'sessions', sessions: workspacePayload });
+      assert.match(allSessions.elFor('ov-sessions').innerHTML, /data-sess-switch="quiet-local"/);
+      assert.doesNotMatch(allSessions.elFor('ov-sessions').innerHTML, /hidden by Active only/);
+      // Every refresh tick posts a payload, and each one re-rendered the list. A payload that changes
+      // nothing must leave the rendered rows alone: a rebuild between a click's press and its release
+      // swallowed the click.
+      {
+        const host = elFor('ov-sessions');
+        let html = host.innerHTML, writes = 0;
+        Object.defineProperty(host, 'innerHTML', { configurable: true, get: () => html, set: (v) => { writes++; html = v; } });
+        solo.post({ type: 'sessions', sessions: workspacePayload });
+        solo.post({ ...ovPayload(shells), sessions: workspacePayload });
+        assert.equal(writes, 0, 'an unchanged listing is not rebuilt, by a sessions payload or an overview payload');
+        solo.post({ type: 'sessions', sessions: { ...workspacePayload, sessions: workspacePayload.sessions.map((r) => (r.id === 'other-local' ? { ...r, title: 'Renamed conversation' } : r)) } });
+        assert.equal(writes, 1, 'control: a changed listing does repaint');
+        assert.match(html, /Renamed conversation/);
+        // A pinned session the listing lacks is explained. The listing spans every workspace on this
+        // machine, so it is never "another workspace's".
+        solo.post({ ...ovPayload(shells), session: 'ghostPin01', pinned: 'ghostPin01' });
+        assert.match(html, /reviewing ghostPin — not in this machine’s session list \(deleted, empty, or a copy mirrored from another machine\)/);
+        assert.doesNotMatch(html, /another workspace/);
+        solo.post(ovPayload(shells));
+        assert.doesNotMatch(html, /not in this machine’s session list/, 'control: a listed pin gets no such line');
+        delete host.innerHTML;
+        host.innerHTML = html;
+      }
+      if (process.env.SESSIONS_SCREENSHOT_DIR) fs.writeFileSync(path.join(process.env.SESSIONS_SCREENSHOT_DIR, 'sessions-after.html'), '<!doctype html><meta charset="utf-8">'+[...cmView.webview.html.matchAll(/<style[^>]*>[\s\S]*?<\/style>/gi)].map(x=>x[0]).join('')+'<body style="background:#181818;color:#ddd;width:1100px;font-family:system-ui,sans-serif">'+workspaceHtml+'</body>');
+
+      // ---- The store folder, EXECUTED end to end. A Sessions row's size and the
+      // toolbar's Store button run through the real page script to the message they post, then through
+      // the real host handler to the call that opens the folder. The stub's querySelectorAll answers []
+      // everywhere, so the row wiring never ran here: the Sessions host answers attribute selectors from
+      // its own markup — one stable node per match per render, what the script wires its handlers onto.
+      {
+        const sessHost = elFor('ov-sessions');
+        let qsHtml = null, qsCache = {};
+        sessHost.querySelectorAll = (sel) => {
+          const m = /^\[([\w-]+)\]$/.exec(sel);
+          if (!m) return [];
+          if (qsHtml !== sessHost.innerHTML) { qsHtml = sessHost.innerHTML; qsCache = {}; }
+          return qsCache[sel] || (qsCache[sel] = [...qsHtml.matchAll(new RegExp(m[1] + '="([^"]*)"', 'g'))].map((hit) => {
+            const node = mkEl();
+            node.getAttribute = (k) => (k === m[1] ? hit[1] : null);
+            return node;
+          }));
+        };
+        sessHost.querySelector = (sel) => sessHost.querySelectorAll(sel)[0] || null;
+        const storeDir = core.storeDir(S);
+        assert.ok(fs.existsSync(storeDir), 'control: the seeded session has a store folder on disk');
+        solo.post({ type: 'sessions', sessions: { active: S, sessions: [
+          { id: S, workspace: '~/projects/app', title: 'the seeded session', lastActiveMs: Date.now(), current: true, edits: 2, storeBytes: core.storeBytes(S), storePath: storeDir },
+        ] } });
+        const sizes = sessHost.querySelectorAll('[data-store]');
+        assert.equal(sizes.length, 1, 'the row renders its store size as a click target');
+        solo.posts.length = 0;
+        solo.fire(sizes[0], 'click');
+        assert.deepEqual(solo.posts, [{ type: 'openStore', id: S }], 'clicking the size asks the host to open THAT row’s store');
+        // A local window: the OS file manager opens the folder itself.
+        openExternalCalls.length = 0;
+        openFolderCalls.length = 0;
+        cmMsgHandler(solo.posts[0]);
+        // `.path` is the exact string handed to Uri.file — the mock's fsPath lower-cases a Windows drive letter.
+        assert.deepEqual(openExternalCalls.map((u) => [u.scheme, u.path]), [['file', storeDir]], 'locally, the store folder opens in the OS file manager');
+        assert.equal(openFolderCalls.length, 0, '…and no editor window opens');
+        // A remote window (Remote-SSH, WSL, a container): this extension runs on the remote host, so the
+        // store is there, and openExternal would hand the UI machine a vscode-remote:// URL that nothing
+        // opens — the reported failure. The folder opens in a new window on the remote host instead.
+        vscode.env.remoteName = 'ssh-remote';
+        try {
+          openExternalCalls.length = 0;
+          cmMsgHandler(solo.posts[0]);
+          assert.equal(openExternalCalls.length, 0, 'in a remote window nothing is handed to the local OS');
+          assert.equal(openFolderCalls.length, 1, 'the folder opens in an editor window instead');
+          const [uri, opts] = openFolderCalls[0];
+          assert.deepEqual([uri.scheme, uri.path], ['file', storeDir], '…on the store folder itself (the remote host maps file: to its own URI)');
+          assert.deepEqual(opts, { forceNewWindow: true, noRecentEntry: true }, '…in a NEW window, kept out of the recent list');
+        } finally {
+          vscode.env.remoteName = undefined;
+        }
+        // The toolbar's Store button names no row: it opens the reviewed session's store.
+        solo.posts.length = 0;
+        solo.fire(elFor('ov-store'), 'click');
+        assert.deepEqual(solo.posts, [{ type: 'openStore' }], 'the Store button posts openStore');
+        openExternalCalls.length = 0;
+        cmMsgHandler(solo.posts[0]);
+        assert.deepEqual(openExternalCalls.map((u) => u.path), [storeDir], '…which opens the reviewed session’s store folder');
+        // Never silent: a session with no folder yet, a row id that is not a session, and an open the
+        // platform refused each SAY so — and none of them throws out of the host handler.
+        const warnedBefore = warnMessages.length;
+        openExternalCalls.length = 0;
+        cmMsgHandler({ type: 'openStore', id: 'nostore01' });
+        assert.equal(openExternalCalls.length, 0, 'a session with no store folder opens nothing');
+        assert.match(warnMessages.slice(warnedBefore).join('\n'), /nostore0 has no store folder yet/, '…and says so');
+        assert.doesNotThrow(() => cmMsgHandler({ type: 'openStore', id: '../escape' }), 'an id that is not a session cannot throw out of the handler');
+        assert.equal(openExternalCalls.length, 0, '…nor open anything');
+        openExternalAnswer = false;
+        try {
+          cmMsgHandler({ type: 'openStore', id: S });
+          await new Promise((r) => setImmediate(r));
+          assert.match(warnMessages.slice(warnedBefore).join('\n'), /could not open the store folder/, 'an open the platform refused is reported');
+        } finally {
+          openExternalAnswer = true;
+        }
+      }
+      solo.post(ovPayload(shells));
+
+
+      // The harness DOM mints elements on demand (getElementById never fails here), so the one
+      // thing it can NOT catch is a missing container in the real page — which is exactly how
+      // the one-group change shipped blank: the skeleton still carried the two old group divs.
+      // Pin the STATIC html: the group container the script looks up must exist in the page.
+      assert.ok(cmView.webview.html.includes('id="ov-group-all"'), 'the page ships the one-group container the script renders into');
+      assert.ok(!cmView.webview.html.includes('id="ov-group-sf"') && !cmView.webview.html.includes('id="ov-group-wtp"'),
+        'and the two-group era containers are gone');
       const grouped = runOverview({ groupedNav: true });
       // pr:null on the FIRST payload — an older CLI, or the answer not back yet. The Processes column must
       // still be there (a tab that vanishes when the CLI cannot answer hides the failure), badge blank.
       grouped.post(ovPayload(null));
       const gTabs = grouped.elFor('ov-navtabs').innerHTML;
-      assert.equal((gTabs.match(/class="ov-tab/g) || []).length, 2, 'grouped: exactly two tabs');
-      assert.ok(gTabs.includes('>Sessions · Fleet<'), 'named Sessions · Fleet');
-      assert.ok(gTabs.includes('>Workflows · Tasks · Processes<'), '…and Workflows · Tasks · Processes');
-      const wtp = grouped.elFor('ov-group-wtp').innerHTML;
-      assert.equal((wtp.match(/class="ov-groupcol"/g) || []).length, 3, 'the Workflows·Tasks·Processes pane renders THREE columns');
-      for (const k of ['workflows', 'tasks', 'processes'])
+      // ONE group: every member side by side, never split into two tabs.
+      assert.equal((gTabs.match(/class="ov-tab/g) || []).length, 1, 'grouped: exactly one tab');
+      assert.ok(gTabs.includes('>Sessions · Workers · Workflows · Tasks · Processes<'), 'named for all five members');
+      const wtp = grouped.elFor('ov-group-all').innerHTML;
+      assert.equal((wtp.match(/class="ov-groupcol"/g) || []).length, 5, 'the one group renders FIVE columns');
+      for (const k of ['sessions', 'fleet', 'workflows', 'tasks', 'processes'])
         assert.ok(wtp.includes(`id="ov-g-${k}"`), `the ${k} column carries its own list node`);
       assert.equal(grouped.elFor('ov-gb-processes').textContent, '', 'with no shells payload the Processes badge is blank — the column is not');
-      assert.equal((grouped.elFor('ov-group-sf').innerHTML.match(/class="ov-groupcol"/g) || []).length, 2, 'and Sessions · Fleet renders two');
       // The member lists are RENDERED INTO those columns — one renderer per member, writing wherever the
       // member's list currently lives.
       assert.match(grouped.elFor('ov-g-workflows').innerHTML, /the workflow run/, 'the Workflows column holds the workflow list');
@@ -1669,14 +2305,12 @@ test('extension: three views, click commands, inline annotations, chat, status s
       grouped.post(ovPayload(shells));
       assert.equal(grouped.elFor('ov-gb-processes').textContent, '1/1', 'the Processes badge appears once the CLI answers');
       assert.match(grouped.elFor('ov-g-processes').innerHTML, /bash_9/, 'and the Processes column lists the shell');
-      // The tour names MEMBERS, always. Grouped, a step about `fleet` has to bring the group holding it
-      // forward — resolveTab is the one place that knows the mapping, and both paths go through it.
+      // The tour names MEMBERS, always. Grouped, a step about any member lands on the ONE group —
+      // resolveTab is the one place that knows the mapping, and both paths go through it.
       grouped.post({ type: 'tour', tab: 'fleet', anchor: 'nav-tabs' });
-      assert.equal(grouped.elFor('ov-group-sf').style.display, 'flex', 'a tour step naming fleet opens the group that contains it');
-      assert.equal(grouped.elFor('ov-group-wtp').style.display, 'none', 'and the other group closes');
+      assert.equal(grouped.elFor('ov-group-all').style.display, 'flex', 'a tour step naming fleet opens the group');
       grouped.post({ type: 'tour', tab: 'processes', anchor: 'nav-tabs' });
-      assert.equal(grouped.elFor('ov-group-wtp').style.display, 'flex', 'a step naming processes opens Workflows · Tasks · Processes');
-      assert.equal(grouped.elFor('ov-group-sf').style.display, 'none', 'and Sessions · Fleet closes');
+      assert.equal(grouped.elFor('ov-group-all').style.display, 'flex', 'and one naming processes lands on the same group');
       // Grouped mode drives the SAME split variables the master column already uses, so the reader's drag
       // and the vertical-responsive branch keep working — with its own remembered width. (documentElement
       // is a stub whose style writes are not observable, so this reads the shipped source.)
@@ -1709,44 +2343,46 @@ test('extension: three views, click commands, inline annotations, chat, status s
       assert.equal(Number(grouped.elFor('ov-gc-workflows').style['--ov-cw']), wW, 'a later payload leaves the dragged width alone');
       assert.equal(Number(grouped.elFor('ov-gc-tasks').style['--ov-cw']), wT, '…on both sides of the divider');
       assert.equal(grouped.elFor('ov-gb-processes').textContent, '1/1', 'while the badge it carried still lands');
-      assert.deepEqual(grouped.saved[grouped.saved.length - 1].colW.wtp.map((n) => Math.round(n * 1000)),
-        [Math.round(wW * 1000), Math.round(wT * 1000), 1000], 'the widths are persisted on pointer-up');
+      assert.deepEqual(grouped.saved[grouped.saved.length - 1].colW.all.map((n) => Math.round(n * 1000)),
+        [1000, 1000, Math.round(wW * 1000), Math.round(wT * 1000), 1000], 'the widths are persisted on pointer-up');
       // FOLDING a column: a rail that still names itself, and a group that always keeps one open.
       grouped.fire(grouped.elFor('ov-cc-tasks'), 'click');
-      const wtpFolded = grouped.elFor('ov-group-wtp').innerHTML;
+      const wtpFolded = grouped.elFor('ov-group-all').innerHTML;
       assert.match(wtpFolded, /class="ov-groupcol rail" id="ov-gc-tasks"/, 'the folded column becomes a rail');
       // …past the end of the opening tag, so the button's own title cannot satisfy this: the NAME has to
       // be in the rail's content, which is what the reader sees.
       assert.match(wtpFolded, /id="ov-cc-tasks"[^>]*>[\s\S]*?Tasks/, '…which still NAMES the member, so it can be clicked back');
       assert.ok(wtpFolded.includes('id="ov-gb-tasks"'), '…and still carries its badge');
       assert.ok(!wtpFolded.includes('id="ov-g-tasks"'), 'and its list is not drawn while folded');
-      assert.equal((wtpFolded.match(/class="ov-groupcol"/g) || []).length, 2, 'two columns remain expanded');
+      assert.equal((wtpFolded.match(/class="ov-groupcol"/g) || []).length, 4, 'four columns remain expanded');
       grouped.fire(grouped.elFor('ov-cc-processes'), 'click');
-      assert.equal((grouped.elFor('ov-group-wtp').innerHTML.match(/class="ov-groupcol"/g) || []).length, 1, 'and then one');
-      assert.ok(!grouped.elFor('ov-group-wtp').innerHTML.includes('id="ov-cc-workflows"'), 'the last expanded column offers no fold button');
+      grouped.fire(grouped.elFor('ov-cc-sessions'), 'click');
+      grouped.fire(grouped.elFor('ov-cc-fleet'), 'click');
+      assert.equal((grouped.elFor('ov-group-all').innerHTML.match(/class="ov-groupcol"/g) || []).length, 1, 'and then one');
+      assert.ok(!grouped.elFor('ov-group-all').innerHTML.includes('id="ov-cc-workflows"'), 'the last expanded column offers no fold button');
       grouped.fire(grouped.elFor('ov-cc-workflows'), 'click'); // a click that raced the repaint
-      assert.equal((grouped.elFor('ov-group-wtp').innerHTML.match(/class="ov-groupcol"/g) || []).length, 1,
+      assert.equal((grouped.elFor('ov-group-all').innerHTML.match(/class="ov-groupcol"/g) || []).length, 1,
         'and folding it is refused — a group with every column folded is an empty pane');
       assert.ok(grouped.saved[grouped.saved.length - 1].colC.tasks, 'the folded set is persisted');
       assert.ok(!grouped.saved[grouped.saved.length - 1].colC.workflows, '…and the refused fold is not in it');
       // A later payload must not un-fold anything either.
       grouped.post(ovPayload(shells));
-      assert.equal((grouped.elFor('ov-group-wtp').innerHTML.match(/class="ov-groupcol"/g) || []).length, 1,
+      assert.equal((grouped.elFor('ov-group-all').innerHTML.match(/class="ov-groupcol"/g) || []).length, 1,
         'a later payload leaves the folded columns folded');
       // Restoring gives back the width that was SET, not an equal share — the whole reason a fold leaves
       // the weight alone. wT came from the drag above and is deliberately not 1.
       assert.ok(Math.abs(wT - 1) > 0.01, 'the dragged weight is distinguishable from an equal share');
       grouped.fire(grouped.elFor('ov-cc-tasks'), 'click');
-      assert.equal((grouped.elFor('ov-group-wtp').innerHTML.match(/class="ov-groupcol"/g) || []).length, 2, 'clicking a rail brings the column back');
+      assert.equal((grouped.elFor('ov-group-all').innerHTML.match(/class="ov-groupcol"/g) || []).length, 2, 'clicking a rail brings the column back');
       assert.equal(Number(grouped.elFor('ov-gc-tasks').style['--ov-cw']), wT, '…at the width it had before it folded');
       // Double-click is the way back from a bad drag.
       grouped.fire(grouped.elFor('ov-cg-tasks'), 'dblclick', {});
       assert.equal(Number(grouped.elFor('ov-gc-workflows').style['--ov-cw']), 1, 'double-click splits that pair evenly again');
       assert.equal(Number(grouped.elFor('ov-gc-tasks').style['--ov-cw']), 1, '…on both sides');
       // And a reload comes back on the layout that was persisted.
-      const reloaded = runOverview({ groupedNav: true, colC: { processes: 1 }, colW: { wtp: [1.7, 0.3, 1], sf: [1, 1] } });
+      const reloaded = runOverview({ groupedNav: true, colC: { processes: 1 }, colW: { all: [1, 1, 1.7, 0.3, 1] } });
       reloaded.post(ovPayload(shells));
-      assert.match(reloaded.elFor('ov-group-wtp').innerHTML, /class="ov-groupcol rail" id="ov-gc-processes"/, 'a reload restores the folded column');
+      assert.match(reloaded.elFor('ov-group-all').innerHTML, /class="ov-groupcol rail" id="ov-gc-processes"/, 'a reload restores the folded column');
       assert.equal(reloaded.elFor('ov-gc-workflows').style['--ov-cw'], '1.7', '…and the widths that went with it');
     }
     // 0.10.0: the Group-tabs toggle moved OUT of the top toolbar and onto the tab-strip row — the control
@@ -1760,14 +2396,14 @@ test('extension: three views, click commands, inline annotations, chat, status s
       assert.ok(toolbarEnd > 0 && tabRow > toolbarEnd, 'the tab-strip row is below the toolbar');
       assert.ok(groupnav > tabRow && groupnav < ctl, 'the Group tabs toggle sits on that row, beside the tab strip');
       assert.ok(groupnav > toolbarEnd, '…and no longer inside the top toolbar');
-      assert.ok(html.includes('title="Group related tabs side by side (Sessions · Fleet / Workflows · Tasks · Processes)"'),
-        'with its title text unchanged');
+      assert.ok(html.includes('title="Show every tab side by side in one group (Sessions · Workers · Workflows · Tasks · Processes)"'),
+        'with the one-group title');
       assert.match(html, /groupedNav:GROUPNAV/, 'and its persisted state key unchanged');
     }
     // The toggle itself, with the copy the plan fixed on — a title that stops naming what it groups is a
     // control nobody can find.
     assert.ok(cmView.webview.html.includes('id="ov-groupnav"'), 'the Overview toolbar carries the grouping toggle');
-    assert.ok(cmView.webview.html.includes('title="Group related tabs side by side (Sessions · Fleet / Workflows · Tasks · Processes)"'),
+    assert.ok(cmView.webview.html.includes('title="Show every tab side by side in one group (Sessions · Workers · Workflows · Tasks · Processes)"'),
       'and says exactly what it does');
     assert.ok(/id="ov-groupnav"[^>]*codicon-split-horizontal|codicon-split-horizontal/.test(cmView.webview.html), 'with the split-horizontal codicon');
     assert.match(fs.readFileSync(path.resolve(__dirname, '../src/codicon.ts'), 'utf8'), /codicon-split-horizontal:before/,
@@ -1847,7 +2483,7 @@ test('extension: three views, click commands, inline annotations, chat, status s
     assert.ok(/cm === void 0 \|\| mt === void 0 \|\| pr === void 0\)/.test(bundleSrc), 'the Overview paint waits for its three spawns (prompts is no longer one of them)');
     assert.ok(!/setInterval[^;]*prompts/.test(bundleSrc), 'the Prompts window adds no polling timer of its own');
     assert.ok(/"prompts", "--id", id, "--response", "--json", "--session", session/.test(bundleSrc),
-      'a row expand fetches Claude’s reply via prompts --id --response --json');
+      'a row expand fetches the agent’s reply via prompts --id --response --json');
 
     // 0.10.0: a prompt picked ON THE NAV BAR selects in the Prompts list too. Scoping the Overview and
     // leaving the list's own selection where it was left the two surfaces naming different asks — the
@@ -1959,19 +2595,15 @@ test('extension: three views, click commands, inline annotations, chat, status s
     assert.ok(cmRefreshed >= 1, 'refreshAll includes the combined Overview view');
     assert.ok(actRefreshed >= 1, 'refreshAll includes the Actions tab');
 
-    // chatAction (0.8.0): the zero-token handoff for ANY action/edit/subagent/task. It assembles the
-    // prompt IN-PROCESS via core.assembleChatContext (the same single-backend the CLI's chat-context
-    // wraps — never a model call), copies it, and opens the user's Claude sidebar. Here: an edit ref.
-    assert.ok(typeof commands['claudeObservatory.chatAction'] === 'function', 'chatAction command registered');
-    let claudeOpened = 0;
-    commands['claude-vscode.sidebar.open'] = () => { claudeOpened++; };
+    // Dismissal retains the draft; it cannot submit or consume comments.
+    assert.ok(typeof commands['claudeObservatory.chatAction'] === 'function');
     clipboardText = '';
+    infoPick = undefined;
+    const beforeDraft = infoMessages.length;
     await commands['claudeObservatory.chatAction']({ editId: 1 });
-    assert.match(clipboardText, /app\.txt/, 'chatAction assembled a prompt about the edited file');
-    assert.ok(/Please explain/.test(clipboardText), 'chatAction wrote the assembled chat-context prompt to the clipboard');
-    assert.ok(clipboardText.includes('AAA') && clipboardText.includes('a\nb\nc'), 'chatAction prompt carries before/after (assembled in-process, not a model call)');
-    assert.ok(claudeOpened >= 1, "chatAction opened the user's Claude (zero-token handoff)");
-    delete commands['claude-vscode.sidebar.open'];
+    assert.match(clipboardText, /app\.txt/);
+    assert.ok(clipboardText.includes('AAA') && clipboardText.includes('a\nb\nc'));
+    assert.ok(infoMessages.slice(beforeDraft).some(m => /Send it to this session/.test(typeof m === 'string' ? m : m.m)), 'explicit send is offered with a clipboard fallback');
 
     // Stats top navbar: active session + clickable pending count → first edit. (The Search-edits box
     // was removed in 0.7.5 — the Edits/Diffs title-bar `searchEdits` action is the one search entry.)
@@ -1985,6 +2617,14 @@ test('extension: three views, click commands, inline annotations, chat, status s
     stView.webview.postMessage = (m) => nbMsgs.push(m);
     stProvider.refresh();
     assert.ok(nbMsgs.some((m) => m.type === 'counts' && m.session === S), 'counts post carries the active session');
+    // …named the way every surface names it: a rename (custom-title) outranks Claude Code's own title.
+    const txFile = path.join(proj, S + '.jsonl');
+    const txBefore = fs.readFileSync(txFile);
+    fs.appendFileSync(txFile, '\n' + JSON.stringify({ type: 'custom-title', customTitle: 'Renamed for review', sessionId: S }) + '\n'); // the fixture has no final newline
+    nbMsgs.length = 0;
+    stProvider.refresh();
+    assert.ok(nbMsgs.some((m) => m.type === 'counts' && m.sessionTitle === 'Renamed for review'), 'the navbar names the session by its rename');
+    fs.writeFileSync(txFile, txBefore);
     // The webview registers a handler for the one message it still sends (the pending cell → reviewFirst).
     // Deliberately not driven here: reviewFirst moves the review cursor, which later assertions depend on.
     assert.ok(typeof stMsgHandler === 'function', 'the stats webview registered a message handler');
@@ -2005,6 +2645,59 @@ test('extension: three views, click commands, inline annotations, chat, status s
         'claudeObservatory.toggleHeatmap', 'claudeObservatory.barDetails']) {
         assert.ok(bar.includes(need), `the compact review bar is missing ${need}`);
       }
+    }
+
+    // The status bar's 60-second usage poll claims the Remote Control titles refresh, in-host like the
+    // account pull (the claim marker is the evidence; with no login in this HOME the refresh reads nothing).
+    assert.ok(fs.existsSync(path.join(home, '.claude', 'claude-observatory', 'remote-cache', 'session-titles.json.kick')),
+      'the status-bar poll claims a Remote Control titles refresh');
+
+    // --- the usage readout: 5h · wk · mo, the PER-MODEL weekly cap in the tooltip only -------------
+    // The account's scoped cap (its "Fable" row) is detail, not a window of the bar:
+    // the status bar shows the three windows the TUI's one-line readout shows, and the cap stays named
+    // in the tooltip, after the week it narrows, as it is in the Stats panel. The week keeps its own
+    // countdown whether or not the cap reports the same reset.
+    {
+      const cache = path.join(home, '.claude', 'statusline-last.json');
+      const sec = Math.floor(Date.now() / 1000);
+      const weekReset = sec + 3 * 86400; // the account reports ONE instant for both weekly windows
+      const month = { month_tok: 18_000_000, month_tok_total: 100_000_000, month_reset: sec + 19 * 86400 };
+      const visibleUsage = (label) => statusBarItems.find((i) => i.visible && i.text.startsWith(label + ': '));
+      // Left-to-right IS priority order, so the claude group is asserted as a sequence.
+      const claudeSlots = () => statusBarItems
+        .filter((i) => i.command === 'claudeObservatory.stats.focus' && i.priority > 4.6)
+        .sort((a, b) => b.priority - a.priority);
+      for (const fableReset of [weekReset, weekReset + 86400]) {
+        fs.writeFileSync(cache, JSON.stringify({
+          five_pct: 26, five_reset: sec + 3600, week_pct: 77, week_reset: weekReset, ...month,
+          fable_pct: 93, fable_reset: fableReset, fable_label: 'Fable',
+        }));
+        await commands['claudeObservatory.usageRefresh']();
+        const five = visibleUsage('5h'), wk = visibleUsage('wk'), mo = visibleUsage('mo');
+        assert.ok(five && wk && mo, 'control: the claude windows render from this cache');
+        assert.ok(!statusBarItems.some((i) => i.visible && /Fable|93%/.test(i.text)), 'the per-model cap is not a status-bar window');
+        assert.match(wk.text, /^wk: 77% \d+d \d+h$/, 'the week keeps its own countdown');
+        assert.match(five.text, /^5h: 26% \d+/, 'a window with its own reset keeps its countdown');
+        assert.equal(claudeSlots().length, 4, 'the icon and THREE windows, with no slot for the cap');
+        assert.deepEqual(claudeSlots().filter((i) => i.visible).map((i) => i.text.replace(/:.*$/, '')),
+          ['\u2733', '5h', 'wk', 'mo'], 'left to right: the claude icon, then 5h · wk · mo');
+        for (const item of [five, wk, mo]) {
+          assert.match(String(item.tooltip), /\nwk 77% · resets in \d+d \d+h\nFable 93% · resets in \d+d \d+h\nmo 18% /,
+            'the tooltip still names the cap and its reset, after the week it narrows');
+        }
+      }
+      // An account that reports no scoped cap: the same three windows, and no cap line in the tooltip.
+      fs.writeFileSync(cache, JSON.stringify({ five_pct: 26, five_reset: sec + 3600, week_pct: 77, week_reset: weekReset, ...month }));
+      await commands['claudeObservatory.usageRefresh']();
+      assert.match(visibleUsage('wk').text, /^wk: 77% \d+d \d+h$/, 'the week retains its countdown without a cap');
+      assert.ok(visibleUsage('mo'), 'control: the month still renders');
+      assert.doesNotMatch(String(visibleUsage('wk').tooltip), /Fable/, 'no cap reported, no cap line in the tooltip');
+      // A quota-less plan (Enterprise/API) reports no window at all: the month slot carries the spend.
+      fs.writeFileSync(cache, JSON.stringify({ month_cost: 42.5 }));
+      await commands['claudeObservatory.usageRefresh']();
+      assert.deepEqual(claudeSlots().filter((i) => i.visible).map((i) => i.text), ['\u2733', 'mo: ~$42.5'],
+        'the spend takes the month slot and keeps the claude group visible');
+      fs.rmSync(cache, { force: true });
     }
 
     // realtime observatory: status-bar microscope shows the pending count + the review scoreboard tooltip
@@ -2080,10 +2773,63 @@ test('extension: three views, click commands, inline annotations, chat, status s
       assert.ok(typeof commands[c] === 'function', `${c} registered`);
     }
 
+    // Setup Check runs doctor ASYNCHRONOUSLY. Doctor waits on every saved herdr machine in turn, and a
+    // synchronous spawn froze the whole extension host for all of it. A slow fake doctor shows the host
+    // keeps turning while it runs (POSIX only: the fake is a shell script).
+    if (process.platform !== 'win32') {
+      const slowDoctor = path.join(ws, 'slow-doctor');
+      fs.writeFileSync(slowDoctor, '#!/bin/sh\nsleep 1\nprintf "# fake doctor report\\n"\nexit 1\n');
+      fs.chmodSync(slowDoctor, 0o755);
+      const realOpen = vscode.workspace.openTextDocument;
+      const openedDocs = [];
+      vscode.workspace.openTextDocument = (arg) => { openedDocs.push(arg); return realOpen(arg); };
+      process.env.CLAUDE_OBSERVATORY_BIN = slowDoctor;
+      try {
+        const order = [];
+        setTimeout(() => order.push('host turned'), 100);
+        await commands['claudeObservatory.doctor']();
+        order.push('doctor finished');
+        assert.deepEqual(order, ['host turned', 'doctor finished'], 'the extension host keeps turning while doctor runs');
+        assert.equal(openedDocs.at(-1)?.content, '# fake doctor report\n', '…and the report is opened although doctor exited 1 (a failed check)');
+      } finally {
+        vscode.workspace.openTextDocument = realOpen;
+        process.env.CLAUDE_OBSERVATORY_BIN = TREE_OAK;
+      }
+    }
+
     // chat: copies a prompt (with the diff) to the clipboard
     await commands['claudeObservatory.chatEdit'](1);
     assert.match(clipboardText, /edit #1/, 'chat prompt names the edit');
     assert.ok(clipboardText.includes('AAA') && clipboardText.includes('a\nb\nc'), 'chat prompt carries before/after');
+    // The draft is EDITABLE before it is sent, as JetBrains' dialog and the TUI's composer allow: "Edit
+    // first…" opens it as a document, and Send takes what the document says then.
+    {
+      const realInfo = vscode.window.showInformationMessage;
+      const realOpen = vscode.workspace.openTextDocument;
+      const offered = [];
+      let draftDoc = null;
+      const picks = ['Edit first…', 'Send to agent'];
+      vscode.window.showInformationMessage = (m, ...rest) => {
+        const items = actionsOf(rest);
+        offered.push(items);
+        const next = picks.shift();
+        return Promise.resolve(items.includes(next) ? next : undefined);
+      };
+      vscode.workspace.openTextDocument = (arg) => {
+        draftDoc = { ...arg, text: arg.content + '\nOne more thing: keep the old name.', getText() { return this.text; } };
+        return Promise.resolve(draftDoc);
+      };
+      try {
+        await commands['claudeObservatory.chatEdit'](1);
+      } finally {
+        vscode.window.showInformationMessage = realInfo;
+        vscode.workspace.openTextDocument = realOpen;
+      }
+      assert.deepEqual(offered[0], ['Send to agent', 'Edit first…'], 'the draft offers Send and Edit first…');
+      assert.ok(draftDoc && /edit #1/.test(draftDoc.content), 'Edit first… opens the draft itself as a document');
+      assert.deepEqual(offered[1], ['Send to agent'], '…and Send is offered again once it has been edited');
+      assert.match(clipboardText, /One more thing: keep the old name\.$/, 'what goes out (and stays on the clipboard) is the EDITED draft');
+    }
 
     // openFileAtEdit opens the real file
     await commands['claudeObservatory.openFileAtEdit']({ kind: 'edit', rec: core.findRecord(S, 1) });
@@ -2176,7 +2922,7 @@ test('extension: three views, click commands, inline annotations, chat, status s
     // The install/update offer must NEVER fire in an automated run. Its guard is that
     // `context.extension` is absent under this mock — the same guard checkForUpdate already relies on —
     // so if it ever fires here it would also fire in every CI job and every headless host.
-    assert.equal(infoMessages.filter((m) => /Claude Observatory is (installed|now )/.test(m)).length, 0, 'the first-run offer stays out of automated runs');
+    assert.equal(infoMessages.filter((m) => /OAK is (installed|now )/.test(m)).length, 0, 'the first-run offer stays out of automated runs');
 
     for (const c of ['startDemo', 'restartDemo', 'startTour', 'tourNext', 'tourBack', 'tourGoto', 'exitDemo']) {
       assert.ok(typeof commands[`claudeObservatory.${c}`] === 'function', `${c} registered`);
@@ -2634,7 +3380,7 @@ test('extension: three views, click commands, inline annotations, chat, status s
 
     // (2) The counters. Both axes, off the same helpers the status bar reads, so the bar can never name a
     // different position than the counters beside it.
-    assert.match(bar().label, /Claude edit #1\b/, 'the bar names the edit it is parked on');
+    assert.match(bar().label, /Agent edit #1\b/, 'the bar names the edit it is parked on');
     assert.match(bar().label, /\+\d+ −\d+/, 'with its line delta');
     assert.match(bar().label, /Diff 1\/3/, 'Diff n/m — position among THIS file’s pending edits');
     assert.match(bar().label, /File 1\/2/, 'File i/k — position among the files with pending edits');
@@ -2651,14 +3397,14 @@ test('extension: three views, click commands, inline annotations, chat, status s
     assert.equal(core.findRecord(BS, 1).status, 'kept', 'the bar’s Keep keeps the edit it names');
     assert.equal(liveThreads().length, 1, 'and exactly one bar is still live — it carried itself, it did not clone');
     assert.equal(bar().contextValue, 'claudeNavBar', 'still the bar, not swapped to the bubble');
-    assert.match(bar().label, /Claude edit #2\b/, 'parked on the next edit awaiting review');
+    assert.match(bar().label, /Agent edit #2\b/, 'parked on the next edit awaiting review');
     assert.match(bar().label, /Diff 1\/2/, 'with its counters recomputed — one fewer edit pending in this file');
 
     // (4) …and it closes when the file has nothing left to review. Assert against a file that EXISTS and
     // is simply untouched, not against "no session": the empty-session path proves nothing about this.
     focusFile(BN);
     await settle();
-    assert.equal(liveThreads().length, 0, 'no bar over a file with no pending Claude edits');
+    assert.equal(liveThreads().length, 0, 'no bar over a file with no pending agent edits');
     assert.equal(contextKeys['claudeObservatory.barMultiEdit'], false, 'and the stepper keys go down with it');
     assert.equal(contextKeys['claudeObservatory.barMultiFile'], false);
     focusFile(BA);
@@ -2668,11 +3414,11 @@ test('extension: three views, click commands, inline annotations, chat, status s
     // (5) THE BAR AND THE BUBBLE ARE NEVER OPEN AT ONCE. They are two flavours of one thread on one
     // controller, and every path funnels through the same single `thread` field — this is the assertion
     // that keeps that true, in both directions and across a refresh.
-    const barId = Number(/Claude edit #(\d+)/.exec(bar().label)[1]);
+    const barId = Number(/Agent edit #(\d+)/.exec(bar().label)[1]);
     await commands['claudeObservatory.barDetails']();
     assert.equal(liveThreads().length, 1, '⋯ Details leaves exactly one surface live');
     assert.equal(bar().contextValue, 'claudeEdit', 'and it is the bubble');
-    assert.match(bar().label, new RegExp(`Claude edit #${barId}\\b`), 'at the SAME edit the bar was on');
+    assert.match(bar().label, new RegExp(`Agent edit #${barId}\\b`), 'at the SAME edit the bar was on');
     assert.equal(bar().comments.length, 1, 'the bubble does have a body (the reasoning + the git-coloured diff)');
     await settle();
     assert.equal(liveThreads().length, 1, 'a refresh does not open a bar beside the bubble the reader asked for');
@@ -2703,7 +3449,7 @@ test('extension: three views, click commands, inline annotations, chat, status s
     await settle();
     assert.equal(liveThreads().length, 1, '^ leaves exactly one surface live');
     assert.equal(bar().contextValue, 'claudeNavBar', 'and it is the review bar — one step down, not gone');
-    assert.match(bar().label, new RegExp(`Claude edit #${barId}\\b`), 'still at the same edit');
+    assert.match(bar().label, new RegExp(`Agent edit #${barId}\\b`), 'still at the same edit');
     assert.equal(bar().collapsibleState, vscode.CommentThreadCollapsibleState.Expanded,
       'the bar it lands on is expanded — a collapsed one shows no toolbar at all');
 
@@ -2784,7 +3530,7 @@ test('extension: three views, click commands, inline annotations, chat, status s
     await new Promise((r) => setTimeout(r, 0));
     assert.equal(commentThreads.length - builtBefore, 1, 'the auto-sync builds nothing underneath an open the reader triggered');
     assert.equal(liveThreads().length, 1, 'and exactly one surface is live afterwards');
-    assert.match(bar().label, /Claude edit #2\b/, 'parked where the reader asked, not where the refresh would have put it');
+    assert.match(bar().label, /Agent edit #2\b/, 'parked where the reader asked, not where the refresh would have put it');
     focusFile(BA);
     await settle();
 
@@ -2913,7 +3659,7 @@ test('extension: three views, click commands, inline annotations, chat, status s
     core.appendLog(RS, { id: 6, ts: 6000, tool: 'Edit', file: RA, beforeBlob: core.writeBlob(RS, Buffer.from('A3\n')), afterBlob: core.writeBlob(RS, Buffer.from('A4\n')), status: 'pending' });
     const badge = decoProvider.provideFileDecoration(Uri.file(RA));
     assert.equal(badge?.badge, String(core.readLog(RS).filter((r) => r.file === RA && r.status === 'pending').length), 'a file with pending edits carries their count');
-    assert.match(badge?.tooltip ?? '', /pending Claude edit/, 'and says what the number means');
+    assert.match(badge?.tooltip ?? '', /pending agent edit/, 'and says what the number means');
     assert.equal(badge?.propagate, false, 'files only — folders are the Overview’s job');
     assert.equal(decoProvider.provideFileDecoration(Uri.file(path.join(ws, "never-edited.txt"))), undefined, 'an untouched file is undecorated');
     // The badge's colour is the other half that lives in the manifest: VS Code resolves a ThemeColor id
@@ -3113,7 +3859,15 @@ test('extension: three views, click commands, inline annotations, chat, status s
         const posted = [];
         const saved = [];
         const els = new Map();
-        const el = (id) => { if (!els.has(id)) els.set(id, mk()); return els.get(id); };
+        const el = (id) => {
+          if (!els.has(id)) {
+            const node = mk();
+            node.querySelector = (selector) => selector[0] === '#' ? el(selector.slice(1)) : null;
+            Object.assign(node, { scrollTop: 0, scrollHeight: 600, clientHeight: 300, childNodes: [] });
+            els.set(id, node);
+          }
+          return els.get(id);
+        };
         let listener = null;
         const win = { addEventListener: (t, cb) => { if (t === 'message') listener = cb; } };
         // `querySelector('#id')` resolves to the same node getElementById hands out, so the tour's
@@ -3145,6 +3899,11 @@ test('extension: three views, click commands, inline annotations, chat, status s
         };
         return { el, posted, saved, fire, post: (data) => listener({ data }) };
       };
+      const migrated = runTimeline({ tab: 'conversation', groupedTabs: true, colC: { agent: true, conversation: true } });
+      migrated.post({ type: 'tab', tab: 'feed' });
+      assert.equal(migrated.saved.at(-1).tab, 'feed', 'a persisted Agent/Conversation pick lands on the Feed');
+      assert.ok(!('agent' in migrated.saved.at(-1).colC) && !('conversation' in migrated.saved.at(-1).colC), 'new state drops the retired column ids');
+      assert.ok(!migrated.saved.at(-1).colC.feed, '…without transferring their fold to the Feed column');
       const solo = runTimeline(null);
       const el = solo.el;
       const posted = solo.posted;
@@ -3163,6 +3922,12 @@ test('extension: three views, click commands, inline annotations, chat, status s
       el('rq-schip').click();
       assert.equal(el('rq-slist').hidden, false, 'clicking the chip opens it');
       const listHtml = el('rq-slist').innerHTML;
+      // The dropdown's own controls: search, sort, active-only — the full
+      // listing needs them.
+      assert.ok(listHtml.includes('id="rq-sq"') && listHtml.includes('id="rq-ssort"') && listHtml.includes('id="rq-sfilter"'),
+        'the search/sort/filter bar rides the top of the dropdown');
+      assert.ok(listHtml.includes('Sort: Newest') && listHtml.includes('data-ssort="az"') && listHtml.includes('data-sflt="act"'),
+        'in the Traces navbar’s own control language — labeled sort menu, ✓-row filter menu');
       assert.ok(listHtml.includes('data-sid="' + LIVE + '"'), 'the active session is offered');
       assert.ok(listHtml.includes('data-sid="' + OLDPIN + '"'), '…and the reviewed-but-quiet one, marked ○');
       assert.match(listHtml, /session oldPinn/, 'a session with no title falls back to its short id, never to a blank row');
@@ -3175,6 +3940,13 @@ test('extension: three views, click commands, inline annotations, chat, status s
       // The list was left open, so this is what it renders with nothing to offer: the way out, and only it.
       assert.match(el('rq-slist').innerHTML, /All sessions…/, 'and the list still offers the full browser');
       assert.doesNotMatch(el('rq-slist').innerHTML, /data-sid=/, 'with no row to pick');
+      // A conversation search that FAILED says so; only a search that ran may say nothing matches.
+      solo.fire(el('rq-slist'), 'input', { target: { id: 'rq-sq', value: 'needle' } });
+      solo.post({ type: 'searchResults', q: 'needle', hits: [], error: 'the index could not be read' });
+      assert.match(el('rq-srows').innerHTML, /could not search the conversations — the index could not be read/, 'a failed search names its failure');
+      assert.doesNotMatch(el('rq-srows').innerHTML, /nothing matches/, '…and never claims an empty result');
+      solo.post({ type: 'searchResults', q: 'needle', hits: [] });
+      assert.match(el('rq-srows').innerHTML, /nothing matches “needle” in any conversation/, 'control: a search that ran and found nothing says that');
 
       // The guided tour's ring SURVIVES a repaint, and lands even though the host broadcasts the anchor
       // before it names the tab. Both are real: the host's order is fixed (anchor to every panel, then
@@ -3192,27 +3964,47 @@ test('extension: three views, click commands, inline annotations, chat, status s
         'the Prompts renderer re-applies the tour ring after every repaint');
 
       // ---- 0.10.0: the TAB STRIP ------------------------------------------------------------------
-      // Three tabs, drawn by the window itself — a panel container stacks its views under collapsible
-      // headers and has no tabs to give it.
+      // Four tabs (the Conversation tab folded INTO the Feed, 2026-09-23), drawn by the window
+      // itself — a panel container stacks its views under collapsible headers and has no tabs.
       const tabsHtml = el('tl-tabs').innerHTML;
-      assert.equal((tabsHtml.match(/class="tl-tab/g) || []).length, 3, 'ungrouped: three tabs');
-      for (const k of ['prompts', 'observations', 'actions'])
+      assert.equal((tabsHtml.match(/class="tl-tab/g) || []).length, 4, 'ungrouped: four tabs');
+      for (const k of ['feed', 'prompts', 'observations', 'actions'])
         assert.ok(tabsHtml.includes(`data-tab="${k}"`), `the ${k} tab is one of them`);
-      assert.equal(el('tl-pane-prompts').style.display, 'flex', 'Prompts leads');
+      assert.ok(!tabsHtml.includes('data-tab="conversation"'), 'and no Conversation tab');
+      // The Feed LEADS: the conversation as it happened is the landing surface.
+      assert.ok(tabsHtml.indexOf('data-tab="feed"') < tabsHtml.indexOf('data-tab="prompts"'), 'Feed is the first tab in the strip');
+      assert.equal(el('tl-pane-feed').style.display, 'flex', 'Feed leads');
       assert.equal(el('tl-pane-actions').style.display, 'none', '…and the others are closed');
+      assert.doesNotThrow(() => solo.post({ type: 'agentFeed', session: LIVE, patches: {}, feed: { mode: 'live', title: 'the live conversation', lastTs: 8, entries: [
+        { ts: 1, kind: 'prompt', label: '#1', promptText: 'fix it' },
+        { ts: 2, kind: 'reasoning', label: 'thinking', reasoning: 'checking the test first', reasoningKind: 'thinking' },
+        { ts: 3, kind: 'reasoning', label: 'said', reasoning: 'I will run the tests.', reasoningKind: 'text' },
+        { ts: 4, kind: 'action', label: 'Bash', target: 'npm test', category: 'exec', cmd: 'npm test', ok: true, reasoning: 'I will run the tests.', reasoningKind: 'text' },
+        { ts: 8, kind: 'reasoning', label: 'said', reasoning: '**done** — all green', reasoningKind: 'text' },
+      ] } }), 'a whole-conversation feed payload renders without throwing');
+      const feedHtml = el('tl-feed').innerHTML;
+      assert.match(feedHtml, /tlf-blob user[\s\S]*?class="tlf-user-text">fix it<\/div>/, 'the prompt bubble renders its text');
+      assert.match(feedHtml, /tlf-verb agent">thinking<[\s\S]*?4 words/, 'a thought is a row, folded to its word-count label by default');
+      assert.doesNotMatch(feedHtml, /tlf-think tla-md/, '…its body closed until the reader opens it');
+      assert.match(feedHtml, /tlf-verb agent">said<[\s\S]*?class="tla-text tla-md"><div>I will run the tests\.<\/div>/, 'a reply is a row, open, rendered as markdown');
+      assert.match(feedHtml, /tlf-verb exec">\$<[\s\S]*?npm/, 'the tool call renders its command');
+      assert.equal((feedHtml.match(/I will run the tests\./g) || []).length, 1, 'the call does not repeat the reply above it (same reasoning string)');
+      assert.match(feedHtml, /<b>done<\/b> — all green/, 'the closing reply is a row of its own, with its markdown');
+      const feedSource = fs.readFileSync(path.resolve(__dirname, '../src/extension.ts'), 'utf8');
+      assert.ok(!/function conversationEventHtml|function renderAgentTab|fetchConversation\(/.test(feedSource), 'the separate conversation renderer and its poll are gone');
       assert.equal(el('tl-group').style.display, 'none', 'with the grouped pane put away');
       // The session selector stays ABOVE the tabs, visible whichever one is forward.
       assert.ok(rqView.webview.html.indexOf('id="rq-sess"') < rqView.webview.html.indexOf('class="tl-tabrow"'),
         'the session selector row sits above the tab strip');
       // Only what is on screen is served: the Actions root walks every sibling worktree for conflicts.
       const view0 = posted.filter((m) => m.type === 'view').pop();
-      assert.ok(view0 && view0.shows.prompts === true && view0.shows.actions === false && view0.shows.observations === false,
+      assert.ok(view0 && view0.shows.feed === true && view0.shows.prompts === false && view0.shows.actions === false && view0.shows.observations === false,
         'the window tells the host which tabs are on screen, so it serves only those');
 
       // A tab message (the tour's path, and the palette's) brings that tab forward.
       solo.post({ type: 'tab', tab: 'actions' });
       assert.equal(el('tl-pane-actions').style.display, 'flex', 'a tab message brings Actions forward');
-      assert.equal(el('tl-pane-prompts').style.display, 'none', '…and closes Prompts');
+      assert.equal(el('tl-pane-feed').style.display, 'none', '…and closes the Feed');
       assert.ok(posted.filter((m) => m.type === 'view').pop().shows.actions === true, 'and the host is told to start serving it');
 
       // ---- the flattened trees --------------------------------------------------------------------
@@ -3248,28 +4040,28 @@ test('extension: three views, click commands, inline annotations, chat, status s
       // The empty states the two removed views carried as viewsWelcome entries, verbatim.
       solo.post({ type: 'rows', tab: 'actions', parent: '', count: 0, rows: [] });
       assert.match(el('tl-actions').innerHTML, /No tool calls in this session yet/, 'Actions keeps its welcome copy');
-      assert.match(el('tl-actions').innerHTML, /Edits, commands, reads, searches, egress, and to-dos appear here as Claude works/, '…in full');
+      assert.match(el('tl-actions').innerHTML, /Edits, commands, reads, searches, egress, and to-dos appear here as the agent works/, '…in full');
       solo.post({ type: 'rows', tab: 'observations', parent: '', count: 0, rows: [], hooks: true });
       assert.match(el('tl-observations').innerHTML, /No edits in this session yet/, 'Observations keeps the hooks-installed variant');
       solo.post({ type: 'rows', tab: 'observations', parent: '', count: 0, rows: [], hooks: false });
-      assert.match(el('tl-observations').innerHTML, /No tracked Claude edits in this workspace yet/, '…and the no-hooks one');
-      assert.match(el('tl-observations').innerHTML, /Try the demo — no Claude session needed/, 'with the demo offer, as a button');
+      assert.match(el('tl-observations').innerHTML, /No tracked agent edits in this workspace yet/, '…and the no-hooks one');
+      assert.match(el('tl-observations').innerHTML, /Try the demo — no agent session needed/, 'with the demo offer, as a button');
       // A feed that could not be built SAYS so — an empty list would read as a session that did nothing.
       solo.post({ type: 'rows', tab: 'actions', parent: '', rows: [], err: 'transcript unreadable' });
       assert.match(el('tl-actions').innerHTML, /Could not read this session’s actions/, 'a failed read is stated, not swallowed');
       assert.match(el('tl-actions').innerHTML, /transcript unreadable/, '…with what went wrong');
 
-      // ---- grouped mode: three columns, resizable and foldable -------------------------------------
+      // ---- grouped mode: four columns, resizable and foldable --------------------------------------
       const grouped = runTimeline({ groupedTabs: true });
       const gEl = grouped.el;
       assert.equal(gEl('tl-group').style.display, 'flex', 'grouped: the one pane is on screen');
       assert.equal((gEl('tl-tabs').innerHTML.match(/class="tl-tab/g) || []).length, 1, 'and the strip carries a single tab');
-      assert.match(gEl('tl-tabs').innerHTML, /Prompts · Observations · Actions/, 'naming all three, in column order');
+      assert.match(gEl('tl-tabs').innerHTML, /Feed · Prompts · Observations · Actions/, 'naming all four, in column order');
       const gHtml = gEl('tl-group').innerHTML;
-      assert.equal((gHtml.match(/class="tl-groupcol"/g) || []).length, 3, 'three columns');
-      for (const k of ['prompts', 'observations', 'actions'])
+      assert.equal((gHtml.match(/class="tl-groupcol"/g) || []).length, 4, 'four columns');
+      for (const k of ['feed', 'prompts', 'observations', 'actions'])
         assert.ok(gHtml.includes(`id="tl-g-${k}"`), `the ${k} column carries its own host node`);
-      assert.ok(grouped.posted.filter((m) => m.type === 'view').pop().shows.actions === true, 'and the host is asked for all three');
+      assert.ok(grouped.posted.filter((m) => m.type === 'view').pop().shows.actions === true, 'and the host is asked for all of them');
       // Members render INTO those columns — one renderer per member, writing wherever it currently lives.
       grouped.post({ type: 'rows', tab: 'actions', parent: '', count: 2, rows: [
         { key: 'gEdits', label: 'Edits', desc: '2', tip: 't', glyph: '✎', tone: '', open: false, act: false, acts: [] } ] });
@@ -3292,9 +4084,11 @@ test('extension: three views, click commands, inline annotations, chat, status s
       assert.ok(wP > 1 && wO < 1, 'the drag moved the split');
       assert.ok(Math.abs(wP + wO - 2) < 1e-9, '…without changing the pair’s combined share');
       assert.ok(wO >= 2 * (190 / 600) - 1e-9, 'and the shrinking column stopped at the 190px floor, never at zero');
-      assert.ok(gEl('tl-gc-actions').style['--tl-cw'] === '1', 'the third column is untouched by a drag between the other two');
+      assert.ok(gEl('tl-gc-actions').style['--tl-cw'] === '1' && gEl('tl-gc-feed').style['--tl-cw'] === '1',
+        'the other columns are untouched by a drag between prompts and observations');
+      // colW persists by TABS index — the Feed leads, so its untouched share is the FIRST slot.
       assert.deepEqual(grouped.saved[grouped.saved.length - 1].colW.map((n) => Math.round(n * 1000)),
-        [Math.round(wP * 1000), Math.round(wO * 1000), 1000], 'the widths are persisted on pointer-up');
+        [1000, Math.round(wP * 1000), Math.round(wO * 1000), 1000], 'the widths are persisted on pointer-up');
       // A LATER PAYLOAD must not reset them — this is the case a naive implementation gets wrong, because
       // badges arrive on their own tick long after the reader has set a layout.
       grouped.post({ type: 'rows', tab: 'actions', parent: '', count: 99, rows: [] });
@@ -3308,8 +4102,9 @@ test('extension: three views, click commands, inline annotations, chat, status s
       assert.match(folded, /id="tl-cc-observations"[^>]*>[\s\S]*?Observations/, '…which still NAMES the member, so it can be clicked back');
       assert.ok(folded.includes('id="tl-gb-observations"'), '…and still carries its badge');
       assert.ok(!folded.includes('id="tl-g-observations"'), 'and its list is not drawn while folded');
-      assert.equal((folded.match(/class="tl-groupcol"/g) || []).length, 2, 'two columns remain expanded');
+      assert.equal((folded.match(/class="tl-groupcol"/g) || []).length, 3, 'three columns remain expanded');
       grouped.fire(gEl('tl-cc-actions'), 'click');
+      grouped.fire(gEl('tl-cc-feed'), 'click');
       assert.equal((gEl('tl-group').innerHTML.match(/class="tl-groupcol"/g) || []).length, 1, 'and then one');
       assert.ok(!gEl('tl-group').innerHTML.includes('id="tl-cc-prompts"'), 'the last expanded column offers no fold button');
       grouped.fire(gEl('tl-cc-prompts'), 'click'); // a click that raced the repaint
@@ -3328,7 +4123,8 @@ test('extension: three views, click commands, inline annotations, chat, status s
       assert.equal(Number(gEl('tl-gc-prompts').style['--tl-cw']), 1, 'double-click resets the pair');
       assert.equal(Number(gEl('tl-gc-observations').style['--tl-cw']), 1, '…on both sides');
       // A folded column restored from PERSISTED state comes back folded, with the widths it had.
-      const reload = runTimeline({ groupedTabs: true, colC: { actions: 1 }, colW: [1.4, 0.6, 1] });
+      // (colW is by TABS index — Feed first, then Prompts.)
+      const reload = runTimeline({ groupedTabs: true, colC: { actions: 1 }, colW: [1, 1.4, 0.6, 1] });
       assert.match(reload.el('tl-group').innerHTML, /class="tl-groupcol rail" id="tl-gc-actions"/, 'a reload restores the folded column');
       assert.equal(reload.el('tl-gc-prompts').style['--tl-cw'], '1.4', '…and the widths that went with it');
       // The persisted TAB is restored too.
@@ -3336,26 +4132,19 @@ test('extension: three views, click commands, inline annotations, chat, status s
       assert.equal(onActions.el('tl-pane-actions').style.display, 'flex', 'a reload comes back on the tab it left on');
     }
 
-    // The selector rides the window's EXISTING refresh, so this drives that refresh. Pointing the CLI at a
-    // non-executable file keeps a unit test from launching a real subprocess: the sessions push is
-    // in-process and happens before the spawn, which then fails at once.
-    const notABin = path.join(ws, 'not-a-binary');
-    fs.writeFileSync(notABin, 'this is not executable\n');
-    const binWas = process.env.CLAUDE_OBSERVATORY_BIN;
+    // The selector consumes the built CLI (the file's TREE_OAK pin) on the window's existing refresh.
     const sessionsPush = async (pin) => {
       configValues['session'] = pin;
-      process.env.CLAUDE_OBSERVATORY_BIN = notABin;
       const posts = [];
       rqView.webview.postMessage = (m) => { posts.push(m); return Promise.resolve(true); };
       rqView.visible = true;
       // The window coalesces to one spawn at a time, and a failed spawn releases that gate on a later
       // tick — so wait for it rather than racing it. Twenty tries is ~200ms; the gate opens on the first.
-      for (let i = 0; i < 20 && !posts.some((m) => m.type === 'sessions'); i++) {
+      for (let i = 0; i < 200 && !posts.some((m) => m.type === 'sessions'); i++) {
         rqProvider.refresh(true);
         if (!posts.some((m) => m.type === 'sessions')) await new Promise((r) => setTimeout(r, 10));
       }
       rqView.visible = false;
-      if (binWas === undefined) delete process.env.CLAUDE_OBSERVATORY_BIN; else process.env.CLAUDE_OBSERVATORY_BIN = binWas;
       return posts.find((m) => m.type === 'sessions');
     };
     const sp = await sessionsPush(OLDPIN);
@@ -3366,12 +4155,120 @@ test('extension: three views, click commands, inline annotations, chat, status s
     assert.equal(sp.rows[0].active, false, 'and is marked NOT active — the pin is why it is listed, not liveness');
     assert.ok(spIds.includes(LIVE), 'a session still being written is listed');
     assert.equal(sp.rows.find((r) => r.id === LIVE).active, true, 'and marked active');
-    assert.ok(!spIds.includes(STALE), 'a session that is neither active nor under review is NOT — this is the active-only list');
+    // FULL listing now: the Timeline selector shows the same population the
+    // Overview's Sessions pane does — the active-only cut read as missing sessions. The dropdown's
+    // own search/sort/filter bar carries the long list.
+    assert.ok(spIds.includes(STALE), 'a quiet old session IS listed — the selector matches the Overview');
     // Pinned to something this workspace has no row for: synthesized, so the selector can still name it
     // and switch away from it.
     const spGhost = await sessionsPush('ghostSess99');
-    assert.ok(spGhost.rows.some((r) => r.id === 'ghostSess99' && r.title === null),
-      'a pinned session with no row here is synthesized rather than dropped');
+    assert.ok(!spGhost.rows.some((r) => r.id === 'ghostSess99'),
+      'an unavailable pin is named by the chip but never fabricated as a local row');
+    // "Nobody is waiting" is a claim about every session, so it needs a listing that loaded. After one
+    // that failed, the jump says it could not read them instead.
+    {
+      const pinWas = configValues['session'];
+      configValues['session'] = OLDPIN; // postSessions keeps only a listing for the session current now
+      const notExec = path.join(ws, 'not-a-binary-hands');
+      fs.writeFileSync(notExec, 'this is not executable\n');
+      process.env.CLAUDE_OBSERVATORY_BIN = notExec;
+      await rqProvider.postSessions(ws, OLDPIN);
+      process.env.CLAUDE_OBSERVATORY_BIN = TREE_OAK;
+      const warnedBefore = warnMessages.length, toldBefore = infoMessages.length;
+      rqProvider.jumpToNextHand();
+      assert.match(warnMessages.slice(warnedBefore).join('\n'), /could not read which sessions are waiting/, 'a failed listing is not read as nobody waiting');
+      assert.ok(!infoMessages.slice(toldBefore).some((m) => /nobody is waiting/.test(m)), '…and nobody-waiting is not claimed');
+      await rqProvider.postSessions(ws, OLDPIN);
+      rqProvider.jumpToNextHand();
+      assert.ok(infoMessages.slice(toldBefore).some((m) => /nobody is waiting on you/.test(m)), 'control: after a listing that loaded, with no raised hand, it is');
+      configValues['session'] = pinWas;
+    }
+    // ONE listing per refresh tick: with the Overview AND the Timeline on screen, the Timeline's own
+    // `sessions --json` recomputed the listing the Overview's batch had just built. The CLI is wrapped in
+    // a counter, so the spawns themselves are asserted (POSIX only: the counter is a shell script).
+    if (process.platform !== 'win32') {
+      const argvLog = path.join(ws, 'oak-argv.log');
+      const counter = path.join(ws, 'oak-counter');
+      fs.writeFileSync(counter, `#!/bin/sh\nprintf '%s\\n' "$1" >> ${JSON.stringify(argvLog)}\nexec ${JSON.stringify(TREE_OAK)} "$@"\n`);
+      fs.chmodSync(counter, 0o755);
+      const spawned = (verb) => (fs.existsSync(argvLog) ? fs.readFileSync(argvLog, 'utf8').split('\n') : []).filter((v) => v === verb).length;
+      const settle = async (cond) => { for (let i = 0; i < 1500 && !cond(); i++) await new Promise((r) => setTimeout(r, 10)); };
+      const wasPin = configValues['session'];
+      const cmPost = cmView.webview.postMessage;
+      const rqPost = rqView.webview.postMessage;
+      process.env.CLAUDE_OBSERVATORY_BIN = counter;
+      configValues['session'] = OLDPIN;
+      try {
+        // Drain the steps above first. A forced re-run they queued mid-spawn fires later, and a forced
+        // refresh rightly retires every batch begun before it, which would make the count below race.
+        for (let round = 0; round < 3; round++) {
+          await settle(() => !rqProvider.running && !cmProvider.running);
+          rqProvider.rerun = false;
+          cmProvider.rerun = false;
+          await new Promise((r) => setTimeout(r, 20));
+        }
+        cmView.webview.postMessage = () => Promise.resolve(true);
+        cmView.visible = true;
+        cmProvider.running = false;
+        cmProvider.refresh(true);
+        await settle(() => !cmProvider.running);
+        assert.equal(spawned('views'), 1, 'control: the Overview batch ran, through the counter');
+        const posts = [];
+        rqView.webview.postMessage = (m) => { posts.push(m); return Promise.resolve(true); };
+        rqView.visible = true;
+        rqProvider.running = false;
+        rqProvider.run = 0;
+        rqProvider.refresh(false); // the watcher's tick, just after the batch landed
+        await settle(() => posts.some((m) => m.type === 'sessions'));
+        assert.ok(posts.find((m) => m.type === 'sessions')?.rows.some((r) => r.id === OLDPIN), 'the Timeline posted its selector rows…');
+        assert.equal(spawned('sessions'), 0, '…from the listing the Overview batch built, with no sessions spawn of its own');
+        // A forced refresh (every review verb) never reuses a listing gathered before it.
+        posts.length = 0;
+        await settle(() => !rqProvider.running);
+        rqProvider.refresh(true);
+        await settle(() => posts.some((m) => m.type === 'sessions'));
+        assert.equal(spawned('sessions'), 1, 'a forced refresh reads a listing of its own');
+        posts.length = 0;
+        await settle(() => !rqProvider.running);
+        rqProvider.run = 0;
+        rqProvider.refresh(false);
+        await settle(() => posts.some((m) => m.type === 'sessions'));
+        assert.equal(spawned('sessions'), 2, '…and so does the tick after it: the batch on hand began before the change');
+        await settle(() => !rqProvider.running && !cmProvider.running);
+        // A change another tool made — a keep in the TUI, a hand raised in another session — reaches this
+        // window only through the store watcher, whose refresh is unforced: the batch on hand began before
+        // it, so the tick after it reads a listing of its own.
+        cmProvider.running = false;
+        cmProvider.refresh(true);
+        await settle(() => !cmProvider.running);
+        const store = fsWatchers.find((w) => String(w.pattern).includes('log.jsonl'));
+        assert.ok(store && store.change.length, 'control: the store watcher is registered');
+        store.change.forEach((f) => f(vscode.Uri.file(path.join(core.rootDir(), 'fixture-other-session', 'attention.json'))));
+        posts.length = 0;
+        rqProvider.run = 0;
+        rqProvider.refresh(false);
+        await settle(() => posts.some((m) => m.type === 'sessions'));
+        assert.equal(spawned('sessions'), 3, 'the tick after an outside change reads a listing of its own');
+        // Control: a batch begun after that change is reused again.
+        await settle(() => !rqProvider.running && !cmProvider.running);
+        cmProvider.running = false;
+        cmProvider.refresh(true);
+        await settle(() => !cmProvider.running);
+        posts.length = 0;
+        rqProvider.run = 0;
+        rqProvider.refresh(false);
+        await settle(() => posts.some((m) => m.type === 'sessions'));
+        assert.equal(spawned('sessions'), 3, 'control: a batch begun after the change is reused');
+        await settle(() => !rqProvider.running && !cmProvider.running);
+      } finally {
+        cmView.visible = false;
+        rqView.visible = false;
+        cmView.webview.postMessage = cmPost;
+        rqView.webview.postMessage = rqPost;
+        configValues['session'] = wasPin;
+        process.env.CLAUDE_OBSERVATORY_BIN = TREE_OAK;
+      }
+    }
     // The two messages the selector posts, and where they land. 0.10.0: "All sessions…" goes to the
     // Overview's SESSIONS TAB — the full browser — not to the deprecated switchSession QuickPick.
     for (const [msg, cmd, arg] of [['pickSession', 'claudeObservatory.pinSession', LIVE], ['allSessions', 'claudeObservatory.showSessions', undefined]]) {
@@ -3420,7 +4317,7 @@ test('extension: three views, click commands, inline annotations, chat, status s
     const pinSeen = [];
     const realPin = commands['claudeObservatory.pinSession'];
     commands['claudeObservatory.pinSession'] = (id) => { pinSeen.push(id); };
-    vscode.window.showQuickPick = (items) => { qpItems = items; return Promise.resolve(items[0]); };
+    createQuickPickChoose = (items) => { qpItems = items; return items[0]; };
     await commands['claudeObservatory.switchActiveSession']();
     assert.deepEqual(pinSeen, [OLDPIN], 'a pick routes through pinSession — so a switch made mid-demo never writes settings.json');
     assert.equal(qpItems[0].label.slice(0, 1), '○', 'the reviewed-but-quiet session leads, marked ○');
@@ -3435,7 +4332,7 @@ test('extension: three views, click commands, inline annotations, chat, status s
     const realQPFall = commands['claudeObservatory.switchSession'];
     commands['claudeObservatory.showSessions'] = () => { fallSeen.push(1); };
     commands['claudeObservatory.switchSession'] = () => { qpFallSeen.push(1); };
-    vscode.window.showQuickPick = (items) => Promise.resolve(items[items.length - 1]);
+    createQuickPickChoose = (items) => items[items.length - 1];
     await commands['claudeObservatory.switchActiveSession']();
     assert.deepEqual(fallSeen, [1], 'All sessions… hands over to the Overview’s Sessions tab');
     assert.deepEqual(qpFallSeen, [], 'and not to the deprecated QuickPick');
@@ -3444,6 +4341,27 @@ test('extension: three views, click commands, inline annotations, chat, status s
     commands['claudeObservatory.switchSession'] = realQPFall;
     commands['claudeObservatory.pinSession'] = realPin;
     vscode.window.showQuickPick = realQP;
+    createQuickPickChoose = null;
+    // The pickers' 📁 row button is the third store affordance, EXECUTED: press it on the seeded session's
+    // row (it has a store, so it carries the button) and the same reveal opens that row's folder, without
+    // switching the review to it. Both pickers share one handler (pinned above by source); this drives one.
+    {
+      let pressedRow = null;
+      createQuickPickButton = (items) => {
+        pressedRow = items.find((i) => i.id === S) || null;
+        return pressedRow && { item: pressedRow, button: pressedRow.buttons[0] };
+      };
+      createQuickPickChoose = () => undefined; // then dismiss the picker
+      openExternalCalls.length = 0;
+      try {
+        await commands['claudeObservatory.switchSession']();
+      } finally {
+        createQuickPickButton = null;
+        createQuickPickChoose = null;
+      }
+      assert.ok(pressedRow && pressedRow.buttons.length === 2, 'control: the seeded session’s row carries the store button');
+      assert.deepEqual(openExternalCalls.map((u) => u.path), [core.storeDir(S)], 'the picker’s folder button opens that row’s store folder');
+    }
 
     // The Prompt AXIS moves BOTH surfaces. Left to the end of the run deliberately: it opens files and
     // moves the review cursor, which the axis assertions above read.
@@ -3536,6 +4454,31 @@ test('extension: three views, click commands, inline annotations, chat, status s
       assert.equal(root.count, core.readLog(S).length, 'the badge counts EDITS, so coalescing never hides any');
     }
 
+    // A ×N run whose NEWEST edit has no reasoning: a formatter's Bash rewrite right after the agent's Edit.
+    // The run row speaks for its newest edit only, as JetBrains' run row does (runReasoningLine): that
+    // edit's change summary, never an older edit's words beside the newest edit's time.
+    {
+      configValues['session'] = S;
+      const FMT = path.join(ws, 'features.py');
+      const WHY = 'Adding scale() so features share a range before training.';
+      const t0 = Date.now() + 90000; // newer than the run above, older than the capped feed below
+      fs.appendFileSync(path.join(proj, S + '.jsonl'), '\n' + JSON.stringify({ type: 'assistant', timestamp: new Date(t0 - 500).toISOString(),
+        message: { role: 'assistant', content: [{ type: 'text', text: WHY }, { type: 'tool_use', name: 'Edit', input: { file_path: FMT } }] } }));
+      const f0 = core.writeBlob(S, Buffer.from('def f(x):\n    return x\n'));
+      const f1 = core.writeBlob(S, Buffer.from('def f(x):\n    return (x - m) / s\n'));
+      const f2 = core.writeBlob(S, Buffer.from('def f(x):\n    return (x - m) / s\n\n'));
+      const edit = core.appendLog(S, { ts: t0, tool: 'Edit', file: FMT, beforeBlob: f0, afterBlob: f1, status: 'pending' });
+      const bash = core.appendLog(S, { ts: t0 + 1000, tool: 'Bash', file: FMT, beforeBlob: f1, afterBlob: f2, status: 'pending' });
+      const reasons = core.reasoningByEdit(ws, S);
+      assert.deepEqual([reasons.get(edit.id), reasons.get(bash.id)], [WHY, undefined], 'fixture: the Edit has reasoning, the Bash rewrite none');
+      tlProvider.observations.refresh();
+      const fmtRun = tlProvider.observations.getChildren().find((n) => n.kind === 'tlrun' && n.file === FMT);
+      assert.deepEqual(fmtRun?.edits.map((e) => e.id), [bash.id, edit.id], 'fixture: one ×2 run, the Bash rewrite newest');
+      const fmtItem = tlProvider.observations.getTreeItem(fmtRun);
+      assert.ok(String(fmtItem.description).endsWith(` · ${core.summarize(S, bash)}`), `the run row reads the newest edit's summary: ${fmtItem.description}`);
+      assert.ok(!String(fmtItem.description).includes(WHY) && !String(fmtItem.tooltip).includes(WHY), '…and never the older edit\'s reasoning');
+    }
+
     // A feed BIGGER THAN THE CAP: the bound is stated, the tail survives, and the badge is untouched.
     //
     // The ×N assertions above run on a two-edit fixture, so they would pass through any cap without
@@ -3624,7 +4567,7 @@ test('extension: three views, click commands, inline annotations, chat, status s
       // ---- the tree block's own throttle -------------------------------------------------------------
       // Both feeds used to ride EVERY refresh, forced or not, on the reasoning that they cost no spawn.
       // That was true of the trees, which VS Code virtualized; a webview pays a full build + post, and
-      // the store watcher fires one refresh per 150ms burst while Claude works.
+      // the store watcher fires one refresh per 150ms burst while the agent works.
       const notABinBig = path.join(ws, 'not-a-binary-big');
       fs.writeFileSync(notABinBig, 'this is not executable\n');
       const wasBinBig = process.env.CLAUDE_OBSERVATORY_BIN;
@@ -3669,7 +4612,83 @@ test('extension: three views, click commands, inline annotations, chat, status s
         else process.env.CLAUDE_OBSERVATORY_BIN = wasBinBig;
       }
     }
+
+    // A store that stays busy after the files changed (a live holder, past the status write's budget).
+    // The file-scoped revert still reverts, and its toast is a WARNING naming the edit it could not
+    // record and the command that records it — never a bare "Undid 1 edit(s)".
+    {
+      const K = path.join(ws, 'held.txt');
+      const kb = core.writeBlob(S, Buffer.from('k1\n')), ka = core.writeBlob(S, Buffer.from('k2\n'));
+      const held = core.appendLog(S, { ts: 9990, tool: 'Edit', file: K, beforeBlob: kb, afterBlob: ka, status: 'pending' });
+      fs.writeFileSync(K, 'k2\n');
+      const wasSession = configValues['session'], wasEditor = vscode.window.activeTextEditor;
+      configValues['session'] = S;
+      vscode.window.activeTextEditor = { document: { uri: Uri.file(K), lineCount: 1, getText: () => 'k2\n', lineAt: () => ({ range: new Range(0, 0, 0, 2) }) }, selection: { active: { line: 0 } }, setDecorations() {}, revealRange() {} };
+      const lock = path.join(core.storeDir(S), '.lock');
+      fs.writeFileSync(lock, String(process.pid));
+      const warnsBefore = warnMessages.length;
+      try {
+        await commands['claudeObservatory.undoOpenFile']();
+      } finally {
+        fs.rmSync(lock, { force: true });
+        configValues['session'] = wasSession;
+        vscode.window.activeTextEditor = wasEditor;
+      }
+      const toast = warnMessages.slice(warnsBefore).pop() ?? '';
+      assert.equal(fs.readFileSync(K, 'utf8'), 'k1\n', 'the file was reverted');
+      assert.match(toast, /^Undid 1 edit\(s\) in held\.txt\. .*not recorded as reverted/, toast);
+      assert.ok(toast.includes(`\`oak undo --ids ${held.id} --record-only --session ${S}\``), toast);
+      assert.equal(core.findRecord(S, held.id).status, 'pending', 'unrecorded, as the toast says');
+      core.recordOnly(S, [held.id], 'undo');
+      assert.equal(core.findRecord(S, held.id).status, 'undone');
+    }
   } finally {
     Module._load = origLoad;
   }
+});
+
+// The rename's migration, EXECUTED: an install that still carries a pre-rename id retires it on
+// activation — each old id uninstalled once, one reload offered — and registers nothing in that window,
+// so the two builds never race for the same commands. The window after the reload, with the old id
+// gone, retires nothing again: no uninstall/reload loop.
+test('extension: a pre-rename install retires the old id once, then activates for real', async () => {
+  const bundle = require.resolve(BUNDLE);
+  const activateWith = async (installed) => {
+    const calls = [];
+    const registered = [];
+    // Permissive stand-ins for everything this test does not look at. The bundle copies the module's OWN
+    // keys into its `vscode` namespace, so every name it uses gets one.
+    const any = () => new Proxy(function () {}, { get: (_t, k) => (k === 'then' ? undefined : any()), apply: () => any(), construct: () => any() });
+    const vscode = Object.fromEntries([...new Set([...fs.readFileSync(bundle, 'utf8').matchAll(/\bvscode\.([A-Za-z_]\w*)/g)].map((m) => m[1]))].map((k) => [k, any()]));
+    vscode.extensions = { getExtension: (id) => (installed.has(id) ? { id } : undefined) };
+    vscode.commands = {
+      registerCommand: (id) => { registered.push(id); return { dispose() {} }; },
+      executeCommand: (cmd, ...args) => { calls.push([cmd, ...args]); if (cmd === 'workbench.extensions.uninstallExtension') installed.delete(args[0]); return Promise.resolve(); },
+    };
+    vscode.window = new Proxy({}, { get: (_w, wk) => (wk === 'showInformationMessage' ? () => Promise.resolve('Reload Window') : any()) });
+    const origLoad = Module._load;
+    Module._load = function (req, ...rest) { return req === 'vscode' ? vscode : origLoad.call(this, req, ...rest); };
+    delete require.cache[bundle];
+    let threw = null;
+    try {
+      require(bundle).activate({ subscriptions: [], globalState: { get: (_k, d) => d, update: () => Promise.resolve() } });
+    } catch (e) {
+      threw = e; // the stand-ins cannot carry a full activation; how far it got is what is asserted
+    } finally {
+      Module._load = origLoad;
+      delete require.cache[bundle];
+    }
+    for (let i = 0; i < 20; i++) await new Promise((r) => setTimeout(r, 5)); // the retirement runs async
+    return { calls, registered, threw };
+  };
+  const installed = new Set(['cell-observatory.claude-observatory-vscode', 'cell-observatory.oak-observatory-vscode']);
+  const first = await activateWith(installed);
+  assert.deepEqual(first.calls.filter(([c]) => c === 'workbench.extensions.uninstallExtension').map(([, id]) => id),
+    ['cell-observatory.claude-observatory-vscode'], 'the pre-rename id is uninstalled, once, and the running build is not');
+  assert.equal(first.threw, null, 'the retirement window activates without error');
+  assert.deepEqual(first.calls.filter(([c]) => c === 'workbench.action.reloadWindow').length, 1, 'one reload finishes the move');
+  assert.deepEqual(first.registered, [], 'nothing is registered beside the old build');
+  const second = await activateWith(installed);
+  assert.ok(!second.calls.some(([c]) => c === 'workbench.extensions.uninstallExtension'), 'after the reload nothing is uninstalled again');
+  assert.ok(second.registered.length > 0, 'and the new build goes on to register its commands');
 });

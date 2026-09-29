@@ -12,15 +12,20 @@ const b64 = ttf.toString('base64');
 const glyphs = {
   'chevron-left': 'eab5', 'chevron-right': 'eab6', 'chevron-up': 'eab7', 'chevron-down': 'eab4',
   'check': 'eab2', 'discard': 'eae2', 'check-all': 'ebb1', 'close-all': 'eac1', 'clear-all': 'eabf',
+  'close': 'ea76', // undo/reject one edit — the ✗ of the standard vocabulary (✓ accept · ✗ reject · ↺ redo)
   'lightbulb': 'ea61', 'search': 'ea6d', 'refresh': 'eb37',
-  'checklist': 'eab3', 'history': 'ea82', 'comment-discussion': 'eac7',
+  'checklist': 'eab3', 'comment-discussion': 'eac7',
   'list-ordered': 'eb16', // Prompt axis Review: step through one prompt's edits in order
   'diff': 'eae1', // nav bar: open the current edit as a full diff tab
   'export': 'ebac', // nav bar: export a shareable review summary
+  'folder-opened': 'eaf7', // Overview toolbar: open this session's store folder on disk (beside Export)
   'cloud-download': 'eac2', // version dropdown: Update now
   'debug-step-back': 'eb8f', // Prompt axis Rewind: revert this ask and everything after it
   'split-horizontal': 'eb56', // left-nav toggle: pair related sections side by side
   'settings-gear': 'eb51', // Overview controls: open this extension's settings, beside the version chip
+  'filter': 'eaf1', // Overview toolbar: the filter menu (regex / file type / extension)
+  'filter-filled': 'ebce', // …the same button when a filter is active
+  'sort-precedence': 'eb55', // Overview toolbar: cycle the sort order (time / name)
 };
 
 let rules = '';

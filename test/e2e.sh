@@ -3,16 +3,31 @@
 # Repo-relative + self-contained (temp HOME/workspace); run via `npm run e2e`.
 set -u
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
+# `oak` by name (the status line's usage delegate) is this tree's CLI, never one installed on the machine.
+export PATH="$REPO/node_modules/.bin:$PATH"
 CLI="$REPO/packages/cli/dist/index.js"
 CAPTURE="$REPO/packages/cli/dist/capture.js"
 CORE="$REPO/packages/core/dist/index.js"
 SETLINE="$REPO/test/setline.js"
-if [ ! -f "$CLI" ] || [ ! -f "$CAPTURE" ]; then echo "build first: npm run build"; exit 1; fi
+if [ ! -f "$CLI" ] || [ ! -f "$CAPTURE" ] || [ ! -f "$CORE" ] || [ ! -f "$REPO/packages/tui/dist/index.js" ]; then
+  echo "build first: npm run build"; exit 1
+fi
 
 TMP="$(cd "$(mktemp -d)" && pwd -P)"   # canonical path (macOS /var -> /private/var) so mangle == process.cwd()
-trap 'rm -rf "$TMP"' EXIT
+# The interactive boot below starts this store's focus server; stop it before its store is deleted, or
+# it outlives the run by its idle timeout.
+trap 'node "$CLI" server stop >/dev/null 2>&1; rm -rf "$TMP"' EXIT
 export HOME="$TMP/home"
 unset CLAUDE_CONFIG_DIR   # isolation: stats/usage read transcripts from here if set
+# …and codex's own home, for the same reason and with more at stake:  writes hooks.json,
+# appends trust state to config.toml and can WIRE A MODEL there. Leaving CODEX_HOME set pointed all
+# of that at the developer's real configuration — a per-user file no review would ever see.
+unset CODEX_HOME
+# …and herdr's. Run from a herdr pane, this shell names the person's LIVE server, and `tui --once` read
+# it (and once wrote to it); XDG_CONFIG_HOME would hand herdr the real saved machines. Nothing here may
+# reach either: the socket below does not exist.
+unset HERDR_PANE_ID HERDR_TAB_ID HERDR_WORKSPACE_ID HERDR_ENV HERDR_BIN_PATH HERDR_SESSION XDG_CONFIG_HOME
+export HERDR_SOCKET_PATH="$TMP/no-herdr.sock"
 WS="$TMP/ws"
 SESSION="e2eSess"
 mkdir -p "$WS"
@@ -116,12 +131,14 @@ ok "…and the cached map inside it"            "[ -n \"$CACHED\" ] && [ -e \"$S
 echo "════════ E2E 9: init installs hooks, status reports them, uninstall removes them ════════"
 out=$(cc init 2>&1)
 ok "init installs capture hooks"          "echo \"\$out\" | grep -qi 'installed capture hooks'"
-ok "settings.json now carries our hook"   "grep -q 'claude-observatory-hook' '$HOME/.claude/settings.json'"
-ok "init is idempotent (2nd run no-op)"   "cc init 2>&1 | grep -qi 'already installed'"
+ok "settings.json now carries our hook"   "grep -q 'oak-observatory-hook' '$HOME/.claude/settings.json'"
+out2=$(cc init 2>&1)
+ok "init is idempotent (2nd run no-op)"   "echo \"\$out2\" | grep -qi 'already installed'"
+ok "…and the 2nd run still reaches the codex leg" "echo \"\$out2\" | grep -qiE 'codex:? (hooks|capture|is not|not on this machine)'"
 ok "status reports hooks installed"       "cc status | grep -qE 'hooks:[[:space:]]+installed'"
 out=$(cc uninstall 2>&1)
 ok "uninstall removes capture hooks"      "echo \"\$out\" | grep -qi 'removed capture hooks'"
-ok "hook gone from settings.json"         "! grep -q 'claude-observatory-hook' '$HOME/.claude/settings.json'"
+ok "hook gone from settings.json"         "! grep -q 'oak-observatory-hook' '$HOME/.claude/settings.json'"
 ok "status now reports not installed"     "cc status | grep -qi 'not installed'"
 
 echo "════════ E2E 10: list filters + diff of a KEPT edit + sessions listing ════════"
@@ -639,7 +656,7 @@ ok "demo observations: runs + reasoning + next steps"                  "printf '
 DTOUR=$( ( cd "$DEMOWS" && node "$CLI" demo --tour --json ) )
 ok "demo --tour --json emits the shared step list"                     "printf '%s' \"\$DTOUR\" | jq -e '(.steps|length)>=15 and ([.steps[].id]|unique|length)==(.steps|length)' >/dev/null"
 ok "demo --tour covers every Overview tab"                             "printf '%s' \"\$DTOUR\" | jq -e '[.steps[]|select(.tab)|.tab]|unique|sort == [\"fleet\",\"processes\",\"sessions\",\"tasks\",\"workflows\"]' >/dev/null"
-ok "demo --tour (text) is readable without a session"                  "( cd \"\$DEMOWS\" && node \"\$CLI\" demo --tour ) | grep -q 'Fleet'"
+ok "demo --tour (text) is readable without a session"                  "( cd \"\$DEMOWS\" && node \"\$CLI\" demo --tour ) | grep -q 'Workers'"
 # The prose renderer must print every field the editors render, or the printed tour is quietly a
 # different, shorter tour than the driven one — the drift core owning the script exists to prevent.
 DTIP=$( printf '%s' "$DTOUR" | jq -r '[.steps[]|select(.tip)][0].tip' )
@@ -655,7 +672,7 @@ ok "--essentials and --remainder together is an error, not a guess"    "! ( cd \
 # Action steps: both labels present, well formed, and never doubled up with a tryIt line.
 ok "demo --tour: action steps are well formed, both modes present"     "printf '%s' \"\$DTOUR\" | jq -e '([.steps[]|select(.action)]|length)>=4 and ([.steps[]|select(.action.mode==\"wait\")]|length)>=1 and ([.steps[]|select(.action.mode==\"auto\")]|length)>=1 and ([.steps[]|select(.action and .tryIt)]|length)==0 and ([.steps[]|select(.action and (.action.mode==\"auto\") and (.action.done|not))]|length)==0' >/dev/null"
 ok "…and every step in it is in the full tour, in the same order"      "[ \"\$(printf '%s' \"\$DTOURE\" | jq -r '[.steps[].id]|join(\",\")')\" = \"\$(printf '%s' \"\$DTOUR\" | jq -r --argjson e \"\$(printf '%s' \"\$DTOURE\" | jq -c '[.steps[].id]')\" '[.steps[].id|select(. as \$i|\$e|index(\$i))]|join(\",\")')\" ]"
-ok "demo --tour covers every shipped panel (Edits/Diffs trees are gone)" "printf '%s' \"\$DTOUR\" | jq -e '[.steps[].view]|unique|sort == [\"actions\",\"editor\",\"fileHistory\",\"observations\",\"overview\",\"prompts\",\"review\",\"stats\"]' >/dev/null"
+ok "demo --tour covers every shipped panel (Edits/Diffs trees are gone)" "printf '%s' \"\$DTOUR\" | jq -e '[.steps[].view]|unique|sort == [\"actions\",\"editor\",\"feed\",\"fileHistory\",\"observations\",\"overview\",\"prompts\",\"review\",\"stats\"]' >/dev/null"
 # The heartbeat keeps a paced tour inside the fleet's 60s active window — mtime only, never a write.
 DBYTES=$(wc -c < "$HOME/.claude/projects/$(printf '%s' "$DEMOWS" | sed 's/[^a-zA-Z0-9]/-/g')/$DSESS.jsonl")
 ok "demo --touch bumps both transcripts and the workflow state"        "( cd \"\$DEMOWS\" && node \"\$CLI\" demo --touch --json ) | jq -e '([.touched[]|select(endswith(\".jsonl\"))]|length)==2 and ([.touched[]|select(endswith(\"wf_demo.json\"))]|length)==1' >/dev/null"
@@ -690,10 +707,21 @@ ok "demo --clean drops both demo usage cursors, keeping the others"    "[ \"\$DC
 # `indexOf` returns -1 and the filter removed argument zero — so every view described a DIFFERENT session
 # while looking perfectly plausible. That is what these pin.)
 echo "════════ E2E 23: views batching must not change a single answer ════════"
-# `multitask` carries fleet liveness, and isFleetActive is `now - transcript mtime <= 60s`. The single
-# and batched invocations below run seconds apart, ~2/3 into a multi-minute suite — a transcript aging
-# PAST 60s BETWEEN the two flips active/folded and the bytes differ (observed as an intermittent
-# failure). Freshening the mtime pins both sides of every pair well inside the window.
+# These separate processes must see the same phase/liveness inputs. Backdate the other fixtures
+# well past the 10-second pending-tool and 5-minute idle thresholds, then keep the selected session
+# fresh for the fleet's 60-second active window. Refreshing only the selected transcript left
+# obsSess crossing working -> awaiting-permission between the batch and single macOS reads.
+node -e '
+  const fs=require("fs"), path=require("path"), stamp=(Date.now()-3600000)/1000;
+  function walk(dir) {
+    for (const e of fs.readdirSync(dir,{withFileTypes:true})) {
+      const file=path.join(dir,e.name);
+      if (e.isDirectory()) walk(file);
+      else if (e.isFile() && e.name.endsWith(".jsonl")) fs.utimesSync(file,stamp,stamp);
+    }
+  }
+  walk(process.argv[1]);
+' "$HOME/.claude/projects"
 touch "$HOME/.claude/projects/$MANGLE/$SESSION.jsonl"
 VJ=$( cc views --session "$SESSION" --root "$WS" --json )
 # Non-empty FIRST: without this the comparisons below pass when both sides fail, which is how the first
@@ -813,7 +841,7 @@ echo "════════ E2E 25: tui renders headlessly ══════
 # alternate screen and the exit guard are UNTESTABLE here — a green job is not TTY coverage, and the
 # interactive path has to be exercised by hand. What this does pin is that the non-interactive path
 # produces a real frame instead of crashing on `columns === undefined`, and exits 0.
-DASH=$( cc tui --once --cols 96 --rows 14 --no-color --session "$SESSION" --root "$WS" )
+DASH=$( cc tui --once --cols 96 --rows 14 --no-color --session "$SESSION" --root "$WS" --tab review )
 ok "tui --once exits 0 and prints exactly its height"  "[ \"\$(printf '%s\n' \"\$DASH\" | wc -l | tr -d ' ')\" = 14 ]"
 ok "tui --once emits no escapes under --no-color"      "! printf '%s' \"\$DASH\" | grep -q \$'\\033'"
 # Measured with the product's own display-width ruler, not awk's `length`: awk counts bytes, so a
@@ -826,15 +854,16 @@ ok "tui --once holds the column budget"                "printf '%s\n' \"\$DASH\"
 # Checked against the BAR ROW, not the whole frame. Grepping the frame passed against a bar that had
 # dropped every chip, because the same words appear in the blocked-size status line underneath: the
 # check reported healthy for precisely the failure it existed to catch.
-BAR=$( printf '%s\n' "$DASH" | sed -n 1p )
-ok "tui names every window on its bar, at a size that cannot show them all" "printf '%s' \"\$BAR\" | grep -q 'F1 .Claude' && printf '%s' \"\$BAR\" | grep -q 'F2 .Prompts' && printf '%s' \"\$BAR\" | grep -q 'F3 .Traces' && printf '%s' \"\$BAR\" | grep -q 'F4 .Map' && printf '%s' \"\$BAR\" | grep -q 'F5 .Diff' && printf '%s' \"\$BAR\" | grep -q 'F6 .Dashboards'"
+BAR=$( printf '%s\n' "$DASH" | grep -E 'F2.+Prompts' )
+ok "review names its four panes even when they cannot all fit" "printf '%s' \"\$BAR\" | grep -qE 'F2 .Prompts.*F3 .Traces.*F4 .Map.*F5 .Diff'"
+
 ok "and says what a window it cannot open would cost"  "printf '%s' \"\$DASH\" | grep -qE 'needs [0-9]+ (cols|body rows)'"
 # The keys row must not advertise a key the runtime does not answer. `j`/`k` are gone; arrows moved in.
 ok "the key row advertises arrows, not j/k"             "printf '%s\n' \"\$DASH\" | tail -1 | grep -q '↑↓' && ! printf '%s\n' \"\$DASH\" | tail -1 | grep -q 'j/k'"
 # The product's front door is the app: a bare invocation, or one carrying only flags, opens the
 # dashboard rather than printing help or erroring on a leading flag it would read as a command.
-ok "a bare invocation opens the app, not usage"         "cc --root \"\$WS\" --no-color | grep -q 'Traces'"
-ok "flags alone still open it"                          "cc --root \"\$WS\" --session \"\$SESSION\" --no-color | grep -q 'Dashboards'"
+ok "a bare invocation opens the app, not usage"         "cc --root \"\$WS\" --no-color | grep -q 'Sessions'"
+ok "flags alone still open it"                          "cc --root \"\$WS\" --session \"\$SESSION\" --no-color | grep -q 'Sessions'"
 # `diff --patch` is what the dashboard parses. The human trailer is not diff, and it rendered as a
 # context row at the foot of every edit until the flag existed.
 # `grep -qv` was a tautology: it exits 0 as soon as ANY line fails to match, so it passed for output
@@ -846,11 +875,20 @@ ok "…and plain diff still prints the trailer for a human" "cc diff 1 --session
 # …but the two questions still answer for themselves, or every script and doc changes meaning.
 # The INTERACTIVE first frame. `--once` renders directly and never calls `paint`, so it cannot catch
 # an error thrown while drawing frame one — which is how a temporal-dead-zone crash reached a user.
+# Its 60-second usage poll also kicks the Remote Control titles refresh (claimed, then detached). Clear
+# what earlier `usage` calls left so the claim this checks can only be the paint's.
+RT="$HOME/.claude/claude-observatory/remote-cache/session-titles.json"
+rm -f "$RT" "$RT.kick"
 ok "the interactive path boots and paints"       "cd \"$WS\" && node \"$REPO/test/tty-boot.js\" \"$REPO/packages/cli/dist/index.js\""
+ok "…and its first poll claims a Remote Control titles refresh" "[ -f \"$RT.kick\" ]"
 # …and then it is DRIVEN. `--once` never installs a key handler and tty-boot only proves frame one
 # does not throw, so neither presses a key — which is how five separate keys shipped bound to a string
 # the decoder never emits. This one sends real bytes and reads the frame that comes back.
-ok "the interactive path answers real keystrokes" "cd \"$WS\" && node \"$REPO/test/tty-drive.js\" \"$REPO/packages/cli/dist/index.js\""
+# …and an accept SURVIVES the read that was already running when it happened. Both halves take about
+# the same time on a fixture, so this one deliberately slows the read: on a real session the read is
+# ~11s and the write ~90ms, and a reader watched their accepted rows come back.
+ok "an accept is not clobbered by a read that predates it" "cd \"$WS\" && node \"$REPO/test/stale-read-race.js\" \"$REPO/packages/cli/dist/index.js\""
+
 ok "--help still prints usage"                          "cc --help | grep -qi 'per-edit Keep/Undo'"
 ok "--version still prints a version"                   "cc --version | grep -qE '[0-9]+\\.[0-9]+\\.[0-9]+'"
 ok "a named verb still dispatches"                      "cc status | grep -qi 'capture hooks'"

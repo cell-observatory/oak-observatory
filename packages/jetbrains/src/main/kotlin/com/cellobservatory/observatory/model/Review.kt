@@ -5,7 +5,7 @@ import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 
 /**
- * Kotlin mirror of `claude-observatory review --prompt <id> --json --no-patch` — ONE ask's work as
+ * Kotlin mirror of `oak review --prompt <id> --json --no-patch` — ONE ask's work as
  * review UNITS. No patch field: the plugin's Review tab is a LIST, every diff renders in the editor
  * from the store's blobs, so this parser mirrors only what the panel consumes (the CLI still emits
  * patches without `--no-patch`, for CLI consumers).
@@ -26,6 +26,13 @@ data class ReviewUnit(
     val ts: Long,
     val added: Int,
     val removed: Int,
+    /** Review-only: the before-content never arrived (ACP) or is uncertain, so undo refuses and
+     *  keep works. Marked BEFORE the reader acts, not explained after (parity with VS Code's badge
+     *  and the store-backed tree). The wire carries `partial:true` only when set. */
+    val partial: Boolean = false,
+    /** core.captureSummary for the unit's record — the authoritative capture-evidence string
+     *  (fidelity · runtime · model · tool · turn). Rendered verbatim rather than re-derived. */
+    val capture: String = "",
 ) {
     val pending: Boolean get() = status == "pending"
 }
@@ -112,6 +119,8 @@ object ReviewParser {
         ts = long(o, "ts"),
         added = int(o, "added"),
         removed = int(o, "removed"),
+        partial = o.get("partial")?.let { it.isJsonPrimitive && it.asJsonPrimitive.isBoolean && it.asBoolean } ?: false,
+        capture = str(o, "capture") ?: "",
     )
 
     private fun str(o: JsonObject, k: String): String? = o.get(k)?.takeIf { !it.isJsonNull }?.asString

@@ -1,0 +1,45 @@
+# OAK's herdr plugin — one action, so "open this pane's conversation in OAK" appears in herdr's own
+# action list and keymap, and one startup hook that restarts the system monitor in the `home`
+# workspace's `btop` tab. Linked (not installed from GitHub) by `ensureHerdr()`, which passes the
+# absolute path of this directory to `herdr plugin link`; herdr rereads this file at every server start.
+#
+# `version` is the PLUGIN's version and deliberately tracks nothing: OAK's version:check gate syncs
+# package.json + build.gradle.kts, and adding a fourth number to keep in step buys nothing here.
+# `min_herdr_version` is the pin in herdr.lock — ensureHerdr() never leaves a herdr older than that.
+id = "oak.observatory"
+name = "OAK Observatory"
+version = "0.1.0"
+min_herdr_version = "0.9.1"
+description = "Open a pane's agent conversation in the OAK observatory; restart the btop monitor when herdr starts"
+platforms = ["linux", "macos", "windows"]
+
+# Pane context: herdr offers this action when a pane is focused, and passes the pane's identity in
+# the environment (HERDR_PANE_ID, HERDR_PLUGIN_CONTEXT_JSON). herdr does NOT template command
+# arguments — commands are argv arrays run without a shell — so the session id the action needs is
+# read from that environment by the script, not substituted into the command line here.
+[[actions]]
+id = "open-in-oak"
+title = "Open in OAK"
+description = "Show this pane's conversation in the OAK observatory"
+contexts = ["pane"]
+platforms = ["linux", "macos"]
+command = ["sh", "open-in-oak.sh"]
+
+# herdr supports action-level platforms but rejects duplicate action ids, even
+# for disjoint platforms. Windows therefore needs its own qualified action id.
+[[actions]]
+id = "open-in-oak-windows"
+title = "Open in OAK"
+description = "Show this pane's conversation in the OAK observatory"
+contexts = ["pane"]
+platforms = ["windows"]
+command = ["cmd.exe", "/d", "/c", "open-in-oak.cmd"]
+
+# herdr runs [[startup]] commands once per server start, after it restores the saved session. herdr
+# 0.9.1 restores the monitor's pane as a plain shell, so a reboot stops the system monitor in the
+# `btop` tab; herdr-startup.py starts it again without waiting for OAK, typing only into that pane's
+# idle shell, and never creates or renames anything. POSIX only: the monitor is launched with a
+# POSIX-shell command line.
+[[startup]]
+command = ["python3", "herdr-startup.py"]
+platforms = ["linux", "macos"]

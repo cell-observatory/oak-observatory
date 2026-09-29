@@ -16,7 +16,7 @@ import com.intellij.openapi.util.Disposer
 
 /**
  * The floating review bar: Keep · Undo · ‹ Diff n/m › · Accept File · Reject File, drawn in the corner of
- * any editor whose file still has Claude edits awaiting review.
+ * any editor whose file still has agent edits awaiting review.
  *
  * This is the port of Copilot's editor overlay controls, and the platform's own floating-toolbar
  * extension point is a true overlay over the code — the thing VS Code has no extension API for at all

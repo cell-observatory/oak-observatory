@@ -1,18 +1,22 @@
 {
-  "name": "@claude-observatory/core",
+  "name": "@oak-observatory/core",
   "version": "0.10.0-dev.0",
   "private": true,
-  "description": "Capture + git-free snapshot store + surgical undo engine for Claude Observatory. No model calls.",
+  "description": "Capture + git-free snapshot store + surgical undo engine for OAK. No model calls.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "files": [
     "dist"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json"
+    "build": "npm run gen:herdr-lock && tsc -p tsconfig.json && node -e \"require('fs').copyFileSync('src/herdr-api.d.ts', 'dist/herdr-api.d.ts')\"",
+    "gen:herdr-lock": "node scripts/gen-herdr-lock.js",
+    "gen:herdr": "node scripts/gen-herdr-types.js",
+    "test:herdr": "node --test test/herdr.test.js"
   },
   "dependencies": {
-    "diff": "^9.0.0"
+    "diff": "^9.0.0",
+    "smol-toml": "1.8.0"
   },
   "devDependencies": {
     "@types/node": "^26.1.2"
@@ -20,10 +24,10 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/cell-observatory/claude-observatory.git"
+    "url": "https://github.com/cell-observatory/oak-observatory.git"
   },
-  "homepage": "https://github.com/cell-observatory/claude-observatory#readme",
+  "homepage": "https://github.com/cell-observatory/oak-observatory#readme",
   "bugs": {
-    "url": "https://github.com/cell-observatory/claude-observatory/issues"
+    "url": "https://github.com/cell-observatory/oak-observatory/issues"
   }
 }

@@ -2,7 +2,6 @@ package com.cellobservatory.observatory.services
 
 import com.cellobservatory.observatory.core.ClaudePaths
 import com.cellobservatory.observatory.core.ObservatoryCli
-import com.cellobservatory.observatory.core.SessionResolver
 import com.cellobservatory.observatory.core.StoreReader
 import com.cellobservatory.observatory.core.StoreWatcher
 import com.cellobservatory.observatory.core.TranscriptWatcher
@@ -39,6 +38,9 @@ import java.util.concurrent.atomic.AtomicBoolean
  * Project-level hub: resolves the active session for this project's root, caches the folded log
  * on the (mtime,size) key, and fans out refresh events (store watcher → trees, status bar, …).
  */
+/** The four sort-order keys, in cycle order — the Kotlin peer of core.SORT_KEYS. */
+internal val OAK_SORT_KEYS = listOf("time", "time-asc", "name", "name-desc")
+
 @Service(Service.Level.PROJECT)
 class ObservatoryService(private val project: Project) : Disposable {
     private val listeners = CopyOnWriteArrayList<Runnable>()
@@ -48,8 +50,46 @@ class ObservatoryService(private val project: Project) : Disposable {
     // session's key, which then sticks until the key moves again.
     @Volatile private var cachedLog: List<EditRecord> = emptyList()
     @Volatile private var cachedKey: String = ""
-    @Volatile private var cachedAutoSession: String? = null
-    @Volatile private var cachedAutoRoot: String? = null
+
+    /** Memo for [pinStillExists] — currentSession() is hot (per cell renderer), the check is IO. */
+    @Volatile private var checkedPin: Pair<String, Boolean>? = null
+    private val pinLock = Any()
+
+    /**
+     * Validate a persisted pin against disk, ONCE per pin value (re-checked on [refresh], which
+     * already re-resolves the session). On a PROVEN absence — no store dir and no transcript in any
+     * project; [StoreReader.sessionExists] errs toward true on IO trouble — the pin is cleared so
+     * settings and pickers agree, and the reader is told once why the observatory moved.
+     */
+    private fun pinStillExists(pin: String): Boolean {
+        checkedPin?.let { (id, ok) -> if (id == pin) return ok }
+        synchronized(pinLock) {
+            checkedPin?.let { (id, ok) -> if (id == pin) return ok }
+            val ok = StoreReader.sessionExists(pin)
+            checkedPin = pin to ok
+            if (!ok) {
+                // Compare-and-clear: a picker may have re-pinned while this check's IO was in
+                // flight, and clearing unconditionally would throw away that fresh, valid pick.
+                val st = com.cellobservatory.observatory.settings.ObservatorySettings.instance.state
+                if (st.session == pin) st.session = null
+                // One balloon per stale pin for the whole IDE — the pin is application-wide, so
+                // every open project's service detects the same one, and each would otherwise say it.
+                if (staleNotifiedPins.add(pin)) {
+                    ApplicationManager.getApplication().invokeLater {
+                        if (!project.isDisposed) {
+                            com.cellobservatory.observatory.ui.ReviewOps.notify(
+                                project,
+                                "Pinned session ${pin.take(8)} no longer exists on this machine (no store " +
+                                    "or transcript found) — following the newest session again.",
+                                com.intellij.notification.NotificationType.WARNING,
+                            )
+                        }
+                    }
+                }
+            }
+            return ok
+        }
+    }
     private val watchListener = Runnable { refresh() }
 
     /** True while a coalesced repaint is queued on the EDT — see [notifyListeners]. */
@@ -69,32 +109,30 @@ class ObservatoryService(private val project: Project) : Disposable {
      * would leave a pin behind after a crash pointing at a session demo cleanup has since deleted,
      * which shows as every panel being permanently empty for a non-obvious reason. Auto-resolution
      * already lands on a running demo unaided (its transcript is the newest); this is the guard against
-     * a real Claude session starting mid-tour.
+     * a real agent session starting mid-tour.
      */
     @Volatile
     var demoSessionOverride: String? = null
         set(value) {
             field = value
-            cachedAutoSession = null // the auto-resolution memo must not answer for the old session
-            cachedAutoRoot = null
             refresh(force = true)
         }
 
     fun currentSession(): String? {
         demoSessionOverride?.takeIf { it.isNotBlank() }?.let { return it }
         // A pinned session (Switch Session / settings) wins over auto-resolution — lets you review a
-        // demo session or any past session instead of just the newest for this workspace.
+        // demo session or any past session instead of just the newest for this workspace. But only
+        // while it still EXISTS: the pin is persisted and application-wide, so a session deleted
+        // after pinning (demo Exit, `clean --drop`) otherwise blanks every panel in every project
+        // for a non-obvious reason — the exact failure the demo override's in-memory design above
+        // exists to avoid. A stale pin is dropped (with a notification) and auto-resolution resumes.
         com.cellobservatory.observatory.settings.ObservatorySettings.instance.state.session
             ?.takeIf { it.isNotBlank() }
-            ?.let { return it }
-        val root = workspaceRoot ?: return null
-        // Memoize the auto-resolution (invalidated on refresh()): resolveSessionId walks parent dirs
-        // listing *.jsonl, and currentSession() is hit per cell renderer + per log()/counts()/tree call.
-        cachedAutoSession?.let { if (cachedAutoRoot == root) return it }
-        return SessionResolver.resolveSessionId(root).also {
-            cachedAutoSession = it
-            cachedAutoRoot = root
-        }
+            ?.let { pin -> if (pinStillExists(pin)) return pin }
+        if (workspaceRoot == null) return null
+        // The CLI owns provenance and auto-selection. A cold listing starts off the UI thread;
+        // an answered null stays null, including a project containing only mirrored transcripts.
+        return (peekSessions() ?: sessionsFetch.get(""))?.active
     }
 
     @Volatile private var pendingByFile: Map<String, Int> = emptyMap()
@@ -198,11 +236,81 @@ class ObservatoryService(private val project: Project) : Disposable {
     // (parity with the VS Code module-level filter). Matches on workspace-relative path.
     @Volatile var filterQuery: String = ""
         private set
+    // The rest of the filter control: extension/type narrowing, session-transient like the Search
+    // query. Applied on top of filterQuery by the ledger and the Review tree, so all surfaces narrow
+    // together (parity with VS Code's module-level spec). There is no regex flag — the query reads as
+    // a regex on its own when it carries regex syntax.
+    @Volatile var filterExts: List<String> = emptyList()
+        private set
+    @Volatile var filterCats: List<String> = emptyList()
+        private set
 
     /** Set the Search filter and re-render every surface. Empty/blank clears it. */
     fun setFilter(query: String) {
         filterQuery = query.trim()
         refresh()
+    }
+    /** Alias the inline toolbar's search field and its Clear call, so the intent reads at the call site. */
+    fun setFilterQuery(query: String) = setFilter(query)
+
+    /** Set the extension/type part of the filter and re-render. (Regex is automatic — no flag.) */
+    fun setFilterSpec(exts: List<String>, cats: List<String>) {
+        filterExts = exts
+        filterCats = cats
+        refresh()
+    }
+
+    /** True when anything narrows the file lists — for the "filter active" affordance. */
+    fun filterActive(): Boolean = filterQuery.isNotBlank() || filterExts.isNotEmpty() || filterCats.isNotEmpty()
+
+    /** A query is read as a regex the moment it carries regex syntax — a dot or slash is NOT a signal
+     *  (they sit in every literal path). Kotlin peer of core.isRegexQuery. */
+    private fun isRegexQuery(q: String): Boolean = q.any { it in "^\$*+?()[]{}|\\" }
+
+    /** The shared match predicate (query/ext/type over one file's path). Kotlin peer of
+     *  core.matchesFileFilter: the query is a case-insensitive regex when it carries regex syntax, a
+     *  substring otherwise; a pattern that will not compile falls back to substring. */
+    fun matchesFile(rel: String, ext: String, category: String): Boolean {
+        val q = filterQuery
+        if (q.isNotBlank()) {
+            val ok = if (isRegexQuery(q))
+                runCatching { Regex(q, RegexOption.IGNORE_CASE).containsMatchIn(rel) }.getOrElse { rel.contains(q, ignoreCase = true) }
+            else rel.contains(q, ignoreCase = true)
+            if (!ok) return false
+        }
+        if (filterExts.isNotEmpty() && !filterExts.contains(ext)) return false
+        if (filterCats.isNotEmpty() && !filterCats.contains(category)) return false
+        return true
+    }
+
+    /** A one-line summary of what the filter narrows by — the query (shown /…/ when a live regex,
+     *  quoted when literal), then the type buckets and extensions. Empty when nothing is applied.
+     *  Backs the Filter button's "what is applied" label. */
+    fun filterSummary(): String {
+        val bits = ArrayList<String>()
+        val q = filterQuery.trim()
+        if (q.isNotEmpty()) bits.add(if (isRegexQuery(q)) "/$q/" else "\"$q\"")
+        for (c in filterCats) bits.add(when (c) { "code" -> "Code"; "tests" -> "Tests"; "config" -> "Config"; "docs" -> "Docs"; "styles" -> "Styles"; else -> "Other" })
+        for (e in filterExts) bits.add(".$e")
+        return bits.joinToString(", ")
+    }
+
+    /** The sort order (persisted in settings) — one of the four keys, with `time` as the fallback for
+     *  any unknown / legacy value. Kotlin peer of core.SortKey / normalizeSort. */
+    fun sortKey(): String {
+        val raw = com.cellobservatory.observatory.settings.ObservatorySettings.instance.state.overviewSort
+        return if (raw in OAK_SORT_KEYS) raw else "time"
+    }
+    fun setSortKey(key: String) {
+        com.cellobservatory.observatory.settings.ObservatorySettings.instance.state.overviewSort = if (key in OAK_SORT_KEYS) key else "time"
+        refresh()
+    }
+    /** Label for the sort dropdown row, one per key. */
+    fun sortLabel(key: String): String = when (key) {
+        "time-asc" -> "Time (oldest first)"
+        "name" -> "Name (A→Z)"
+        "name-desc" -> "Name (Z→A)"
+        else -> "Time (newest first)"
     }
 
     // Edit-tree view-model from the CLI `tree --json` (the single source; VS Code renders the same
@@ -211,6 +319,17 @@ class ObservatoryService(private val project: Project) : Disposable {
     // on first read and repaints when it lands.
     @Volatile private var editTreeCache: EditTree? = null
     @Volatile private var editTreeKey: String = ""
+
+    /** True while the LAST `tree --json` spawn failed — so an empty Review tree can say "the CLI did
+     *  not answer" instead of the silently-wrong "no edits in this session yet". Cleared by the next
+     *  fetch that lands (each refresh retries). */
+    @Volatile var treeFetchFailed: Boolean = false
+        private set
+
+    /** When that failure landed — retries hold off for a few seconds, because the failure repaint
+     *  itself re-enters [refreshEditTree] via [editTree], and an unthrottled loop would spawn the
+     *  missing CLI forever. */
+    @Volatile private var failedTreeAt: Long = 0L
 
     /**
      * Records inside a chain that CANCELS OUT — a file created then deleted, or an edit put back.
@@ -231,19 +350,37 @@ class ObservatoryService(private val project: Project) : Disposable {
     }
 
     private fun refreshEditTree() {
-        val session = currentSession() ?: run { editTreeCache = null; return }
-        val key = "$session|$filterQuery|${StoreReader.logKey(session)}"
+        val session = currentSession() ?: run {
+            editTreeCache = null
+            // No session is not a fetch failure — a flag left over from one would make the empty
+            // tree claim "the CLI did not answer" about a project with nothing to ask it for.
+            treeFetchFailed = false
+            failedTreeAt = 0L
+            return
+        }
+        // The CLI applies a SUBSTRING query; regex/extension/type narrowing is client-side (over the
+        // parsed tree, in EditsTreePanel), so when the query is a regex the CLI fetches the full tree
+        // and the client filters it. The key tracks the CLI-side filter only — client-side changes
+        // just re-render.
+        val cliFilter = if (isRegexQuery(filterQuery)) "" else filterQuery
+        val key = "$session|$cliFilter|${StoreReader.logKey(session)}"
         if (key == editTreeKey) return
+        if (failedTreeAt != 0L && System.currentTimeMillis() - failedTreeAt < 5_000) return // failure backoff
         editTreeKey = key // claim this fetch so rapid refreshes don't stack
         ApplicationManager.getApplication().executeOnPooledThread {
-            val parsed = ObservatoryCli.treeJson(session, workspaceRoot, filterQuery)?.let { TreeParser.parse(it) }
+            val parsed = ObservatoryCli.treeJson(session, workspaceRoot, cliFilter)?.let { TreeParser.parse(it) }
             // Ignore a result the key has already moved past: a mutation re-keys mid-flight and starts a
             // second fetch, and the two land in whatever order the CLI finishes them — an older answer
             // winning would park a pre-mutation tree in the cache that nothing would refetch.
             if (editTreeKey != key) return@executeOnPooledThread
             if (parsed == null) {
-                editTreeKey = "" // fetch failed — retry on the next refresh
+                editTreeKey = "" // fetch failed — retry on the next refresh (held off by the backoff)
+                failedTreeAt = System.currentTimeMillis()
+                treeFetchFailed = true
+                notifyListeners() // repaint so the tree's empty state can SAY the CLI failed
             } else {
+                failedTreeAt = 0L
+                treeFetchFailed = false
                 editTreeCache = parsed
                 // Publish the set BEFORE the fan-out, so the counts every listener recomputes below
                 // agree with the tree that just landed rather than lagging it by one tick.
@@ -353,8 +490,39 @@ class ObservatoryService(private val project: Project) : Disposable {
     // Every session in this workspace, newest CONVERSATION first (0.8.8) — the Overview's Sessions tab
     // and the Switch Session popup read the same rows. Cheap by construction in core (stats + a bounded,
     // sidecar-cached title scan; no store log is parsed), so it rides the shared tick like any other view.
-    private val sessionsFetch = ThrottledFetch { _ ->
-        ObservatoryCli.sessionsJson(workspaceRoot, currentSession(), buildBatch = true)?.let { SessionsParser.parse(it) }
+    /** One balloon per raised hand: session id → the attention ts already announced. */
+    private val attnNotified = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    /** One DESKTOP hand-off per raised hand (idle-done included — the reader's prefs decide in core). */
+    private val attnDesktop = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    private val sessionsFetch = ThrottledFetch { session ->
+        ObservatoryCli.sessionsJson(workspaceRoot, session.takeIf { it.isNotBlank() }, buildBatch = true)?.let { SessionsParser.parse(it) }?.let { r ->
+            // ATTENTION: a session whose agent raised its hand — a question, a
+            // permission ask, an input wait — balloons ONCE per raise (keyed by the attention ts).
+            // idle-done stays quiet: shown by the panels, never announced.
+            for (row in r.sessions) {
+                val a = row.attention ?: continue
+                // …and the DESKTOP announcement (2026-09-15): core's once-per-machine claim decides,
+                // reached through the CLI, off this fetch thread so a slow notifier never delays the rows.
+                if ((attnDesktop[row.id] ?: 0L) < a.ts) {
+                    attnDesktop[row.id] = a.ts
+                    val wd = workspaceRoot
+                    ApplicationManager.getApplication().executeOnPooledThread {
+                        ObservatoryCli.notifyHand(row.id, a.kind, a.ts, row.title, a.message, row.agent, wd)
+                    }
+                }
+                if (a.kind == "idle-done") continue
+                if ((attnNotified[row.id] ?: 0L) >= a.ts) continue
+                attnNotified[row.id] = a.ts
+                val label = com.cellobservatory.observatory.model.attentionLabel(a.kind)
+                val name = row.title?.takeIf { it.isNotBlank() } ?: ("session " + row.id.take(8))
+                com.cellobservatory.observatory.ui.ReviewOps.notify(
+                    project,
+                    "“$name” $label" + (a.message.takeIf { it.isNotBlank() }?.let { " — $it" } ?: ""),
+                    com.intellij.notification.NotificationType.WARNING,
+                )
+            }
+            r
+        }
     }
     // The folded footprint's two surviving facts (0.8.7): the writes that left the workspace (`risk`) and
     // the reads that did (`egress`'s `file` channels). Neither rides the shared multitask payload, so both
@@ -366,19 +534,39 @@ class ObservatoryService(private val project: Project) : Disposable {
     }
 
     /** Which feed to tail. Carries the SESSION as well as core's ref, because a fleet row can name a
-     *  sibling session rather than this project's active one. */
-    data class FeedRef(val session: String, val kind: String, val id: String) {
-        internal val key: String get() = listOf(session, kind, id).joinToString(KEY_SEP)
+     *  sibling session rather than this project's active one. [limit] is how deep the tail reads —
+     *  part of the key, so the Feed tab's "load more" is a NEW fetch, never a stale cache hit. */
+    data class FeedRef(val session: String, val kind: String, val id: String, val limit: Int = FEED_LIMIT) {
+        internal val key: String get() = listOf(session, kind, id, limit.toString()).joinToString(KEY_SEP)
     }
 
     /** One shared slot serves every feed, so the cached tail carries the ref it was fetched FOR — a tail
-     *  that landed for a previous selection must never be handed back under the new one. */
+     *  that landed for a previous selection must never be handed back under the new one. ONE consumer
+     *  (the Timeline's FeedPanel, 0.10.0): a second surface asking for a different ref every tick would
+     *  key-thrash the slot into a spawn per call. */
     private val feedFetch = ThrottledFetch { key ->
         val p = key.split(KEY_SEP)
-        ObservatoryCli.feedJson(p[0], p[1], p[2], FEED_LIMIT, workspaceRoot)
+        ObservatoryCli.feedJson(p[0], p[1], p[2], p[3].toIntOrNull() ?: FEED_LIMIT, workspaceRoot)
             ?.let { FeedParser.parse(it) }
-            ?.let { key to it }
+            // The rows' inline diffs are built HERE, on this pooled thread: a log read plus two blob
+            // reads and a line comparison per edit, which the Feed tab used to do on the EDT.
+            ?.let { key to it.copy(previews = com.cellobservatory.observatory.ui.DiffPreviews.forFeed(p[0], it.entries)) }
     }
+
+    /**
+     * The Overview's feed SUBJECT — what its nav last selected (a worker session, a subagent, a
+     * workflow run, a task, a background shell), published for the Timeline's Feed tab to follow.
+     * Null = nothing picked, and the Feed tab shows the reviewed session's own feed. [forSession]
+     * remembers which session the pick belonged to, so a session switch drops it. The precedent is
+     * [selectedPromptId] below: shared cross-window selection, setter notifies every surface.
+     */
+    data class FeedSel(val ref: FeedRef, val forSession: String?)
+    @Volatile var selectedFeed: FeedSel? = null
+        set(value) {
+            if (field == value) return
+            field = value
+            notifyListeners()
+        }
 
     /** The shared `multitask --json` view (fleet + workflows + curated actions). Keyed on the active
      *  session so a session switch refetches immediately. */
@@ -441,6 +629,19 @@ class ObservatoryService(private val project: Project) : Disposable {
             notifyListeners()
         }
 
+    /** One-shot: the Prompts window asks the Feed tab to seat its feed on an ask's ANSWER
+     * Consumed by [takeResponseJump] on the next listener pass. */
+    @Volatile private var responseJumpId: String? = null
+    fun requestResponseJump(promptId: String) {
+        responseJumpId = promptId
+        notifyListeners()
+    }
+    fun takeResponseJump(): String? {
+        val v = responseJumpId
+        if (v != null) responseJumpId = null
+        return v
+    }
+
     /**
      * The `feed --json` tail for [ref], on the same throttled path as every other view — the panel gets
      * its feed on its existing refresh tick, no extra timer.
@@ -482,17 +683,39 @@ class ObservatoryService(private val project: Project) : Disposable {
      */
     fun refresh(force: Boolean = false) {
         cachedKey = "" // force re-read
-        cachedAutoSession = null // re-resolve the session (a new session may have appeared)
+        checkedPin = null // …and re-validate a pin (a re-pinned or re-created session must not stay condemned)
         if (force) {
             // A forced refresh follows a MUTATION. The batched views are cached for ~2.5 s, so without
             // this the Overview would repaint with pre-mutation counts while the Edits tree — which reads
             // the store directly — already showed the new ones: the two panels disagreeing on screen.
             ObservatoryCli.invalidateViewBatch()
             sharedViews.forEach { it.forceNext() }
+            // …and the tree's failure backoff yields to it: "must never be swallowed" includes the
+            // user's own Refresh right after installing the CLI this backoff is waiting out.
+            failedTreeAt = 0L
         }
         refreshEditTree() // kick a background tree fetch; repaints when it lands
         notifyListeners()
         warmRecentSessions()
+    }
+
+    /**
+     * A USER Refresh: sweep a newly-added `.observatoryignore` for the reviewed session, THEN run [then]
+     * (the panel's own refresh). Adding the ignore file fires no capture hook, so the capture-time sweep
+     * never runs and a plain refresh — a read — leaves the now-ignored records in the store.
+     * The sweep is `dropIgnored` (self-gating, a no-op when nothing matches) via the CLI, on a
+     * background thread; [then] runs on the EDT once it finishes. NEVER wire this to the file-watch tick —
+     * only to a button — since it rewrites the store and must not race the auto readers.
+     */
+    fun sweepIgnoredThen(then: () -> Unit) {
+        val session = currentSession()
+        if (session == null) { then(); return }
+        com.intellij.util.concurrency.AppExecutorUtil.getAppExecutorService().submit {
+            ObservatoryCli.ignoreSweep(project.basePath, session)
+            com.intellij.openapi.application.ApplicationManager.getApplication().invokeLater {
+                if (!project.isDisposed) then()
+            }
+        }
     }
 
     /** When this project last pre-built its recent sessions, so an idle IDE does not loop on it. */
@@ -524,7 +747,21 @@ class ObservatoryService(private val project: Project) : Disposable {
         if (!repaintQueued.compareAndSet(false, true)) return
         EdtScheduledExecutorService.getInstance().schedule({
             repaintQueued.set(false)
-            if (!project.isDisposed) listeners.forEach { it.run() }
+            if (!project.isDisposed) {
+                // Per-listener isolation: one throwing listener must not abort the fan-out — that
+                // failure mode starved every later-registered panel of repaints and blanked the
+                // whole product (field failure, 2026-08-20: a panel that died mid-construction had
+                // already registered, and its NPE ate everyone behind it). LOG.error keeps the bug
+                // LOUD: the test framework turns it into a failure, production logs a SEVERE per
+                // tick — a broken panel, not a broken product.
+                listeners.forEach {
+                    try {
+                        it.run()
+                    } catch (e: Throwable) {
+                        LOG.error("observatory listener failed — its panel is broken, siblings continue", e)
+                    }
+                }
+            }
         }, NOTIFY_COALESCE_MS, TimeUnit.MILLISECONDS)
     }
 
@@ -542,7 +779,13 @@ class ObservatoryService(private val project: Project) : Disposable {
     }
 
     companion object {
+        private val LOG = com.intellij.openapi.diagnostic.Logger.getInstance(ObservatoryService::class.java)
+
         fun getInstance(project: Project): ObservatoryService = project.getService(ObservatoryService::class.java)
+
+        /** Stale pins already announced this run — shared across the per-project services, see
+         *  [pinStillExists]. */
+        private val staleNotifiedPins: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
 
         /** Minimum interval between spawns of the same CLI view (matches VS Code's Overview throttle). */
         private const val MIN_FETCH_MS = 3_000L
@@ -551,8 +794,9 @@ class ObservatoryService(private val project: Project) : Disposable {
         private const val NOTIFY_COALESCE_MS = 90L
 
         /** Feed rows per fetch — enough scrollback to be useful, bounded so a busy agent's tail stays
-         *  cheap to post on every tick. Anything older comes back as the feed's `truncated` count. */
-        private const val FEED_LIMIT = 80
+         *  cheap to post on every tick. Anything older comes back as the feed's `truncated` count.
+         *  Internal: the FeedPanel's base depth (its load-more grows a per-subject copy of it). */
+        internal const val FEED_LIMIT = 80
 
         /** Field separator for the feed's composite cache key (session · kind · id) — a control char, so
          *  no id can ever split into the wrong fields. */
@@ -560,12 +804,82 @@ class ObservatoryService(private val project: Project) : Disposable {
     }
 }
 
+/**
+ * The pre-rename plugin's retirement, apart from [ObservatoryStartup] so a test can drive it: the startup
+ * skips it in unit-test and headless runs, and the three platform calls are swappable. It only ever
+ * DISABLES the old id; nothing in this plugin enables or installs it again.
+ */
+internal object OldPluginRetirement {
+    val OLD_ID: com.intellij.openapi.extensions.PluginId = com.intellij.openapi.extensions.PluginId.getId("com.cell-observatory.claude-observatory")
+
+    enum class Outcome { ABSENT, ALREADY_DISABLED, DISABLED, REFUSED }
+
+    @Volatile internal var installed: () -> Boolean = { com.intellij.ide.plugins.PluginManagerCore.getPlugin(OLD_ID) != null }
+    @Volatile internal var disabled: () -> Boolean = { com.intellij.ide.plugins.PluginManagerCore.isDisabled(OLD_ID) }
+    @Volatile internal var disable: () -> Unit = { com.intellij.ide.plugins.PluginEnabler.getInstance().disableById(setOf(OLD_ID)) }
+
+    /**
+     * Disable the old plugin when it is installed and still enabled. An old plugin already disabled (the
+     * run after the restart this asks for) is left alone, so the retirement cannot loop.
+     *
+     * disableById's Boolean answers "unloaded dynamically, no restart needed" — NOT "disable succeeded":
+     * the disabled state is persisted unconditionally before the dynamic-unload attempt (verified against
+     * 2025.2's DynamicPluginEnabler bytecode). So the only real failure is the call THROWING; a
+     * false return still wants the restart offer — more so, since the old plugin is then still resident.
+     */
+    fun retire(): Outcome = when {
+        !installed() -> Outcome.ABSENT
+        disabled() -> Outcome.ALREADY_DISABLED
+        runCatching { disable() }.isSuccess -> Outcome.DISABLED
+        else -> Outcome.REFUSED
+    }
+}
+
 /** Startup: arm the watcher and the inline overlay even before the tool window is first opened. */
 class ObservatoryStartup : ProjectActivity {
+
+    /** One shot per IDE run — [retireOldPlugin] is application-level work in a per-project activity. */
+    private companion object {
+        val oldPluginChecked = java.util.concurrent.atomic.AtomicBoolean(false)
+    }
+
+    /**
+     * 0.10.0 renamed the plugin id (com.cell-observatory.claude-observatory → …oak-observatory), and
+     * the platform treats the pre-rename install as a SEPARATE plugin — both then race to register
+     * the SAME tool-window and action ids, and the loser's registrations are dropped: the visible
+     * symptom is an empty or half-working Observatory window with nothing naming the cause. (VS
+     * Code's activate has carried this guard since its own 0.8.6 rename.) Disable the old one and
+     * offer the restart that unloads it; if the platform refuses, name what to uninstall by hand.
+     */
+    private fun retireOldPlugin(project: Project) {
+        if (!oldPluginChecked.compareAndSet(false, true)) return
+        val app = com.intellij.openapi.application.ApplicationManager.getApplication()
+        if (app.isUnitTestMode || app.isHeadlessEnvironment) return
+        val outcome = OldPluginRetirement.retire()
+        if (outcome == OldPluginRetirement.Outcome.ABSENT || outcome == OldPluginRetirement.Outcome.ALREADY_DISABLED) return
+        val group = com.intellij.notification.NotificationGroupManager.getInstance().getNotificationGroup("OAK")
+        if (outcome == OldPluginRetirement.Outcome.DISABLED) {
+            group.createNotification(
+                "Claude Observatory is OAK now — the old plugin was disabled (both register the same " +
+                    "windows and actions, and the two fight). Restart to finish.",
+                com.intellij.notification.NotificationType.WARNING,
+            ).addAction(com.intellij.notification.NotificationAction.createSimpleExpiring("Restart now") {
+                com.intellij.openapi.application.ApplicationManager.getApplication().restart()
+            }).notify(project)
+        } else {
+            group.createNotification(
+                "OAK is installed twice: the old \"Claude Observatory\" plugin is still enabled and " +
+                    "registers the same windows and actions. Uninstall it in Settings → Plugins, then restart.",
+                com.intellij.notification.NotificationType.WARNING,
+            ).notify(project)
+        }
+    }
+
     override suspend fun execute(project: Project) {
         ObservatoryService.getInstance(project)
         com.intellij.openapi.application.ApplicationManager.getApplication().invokeLater {
             if (!project.isDisposed) {
+                retireOldPlugin(project)
                 com.cellobservatory.observatory.ui.inline.InlineOverlay.getInstance(project).install()
                 val svc = ObservatoryService.getInstance(project)
                 // Keep the editor-top review banner live: re-run the notification provider on every store change.
@@ -595,7 +909,7 @@ class ObservatoryStartup : ProjectActivity {
      * Offer the demo on a first install and after an update, once, with a way to decline for good.
      *
      * Every gate matters, and the last one most: an unsolicited notification that interrupts a live
-     * Claude session is worse than never offering, so a busy project is skipped WITHOUT stamping the
+     * agent session is worse than never offering, so a busy project is skipped WITHOUT stamping the
      * version — it is offered next launch, when the reader is idle.
      */
     private fun offerDemo(project: Project) {
@@ -607,7 +921,7 @@ class ObservatoryStartup : ProjectActivity {
         val state = com.cellobservatory.observatory.settings.ObservatorySettings.instance.state
         if (state.demoOfferNever) return
         val current = com.intellij.ide.plugins.PluginManagerCore
-            .getPlugin(com.intellij.openapi.extensions.PluginId.getId("com.cell-observatory.claude-observatory"))
+            .getPlugin(com.intellij.openapi.extensions.PluginId.getId("com.cell-observatory.oak-observatory"))
             ?.version ?: return
         if (state.demoOfferLastSeenVersion == current) return
         val root = project.basePath ?: return
@@ -640,12 +954,12 @@ class ObservatoryStartup : ProjectActivity {
             }
             state.demoOfferLastSeenVersion = current // stamp BEFORE showing: an ignored balloon never re-asks
             val text = if (kind == "install") {
-                "Claude Observatory is installed. There is nothing to set up to look around: the demo replays a real Claude session through the real capture pipeline in about twenty seconds, every button in it works, and leaving removes every trace."
+                "OAK is installed. There is nothing to set up to look around: the demo replays a real agent session through the real capture pipeline in about twenty seconds, every button in it works, and leaving removes every trace."
             } else {
-                "Claude Observatory is now $current. The guided tour walks what changed alongside everything else — the demo replays in about twenty seconds and removes every trace when you leave."
+                "OAK is now $current. The guided tour walks what changed alongside everything else — the demo replays in about twenty seconds and removes every trace when you leave."
             }
             com.intellij.notification.NotificationGroupManager.getInstance()
-                .getNotificationGroup("Claude Observatory")
+                .getNotificationGroup("OAK")
                 .createNotification(text, com.intellij.notification.NotificationType.INFORMATION)
                 // startDemo replays AND then tours: there is no demo yet, so the tour alone would walk
                 // the reader through an empty product.

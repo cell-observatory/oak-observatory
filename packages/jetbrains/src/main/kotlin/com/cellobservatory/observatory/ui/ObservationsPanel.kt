@@ -38,13 +38,22 @@ import javax.swing.tree.TreeSelectionModel
 /**
  * Observations (0.8.0 r4 — the single reasoning feed): the session recap on top, then the edit timeline in
  * chronological-run STYLE (files by most-recent activity; adjacent same-file edits coalesce into ×N runs with
- * a combined delta, expandable to their per-edit rows with Keep/Undo), Claude's own reasoning inline on each
+ * a combined delta, expandable to their per-edit rows with Keep/Undo), the agent's own reasoning inline on each
  * edit, and the still-open Next steps at the end. Backed by one `observations --json` payload (assembled in
  * core). The Actions tool-call timeline now lives in the Edits sidebar (ActionsPanel).
  *
  * This panel only paints — parity with the VS Code Observations view. Keep/Undo route through the store-
  * mutation CLI (ReviewOps), zero-token.
  */
+/**
+ * The line a ×N run row shows: the first non-blank line of its NEWEST edit's reasoning, as VS Code's run row shows
+ * (`firstLine`), or none when that edit has none. [ObservationRun.edits] is chronological, so the newest is last.
+ * An older edit's words beside the newest edit's time describe a change the row does not show: reading the edits
+ * front to back showed the oldest's, and borrowing an older edit's for a newest edit without any did the same.
+ */
+internal fun runReasoningLine(run: ObservationRun): String? =
+    run.edits.lastOrNull()?.reasoning?.lineSequence()?.firstOrNull { it.isNotBlank() }
+
 class ObservationsPanel(private val project: Project) : SimpleToolWindowPanel(true, true) {
 
     private object RecapMarker
@@ -69,7 +78,7 @@ class ObservationsPanel(private val project: Project) : SimpleToolWindowPanel(tr
         isRootVisible = false
         showsRootHandles = true
         selectionModel.selectionMode = TreeSelectionModel.SINGLE_TREE_SELECTION
-        emptyText.text = "No tracked Claude edits in this project yet"
+        emptyText.text = "No tracked agent edits in this project yet"
         cellRenderer = Renderer()
     }
 
@@ -114,20 +123,20 @@ class ObservationsPanel(private val project: Project) : SimpleToolWindowPanel(tr
         tree.emptyText.clear()
         when {
             !com.cellobservatory.observatory.core.ClaudePaths.hooksInstalled() -> {
-                tree.emptyText.appendLine("No tracked Claude edits in this project yet")
-                tree.emptyText.appendLine("Run `claude-observatory init`, then let Claude Code edit.")
+                tree.emptyText.appendLine("No tracked agent edits in this project yet")
+                tree.emptyText.appendLine("Run `oak init`, then let Claude Code edit.")
             }
             session != null && service.log().isEmpty() -> {
                 tree.emptyText.appendLine("No edits in this session yet — the hooks are working.")
-                tree.emptyText.appendLine("Observations fill in as Claude edits files.")
+                tree.emptyText.appendLine("Observations fill in as agent edits files.")
             }
-            else -> tree.emptyText.appendLine("No tracked Claude edits in this project yet")
+            else -> tree.emptyText.appendLine("No tracked agent edits in this project yet")
         }
         // The same way in the Edits tree offers (VS Code offers it from this panel's empty state too):
         // an empty Observations pane is exactly where a first-time reader is looking for something to see.
         if (!ReviewOps.demoPresent(project)) {
             tree.emptyText.appendLine(
-                "Try the demo — no Claude session needed",
+                "Try the demo — no agent session needed",
                 com.intellij.ui.SimpleTextAttributes.LINK_ATTRIBUTES,
             ) { ReviewOps.startDemo(project) }
         }
@@ -170,7 +179,7 @@ class ObservationsPanel(private val project: Project) : SimpleToolWindowPanel(tr
             for (s in ctxSources) n.add(DefaultMutableTreeNode(s))
             root.add(n)
         }
-        // Next-steps: Claude's own open to-dos + heuristic follow-ups (shown independently of the timeline).
+        // Next-steps: the agent's own open to-dos + heuristic follow-ups (shown independently of the timeline).
         if (d != null && d.nextSteps.isNotEmpty()) {
             root.add(DefaultMutableTreeNode(StepsMarker))
             for (s in d.nextSteps) root.add(DefaultMutableTreeNode(s))
@@ -254,10 +263,10 @@ class ObservationsPanel(private val project: Project) : SimpleToolWindowPanel(tr
             action("Clean Store…", AllIcons.Vcs.Remove) { ReviewOps.cleanStore(project, tree) },
             action("Switch Session", AllIcons.Vcs.Branch) { ReviewOps.chooseSession(project, tree) },
             // Opt-in `claude -p` recap (spends tokens): regenerate, then repaint the recap row with it.
-            action("Refresh Recap (Claude)", Icons.Star) {
+            action("Refresh Recap", Icons.Star) {
                 withSession { s -> ReviewOps.refreshRecap(project, s) { text -> freshRecap = text; repaintTree() } }
             },
-            action("Refresh", AllIcons.Actions.Refresh) { service().observations(force = true); service().refresh() },
+            action("Refresh", AllIcons.Actions.Refresh) { service().sweepIgnoredThen { service().observations(force = true); service().refresh(force = true) } },
             action("Setup Check (doctor)", AllIcons.General.Information) { ReviewOps.openDoctor(project) },
         )
         val tb = ActionManager.getInstance().createActionToolbar("ClaudeObservatoryObs", group, true)
@@ -326,13 +335,13 @@ class ObservationsPanel(private val project: Project) : SimpleToolWindowPanel(tr
                 is RecapMarker -> {
                     icon = Icons.Microscope
                     val recap = (freshRecap ?: data?.recap)?.takeIf { it.isNotBlank() }
-                    append(recap ?: "No recap yet — it fills in from Claude's session title / last summary.")
+                    append(recap ?: "No recap yet — it fills in from the agent's session title / last summary.")
                     append("  session recap", SimpleTextAttributes.GRAYED_ATTRIBUTES)
                 }
                 is StepsMarker -> {
                     icon = AllIcons.Actions.IntentionBulb
                     append("Next steps", SimpleTextAttributes.REGULAR_BOLD_ATTRIBUTES)
-                    append("  from Claude's to-dos + heuristics", SimpleTextAttributes.GRAYED_ATTRIBUTES)
+                    append("  from the agent's to-dos + heuristics", SimpleTextAttributes.GRAYED_ATTRIBUTES)
                 }
                 is ContextMarker -> {
                     icon = AllIcons.General.InspectionsEye
@@ -389,7 +398,7 @@ class ObservationsPanel(private val project: Project) : SimpleToolWindowPanel(tr
                     append((if (ts > 0) "${hhmm.format(Date(ts))}  " else "") + File(node.file).name)
                     if (node.count > 1) append("  ×${node.count}", SimpleTextAttributes.REGULAR_BOLD_ATTRIBUTES)
                     if (node.added > 0 || node.removed > 0) append("  +${node.added} -${node.removed}", SimpleTextAttributes.GRAYED_ATTRIBUTES)
-                    val why = node.edits.firstNotNullOfOrNull { it.reasoning?.lineSequence()?.firstOrNull()?.takeIf { l -> l.isNotBlank() } }
+                    val why = runReasoningLine(node)
                     if (why != null) append("  $why", SimpleTextAttributes.GRAYED_ATTRIBUTES)
                     appendObs(ob)
                     toolTipText = buildString {

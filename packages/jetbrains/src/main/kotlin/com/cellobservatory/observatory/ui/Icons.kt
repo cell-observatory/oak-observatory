@@ -13,7 +13,11 @@ object Icons {
     @JvmField
     val CheckAll = IconLoader.getIcon("/icons/checkAll.svg", Icons::class.java)
 
-    /** Claude-coral ✨ sparkle — the "Claude edited here" gutter marker (parity with the VS Code star). */
+    /** Double-✗ ("reject scope"), matching VS Code's `$(close-all)` — the reject mirror of [CheckAll]. */
+    @JvmField
+    val CloseAll = IconLoader.getIcon("/icons/closeAll.svg", Icons::class.java)
+
+    /** Claude-coral ✨ sparkle — the "Agent edited here" gutter marker (parity with the VS Code star). */
     @JvmField
     val Star = IconLoader.getIcon("/icons/star.svg", Icons::class.java)
 

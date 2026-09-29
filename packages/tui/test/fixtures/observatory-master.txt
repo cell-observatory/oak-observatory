@@ -1,0 +1,21 @@
+laptop
+  demo
+    v claude · p1
+        Fix the demo
+        + blocked · Opus · 900 tok · 2 pending · 14:00:00
+    v claude · p2
+        Run checks
+        | working · Opus · 900 tok · 0 pending · 14:00:00
+  docs
+    v claude · p3
+        Waiting for prompt
+        + idle · Opus · 900 tok · 0 pending · 14:00:00
+build-box
+  review
+    v codex · p1
+        Remote review
+        * done · GPT · 900 tok · 3 pending · 14:00:00
+    v codex · p2
+        Unknown state
+        ~ unknown · GPT · 900 tok · 0 pending · 14:00:00
+> earlier · 1

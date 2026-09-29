@@ -121,7 +121,7 @@ data class ActionsResult(
     val fleetSummary: FleetSummary?,
 )
 
-/** Parse the `claude-observatory actions --json` payload (which already carries the grouped view-model). */
+/** Parse the `oak actions --json` payload (which already carries the grouped view-model). */
 object ActionsParser {
     private fun strOrNull(o: JsonObject, k: String) = o.get(k)?.takeIf { !it.isJsonNull }?.asString
     private fun longOrNull(o: JsonObject, k: String) = o.get(k)?.takeIf { !it.isJsonNull }?.asLong

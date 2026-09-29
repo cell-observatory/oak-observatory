@@ -258,7 +258,7 @@ class ActionsPanel(private val project: Project) : SimpleToolWindowPanel(true, t
                 }
                 is OutsideMore -> {
                     append("… ${node.hidden} more not listed", SimpleTextAttributes.GRAYED_ATTRIBUTES)
-                    toolTipText = "This list shows the $OUTSIDE_CAP most-edited files — ${node.hidden} further file(s) were also edited outside this workspace (`claude-observatory risk --all` lists them)"
+                    toolTipText = "This list shows the $OUTSIDE_CAP most-edited files — ${node.hidden} further file(s) were also edited outside this workspace (`oak risk --all` lists them)"
                 }
                 is EgressRoot -> {
                     icon = AllIcons.General.Web

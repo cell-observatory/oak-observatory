@@ -294,7 +294,7 @@ private class FloatingDiffCounter : AnAction(), DumbAware {
 /** Hand the CURRENT edit's context to the reader's Claude — the nav bar's Chat, on the bar over the code
  *  it is about. The balloon glyph, never the bulb: the bulb is Spotlight's, two buttons along. */
 private class FloatingChat : FloatingBarAction(
-    "Chat", "Chat about this edit — copies its context, opens your Claude", NavTint.CHAT,
+    "Chat", "Chat about this edit — copies its context, opens your agent", NavTint.CHAT,
 ) {
     override fun applies(c: BarContext) = c.current != null
     override fun run(c: BarContext) {

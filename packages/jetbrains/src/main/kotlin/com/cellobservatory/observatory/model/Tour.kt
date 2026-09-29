@@ -4,7 +4,7 @@ import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 
 /**
- * Kotlin mirror of core's guided-tour script, parsed from `claude-observatory demo --tour --json`.
+ * Kotlin mirror of core's guided-tour script, parsed from `oak demo --tour --json`.
  *
  * The script is NOT written here. It lives in core (`packages/core/src/tour.ts`) so the CLI's printed
  * tour, the VS Code panel and this one are the same tour — a step added to a panel reaches every editor
@@ -18,7 +18,7 @@ data class DemoStep(
     val id: String,
     val title: String,
     val body: String,
-    /** 'overview' | 'prompts' | 'stats' | 'edits' | 'diffs' | 'fileHistory' | 'actions' | 'observations' | 'editor' */
+    /** 'overview' | 'prompts' | 'stats' | 'edits' | 'diffs' | 'fileHistory' | 'actions' | 'observations' | 'feed' | 'editor' */
     val view: String,
     /** The Overview left-nav tab, when [view] is 'overview'. */
     val tab: String?,

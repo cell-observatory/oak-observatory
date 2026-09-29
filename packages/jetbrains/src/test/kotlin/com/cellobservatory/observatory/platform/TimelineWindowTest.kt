@@ -1,7 +1,9 @@
 package com.cellobservatory.observatory.platform
 
+import com.cellobservatory.observatory.model.NavGrouping
 import com.cellobservatory.observatory.settings.ObservatorySettings
 import com.cellobservatory.observatory.ui.ColumnGroupPane
+import com.cellobservatory.observatory.ui.TimelineNewSessionAction
 import com.cellobservatory.observatory.ui.PromptsPanel
 import com.cellobservatory.observatory.ui.ObservatoryTimelineFactory
 import com.cellobservatory.observatory.ui.TimelinePanel
@@ -100,7 +102,9 @@ class TimelineWindowTest : BasePlatformTestCase() {
             .firstOrNull { isDescendant(it, anchor as Container) || it === anchor }
             ?: throw AssertionError("the session anchor holds no toolbar")
         val actions = toolbar.actionGroup.getChildren(null)
-        assertEquals("exactly one selector on the row", 1, actions.size)
+        // The selector plus the "+ new session" launcher share the row.
+        assertEquals("the selector and the + launcher on the row", 2, actions.size)
+        assertTrue("the + launcher rides beside it", actions.any { it is TimelineNewSessionAction })
         assertTrue(
             "the row carries something other than the session selector: ${actions[0].javaClass.name}",
             actions[0] is com.cellobservatory.observatory.ui.TimelineSessionAction,
@@ -122,8 +126,8 @@ class TimelineWindowTest : BasePlatformTestCase() {
     fun testTabsBecomeColumnsAndBack() {
         val panel = TimelinePanel(project)
         assertEquals(
-            "ungrouped, the three surfaces are tabs",
-            listOf("Prompts", "Observations", "Actions"),
+            "ungrouped, the four surfaces are tabs",
+            listOf("Feed", "Prompts", "Observations", "Actions"),
             tabTitles(panel),
         )
         assertTrue("and no column pane is mounted", find(panel, ColumnGroupPane::class.java).isEmpty())
@@ -137,21 +141,24 @@ class TimelineWindowTest : BasePlatformTestCase() {
         toggle.setSelected(e, true)
         assertTrue("grouped, the surfaces move into one column pane", find(panel, ColumnGroupPane::class.java).isNotEmpty())
         assertEquals("and the tab strip lets them go", emptyList<String>(), tabTitles(panel))
-        // Every surface is still on screen — grouped means all three at once, not two of three.
-        for (name in listOf("Prompts", "Observations", "Actions")) {
+        // Every surface is still on screen — grouped means all of them at once, none folded away.
+        for (name in listOf("Feed", "Prompts", "Observations", "Actions")) {
             assertTrue("$name vanished in grouped mode", panel.selectMember(name.lowercase()))
         }
 
         toggle.setSelected(e, false)
-        assertEquals("off restores the three separate tabs", listOf("Prompts", "Observations", "Actions"), tabTitles(panel))
+        assertEquals("off restores the four separate tabs", listOf("Feed", "Prompts", "Observations", "Actions"), tabTitles(panel))
         assertTrue("and the column pane gives the panes back", find(panel, ColumnGroupPane::class.java).all { it.componentCount == 0 })
     }
 
-    /** The tour drives tabs by core's member names; a rename that only touched the titles would strand it. */
+    /** The tour and tab strip address the same Feed member id. */
     fun testTheTourCanBringEachMemberForward() {
         val panel = TimelinePanel(project)
-        for (m in listOf("prompts", "observations", "actions")) {
-            assertTrue("the tour cannot bring \"$m\" forward", panel.selectMember(m))
+        for (m in listOf("feed", "prompts", "observations", "actions")) {
+            assertTrue(
+                "the tour cannot bring \"$m\" forward",
+                panel.selectMember(m),
+            )
         }
         assertFalse("an unknown member moves nothing", panel.selectMember("sessions"))
     }

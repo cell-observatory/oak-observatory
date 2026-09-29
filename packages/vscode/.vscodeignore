@@ -2,6 +2,7 @@ src/**
 test/**
 tsconfig.json
 .vscodeignore
+.gitignore
 node_modules/**
 **/*.map
 **/*.ts

@@ -6,6 +6,7 @@ import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.file.Paths
 import kotlin.io.path.exists
 import kotlin.io.path.listDirectoryEntries
 import kotlin.io.path.readText
@@ -18,6 +19,26 @@ import kotlin.io.path.readText
  */
 object StoreReader {
 
+    /** Native rollout inventory used only to check whether a persisted pin still exists. */
+    internal fun codexSessions(includeArchived: Boolean = false, home: Path = Paths.get(
+        System.getenv("CODEX_HOME")?.takeIf { it.isNotBlank() } ?: Paths.get(System.getProperty("user.home"), ".codex").toString()
+    )): List<Pair<String, Pair<Path, Long>>> = (if (includeArchived) listOf("sessions", "archived_sessions") else listOf("sessions")).flatMap { name ->
+        val root = home.resolve(name)
+        if (!Files.isDirectory(root)) emptyList() else runCatching {
+            Files.walk(root, 5).use { files -> files.filter { Files.isRegularFile(it) && it.toString().endsWith(".jsonl") }.map { file ->
+                runCatching {
+                    val text = Files.newInputStream(file).use { String(it.readNBytes(65536), Charsets.UTF_8) }
+                    val meta = text.lineSequence().mapNotNull { line -> runCatching { JsonParser.parseString(line).asJsonObject }.getOrNull() }
+                        .firstOrNull { it.get("type")?.asString == "session_meta" }?.getAsJsonObject("payload")
+                    val id = meta?.get("id")?.asString ?: meta?.get("session_id")?.asString
+                    val cwd = meta?.get("cwd")?.asString
+                    if (id != null && cwd != null) id to (Paths.get(cwd).toAbsolutePath().normalize() to Files.getLastModifiedTime(file).toMillis()) else null
+                }.getOrNull()
+            }.toList().filterNotNull() }
+        }.getOrDefault(emptyList())
+    }
+
+
     fun readLog(sessionId: String): List<EditRecord> {
         val path = ClaudePaths.logPath(sessionId)
         if (!path.exists()) return emptyList()
@@ -27,6 +48,7 @@ object StoreReader {
             return emptyList()
         }
         val records = LinkedHashMap<Int, EditRecord>()
+        var maxId = 0
         for (line in text.lineSequence()) {
             val t = line.trim()
             if (t.isEmpty()) continue
@@ -42,6 +64,13 @@ object StoreReader {
             // real record at that id (resetting its status to "pending"). Pinned by the port test.
             val opKind = o.get("op")?.takeIf { it.isJsonPrimitive }?.asString
             if (opKind != null) {
+                if (opKind == "capture-evidence") {
+                    val id = o.get("id")?.asIntOrNull() ?: continue
+                    records[id]?.let { rec -> if (rec.uid == o.get("uid")?.asStringOrNull()) records[id] = rec.copy(
+                        beforeBlob = o.get("beforeBlob")?.asStringOrNull(), tool = o.get("tool")?.asStringOrNull() ?: rec.tool,
+                        toolCallId = o.get("toolCallId")?.asStringOrNull(), beforeState = o.get("beforeState")?.asStringOrNull(),
+                        source = "hook", provenance = "tool", attribution = "correlated", partial = false) }
+                }
                 if (opKind == "status") {
                     val id = o.get("id")?.asIntOrNull() ?: continue
                     val status = o.get("status")?.asStringOrNull() ?: continue
@@ -49,10 +78,15 @@ object StoreReader {
                 }
                 continue
             }
-            val id = o.get("id")?.asIntOrNull() ?: continue
+            var id = o.get("id")?.asIntOrNull() ?: continue
+            if (id <= 0) continue
             // canonPath mirrors core's readLog heal (#43): pre-fix stores hold drive-letter case twins
             // for one file; normalizing here makes every panel see one file without rewriting disk.
             val file = o.get("file")?.asStringOrNull()?.let { ClaudePaths.canonPath(it) } ?: continue
+            // Same append-order reconciliation as core: never hide an older edit or target
+            // another record when historical writers reused a display ID.
+            if (records.containsKey(id)) id = maxId + 1
+            maxId = maxOf(maxId, id)
             records[id] = EditRecord(
                 id = id,
                 ts = o.get("ts")?.asLongOrNull() ?: 0L,
@@ -61,6 +95,11 @@ object StoreReader {
                 beforeBlob = o.get("beforeBlob")?.asStringOrNull(),
                 afterBlob = o.get("afterBlob")?.asStringOrNull(),
                 status = o.get("status")?.asStringOrNull() ?: "pending",
+                uid = o.get("uid")?.asStringOrNull(), source = o.get("source")?.asStringOrNull(), toolCallId = o.get("toolCallId")?.asStringOrNull(),
+                beforeState = o.get("beforeState")?.asStringOrNull(), model = o.get("model")?.asStringOrNull(), runtime = o.get("runtime")?.asStringOrNull(),
+                provenance = o.get("provenance")?.asStringOrNull(), attribution = o.get("attribution")?.asStringOrNull(),
+                nativeTurnId = o.get("nativeTurnId")?.asStringOrNull(),
+                partial = o.get("partial")?.let { it.isJsonPrimitive && it.asJsonPrimitive.isBoolean && it.asBoolean } ?: false,
             )
         }
         return records.values.toList()
@@ -111,6 +150,32 @@ object StoreReader {
                 )
             }
             .sortedByDescending { it.lastMs }
+    }
+
+    /**
+     * Whether [sessionId] is still reviewable ANYWHERE on this machine: its store directory exists,
+     * or some project's transcript does. The transcript half scans every <config>/projects/<dir> —
+     * the session pin is application-wide, so the session may belong to a different project than the
+     * one asking — one readdir plus a stat per project dir; callers memoize per pin value. On an
+     * UNREADABLE layout this answers true: the caller heals state off a proven absence, and an IO
+     * hiccup is not proof.
+     */
+    fun sessionExists(sessionId: String): Boolean {
+        if (sessionId.isBlank()) return false
+        return try {
+            if (ClaudePaths.storeDir(sessionId).exists()) return true
+            if (codexSessions(includeArchived = true).any { it.first == sessionId }) return true
+            val projects = ClaudePaths.configDir().resolve("projects")
+            projects.exists() && projects.listDirectoryEntries().any { dir ->
+                Files.isDirectory(dir) && dir.resolve("$sessionId.jsonl").exists()
+            }
+        } catch (_: java.nio.file.InvalidPathException) {
+            // An id no path can spell (a legacy "!host" synthetic pin on Windows) is PROVEN unable
+            // to exist on disk — treating it as an IO hiccup would keep it pinned forever.
+            false
+        } catch (_: Exception) {
+            true
+        }
     }
 
     /** (mtime, size) freshness key for the session log — cheap cache invalidation, same as core. */

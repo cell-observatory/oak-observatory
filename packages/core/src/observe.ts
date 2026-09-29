@@ -3,29 +3,46 @@
  * the session transcript, plus cheap heuristic change-summaries, issue-flags, and next-step
  * suggestions. No model calls — the transcript already contains Claude's words.
  */
+import { personPromptOf, transcriptForSession } from './asks';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import { diffArrays } from 'diff';
-import { EditRecord, EditStatus, readLog, blobText as storeBlobText, logPath, maxOf, listSessions, SessionInfo, allStoreSessionIds, rootDir, isSafeSessionId, hasInflightCapture, hasBlob } from './store';
-import { lineDelta } from './format';
-import { projectDir, resolveSessionId, listWorkspaces, bridgeInfo } from './session';
-import { claudeConfigDir } from './paths';
+import { EditRecord, EditStatus, readLog, blobText as storeBlobText, logPath, maxOf, listSessions, SessionInfo, allStoreSessionIds, rootDir, isSafeSessionId, hasInflightCapture, hasBlob, storeBytes, storeDir, hiddenSessions, hideSession, removeSession, withFileMutation, FileBusyError } from './store';
+import { lineDelta, plainTitle } from './format';
+import { spawnToolSync } from './spawn';
+import { contentGet, contentNote, flushPairDeltas, pairDelta, pairKeyOf, derivedInventory } from './derived';
+import { projectDir, resolveSessionId, listWorkspaces, isBridgePointer, isMirroredTranscript, workspaceLabel, SESSION_BUSY_MS } from './session';
+import { readAttention, readTabLink, captureMutex } from './capture';
+import { claudeConfigDir, canonPath } from './paths';
+import { agentPhaseDetail } from './actions';
 import { cachedAnalysis } from './analyze';
 import { cachedByFiles, readLines } from './fscache';
+import { transcriptFacts } from './derived-transcript';
 import { reviewEdits, visibleEdits } from './groups';
 // NOTE: metrics.ts imports `findTranscript` from this module, so this pair is CIRCULAR. It is safe only
 // because both directions are used at CALL time, never at module-init time — nothing here runs during
 // load. `test/core.test.js` requires each module first in a child process to keep that true.
 import { sessionUsage, sessionVitals } from './metrics';
+import { captureEventsPath, readCaptureEvents } from './capture-events';
+import { findCodexRollout, readCodexAgentMeta, readCodexRollout, codexSessionTitle } from './codex';
+import { codexSessionSources } from './codex';
+import { codexTranscriptFile, codexPromptText, isCodexTranscriptFile } from './codex-events';
+import { remoteSessionTitle } from './remote-titles';
+import { pidAlive } from './daemon';
 
 /** Locate the Claude Code transcript jsonl for a session, walking up from cwd (like resolveSessionId). */
 export function findTranscript(cwd: string, sessionId: string): string | null {
+  return derivedInventory(`transcript:${rootDir()}:${cwd}:${sessionId}`, () => findTranscriptInInventory(cwd, sessionId));
+}
+
+function findTranscriptInInventory(cwd: string, sessionId: string): string | null {
   let dir = path.resolve(cwd);
   for (;;) {
     const p = path.join(projectDir(dir), `${sessionId}.jsonl`);
-    if (fs.existsSync(p)) return p;
+    if (fs.existsSync(p) && !isMirroredTranscript(p).mirrored && !isBridgePointer(p)) return p;
     const parent = path.dirname(dir);
-    if (parent === dir) return null;
+    if (parent === dir) { const source = findCodexRollout(sessionId); return source && !isMirroredTranscript(source).mirrored ? codexTranscriptFile(source) : null; }
     dir = parent;
   }
 }
@@ -55,7 +72,7 @@ export function transcriptSessionIds(cwd: string): string[] {
   for (const n of names) {
     if (!n.endsWith('.jsonl')) continue;
     const id = n.slice(0, -6);
-    if (!isSafeSessionId(id)) continue;
+    if (!isSafeSessionId(id) || isMirroredTranscript(path.join(dir, n)).mirrored || isBridgePointer(path.join(dir, n))) continue;
     let ms = 0;
     try {
       ms = fs.statSync(path.join(dir, n)).mtimeMs;
@@ -69,7 +86,7 @@ export function transcriptSessionIds(cwd: string): string[] {
 
 /** The file-editing tools that appear as tool_uses in the transcript (parseToolUses queues these);
  *  a store record with any other tool (e.g. Bash) has no transcript counterpart to correlate. */
-const CORRELATED_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit']);
+const CORRELATED_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit', 'apply_patch']);
 
 interface ToolUse {
   file: string;
@@ -83,53 +100,39 @@ interface ToolUse {
 
 /** Edit/Write/MultiEdit/NotebookEdit tool_uses in transcript order, each with its message's text. */
 function parseToolUses(transcriptPath: string): ToolUse[] {
-  const out: ToolUse[] = [];
-  let lines: string[];
-  try {
-    lines = readLines(transcriptPath);
-  } catch {
-    return out;
-  }
-  // Carry the most recent assistant text/thinking forward: Claude often emits its reasoning in one
-  // message (a `text` explanation and/or a `thinking` block) and the tool_use in the next message.
-  let lastReasoning = '';
-  for (const line of lines) {
-    const t = line.trim();
-    if (!t) continue;
-    let o: any;
-    try {
-      o = JSON.parse(t);
-    } catch {
-      continue;
-    }
-    const msg = o.message;
-    if (!msg || msg.role !== 'assistant' || !Array.isArray(msg.content)) continue;
-    // NOTE: sidechain (subagent) messages are deliberately NOT skipped here. The capture hooks fire
-    // for subagent edits too (same session store), so if a legacy transcript inlines them
-    // (isSidechain:true) their tool_uses must stay in the queues. Current Claude Code writes sidechains
-    // to separate subagents/*.jsonl files — which this parser is now pointed at as well, so a
-    // subagent's edit takes ITS OWN agent's words instead of the orchestrator's.
-    let text = '';
-    let think = '';
-    for (const b of msg.content) {
-      if (b.type === 'text' && typeof b.text === 'string') text += (text ? '\n' : '') + b.text.trim();
-      else if (b.type === 'thinking') {
-        const th = typeof b.thinking === 'string' ? b.thinking : typeof b.text === 'string' ? b.text : '';
-        if (th) think += (think ? '\n' : '') + th.trim();
-      }
-    }
-    const reasoning = text || think; // prefer the visible explanation; fall back to thinking
-    if (reasoning) lastReasoning = reasoning;
-    const ts = toEpochMs(o.timestamp ?? o.ts) ?? 0;
-    for (const b of msg.content) {
-      if (b.type === 'tool_use' && CORRELATED_TOOLS.has(b.name)) {
-        const f = b.input && (b.input.file_path || b.input.notebook_path);
-        if (typeof f === 'string')
-          out.push({ file: path.resolve(f), reasoning: lastReasoning, ts, id: typeof b.id === 'string' ? b.id : '' });
-      }
+  return transcriptFacts(transcriptPath).reasoning.uses.map((use) => ({ ...use, file: path.resolve(use.file) }));
+}
+
+export interface ReasoningFacts { lastReasoning: string; uses: ToolUse[] }
+
+/** Unlike the main action timeline, historical reasoning includes legacy inlined sidechains. */
+export function foldReasoningFacts(facts: ReasoningFacts, o: any): void {
+  const msg = o.message;
+  if (!msg || msg.role !== 'assistant' || !Array.isArray(msg.content)) return;
+  // NOTE: sidechain (subagent) messages are deliberately NOT skipped here. The capture hooks fire
+  // for subagent edits too (same session store), so if a legacy transcript inlines them
+  // (isSidechain:true) their tool_uses must stay in the queues. Current Claude Code writes sidechains
+  // to separate subagents/*.jsonl files — which this parser is now pointed at as well, so a
+  // subagent's edit takes ITS OWN agent's words instead of the orchestrator's.
+  let text = '';
+  let think = '';
+  for (const b of msg.content) {
+    if (b && b.type === 'text' && typeof b.text === 'string') text += (text ? '\n' : '') + b.text.trim();
+    else if (b && b.type === 'thinking') {
+      const th = typeof b.thinking === 'string' ? b.thinking : typeof b.text === 'string' ? b.text : '';
+      if (th) think += (think ? '\n' : '') + th.trim();
     }
   }
-  return out;
+  const reasoning = text || think; // prefer the visible explanation; fall back to thinking
+  if (reasoning) facts.lastReasoning = reasoning;
+  const ts = toEpochMs(o.timestamp ?? o.ts) ?? 0;
+  for (const b of msg.content) {
+    if (b && b.type === 'tool_use' && CORRELATED_TOOLS.has(b.name)) {
+      const f = b.input && (b.input.file_path || b.input.notebook_path);
+      if (typeof f === 'string')
+        facts.uses.push({ file: f, reasoning: facts.lastReasoning, ts, id: typeof b.id === 'string' ? b.id : '' });
+    }
+  }
 }
 
 /** Map edit id -> Claude's reasoning text, correlating store edits to transcript tool_uses per file. */
@@ -138,7 +141,7 @@ export function reasoningByEdit(cwd: string, sessionId: string): Map<number, str
   if (!transcript) return new Map<number, string>();
   // Depends on the transcript (tool_uses) AND the store log (the cursor walk) — keyed on both files'
   // (mtime,size), so a new capture or a review op invalidates it. Read-only result, shared as-is.
-  return cachedByFiles('reasoningByEdit', [transcript, logPath(sessionId)], () =>
+  return cachedByFiles('reasoningByEdit', [...explainingTranscripts(transcript), logPath(sessionId)], () =>
     reasoningByEditUncached(transcript, sessionId)
   );
 }
@@ -247,21 +250,23 @@ export interface TranscriptInsights {
   todos: { content: string; status: string }[]; // from the latest non-empty TodoWrite in the session
   lastSummary: string | null; // last assistant text block (what Claude said it just did)
   title: string | null; // Claude Code's latest auto session title (the `ai-title` entries) — a recap line
+  customTitle: string | null; // the name a person gave the session (the newest `custom-title`; an empty one clears it)
+  bridgeSessionId: string | null; // the Remote Control session it ran as (the newest `bridge-session` record)
   firstUserPrompt: string | null; // first real user message (non-sidechain, text — never a tool_result/command wrapper)
 }
 export function transcriptInsights(cwd: string, sessionId: string): TranscriptInsights {
-  const empty: TranscriptInsights = { todos: [], lastSummary: null, title: null, firstUserPrompt: null };
+  const empty: TranscriptInsights = { todos: [], lastSummary: null, title: null, customTitle: null, bridgeSessionId: null, firstUserPrompt: null };
   const p = findTranscript(cwd, sessionId);
   if (!p) return empty;
-  // Memoized per (mtime,size) — several views consult the same insights per refresh. Read-only result.
-  return cachedByFiles('insights', [p], () => transcriptInsightsUncached(p));
+  return transcriptInsightsAt(p);
 }
 
-/** Every store session (listSessions order) + its human-readable TITLE — the transcript's `ai-title`,
- *  else the first user prompt — for the session pickers: both editors' dropdowns show names, with the
- *  raw id demoted to detail. `title` is null when the session has no transcript under this cwd (another
- *  project's session) — renderers fall back to the id. Insights are memoized per (mtime,size), so
- *  re-opening a picker costs stats, not parses. */
+/** Insights from an already resolved transcript, including sessions in another workspace. */
+export function transcriptInsightsAt(p: string): TranscriptInsights {
+  // Memoized per (mtime,size) — several views consult the same insights per refresh. Read-only result.
+  return transcriptFacts(p).insights;
+}
+
 export function listSessionsWithTitles(cwd: string): (SessionInfo & { title: string | null })[] {
   const rows = listSessions();
   const seen = new Set(rows.map((s) => s.id));
@@ -281,11 +286,11 @@ export function listSessionsWithTitles(cwd: string): (SessionInfo & { title: str
     rows.push({ id, edits: 0, pending: 0, lastMs });
   }
   rows.sort((a, b) => b.lastMs - a.lastMs);
-  return rows.map((s) => {
+  const hidden = hiddenSessions();
+  return rows.filter((s) => !hidden.has(s.id)).map((s) => {
     let title: string | null = null;
     try {
-      const ins = transcriptInsights(cwd, s.id);
-      title = normalizeSessionTitle(ins.title ?? ins.firstUserPrompt ?? '');
+      title = normalizeSessionTitle(preferredSessionTitle(transcriptInsights(cwd, s.id)) ?? '');
     } catch {
       /* unreadable transcript — the id still identifies the session */
     }
@@ -293,10 +298,39 @@ export function listSessionsWithTitles(cwd: string): (SessionInfo & { title: str
   });
 }
 
+/**
+ * A session's name before any row shaping — ONE precedence for every surface that names a session:
+ *  1. the name a person gave it (`custom-title`: `/rename`, or a rename made on claude.ai or the Claude
+ *     app over Remote Control, which Claude Code writes back into the transcript) — local and immediate;
+ *  2. the title claude.ai holds for its Remote Control session — what the Claude app shows. Claude Code
+ *     keeps it on the server only, so it comes from the cached read (remote-titles.ts), never a fetch;
+ *  3. Claude Code's own `ai-title`;
+ *  4. the first real prompt.
+ * `fastSessionTitle` applies the same order on a byte budget. One line of plain text (`plainTitle`);
+ * null when none exists.
+ */
+export function preferredSessionTitle(
+  ins: Pick<TranscriptInsights, 'customTitle' | 'title' | 'firstUserPrompt'> & { bridgeSessionId?: string | null }
+): string | null {
+  return plainTitle(ins.customTitle ?? remoteSessionTitle(ins.bridgeSessionId) ?? ins.title ?? ins.firstUserPrompt ?? '') || null;
+}
+
+/**
+ * The name a session's own views show: the change map's summary (the terminal's session chip, the
+ * JetBrains Stats header) and the VS Code Stats header. A Codex session is named as its list row names
+ * it (`codexSessionTitle`): read the Claude way, its derived transcript offered Codex's injected
+ * context as the first prompt, so those views showed `# AGENTS.md instructions …` or a whole prompt.
+ */
+export function sessionViewTitle(cwd: string, session: string, insights?: TranscriptInsights): string | null {
+  const transcript = findTranscript(cwd, session);
+  if (transcript && isCodexTranscriptFile(transcript)) return codexSessionTitle(findCodexRollout(session) ?? '', session);
+  return preferredSessionTitle(insights ?? transcriptInsights(cwd, session));
+}
+
 /** Keep list rows SHORT but informative: ai-titles already are, but the first-PROMPT fallback can be a
  *  whole pasted brief — take its first sentence, then hard-cap at 64. Hover surfaces show it uncapped. */
 export function normalizeSessionTitle(raw: string): string | null {
-  let title = raw.replace(/\s+/g, ' ').trim();
+  let title = plainTitle(raw);
   if (!title) return null;
   const sentence = /^(.*?[.?!])(?:\s|$)/.exec(title);
   if (sentence && sentence[1].length >= 12) title = sentence[1]; // a bare "Hi." is no title
@@ -309,34 +343,130 @@ export function normalizeSessionTitle(raw: string): string | null {
 /** What every picker calls the machine it is running on. One constant, so the terminal, VS Code and
  *  JetBrains cannot each invent their own wording for the same fact. */
 export const THIS_MACHINE = 'this machine';
-/** …and what they call a conversation whose content lives on Claude Code's bridge rather than here. */
-export const BRIDGE_MACHINE = 'the bridge';
+
+/** What a listed row reads until its session has a name of its own. Display text for session lists
+ *  and pickers only: it names nothing else. A herdr tab is never renamed to it, and any real title
+ *  (a pane's own, the change map's) outranks it. `realSessionTitle` tells the two apart. */
+export const UNTITLED_SESSION_TITLES = { claude: 'New Claude session', codex: 'New Codex session' } as const;
+
+/** What a row reads for its workspace when nothing on disk says where its session ran. One label, so
+ *  no surface shows a blank workspace in one row and a name in another for the same fact. */
+export const UNKNOWN_WORKSPACE = 'Unknown workspace';
+
+/** A listed row's title when it names the session; null when it is blank or only a placeholder. */
+export function realSessionTitle(title: string | null | undefined): string | null {
+  if (typeof title !== 'string' || !title.trim()) return null;
+  return title === UNTITLED_SESSION_TITLES.claude || title === UNTITLED_SESSION_TITLES.codex ? null : title;
+}
+
+/**
+ * One session's name as its row in `sessionMeta` gives it, found by id alone: `codexSessionTitle` of
+ * its rollout, else `fastSessionTitle` of its transcript. Null while it has no name (`realSessionTitle`)
+ * or has no row here: deleted from the pickers, or only a mirrored copy or a bridge pointer. The name a
+ * herdr tab takes when its session names it (herdr-tabs.ts `syncSessionTab`).
+ */
+export function listedSessionTitle(id: string): string | null {
+  if (!isSafeSessionId(id) || hiddenSessions().has(id)) return null;
+  const rollout = findCodexRollout(id);
+  if (rollout) return isMirroredTranscript(rollout).mirrored ? null : realSessionTitle(codexSessionTitle(rollout, id));
+  const transcript = transcriptForSession(id);
+  if (!transcript || isMirroredTranscript(transcript).mirrored || isBridgePointer(transcript)) return null;
+  return realSessionTitle(fastSessionTitle(transcript, id));
+}
+
+const TURN_TAIL_CHUNK = 64 * 1024;
+const TURN_TAIL_LIMIT = 8 * 1024 * 1024;
+/** What a turn is in each agent's session file: Claude's user and assistant records (not the system,
+ *  bridge-session, cost-state, last-prompt or mode lines a resume appends, nor meta stubs, nor the
+ *  `<synthetic>` reply Claude Code stamps when it resumes a cut-off turn); Codex's response items
+ *  (messages, reasoning, tool calls and their output), not its session_meta, turn_context, world_state or
+ *  the thread_settings_applied a reattach writes. */
+const TURN_OF = {
+  claude: (o: any): boolean => (o?.type === 'user' || o?.type === 'assistant') && o.isMeta !== true && o.message?.model !== '<synthetic>',
+  codex: (o: any): boolean => o?.type === 'response_item',
+};
+
+/**
+ * When a session last took a turn: the timestamp of the newest turn record in its file, read back from
+ * the end in 64 KB steps. A resume appends bookkeeping with a fresh timestamp and a fresh mtime while
+ * nobody takes a turn (herdr restoring a two-day-old Claude session at startup made it
+ * the "most recently active" session, and Review opened on it instead of the one being worked on). 0 when
+ * the whole file holds no turn; null when that is unknown: the file cannot be read, or its last 8 MB hold
+ * no turn. Memoized per file stamp. Each step searches only its own bytes for a line break, so a line
+ * longer than a step costs its length once.
+ */
+export function lastTurnMs(file: string, agent: keyof typeof TURN_OF): number | null {
+  return cachedByFiles(`last-turn-${agent}`, [file], (): number | null => {
+    let fd: number;
+    try { fd = fs.openSync(file, 'r'); } catch { return null; }
+    try {
+      const size = fs.fstatSync(fd).size;
+      let end = size;
+      // The start of the line cut at `end`, read in earlier steps, in file order: it runs on to a line break.
+      let pieces: Buffer[] = [];
+      while (end > 0 && size - end < TURN_TAIL_LIMIT) {
+        const start = Math.max(0, end - TURN_TAIL_CHUNK);
+        const chunk = Buffer.alloc(end - start);
+        fs.readSync(fd, chunk, 0, chunk.length, start);
+        // The first line of the step may begin before `start`: only what follows its line break is whole.
+        const cut = start > 0 ? chunk.indexOf(0x0a) : -1;
+        if (start > 0 && cut === -1) { pieces.unshift(chunk); end = start; continue; }
+        const lines = Buffer.concat([chunk.subarray(cut + 1), ...pieces]).toString('utf8').split('\n');
+        for (let i = lines.length - 1; i >= 0; i--) {
+          if (!lines[i].includes('"timestamp"')) continue;
+          let o: any;
+          try { o = JSON.parse(lines[i]); } catch { continue; }
+          if (!TURN_OF[agent](o)) continue;
+          const ts = Date.parse(o.timestamp);
+          if (ts > 0) return ts;
+        }
+        pieces = start > 0 ? [chunk.subarray(0, cut)] : [];
+        end = start;
+      }
+      return end > 0 ? null : 0;
+    } catch {
+      return null;
+    } finally {
+      fs.closeSync(fd);
+    }
+  });
+}
 
 export interface SessionMetaRow {
   id: string;
-  /** Which workspace this session belongs to, as a readable label (`~`, `Github-myrepo`). Sessions
-   *  from every workspace are offered, so the row has to SAY which one — the previous listing mixed
-   *  ancestor-directory sessions in with this repo's and named none of them. */
+  /** Which workspace this session belongs to, as a readable label (`~`, `Github-myrepo`), or
+   *  UNKNOWN_WORKSPACE when nothing on disk records it — never blank. Sessions from every workspace
+   *  are offered, so the row has to SAY which one — the previous listing mixed ancestor-directory
+   *  sessions in with this repo's and named none of them. */
   workspace: string;
-  /**
-   * Where the conversation actually lives.
-   *  · `local`   — a real transcript on this machine.
-   *  · `bridged` — a `bridge-session` pointer; the content is on Claude Code's bridge, not here.
-   *  · `remote`  — enumerated over SSH from a configured host (see `host`).
-   */
-  origin: 'local' | 'bridged' | 'remote';
-  /** The configured remote this row came from, when `origin` is `remote`. */
-  host?: string;
-  /** WHICH MACHINE this session lives on, ready to render: the reader's name for the configured
-   *  remote, or [THIS_MACHINE] for one that is here. Present on every row, in its own field, so no
-   *  picker has to infer it from `origin` and none of them can disagree about the answer. */
+  /** Where the conversation lives: a real transcript on this machine. Mirrored copies and bridge
+   *  pointers are not listed at all. */
+  origin: 'local';
+  /** WHICH MACHINE this session lives on, ready to render: [THIS_MACHINE]. Present on every row, in its
+   *  own field, so no picker has to infer it and none of them can disagree about the answer. */
   machine: string;
-  /** Human-readable name (latest ai-title, else the first user prompt), normalized; null when neither
-   *  could be found in the bounded scan — renderers fall back to the short id. */
+  /** Human-readable name in preferredSessionTitle's order (a rename, the claude.ai Remote Control title,
+   *  the latest ai-title, the first user prompt), normalized; a Codex row's is `codexSessionTitle`'s. A
+   *  listed row with no name reads its agent's UNTITLED_SESSION_TITLES placeholder, which
+   *  `realSessionTitle` reports as no name. */
   title: string | null;
   /** Conversation recency: the TRANSCRIPT's mtime (a review click on the store must not resurrect a
    *  dead session), falling back to log.jsonl mtime for a transcript that vanished. */
   lastActiveMs: number;
+  /** When the session last took a TURN: the newest user or assistant record (a Codex response item),
+   *  which bookkeeping a resume appends never moves (`lastTurnMs`). Null when it never took one; absent
+   *  when that is unknown (a file past the reader's reach), where callers fall back to `lastActiveMs`. */
+  lastTurnMs?: number | null;
+
+  liveMs: number;
+  /** What the agent is waiting on RIGHT NOW, if anything — from the Notification/Stop hooks
+   *  (cleared the moment a tool runs again), upgraded to `question` when the transcript tail
+   *  holds an unanswered AskUserQuestion. Null = nothing waiting. `idle-done` is the quiet
+   *  "turn finished, your move" state; surfaces show it but never toast it. */
+  attention: { kind: 'permission' | 'input' | 'question' | 'idle-done'; message: string; ts: number } | null;
+  /** The terminal app's native tab this session runs in (`<tab>@<pid>`, from tab.json), when one
+   *  launched it — the auto-title's link. Null for every other session. */
+  tab: string | null;
   /** True for the session `resolveSessionId(cwd)` currently answers with. */
   current: boolean;
   /** What the session did to this workspace, in the terms the log itself carries: how many edits were
@@ -350,6 +480,9 @@ export interface SessionMetaRow {
   /** Lines added / removed across the session's captured edits (sidecar-cached — see SessionCounts). */
   added: number;
   removed: number;
+  /** The newest record id in the session's log when this row was counted (0 with no store). A delete
+   *  confirmed from this row passes it as `seenThrough`, so an edit captured after the row is refused. */
+  lastEdit: number;
   /** NEW tokens the conversation produced — uncached input + generated output — and its wall-clock
    *  span. Both ride sessionUsage's persisted byte cursor, so a finished session is a stat and the
    *  live one is a delta parse. */
@@ -361,16 +494,57 @@ export interface SessionMetaRow {
    *  nothing; it just stops one of them impersonating the other. */
   cached: number;
   durationMs: number;
+  /** The session store's on-disk footprint in bytes (log + blobs), so every picker that lists a session
+   *  can show what it costs to keep — the same figure the TUI's session blobs show. Cached on the store's
+   *  shape (stat-keyed), so a listed-but-idle session pays a stat, not a walk. 0 when it has no store. */
+  storeBytes: number;
+  /** The store DIRECTORY on disk, so an out-of-process client (JetBrains) can reveal it in the OS file
+   *  manager without replicating core's path-mangling. In-process clients (VS Code, the TUI) call
+   *  `storeDir(id)` directly instead. Deterministic from the id — a string op, no I/O. */
+  storePath: string;
   /** The model serving the session's latest turn ('' when no turn exists yet) and the reasoning effort
    *  it declared ('' when it never declared one — unset is reported as unknown, never guessed, because
    *  the default differs by build and model). */
   model: string;
   effort: string;
+
+
+  agent: string;
+  /**
+   * WHAT THIS AGENT IS DOING, for the sessions recent enough for the question to mean anything.
+   *
+   * Absent means "not asked", which for an old session is the same as idle — a conversation nobody
+   * has touched in hours is not blocked on you. Bounded on purpose: this reads each transcript's
+   * tail (~2 ms), and a machine with a hundred sessions would otherwise pay for ninety answers
+   * nobody can act on.
+   *
+   * It exists so a surface can tell a session that FINISHED from one WAITING ON A HUMAN. Every
+   * cross-session list had to collapse those together, because the only phase in any payload was the
+   * current session's.
+   */
+  phase?: string;
+  /** How confident `phase` is: 'high' when a structural marker said so, 'heuristic' when it was
+   *  inferred from staleness. A renderer dims the guess rather than presenting it as a fact. */
+  phaseConfidence?: string;
+}
+
+/** How long a session stays worth asking about. Past this it is idle by definition, and reading its
+ *  transcript to be told so is work nobody can act on. */
+const PHASE_WINDOW_MS = 2 * 60 * 60 * 1000;
+
+function phaseOf(transcript: string, lastActiveMs: number): { phase?: string; phaseConfidence?: string } {
+  if (!transcript || Date.now() - lastActiveMs > PHASE_WINDOW_MS) return {};
+  try {
+    const d = agentPhaseDetail(transcript);
+    return { phase: d.phase, phaseConfidence: d.confidence };
+  } catch {
+    return {}; // a torn transcript is not a phase — absent, never guessed
+  }
 }
 
 export interface SessionMeta {
   active: string | null;
-  /** This WORKSPACE's sessions, newest conversation first. */
+  /** This machine's sessions grouped by workspace, editor root first; newest in each group. */
   sessions: SessionMetaRow[];
 }
 
@@ -435,7 +609,7 @@ export function reapableSessions(cwd: string, now: number = Date.now(), staleMs:
   // monorepo root, all ordinary launch dirs) resolves here and would be reaped from a subdirectory.
   // Listing such a session is fine; deleting it is not, so the destructive path narrows the rule.
   const here = projectDir(cwd);
-  return sessionMeta(cwd)
+  return sessionMeta(cwd, null, { includeEmpty: true })
     .sessions.filter((r) => {
       const t = findTranscript(cwd, r.id);
       if (!t || path.dirname(path.resolve(t)) !== path.resolve(here)) return false;
@@ -457,7 +631,140 @@ export function reapableSessions(cwd: string, now: number = Date.now(), staleMs:
     }));
 }
 
-export function sessionMeta(cwd: string, reviewing?: string | null): SessionMeta {
+/** A pending AskUserQuestion in the transcript TAIL: a tool_use with no tool_result yet. The
+ *  payload is structured (question/header/options with descriptions), so surfaces can render the
+ *  real choices — read-only, because the owning terminal holds stdin. */
+export interface PendingQuestion {
+  question: string;
+  header: string;
+  multiSelect: boolean;
+  options: { label: string; description: string }[];
+}
+
+const QUESTION_TAIL_BYTES = 256 * 1024;
+
+function pendingQuestionInTail(transcript: string): PendingQuestion | null {
+  let tail = '';
+  try {
+    const fd = fs.openSync(transcript, 'r');
+    try {
+      const size = fs.fstatSync(fd).size;
+      const start = Math.max(0, size - QUESTION_TAIL_BYTES);
+      const buf = Buffer.alloc(size - start);
+      const n = fs.readSync(fd, buf, 0, buf.length, start);
+      tail = buf.toString('utf8', 0, n);
+      if (start > 0) tail = tail.slice(tail.indexOf('\n') + 1);
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return null;
+  }
+  const uses = new Map<string, PendingQuestion>();
+  const answered = new Set<string>();
+  for (const line of tail.split('\n')) {
+    if (!line.includes('AskUserQuestion') && !line.includes('tool_result')) continue;
+    let o: { message?: { content?: unknown } } | undefined;
+    try {
+      o = JSON.parse(line) as typeof o;
+    } catch {
+      continue;
+    }
+    const content = o?.message?.content;
+    if (!Array.isArray(content)) continue;
+    for (const c of content as { type?: string; name?: string; id?: string; tool_use_id?: string; input?: { questions?: unknown[] } }[]) {
+      if (c?.type === 'tool_use' && c.name === 'AskUserQuestion' && c.id) {
+        const q = (c.input?.questions as { question?: string; header?: string; multiSelect?: boolean; options?: { label?: string; description?: string }[] }[] | undefined)?.[0];
+        if (q) {
+          uses.set(c.id, {
+            question: String(q.question ?? ''),
+            header: String(q.header ?? ''),
+            multiSelect: q.multiSelect === true,
+            options: (q.options ?? []).map((op) => ({ label: String(op?.label ?? ''), description: String(op?.description ?? '') })),
+          });
+        }
+      } else if (c?.type === 'tool_result' && c.tool_use_id) {
+        answered.add(c.tool_use_id);
+      }
+    }
+  }
+  let out: PendingQuestion | null = null;
+  for (const [id, q] of uses) if (!answered.has(id)) out = q; // the LAST unanswered ask stands
+  return out;
+}
+
+/** The session's pending question, if one is waiting — for the surfaces that render its options. */
+export function pendingQuestion(cwd: string, sessionId: string): PendingQuestion | null {
+  const t = findTranscript(cwd, sessionId);
+  return t ? pendingQuestionInTail(t) : null;
+}
+
+/** The row's attention state: the hook-recorded wait, upgraded to `question` when the tail holds
+ *  an unanswered AskUserQuestion (only probed while a wait is actually recorded — the tail read
+ *  is bounded but not free, and a session with no hand raised needs no scan). */
+function attentionOf(id: string, transcript: string | null): SessionMetaRow['attention'] {
+  const a = readAttention(id);
+  if (!a) return null;
+  if ((a.kind === 'input' || a.kind === 'permission') && transcript) {
+    const q = pendingQuestionInTail(transcript);
+    if (q) return { kind: 'question', message: q.header || q.question, ts: a.ts };
+  }
+  return a;
+}
+
+/**
+ * The Claude Code sessions running on this machine right now, by id. Claude Code keeps one record per
+ * running process at `<config>/sessions/<pid>.json` (`{pid, sessionId, cwd, …}`), rewrites it as the
+ * session changes and deletes it at exit; a record whose process has died is not evidence. Empty when
+ * the directory is absent (nothing running, or a Claude Code that predates it).
+ */
+function runningClaudeSessions(): Set<string> {
+  const dir = path.join(claudeConfigDir(), 'sessions');
+  const out = new Set<string>();
+  let names: string[] = [];
+  try {
+    names = fs.readdirSync(dir);
+  } catch {
+    return out;
+  }
+  for (const name of names) {
+    if (!/^\d+\.json$/.test(name)) continue;
+    try {
+      const r = JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8')) as { pid?: unknown; sessionId?: unknown };
+      if (typeof r.sessionId === 'string' && typeof r.pid === 'number' && pidAlive(r.pid)) out.add(r.sessionId);
+    } catch {
+      /* a torn record is not evidence */
+    }
+  }
+  return out;
+}
+
+/** Whether the model produced anything in this conversation: an assistant record that is not Claude
+ *  Code's `<synthetic>` stand-in (an API error, a usage limit, "No response requested." after an
+ *  interrupt). Only a row with no edits and no tokens asks, so an ordinary conversation never pays
+ *  for the read. */
+function hasModelTurn(transcript: string): boolean {
+  try {
+    return readLines(transcript).some((line) => {
+      if (!line.includes('"assistant"')) return false;
+      try {
+        const m = JSON.parse(line)?.message;
+        return m?.role === 'assistant' && m.model !== '<synthetic>';
+      } catch {
+        return false;
+      }
+    });
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * This machine's sessions, grouped by workspace. A session in which nothing happened is left out unless
+ * it may still be running (the rule is spelled out where it is applied); `includeEmpty` keeps those
+ * too, for the reaper, to which they are the most finished sessions of all.
+ */
+export function sessionMeta(cwd: string, reviewing?: string | null, opts: { includeEmpty?: boolean } = {}): SessionMeta {
   const active = (() => {
     try {
       return resolveSessionId(cwd);
@@ -467,11 +774,29 @@ export function sessionMeta(cwd: string, reviewing?: string | null): SessionMeta
   })();
   const rows: SessionMetaRow[] = [];
   const seen = new Set<string>();
+  const hidden = hiddenSessions();
+  const workspaceOf = (dir: string | null | undefined): string => (dir ? workspaceLabel(dir) : '') || UNKNOWN_WORKSPACE;
+  // A session in which NOTHING HAPPENED is not listed: no captured edit, no tokens, and no turn the
+  // model produced — Claude Code opened and closed at the prompt, a `/model` or `/login` and nothing
+  // more, a prompt answered only by an API error, a Codex launch with no prompt. Such rows were 30 of
+  // one machine's 128 (2026-09-24), most of them "New Claude session · 0 tok". A session that
+  // may still be RUNNING stays, so a new one shows before its first reply: the current or pinned one,
+  // one Claude Code lists as running, a raised hand, a Codex turn in flight, or activity within
+  // SESSION_BUSY_MS.
+  const running = runningClaudeSessions();
+  const now = Date.now();
+  const listed = (row: SessionMetaRow, transcript: string | null): boolean =>
+    opts.includeEmpty === true || row.edits > 0 || row.tokens > 0 || row.cached > 0 ||
+    row.current || row.id === reviewing || running.has(row.id) ||
+    (row.attention !== null && row.attention.kind !== 'idle-done') || row.phase === 'working' ||
+    now - Math.max(row.lastActiveMs, row.liveMs) <= SESSION_BUSY_MS ||
+    (transcript !== null && hasModelTurn(transcript));
   // Every workspace's transcripts, indexed by id, so a row can name where it came from. The listing
   // used to gate on `findTranscript`, which WALKS UP the tree — so sessions belonging to `~` and other
   // ancestors were offered as if they were this repo's, 13 of 63 on the repo that found this, with
   // nothing on the row to say otherwise. Provenance is now shown rather than guessed at.
-  const byId = new Map<string, { file: string; workspace: string }>();
+  const byId = new Map<string, { file: string; workspace: string; cwd?: string; source?: string }>();
+  const excluded = new Set<string>();
   for (const w of listWorkspaces()) {
     let names: string[] = [];
     try {
@@ -483,23 +808,125 @@ export function sessionMeta(cwd: string, reviewing?: string | null): SessionMeta
       if (!n.endsWith('.jsonl')) continue;
       const id = n.slice(0, -6);
       if (!isSafeSessionId(id) || byId.has(id)) continue;
-      byId.set(id, { file: path.join(w.dir, n), workspace: w.label });
+      const file = path.join(w.dir, n);
+      const provenance = isMirroredTranscript(file);
+      if (provenance.mirrored || isBridgePointer(file)) { excluded.add(id); continue; }
+      const sessionCwd = provenance.recordedCwd;
+      byId.set(id, { file, workspace: sessionCwd ? workspaceLabel(sessionCwd) : w.label, cwd: sessionCwd });
     }
+  }
+  const codexIds = new Set<string>();
+  for (const source of codexSessionSources()) {
+    if (codexIds.has(source.id)) continue; // newest rollout wins when an archived copy also exists
+    const file = codexTranscriptFile(source.file); if (!file) continue;
+    codexIds.add(source.id);
+    byId.set(source.id, { file, workspace: workspaceOf(source.cwd), cwd: source.cwd, source: source.file });
   }
   const push = (id: string): void => {
     if (seen.has(id)) return;
     seen.add(id);
+    if (hidden.has(id)) return; // the user deleted this session — keep it out of every picker
     const found = byId.get(id);
+    if (!found && excluded.has(id)) return;
+    const rawCodex = found?.source ?? findCodexRollout(id);
+    const rolloutOrigin = rawCodex ? isMirroredTranscript(rawCodex) : null;
+    if (rolloutOrigin?.mirrored) return;
     const transcript = found?.file ?? findTranscript(cwd, id);
-    if (!transcript) return; // no transcript anywhere — nothing to open
-    const workspace = found?.workspace ?? '';
-    // A single-line `bridge-session` pointer is not an empty conversation, it is one that lives on
-    // Claude Code's bridge. Reported as such rather than as a local session with no edits, which is
-    // what a reader opening it would otherwise be left to work out for themselves.
-    const bridge = bridgeInfo(transcript);
+    if (!transcript) {
+      // Codex hook metadata keeps a captured session discoverable before its rollout is available.
+      const codexMeta = readCodexAgentMeta(id);
+      if (!codexMeta) return; // truly nothing to open
+      // Drop a dead throwaway codex session: one whose recorded workspace is a temp dir AND whose
+      // raw rollout is gone (a scratch `codex exec` from a probe/review — no conversation to resume).
+      // Scoped to temp roots so a real project is never hidden, and only when the rollout is truly
+      // gone: a real codex session run in /tmp keeps its rollout (findCodexRollout finds it) and stays.
+      if (codexMeta && typeof codexMeta.cwd === 'string' && codexMeta.cwd) {
+        const cw = path.resolve(codexMeta.cwd);
+        const tmp = [os.tmpdir(), '/tmp', '/private/tmp', '/var/folders'].some((r) => cw.startsWith(path.resolve(r) + path.sep));
+        if (tmp && !findCodexRollout(id)) return;
+      }
+      let title: string | null = null;
+      let lastActiveMs = 0;
+      try {
+        const events = readCaptureEvents(id, ['turn_start']);
+        for (const event of events) {
+          const prompt = (event.payload as { prompt?: string })?.prompt;
+          if (typeof prompt === 'string') { title = plainTitle(codexPromptText(prompt) ?? '') || null; if (title) break; }
+        }
+        title = codexSessionTitle(rawCodex || '', id) || title;
+        lastActiveMs = fs.statSync(captureEventsPath(id)).mtimeMs;
+      } catch {
+        /* a torn sidecar still identifies the session */
+      }
+      try {
+        lastActiveMs = Math.max(lastActiveMs, fs.statSync(logPath(id)).mtimeMs);
+      } catch {
+        /* no log — an editless drive; the sidecar mtime stands */
+      }
+      let workspace = workspaceOf(codexMeta.cwd);
+      let lastTurn: number | null = null;
+      let tokens = 0;
+      let cached = 0;
+      let model = '';
+      let effort = '';
+      if (codexMeta) {
+        model = codexMeta.model ?? '';
+        // The agent-meta cwd is the fallback workspace when the rollout can't be resolved (describeSession
+        // uses it too); without it a codex session row shows a blank workspace chip on every surface.
+        if (!workspace && codexMeta.cwd) workspace = workspaceLabel(codexMeta.cwd);
+        try {
+          const rollout = findCodexRollout(id);
+          if (rollout) {
+            lastTurn = lastTurnMs(rollout, 'codex');
+            const r = readCodexRollout(rollout);
+            model = r.model || model;
+            effort = r.effort || '';
+            if (!workspace && r.cwd) workspace = workspaceLabel(r.cwd);
+            title = codexSessionTitle(rollout, id) || title;
+            if (r.tokens) {
+              // Same field semantics the Claude rows hold: `tokens` is NEW work (uncached input +
+              // output), cache traffic counts separately and never impersonates it.
+              tokens = Math.max(0, r.tokens.input - r.tokens.cacheRead) + r.tokens.output;
+              cached = r.tokens.cacheRead + r.tokens.cacheWrite;
+            }
+            lastActiveMs = Math.max(lastActiveMs, (() => { try { return fs.statSync(rollout).mtimeMs; } catch { return 0; } })());
+          }
+        } catch {
+          /* a rollout is enrichment; the session lists without it */
+        }
+      }
+      if (!lastActiveMs) return;
+      const row: SessionMetaRow = {
+        id,
+        workspace,
+        origin: 'local',
+        machine: THIS_MACHINE,
+        title: title || UNTITLED_SESSION_TITLES.codex,
+        lastActiveMs,
+        ...(lastTurn === null ? {} : { lastTurnMs: lastTurn || null }),
+        liveMs: lastActiveMs,
+        attention: attentionOf(id, null),
+        tab: readTabLink(id),
+        current: id === active,
+        ...sessionCounts(id),
+        tokens,
+        cached,
+        durationMs: 0,
+        storeBytes: storeBytes(id),
+        storePath: storeDir(id),
+        model,
+        effort,
+        agent: 'codex',
+      };
+      if (listed(row, null)) rows.push(row);
+      return;
+    }
+    // A rollout the source scan passed over (a launch with no prompt, a temp workspace since removed)
+    // still records its workspace in its session_meta.
+    const workspace = found?.workspace ?? workspaceOf(rolloutOrigin?.recordedCwd ?? readCodexAgentMeta(id)?.cwd);
     let lastActiveMs = 0;
     try {
-      lastActiveMs = fs.statSync(transcript).mtimeMs;
+      lastActiveMs = fs.statSync(found?.source ?? transcript).mtimeMs;
     } catch {
       try {
         lastActiveMs = fs.statSync(logPath(id)).mtimeMs;
@@ -508,6 +935,23 @@ export function sessionMeta(cwd: string, reviewing?: string | null): SessionMeta
       }
     }
     if (!lastActiveMs) return;
+    const lastTurn = lastTurnMs(rawCodex ?? transcript, rawCodex ? 'codex' : 'claude');
+    // TWO clocks, on purpose. `lastActiveMs` is the CONVERSATION clock (transcript mtime) — the
+    // reaper and the fold rule key on it, and folding the log in would make reviewing a dead
+    // session look like reviving it (the reapableSessions rule). `liveMs` is the ACTIVITY clock:
+    // a driven session's freshest evidence is its sidecar (appended per streamed chunk) or its
+    // store log (hook captures land mid-turn) — transcript-only liveness flapped working agents
+    // inactive between message boundaries, and the ● marks, ambient status,
+    // and the head re-arm read this one.
+    // Sidecar only — NOT the log file's mtime: keep/undo rewrites the log, so counting it made
+    // REVIEWING a session read as the agent working.
+    // Mid-turn hook captures still register through the transcript itself here.
+    let liveMs = lastActiveMs;
+    try {
+      liveMs = Math.max(liveMs, fs.statSync(captureEventsPath(id)).mtimeMs);
+    } catch {
+      /* no sidecar — the conversation clock stands */
+    }
     // Tokens/duration and model/effort share ONE incremental cursor over the transcript, so asking for
     // both costs a single delta parse — and nothing at all for a session whose transcript has not moved.
     let tokens = 0;
@@ -531,23 +975,32 @@ export function sessionMeta(cwd: string, reviewing?: string | null): SessionMeta
     } catch {
       /* an unreadable transcript still identifies a session — report the row without its vitals */
     }
-    rows.push({
+    const row: SessionMetaRow = {
       id,
       workspace,
-      origin: bridge ? 'bridged' : 'local',
-      // A bridged conversation is NOT on this machine, and saying so in one column while the row's
-      // own status line says the opposite is the kind of contradiction a reader stops trusting.
-      machine: bridge ? BRIDGE_MACHINE : THIS_MACHINE,
-      title: fastSessionTitle(transcript, id),
+      origin: 'local',
+      machine: THIS_MACHINE,
+      title: rawCodex ? codexSessionTitle(rawCodex, id) || UNTITLED_SESSION_TITLES.codex : fastSessionTitle(transcript, id) || UNTITLED_SESSION_TITLES.claude,
       lastActiveMs,
+      ...(lastTurn === null ? {} : { lastTurnMs: lastTurn || null }),
+      liveMs,
+      attention: attentionOf(id, transcript),
+      tab: readTabLink(id),
       current: id === active,
       ...sessionCounts(id),
       tokens,
       cached,
       durationMs,
+      storeBytes: storeBytes(id),
+      storePath: storeDir(id),
       model,
       effort,
-    });
+      // A rollout makes it Codex's, as it already does for the title: a Codex session driven over ACP
+      // has a rollout and a store but no hook metadata, and was listed as `claude`.
+      agent: rawCodex || readCodexAgentMeta(id) ? 'codex' : 'claude',
+      ...phaseOf(transcript, lastActiveMs),
+    };
+    if (listed(row, transcript)) rows.push(row);
   };
   for (const id of allStoreSessionIds()) push(id);
   // …and every session with a TRANSCRIPT here. A store directory appears the first time the capture
@@ -558,7 +1011,18 @@ export function sessionMeta(cwd: string, reviewing?: string | null): SessionMeta
   for (const id of byId.keys()) push(id);
   if (active) push(active);
   if (reviewing) push(reviewing);
-  rows.sort((a, b) => b.lastActiveMs - a.lastActiveMs);
+  // Order once in core. Both editors and the CLI render these workspace groups verbatim.
+  const groups = new Map<string, { current: boolean; last: number }>();
+  for (const row of rows) {
+    const sessionCwd = byId.get(row.id)?.cwd ?? readCodexAgentMeta(row.id)?.cwd;
+    const current = row.current || (!!sessionCwd && canonPath(sessionCwd) === canonPath(path.resolve(cwd)));
+    const group = groups.get(row.workspace);
+    groups.set(row.workspace, { current: current || !!group?.current, last: Math.max(row.lastActiveMs, group?.last ?? 0) });
+  }
+  rows.sort((a, b) => {
+    const ag = groups.get(a.workspace)!, bg = groups.get(b.workspace)!;
+    return Number(bg.current) - Number(ag.current) || bg.last - ag.last || a.workspace.localeCompare(b.workspace) || b.lastActiveMs - a.lastActiveMs;
+  });
   return { active, sessions: rows };
 }
 
@@ -582,12 +1046,19 @@ export interface SessionCounts {
    */
   added: number;
   removed: number;
+  /**
+   * The newest record id in the session's log when these counts were taken (0 with no store). A delete
+   * confirmed from these counts passes it back as `seenThrough`, so an edit captured after them is
+   * refused even when it joined a review unit `pending` already counted (see deleteSession).
+   */
+  lastEdit: number;
 }
 
-// 6: chains that cancel out are not counted (a file created then deleted is not an edit to review);
-// 5: counts are over DISPLAY units (same-code collapsed), matching the change map; 4: line deltas
-// moved to the per-blob-pair cache (deltaCache); 2: added `files`.
-const COUNTS_SIDECAR_VERSION = 6;
+// 7: added `lastEdit`, the newest record id the counts saw; 6: chains that cancel out are not counted
+// (a file created then deleted is not an edit to review); 5: counts are over DISPLAY units (same-code
+// collapsed), matching the change map; 4: line deltas moved to the per-blob-pair cache (deltaCache);
+// 2: added `files`.
+const COUNTS_SIDECAR_VERSION = 7;
 
 /**
  * A session's captured-edit counts, cached in the same sidecar the title uses and keyed to the LOG's
@@ -598,7 +1069,7 @@ const COUNTS_SIDECAR_VERSION = 6;
  * the transcript would not be, which is why nothing here parses one.
  */
 export function sessionCounts(sessionId: string): SessionCounts {
-  const empty: SessionCounts = { edits: 0, pending: 0, files: 0, added: 0, removed: 0 };
+  const empty: SessionCounts = { edits: 0, pending: 0, files: 0, added: 0, removed: 0, lastEdit: 0 };
   let stamp = '';
   try {
     const st = fs.statSync(logPath(sessionId));
@@ -626,8 +1097,12 @@ export function sessionCounts(sessionId: string): SessionCounts {
   // against +355,905, because 1,589 records collapsed away. One product, one meaning for "pending".
   // …and not the chains that CANCEL OUT: a file created and then deleted is not an edit anybody can
   // review, and the review list, the change map and this row have to mean the same thing by "pending".
-  const log = visibleEdits(sessionId);
+  // `lastEdit` first, over every record: a delete checks its `seenThrough` against every pending record,
+  // one inside a chain that cancels out included, and an edit captured while the units below are counted
+  // must come out newer than it, so that a delete confirmed from these counts refuses that edit.
   const counts = { ...empty };
+  for (const r of readLog(sessionId)) if (r.id > counts.lastEdit) counts.lastEdit = r.id;
+  const log = visibleEdits(sessionId);
   const files = new Set<string>();
   for (const r of log) {
     counts.edits++;
@@ -663,6 +1138,59 @@ export function sessionCounts(sessionId: string): SessionCounts {
   return counts;
 }
 
+/**
+ * How long a delete waits for a capture in progress. VS Code's extension host and the terminal app call
+ * deleteSession on their own thread, so a capture that holds the mutex longer is a refusal to retry, not a
+ * frozen editor: the default 5 s blocked that thread for all of it.
+ */
+const DELETE_WAIT_MS = 500;
+
+/**
+ * Remove a session from Observatory: hide it from every picker AND purge its stored edits/blobs.
+ * The agent's own transcript or rollout is left untouched (deleting Claude Code's or Codex's files
+ * is not ours to do); the hidden list is what keeps the session out of the listings regardless.
+ *
+ * The purge is for good: `unhideSession` (`oak sessions --undelete`) puts the session back in the
+ * pickers, never its edits. An edit still pending review loses its before-snapshot with it, so the
+ * agent's change on disk can no longer be undone. A session that holds any is therefore refused
+ * unless the caller's confirmation named them: `confirmedPending` is the count it showed (the CLI's
+ * `--force` passes Infinity), and a delete that finds more pending than that is refused.
+ * The count is of review units, as the dialog's is, so an edit that rewrites a change the
+ * dialog already counted joins that change and leaves the count as it was. `seenThrough` closes that
+ * gap: it is the newest record id of the listing the count came from (`SessionCounts.lastEdit`), and a
+ * delete that finds a pending record newer than it is refused too, so no edit captured after that
+ * listing is purged unseen. A caller that passes no `seenThrough` (an older editor) gets the count check
+ * alone. The checks and the purge hold the session's capture mutex, so no capture lands between them.
+ */
+export function deleteSession(sessionId: string, opts: { confirmedPending?: number; seenThrough?: number } = {}): void {
+  const confirmed = typeof opts.confirmedPending === 'number' && opts.confirmedPending >= 0 ? opts.confirmedPending : 0;
+  const seenThrough = typeof opts.seenThrough === 'number' && Number.isFinite(opts.seenThrough) ? opts.seenThrough : Infinity;
+  try {
+    withFileMutation(captureMutex(sessionId), () => deleteSessionLocked(sessionId, confirmed, seenThrough), DELETE_WAIT_MS);
+  } catch (e) {
+    if (e instanceof FileBusyError) throw new Error(`${sessionId} is recording an edit right now, so it was not deleted; try again in a moment`);
+    throw e;
+  }
+}
+
+function deleteSessionLocked(sessionId: string, confirmed: number, seenThrough: number): void {
+  // A pending edit needs a pending record, and the log is cheap to read; the display count (sidecar-cached,
+  // a whole derivation when it cannot be cached) is asked only when one exists. Editors call this in-process.
+  const log = readLog(sessionId);
+  const pending = !log.some((r) => r.status === 'pending') ? 0 : sessionCounts(sessionId).pending;
+  if (pending > confirmed) {
+    const edits = `${pending} edit${pending === 1 ? '' : 's'} pending review`;
+    throw new Error(confirmed
+      ? `${sessionId} has ${edits}, more than the ${confirmed} this delete confirmed; deleting the session would purge the rest unseen, so it was not deleted`
+      : `${sessionId} has ${edits}; deleting the session would purge ${pending === 1 ? 'it' : 'them'} for good, so it was not deleted`);
+  }
+  const unseen = log.filter((r) => r.status === 'pending' && r.id > seenThrough).length;
+  if (unseen)
+    throw new Error(`${sessionId} captured ${unseen === 1 ? 'an edit' : `${unseen} edits`} after the listing this delete was confirmed from, still pending review; deleting the session would purge ${unseen === 1 ? 'it' : 'them'} unseen, so it was not deleted`);
+  hideSession(sessionId);
+  try { removeSession(sessionId); } catch { /* no store dir (a transcript-only session) — hiding is enough */ }
+}
+
 /** Bump when the stored shape changes. */
 const DELTA_CACHE_VERSION = 1;
 
@@ -696,8 +1224,8 @@ function deltaCache(sessionId: string): { get(r: EditRecord): { added: number; r
   return {
     complete: () => complete,
     get(r) {
-      const key = `${r.beforeBlob ?? '-'}:${r.afterBlob ?? '-'}`;
-      const cached = map.get(key);
+      const key = pairKeyOf(r.beforeBlob, r.afterBlob);
+      const cached = map.get(key) ?? pairDelta(sessionId, key);
       if (cached) {
         keep.set(key, cached); // retained: this pass used it
         return { added: cached[0], removed: cached[1] };
@@ -718,33 +1246,56 @@ function deltaCache(sessionId: string): { get(r: EditRecord): { added: number; r
       return { added: v[0], removed: v[1] };
     },
     flush() {
-      // Write only when something changed, and keep only the pairs still referenced — a log that drops
-      // records (clean --resolved) must not leave their entries behind forever.
-      if (!file || (!dirty && keep.size === map.size)) return;
+      // The FILE is written by the shared store now, pruned by log membership rather than by what
+      // this pass happened to touch — `lineDelta` writes the same entries, and two passes pruning to
+      // their own reference sets would delete each other's work on every poll.
+      if (!dirty && keep.size === map.size) return;
+      const live = new Set<string>();
       try {
-        fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-        const tmp = `${file}.${process.pid}.tmp`;
-        fs.writeFileSync(tmp, JSON.stringify({ version: DELTA_CACHE_VERSION, pairs: Object.fromEntries(keep) }), { mode: 0o600 });
-        fs.renameSync(tmp, file);
+        for (const r of readLog(sessionId)) live.add(pairKeyOf(r.beforeBlob, r.afterBlob));
       } catch {
-        /* cache is best-effort */
+        /* an unreadable log prunes nothing */
       }
+      flushPairDeltas(sessionId, live);
     },
   };
 }
 
-const TITLE_SIDECAR_VERSION = 1;
-const TITLE_TAIL_SCAN = 4 * 1024 * 1024; // ai-title rides near the end; latest wins
+// 2: a pasted-only first prompt (`<pasted_content>`) is a title now (2026-09-22).
+// 4: the sidecar holds the title's PARTS — a rename (`custom-title`) outranks the ai-title, and the
+//    Remote Control title between them is looked up at read time, never cached here (2026-09-24).
+// 5: a prompt title loses its markdown heading markers on EVERY line, which only a rescan can do: a
+//    v4 part has its lines already joined (2026-09-24).
+const TITLE_SIDECAR_VERSION = 5;
+const TITLE_TAIL_SCAN = 4 * 1024 * 1024; // title records ride near the end; latest wins
 const TITLE_HEAD_SCAN = 256 * 1024; // the first user prompt sits near the top
 
+/** What a session's name is made from, as the bounded scan finds it. The newest rename (null when none
+ *  or cleared), the newest ai-title, the first real prompt (read only when there is no ai-title — it
+ *  would never win), and the Remote Control session id whose claude.ai title outranks the last two. */
+export interface SessionTitleParts {
+  rename: string | null;
+  aiTitle: string | null;
+  prompt: string | null;
+  bridge: string | null;
+}
+
 /**
- * A session's display title from a BOUNDED transcript scan, cached in an on-disk sidecar
- * (`<store>/session-meta/<id>.json`, keyed to the transcript's mtime:size — the usage-cursors
- * pattern). The scan replicates transcriptInsights' rules on a budget: the LATEST `ai-title` from the
- * tail, else the first REAL user prompt from the head (no sidechains, no compact summaries, no
- * command/caveat wrappers).
+ * A session's display title from a BOUNDED transcript scan, in `preferredSessionTitle`'s order. The
+ * scan's parts are cached in an on-disk sidecar (`<store>/session-meta/<id>.json`, keyed to the
+ * transcript's mtime:size — the usage-cursors pattern); the Remote Control title comes from its own
+ * cache at every call, so a changed server title shows without a rescan.
  */
 export function fastSessionTitle(transcriptPath: string, sessionId: string): string | null {
+  const p = sessionTitleParts(transcriptPath, sessionId);
+  if (!p) return null;
+  return normalizeSessionTitle(
+    preferredSessionTitle({ customTitle: p.rename, bridgeSessionId: p.bridge, title: p.aiTitle, firstUserPrompt: p.prompt }) ?? ''
+  );
+}
+
+/** The scan's parts for one transcript, sidecar-cached; null when the transcript cannot be read. */
+export function sessionTitleParts(transcriptPath: string, sessionId: string): SessionTitleParts | null {
   let stamp = '';
   try {
     const st = fs.statSync(transcriptPath);
@@ -754,34 +1305,37 @@ export function fastSessionTitle(transcriptPath: string, sessionId: string): str
   }
   // The id reaches here from a pinned setting or a --session flag, so it is not trusted to be a single
   // path segment: without this, `../../evil` would resolve OUTSIDE the store and then be written to.
-  if (!isSafeSessionId(sessionId)) return scanTitle(transcriptPath);
+  if (!isSafeSessionId(sessionId)) return scanTitleParts(transcriptPath);
   const sidecar = path.join(rootDir(), 'session-meta', `${sessionId}.json`);
   try {
-    const hit = JSON.parse(fs.readFileSync(sidecar, 'utf8')) as { stamp: string; title: string | null };
-    if (hit && hit.stamp === stamp) return hit.title;
+    const hit = JSON.parse(fs.readFileSync(sidecar, 'utf8')) as { stamp: string; parts?: SessionTitleParts };
+    if (hit && hit.stamp === stamp && hit.parts) return hit.parts;
   } catch {
     /* absent or unreadable — scan */
   }
-  const title = scanTitle(transcriptPath);
+  const parts = scanTitleParts(transcriptPath);
+  if (!parts) return null;
   try {
     fs.mkdirSync(path.dirname(sidecar), { recursive: true, mode: 0o700 });
     const tmp = `${sidecar}.${process.pid}.tmp`;
     // Merge: the counts half of this file is keyed to the LOG and must survive a transcript-only change.
+    // A pre-v4 `title` is dropped: it is not what this build would show.
     let prev: Record<string, unknown> = {};
     try {
       prev = JSON.parse(fs.readFileSync(sidecar, 'utf8'));
     } catch {
       /* first write */
     }
-    fs.writeFileSync(tmp, JSON.stringify({ ...prev, stamp, title }), { mode: 0o600 });
+    delete prev.title;
+    fs.writeFileSync(tmp, JSON.stringify({ ...prev, stamp, parts }), { mode: 0o600 });
     fs.renameSync(tmp, sidecar); // atomic — a concurrent reader sees old-or-new, never a torn file
   } catch {
     /* sidecar is best-effort */
   }
-  return title;
+  return parts;
 }
 
-function scanTitle(transcriptPath: string): string | null {
+function scanTitleParts(transcriptPath: string): SessionTitleParts | null {
   let fd: number;
   let size = 0;
   try {
@@ -790,25 +1344,44 @@ function scanTitle(transcriptPath: string): string | null {
   } catch {
     return null;
   }
+  const parts: SessionTitleParts = { rename: null, aiTitle: null, prompt: null, bridge: null };
   try {
-    // Tail: the LATEST ai-title wins, so walk the last chunk's lines backwards.
+    // Tail: the LATEST records win, so walk the last chunk's lines backwards. A rename outranks the
+    // rest wherever it sits — Claude Code re-appends its metadata as custom-title THEN ai-title, so the
+    // newest ai-title line usually comes after the newest rename. The newest custom-title decides alone:
+    // an empty one is a cleared rename, and no older one counts.
     const tailLen = Math.min(size, TITLE_TAIL_SCAN);
     const tail = Buffer.alloc(tailLen);
     fs.readSync(fd, tail, 0, tailLen, size - tailLen);
     const tailLines = tail.toString('utf8').split('\n');
     if (tailLen < size) tailLines.shift(); // first line may be partial
-    for (let i = tailLines.length - 1; i >= 0; i--) {
+    let renameSeen = false;
+    for (let i = tailLines.length - 1; i >= 0 && !(renameSeen && parts.aiTitle !== null && parts.bridge !== null); i--) {
       const t = tailLines[i];
-      if (t.indexOf('"ai-title"') === -1) continue;
+      const rename = !renameSeen && t.indexOf('"custom-title"') !== -1;
+      const ai = parts.aiTitle === null && t.indexOf('"ai-title"') !== -1;
+      const bridge = parts.bridge === null && t.indexOf('"bridge-session"') !== -1;
+      if (!rename && !ai && !bridge) continue;
       try {
         const o = JSON.parse(t);
-        if (o && o.type === 'ai-title' && typeof o.aiTitle === 'string' && o.aiTitle.trim())
-          return normalizeSessionTitle(o.aiTitle);
+        if (rename && o && o.type === 'custom-title') {
+          renameSeen = true;
+          if (typeof o.customTitle === 'string' && o.customTitle.trim()) {
+            parts.rename = o.customTitle.trim();
+            return parts; // nothing outranks it
+          }
+        } else if (ai && o && o.type === 'ai-title' && typeof o.aiTitle === 'string' && o.aiTitle.trim()) {
+          parts.aiTitle = o.aiTitle.trim();
+        } else if (bridge && o && o.type === 'bridge-session' && typeof o.bridgeSessionId === 'string' && o.bridgeSessionId) {
+          parts.bridge = o.bridgeSessionId;
+        }
       } catch {
         /* partial line */
       }
     }
-    // Head: the first REAL user prompt (same filters as transcriptInsights).
+    if (parts.aiTitle !== null) return parts;
+    // Head: the first REAL user prompt (same filters as transcriptInsights), kept only as long as a
+    // row can show it.
     const headLen = Math.min(size, TITLE_HEAD_SCAN);
     const head = Buffer.alloc(headLen);
     fs.readSync(fd, head, 0, headLen, 0);
@@ -823,80 +1396,99 @@ function scanTitle(transcriptPath: string): string | null {
       }
       const msg = o.message;
       if (!msg || msg.role !== 'user' || o.isSidechain === true || o.isCompactSummary === true) continue;
-      let text: string | null = null;
-      if (typeof msg.content === 'string') text = msg.content;
-      else if (Array.isArray(msg.content)) {
-        const tb = msg.content.find((b: any) => b && b.type === 'text' && typeof b.text === 'string');
-        if (tb) text = tb.text;
+      const clean = personPromptOf(msg);
+      if (clean) {
+        parts.prompt = normalizeSessionTitle(clean);
+        break;
       }
-      const clean = text ? text.trim() : '';
-      if (clean && !clean.startsWith('<') && !/^caveat:/i.test(clean)) return normalizeSessionTitle(clean);
     }
-    return null;
+    return parts;
   } finally {
     fs.closeSync(fd);
   }
 }
 
-function transcriptInsightsUncached(p: string): TranscriptInsights {
-  const empty: TranscriptInsights = { todos: [], lastSummary: null, title: null, firstUserPrompt: null };
-  let lines: string[];
+/**
+ * The pid of the AGENT process running a session — its `claude --resume <id>` / `codex … <id>` — so the
+ * observatory can stop an agent it did NOT spawn.
+ * The session id (a uuid) rides the agent's own command line, which is what makes this possible without
+ * the agents recording anything. SAFE BY CONSTRUCTION: it returns a pid ONLY when exactly one process
+ * matches — never guessing which of several to kill — and it excludes this dashboard's own surfaces (the
+ * `oak` binary, the `tui`, the capture hook, an `-acp` adapter) and this very process, so a
+ * kill can never turn on the observatory itself. Returns null on any ambiguity or if `ps` is unavailable.
+ */
+export function findAgentPid(sessionId: string): number | null {
+  if (!isSafeSessionId(sessionId)) return null;
+  let out = '';
   try {
-    lines = readLines(p);
+    // Through the project's ONE launcher, like every other child process here (the spawn-hygiene gate).
+    const r = spawnToolSync('ps', ['-eo', 'pid=,args='], { encoding: 'utf8', timeout: 3000 });
+    if (r.error || r.status !== 0 || typeof r.stdout !== 'string') return null;
+    out = r.stdout;
   } catch {
-    return empty;
+    return null; // no ps (or it failed) — we simply cannot find it, and we do not pretend to
   }
-  let todos: { content: string; status: string }[] = [];
-  let lastSummary: string | null = null;
-  let title: string | null = null;
-  let firstUserPrompt: string | null = null;
-  for (const line of lines) {
-    const t = line.trim();
-    if (!t) continue;
-    let o: any;
-    try {
-      o = JSON.parse(t);
-    } catch {
-      continue;
-    }
-    // Claude Code writes an `ai-title` entry whenever it (re)titles the session — keep the latest.
-    if (o.type === 'ai-title' && typeof o.aiTitle === 'string' && o.aiTitle.trim()) {
-      title = o.aiTitle.trim();
-      continue;
-    }
-    const msg = o.message;
-    // First REAL user prompt — the fallback session title for sessions without to-dos. String or
-    // text-block content both occur; skip sidechains, tool_result-only turns, and the harness's
-    // command/caveat wrappers (`<command-name>…`, `Caveat: …`) — those aren't what the user asked.
-    // A compaction summary is likewise excluded: it's a synthesized user turn ("This session is being
-    // continued from a previous conversation…"), so on a compacted session it would otherwise become
-    // the session title and the session picker's label.
-    if (firstUserPrompt === null && msg && msg.role === 'user' && o.isSidechain !== true && o.isCompactSummary !== true) {
-      let text: string | null = null;
-      if (typeof msg.content === 'string') text = msg.content;
-      else if (Array.isArray(msg.content)) {
-        const tb = msg.content.find((b: any) => b && b.type === 'text' && typeof b.text === 'string');
-        if (tb) text = tb.text;
-      }
-      const clean = text ? text.trim() : '';
-      if (clean && !clean.startsWith('<') && !/^caveat:/i.test(clean)) firstUserPrompt = clean;
-    }
-    if (!msg || msg.role !== 'assistant' || !Array.isArray(msg.content)) continue;
-    // Skip inlined sidechain (subagent) turns: a subagent's report/TodoWrite is not "what Claude
-    // said it just did" in the main conversation. (Current Claude Code stores sidechains in
-    // separate files; this guards legacy transcripts.)
-    if (o.isSidechain === true) continue;
-    for (const b of msg.content) {
-      if (b.type === 'text' && typeof b.text === 'string' && b.text.trim()) lastSummary = b.text.trim();
-      if (b.type === 'tool_use' && b.name === 'TodoWrite' && b.input && Array.isArray(b.input.todos)) {
-        const list = b.input.todos
-          .filter((td: any) => td && typeof td.content === 'string')
-          .map((td: any) => ({ content: String(td.content).trim(), status: String(td.status || '') }));
-        if (list.length) todos = list; // keep the LATEST non-empty list — it supersedes earlier ones
-      }
+  const self = process.pid;
+  const hits: number[] = [];
+  for (const line of out.split('\n')) {
+    const m = /^\s*(\d+)\s+(.*)$/.exec(line);
+    if (!m) continue;
+    const pid = Number(m[1]);
+    const cmd = m[2];
+    if (pid === self || !cmd.includes(sessionId)) continue;
+    if (/observatory|capture\.(js|ts)\b|-acp\b|(?:^|\s|\/)tui(?:\s|$)/.test(cmd)) continue; // our own surfaces
+    if (/(?:^|\s|\/)(claude|codex)(?:\s|$)/.test(cmd)) hits.push(pid); // the agent binary itself
+  }
+  return hits.length === 1 ? hits[0] : null; // exactly one, or refuse — a kill must never guess its target
+}
+
+export function newInsightFacts(): TranscriptInsights {
+  return { todos: [], lastSummary: null, title: null, customTitle: null, bridgeSessionId: null, firstUserPrompt: null };
+}
+
+export function foldInsightFacts(facts: TranscriptInsights, o: any): void {
+  // Claude Code writes an `ai-title` entry whenever it (re)titles the session — keep the latest.
+  if (o.type === 'ai-title' && typeof o.aiTitle === 'string' && o.aiTitle.trim()) {
+    facts.title = o.aiTitle.trim();
+    return;
+  }
+  // …and a `custom-title` entry when a person renames it (`/rename`, or claude.ai / the Claude app).
+  // The newest one decides, and an empty one is how a rename is cleared.
+  if (o.type === 'custom-title') {
+    facts.customTitle = typeof o.customTitle === 'string' && o.customTitle.trim() ? o.customTitle.trim() : null;
+    return;
+  }
+  // …and a `bridge-session` entry for the Remote Control session it runs as, whose claude.ai title
+  // names it on the phone. The newest id is the live one.
+  if (o.type === 'bridge-session') {
+    if (typeof o.bridgeSessionId === 'string' && o.bridgeSessionId) facts.bridgeSessionId = o.bridgeSessionId;
+    return;
+  }
+  const msg = o.message;
+  // First REAL user prompt — the fallback session title for sessions without to-dos. String or
+  // text-block content both occur; skip sidechains, tool_result-only turns, and the harness's
+  // command/caveat wrappers (`<command-name>…`, `Caveat: …`) — those aren't what the user asked.
+  // A compaction summary is likewise excluded: it's a synthesized user turn ("This session is being
+  // continued from a previous conversation…"), so on a compacted session it would otherwise become
+  // the session title and the session picker's label.
+  if (facts.firstUserPrompt === null && msg && msg.role === 'user' && o.isSidechain !== true && o.isCompactSummary !== true) {
+    const clean = personPromptOf(msg);
+    if (clean) facts.firstUserPrompt = clean;
+  }
+  if (!msg || msg.role !== 'assistant' || !Array.isArray(msg.content)) return;
+  // Skip inlined sidechain (subagent) turns: a subagent's report/TodoWrite is not "what Claude
+  // said it just did" in the main conversation. (Current Claude Code stores sidechains in
+  // separate files; this guards legacy transcripts.)
+  if (o.isSidechain === true) return;
+  for (const b of msg.content) {
+    if (b && b.type === 'text' && typeof b.text === 'string' && b.text.trim()) facts.lastSummary = b.text.trim();
+    if (b && b.type === 'tool_use' && b.name === 'TodoWrite' && b.input && Array.isArray(b.input.todos)) {
+      const list = b.input.todos
+        .filter((td: any) => td && typeof td.content === 'string')
+        .map((td: any) => ({ content: String(td.content).trim(), status: String(td.status || '') }));
+      if (list.length) facts.todos = list; // keep the LATEST non-empty list — it supersedes earlier ones
     }
   }
-  return { todos, lastSummary, title, firstUserPrompt };
 }
 
 // --- context sources: what shaped this session ---
@@ -1181,6 +1773,19 @@ function flagInputs(sessionId: string, rec: EditRecord): FlagInputs | null {
   const key = `${rec.beforeBlob ?? ''}\u0000${rec.afterBlob ?? ''}`;
   const hit = flagBlobMemo.get(key);
   if (hit !== undefined) return hit;
+  // …and the same answer from the LAST process. This was the single largest cost in a change-map
+  // rebuild — `flagsFor` measured 71 % of a 4.9 s build on a 978-record session, nearly all of it
+  // `addedLines` re-diffing blobs whose bytes had not moved since the previous poll. The memo above
+  // is content-keyed and correct; it simply never survived exit, and the read commands are spawned.
+  //
+  // `null` is a REAL answer here (the file was deleted), so absence is `undefined`: a store that
+  // conflated the two would re-diff every deletion forever.
+  const pk = pairKeyOf(rec.beforeBlob, rec.afterBlob);
+  const kept = contentGet<FlagInputs | null>(sessionId, 'flags', pk);
+  if (kept !== undefined) {
+    flagBlobMemo.set(key, kept);
+    return kept;
+  }
   const before = blobText(sessionId, rec.beforeBlob);
   const after = blobText(sessionId, rec.afterBlob);
   let value: FlagInputs | null = null; // null = the file was deleted; the caller answers that without diffing
@@ -1201,6 +1806,13 @@ function flagInputs(sessionId: string, rec: EditRecord): FlagInputs | null {
   }
   if (flagBlobMemo.size >= FLAG_MEMO_CAP) flagBlobMemo.clear();
   flagBlobMemo.set(key, value);
+  // Only an INTACT pair is published, the same guard `lineDelta` applies to the same hazard: a blob
+  // that cannot be read yields '' from `blobText`, and filing that under the healthy sha would hand
+  // every later process a "the whole file was removed" answer that nothing could ever heal, because
+  // the key never changes.
+  if (hasBlob(sessionId, rec.beforeBlob) && hasBlob(sessionId, rec.afterBlob)) {
+    contentNote(sessionId, 'flags', pk, value);
+  }
   return value;
 }
 
@@ -1399,6 +2011,16 @@ export interface UsageLine {
   weekPct: number | null; // 7-day plan usage
   fiveReset: number | null; // reset time for the 5h window, epoch ms
   weekReset: number | null; // reset time for the 7-day window, epoch ms
+  /** The per-model weekly cap the account reports (the desktop app's "Fable" row) — share,
+   *  reset (epoch ms) and the model's display name. Null until the account API supplied one. */
+  fablePct: number | null;
+  fableReset: number | null;
+  fableLabel: string | null;
+  /** ~tokens used / projected 100% budget / cache reads for the fable cap — union-measured and
+   *  calibrated by the statusline scan, same canon as the 5h/weekly figures. */
+  fableTokens: number | null;
+  fableTotal: number | null;
+  fableReads: number | null;
   fiveTokens: number | null; // ~estimated tokens used in the 5h window
   weekTokens: number | null; // ~estimated tokens used in the 7-day window
   statuslineCache: boolean; // whether statusline-last.json was found — false ⇒ claude-statusline
@@ -1418,6 +2040,34 @@ export interface UsageLine {
    * that distinguishes them — so the UI must not label it "Enterprise".
    */
   rollingLimits: boolean | null;
+  /**
+   * The rest of what the SHIPPED statusline draws (0.10.0). The dashboard renders that statusline
+   * verbatim, so it needs the same inputs — and the statusline is the only thing that HAS them:
+   * they arrive in Claude Code's per-turn payload, which reaches no other surface. It persists
+   * them into its cache; this reads them back. All optional: absent means the cache predates the
+   * field (or no statusline is installed), and the row degrades to that segment's placeholder
+   * rather than inventing a value.
+   */
+  branch: string | null; // the git branch the session is working in
+  thinking: boolean | null; // extended thinking on for this turn
+  outputStyle: string | null; // '' / 'default' render as nothing
+  tokensIn: number | null; // ↑ input
+  tokensOut: number | null; // ↓ output
+  tokensCacheRead: number | null; // ↺ cache reads
+  /** The projected 100% budgets behind the ~est/total suffixes. Computed inside the statusline's
+   *  own self-calibrating scan and previously thrown away — persisted now so the dashboard can
+   *  print the same denominator instead of a bare estimate. */
+  fiveTotal: number | null;
+  weekTotal: number | null;
+  /**
+   * MEASURED tokens for the rolling windows, summed across the machines this account works on.
+   *
+   * Provider percentages are account-wide; these token measurements come only from transcripts
+   * on this machine. Field names remain stable for editor consumers; usageScope is always "here".
+   */
+  fiveMeasuredAll: number | null;
+  weekMeasuredAll: number | null;
+  usageScope: string;
   /** Measured token totals per rolling window, replacing the 5h/weekly bars on a plan that has no
    *  windows. Populated only when `rollingLimits === false`. Deliberately no percentage — there is no
    *  quota to divide by, and inventing a denominator would be the same wrong-by-plausible answer the
@@ -1428,6 +2078,55 @@ export interface UsageLine {
    *  measures 24h/7d from `computeStats`. Whichever answers, the label travels with the number, so a
    *  row can never be drawn under a window it was not measured over. */
   localWindows: { label: string; tokens: number }[] | null;
+  /** Schema version of the statusline cache that produced this line. Absent means a status line
+   *  older than 0.10.0 is installed: it writes a cache without the token split, the branch, the
+   *  think state, the plan totals or the spend ledger — and nothing else could tell you that. */
+  statuslineVersion?: number | null;
+  /** True when these numbers came from CODEX's own reporting rather than Claude Code's statusline.
+   *  Said out loud because the two clients measure different accounts, and a reader with both wants
+   *  to know whose quota the bar is drawing. */
+  usageFrom?: 'claude' | 'codex';
+  /** Credit left on a codex account that reports one, and whether the plan is uncapped. `unlimited`
+   *  is a different fact from a zero balance and never renders as `$0`. */
+  creditBalance?: number | null;
+  creditsUnlimited?: boolean;
+  /** A configured spend cap and how much of it has gone, where the account reports one (codex's
+   *  `spend_control_reached`). Reported beside the rate windows, so it is its own fact. */
+  spendLimit?: number | null;
+  spendUsed?: number | null;
+  /** Dollars spent, as CLAUDE CODE ITSELF reports them (`cost.total_cost_usd` on the statusline
+   *  payload — its own client-side estimate, which it says may differ from the bill). We do not
+   *  price tokens ourselves: a second estimate from a table we maintain would disagree with the
+   *  number the reader already sees in their own client, and one of them would be wrong.
+   *
+   *  `session` is this session's spend; `five`/`week` sum the per-session figures the statusline
+   *  has recorded inside each window. Null when nothing has reported a cost yet. */
+  cost: { session: number | null; five: number | null; week: number | null } | null;
+  /** Window spend and projected $ budgets from the statusline cache (2026-09-03): spend is a
+   *  DELTA of cumulative ledger snapshots (a long session's total no longer lands in one window)
+   *  and already account-wide; totals calibrate like the token budgets. Unlike `cost` above these
+   *  are safe beside a quota bar, and every $ on any surface is an estimate, labeled so. */
+  fiveCost: number | null;
+  weekCost: number | null;
+  fiveCostTotal: number | null;
+  weekCostTotal: number | null;
+  /** 30-day spend and its projected budget (four weekly cycles) — the one $ pair every
+   *  surface shows; for enterprise the total is absent (no quota to project from). */
+  monthCost: number | null;
+  monthCostTotal: number | null;
+  /** ~30-day token pair: account-wide used and the projected budget (four weekly cycles). */
+  monthTokens: number | null;
+  monthTokensTotal: number | null;
+  /** End of the current bill cycle, epoch MILLISECONDS (null: rolling window). */
+  monthReset: number | null;
+  /** Cache READS inside the cycle (charged at a tenth of input; kept beside the quota unit,
+   *  never inside it — the maxed-week ceilings validated the unit as Claude counts it). */
+  monthReads: number | null;
+  fiveReads: number | null;
+  weekReads: number | null;
+  /** The live plan-limit promotion the statusline knows about: label + date span, e.g.
+   *  {label:"+50%", dates:"5/13-9/13"}. The budgets shown already INCLUDE its extra tokens. */
+  promo: { label: string; dates: string } | null;
 }
 
 /** Statusline cache older than this ⇒ the UI should surface its age and the terminal remedy. */
@@ -1438,6 +2137,31 @@ export const USAGE_STALE_MS = 5 * 60 * 1000;
 const USAGE_TAIL_BYTES = 2 * 1024 * 1024;
 
 /** Claude Code sends `resets_at` as either epoch seconds (a number) or an ISO string → epoch ms. */
+/** Claude Code 2.1.263 stopped sending resets_at (the percentages still arrive), so a cached or
+ *  remote reset anchor can be PAST — roll it forward by whole periods at read time, like the
+ *  statusline script does: exact for the periodic weekly window, the client's own one-period
+ *  estimate for 5h. Writers keep the original anchor, so the estimate never compounds. */
+function rollFwd(ms: number | null, periodMs: number): number | null {
+  if (ms === null) return null;
+  const now = Date.now();
+  if (ms > now) return ms;
+  return ms + (Math.floor((now - ms) / periodMs) + 1) * periodMs;
+}
+
+/** Roll a MONTHLY anchor (a bill-cycle boundary) forward to its next future occurrence — by whole
+ *  CALENDAR months, so a "resets on the 14th" cycle lands on the 14th rather than drifting by a fixed
+ *  30-day period. The month reset is the only usage window not covered by the fixed-period `rollFwd`
+ *  (the period is not constant), and before this it was left un-rolled: a stale cache kept a past
+ *  anchor, which the editors' `resets in` math renders as "now" instead of the next boundary. */
+function rollFwdMonth(ms: number | null): number | null {
+  if (ms === null) return null;
+  const now = Date.now();
+  if (ms > now) return ms;
+  const d = new Date(ms);
+  for (let guard = 0; d.getTime() <= now && guard < 1200; guard++) d.setUTCMonth(d.getUTCMonth() + 1);
+  return d.getTime();
+}
+
 function toEpochMs(v: unknown): number | null {
   if (typeof v === 'number' && isFinite(v)) return v > 1e12 ? v : v * 1000; // >1e12 already ms
   if (typeof v === 'string') {
@@ -1457,17 +2181,85 @@ export function usageLine(cwd: string, sessionId: string): UsageLine {
     weekPct: null,
     fiveReset: null,
     weekReset: null,
+    fablePct: null,
+    fableReset: null,
+    fableLabel: null,
+    fableTokens: null,
+    fableTotal: null,
+    fableReads: null,
     fiveTokens: null,
     weekTokens: null,
     statuslineCache: false,
     cachedAtMs: null,
     rollingLimits: null,
     localWindows: null,
+    cost: null,
+    fiveCost: null,
+    weekCost: null,
+    fiveCostTotal: null,
+    weekCostTotal: null,
+    monthCost: null,
+    monthCostTotal: null,
+    monthTokens: null,
+    monthTokensTotal: null,
+    monthReset: null,
+    monthReads: null,
+    fiveReads: null,
+    weekReads: null,
+    promo: null,
+    branch: null,
+    thinking: null,
+    outputStyle: null,
+    tokensIn: null,
+    tokensOut: null,
+    tokensCacheRead: null,
+    fiveTotal: null,
+    weekTotal: null,
+    fiveMeasuredAll: null,
+    weekMeasuredAll: null,
+    usageScope: 'here',
   };
+  // Choose the runtime before loading any account cache; fallback after filling Claude fields
+  // cannot undo cross-provider contamination. Tokens and context use this session's exact source.
+  const cx = require('./codex') as typeof import('./codex');
+  const rawCodex = cx.findCodexRollout(sessionId);
+  const isCodex = !!rawCodex || !!cx.readCodexAgentMeta(sessionId);
+  if (isCodex) {
+    out.usageFrom = 'codex';
+    if (!rawCodex) return out;
+    const cu = cx.codexUsageLive(rawCodex);
+    out.cachedAtMs = cu.snapshotMs;
+    out.fiveHourPct = cu.fivePct; out.weekPct = cu.weekPct;
+    out.fiveReset = cu.fiveReset; out.weekReset = cu.weekReset;
+    out.rollingLimits = cu.fivePct !== null || cu.weekPct !== null;
+    out.creditBalance = cu.creditBalance; out.creditsUnlimited = cu.creditsUnlimited;
+    out.spendLimit = cu.spendLimit;
+    out.spendUsed = cu.spendLimit !== null && cu.spendRemainingPct !== null ? cu.spendLimit * (1-cu.spendRemainingPct/100) : null;
+    if (cu.ctxTokens !== null && cu.ctxSize) out.ctx = { tokens: cu.ctxTokens, size: cu.ctxSize, pct: Math.min(100,100*cu.ctxTokens/cu.ctxSize) };
+    if (cu.tokens) { out.tokensIn = cu.tokens.input; out.tokensOut = cu.tokens.output; out.tokensCacheRead = cu.tokens.cacheRead; }
+    const g = cx.gptUsagePanel(sessionId);
+    if (g) {
+      out.weekTokens = g.weekTok;
+      out.monthTokens = g.monthTok; out.monthReads = g.monthReads;
+      out.monthCost = g.monthCost; out.monthReset = g.monthReset;
+      const provider = (require('./codex-events') as typeof import('./codex-events')).codexUsageState(rawCodex)?.provider;
+      if (!provider || provider === 'openai') {
+        out.fiveHourPct = g.fivePct; out.fiveReset = g.fiveReset;
+        out.weekPct = g.weekPct; out.weekReset = g.weekReset;
+        out.rollingLimits = g.fivePct !== null || g.weekPct !== null;
+      }
+    }
+    return out;
+  }
   const fin = (v: unknown): v is number => typeof v === 'number' && isFinite(v); // reject NaN from a corrupt cache
   const cachePath = path.join(claudeConfigDir(), 'statusline-last.json');
+  // When each share was measured (epoch seconds): the status line and the account pull stamp five_at,
+  // week_at and fable_at when a fresh share arrives. A cache written before fable_at existed dates its
+  // Fable share by its last pull, which is never earlier than the share.
+  let measuredAt: { five?: number; week?: number; fable?: number } = {};
   try {
     const last = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
+    measuredAt = { five: fin(last.five_at) ? last.five_at : undefined, week: fin(last.week_at) ? last.week_at : undefined, fable: fin(last.fable_at) ? last.fable_at : fin(last.api_ts) ? last.api_ts : undefined };
     out.statuslineCache = true; // the cache exists and parsed — statusline is installed & writing
     out.cachedAtMs = fs.statSync(cachePath).mtimeMs;
     if (fin(last.ctx_pct)) {
@@ -1481,8 +2273,58 @@ export function usageLine(cwd: string, sessionId: string): UsageLine {
     }
     if (fin(last.five_pct)) out.fiveHourPct = Math.min(100, last.five_pct);
     if (fin(last.week_pct)) out.weekPct = Math.min(100, last.week_pct);
+    // Raw anchors are rolled forward once below.
     out.fiveReset = toEpochMs(last.five_reset);
     out.weekReset = toEpochMs(last.week_reset);
+    if (fin(last.fable_pct) || last.fable_pct === 0) out.fablePct = Math.min(100, Number(last.fable_pct));
+    out.fableReset = toEpochMs(last.fable_reset);
+    if (typeof last.fable_label === 'string' && last.fable_label) out.fableLabel = last.fable_label;
+    if (fin(last.fable_tok)) out.fableTokens = last.fable_tok;
+    if (fin(last.fable_tok_total)) out.fableTotal = last.fable_tok_total;
+    if (fin(last.fable_reads)) out.fableReads = last.fable_reads;
+    // The rest of the shipped statusline's inputs (0.10.0). Each is guarded on its own: a cache
+    // written by an older statusline simply lacks the key, and its segment renders as the
+    // statusline's own placeholder rather than as a zero pretending to be a measurement.
+    // Which schema wrote this cache. Absent = an older statusline is installed and never wrote the
+    // fields below it; the surfaces say so rather than drawing blanks.
+    out.statuslineVersion = typeof last.v === 'number' ? last.v : null;
+    if (typeof last.branch === 'string' && last.branch) out.branch = last.branch;
+    if (typeof last.thinking === 'boolean') out.thinking = last.thinking;
+    if (typeof last.output_style === 'string' && last.output_style) out.outputStyle = last.output_style;
+    if (fin(last.tok_in) && last.tok_in > 0) out.tokensIn = last.tok_in;
+    if (fin(last.tok_out) && last.tok_out > 0) out.tokensOut = last.tok_out;
+    if (fin(last.tok_cache) && last.tok_cache > 0) out.tokensCacheRead = last.tok_cache;
+    if (fin(last.five_total) && last.five_total > 0) out.fiveTotal = last.five_total;
+
+    // but only from a v3 statusline, and only when the reading was taken INSIDE the current
+    // window. Older statuslines counted every transcript line of every synced-in transcript
+    // (2.5-3x high, measured, and double-counting the moment machines are added up), and a
+    // measurement from before the window opened counts tokens that have already rolled out.
+    const measV3 = typeof last.v === 'number' && last.v >= 3;
+    const takenInside = (resetMs: number | null, windowMs: number): boolean =>
+      out.cachedAtMs !== null &&
+      out.cachedAtMs >= (resetMs !== null ? rollFwd(resetMs, windowMs)! - windowMs : Date.now() - windowMs);
+    if (fin(last.five_cost) && last.five_cost > 0) out.fiveCost = last.five_cost;
+    if (fin(last.week_cost) && last.week_cost > 0) out.weekCost = last.week_cost;
+    if (fin(last.five_cost_total) && last.five_cost_total > 0) out.fiveCostTotal = last.five_cost_total;
+    if (fin(last.week_cost_total) && last.week_cost_total > 0) out.weekCostTotal = last.week_cost_total;
+    if (fin(last.month_cost) && last.month_cost > 0) out.monthCost = last.month_cost;
+    if (fin(last.month_cost_total) && last.month_cost_total > 0) out.monthCostTotal = last.month_cost_total;
+    if (fin(last.month_tok) && last.month_tok > 0) out.monthTokens = last.month_tok;
+    if (fin(last.month_tok_total) && last.month_tok_total > 0) out.monthTokensTotal = last.month_tok_total;
+    if (fin(last.month_reset) && last.month_reset > 0) out.monthReset = toEpochMs(last.month_reset);
+    if (fin(last.month_reads) && last.month_reads > 0) out.monthReads = last.month_reads;
+    if (fin(last.five_reads) && last.five_reads > 0) out.fiveReads = last.five_reads;
+    if (fin(last.week_reads) && last.week_reads > 0) out.weekReads = last.week_reads;
+    if (typeof last.promo === 'string' && last.promo) {
+      const [plabel, ...prest] = String(last.promo).split(':');
+      if (plabel) out.promo = { label: plabel, dates: prest.join(' ') };
+    }
+    if (measV3 && fin(last.five_meas) && last.five_meas > 0 && takenInside(out.fiveReset, 5 * 3600_000))
+      out.fiveMeasuredAll = last.five_meas;
+    if (measV3 && fin(last.week_meas) && last.week_meas > 0 && takenInside(out.weekReset, 7 * 86400_000))
+      out.weekMeasuredAll = last.week_meas;
+    if (fin(last.week_total) && last.week_total > 0) out.weekTotal = last.week_total;
     if (fin(last.five_tok) && last.five_tok > 0) out.fiveTokens = last.five_tok;
     if (fin(last.week_tok) && last.week_tok > 0) out.weekTokens = last.week_tok;
     // The status line has written a reading. If it carried no rolling percentages, this plan does not
@@ -1495,10 +2337,36 @@ export function usageLine(cwd: string, sessionId: string): UsageLine {
     // on the reset clocks it draws — so taking its numbers is what keeps this panel and that line from
     // reporting two different totals for one account, which is the whole point of reading its cache.
     if (out.rollingLimits === false) {
+      // v3-only, like the aggregate above: an older statusline's totals are the 2.5-3x figures,
+      // and leaving them out here lets the deduped computeStats fallback below answer instead.
       const w: { label: string; tokens: number }[] = [];
-      if (fin(last.five_meas) && last.five_meas > 0) w.push({ label: '5h', tokens: last.five_meas });
-      if (fin(last.week_meas) && last.week_meas > 0) w.push({ label: 'wk', tokens: last.week_meas }); // "wk", as the status line itself prints it
+      if (measV3 && fin(last.five_meas) && last.five_meas > 0) w.push({ label: '5h', tokens: last.five_meas });
+      if (measV3 && fin(last.week_meas) && last.week_meas > 0) w.push({ label: 'wk', tokens: last.week_meas }); // "wk", as the status line itself prints it
       if (w.length) out.localWindows = w;
+      // SPEND, as the client that computes it reported it. `cost.total_cost_usd` is Claude Code's
+      // own per-session estimate; the statusline records each session's latest figure with the
+      // moment it arrived, so a window total is a sum of REPORTED numbers rather than a second
+      // estimate of our own that would disagree with the one the reader already sees.
+      const sess = fin(last.cost_usd) && last.cost_usd > 0 ? last.cost_usd : null;
+      const ledger = last.costs && typeof last.costs === 'object' ? (last.costs as Record<string, { usd?: unknown; at?: unknown }>) : null;
+      if (sess !== null || ledger) {
+        const nowS = Date.now() / 1000;
+        const sum = (sinceS: number): number | null => {
+          if (!ledger) return null;
+          let t = 0;
+          let any = false;
+          for (const e of Object.values(ledger)) {
+            const at = Number(e?.at) || 0;
+            const usd = Number(e?.usd) || 0;
+            if (at >= sinceS && usd > 0) {
+              t += usd;
+              any = true;
+            }
+          }
+          return any ? t : null;
+        };
+        out.cost = { session: sess, five: sum(nowS - 5 * 3600), week: sum(nowS - 7 * 86400) };
+      }
     }
   } catch {
     /* no statusline cache yet (or corrupt JSON) — fall back to a transcript estimate below */
@@ -1512,11 +2380,12 @@ export function usageLine(cwd: string, sessionId: string): UsageLine {
   // something true rather than nothing. ~51ms cold / ~7ms warm over this machine's transcripts.
   if (out.rollingLimits === false && out.localWindows === null) {
     try {
-      const w = require('./stats').computeStats() as import('./stats').StatsResult;
+      const w = require('./stats').computeStats(undefined, undefined, /* claudeOnly */ true) as import('./stats').StatsResult;
       out.localWindows = [
         { label: '24h', tokens: w.windows.day.tokens },
         { label: 'wk', tokens: w.windows.week.tokens },
       ];
+
     } catch {
       /* a stats scan that fails is not a reason to lose the rest of the usage line */
     }
@@ -1577,5 +2446,62 @@ export function usageLine(cwd: string, sessionId: string): UsageLine {
       }
     }
   }
+  out.fiveReset = rollFwd(out.fiveReset, 5 * 3600_000);
+  out.weekReset = rollFwd(out.weekReset, 7 * 86400_000);
+  out.fableReset = rollFwd(out.fableReset, 7 * 86400_000);
+  out.monthReset = rollFwdMonth(out.monthReset);
+  // A share measured before its window began is the last window's: after a reset, until a session or the
+  // account pull brings a fresh one, the window has no share rather than last week's (a cache kept the old
+  // week's share for hours after the reset). Its token estimate restates the share, so it goes too. A cache
+  // without the stamp (an older status line) keeps its share.
+  const before = (at: number | undefined, reset: number | null, periodMs: number): boolean =>
+    at !== undefined && reset !== null && at * 1000 < reset - periodMs;
+  if (before(measuredAt.five, out.fiveReset, 5 * 3600_000)) { out.fiveHourPct = null; out.fiveTokens = null; }
+  if (before(measuredAt.week, out.weekReset, 7 * 86400_000)) { out.weekPct = null; out.weekTokens = null; }
+  if (before(measuredAt.fable, out.fableReset, 7 * 86400_000)) { out.fablePct = null; out.fableTokens = null; }
   return out;
+}
+
+/** One usage window for the compact per-provider readout: a share (null when not measured), its reset
+ *  instant, and — for a token-only window like gpt's month — a raw token count instead of a share. */
+export interface BriefWindow {
+  pct: number | null;
+  resetMs: number | null;
+  tok?: number | null;
+}
+export interface UsageBrief {
+  claude: { five: BriefWindow; week: BriefWindow; month: BriefWindow };
+  /** Absent when this machine has no codex/gpt usage at all. */
+  gpt: { five: BriefWindow; week: BriefWindow; month: BriefWindow } | null;
+}
+
+/** BOTH providers' 5h / week / month windows at once, for the terminal app's status readout (which
+ *  shows claude and gpt side by side, unlike `usageLine`, which reports only the active session's
+ *  provider). Claude comes from the account/statusline path (`usageLine` with no session takes it,
+ *  since provider detection is per-session), gpt from `gptUsagePanel`. Neither provider exposes a
+ *  monthly QUOTA percentage, so BOTH months are a synthesized share (tokens / a projected budget):
+ *  claude's from the statusline's bill-cycle estimate, gpt's from `gptUsagePanel` back-deriving the
+ *  same way (weekly fill → monthly budget). `month.tok` still carries the raw count for the label. */
+export function usageBrief(cwd: string): UsageBrief {
+  const u = usageLine(cwd, '');
+  const claudeMonthPct = u.monthTokens != null && u.monthTokensTotal != null && u.monthTokensTotal > 0
+    ? Math.min(100, (u.monthTokens / u.monthTokensTotal) * 100) : null;
+  const g = (require('./codex') as typeof import('./codex')).gptUsagePanel();
+  // gpt's month % is estimated the SAME way as claude's — tokens over a projected budget
+  // (gptUsagePanel back-derives monthTokTotal from the weekly fill, mirroring the statusline). This
+  // line is claude's, with the gpt fields: when the budget is known, the month reads as a percentage.
+  const gptMonthPct = g && g.monthTok != null && g.monthTokTotal != null && g.monthTokTotal > 0
+    ? Math.min(100, (g.monthTok / g.monthTokTotal) * 100) : null;
+  return {
+    claude: {
+      five: { pct: u.fiveHourPct, resetMs: u.fiveReset },
+      week: { pct: u.weekPct, resetMs: u.weekReset },
+      month: { pct: claudeMonthPct, resetMs: u.monthReset ?? null, tok: u.monthTokens ?? null },
+    },
+    gpt: g ? {
+      five: { pct: g.fivePct, resetMs: g.fiveReset },
+      week: { pct: g.weekPct, resetMs: g.weekReset },
+      month: { pct: gptMonthPct, resetMs: g.monthReset ?? null, tok: g.monthTok },
+    } : null,
+  };
 }

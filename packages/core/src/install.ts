@@ -1,11 +1,12 @@
 /**
  * Installer: careful merge of the PreToolUse/PostToolUse capture hooks into ~/.claude/settings.json.
- * Shared by the CLI (`claude-observatory init`) and the VS Code extension so there is one source of truth.
+ * Shared by the CLI (`oak init`) and the VS Code extension so there is one source of truth.
  * Adds only the `hooks` entries; never disturbs existing permissions/statusLine/etc.
  */
 import * as fs from 'fs';
 import * as path from 'path';
 import { claudeConfigDir } from './paths';
+import { rootDir } from './store';
 
 export const MATCHER = 'Edit|Write|MultiEdit|NotebookEdit|Bash';
 
@@ -13,7 +14,12 @@ export const MATCHER = 'Edit|Write|MultiEdit|NotebookEdit|Bash';
 const LEGACY_MATCHERS = ['Edit|Write|MultiEdit|NotebookEdit'];
 
 /** Stable, path-independent marker appended (as a shell comment) to our hook command. */
-export const HOOK_MARKER = 'claude-observatory-hook';
+export const HOOK_MARKER = 'oak-observatory-hook';
+
+/** Markers shipped before the OAK rename (the product was `claude-observatory`). Still recognized so
+ *  re-running `init` MIGRATES an old install's hook in place — addTo replaces it with the current
+ *  canonical command — and so an old hook is still counted as installed until then. */
+const LEGACY_HOOK_MARKERS = ['claude-observatory-hook'];
 
 interface HookCmd {
   type: string;
@@ -39,7 +45,8 @@ export function projectSettingsPath(cwd: string): string {
  */
 export function isOurCommand(cmd: string): boolean {
   if (cmd.includes(HOOK_MARKER)) return true;
-  return /(claude[-_](observatory|changes)|claude_review)/.test(cmd) && /capture(\.js)?["']?\s*$/.test(cmd.trim());
+  if (LEGACY_HOOK_MARKERS.some((m) => cmd.includes(m))) return true;
+  return /(\boak\b|claude[-_](observatory|changes)|claude_review)/.test(cmd) && /capture(\.js)?["']?\s*$/.test(cmd.trim());
 }
 
 function readSettings(file: string): { path: string; exists: boolean; data: any } {
@@ -106,19 +113,59 @@ export function installedHookCommand(file: string = settingsPath()): string | nu
   return null;
 }
 
+/**
+ * Upsert OUR hook entry for one event: exactly one canonical entry survives, in the MATCHER group.
+ *
+ * This used to dedupe on EXACT command equality only, so any variant rendering of our command — a
+ * dist path that moved, the marker arriving in a later version, a legacy shape — appended a second
+ * entry beside the first. Both fired on every tool call (double snapshot, double tree-walk), and an
+ * uninstall that recognized only one shape left the other behind. Replacing every entry
+ * `isOurCommand` recognizes with the one canonical command makes a version upgrade a REPLACEMENT,
+ * never a double — and makes re-running `init` the repair for installs the old behavior doubled.
+ */
 function addTo(events: Record<string, HookGroup[]>, event: string, command: string): boolean {
+  const matcher = matcherFor(event);
   const list = (events[event] = events[event] || []);
+  // Census first: how many entries of ours exist, and is the canonical one already in place?
+  let ours = 0;
+  let canonical = false;
   for (const g of list) {
-    if ((g.hooks || []).some((h) => h.command === command)) return false; // dedupe
+    for (const h of Array.isArray(g.hooks) ? g.hooks : []) {
+      if (!isOurCommand(h.command)) continue;
+      ours++;
+      if (h.command === command && g.matcher === matcher) canonical = true;
+    }
   }
-  const group = list.find((g) => g.matcher === MATCHER);
-  if (group) {
-    group.hooks = group.hooks || [];
-    group.hooks.push({ type: 'command', command });
-  } else {
-    list.push({ matcher: MATCHER, hooks: [{ type: 'command', command }] });
+  if (ours === 1 && canonical) return false; // exactly right already — a no-op re-init
+  // Remove every entry of ours, of any vintage, pruning only the groups OUR removal emptied — a
+  // user's own empty group, however odd, is not ours to tidy.
+  for (let i = list.length - 1; i >= 0; i--) {
+    const g = list[i];
+    const hooks = Array.isArray(g.hooks) ? g.hooks : [];
+    if (!hooks.some((h) => isOurCommand(h.command))) continue;
+    g.hooks = hooks.filter((h) => !isOurCommand(h.command));
+    if (g.hooks.length === 0) list.splice(i, 1);
   }
+  // Always OUR OWN group. The upsert used to append into any group carrying our matcher, which
+  // was safe while that matcher was a tool list nobody else writes; with `*` on the attention
+  // events it would land our entry inside a foreign managed group (Orca, herdr and Superset all
+  // install `*` groups) — mutating a group that is not ours to touch. Every entry of ours is gone
+  // by this point, so a fresh group is always the right home.
+  list.push({ matcher, hooks: [{ type: 'command', command }] });
   return true;
+}
+
+/**
+ * The matcher OUR group carries for one event. Claude Code matches it against a different field
+ * per event (tool name for Pre/PostToolUse, PostToolUseFailure and PermissionRequest, the notification TYPE for
+ * Notification, nothing for Stop and UserPromptSubmit), so one string cannot serve them all:
+ * the tool list on a Notification group is compared to `permission_prompt` and never matches —
+ * which is exactly what the 2026-09-02 attention install did, so claude's permission and input
+ * hands never fired live (Stop, which ignores matchers, did). Capture stays scoped to the edit
+ * tools + Bash; everything else is match-all — a permission wait on ANY tool is a raised hand.
+ */
+export function matcherFor(event: string): string {
+  return event === 'PreToolUse' || event === 'PostToolUse' || event === 'PostToolUseFailure' ? MATCHER : '*';
 }
 
 /** Upgrade a pre-existing hook group (our command, an older matcher) to the current MATCHER, so
@@ -147,6 +194,70 @@ export interface InstallResult {
   changed: boolean;
   settingsPath: string;
   backupPath?: string;
+  /** Set when the settings write succeeded but the install ledger could not be updated — the
+   *  install is real, the RECORD of it is not, and the caller must say so. */
+  ledgerError?: string;
+}
+
+// --- the install ledger --------------------------------------------------------------------------
+//
+// Every settings file this installer writes is recorded here, store-side — NEVER in the settings
+// file itself (that would be us decorating a file users hand-edit and commit). Before the ledger,
+// no record existed of which files we had written: `uninstall` defaulted to the user scope while
+// project-scoped installs (committed into repos) were never enumerated, so they had to be hunted
+// by hand. A FILE at the store root is safe from `clean`: allStoreSessionIds keeps only
+// DIRECTORIES that parse as session ids, and a file is neither.
+
+/** One settings file this installer has written. */
+export interface LedgerEntry {
+  path: string;
+  scope: 'user' | 'project';
+  /** ms epoch of the last install into this file. */
+  ts: number;
+}
+
+export function ledgerPath(): string {
+  return path.join(rootDir(), 'install-ledger.json');
+}
+
+/** Every settings file the ledger knows about. Missing/corrupt ledger reads as empty — the marker
+ *  scan of the user scope is the pre-ledger fallback, so an empty ledger degrades, never lies. */
+export function readLedger(): LedgerEntry[] {
+  try {
+    const v = JSON.parse(fs.readFileSync(ledgerPath(), 'utf8'));
+    if (!Array.isArray(v?.files)) return [];
+    return v.files.filter(
+      (e: unknown): e is LedgerEntry =>
+        typeof (e as LedgerEntry)?.path === 'string' && ((e as LedgerEntry).scope === 'user' || (e as LedgerEntry).scope === 'project')
+    );
+  } catch {
+    return [];
+  }
+}
+
+function writeLedger(files: LedgerEntry[]): void {
+  fs.mkdirSync(rootDir(), { recursive: true });
+  const tmp = `${ledgerPath()}.tmp-${process.pid}`;
+  fs.writeFileSync(tmp, JSON.stringify({ files }, null, 2) + '\n');
+  fs.renameSync(tmp, ledgerPath()); // atomic, like every store write
+}
+
+function recordInstall(file: string, scope: 'user' | 'project'): void {
+  const files = readLedger().filter((e) => e.path !== file);
+  files.push({ path: file, scope, ts: Date.now() });
+  writeLedger(files);
+}
+
+function forgetInstall(file: string): void {
+  const files = readLedger();
+  const kept = files.filter((e) => e.path !== file);
+  if (kept.length !== files.length) writeLedger(kept);
+}
+
+/** The scope a settings path implies. Everything that is not THE user settings file is a project
+ *  file — the two are the only shapes the installer writes. */
+function scopeOf(file: string): 'user' | 'project' {
+  return path.resolve(file) === path.resolve(settingsPath()) ? 'user' : 'project';
 }
 
 /** Install both hook entries. `command` is the exact shell command Claude Code will run. */
@@ -155,9 +266,14 @@ export function installHooks(command: string, file: string = settingsPath()): In
   if (!exists) fs.mkdirSync(path.dirname(p), { recursive: true });
   const hooks = (data.hooks = data.hooks || {});
   const migrated = migrateMatchers(hooks);
-  const a = addTo(hooks, 'PreToolUse', command);
-  const b = addTo(hooks, 'PostToolUse', command);
-  const changed = migrated || a || b;
+  // One entry per event in CAPTURE_HOOK_EVENTS — capture (Pre/Post/PostToolUseFailure), attention (Notification/Stop,
+  // 2026-09-02) and the structured pair (PermissionRequest/UserPromptSubmit, 2026-09-15). Same
+  // command, same marker, same merge — a user's own hooks on any of these events (sync scripts and
+  // the like) are left beside, never disturbed. Driven by the constant so the installer and the
+  // health count cannot drift apart.
+  let added = false;
+  for (const event of CAPTURE_HOOK_EVENTS) if (addTo(hooks, event, command)) added = true;
+  const changed = migrated || added;
   let backupPath: string | undefined;
   if (changed) {
     // Back up the ORIGINAL file (only when we're actually going to modify it — a no-op re-init
@@ -168,13 +284,30 @@ export function installHooks(command: string, file: string = settingsPath()): In
     }
     writeSettingsFile(p, data);
   }
-  return { changed, settingsPath: p, backupPath };
+  // Recorded on EVERY install call, changed or not: an unchanged re-init over a pre-ledger install
+  // is exactly the moment the ledger learns about it. A ledger failure must not fail an install
+  // that already happened — it is reported instead, and the marker scan remains the fallback.
+  let ledgerError: string | undefined;
+  try {
+    recordInstall(p, scopeOf(p));
+  } catch (e) {
+    ledgerError = String((e as Error)?.message || e);
+  }
+  return { changed, settingsPath: p, backupPath, ledgerError };
 }
 
 /** Remove any of our capture hooks. */
 export function uninstallHooks(file: string = settingsPath()): InstallResult {
   const { path: p, exists, data } = readSettingsForWrite(file);
-  if (!exists || !data.hooks) return { changed: false, settingsPath: p };
+  if (!exists || !data.hooks) {
+    // Nothing installed here — and the ledger should not claim otherwise.
+    try {
+      forgetInstall(p);
+    } catch {
+      /* a stale ledger row is harmless; uninstallEverywhere reports per-file state anyway */
+    }
+    return { changed: false, settingsPath: p };
+  }
   const hooks = data.hooks as Record<string, HookGroup[]>;
   let changed = false;
   for (const event of Object.keys(hooks)) {
@@ -192,7 +325,179 @@ export function uninstallHooks(file: string = settingsPath()): InstallResult {
     fs.writeFileSync(p + '.bak', fs.readFileSync(p));
     writeSettingsFile(p, data);
   }
-  return { changed, settingsPath: p };
+  let ledgerError: string | undefined;
+  try {
+    forgetInstall(p);
+  } catch (e) {
+    ledgerError = String((e as Error)?.message || e);
+  }
+  return { changed, settingsPath: p, ledgerError };
+}
+
+// --- multi-file operations: status, uninstall-everywhere, repair ---------------------------------
+
+/** The union of every location the ledger records and the user settings file — the user scope is
+ *  always probed because pre-ledger installs exist and the marker scan still finds them there. */
+function knownSettingsFiles(): { path: string; scope: 'user' | 'project' }[] {
+  const out = new Map<string, 'user' | 'project'>();
+  out.set(path.resolve(settingsPath()), 'user');
+  for (const e of readLedger()) {
+    const key = path.resolve(e.path);
+    if (!out.has(key)) out.set(key, e.scope);
+  }
+  return [...out].map(([p, scope]) => ({ path: p, scope }));
+}
+
+/**
+ * Hook commands in a settings file that are NOT ours — other tools' managed entries. Orca, herdr
+ * and Superset all install PostToolUse hooks (typically matcher `*`) into the same contested file;
+ * this names them so `status` can show what else lives there. VISIBILITY ONLY: nothing in this
+ * installer ever modifies, moves or removes a foreign entry — the upsert and the uninstall both
+ * filter strictly on `isOurCommand`.
+ */
+export function foreignHooks(file: string = settingsPath()): string[] {
+  let data: unknown;
+  try {
+    data = readSettings(file).data;
+  } catch {
+    return [];
+  }
+  const hooks = (data as { hooks?: Record<string, unknown> })?.hooks ?? {};
+  const out = new Set<string>();
+  for (const event of Object.keys(hooks)) {
+    for (const g of hookGroups(data, event)) {
+      for (const h of Array.isArray(g.hooks) ? g.hooks : []) {
+        if (typeof h?.command === 'string' && h.command && !isOurCommand(h.command)) out.add(h.command);
+      }
+    }
+  }
+  return [...out];
+}
+
+/** One settings file's install state, as `install --status` prints it. */
+export interface InstallStatusRow {
+  path: string;
+  scope: 'user' | 'project';
+  /** The settings file exists on disk. */
+  exists: boolean;
+  /** Our hook is present (PreToolUse probe, same as hooksInstalled). */
+  installed: boolean;
+  /** The installed command, when present. */
+  command: string | null;
+  /** How many entries of ours exist across CAPTURE_HOOK_EVENTS. Healthy is exactly
+   *  HEALTHY_HOOK_ENTRIES — one per event; more is the doubled-hook defect the upsert repairs,
+   *  fewer a partial install the repair completes. */
+  entries: number;
+  /** Other tools' hook commands in the same file — reported, never touched. */
+  foreign: string[];
+}
+
+/** The hook events the installer writes one of our entries into (capture: Pre/Post, plus
+ *  PostToolUseFailure, which Claude Code fires INSTEAD of PostToolUse when a tool fails — a Bash
+ *  command that exits non-zero — so without it that command's snapshot was never claimed and its
+ *  changes never recorded, 2026-09-26; attention: Notification/Stop, 2026-09-02; structured
+ *  attention: PermissionRequest names the TOOL a permission prompt waits on and UserPromptSubmit
+ *  marks the turn's start, 2026-09-15 — the pair codex has had since its hooks landed). A healthy
+ *  install has exactly one of our command per event, so `installStatus().entries ===
+ *  HEALTHY_HOOK_ENTRIES`; more is the doubled-hook defect, fewer a partial install. Consumers (CLI
+ *  status/doctor) and the installer itself iterate this constant, never a literal, so adding an event
+ *  here cannot leave a stale count behind. */
+export const CAPTURE_HOOK_EVENTS = ['PreToolUse', 'PostToolUse', 'PostToolUseFailure', 'Notification', 'Stop', 'PermissionRequest', 'UserPromptSubmit', 'SessionEnd'] as const;
+export const HEALTHY_HOOK_ENTRIES = CAPTURE_HOOK_EVENTS.length;
+
+/** The events in CAPTURE_HOOK_EVENTS that carry no entry of ours: what an install written by an older
+ *  OAK lacks until `oak init` runs again. Capture keeps working meanwhile, so doctor names these
+ *  instead of calling the install broken. */
+export function missingHookEvents(file: string = settingsPath()): string[] {
+  let data: any;
+  try {
+    data = readSettings(file).data;
+  } catch {
+    return [];
+  }
+  return CAPTURE_HOOK_EVENTS.filter(
+    (event) => !hookGroups(data, event).some((g) => (Array.isArray(g.hooks) ? g.hooks : []).some((h) => isOurCommand(h.command)))
+  );
+}
+
+export function installStatus(): InstallStatusRow[] {
+  return knownSettingsFiles().map(({ path: p, scope }) => {
+    const exists = fs.existsSync(p);
+    let entries = 0;
+    if (exists) {
+      try {
+        const data = readSettings(p).data;
+        for (const event of CAPTURE_HOOK_EVENTS) {
+          for (const g of hookGroups(data, event)) {
+            entries += (Array.isArray(g.hooks) ? g.hooks : []).filter((h) => isOurCommand(h.command)).length;
+          }
+        }
+      } catch {
+        /* unreadable JSON: reported below as not-installed; repair/uninstall will surface the error */
+      }
+    }
+    return { path: p, scope, exists, installed: hooksInstalled(p), command: installedHookCommand(p), entries, foreign: foreignHooks(p) };
+  });
+}
+
+/** The per-file outcome of a multi-file operation. `error` carries a parse failure the caller must
+ *  show — a file we cannot read is a file we did NOT clean. */
+export interface MultiFileResult {
+  path: string;
+  scope: 'user' | 'project';
+  changed: boolean;
+  /** For repair: what happened, said in one word the CLI can print. */
+  action?: 'repaired' | 'installed' | 'ok' | 'skipped';
+  error?: string;
+}
+
+/**
+ * Remove our hooks from EVERY file the ledger records, plus the user scope (the pre-ledger
+ * fallback). Files that are gone are reported and forgotten, never re-created.
+ */
+export function uninstallEverywhere(): MultiFileResult[] {
+  return knownSettingsFiles().map(({ path: p, scope }) => {
+    try {
+      const r = uninstallHooks(p);
+      return { path: p, scope, changed: r.changed, error: r.ledgerError };
+    } catch (e) {
+      return { path: p, scope, changed: false, error: String((e as Error)?.message || e) };
+    }
+  });
+}
+
+/**
+ * The self-fix for older installs (the doubled-hook defect): re-run the upsert install over every
+ * known location. `installHooks` IS the repair now — one canonical entry per event survives — so
+ * this only adds enumeration and the rule that repair never resurrects: a ledger-recorded settings
+ * file that no longer exists is skipped and forgotten, not re-created in a repo that may be gone.
+ */
+export function repairInstall(command: string): MultiFileResult[] {
+  return knownSettingsFiles().map(({ path: p, scope }) => {
+    // The user-scope file may legitimately not exist yet (fresh machine): install it. A missing
+    // PROJECT file means the repo moved or removed it — leave it gone.
+    if (scope === 'project' && !fs.existsSync(p)) {
+      try {
+        forgetInstall(p);
+      } catch {
+        /* stale row; reported by --status if it persists */
+      }
+      return { path: p, scope, changed: false, action: 'skipped' as const, error: 'file no longer exists — removed from the ledger' };
+    }
+    try {
+      const existed = fs.existsSync(p) && hooksInstalled(p);
+      const r = installHooks(command, p);
+      return {
+        path: p,
+        scope,
+        changed: r.changed,
+        action: r.changed ? (existed ? ('repaired' as const) : ('installed' as const)) : ('ok' as const),
+        error: r.ledgerError,
+      };
+    } catch (e) {
+      return { path: p, scope, changed: false, error: String((e as Error)?.message || e) };
+    }
+  });
 }
 
 /**
@@ -238,7 +543,7 @@ export function referencesOurStatusline(
 /**
  * Revert the bundled status line — but ONLY if settings.json's `statusLine.command` still points at
  * OUR `<configDir>/statusline.sh` (never disturb a user's own custom statusLine). Also removes the
- * vendored script + its cache. Part of `uninstall --all`.
+ * vendored script, its cache and its tab-title record. Part of `uninstall --all`.
  */
 export function uninstallStatusline(file: string = settingsPath()): {
   changed: boolean;
@@ -285,6 +590,13 @@ export function uninstallStatusline(file: string = settingsPath()): {
     } catch {
       /* best-effort */
     }
+  }
+  // The script's record of the tab titles it started a sync for (a pane id and a session title each):
+  // conversation content, and as disposable as its cache.
+  try {
+    fs.rmSync(path.join(claudeConfigDir(), 'statusline-tab-titles'), { recursive: true, force: true });
+  } catch {
+    /* best-effort */
   }
   // Surfaced, never silent: the caller prints only when something happened, so a skipped removal has
   // to be its own signal.

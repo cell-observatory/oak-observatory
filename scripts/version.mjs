@@ -7,9 +7,9 @@
  *   node scripts/version.mjs --write    propagate the current root version to every package/plugin
  *
  * Keeps the four package.json versions and the JetBrains build.gradle.kts in lockstep, so
- * `claude-observatory --version`, the .vsix, and the plugin zip can never disagree again.
+ * `oak --version`, the .vsix, and the plugin zip can never disagree again.
  */
-import { readFileSync, writeFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
@@ -33,10 +33,10 @@ const pkgVersionRe = /("version":\s*")([^"]+)(")/;
 const gradleVersionRe = /^(version\s*=\s*")([^"]+)(")/m;
 const reFor = (rel) => (rel === GRADLE ? gradleVersionRe : pkgVersionRe);
 
-// @claude-observatory/core is repo-only (never published): cli + vscode pin it exactly, and if a pin
+// @oak-observatory/core is repo-only (never published): cli + vscode pin it exactly, and if a pin
 // drifts from the workspace version, `npm ci` falls back to the registry and 404s. Lockstep these too.
 const CORE_PIN_FILES = ['packages/cli/package.json', 'packages/tui/package.json', 'packages/vscode/package.json'];
-const corePinRe = /("@claude-observatory\/core":\s*")([^"]+)(")/;
+const corePinRe = /("@oak-observatory\/core":\s*")([^"]+)(")/;
 
 // The lockfile records the same versions again (`npm ci` in CI + release hard-fails if it disagrees
 // with package.json). A bump that skips it passes this drift check but reddens every CI run — so we
@@ -69,10 +69,25 @@ function setBadgeVersion(next) {
 // `<span data-co-version>vX.Y.Z</span>` markers stamped here — correct by construction, because the
 // site only deploys from main, whose committed version IS the current stable; the version:check gate
 // in CI keeps the markers from ever drifting.
-const SITE_FILES = ['docs/releases.html', 'docs/showcase.html', 'docs/getting-started.html', 'docs/concepts.html'];
+// The marker-bearing pages are DISCOVERED by scan, not listed: the docs are generated
+// (scripts/build-docs.mjs) and a hand-kept list went stale the moment two pages became redirect
+// stubs — version:check then threw on files that no longer carry a marker.
 // Attribute-tolerant: the markers carry classes (`brandver`) and ids (`rel-stable`) beside the
 // data attribute — a bare `<span data-co-version>` pattern silently stamped NOTHING once they did.
 const siteVersionRe = /(<span[^>]*\bdata-co-version\b[^>]*>v)([^<]+)(<\/span>)/g;
+
+function siteFiles() {
+  // String.match (not RegExp.test) — a /g regex's lastIndex persists across .test calls and
+  // alternates false negatives.
+  const files = readdirSync(join(root, 'docs'))
+    .filter((f) => f.endsWith('.html'))
+    .sort()
+    .map((f) => `docs/${f}`)
+    .filter((rel) => read(rel).match(siteVersionRe) !== null);
+  if (files.length === 0)
+    throw new Error('no docs/*.html carries a data-co-version marker — the site version scan found nothing to check or stamp');
+  return files;
+}
 
 function siteVersionsOf(rel) {
   const all = [...read(rel).matchAll(siteVersionRe)].map((m) => m[2]);
@@ -81,7 +96,31 @@ function siteVersionsOf(rel) {
 }
 
 function setSiteVersion(rel, next) {
-  writeFileSync(join(root, rel), read(rel).replace(siteVersionRe, (_all, a, _v, c) => `${a}${next}${c}`));
+  let stamped = 0;
+  const out = read(rel).replace(siteVersionRe, (_all, a, _v, c) => {
+    stamped++;
+    return `${a}${next}${c}`;
+  });
+  if (stamped === 0) throw new Error(`no data-co-version marker found in ${rel} — nothing was stamped`);
+  writeFileSync(join(root, rel), out);
+}
+
+// A release stamp (no prerelease suffix) turns the changelog's `[Unreleased]` notes into the version's
+// own section — the one release.yml publishes as the release notes — under a fresh, empty
+// `[Unreleased]`. Rolling dev stamps, an empty `[Unreleased]` (a hotfix writes its own section) and a
+// version that already has a section are left alone.
+const CHANGELOG = 'CHANGELOG.md';
+function stampChangelog(next) {
+  if (next.includes('-') || next.includes('+')) return false;
+  const text = read(CHANGELOG);
+  if (text.split('\n').some((line) => line.startsWith(`## [${next}]`))) return false;
+  const unreleased = /^## \[Unreleased\][^\n]*\n([\s\S]*?)(?=^## \[|(?![\s\S]))/m.exec(text);
+  if (!unreleased || !unreleased[1].replace(/<!--[\s\S]*?-->/g, '').trim()) return false;
+  // The maintainer's own date: UTC's is already tomorrow on a US evening.
+  const now = new Date();
+  const date = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+  writeFileSync(join(root, CHANGELOG), text.replace(/^## \[Unreleased\][^\n]*\n/m, `## [Unreleased]\n\n## [${next}] — ${date}\n`));
+  return true;
 }
 
 function versionOf(rel) {
@@ -97,7 +136,7 @@ function setVersion(rel, next) {
 
 function corePinOf(rel) {
   const m = read(rel).match(corePinRe);
-  if (!m) throw new Error(`no @claude-observatory/core pin found in ${rel}`);
+  if (!m) throw new Error(`no @oak-observatory/core pin found in ${rel}`);
   return m[2];
 }
 
@@ -116,8 +155,8 @@ function lockfileVersionFields(lock) {
     if (!p) continue;
     if (p.version !== undefined) out.push({ label: `${k}#version`, get: () => p.version, set: (v) => (p.version = v) });
     for (const dep of ['dependencies', 'devDependencies']) {
-      if (p[dep]?.['@claude-observatory/core'] !== undefined)
-        out.push({ label: `${k}#${dep}.core`, get: () => p[dep]['@claude-observatory/core'], set: (v) => (p[dep]['@claude-observatory/core'] = v) });
+      if (p[dep]?.['@oak-observatory/core'] !== undefined)
+        out.push({ label: `${k}#${dep}.core`, get: () => p[dep]['@oak-observatory/core'], set: (v) => (p[dep]['@oak-observatory/core'] = v) });
     }
   }
   return out;
@@ -149,12 +188,14 @@ if (arg && arg !== '--write' && arg !== 'check') {
     console.error(`bad version "${arg}" — expected semver like 0.4.0`);
     process.exit(1);
   }
+  const site = siteFiles();
   for (const t of targets) setVersion(t, arg);
   for (const t of CORE_PIN_FILES) setCorePin(t, arg);
   setLockfileVersions(arg);
   setBadgeVersion(arg);
-  for (const t of SITE_FILES) setSiteVersion(t, arg);
-  console.log(`✓ set version ${arg} across ${targets.length} files (+ ${CORE_PIN_FILES.length} core pins + ${LOCKFILE} + the README badge + ${SITE_FILES.length} site pages)`);
+  for (const t of site) setSiteVersion(t, arg);
+  const notes = stampChangelog(arg);
+  console.log(`✓ set version ${arg} across ${targets.length} files (+ ${CORE_PIN_FILES.length} core pins + ${LOCKFILE} + the README badge + ${site.length} site pages${notes ? ` + ${CHANGELOG}'s [Unreleased] → [${arg}]` : ''})`);
   process.exit(0);
 }
 
@@ -162,12 +203,13 @@ const rootVersion = versionOf('package.json');
 
 // `--write` — sync every package to the current root version.
 if (arg === '--write') {
+  const site = siteFiles();
   for (const t of targets) setVersion(t, rootVersion);
   for (const t of CORE_PIN_FILES) setCorePin(t, rootVersion);
   setLockfileVersions(rootVersion);
   setBadgeVersion(rootVersion);
-  for (const t of SITE_FILES) setSiteVersion(t, rootVersion);
-  console.log(`✓ propagated root version ${rootVersion} to ${targets.length} files (+ ${CORE_PIN_FILES.length} core pins + ${LOCKFILE} + the README badge + ${SITE_FILES.length} site pages)`);
+  for (const t of site) setSiteVersion(t, rootVersion);
+  console.log(`✓ propagated root version ${rootVersion} to ${targets.length} files (+ ${CORE_PIN_FILES.length} core pins + ${LOCKFILE} + the README badge + ${site.length} site pages)`);
   process.exit(0);
 }
 
@@ -189,7 +231,7 @@ if (checkLockfile(rootVersion)) drift = true;
   if (v !== rootVersion) drift = true;
   console.log(`${v === rootVersion ? '✓' : '✗'} ${README} (version badge): ${v}`);
 }
-for (const t of SITE_FILES) {
+for (const t of siteFiles()) {
   const bad = siteVersionsOf(t).filter((v) => v !== rootVersion);
   if (bad.length) drift = true;
   console.log(`${bad.length === 0 ? '✓' : '✗'} ${t} (site version): ${bad[0] ?? rootVersion}`);

@@ -4,6 +4,7 @@ import com.cellobservatory.observatory.core.ObservatoryCli
 import com.cellobservatory.observatory.model.SessionRow
 import com.cellobservatory.observatory.model.SessionsParser
 import com.cellobservatory.observatory.model.activeSessionRows
+import com.cellobservatory.observatory.model.compactBytes
 import com.cellobservatory.observatory.model.isSessionActive
 import com.cellobservatory.observatory.model.relTime
 import com.cellobservatory.observatory.services.ObservatoryService
@@ -57,7 +58,7 @@ class TimelineSessionAction(private val project: Project) : AnAction(), DumbAwar
             return
         }
         val row = service.peekSessions()?.sessions?.firstOrNull { it.id == current }
-        val live = row != null && isSessionActive(row.lastActiveMs, System.currentTimeMillis())
+        val live = row != null && isSessionActive(maxOf(row.lastActiveMs, row.liveMs), System.currentTimeMillis())
         val name = row?.displayName ?: "session ${current.take(8)}"
         e.presentation.text = (if (live) "● " else "○ ") + name
         e.presentation.description =
@@ -78,12 +79,12 @@ class TimelineSessionAction(private val project: Project) : AnAction(), DumbAwar
                 ?: ObservatoryCli.sessionsJson(project.basePath, service.currentSession())?.let { SessionsParser.parse(it) }
             val current = service.currentSession()
             val now = System.currentTimeMillis()
-            var rows = payload?.let { activeSessionRows(it.sessions, current, now) } ?: emptyList()
-            // A session pinned from elsewhere (or one whose listing the CLI cannot produce) still has to be
-            // in its own selector — synthesized from the id we do know, with no invented recency.
-            if (current != null && rows.none { it.id == current }) {
-                rows = listOf(SessionRow(current, null, 0L, true, edits = 0, pending = 0, files = 0)) + rows
-            }
+            // Every locally reviewable session, current first, matching VS Code's selector.
+            // The CLI scopes the listing to this machine. The popup's own
+            // speed search covers the long list.
+            var rows = payload?.let { p2 -> p2.sessions.let { local ->
+                listOfNotNull(local.firstOrNull { it.id == current }) + local.filter { it.id != current }
+            } } ?: emptyList()
             ApplicationManager.getApplication().invokeLater {
                 if (project.isDisposed) return@invokeLater
                 showChooser(rows, current, now, anchor)
@@ -93,26 +94,32 @@ class TimelineSessionAction(private val project: Project) : AnAction(), DumbAwar
 
     private fun showChooser(rows: List<SessionRow>, current: String?, now: Long, anchor: JComponent?) {
         val labelToId = LinkedHashMap<String, String?>()
-        val labelToRow = HashMap<String, com.cellobservatory.observatory.model.SessionRow>()
         for (r in rows) {
-            val mark = if (isSessionActive(r.lastActiveMs, now)) "● " else "○ "
+            val waiting = r.attention != null && r.attention.kind != "idle-done"
+            val mark = if (waiting) "⚠ " else if (isSessionActive(maxOf(r.lastActiveMs, r.liveMs), now)) "● " else "○ "
             // The 8-char id keeps labels unique when two live sessions share a title (the map is keyed by
             // label). Recency is omitted for a synthesized row rather than shown as an epoch date.
-            // WHICH MACHINE rides in the label, like the other two pickers: this popup can list a
-            // remote's sessions, and choosing one is refused — so the row has to say so BEFORE the
-            // click rather than only in the notification that explains the refusal afterwards.
             val label = "$mark${r.displayName}  —  ${r.id.take(8)}" +
-                (if (r.machine.isNotBlank()) " · ${r.machine}" else "") +
+                // Agent + model: Claude unmarked, other agents named, the
+                // model shown whenever recorded — same rule as every other session chooser.
+                (if (r.agent.isNotBlank() && r.agent != "claude") " · [${r.agent}]" else "") +
+                " · ${r.model.ifBlank { "model unknown" }}" +
+                " · ${r.workspace.ifBlank { "Unknown workspace" }} · ${r.edits} edit${if (r.edits == 1) "" else "s"} · ${fmtTok(r.tokens)} tok · ${fmtDur(r.durationMs)}" +
+                // What this session COSTS to keep on disk: the same store size the TUI's
+                // session blobs show. Omitted when zero — a conversation that captured nothing, or a CLI
+                // too old to report it, so the chip never draws a misleading "0B".
+                (if (r.storeBytes > 0) " · ${compactBytes(r.storeBytes)}" else "") +
                 (if (r.lastActiveMs > 0) " · ${relTime(r.lastActiveMs, now)}" else "") +
                 (if (r.id == current) " · reviewing" else "")
             labelToId[label] = r.id
-            labelToRow[label] = r
         }
         labelToId[ALL_SESSIONS] = null
-        // Machines, from the one list that shows sessions from them. Configuring a remote used to be
-        // reachable only from the terminal dashboard's options window — a feature all three front ends
-        // RENDER, configurable in exactly one of them.
-        labelToId[MACHINES] = null
+        if (rows.isNotEmpty()) labelToId[ReviewOps.DELETE_SESSION] = null
+        // THIS session's OWN store folder on disk, revealed in the OS file manager. A plain-string
+        // chooser cannot make the per-row size a click target, so the reviewed session's folder gets this
+        // row instead — shown only when we know its path (a listed session that has a store).
+        val reviewedStore = current?.let { c -> rows.firstOrNull { it.id == c }?.storePath }?.takeIf { it.isNotBlank() }
+        if (reviewedStore != null) labelToId[STORE_FOLDER] = null
         // …and where the data itself lives. "Where does this thing keep my files" had no answer in
         // any of the three front ends until now.
         labelToId[STORE] = null
@@ -120,12 +127,10 @@ class TimelineSessionAction(private val project: Project) : AnAction(), DumbAwar
             .createPopupChooserBuilder(labelToId.keys.toList())
             .setTitle(if (rows.size > 1) "Which live session?" else "Which session?")
             .setItemChosenCallback { chosen ->
-                if (chosen == STORE) ReviewOps.storeLocation(project, anchor)
-                else if (chosen == MACHINES) ReviewOps.manageRemotes(project, anchor)
+                if (chosen == STORE_FOLDER) ReviewOps.revealStoreFolder(project, reviewedStore)
+                else if (chosen == STORE) ReviewOps.storeLocation(project, anchor)
                 else if (chosen == ALL_SESSIONS) ReviewOps.chooseSession(project, anchor)
-                // A remote row is listed (it may be live) but cannot be reviewed here — refused with
-                // the reason, exactly as the terminal and VS Code do.
-                else if (ReviewOps.refuseRemote(project, labelToRow[chosen])) Unit
+                else if (chosen == ReviewOps.DELETE_SESSION) ReviewOps.chooseSessionToDelete(project, rows, anchor)
                 else labelToId[chosen]?.let { ReviewOps.applySessionChoice(project, it) }
             }
             .createPopup()
@@ -137,7 +142,7 @@ class TimelineSessionAction(private val project: Project) : AnAction(), DumbAwar
         /** The fall-through row. `null` in the map would mean "auto-resolve" to applySessionChoice, so this
          *  row is matched by label and handed to the full chooser instead. */
         const val ALL_SESSIONS = "All sessions…"
-        const val MACHINES = "＋  Machines…"
+        const val STORE_FOLDER = "📂  Open this session's store folder"
         const val STORE = "🗄  Store location…"
     }
 }

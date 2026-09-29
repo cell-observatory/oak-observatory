@@ -1,0 +1,11 @@
+# Text checks out with LF on every OS. Git for Windows checks text out with CRLF by default
+# (core.autocrlf=true), and the tests compare checked-out files with LF patterns and goldens.
+* text=auto eol=lf
+# Windows batch files (gradlew.bat) check out with CRLF on every OS, after `git add --renormalize`
+# too. text stays auto, unlike Gradle's `text eol=crlf`, so the CRLF copy committed before this rule
+# is not reported as modified.
+*.bat eol=crlf
+# Binary: never converted.
+*.png binary
+*.gif binary
+*.jar binary

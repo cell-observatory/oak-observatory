@@ -68,6 +68,8 @@ const num = (v: unknown): number => (typeof v === 'number' && isFinite(v) ? v : 
 
 /** Session-total token counters, split the way the API bills them (all from `message.usage`). */
 export interface SessionTokens {
+  /** False when no usage record is available; numeric zeros remain compatible with older clients. */
+  available?: boolean;
   /**
    * Tokens PROCESSED ONCE: `input` + `output` + `cacheCreation`. The headline every surface prints
    * as "N tok".
@@ -368,7 +370,7 @@ function touchCursor(transcript: string, cur: UsageCursor): void {
 }
 
 function emptyUsage(): SessionTokens & { durationMs: number } {
-  return { total: 0, input: 0, output: 0, cacheRead: 0, cacheCreation: 0, hitPct: null, durationMs: 0 };
+  return { available: false, total: 0, input: 0, output: 0, cacheRead: 0, cacheCreation: 0, hitPct: null, durationMs: 0 };
 }
 
 /** The cursor is mutable shared state — hand callers a fresh object, never a live reference. */
@@ -376,6 +378,7 @@ function usageSnapshot(cur: UsageCursor): SessionTokens & { durationMs: number }
   const { input, output, cacheRead, cacheCreation } = cur;
   const ctxSent = input + cacheRead + cacheCreation;
   return {
+    available: cur.seen.size > 0,
     total: input + output + cacheCreation, // tokens processed ONCE — see SessionTokens.total
     input,
     output,
@@ -506,6 +509,7 @@ function peekTail(transcript: string, cur: UsageCursor, end: number, snap: Sessi
   const id = typeof m.id === 'string' ? m.id : null;
   if (id !== null && cur.seen.has(id)) return;
   const u = m.usage || {};
+  snap.available = true;
   snap.input += num(u.input_tokens);
   snap.output += num(u.output_tokens);
   snap.cacheRead += num(u.cache_read_input_tokens);

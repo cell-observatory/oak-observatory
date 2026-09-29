@@ -11,7 +11,7 @@ import java.io.File
  * Drives the REAL demo and the REAL guided tour inside a headless IDE — replay, every step, the actions a
  * step performs, and teardown — so the interactive feature can be verified without a human at a screen.
  *
- * It runs the actual `claude-observatory` CLI against a throwaway HOME, so the store, the transcripts and
+ * It runs the actual `oak` CLI against a throwaway HOME, so the store, the transcripts and
  * the tour script are all genuine; nothing here is a stub. Skipped (not failed) when the CLI is not on
  * PATH, because that is an environment fact, not a defect — but it says so loudly rather than passing
  * silently, since a test that quietly tests nothing is worse than no test.
@@ -23,7 +23,7 @@ class DemoTourDriveTest : BasePlatformTestCase() {
     private var prevHome: String? = null
 
     private fun cliOnPath(): Boolean = runCatching {
-        ProcessBuilder("claude-observatory", "--version").start().waitFor() == 0
+        ProcessBuilder("oak", "--version").start().waitFor() == 0
     }.getOrDefault(false)
 
     override fun setUp() {
@@ -36,7 +36,7 @@ class DemoTourDriveTest : BasePlatformTestCase() {
     override fun tearDown() {
         try {
             if (work.isDirectory) runCatching {
-                ProcessBuilder("claude-observatory", "demo", "--clean").directory(work)
+                ProcessBuilder("oak", "demo", "--clean").directory(work)
                     .also { it.environment()["HOME"] = home.absolutePath }.start().waitFor()
             }
             home.deleteRecursively(); work.deleteRecursively()
@@ -49,7 +49,7 @@ class DemoTourDriveTest : BasePlatformTestCase() {
      *  each step actually resolves the control it names. */
     fun testTheTourWalksEveryStepAgainstARealDemo() {
         if (!cliOnPath()) {
-            println("SKIPPED DemoTourDriveTest: `claude-observatory` is not on PATH in this environment")
+            println("SKIPPED DemoTourDriveTest: `oak` is not on PATH in this environment")
             return
         }
         // The script itself comes from core, over the CLI — the same list both editors render.
@@ -79,11 +79,11 @@ class DemoTourDriveTest : BasePlatformTestCase() {
     /** The demo's own contract: a replay leaves a demo session, and `--clean` removes every trace. */
     fun testDemoReplayAndCleanupAreCompleteFromInsideTheIde() {
         if (!cliOnPath()) {
-            println("SKIPPED DemoTourDriveTest: `claude-observatory` is not on PATH in this environment")
+            println("SKIPPED DemoTourDriveTest: `oak` is not on PATH in this environment")
             return
         }
         fun cli(vararg args: String): String {
-            val pb = ProcessBuilder(listOf("claude-observatory") + args).directory(work).redirectErrorStream(true)
+            val pb = ProcessBuilder(listOf("oak") + args).directory(work).redirectErrorStream(true)
             pb.environment()["HOME"] = home.absolutePath
             val p = pb.start()
             val out = p.inputStream.bufferedReader().readText()

@@ -30,6 +30,18 @@ import com.intellij.openapi.vfs.LocalFileSystem
  */
 object Navigate {
 
+    /** Open a file by its record path, no caret placement — the Review tree's FILE rows use this
+     *  (parity with the VS Code Review list, where the filename itself opens the file). */
+    fun openFile(project: Project, path: String) {
+        val vf = LocalFileSystem.getInstance()
+            .refreshAndFindFileByPath(com.intellij.openapi.util.io.FileUtil.toSystemIndependentName(path))
+        if (vf == null) {
+            ReviewOps.notify(project, "File not found: $path", NotificationType.WARNING)
+            return
+        }
+        FileEditorManager.getInstance(project).openTextEditor(OpenFileDescriptor(project, vf), true)
+    }
+
     fun openFileAtEdit(project: Project, session: String, rec: EditRecord) {
         // Record paths are OS-native (backslashes on Windows); the VFS wants system-independent.
         val vf = LocalFileSystem.getInstance()

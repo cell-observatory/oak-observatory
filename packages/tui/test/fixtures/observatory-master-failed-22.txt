@@ -1,0 +1,31 @@
+laptop
+  demo
+    v claude · p1
+        drive-agents-e
+        ditor-polish
+        with every
+        word preserved
+        + blocked ·
+        Opus · 900
+        tok · 2
+        pending ·
+        14:00:00
+    v claude · p2
+        Run checks
+        | working ·
+        Opus · 900
+        tok · 0
+        pending ·
+        14:00:00
+    v claude · p4
+      no session yet
+  docs
+    v claude · p3
+        Waiting for
+        prompt
+        + idle · Opus
+        · 900 tok · 0
+        pending ·
+        14:00:00
+build-box ✗
+> earlier · 2

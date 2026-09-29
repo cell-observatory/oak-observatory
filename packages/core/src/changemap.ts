@@ -13,8 +13,11 @@ import * as path from 'path';
 import * as crypto from 'crypto';
 import { EditStatus, EditRecord, readLog, minOf, maxOf, logPath, readScopeOverrides, rootDir, isSafeSessionId } from './store';
 import { canonPath } from './paths';
+import { fileExt, fileCategory, type FileCategory } from './filetype';
 import { buildEditTree, EditTree, TreeEdit, TreeFolder, TreeFile } from './tree';
-import { reasoningByEdit, transcriptInsights, findTranscript, flagsFor } from './observe';
+import { reasoningByEdit, transcriptInsights, sessionViewTitle, sessionTitleParts, findTranscript, flagsFor } from './observe';
+import { isCodexTranscriptFile } from './codex-events';
+import { remoteSessionTitle } from './remote-titles';
 import { parseActions, summarizeActions, compactLabel } from './actions';
 import { parseSubagents, allSessionTaskRows } from './subagents';
 import { buildEgressReport } from './egress';
@@ -23,7 +26,10 @@ import { parseWorkflows, workflowWindows, workflowForTs } from './workflows';
 import { taskSnaps, digest12 } from './tasks';
 import { sessionPrompts } from './prompts';
 import { sessionProcesses } from './processes';
-import { cachedByFiles, readLines } from './fscache';
+import { cachedByFiles } from './fscache';
+import { derivedInventory, withDerivedInventory } from './derived';
+import { projectDir } from './session';
+import { transcriptFacts, TRANSCRIPT_FACTS_VERSION } from './derived-transcript';
 
 /** One edit (review unit) placed in the map: where it landed, how big, how reviewed, why, and which goal. */
 export interface ChangeMapEdit {
@@ -61,6 +67,12 @@ export interface ChangeMapFile {
   status: EditStatus;
   /** Most-recent edit id in this file — the drill-through target (open its diff / review). */
   maxId: number;
+  /** Timestamp of the most-recent edit to this file — drives the "N min ago" column and the time sort. */
+  maxTs: number;
+  /** Bare lowercased extension ('ts', 'py', '') — the extension filter key. */
+  ext: string;
+  /** Which of the six type buckets this file falls in — the file-type filter key. */
+  category: FileCategory;
   classes: string[]; // distinct classes/functions touched
   agent: boolean; // any edit subagent-authored
   risk: string | null; // first warn-level flag, if any
@@ -80,11 +92,13 @@ export interface ChangeMapModule {
   undone: number;
   status: EditStatus;
   files: number;
+  /** Timestamp of the most-recent edit under this folder — for the "N min ago" column and time sort. */
+  maxTs: number;
 }
 
 export interface ChangeMapSummary {
   session: string;
-  title?: string; // human-readable session name (Claude's ai-title, else the first user prompt; '' when neither) — the Overview session selector + the Stats panel show it instead of the raw id
+  title?: string; // human-readable session name (sessionViewTitle: a Codex session's own title, else preferredSessionTitle — a rename, else the claude.ai Remote Control title, else Claude's ai-title, else the first user prompt; '' when none) — the Overview session selector + the Stats panel show it instead of the raw id
   units: number; // edits after same-code collapse (what the map draws)
   rawEdits: number; // raw store edits
   pending: number;
@@ -99,6 +113,9 @@ export interface ChangeMapSummary {
   egress: number; // off-machine destinations
   compactions: number; // context compactions the harness performed this session
   spanMs: number; // wall-clock span of the session's actions
+  /** The workspace root `rel` paths are relative to — what lets a renderer resolve an
+   *  outside-workspace `../..` rel back to the REAL path it names (additive, 0.10.0). */
+  root: string;
 }
 
 /** Per-TASK rollup row (strict spans). `taskId: null` is the explicit unassigned bucket. */
@@ -295,7 +312,8 @@ function rollupFiles(edits: ChangeMapEdit[]): ChangeMapFile[] {
       f = {
         rel: e.rel, module: e.module, moduleLabel: moduleLabel(e.module), file: e.file,
         churn: 0, cnt: 0, added: 0, removed: 0,
-        kept: 0, pending: 0, undone: 0, status: 'kept', maxId: -1, classes: [],
+        kept: 0, pending: 0, undone: 0, status: 'kept', maxId: -1, maxTs: 0,
+        ext: fileExt(e.rel), category: fileCategory(e.rel), classes: [],
         agent: false, risk: null, reason: null,
       };
       by.set(e.rel, f);
@@ -313,6 +331,7 @@ function rollupFiles(edits: ChangeMapEdit[]): ChangeMapFile[] {
     if (e.risk && !f.risk) f.risk = e.risk;
     if (e.reasoning && !f.reason) f.reason = e.reasoning;
     if (e.id > f.maxId) f.maxId = e.id; // newest edit = what a click on this row opens
+    if (e.ts > f.maxTs) f.maxTs = e.ts; // most-recent edit time — the "N min ago" + time sort
   }
   const out = [...by.values()];
   for (const f of out) {
@@ -338,10 +357,11 @@ function rollupModules(files: ChangeMapFile[]): ChangeMapModule[] {
     if (!m) {
       m = {
         module: key, label: key, churn: 0, cnt: 0, added: 0, removed: 0,
-        kept: 0, pending: 0, undone: 0, status: 'kept', files: 0,
+        kept: 0, pending: 0, undone: 0, status: 'kept', files: 0, maxTs: 0,
       };
       by.set(key, m);
     }
+    if (f.maxTs > m.maxTs) m.maxTs = f.maxTs;
     m.churn += f.churn;
     m.cnt += f.cnt;
     m.added += f.added;
@@ -429,42 +449,22 @@ function planSnaps(transcriptPath: string): TodoSnap[] {
 
 /** Ordered TodoWrite snapshots from the main transcript (each carries its ts + the full list). */
 function todoSnaps(transcriptPath: string): TodoSnap[] {
-  // Memoized per (mtime,size): one build consults the snapshots for BOTH span models, and the fleet
-  // paths re-consult per sibling — read-only result, so the cached value is shared as-is.
-  return cachedByFiles('todoSnaps', [transcriptPath], () => todoSnapsUncached(transcriptPath));
+  return transcriptFacts(transcriptPath).todos;
 }
 
-function todoSnapsUncached(transcriptPath: string): TodoSnap[] {
-  let lines: string[];
-  try {
-    lines = readLines(transcriptPath);
-  } catch {
-    return [];
-  }
-  const out: TodoSnap[] = [];
-  for (const line of lines) {
-    const t = line.trim();
-    if (!t || !t.includes('TodoWrite')) continue;
-    let o: any;
-    try {
-      o = JSON.parse(t);
-    } catch {
-      continue;
-    }
-    if (o.isSidechain === true) continue; // a subagent's checklist is not the main plan
-    const msg = o.message;
-    if (!msg || msg.role !== 'assistant' || !Array.isArray(msg.content)) continue;
-    const ts = toMs(o.timestamp ?? o.ts);
-    for (const b of msg.content) {
-      if (b && b.type === 'tool_use' && b.name === 'TodoWrite' && b.input && Array.isArray(b.input.todos)) {
-        const todos = b.input.todos
-          .filter((td: any) => td && typeof td.content === 'string')
-          .map((td: any) => ({ content: String(td.content).trim(), status: String(td.status || '') }));
-        if (todos.length) out.push({ ts, todos });
-      }
+export function foldTodoFacts(out: TodoSnap[], o: any): void {
+  if (o.isSidechain === true) return; // a subagent's checklist is not the main plan
+  const msg = o.message;
+  if (!msg || msg.role !== 'assistant' || !Array.isArray(msg.content)) return;
+  const ts = toMs(o.timestamp ?? o.ts);
+  for (const b of msg.content) {
+    if (b && b.type === 'tool_use' && b.name === 'TodoWrite' && b.input && Array.isArray(b.input.todos)) {
+      const todos = b.input.todos
+        .filter((td: any) => td && typeof td.content === 'string')
+        .map((td: any) => ({ content: String(td.content).trim(), status: String(td.status || '') }));
+      if (todos.length) out.push({ ts, todos });
     }
   }
-  return out;
 }
 
 function toMs(v: unknown): number {
@@ -709,7 +709,7 @@ export function buildChangeMap(
 
   const summary: ChangeMapSummary = {
     session,
-    title: (insights.title ?? insights.firstUserPrompt ?? '').replace(/\s+/g, ' ').trim(),
+    title: (sessionViewTitle(cwd, session, insights) ?? '').replace(/\s+/g, ' ').trim(),
     units: edits.length,
     rawEdits: log.length,
     pending: edits.filter((e) => e.status === 'pending').length,
@@ -720,10 +720,11 @@ export function buildChangeMap(
     actions: aSum.total,
     errors: aSum.errors,
     subagents: subs.length,
-    fleet: projectSessionIds(cwd).filter((id) => id !== session).length,
+    fleet: mapProjectSessionIds(cwd).filter((id) => id !== session).length,
     egress: buildEgressReport(actions).length,
     compactions: compactions.length,
     spanMs: aSum.lastTs && aSum.firstTs ? Math.max(0, aSum.lastTs - aSum.firstTs) : 0,
+    root,
   };
 
   // Aggregate ONCE, here — every front-end (VS Code webview, JetBrains Swing) renders these rows as
@@ -949,7 +950,13 @@ export function taskEditIds(cwd: string, session: string, taskId: string): numbe
 // that says `3|live` becomes a false alarm the moment this is bumped for a real reason, which is
 // exactly what it did here. Deriving it keeps the assertion about the BEHAVIOUR (live survives,
 // superseded is reaped) instead of about the current value.
-export const MAP_CACHE_VERSION = 5;
+// 6: pasted prompts (`<pasted_content>`) became asks (2026-09-22) — the ask slices are inputs no stamp saw.
+// 7: summary.title follows preferredSessionTitle — a rename (`custom-title`), then the Remote Control
+//    title from claude.ai, then the ai-title (2026-09-24).
+// 8: a Codex session's summary.title is its own title (`codexSessionTitle`), no longer its first prompt
+//    read the Claude way — and a build still on 7 must not share (and rebuild) the same files (2026-09-24).
+// 9: summary.title is plain text — no markdown heading markers, no line breaks (`plainTitle`) (2026-09-24).
+export const MAP_CACHE_VERSION = 9;
 
 /** (mtimeMs:size) for a file, or '' when it can't be stat'd. */
 /**
@@ -1012,14 +1019,19 @@ function nestedDirStamp(dir: string | null): string {
  * only read, and siblings starting in other worktrees, changed no keyed file, so the Overview kept
  * reporting zero of them until something unrelated moved.
  */
-function derivedInputsStamp(cwd: string, session: string, includeWorkspace: boolean): string {
+function mapProjectSessionIds(cwd: string): string[] {
+  return derivedInventory(`project:${cwd}`, () =>
+    cachedByFiles('mapProjectInventory', [projectDir(cwd)], () => projectSessionIds(cwd)));
+}
+
+export function derivedInputsStamp(cwd: string, session: string, includeWorkspace: boolean): string {
   const transcript = findTranscript(cwd, session);
   const base = transcript ? transcript.replace(/\.jsonl$/, '') : null;
   const subs = base ? path.join(base, 'subagents') : null;
   return [
-    dirStamp(subs),
-    nestedDirStamp(subs ? path.join(subs, 'workflows') : null),
-    nestedDirStamp(base ? path.join(base, 'workflows') : null),
+    derivedInventory(`subagents:${subs}`, () => dirStamp(subs)),
+    derivedInventory(`sub-workflows:${subs}`, () => nestedDirStamp(subs ? path.join(subs, 'workflows') : null)),
+    derivedInventory(`workflows:${base}`, () => nestedDirStamp(base ? path.join(base, 'workflows') : null)),
     // The project dir's ONLY contribution to a map is `summary.fleet`, a COUNT of the sibling session
     // ids in it (see the projectSessionIds call in buildChangeMap) — so the stamp IS that id list, and
     // never the entries' mtime/size. Stamping those made one session's append invalidate every OTHER
@@ -1029,13 +1041,25 @@ function derivedInputsStamp(cwd: string, session: string, includeWorkspace: bool
     // transcript watcher, so that fired on very nearly every tick — the cache almost never hit.
     // Deriving the stamp from the same call the map derives the value from is also what keeps the two
     // from drifting apart later.
-    projectSessionIds(cwd).join(','),
+    mapProjectSessionIds(cwd).join(','),
     // Only for the session being RENDERED. A sibling's map is the "finished session whose inputs never
     // change again" case this disk cache exists for, and siblings share files with the active session —
     // 14 of 30 on a real repo — so stamping their workspace too made one save rebuild all of them
     // (9.6 s cold, 542 ms warm), for a map whose class attribution nobody is looking at.
     includeWorkspace ? workspaceStamp(session, cwd) : '',
   ].join('|');
+}
+
+/** A map's summary.title can change without the transcript moving: the claude.ai title of the session's
+ *  Remote Control session, or a Codex session's own title (a rename in Codex's index, an edited brief)
+ *  — so the map caches stamp that title too, from cached reads (sidecar-cached parts for Claude; for
+ *  Codex its index, cursor and brief), never a transcript scan. Kept out of `derivedInputsStamp`, whose
+ *  other users never show a title. */
+function titleStamp(cwd: string, session: string): string {
+  const transcript = findTranscript(cwd, session);
+  if (!transcript) return '';
+  if (isCodexTranscriptFile(transcript)) return sessionViewTitle(cwd, session) ?? '';
+  return remoteSessionTitle(sessionTitleParts(transcript, session)?.bridge) ?? '';
 }
 
 
@@ -1137,7 +1161,8 @@ function mapCachePath(session: string, key: string): string {
 }
 
 /**
- * Delete cached map payloads left behind by an EARLIER cache version, for one session.
+ * Delete cached map payloads AND shared transcript facts left behind by an EARLIER cache version,
+ * for one session.
  *
  * The version is part of the file NAME (see MAP_CACHE_VERSION), which is what stops two builds fighting
  * over one file — but it also means a bump orphans every old file instead of overwriting it. Measured
@@ -1170,7 +1195,24 @@ export function pruneStaleMaps(session: string): { removed: number; bytes: numbe
     return out; // no cache for this session
   }
   const live = `${MAP_CACHE_VERSION}|`;
+  // The shared transcript facts are orphaned the same way the map payloads are, one dead generation
+  // per schema bump, per transcript — 471 files / 47.6 MB measured on one real store. Only the LIVE
+  // spelling is reachable: every other transcript-facts name, including the pre-versioning
+  // `transcript-facts-<key>.json` this release replaced, is addressed by nothing. A publication in
+  // flight ends in `.tmp`, never `.json`, so this cannot race the writer.
+  const liveFacts = new RegExp(`^transcript-facts-v${TRANSCRIPT_FACTS_VERSION}-[0-9a-f]{64}\\.json$`);
   for (const n of names) {
+    if (n.startsWith('transcript-facts-') && n.endsWith('.json')) {
+      if (liveFacts.test(n)) continue;
+      const p = path.join(dir, n);
+      try {
+        const size = fs.statSync(p).size;
+        fs.unlinkSync(p);
+        out.removed++;
+        out.bytes += size;
+      } catch { /* unreadable or already gone — leave it */ }
+      continue;
+    }
     // Only the hashed map/view payloads are versioned this way; the sibling caches beside them
     // (placements.json, deltas.json) are content-keyed and own their own version field.
     if (!/^[0-9a-f]{16}\.json$/.test(n)) continue;
@@ -1202,7 +1244,7 @@ export function cachedChangeMap(cwd: string, session: string, opts: { root: stri
   const lStamp = fileStamp(logPath(session));
   const build = (): ChangeMap => buildChangeMap(cwd, session, opts);
   if (!tStamp && !lStamp) return build(); // nothing stable to key on
-  const stamp = `${MAP_CACHE_VERSION}|${tStamp}|${lStamp}|${opts.prompts ? 'p' : '-'}|${derivedInputsStamp(cwd, session, true)}`;
+  const stamp = `${MAP_CACHE_VERSION}|${tStamp}|${lStamp}|${opts.prompts ? 'p' : '-'}|${derivedInputsStamp(cwd, session, true)}|${titleStamp(cwd, session)}`;
   // `prompts` belongs in the KEY, not only the stamp: two callers disagreeing about it would otherwise
   // share one filename and each write would be a permanent miss for the other.
   //
@@ -1224,6 +1266,7 @@ export function cachedChangeMap(cwd: string, session: string, opts: { root: stri
     /* absent or unreadable — rebuild */
   }
   const map = build();
+  if (!fs.existsSync(logPath(session))) return map;
   try {
     fs.mkdirSync(path.dirname(p), { recursive: true, mode: 0o700 });
     const tmp = `${p}.${process.pid}.tmp`;
@@ -1267,6 +1310,10 @@ export function overviewChangeMap(cwd: string, session: string, opts: { root: st
   agents: unknown[];
   unassigned: unknown;
 } {
+  return withDerivedInventory(() => overviewChangeMapInBatch(cwd, session, opts));
+}
+
+function overviewChangeMapInBatch(cwd: string, session: string, opts: { root: string }): ReturnType<typeof overviewChangeMap> {
   const { root } = opts;
   // `prompts: true` — the per-ask slices the Prompts window scopes everything by. Only the ACTIVE
   // session builds them; a sibling worktree's map is never scoped by an ask typed into this window.
@@ -1328,7 +1375,7 @@ function siblingSlot(cwd: string, session: string, opts: { root: string; bins?: 
   const lStamp = fileStamp(logPath(session));
   if (!tStamp && !lStamp) return null; // neither input exists — nothing stable to key on
   const bins = opts.bins ?? 20;
-  const stamp = `${MAP_CACHE_VERSION}|${tStamp}|${lStamp}|${bins}|${derivedInputsStamp(cwd, session, false)}`;
+  const stamp = `${MAP_CACHE_VERSION}|${tStamp}|${lStamp}|${bins}|${derivedInputsStamp(cwd, session, false)}|${titleStamp(cwd, session)}`;
   const key = crypto.createHash('sha256').update(`v${MAP_CACHE_VERSION} ${cwd} ${session} ${opts.root}`).digest('hex').slice(0, 16);
   return { p: mapCachePath(session, key), stamp };
 }
@@ -1365,7 +1412,7 @@ export function siblingOverview(cwd: string, session: string, opts: { root: stri
     sparkline: activityBins(parseActions(cwd, session).map((a) => a.ts), opts.bins ?? 20),
     todos: transcriptInsights(cwd, session).todos,
   };
-  if (slot) {
+  if (slot && fs.existsSync(logPath(session))) {
     try {
       fs.mkdirSync(path.dirname(slot.p), { recursive: true, mode: 0o700 });
       const tmp = `${slot.p}.${process.pid}.tmp`; // pid-scoped so concurrent CLI processes can't collide
@@ -1389,7 +1436,7 @@ function unbuiltChangeMap(session: string): ChangeMap {
   return {
     summary: {
       session, units: 0, rawEdits: 0, pending: 0, kept: 0, undone: 0, added: 0, removed: 0,
-      actions: 0, errors: 0, subagents: 0, fleet: 0, egress: 0, compactions: 0, spanMs: 0,
+      actions: 0, errors: 0, subagents: 0, fleet: 0, egress: 0, compactions: 0, spanMs: 0, root: '',
     },
     edits: [], compactions: [], files: [], modules: [],
     rollupByTask: [], rollupBySubagent: [], rollupByWorkflow: [],

@@ -20,7 +20,7 @@ class ToolWindowIdContractTest {
             "Observatory Traces", // ReviewNavBar, EditsTreePanel, TourController
             "Observatory Dashboards", // ObservatoryService, TourController
             "Observatory Timeline", // TourController, ObservatoryService
-            "Claude Observatory Tour", // TourController.TOOL_WINDOW_ID
+            "OAK Tour", // TourController.TOOL_WINDOW_ID
         )
         raised.forEach { id -> assertTrue("plugin.xml is missing toolWindow id \"$id\"", id in declared) }
     }

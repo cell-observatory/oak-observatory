@@ -1,5 +1,5 @@
 {
-  "name": "claude-observatory-monorepo",
+  "name": "oak-observatory-monorepo",
   "version": "0.10.0-dev.0",
   "private": true,
   "description": "Standalone, git-free, per-edit Keep/Undo for Claude Code on established and mission-critical codebases \u2014 terminal, VS Code and JetBrains, zero extra tokens.",
@@ -10,11 +10,12 @@
     "packages/vscode"
   ],
   "scripts": {
-    "build": "npm run build -w @claude-observatory/core && npm run build -w @claude-observatory/tui && npm run build -w claude-observatory",
-    "build:core": "npm run build -w @claude-observatory/core",
-    "build:cli": "npm run build -w claude-observatory",
-    "build:vscode": "npm run build -w @claude-observatory/core && npm run build -w claude-observatory-vscode",
-    "test": "npm run version:check && npm run check:privacy && npm run check:webview && npm run build && npm run build:vscode && node --test packages/core/test/core.test.js packages/vscode/test/smoke.test.js",
+    "postinstall": "node scripts/pty-spawn-helper.mjs",
+    "build": "npm run build -w @oak-observatory/core && npm run build -w @oak-observatory/tui && npm run build -w oak-observatory && npm rebuild oak-observatory --ignore-scripts",
+    "build:core": "npm run build -w @oak-observatory/core",
+    "build:cli": "npm run build -w oak-observatory",
+    "build:vscode": "npm run build -w @oak-observatory/core && npm run build -w oak-observatory-vscode",
+    "test": "npm run version:check && npm run check:privacy && npm run check:webview && npm run build && npm run build:vscode && node --require ./test/bootstrap.cjs --test test/bootstrap.test.js test/cli.test.js test/session-listing-cli.test.js test/gates.test.js packages/core/test/core.test.js packages/core/test/parity.test.js packages/core/test/review.test.js packages/core/test/herdr-install.test.js packages/core/test/herdr-plugin.test.js packages/core/test/herdr-tabs.test.js packages/core/test/herdr.test.js packages/core/test/session-listing.test.js packages/core/test/codex-hook-trust.test.js packages/core/test/conversation.test.js packages/core/test/conversation-perf.test.js packages/core/test/derived-transcript.test.js packages/core/test/codex-herdr-join.test.js packages/core/test/retirement.test.js packages/vscode/test/smoke.test.js packages/tui/test/textwidth.js packages/tui/test/tabs.js packages/tui/test/conversation-backend.js packages/tui/test/review-remote.js packages/tui/test/media.js packages/tui/test/tab-accessor.js packages/tui/test/tree.js packages/tui/test/observatory.js packages/tui/test/daemon.js packages/tui/test/native.js packages/tui/test/first-run.js packages/tui/test/doctor.js",
     "e2e": "npm run build && bash test/e2e.sh",
     "test:all": "npm test && bash test/e2e.sh",
     "version:check": "node scripts/version.mjs",
@@ -23,20 +24,24 @@
     "clean": "rm -rf packages/*/dist release",
     "check:webview": "node scripts/check-webview-syntax.mjs",
     "check:privacy": "node scripts/check-docs-privacy.mjs",
-    "build:tui": "npm run build -w @claude-observatory/core && npm run build -w @claude-observatory/tui"
+    "build:tui": "npm run build -w @oak-observatory/core && npm run build -w @oak-observatory/tui",
+    "test:codex-perf": "node test/codex-performance.js",
+    "test:codex-probe": "node test/codex-config-probe.js"
   },
   "devDependencies": {
-    "gifenc": "^1.0.3",
     "pngjs": "^7.0.0",
     "typescript": "^5.9.3"
+  },
+  "allowScripts": {
+    "node-pty": true
   },
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/cell-observatory/claude-observatory.git"
+    "url": "https://github.com/cell-observatory/oak-observatory.git"
   },
-  "homepage": "https://github.com/cell-observatory/claude-observatory#readme",
+  "homepage": "https://github.com/cell-observatory/oak-observatory#readme",
   "bugs": {
-    "url": "https://github.com/cell-observatory/claude-observatory/issues"
+    "url": "https://github.com/cell-observatory/oak-observatory/issues"
   }
 }

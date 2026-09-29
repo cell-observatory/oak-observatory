@@ -18,7 +18,7 @@ object RevisionNav {
             ?: return ReviewOps.notify(project, "No active Claude Code session for this project", NotificationType.WARNING)
         val vf = FileDocumentManager.getInstance().getFile(editor.document) ?: return
         val edits = service.log().filter { it.file == ClaudePaths.storeKey(vf.path) }.sortedBy { it.id } // this file's history, oldest->newest
-        if (edits.isEmpty()) return ReviewOps.notify(project, "No Claude edits recorded for this file")
+        if (edits.isEmpty()) return ReviewOps.notify(project, "No agent edits recorded for this file")
         val cur = cursor[vf.path]
         val base = if (cur == null) edits.size else edits.indexOfFirst { it.id == cur } // null = parked "at current"
         val idx = (base + dir).coerceIn(0, edits.size - 1)
