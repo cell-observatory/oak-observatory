@@ -9,7 +9,7 @@
 [![Pages](https://github.com/cell-observatory/oak-observatory/actions/workflows/pages.yml/badge.svg)](https://github.com/cell-observatory/oak-observatory/actions/workflows/pages.yml)
 [![Release](https://github.com/cell-observatory/oak-observatory/actions/workflows/release.yml/badge.svg)](https://github.com/cell-observatory/oak-observatory/actions/workflows/release.yml)
 [![Dependabot](https://img.shields.io/badge/dependabot-enabled-025E8C?logo=dependabot&logoColor=white)](https://github.com/cell-observatory/oak-observatory/blob/main/.github/dependabot.yml)
-[![Version](https://img.shields.io/badge/version-v0.10.0--dev.0-blue)](https://github.com/cell-observatory/oak-observatory/releases/latest)
+[![Version](https://img.shields.io/badge/version-v0.11.0--dev.0-blue)](https://github.com/cell-observatory/oak-observatory/releases/latest)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](https://github.com/cell-observatory/oak-observatory/blob/main/LICENSE)
 
 

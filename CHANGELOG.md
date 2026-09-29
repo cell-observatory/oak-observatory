@@ -8,6 +8,8 @@ the release notes.
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-09-28
+
 **claude-observatory is now OAK.** The command is `oak`, the npm package is `oak-observatory`, the
 VS Code extension is `cell-observatory.oak-observatory-vscode`, the JetBrains plugin is
 `com.cell-observatory.oak-observatory`, and the repository is
