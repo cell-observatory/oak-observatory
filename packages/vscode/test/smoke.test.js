@@ -1502,7 +1502,7 @@ test('extension: three views, click commands, inline annotations, chat, status s
         document: { getElementById: elFor, querySelectorAll: () => [], querySelector: () => null, addEventListener() {}, body: elFor('body') },
         acquireVsCodeApi: () => ({ postMessage() {}, getState: () => ({ utab }), setState() {} }) };
       vm.createContext(sandbox);
-      const scripts = [...stView.webview.html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g)];
+      const scripts = [...stView.webview.html.matchAll(/<script[^>]*>([\s\S]*?)<\/script[^>]*>/gi)];
       vm.runInContext(scripts[scripts.length - 1][1], sandbox);
       listener({ data: { type: 'usage', u } });
       assert.deepEqual([elFor('uc1-$').textContent, elFor('uc2-$').textContent], want, `${utab}: the $ row's spent and projected total are both marked estimates`);

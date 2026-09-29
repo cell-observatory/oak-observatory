@@ -91,7 +91,7 @@ const INDEX = FLAT.map((p) => ({ s: p.slug, t: p.title, g: p.group, d: p.deck })
 // --- heading → id, and TOC extraction ------------------------------------------------------------
 // A heading's text is HTML, so its entities are decoded before it becomes an id or a TOC label — the TOC
 // escapes its labels, and "Switching &amp; updating" otherwise read as "Switching &amp;amp; updating".
-const textOf = (html) => html.replace(/<[^>]+>/g, '').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+const textOf = (html) => html.split(/<[^>]+>/).join('').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
   .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, '&').trim();
 const slugify = (s) =>
   textOf(s).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');

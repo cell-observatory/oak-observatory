@@ -5096,13 +5096,13 @@ const TIMELINE_SCRIPT = `
     flush();
     return out;
   }
-  function mdIsTRow(l){ var t=l.replace(/^\\s+/,'').replace(/\\s+$/,''); return t.charAt(0)==='|'&&t.indexOf('|',1)>0; }
-  function mdIsTSep(l){ var t=l.replace(/^\\s+/,'').replace(/\\s+$/,''); return mdIsTRow(l)&&/-/.test(t)&&/^[|\\s:-]+$/.test(t); }
-  function mdCells(l){ var t=l.replace(/^\\s+/,'').replace(/\\s+$/,'');
+  function mdIsTRow(l){ var t=l.trim(); return t.charAt(0)==='|'&&t.indexOf('|',1)>0; }
+  function mdIsTSep(l){ var t=l.trim(); return mdIsTRow(l)&&/-/.test(t)&&/^[|\\s:-]+$/.test(t); }
+  function mdCells(l){ var t=l.trim();
     if(t.charAt(0)==='|') t=t.slice(1);
     if(t.charAt(t.length-1)==='|') t=t.slice(0,-1);
     var out=t.split('|'), i=0;
-    for(i=0;i<out.length;i++) out[i]=out[i].replace(/^\\s+/,'').replace(/\\s+$/,'');
+    for(i=0;i<out.length;i++) out[i]=out[i].trim();
     return out; }
   function mdHtml(text){
     var lines=String(text==null?'':text).split('\\n');
@@ -5130,9 +5130,9 @@ const TIMELINE_SCRIPT = `
         li=te-1;
         continue;
       }
-      var hm=/^(#{1,6})\\s+(.*)$/.exec(l);
+      var hm=/^(#{1,6})\\s+(\\S.*|)$/.exec(l);
       if(hm){ h+='<div class="tla-mdh"><b>'+mdSpansHtml(hm[2])+'</b></div>'; continue; }
-      var bm=/^(\\s*)([-*•]|\\d{1,2}[.)])\\s+(.*)$/.exec(l);
+      var bm=/^(\\s*)([-*•]|\\d{1,2}[.)])\\s+(\\S.*|)$/.exec(l);
       if(bm){ h+='<div class="tla-mdli" style="padding-left:'+(8+Math.floor(bm[1].length/2)*10)+'px">• '+mdSpansHtml(bm[3])+'</div>'; continue; }
       var qm=/^>\\s?(.*)$/.exec(l);
       if(qm){ h+='<div class="tla-mdq">'+mdSpansHtml(qm[1])+'</div>'; continue; }

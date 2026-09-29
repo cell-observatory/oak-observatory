@@ -64,7 +64,7 @@ test('media privacy scans the shipped READMEs, and tests for real machines and s
     put(rel, text);
     const result = run();
     assert.equal(result.status, 1, result.stdout + result.stderr);
-    assert.match(result.stderr, new RegExp(`${rel.replace(/[.]/g, '\\.').replaceAll('/', '[\\\\/]')}:1 .*\\[${rule}\\]`));
+    assert.match(result.stderr, new RegExp(`${rel.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replaceAll('/', '[\\\\/]')}:1 .*\\[${rule}\\]`));
     put(rel, before);
   }
 });

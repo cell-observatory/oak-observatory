@@ -115,7 +115,7 @@ function stampChangelog(next) {
   const text = read(CHANGELOG);
   if (text.split('\n').some((line) => line.startsWith(`## [${next}]`))) return false;
   const unreleased = /^## \[Unreleased\][^\n]*\n([\s\S]*?)(?=^## \[|(?![\s\S]))/m.exec(text);
-  if (!unreleased || !unreleased[1].replace(/<!--[\s\S]*?-->/g, '').trim()) return false;
+  if (!unreleased || !unreleased[1].split(/<!--[\s\S]*?-->/).join('').trim()) return false;
   // The maintainer's own date: UTC's is already tomorrow on a US evening.
   const now = new Date();
   const date = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;

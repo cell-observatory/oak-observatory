@@ -415,9 +415,11 @@ export interface MdLine {
 /** Classify ONE line's block role. Fences are the CALLER's state (a line of ``` toggles code mode,
  *  in which nothing here applies). */
 export function mdClassify(line: string): MdLine {
-  const h = /^(#{1,6})\s+(.*)$/.exec(line);
+  // `(\S.*|)`, not `(.*)`: the text starts where the spaces end, so a line the pattern rejects is not
+  // retried at every split of a long run of them.
+  const h = /^(#{1,6})\s+(\S.*|)$/.exec(line);
   if (h) return { kind: 'h', depth: h[1].length, text: h[2] };
-  const b = /^(\s*)([-*•]|\d{1,2}[.)])\s+(.*)$/.exec(line);
+  const b = /^(\s*)([-*•]|\d{1,2}[.)])\s+(\S.*|)$/.exec(line);
   if (b) return { kind: 'bullet', depth: Math.floor(b[1].length / 2), text: b[3] };
   const q = /^>\s?(.*)$/.exec(line);
   if (q) return { kind: 'quote', depth: 0, text: q[1] };
@@ -429,6 +431,19 @@ export function mdIsFence(line: string): boolean {
   return /^\s*```/.test(line);
 }
 
+/** A heading's words without its closing sequence and trailing blanks (` Plan ##` → ` Plan`), read
+ *  back from the end: a lazy `(.*?)(?:[ \t]+#+)?[ \t]*$` retried that tail at every column. */
+function headingWords(rest: string): string {
+  const blank = (i: number) => rest[i] === ' ' || rest[i] === '\t';
+  let end = rest.length;
+  while (end > 0 && blank(end - 1)) end--;
+  let hashes = end;
+  while (hashes > 0 && rest[hashes - 1] === '#') hashes--;
+  let words = hashes;
+  while (words > 0 && blank(words - 1)) words--;
+  return rest.slice(0, hashes < end && words < hashes ? words : end);
+}
+
 /**
  * A title as ONE line of plain text, whatever it was made from: a rename, a Codex thread name, a
  * rollout title, an ai-title, a first prompt. A markdown heading keeps its words and loses its markers
@@ -438,7 +453,7 @@ export function mdIsFence(line: string): boolean {
  */
 export function plainTitle(raw: string): string {
   return raw
-    .replace(/^[ \t]*#{1,6}(?=[ \t]|$)(.*?)(?:[ \t]+#+)?[ \t]*$/gm, '$1')
+    .replace(/^[ \t]*#{1,6}(?=[ \t]|$)(.*)$/gm, (_, rest: string) => headingWords(rest))
     .replace(/^[ \t]*(?:=+|-+)[ \t]*$/gm, '')
     .replace(/\s+/g, ' ')
     .trim();

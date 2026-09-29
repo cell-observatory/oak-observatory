@@ -66,3 +66,15 @@ test('sanitizeCell drops C1 control characters as well as C0 and DEL', () => {
   assert.ok(out.startsWith('safe.txt') && out.includes('FAKE'));
   assert.equal(sanitizeCell('\x1b[31mred\x1b[0m é ✓'), '\x1b[31mred\x1b[0m é ✓', 'colour and ordinary text pass unchanged');
 });
+
+// CodeQL js/polynomial-redos alert 33: `/\s+$/` retried the end-of-line test from every blank of a long
+// run (7 s for a 100k-cell row); trimEnd is linear. The bound is far from both, so it cannot flake.
+test('sliceSpan trims a row\'s trailing blanks in linear time', () => {
+  const { sliceSpan } = require('../dist/textwidth');
+  const row = ' '.repeat(100_000) + 'x';
+  const began = process.hrtime.bigint();
+  const got = sliceSpan([row + '   '], { row: 0, col: 0 }, { row: 0, col: 200_000 });
+  const ms = Number(process.hrtime.bigint() - began) / 1e6;
+  assert.equal(got, row, 'the trailing blanks go, the leading ones stay');
+  assert.ok(ms < 500, `sliceSpan must stay linear (took ${ms.toFixed(1)} ms)`);
+});

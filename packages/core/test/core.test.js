@@ -2458,8 +2458,8 @@ test('store: a stale lock that cannot be removed, or a lock directory that vanis
   fs.utimesSync(fl, old, old);
   const G = path.join(tmpWork(), 'i.txt');
   fs.writeFileSync(G, 'x\n');
-  const run = (body) => new Promise((resolve) => {
-    const child = cp.spawn(process.execPath, ['-e', `const c=require(${JSON.stringify(DIST)});const fs=require('fs');try{${body};console.log('ran')}catch(e){console.log('refused: '+e.message)}`],
+  const run = (body, ...args) => new Promise((resolve) => {
+    const child = cp.spawn(process.execPath, ['-e', `const c=require(${JSON.stringify(DIST)});const fs=require('fs');try{${body};console.log('ran')}catch(e){console.log('refused: '+e.message)}`, ...args],
       { env: { ...process.env, HOME: home, USERPROFILE: home } });
     let out = '';
     child.stdout.on('data', (d) => (out += d));
@@ -2470,7 +2470,7 @@ test('store: a stale lock that cannot be removed, or a lock directory that vanis
     run(`c.appendLog(${JSON.stringify(S)},{ts:1,tool:'Edit',file:'/w/x',beforeBlob:null,afterBlob:null,status:'pending'})`),
     run(`c.withFileMutation(${JSON.stringify(F)},()=>0)`),
     // Whichever call creates the lock file, the directory it goes in is gone.
-    run(`const gone=(f)=>function(p,...a){if(String(p).includes('.file-locks')){const e=new Error('gone');e.code='ENOENT';throw e}return f.call(this,p,...a)};fs.writeFileSync=gone(fs.writeFileSync);fs.openSync=gone(fs.openSync);c.withFileMutation(${JSON.stringify(G)},()=>0)`),
+    run(`const gone=(f)=>function(p,...a){if(String(p).includes('.file-locks')){const e=new Error('gone');e.code='ENOENT';throw e}return f.call(this,p,...a)};fs.writeFileSync=gone(fs.writeFileSync);fs.openSync=gone(fs.openSync);c.withFileMutation(process.argv[1],()=>0)`, G),
   ]);
   assert.deepEqual([session.signal, session.code], [null, 0], `the session lock loop ended (${session.out})`);
   assert.match(session.out, /refused: .*busy/);
@@ -20845,4 +20845,49 @@ test('subagents: a background agent runs until its parent logs the completion no
   fs.utimesSync(path.join(subDir, 'agent-afore.jsonl'), old, old);
   assert.deepEqual(by(core.subagentDigests(cwd, S)).aworking, [false, 'done']);
   assert.deepEqual(by(core.parseSubagents(cwd, S)).aworking, [false, 'done']);
+});
+
+// js/polynomial-redos (CodeQL alerts 26-32): each input below is the shape CodeQL reported, at a size
+// where the old regex took 5-8 s (quadratic backtracking); the rewrites take 0.3-20 ms. The bound is
+// far from both, like quoteForCmd's above, so it flags the regression without flaking on a slow runner.
+test('text parsers stay linear on the polynomial-ReDoS inputs CodeQL reported', async (t) => {
+  const linear = (name, run, expected) => t.test(name, () => {
+    const began = process.hrtime.bigint();
+    const got = run();
+    const ms = Number(process.hrtime.bigint() - began) / 1e6;
+    assert.deepStrictEqual(got, expected, 'still correct on the pathological input');
+    assert.ok(ms < 500, `${name} must stay linear (took ${ms.toFixed(1)} ms)`);
+  });
+  const notice = (content) => {
+    const facts = core.newSubagentFacts();
+    core.foldSubagentFacts(facts, { type: 'queue-operation', operation: 'enqueue', timestamp: '2026-09-28T10:00:00.000Z', content });
+    return [...facts.ended];
+  };
+  await linear('targetOf: a Bash command with a long blank run before its last word',
+    () => core.targetOf('Bash', { command: '\t'.repeat(100_000) + 'x' }).target, 'x');
+  await linear('fileCategory: a name of test_ then many _test_',
+    () => core.fileCategory('test_' + '_test_'.repeat(40_000)), 'other');
+  await linear('mdClassify: a heading whose text runs into a bare CR',
+    () => core.mdClassify('#' + '\t'.repeat(100_000) + 'x\ry').kind, 'p');
+  await linear('mdClassify: a bullet whose text runs into a bare CR',
+    () => core.mdClassify('*\t' + '\t'.repeat(100_000) + 'x\ry').kind, 'p');
+  await linear('plainTitle: a heading with a long run of tabs',
+    () => core.plainTitle('#' + '\t'.repeat(50_000) + 'x'), 'x');
+  await linear('rewireCodexConfigText: a long run of blank lines',
+    () => core.rewireCodexConfigText('\n'.repeat(100_000) + 'x', 'm'), '\n'.repeat(100_000) + 'x\nmodel = "m"\nmodel_provider = "ollama"\n');
+  await linear('a task notice of unclosed <task-id> openers',
+    () => notice('<task-notification><task-id>' + '<task-id>a'.repeat(50_000)), []);
+  await linear('a task notice of unclosed <status> openers',
+    () => notice('<task-notification>' + '<status>'.repeat(60_000)), []);
+  await linear('the same notice through the background-shell fold',
+    () => { const f = core.newProcessFacts(); core.foldProcessFacts(f, { type: 'queue-operation', operation: 'enqueue', timestamp: '2026-09-28T10:00:00.000Z', content: '<task-notification><task-id>x</task-id>' + '<status>'.repeat(60_000) }); return f.byId.size >= 0; }, true);
+  // The rewrites keep every match: a closed id after unclosed openers, and the first closed status.
+  assert.deepEqual(notice('<task-notification>\n<task-id>a<task-id>b</task-id>\n<task-id> c </task-id><status>killed</status><status>x'),
+    [['a<task-id>b', { status: 'killed', ts: Date.parse('2026-09-28T10:00:00.000Z') }], ['c', { status: 'killed', ts: Date.parse('2026-09-28T10:00:00.000Z') }]]);
+  assert.equal(core.plainTitle('  ## Plan ##  \n===\n# a#  ##'), 'Plan a#');
+  assert.equal(core.plainTitle('# Notes on C#'), 'Notes on C#', 'a closing # only counts after a blank');
+  assert.equal(core.targetOf('Bash', { command: '  cd x\n  make' }).cmd, '  cd x\n  make', 'only the end is trimmed');
+  assert.equal(core.fileCategory('src/pkg_test_util.go'), 'tests');
+  assert.equal(core.fileCategory('src/latest_test_x'), 'other', 'no extension, no test_ match');
+  assert.deepEqual(core.mdClassify('#  '), { kind: 'h', depth: 1, text: '' });
 });

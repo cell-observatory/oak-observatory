@@ -98,7 +98,7 @@ function herdrTrustCandidates(hooksFile: string, hooksText: string, platform: No
   const script = path.join(path.dirname(hooksFile), platform === 'win32' ? 'herdr-agent-state.ps1' : 'herdr-agent-state.sh');
   // herdr's integration/command.rs::hook_command writes this PowerShell -File form on Windows.
   const command = platform === 'win32'
-    ? `powershell -NoProfile -ExecutionPolicy Bypass -File "${script.replace(/"/g, '\\"')}" session`
+    ? `powershell -NoProfile -ExecutionPolicy Bypass -File "${script}" session` // a Windows path holds no `"`
     : `bash '${script.replace(/'/g, "'\\''")}' session`;
   const candidates: { key: string; hash: string }[] = [];
   groups.forEach((group, groupIndex) => {

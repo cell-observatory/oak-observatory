@@ -59,10 +59,12 @@ function toMs(v: unknown): number {
   return 0;
 }
 
-/** Pull one tagged value out of a <task-notification> block. */
+/** Pull one tagged value out of a <task-notification> block: the first `<name>` that is closed. indexOf, not a
+ *  lazy `<name>([\s\S]*?)</name>`, which read to the end of the text from every unclosed opener. */
 function tag(text: string, name: string): string {
-  const m = new RegExp(`<${name}>([\\s\\S]*?)</${name}>`).exec(text);
-  return m ? m[1].trim() : '';
+  const open = text.indexOf(`<${name}>`);
+  const close = open < 0 ? -1 : text.indexOf(`</${name}>`, open + name.length + 2);
+  return close < 0 ? '' : text.slice(open + name.length + 2, close).trim();
 }
 
 /**

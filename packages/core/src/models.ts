@@ -138,7 +138,15 @@ export function rewireCodexConfigText(text: string, model: string, marker = ''):
     const at = firstTable === -1 ? out.length : firstTable;
     out.splice(at, 0, ...missing);
   }
-  return out.join('\n').replace(/\n*$/, '\n');
+  return oneFinalNewline(out.join('\n'));
+}
+
+/** `text` ending in exactly one newline. A loop: `.replace(/\n*$/, '\n')` retried the end-of-text
+ *  test from every newline of a run, quadratic in a long run of blank lines. */
+function oneFinalNewline(text: string): string {
+  let end = text.length;
+  while (end > 0 && text[end - 1] === '\n') end--;
+  return text.slice(0, end) + '\n';
 }
 
 export interface WireResult {
@@ -193,6 +201,6 @@ export function unwireCodexModel(): string | null {
   });
   if (!removed) return null;
   // Trailing blank lines collapse to one newline, as the wiring wrote the file.
-  fs.writeFileSync(p, kept.join('\n').replace(/\n*$/, '\n'));
+  fs.writeFileSync(p, oneFinalNewline(kept.join('\n')));
   return model ?? 'ollama';
 }

@@ -112,9 +112,9 @@ test('conversation perf: persisted cursor survives a fresh CLI process without r
   const initial = f.read(1);
   fs.appendFileSync(f.file, f.jsonl([f.answer(2)]));
   const output = path.join(f.root, 'child.json'), fd = fs.openSync(output, 'w');
-  const script = `const fs=require('fs'),core=require(${JSON.stringify(path.resolve(__dirname, '../dist'))});let bytes=0;const read=fs.readSync;fs.readSync=function(...args){const n=read.apply(this,args);bytes+=n;return n};const result=core.conversationTail(${JSON.stringify(f.session)},${initial.cursor});console.log(JSON.stringify({result,bytes}));`;
+  const script = `const fs=require('fs'),core=require(${JSON.stringify(path.resolve(__dirname, '../dist'))});let bytes=0;const read=fs.readSync;fs.readSync=function(...args){const n=read.apply(this,args);bytes+=n;return n};const result=core.conversationTail(process.argv[1],${initial.cursor});console.log(JSON.stringify({result,bytes}));`;
   let child;
-  try { child = require('node:child_process').spawnSync(process.execPath, ['-e', script], { stdio: ['ignore', fd, fd], env: { ...process.env, NODE_TEST_CONTEXT: '' } }); }
+  try { child = require('node:child_process').spawnSync(process.execPath, ['-e', script, f.session], { stdio: ['ignore', fd, fd], env: { ...process.env, NODE_TEST_CONTEXT: '' } }); }
   finally { fs.closeSync(fd); }
   assert.ifError(child.error); assert.equal(child.status, 0, fs.readFileSync(output, 'utf8'));
   const { result, bytes } = JSON.parse(fs.readFileSync(output, 'utf8'));

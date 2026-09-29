@@ -50,7 +50,15 @@ const CODE_EXTS = new Set([
 ]);
 
 const TEST_PATH = /(^|\/)(__tests__|__mocks__|tests?|specs?|e2e|__snapshots__)(\/|$)/i;
-const TEST_NAME = /(\.|_|-)(test|spec)\.[a-z0-9]+$|(^|[/_])test_[^/]*\.[a-z0-9]+$|test\.[a-z0-9]+$/i;
+const TEST_NAME = /(\.|_|-)(test|spec)\.[a-z0-9]+$|test\.[a-z0-9]+$/i;
+
+/** `test_foo.py`: a `test_` at the start of a name, or after `_`, before its extension. What
+ *  `(^|[/_])test_[^/]*\.[a-z0-9]+$` matched, found without rescanning the rest from every `_test_`. */
+function testPrefixed(base: string): boolean {
+  const ext = /\.[a-z0-9]+$/i.exec(base);
+  if (!ext) return false;
+  return /(^|_)test_/i.test(base.slice(base.lastIndexOf('/', ext.index) + 1, ext.index));
+}
 
 /** Classify a workspace-relative path into one of the six buckets. Tests win over the code they test
  *  (a `.test.ts` is a test, not code); the order below encodes that precedence. */
@@ -63,7 +71,7 @@ export function fileCategory(rel: string): FileCategory {
   // boundary: `foo.test.ts`, `foo_test.py`, `test.ts` are tests; `latest.ts`, `contest.py`, `attest.go`,
   // `protest.rs` are NOT (the earlier unanchored /test\./ and /test$/ matched them). camelCase
   // `FooTest.kt` / `FooTests.java` is matched on the ORIGINAL case (a capital T after a lowercase/digit).
-  if (TEST_PATH.test(path) || TEST_NAME.test(base)
+  if (TEST_PATH.test(path) || TEST_NAME.test(base) || testPrefixed(base)
       || /(^|[._-])test\.[a-z0-9]+$/.test(base)
       || /(^|[._-])test$/.test(base.replace(/\.[a-z0-9]+$/, ''))
       || /[a-z0-9]Tests?\.[A-Za-z0-9]+$/.test(origBase)) return 'tests';

@@ -12,7 +12,7 @@
 <script>
 (function(){
   var f=document.getElementById('editor-demo'); if(!f) return;
-  function theme(){ return document.documentElement.getAttribute('data-theme') || 'system'; }
+  function theme(){ var t=document.documentElement.getAttribute('data-theme'); return t==='dark'||t==='light'?t:'system'; }
   addEventListener('message',function(e){ if(e.data&&e.data.oakDemoHeight){ f.style.height=e.data.oakDemoHeight+'px'; } });
   function push(){ try{ f.contentWindow.postMessage({oakTheme:theme()},'*'); }catch(_){} }
   f.addEventListener('load',push);

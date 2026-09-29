@@ -132,6 +132,7 @@ function persistCreds(cfg: string, src: { source: 'file' | 'keychain'; account: 
     // user can read in `ps`. Claude Code writes its own item the same way, and like it, falls back to
     // arguments only for a line longer than the 4032 bytes `security -i` reads.
     const hex = Buffer.from(JSON.stringify(blob), 'utf8').toString('hex');
+    if (!/^[0-9a-f]+$/.test(hex)) return false; // hex by construction: never anything a command line could read as more
     const line = `add-generic-password -U -a "${src.account ?? ''}" -s "Claude Code-credentials" -X "${hex}"\n`;
     const r = line.length <= 4032
       ? spawnToolSync('security', ['-i'], { input: line, encoding: 'utf8', timeout: 8000 })

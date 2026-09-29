@@ -218,7 +218,7 @@ export function targetOf(tool: string, input: any): { target: string; detail?: s
     // own `cmd` field, BOUNDED (a giant heredoc must not bloat every poll's payload) and saying
     // exactly how much it withheld. Its own field, never folded into `detail`: detail is the human
     // description on every surface, and the two must stay separable.
-    const lines = cmd.replace(/\s+$/, '').split('\n');
+    const lines = cmd.trimEnd().split('\n');
     const MAX_LINES = 24;
     const MAX_CHARS = 2000;
     let kept = lines.slice(0, MAX_LINES).join('\n');

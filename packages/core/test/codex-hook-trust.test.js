@@ -103,7 +103,7 @@ function backups(b) {
 test('Codex trust regression: matches herdr Windows PowerShell hook and effective command overrides', t => {
   const b = sandbox(t);
   const script = path.join(b.codexDir, 'herdr-agent-state.ps1');
-  const command = `powershell -NoProfile -ExecutionPolicy Bypass -File "${script.replace(/"/g, '\\"')}" session`;
+  const command = `powershell -NoProfile -ExecutionPolicy Bypass -File "${script}" session`;
   const hooks = { hooks: { SessionStart: [
     { hooks: [{ type: 'command', command, timeout: 10 }] },
     { hooks: [{ type: 'command', command: 'bash unrelated.sh', commandWindows: command, timeout: 10 }] },

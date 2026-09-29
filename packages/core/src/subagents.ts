@@ -190,10 +190,12 @@ export function newSubagentFacts(): SubagentFacts {
     vitals: { model: '', effort: '', tokensIn: 0, tokensOut: 0, tokensCacheRead: 0, tokensCacheCreate: 0, firstTs: 0, lastTs: 0, lastTurnTs: 0 } };
 }
 
-/** One tagged value out of a <task-notification> block. */
+/** One tagged value out of a <task-notification> block: the first `<name>` that is closed. indexOf, not
+ *  a lazy `<name>([\s\S]*?)</name>`, which read to the end of the text from every unclosed opener. */
 function notificationTag(text: string, name: string): string {
-  const m = new RegExp(`<${name}>([\\s\\S]*?)</${name}>`).exec(text);
-  return m ? m[1].trim() : '';
+  const open = text.indexOf(`<${name}>`);
+  const close = open < 0 ? -1 : text.indexOf(`</${name}>`, open + name.length + 2);
+  return close < 0 ? '' : text.slice(open + name.length + 2, close).trim();
 }
 
 /** Spawn/result joins and each agent's own todos/usage advance with the shared record cursor. */
@@ -209,11 +211,16 @@ function foldSubagentMeta(facts: SubagentFacts, o: any): void {
     // <summary> and <result>, and are never read as ids.
     const cut = notice.search(/<(?:status|summary|result)>/);
     const status = notificationTag(notice, 'status') || 'completed';
-    for (const m of (cut >= 0 ? notice.slice(0, cut) : notice).matchAll(/<task-id>([\s\S]*?)<\/task-id>/g)) {
-      const id = m[1].trim();
+    const head = cut >= 0 ? notice.slice(0, cut) : notice;
+    // Each <task-id>…</task-id> in turn, by indexOf as notificationTag does.
+    for (let at = head.indexOf('<task-id>'); at >= 0; ) {
+      const end = head.indexOf('</task-id>', at + 9);
+      if (end < 0) break;
+      const id = head.slice(at + 9, end).trim();
       // An enqueue is a new end: a finished agent can be resumed (SendMessage) and notify again.
       // The removal and the attachment are later copies of the same notice, so they only fill a gap.
       if (id && ((o.operation === 'enqueue' && ts > 0) || !facts.ended.has(id))) facts.ended.set(id, { status, ts });
+      at = head.indexOf('<task-id>', end + 10);
     }
     return;
   }

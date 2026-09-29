@@ -28,6 +28,9 @@ class MdTest : TestCase() {
         assertEquals(MdLineKind.Bullet(0, "first"), Md.classify("1. first"))
         assertEquals(MdLineKind.Quote("quoted"), Md.classify("> quoted"))
         assertEquals(MdLineKind.Para("plain text"), Md.classify("plain text"))
+        // Java's \s is ASCII: a Unicode line or paragraph separator is not heading text (JS \S would take it).
+        assertEquals(MdLineKind.Para("# \u2028x"), Md.classify("# \u2028x"))
+        assertEquals(MdLineKind.Heading(1, ""), Md.classify("# \u2029"))
     }
 
     fun testFenceContractCases() {

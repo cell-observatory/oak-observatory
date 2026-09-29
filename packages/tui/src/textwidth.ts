@@ -468,7 +468,7 @@ export function sliceSpan(
       if (col + w - 1 >= from) piece += ch;
       col += w;
     }
-    out.push(piece.replace(/\s+$/, ''));
+    out.push(piece.trimEnd());
   }
   if (clip) while (out.length > 1 && out[out.length - 1] === '') out.pop();
   return out.join('\n');

@@ -417,7 +417,7 @@ test('Observatory detail: a drag over a prompt bands and copies its words, not i
     // From the box's top-left corner to its bottom-right one.
     const a = { row: top, col: clip.x0 }, b = { row: bottom, col: clip.x1 };
     const text = tui.sliceSpan(lines, a, b, { ...clip, rows });
-    assert.equal(text.split('\n').join(' '), PROMPT.replace('\n', ' '), `${label}: every word: ${JSON.stringify(text)}`);
+    assert.equal(text.split('\n').join(' '), PROMPT.replaceAll('\n', ' '), `${label}: every word: ${JSON.stringify(text)}`);
     assert.match(text, /band\nand its own/, `${label}: a row per row, the ask's own line break kept`);
     assert.ok(![glyphs.box.v, glyphs.box.tl, glyphs.box.br].some(c => text.includes(c)), `${label}: no border: ${JSON.stringify(text)}`);
     assert.ok(tui.sliceSpan(lines, a, b, clip).includes(glyphs.box.v), `${label}: control: without the rows, the copy takes the borders`);

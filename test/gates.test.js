@@ -505,7 +505,7 @@ test('a release stamp turns [Unreleased] into the section release.yml publishes'
     fs.writeFileSync(path.join(dir, 'CHANGELOG.md'), changelog);
     const before = day(TZ);
     cp.execFileSync(process.execPath, [path.join(dir, 'scripts/version.mjs'), version], { cwd: dir, env: { ...process.env, TZ } });
-    const dated = new RegExp(`^## \\[${version.replace(/\./g, '\\.')}\\] — (\\S+)$`, 'm').exec(fs.readFileSync(path.join(dir, 'CHANGELOG.md'), 'utf8'))?.[1];
+    const dated = new RegExp(`^## \\[${version.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\] — (\\S+)$`, 'm').exec(fs.readFileSync(path.join(dir, 'CHANGELOG.md'), 'utf8'))?.[1];
     assert.ok([before, day(TZ)].includes(dated), `TZ=${TZ}: stamped ${dated}, where the date is ${before}`);
   }
 });

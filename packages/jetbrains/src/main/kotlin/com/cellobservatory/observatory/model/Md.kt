@@ -18,8 +18,8 @@ sealed class MdLineKind {
 }
 
 object Md {
-    private val H = Regex("^(#{1,6})\\s+(.*)$")
-    private val B = Regex("^(\\s*)([-*•]|\\d{1,2}[.)])\\s+(.*)$")
+    private val H = Regex("^(#{1,6})\\s+([^\\s\\u0085\\u2028\\u2029].*|)$")
+    private val B = Regex("^(\\s*)([-*•]|\\d{1,2}[.)])\\s+([^\\s\\u0085\\u2028\\u2029].*|)$")
     private val Q = Regex("^>\\s?(.*)$")
     private val FENCE = Regex("^\\s*```")
 
