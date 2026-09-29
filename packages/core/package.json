@@ -1,6 +1,6 @@
 {
   "name": "@oak-observatory/core",
-  "version": "0.10.0-dev.0",
+  "version": "0.11.0-dev.0",
   "private": true,
   "description": "Capture + git-free snapshot store + surgical undo engine for OAK. No model calls.",
   "main": "dist/index.js",

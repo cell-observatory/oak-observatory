@@ -2,7 +2,7 @@
   "name": "oak-observatory-vscode",
   "displayName": "OAK",
   "description": "A running list of every file change Claude Code makes, each with its own Keep / Undo (surgical, git-free) \u2014 built for established and mission-critical codebases.",
-  "version": "0.10.0-dev.0",
+  "version": "0.11.0-dev.0",
   "publisher": "cell-observatory",
   "private": true,
   "engines": {
@@ -1455,7 +1455,7 @@
     "vscode:prepublish": "node -e \"require('node:fs').copyFileSync('../../THIRD_PARTY_NOTICES.md', 'THIRD_PARTY_NOTICES.md')\""
   },
   "devDependencies": {
-    "@oak-observatory/core": "0.10.0-dev.0",
+    "@oak-observatory/core": "0.11.0-dev.0",
     "@types/node": "^26.1.2",
     "@types/vscode": "^1.85.0",
     "@vscode/codicons": "^0.0.45",
