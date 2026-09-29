@@ -1,0 +1,9 @@
+<p>OAK captures native <strong>Claude Code and Codex</strong> sessions through hooks and transcript parsing. herdr manages their terminals, state and remote machines.</p>
+<h2>Capture support</h2>
+<table><thead><tr><th>Agent</th><th>Capture</th><th>Setup</th></tr></thead><tbody>
+<tr><td>Claude Code</td><td>Before/after hooks and native transcripts</td><td><code>oak init</code></td></tr>
+<tr><td>Codex</td><td>Native hooks, rollout parsing and reconciled snapshots</td><td><code>oak init</code> with <code>codex</code> on the PATH, or <code>oak init --codex</code> alone</td></tr>
+</tbody></table>
+<p>Run <code>oak doctor --fix</code> to install the pinned herdr backend and its integrations. Start an agent in herdr or use <code>oak agent start --kind claude</code> or <code>codex</code>. Other terminals that herdr can run do not automatically gain OAK edit capture.</p>
+<h2>Models</h2>
+<p>Capture follows the agent’s hooks and transcript format. A model choice does not add a new capture integration. See <a href="models.html">Models</a> for native model configuration.</p>

@@ -54,7 +54,7 @@ export function sanitizeCell(s: string): string {
       i % 2 === 1
         ? part
         : // eslint-disable-next-line no-control-regex
-          part.replace(NON_SGR, '').replace(/[\x00-\x1f\x7f]/g, ' ')
+          part.replace(NON_SGR, '').replace(/[\x00-\x1f\x7f-\x9f]/g, ' ')
     )
     .join('');
 }
@@ -157,28 +157,86 @@ export function fitVisible(s: string, cols: number): string {
  * Wraps rather than ellipsizes: this project's standing rule is that content text is never truncated
  * with an ellipsis, because a path or a message that trails off is a claim the reader cannot check.
  */
+/**
+ * Keep the head AND the tail of a list of lines within a row budget, saying how many are hidden.
+ *
+ * Head-only truncation is the wrong shape for command output: when something fails the reason is in
+ * the LAST rows, so keeping the first N hides exactly the lines a reader opened the row to see. The
+ * marker itself costs a row and therefore comes out of the budget — a fold that overran the budget
+ * it was enforcing would defeat the point.
+ */
+export function middleOut(lines: string[], budget: number): { head: string[]; tail: string[]; hidden: number } {
+  if (budget <= 0) return { head: [], tail: [], hidden: lines.length };
+  if (lines.length <= budget) return { head: lines, tail: [], hidden: 0 };
+  const room = Math.max(1, budget - 1);
+  const headN = Math.ceil(room / 2);
+  const tailN = room - headN;
+  return {
+    head: lines.slice(0, headN),
+    tail: tailN ? lines.slice(lines.length - tailN) : [],
+    hidden: lines.length - headN - tailN,
+  };
+}
+
+/** Compact the active SGR state instead of replaying an ever-growing escape history. */
+function rememberSgr(state: Map<string, string>, escape: string): void {
+  const parts = escape.slice(2, -1).split(';');
+  for (let i = 0; i < parts.length; i++) {
+    const code = Number(parts[i].split(':')[0] || 0);
+    let value = parts[i] || '0', key = String(code);
+    if (code === 0) { state.clear(); state.set('reset', '0'); continue; }
+    if (code === 38 || code === 48 || code === 58) {
+      if (!parts[i].includes(':')) {
+        const count = parts[i + 1] === '2' ? 4 : parts[i + 1] === '5' ? 2 : 0;
+        value = parts.slice(i, i + count + 1).join(';'); i += count;
+      }
+    }
+    if ((code >= 30 && code <= 39) || (code >= 90 && code <= 97)) key = 'fg';
+    else if ((code >= 40 && code <= 49) || (code >= 100 && code <= 107)) key = 'bg';
+    else if (code === 58 || code === 59) key = 'underline-color';
+    else if (code === 22) { state.delete('1'); state.delete('2'); }
+    else if (code === 3 || code === 23) key = 'italic';
+    else if (code === 4 || code === 21 || code === 24) key = 'underline';
+    else if (code === 5 || code === 6 || code === 25) key = 'blink';
+    else if (code === 7 || code === 27) key = 'reverse';
+    else if (code === 8 || code === 28) key = 'conceal';
+    else if (code === 9 || code === 29) key = 'strike';
+    else if (code >= 10 && code <= 19) key = 'font';
+    state.set(key, value);
+  }
+}
+
 export function wrapVisible(s: string, cols: number): string[] {
   if (cols <= 0) return [''];
-  const words = s.split(' ');
-  const lines: string[] = [];
-  let line = '';
-  for (const word of words) {
-    const candidate = line ? `${line} ${word}` : word;
-    if (displayWidth(candidate) <= cols) {
-      line = candidate;
-      continue;
+  const lines: string[] = [], styles = new Map<string, string>();
+  let line = '', width = 0;
+  const replay = () => styles.size ? '\x1b[' + [...styles.values()].join(';') + 'm' : '';
+  const emit = () => {
+    lines.push(line + (styles.size && !line.endsWith('\x1b[0m') ? '\x1b[0m' : ''));
+    line = replay(); width = 0;
+  };
+  for (const word of s.split(' ')) {
+    const wordWidth = displayWidth(word);
+    if (width && width + 1 + wordWidth <= cols) { line += ' '; width++; }
+    else if (width && wordWidth) emit();
+    // Consume SOURCE code points exactly once. A row boundary closes and reopens only the active
+    // style, including styles inherited from earlier words; it never replays the escape history.
+    for (let i = 0; i < word.length;) {
+      if (word[i] === '\x1b') {
+        SGR.lastIndex = i;
+        const escape = SGR.exec(word);
+        if (escape && escape.index === i) {
+          line += escape[0]; rememberSgr(styles, escape[0]); i += escape[0].length;
+          continue;
+        }
+      }
+      const ch = String.fromCodePoint(word.codePointAt(i)!);
+      const cw = charWidth(ch.codePointAt(0)!);
+      if (width && width + cw > cols) emit();
+      line += ch; width += cw; i += ch.length;
     }
-    if (line) lines.push(line);
-    // A single word longer than the budget is hard-broken rather than left to wrap on its own.
-    let rest = word;
-    while (displayWidth(rest) > cols) {
-      const head = trimTrailing(fitVisible(rest, cols), (c) => c === ' ');
-      lines.push(head);
-      rest = rest.slice(head.replace(/\x1b\[[0-9;:]*m/g, '').length);
-    }
-    line = rest;
   }
-  if (line || lines.length === 0) lines.push(line);
+  if (line || !lines.length) lines.push(line);
   return lines;
 }
 
@@ -302,4 +360,116 @@ export function sliceVisible(s: string, from: number, width: number): string {
     col += w;
   }
   return out;
+}
+
+/**
+ * Wrap the display-column range [from, to] (inclusive, in CELLS) of `s` in reverse video, composing
+ * with whatever SGR the line already carries — the drag-selection highlight. A wide glyph is
+ * included whenever any of its cells falls in the range: half a CJK character is not a thing a
+ * terminal can select.
+ */
+export function reverseVisibleSpan(s: string, from: number, to: number, sgr?: string): string {
+  if (to < from) return s;
+  // `sgr`: an explicit selection colour derived from the terminal's real background
+  // (OSC 11) replaces reverse video where the caller has one — same run-length discipline.
+  const OPEN = sgr ?? '\x1b[7m';
+  const CLOSE = sgr ? '\x1b[0m' : '\x1b[27m';
+  const ESC = /\x1b\[[0-9;]*m/g;
+  const parts: { esc: boolean; text: string }[] = [];
+  let at = 0;
+  for (const m of s.matchAll(ESC)) {
+    if (m.index! > at) parts.push({ esc: false, text: s.slice(at, m.index) });
+    parts.push({ esc: true, text: m[0] });
+    at = m.index! + m[0].length;
+  }
+  if (at < s.length) parts.push({ esc: false, text: s.slice(at) });
+  // RUN-LENGTH, not per-char: wrapping every overlapped cell individually multiplied the frame's
+  // bytes ~8× during a full-screen drag (measured 250 KB/paint), and TTY writes are blocking — a
+  // slow SSH link backpressured the key loop mid-drag. One OPEN opens the run; an embedded
+  // SGR inside it (a reset would cancel reverse) is followed by a re-open; one `\x1b[27m` closes.
+  let col = 0;
+  let out = '';
+  let inRun = false;
+  for (const p of parts) {
+    if (p.esc) {
+      out += p.text;
+      if (inRun) out += OPEN; // the embedded sequence may have reset attributes — reassert
+      continue;
+    }
+    for (const ch of p.text) {
+      const w = displayWidth(ch);
+      const overlaps = col <= to && col + w - 1 >= from;
+      if (overlaps && !inRun) {
+        out += OPEN;
+        inRun = true;
+      } else if (!overlaps && inRun) {
+        out += CLOSE;
+        inRun = false;
+      }
+      out += ch;
+      col += w;
+    }
+  }
+  if (inRun) out += CLOSE;
+  return out;
+}
+
+/** A pane's text columns, and the rows that say where their own text is (a boxed prompt's words sit
+ *  inside its borders): `[first, last]`, or null for a row with none. Keyed by painted row. */
+export type SpanClip = { x0: number; x1: number; rows?: ReadonlyMap<number, readonly [number, number] | null> };
+
+/** The columns a span (`a` before `b`) covers on painted row `r`, or null when the row holds no text.
+ *  The drag's band and its copy both read it, so what is banded is what is copied. */
+export function spanCols(r: number, a: { row: number; col: number }, b: { row: number; col: number }, clip?: SpanClip): [number, number] | null {
+  const text = clip?.rows?.get(r);
+  if (text === null) return null;
+  return [
+    r === a.row ? Math.max(a.col, text?.[0] ?? 0) : text?.[0] ?? clip?.x0 ?? 0,
+    r === b.row ? Math.min(b.col, text?.[1] ?? Number.MAX_SAFE_INTEGER) : text?.[1] ?? clip?.x1 ?? Number.MAX_SAFE_INTEGER,
+  ];
+}
+
+/**
+ * The text of a character-precise LINEAR span across painted lines — what a terminal drag selects:
+ * the anchor line from its column to the end, whole lines between, the release line up to and
+ * including its column. Anchor and release arrive in whichever order the drag went; this
+ * normalises. Columns are display cells, so wide glyphs slice correctly. Lines are expected
+ * PLAIN (SGR already stripped); trailing whitespace per line is trimmed, exactly as the painted
+ * frame's right edge is padding, not content.
+ *
+ * `clip` holds the span to ONE pane's text columns, as herdr's selection stays in the pane it began
+ * in: rows are cut to [x0, x1], so a pane beside it never rides along on the rows between. The empty
+ * rows a drag runs past below a pane's last text are dropped too, as herdr's copy drops them. A row
+ * that says where its own text is (`clip.rows`) is cut to that, so a boxed prompt copies as its words.
+ */
+export function sliceSpan(
+  lines: readonly string[],
+  anchor: { row: number; col: number },
+  release: { row: number; col: number },
+  clip?: SpanClip
+): string {
+  const fwd = anchor.row < release.row || (anchor.row === release.row && anchor.col <= release.col);
+  const a = fwd ? anchor : release;
+  const b = fwd ? release : anchor;
+  const out: string[] = [];
+  for (let r = Math.max(0, a.row); r <= b.row && r < lines.length; r++) {
+    const cols = spanCols(r, a, b, clip);
+    if (!cols) continue;
+    const [from, to] = cols;
+    const line = lines[r] ?? '';
+    // OVERLAP-inclusive, the same rule the highlight uses: a wide glyph whose second cell is the
+    // anchor is selected on screen, and the copy must agree with what the reader saw (strict
+    // `col >= from` slicing dropped exactly that glyph).
+    let piece = '';
+    let col = 0;
+    for (const ch of line) {
+      const w = displayWidth(ch);
+      if (col > to) break;
+      if (col + w - 1 >= from) piece += ch;
+      col += w;
+    }
+    out.push(piece.trimEnd());
+  }
+  if (clip) while (out.length > 1 && out[out.length - 1] === '') out.pop();
+  return out.join('\n');
 }

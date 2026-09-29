@@ -4,7 +4,7 @@ import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 
 /**
- * Kotlin mirror of core's Multitasking view-model, parsed from `claude-observatory multitask --json`.
+ * Kotlin mirror of core's Multitasking view-model, parsed from `oak multitask --json`.
  * One row per running agent across every worktree-sibling, nested subagents, and the cross-agent file
  * collisions — all aggregated in core (phase, sparkline bins, ± diffs, risk, the uncapped collision
  * set). The panel only paints; VS Code and JetBrains can never disagree about the numbers.
@@ -32,6 +32,14 @@ data class MtSubagent(
     val edits: Int,
     val added: Int,
     val removed: Int,
+    /** The spawn's OWN model + reasoning effort, its ↑input·↓output·↺cache-read token split, and its
+     *  runtime — the same metrics the terminal shows next to each spawn agent. */
+    val model: String? = null,
+    val effort: String? = null,
+    val tokensIn: Long = 0,
+    val tokensOut: Long = 0,
+    val tokensCacheRead: Long = 0,
+    val durationMs: Long = 0,
 )
 
 /** One running agent (a session in a worktree), the top-level Multitasking row. */
@@ -292,6 +300,12 @@ object MultitaskParser {
         edits = int(o, "edits"),
         added = int(o, "added"),
         removed = int(o, "removed"),
+        model = str(o, "model"),
+        effort = str(o, "effort"),
+        tokensIn = long(o, "tokensIn"),
+        tokensOut = long(o, "tokensOut"),
+        tokensCacheRead = long(o, "tokensCacheRead"),
+        durationMs = long(o, "durationMs"),
     )
 
     private fun collision(o: JsonObject) = Collision(

@@ -25,7 +25,7 @@ export interface ScopeSpan {
 }
 
 /** Which family of syntax a path belongs to. Unknown extensions get no scopes, and say so by `null`. */
-function familyOf(file: string): 'py' | 'brace' | null {
+export function familyOf(file: string): 'py' | 'brace' | null {
   const ext = (file.match(/\.([A-Za-z0-9]+)$/)?.[1] ?? '').toLowerCase();
   if (ext === 'py' || ext === 'pyi') return 'py';
   if (

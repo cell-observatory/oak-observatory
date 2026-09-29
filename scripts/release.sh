@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Build shareable release artifacts into ./release :
-#   - claude-observatory.vsix                    (VS Code extension)
-#   - claude-observatory-<ver>.tgz               (npm-installable CLI:  npm i -g <tgz>)
-#   - claude-observatory-jetbrains-<ver>.zip     (JetBrains plugin — when JDK/Gradle available)
+#   - oak-observatory.vsix                    (VS Code extension)
+#   - oak-observatory-<ver>.tgz               (npm-installable CLI:  npm i -g --allow-scripts=node-pty <tgz>)
+#   - oak-observatory-jetbrains-<ver>.zip     (JetBrains plugin — when JDK/Gradle available)
 # Invoked by `npm run release`. Does NOT publish or commit.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -18,7 +18,7 @@ echo "▸ Packing the CLI (npm tarball)…"
 echo "▸ Building + packaging the VS Code extension…"
 npm run build:vscode --silent
 ( cd packages/vscode && npm run package --silent )
-cp packages/vscode/claude-observatory.vsix release/
+cp packages/vscode/oak-observatory.vsix release/
 
 echo "▸ Building the JetBrains plugin…"
 # Use the committed Gradle wrapper (pins the Gradle version) — never the ambient `gradle`. It still
@@ -26,7 +26,7 @@ echo "▸ Building the JetBrains plugin…"
 : "${JAVA_HOME:=$([ -d /opt/homebrew/opt/openjdk@21 ] && echo /opt/homebrew/opt/openjdk@21 || true)}"
 if [ -n "${JAVA_HOME:-}" ] && [ -x "$JAVA_HOME/bin/java" ]; then
   ( cd packages/jetbrains && JAVA_HOME="$JAVA_HOME" ./gradlew buildPlugin --console=plain -q )
-  cp packages/jetbrains/build/distributions/claude-observatory-jetbrains-*.zip release/
+  cp packages/jetbrains/build/distributions/oak-observatory-jetbrains-*.zip release/
 else
   echo "  (skipped — no JDK at \$JAVA_HOME; CI builds the .zip on tagged releases)"
 fi
@@ -35,6 +35,6 @@ echo
 echo "Release artifacts:"
 ls -1 release
 echo
-echo "Share:  the .tgz installs the CLI with  npm i -g ./claude-observatory-<ver>.tgz"
-echo "        the .vsix installs the sidebar with  code --install-extension claude-observatory.vsix"
+echo "Share:  the .tgz installs the CLI with  npm i -g --allow-scripts=node-pty ./oak-observatory-<ver>.tgz"
+echo "        the .vsix installs the sidebar with  code --install-extension oak-observatory.vsix"
 echo "        the .zip installs in JetBrains IDEs via Settings → Plugins → Install Plugin from Disk"

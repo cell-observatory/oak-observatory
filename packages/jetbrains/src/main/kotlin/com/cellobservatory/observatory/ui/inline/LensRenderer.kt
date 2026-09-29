@@ -19,7 +19,7 @@ import java.awt.Rectangle
 import java.awt.RenderingHints
 
 /**
- * The CodeLens analog: "✓ Keep #N · ↩ Undo · ❝ Chat · ⧉ View diff" above an edit's first line,
+ * The CodeLens analog: "✓ Keep #N · ✗ Undo · ❝ Chat · ⧉ View diff" above an edit's first line,
  * indent-aligned with the code, with real affordances — the hovered action renders in the theme
  * link color with an underline (InlineOverlay drives hover + the hand cursor). Reasoning stays in
  * the Observations tab, not the editor.
@@ -65,7 +65,7 @@ class LensRenderer(
         add(Seg("      ", null))
         add(Seg("✓ Keep") { ReviewOps.keep(project, session, rec.id) })
         add(Seg("      ", null))
-        add(Seg("↩ Undo") { ReviewOps.undoOrRedo(project, session, rec, redo = false) })
+        add(Seg("✗ Undo") { ReviewOps.undoOrRedo(project, session, rec, redo = false) })
         add(Seg("      ", null))
         // ❝ = a monochrome quotation/speech dingbat (matches the row's symbol style; NOT the 💬 emoji).
         add(Seg("❝ Chat") { ReviewOps.chatAbout(project, session, rec.id) })

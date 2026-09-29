@@ -22,7 +22,7 @@ data class ObsFlag(val level: String, val message: String)
 
 data class ObsTodo(val content: String, val status: String)
 
-/** The CLI's `insights` object — Claude's own to-dos + last summary + auto session title. `recap`
+/** The CLI's `insights` object — the agent's own to-dos + last summary + auto session title. `recap`
  *  falls back to `lastSummary` when no `claude -p` recap has been generated (VS Code does the same). */
 data class ObsInsights(val todos: List<ObsTodo>, val lastSummary: String?, val title: String?)
 

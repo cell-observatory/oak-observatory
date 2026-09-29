@@ -3,10 +3,9 @@ package com.cellobservatory.observatory.model
 /**
  * How the Overview's left-nav members fold into side-by-side groups.
  *
- * The five nav members answer two different questions, and reading one usually means reading its partner:
- * WHICH conversation (Sessions ⟷ Fleet) and WHAT it is doing (Workflows ⟷ Tasks ⟷ Processes). Grouped mode
- * renders each group's members as columns of one tab so the pair is on screen together, at the cost of
- * width — which is why it is a toggle and not the default.
+ * Grouped mode renders all five nav members as columns of ONE tab, so which conversation (Sessions,
+ * Workers) and what it is doing (Workflows, Tasks, Processes) are on screen together, at the cost of width —
+ * which is why it is a toggle and not the default.
  *
  * Kept as pure data here, away from the panel, for one reason: the member names are also the names core's
  * guided tour uses, and every tab title write in the panel resolves through them. A wrong answer from this
@@ -20,21 +19,20 @@ object NavGrouping {
     const val TASKS = "tasks"
     const val PROCESSES = "processes"
 
-    const val SESSIONS_FLEET = "sessions-fleet"
-    const val RUNS = "workflows-tasks-processes"
+    /** ONE group (group ALL the tabs together, never two) — every member
+     *  side by side; folding columns is how a reader narrows it. */
+    const val NAV_ALL = "nav-all"
 
     /** Group key → its members, in shipped order. Sessions leads its group for the same reason it leads
      *  the plain tab strip: which session you are reviewing precedes every other question. */
     val GROUPS: Map<String, List<String>> = linkedMapOf(
-        SESSIONS_FLEET to listOf(SESSIONS, FLEET),
-        RUNS to listOf(WORKFLOWS, TASKS, PROCESSES),
+        NAV_ALL to listOf(SESSIONS, FLEET, WORKFLOWS, TASKS, PROCESSES),
     )
 
     /** The tab title each group carries. Members are separated by the same middle dot the product uses
      *  everywhere else for "and also". */
     val GROUP_TITLES: Map<String, String> = mapOf(
-        SESSIONS_FLEET to "Sessions · Fleet",
-        RUNS to "Workflows · Tasks · Processes",
+        NAV_ALL to "Sessions · Workers · Workflows · Tasks · Processes",
     )
 
     /**
@@ -49,24 +47,34 @@ object NavGrouping {
     }
 
     // --- The Timeline window's own grouping (0.10.0) -----------------------------------------------
-    // Its three surfaces answer ONE question between them — what happened, in order — so grouped mode
-    // puts all three on screen at once rather than pairing two of them: the ask on the left, and what
-    // came back from it (observations, then the tool calls themselves) to its right. The Overview's
-    // grouping is a separate toggle for a separate window; nothing here reads its setting.
+    // Its four surfaces answer ONE question between them — what is happening, in order — so grouped mode
+    // puts all four on screen at once rather than pairing two of them: the conversation on the left, and
+    // the asks, observations and tool calls to its right. The Overview's grouping is a separate toggle
+    // for a separate window; nothing here reads its setting.
 
     const val PROMPTS = "prompts"
     const val OBSERVATIONS = "observations"
     const val ACTIONS = "actions"
 
-    /** The group key the Timeline's remembered column widths are stored under. */
-    const val TIMELINE = "timeline"
+    /** The Feed tab (0.10.0) — the conversation as it happened (prompts, replies, thinking, tool
+     *  calls, permissions, captured edits), or the live/audit feed of whatever the Overview selects.
+     *  It absorbed the Conversation tab (2026-09-23): one Timeline surface carries all the info. Its
+     *  KEY is its title lowercased, like every other member here: the tab strip, the column pane and
+     *  the tour all address a member by name, so a key spelling something the reader cannot see
+     *  strands whoever asks for the surface — silently, at the map lookup. */
+    const val FEED = "feed"
 
-    /** The Timeline's members, in shipped order — the same order their tabs carry ungrouped. */
-    val TIMELINE_MEMBERS: List<String> = listOf(PROMPTS, OBSERVATIONS, ACTIONS)
+    /** The group key the Timeline's remembered column widths are stored under. */
+    const val TIMELINE = "timeline-feed"
+
+    /** The members, in the same order as their solo tabs: the Feed leads. */
+    val TIMELINE_MEMBERS: List<String> = listOf(FEED, PROMPTS, OBSERVATIONS, ACTIONS)
 
     val TIMELINE_TITLES: Map<String, String> = mapOf(
         PROMPTS to "Prompts",
         OBSERVATIONS to "Observations",
         ACTIONS to "Actions",
+        FEED to "Feed",
     )
+
 }

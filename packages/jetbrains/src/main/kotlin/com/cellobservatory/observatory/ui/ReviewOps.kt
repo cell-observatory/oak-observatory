@@ -6,6 +6,7 @@ import com.cellobservatory.observatory.model.EditRecord
 import com.cellobservatory.observatory.model.SessionPrompt
 import com.cellobservatory.observatory.model.SessionRow
 import com.cellobservatory.observatory.model.SessionsParser
+import com.cellobservatory.observatory.model.compactBytes
 import com.cellobservatory.observatory.model.relTime
 import com.cellobservatory.observatory.model.UndoResult
 import com.cellobservatory.observatory.services.ObservatoryService
@@ -36,20 +37,24 @@ object ReviewOps {
 
     fun notify(project: Project, text: String, type: NotificationType = NotificationType.INFORMATION) {
         NotificationGroupManager.getInstance()
-            .getNotificationGroup("Claude Observatory")
+            .getNotificationGroup("OAK")
             .createNotification(text, type)
             .notify(project)
     }
 
     /** Shared failure message when a keep/clean CLI call returns non-ok (usually a missing binary). */
     private fun cliFailMsg(action: String) =
-        "Could not $action — the claude-observatory CLI failed or isn't installed. " +
-            "Install it and set its path in Settings → Tools → Claude Observatory."
+        "Could not $action — the oak CLI failed or isn't installed. " +
+            "Install it and set its path in Settings → Tools → OAK."
 
     /** Bulk-revert refusals (e.g. the #43 phantom guard) appended to the toast — the refusal message
      *  names the remediation (`clean --phantoms`), and swallowing it leaves totals that don't add up. */
     private fun refusedSuffix(res: ObservatoryCli.UndoScopeResult): String =
-        if (res.errors > 0) " · ${res.errors} refused — ${res.firstError ?: ""}" else ""
+        (if (res.errors > 0) " · ${res.errors} refused — ${res.firstError ?: ""}" else "") + unrecordedSuffix(res.unrecorded)
+
+    /** Files rewritten whose status the store could not record: the CLI's sentence, which names them and
+     *  the command that records them. Every bulk toast that carries it is a WARNING, never a success. */
+    private fun unrecordedSuffix(unrecorded: String?): String = unrecorded?.let { " · $it" } ?: ""
 
     fun keep(project: Project, session: String, id: Int, advance: Boolean = true) {
         runBg(project, "Keeping edit #$id") {
@@ -157,7 +162,7 @@ object ReviewOps {
                 val choice = Messages.showYesNoCancelDialog(
                     project,
                     "${res.message}\n\nUndo this change and the unit(s) that depend on it together?",
-                    "Claude Observatory — Conflict",
+                    "OAK — Conflict",
                     "Undo Both",
                     "Force-Restore File",
                     "Cancel",
@@ -170,6 +175,7 @@ object ReviewOps {
                         ApplicationManager.getApplication().invokeLater {
                             ObservatoryService.getInstance(project).refresh(force = true)
                             if (r == null) notify(project, cliFailMsg("undo the dependent units"), NotificationType.ERROR)
+                            else if (r.unrecorded != null) notify(project, "Reverted ${r.undone} edit(s) together." + refusedSuffix(r), NotificationType.WARNING)
                             else status(project, "Reverted ${r.undone} edit(s) together." + (if (r.conflicts > 0) " · ${r.conflicts} conflict(s) left" else "") + refusedSuffix(r))
                         }
                     }
@@ -184,9 +190,9 @@ object ReviewOps {
             }
             val force = Messages.showYesNoDialog(
                 project,
-                "${res.message}\n\nForce-${if (redo) "re-apply" else "restore"} the file? " +
-                    "This also drops later edits to this file.",
-                "Claude Observatory — Conflict",
+                // Core's message already names what a forced run drops.
+                "${res.message}\n\nForce-${if (redo) "re-apply" else "restore"} the file?",
+                "OAK — Conflict",
                 if (redo) "Force Re-Apply" else "Force-Restore File",
                 "Cancel",
                 Messages.getWarningIcon(),
@@ -223,7 +229,7 @@ object ReviewOps {
         val ok = Messages.showYesNoDialog(
             project,
             "Revert every pending edit in this session?\n\nThis rewrites files on disk. Accepted edits are left alone.",
-            "Claude Observatory",
+            "OAK",
             "Revert All",
             "Cancel",
             Messages.getWarningIcon(),
@@ -239,7 +245,7 @@ object ReviewOps {
                     notify(
                         project,
                         "Reverted ${r.undone} of ${r.total} pending edit(s)." + refusedSuffix(r),
-                        if (r.errors > 0) NotificationType.WARNING else NotificationType.INFORMATION,
+                        if (r.errors > 0 || r.unrecorded != null) NotificationType.WARNING else NotificationType.INFORMATION,
                     )
                 }
             }
@@ -268,7 +274,7 @@ object ReviewOps {
             "Revert ${list.size} pending edit(s) across $fileCount file(s) in $scope?\n\n" +
                 "This rewrites the files on disk. Later-overlapping edits may conflict " +
                 "(revert those individually to force-restore).",
-            "Revert Claude's Edits",
+            "Revert the agent's Edits",
             "Revert ${list.size} Edit(s)", "Cancel", Messages.getWarningIcon(),
         )
         if (ok != Messages.YES) return
@@ -285,7 +291,7 @@ object ReviewOps {
                     "Reverted ${res.undone} edit(s)" +
                         (if (res.conflicts > 0) " · ${res.conflicts} conflict(s) — undo those individually to force" + (res.firstConflict?.let { " — ${it.substringBefore(". ")}" } ?: "") else "") +
                         refusedSuffix(res),
-                    if (res.errors > 0) NotificationType.WARNING else NotificationType.INFORMATION,
+                    if (res.errors > 0 || res.unrecorded != null) NotificationType.WARNING else NotificationType.INFORMATION,
                 )
             }
         }
@@ -310,7 +316,7 @@ object ReviewOps {
             "Re-apply ${list.size} undone edit(s) across $fileCount file(s) in $scope?\n\n" +
                 "This rewrites the files on disk. Overlapping edits may conflict " +
                 "(redo those individually to force).",
-            "Redo Claude's Edits",
+            "Redo the agent's Edits",
             "Redo ${list.size} Edit(s)", "Cancel", Messages.getWarningIcon(),
         )
         if (ok != Messages.YES) return
@@ -324,7 +330,9 @@ object ReviewOps {
             } else {
                 done(
                     project,
-                    "Re-applied ${res.redone} edit(s)" + if (res.conflicts > 0) " · ${res.conflicts} conflict(s) — redo those individually to force" else "",
+                    "Re-applied ${res.redone} edit(s)" + (if (res.conflicts > 0) " · ${res.conflicts} conflict(s) — redo those individually to force" else "") +
+                        unrecordedSuffix(res.unrecorded),
+                    if (res.unrecorded != null) NotificationType.WARNING else NotificationType.INFORMATION,
                 )
             }
         }
@@ -356,7 +364,7 @@ object ReviewOps {
             "Revert ${list.size} pending edit(s) across ${files.size} file(s) in $longScope?\n\n" +
                 "This rewrites the files on disk. Later-overlapping edits may conflict " +
                 "(revert those individually to force-restore).",
-            "Revert Claude's Edits",
+            "Revert the agent's Edits",
             "Revert ${list.size} Edit(s)", "Cancel", Messages.getWarningIcon(),
         )
         if (ok != Messages.YES) return
@@ -371,7 +379,7 @@ object ReviewOps {
                     "Reverted ${res.undone} edit(s) in $longScope" +
                         (if (res.conflicts > 0) " · ${res.conflicts} conflict(s) — revert those individually to force" + (res.firstConflict?.let { " — ${it.substringBefore(". ")}" } ?: "") else "") +
                         refusedSuffix(res),
-                    if (res.errors > 0) NotificationType.WARNING else NotificationType.INFORMATION,
+                    if (res.errors > 0 || res.unrecorded != null) NotificationType.WARNING else NotificationType.INFORMATION,
                 )
             }
         }
@@ -415,7 +423,7 @@ object ReviewOps {
                 if (!supported) {
                     notify(
                         project,
-                        "Rewind needs claude-observatory 0.10 or newer — run `claude-observatory update`.",
+                        "Rewind needs oak 0.10 or newer — run `oak update`.",
                         NotificationType.WARNING,
                     )
                 } else {
@@ -440,9 +448,9 @@ object ReviewOps {
             project.basePath?.let { refreshRecursive(it) }
             notify(
                 project,
-                "The claude-observatory CLI on PATH ignored `--dry-run` and already reverted " +
+                "The oak CLI on PATH ignored `--dry-run` and already reverted " +
                     "${preview.pending} edit(s) from prompt $label onward, without confirming first. " +
-                    "Nothing further was done — run `claude-observatory update` before rewinding again.",
+                    "Nothing further was done — run `oak update` before rewinding again.",
                 NotificationType.ERROR,
             )
             return
@@ -482,7 +490,7 @@ object ReviewOps {
             "Rewind to before prompt #${prompt.index}?\n\n$scope\n\n" +
                 "Accepted edits are left alone, and edits captured before the session's first ask are " +
                 "outside every boundary and are never included.",
-            "Rewind Claude's Edits",
+            "Rewind the agent's Edits",
             "Rewind", "Cancel", Messages.getWarningIcon(),
         )
         if (ok != Messages.YES) return
@@ -516,9 +524,9 @@ object ReviewOps {
             ApplicationManager.getApplication().invokeLater {
                 if (project.isDisposed) return@invokeLater
                 ObservatoryService.getInstance(project).refresh(force = true)
-                val type = if (res.errors > 0 || res.conflicts > 0) NotificationType.WARNING else NotificationType.INFORMATION
+                val type = if (res.errors > 0 || res.conflicts > 0 || res.unrecorded != null) NotificationType.WARNING else NotificationType.INFORMATION
                 val n = NotificationGroupManager.getInstance()
-                    .getNotificationGroup("Claude Observatory")
+                    .getNotificationGroup("OAK")
                     .createNotification(msg, type)
                 // Redo is the promise the dialog made, so it is a BUTTON, not prose. It restores THESE ids —
                 // the ones this rewind actually moved — never the scope re-resolved, which would also
@@ -558,8 +566,9 @@ object ReviewOps {
             done(
                 project,
                 "Re-applied ${res.redone} edit(s) from prompt $label onward" +
-                    if (res.conflicts > 0) " · ${res.conflicts} conflict(s) — redo those individually to force" else "",
-                if (res.conflicts > 0) NotificationType.WARNING else NotificationType.INFORMATION,
+                    (if (res.conflicts > 0) " · ${res.conflicts} conflict(s) — redo those individually to force" else "") +
+                    unrecordedSuffix(res.unrecorded),
+                if (res.conflicts > 0 || res.unrecorded != null) NotificationType.WARNING else NotificationType.INFORMATION,
             )
         }
     }
@@ -570,7 +579,7 @@ object ReviewOps {
         val what = resolvedCount?.let { "$it resolved edit(s)" } ?: "this session's resolved edits"
         val ok = Messages.showYesNoDialog(
             project, "Clear $what from the log? Pending edits are kept.",
-            "Claude Observatory", "Clear", "Cancel", Messages.getQuestionIcon(),
+            "OAK", "Clear", "Cancel", Messages.getQuestionIcon(),
         )
         if (ok != Messages.YES) return
         runBg(project, "Clearing resolved edits") {
@@ -588,7 +597,7 @@ object ReviewOps {
         }
         val ok = Messages.showYesNoDialog(
             project, "Clear $resolvedCount resolved edit(s) in $scope? Pending edits are kept.",
-            "Claude Observatory", "Clear", "Cancel", Messages.getQuestionIcon(),
+            "OAK", "Clear", "Cancel", Messages.getQuestionIcon(),
         )
         if (ok != Messages.YES) return
         runBg(project, "Clearing resolved edits in $scope") {
@@ -607,7 +616,7 @@ object ReviewOps {
         }
         val ok = Messages.showYesNoDialog(
             project, "Clear $resolved resolved edit(s) in $scope? Pending edits are kept.",
-            "Claude Observatory", "Clear", "Cancel", Messages.getQuestionIcon(),
+            "OAK", "Clear", "Cancel", Messages.getQuestionIcon(),
         )
         if (ok != Messages.YES) return
         runBg(project, "Clearing resolved edits in $scope") {
@@ -649,7 +658,7 @@ object ReviewOps {
             "Reject $pending pending edit(s) in $label? This reverts them on disk. " +
                 "Unsaved changes to affected files are saved first; later-overlapping edits may conflict " +
                 "(revert those individually to force).",
-            "Claude Observatory", "Reject", "Cancel", Messages.getWarningIcon(),
+            "OAK", "Reject", "Cancel", Messages.getWarningIcon(),
         )
         if (ok != Messages.YES) return
         FileDocumentManager.getInstance().saveAllDocuments()
@@ -669,8 +678,9 @@ object ReviewOps {
                     project,
                     "Rejected ${res.undone} edit(s) in $label" +
                         (if (res.conflicts > 0) " · ${res.conflicts} conflict(s) — revert those individually to force" + (res.firstConflict?.let { " — ${it.substringBefore(". ")}" } ?: "") else "") +
-                        (if (res.errors > 0) " · ${res.errors} refused${res.firstError?.let { " — " + it } ?: ""}" else ""),
-                    if (res.errors > 0) NotificationType.WARNING else NotificationType.INFORMATION,
+                        (if (res.errors > 0) " · ${res.errors} refused${res.firstError?.let { " — " + it } ?: ""}" else "") +
+                        unrecordedSuffix(res.unrecorded),
+                    if (res.errors > 0 || res.unrecorded != null) NotificationType.WARNING else NotificationType.INFORMATION,
                 )
             }
         }
@@ -695,7 +705,7 @@ object ReviewOps {
             "Reject all pending edits in task “$label”? This reverts them on disk. " +
                 "Unsaved changes to affected files are saved first; later-overlapping edits may conflict " +
                 "(revert those individually to force).",
-            "Claude Observatory", "Reject Task", "Cancel", Messages.getWarningIcon(),
+            "OAK", "Reject Task", "Cancel", Messages.getWarningIcon(),
         )
         if (ok != Messages.YES) return
         FileDocumentManager.getInstance().saveAllDocuments()
@@ -710,7 +720,9 @@ object ReviewOps {
                 done(
                     project,
                     "Rejected ${res.undone} edit(s) in task “$label”" +
-                        if (res.conflicts > 0) " · ${res.conflicts} conflict(s) — revert those individually to force" + (res.firstConflict?.let { " — ${it.substringBefore(". ")}" } ?: "") else "",
+                        (if (res.conflicts > 0) " · ${res.conflicts} conflict(s) — revert those individually to force" + (res.firstConflict?.let { " — ${it.substringBefore(". ")}" } ?: "") else "") +
+                        unrecordedSuffix(res.unrecorded),
+                    if (res.unrecorded != null) NotificationType.WARNING else NotificationType.INFORMATION,
                 )
             }
         }
@@ -748,21 +760,37 @@ object ReviewOps {
         chatContext(project, session, ChatRef.Edit(id), "edit #$id")
     }
 
-    /** Zero-token context chat about ANY reference (edit / subagent / task / action / whole session):
-     *  core assembles the ready-to-paste prompt via `chat-context --json`, and we copy it to the
-     *  clipboard (Anthropic's JetBrains plugin exposes no open-chat API — clipboard-only, degrading
-     *  identically to VS Code when the Claude extension is absent). NEVER calls a model. */
+    /** The assembled context is a draft until the reader explicitly sends it. */
     fun chatContext(project: Project, session: String, ref: ChatRef, label: String) {
         ApplicationManager.getApplication().executeOnPooledThread {
             val prompt = ObservatoryCli.chatContextJson(session, project.basePath, ref)
             ApplicationManager.getApplication().invokeLater {
-                if (prompt.isNullOrBlank()) {
-                    notify(project, cliFailMsg("build the chat context for $label"), NotificationType.ERROR)
-                } else {
-                    com.intellij.openapi.ide.CopyPasteManager.getInstance()
-                        .setContents(java.awt.datatransfer.StringSelection(prompt))
-                    notify(project, "Prompt about $label copied — paste it into your Claude Code terminal/chat.")
-                }
+                if (project.isDisposed) return@invokeLater
+                if (prompt.isNullOrBlank()) notify(project, cliFailMsg("build the chat context for $label"), NotificationType.ERROR)
+                else deliverPrompt(project, session, prompt, "Prompt about $label")
+            }
+        }
+    }
+
+    /** Clipboard fallback is ready before opening the editable, explicit-send dialog. */
+    fun deliverPrompt(project: Project, session: String, text: String, title: String, commentIds: List<String> = emptyList()) {
+        val clipboard = com.intellij.openapi.ide.CopyPasteManager.getInstance()
+        clipboard.setContents(java.awt.datatransfer.StringSelection(text))
+        val input = javax.swing.JTextArea(text, 18, 72).apply { lineWrap = true; wrapStyleWord = true }
+        val dialog = object : com.intellij.openapi.ui.DialogWrapper(project) {
+            init { setTitle(title); setOKButtonText("Send to agent"); setCancelButtonText("Keep draft"); init() }
+            override fun createCenterPanel(): javax.swing.JComponent = javax.swing.JScrollPane(input)
+        }
+        val send = dialog.showAndGet()
+        val draft = input.text
+        clipboard.setContents(java.awt.datatransfer.StringSelection(draft))
+        if (!send || draft.isBlank()) return
+        ApplicationManager.getApplication().executeOnPooledThread {
+            val failure = ObservatoryCli.prompt(session, draft, project.basePath, commentIds)
+            ApplicationManager.getApplication().invokeLater {
+                // The CLI's reason, as VS Code shows it: "no live pane", "the agent is blocked", or that a
+                // timed-out send may already have landed — each asks for a different next step.
+                if (!project.isDisposed) notify(project, if (failure == null) "Sent to the agent in herdr." else "$failure. Draft kept on the clipboard.")
             }
         }
     }
@@ -808,10 +836,25 @@ object ReviewOps {
 
     /** Run `doctor` and open the setup diagnostics (hooks, PATH, config, session, status line) in a tab. */
     fun openDoctor(project: Project) {
-        openMarkdown(project, "claude-observatory-doctor", "Could not run doctor (is the claude-observatory CLI installed?)") {
-            ObservatoryCli.doctorMarkdown(project.basePath)
+        runBg(project, "Running the setup check…") {
+            val r = ObservatoryCli.doctor(project.basePath)
+            ApplicationManager.getApplication().invokeLater {
+                if (project.isDisposed) return@invokeLater
+                if (r.stdout.isNotBlank()) openTextTab(project, "claude-observatory-doctor", ".md", r.stdout)
+                else notify(project, doctorFailure(r), NotificationType.ERROR)
+            }
         }
     }
+
+    /** Why a doctor run printed nothing. One killed at its deadline is slow, not missing: a saved herdr
+     *  machine that does not answer holds each forwarding probe for its full 30 s. */
+    internal fun doctorFailure(r: ObservatoryCli.CliResult): String =
+        if (r.stderr.startsWith("oak timed out")) {
+            "The setup check did not finish within ${ObservatoryCli.HEAVY_TIMEOUT_MS / 60_000} minutes. A saved herdr machine that does " +
+                "not answer is the usual cause — run `oak doctor` in a terminal to see which check is waiting."
+        } else {
+            "Could not run doctor (is the oak CLI installed?)"
+        }
 
     /** Opt-in `claude -p` deep analysis of one edit — spends tokens, can run for minutes (parity with VS
      *  Code's analyzeEdit). Runs the CLI's `analyze` (honoring the `claudeBin` setting) and opens its
@@ -821,7 +864,7 @@ object ReviewOps {
             val text = ObservatoryCli.analyze(session, id, project.basePath)
             ApplicationManager.getApplication().invokeLater {
                 if (text.isNullOrBlank()) {
-                    notify(project, "Could not analyze edit #$id — is the claude CLI installed? Set its path in Settings → Tools → Claude Observatory.", NotificationType.ERROR)
+                    notify(project, "Could not analyze edit #$id — is the claude CLI installed? Set its path in Settings → Tools → OAK.", NotificationType.ERROR)
                 } else {
                     openTextTab(project, "claude-observatory-analysis-$id", ".md", text)
                 }
@@ -836,7 +879,7 @@ object ReviewOps {
             val text = ObservatoryCli.recap(session, fresh = true, project.basePath)
             ApplicationManager.getApplication().invokeLater {
                 if (text.isNullOrBlank()) {
-                    notify(project, "Could not refresh the recap — is the claude CLI installed? Set its path in Settings → Tools → Claude Observatory.", NotificationType.ERROR)
+                    notify(project, "Could not refresh the recap — is the claude CLI installed? Set its path in Settings → Tools → OAK.", NotificationType.ERROR)
                 } else {
                     onRecap(text)
                 }
@@ -844,16 +887,31 @@ object ReviewOps {
         }
     }
 
-    /** Install the PreToolUse/PostToolUse capture hooks (`claude-observatory init`). Shared by the
+    /** Install the PreToolUse/PostToolUse capture hooks (`oak init`). Shared by the
      *  Observations panel toolbar and the registered Install Hooks action. */
     fun installHooks(project: Project) {
         runBg(project, "Installing capture hooks…") {
             val r = ObservatoryCli.init(project.basePath)
             ApplicationManager.getApplication().invokeLater {
+                // The CLI's own output IS the report now: `init` also installs codex hooks, runs a
+                // live firing probe, and may wire a local model — a canned "installed" line
+                // swallowed all of that, and a codex-probe failure exit read as "CLI missing" even
+                // though the Claude hooks landed fine. Show the tail either way.
+                val tail = (r.stdout.trim().lines().takeLast(6).joinToString("\n")).take(600)
                 if (r.ok) {
-                    notify(project, "Capture hooks installed. Quit Claude Code and relaunch it — hooks are snapshotted at session start.")
+                    notify(
+                        project,
+                        "Capture hooks installed. Quit Claude Code and relaunch it — hooks are snapshotted at session start." +
+                            (if (tail.isNotBlank()) "\n$tail" else "")
+                    )
+                } else if (r.stdout.isNotBlank()) {
+                    notify(
+                        project,
+                        "Install finished with a warning (some steps may still have succeeded):\n$tail\n${r.stderr.take(200)}",
+                        NotificationType.WARNING
+                    )
                 } else {
-                    notify(project, "Install failed — is the claude-observatory CLI installed? ${r.stderr.take(200)}", NotificationType.ERROR)
+                    notify(project, "Install failed — is the oak CLI installed? ${r.stderr.take(200)}", NotificationType.ERROR)
                 }
             }
         }
@@ -926,7 +984,7 @@ object ReviewOps {
                                     "Never included: the session you are in, anything mid-capture, anything from another " +
                                     "workspace, anything reviewed-and-quiet for under a day, or anything with pending edits " +
                                     "that is under two weeks old.",
-                                "Claude Observatory", "Clear Sessions", "Cancel", Messages.getWarningIcon(),
+                                "OAK", "Clear Sessions", "Cancel", Messages.getWarningIcon(),
                             )
                             if (ok == Messages.YES) runClean(project, session, CleanVerb.COMPLETED)
                         }
@@ -936,7 +994,7 @@ object ReviewOps {
                 if (drop) {
                     val ok = Messages.showYesNoDialog(
                         project, "Drop session $session? This deletes its captured edits + blobs. Files on disk are NOT changed.",
-                        "Claude Observatory", "Drop Session", "Cancel", Messages.getWarningIcon(),
+                        "OAK", "Drop Session", "Cancel", Messages.getWarningIcon(),
                     )
                     if (ok != Messages.YES) return@setItemChosenCallback
                 }
@@ -996,7 +1054,7 @@ object ReviewOps {
     /** Pin which capture session the observatory shows (e.g. the demo-showcase fixture) instead of the
      *  auto-resolved newest one — a chooser over every session in the store, centered on [anchor].
      *  Sessions lead with their human-readable TITLE (from `sessions --json`, the single CLI backend),
-     *  fetched off the EDT; when the CLI is unavailable the popup still opens with raw ids. */
+     *  fetched off the EDT; unavailable listings leave the Auto option available. */
     fun chooseSession(project: Project, anchor: javax.swing.JComponent?) {
         com.intellij.util.concurrency.AppExecutorUtil.getAppExecutorService().submit {
             val entries = sessionEntries(project)
@@ -1017,93 +1075,113 @@ object ReviewOps {
         val parsed = ObservatoryCli.sessionsJson(project.basePath, ObservatoryService.getInstance(project).currentSession())
             ?.let { SessionsParser.parse(it) }
         if (parsed != null) return parsed.sessions
-        // CLI-less fallback: the in-process store reader knows the counts but no titles, so rows carry
-        // what it has and nothing invented.
-        return com.cellobservatory.observatory.core.StoreReader.listSessions()
-            .map { SessionRow(it.id, null, it.lastMs, false, edits = it.edits, pending = it.pending, files = 0) }
+        return emptyList() // only the CLI can establish which machine owns a session
     }
 
-    /** The chooser. Rows lead with Claude's own title and are ordered live-session-first, then by
+    /** The session choosers' delete row. A string chooser has no per-row buttons (VS Code's quick picks
+     *  carry a 🗑 on each row), so this row opens [chooseSessionToDelete] over the same sessions. */
+    const val DELETE_SESSION = "🗑  Delete a session…"
+
+    /** Pick which session to delete, then [confirmAndDeleteSession] it. */
+    fun chooseSessionToDelete(project: Project, rows: List<SessionRow>, anchor: javax.swing.JComponent?) {
+        if (rows.isEmpty()) return notify(project, "No session to delete.")
+        val byLabel = LinkedHashMap<String, SessionRow>()
+        for (r in rows) byLabel["${r.displayName}  —  ${r.id.take(8)} · ${r.workspace.ifBlank { "Unknown workspace" }} · ${relTime(r.lastActiveMs)}"] = r
+        val popup = com.intellij.openapi.ui.popup.JBPopupFactory.getInstance()
+            .createPopupChooserBuilder(byLabel.keys.toList())
+            .setTitle("Delete which session?")
+            .setItemChosenCallback { chosen -> byLabel[chosen]?.let { confirmAndDeleteSession(project, it) } }
+            .createPopup()
+        if (anchor != null && anchor.isShowing) popup.showUnderneathOf(anchor) else popup.showCenteredInCurrentWindow(project)
+    }
+
+    /** Remove a conversation from every Observatory picker and purge its captured edits for good
+     *  (`oak sessions --delete <id>`). Confirmed first — the confirm names the edits still pending review,
+     *  whose before-snapshots go with the purge, and says `oak sessions --undelete <id>` lists the session
+     *  again without its edits — then run OFF the EDT with a refresh after, so the row drops out of every
+     *  picker (core filters hidden sessions out of all of them). Deleting the session under review drops
+     *  the pin so resolution falls back to the newest REMAINING session (see below). The agent's own
+     *  transcript/rollout is NEVER touched. */
+    fun confirmAndDeleteSession(project: Project, row: SessionRow) {
+        val pending = row.pending
+        val ok = Messages.showYesNoDialog(
+            project,
+            "Delete “${row.displayName}” (${row.id.take(8)}) from Observatory?\n\n" +
+                "It is removed from every session picker and its captured edits are purged for good. The " +
+                "conversation transcript itself is NOT deleted — only Observatory's view of it.\n\n" +
+                (if (pending > 0) "${if (pending == 1) "1 of those edits is" else "$pending of those edits are"} still pending review: " +
+                    "the purge drops ${if (pending == 1) "its before-snapshot" else "their before-snapshots"}, so OAK can no longer undo " +
+                    "${if (pending == 1) "that change" else "those changes"}.\n\n" else "") +
+                "`oak sessions --undelete ${row.id}` lists the session again, without its edits.",
+            "OAK",
+            if (pending > 0) "Delete and Purge $pending Pending Edit${if (pending == 1) "" else "s"}" else "Delete Session",
+            "Cancel",
+            Messages.getWarningIcon(),
+        )
+        if (ok != Messages.YES) return
+        // Was this the session under review? If so, a plain refresh is not enough: delete leaves the
+        // agent's transcript in place, and the pin-existence check ([ObservatoryService.pinStillExists])
+        // keys on that transcript — so an explicit pin to the deleted id would survive and blank every
+        // panel. Dropping the pin (applySessionChoice(null)) resumes auto-resolution, which core filters
+        // hidden sessions out of, so it lands on the newest REMAINING one. Read on the EDT while the
+        // list is live and currentSession() is warm.
+        val service = ObservatoryService.getInstance(project)
+        val wasCurrent = service.currentSession() == row.id
+        runBg(project, "Deleting ${row.displayName}…") {
+            val r = ObservatoryCli.deleteSession(row.id, project.basePath, confirmedPending = pending, seenThrough = row.lastEdit)
+            val deleted = ObservatoryCli.deletedSession(r, row.id)
+            ApplicationManager.getApplication().invokeLater {
+                if (deleted) {
+                    if (wasCurrent) applySessionChoice(project, null) // drop the pin + refresh every project
+                    else service.refresh(force = true)
+                    notify(project, "Deleted “${row.displayName}” from Observatory and purged its edits — `oak sessions --undelete ${row.id}` lists it again, without them.")
+                } else if (r.ok) {
+                    notify(project, "Could not delete ${row.displayName} — the oak CLI this plugin runs (${ObservatoryCli.resolveBin()}) is too old to delete sessions; nothing was deleted. Update it with OAK's installer, then try again.", NotificationType.ERROR)
+                } else {
+                    notify(project, "Could not delete ${row.displayName} — ${r.stderr.trim().removePrefix("oak: ")}", NotificationType.ERROR)
+                }
+            }
+        }
+    }
+
+    /** The chooser. Rows lead with the agent's own title and are ordered live-session-first, then by
      *  conversation recency; the row currently in effect is pre-selected, so the popup opens showing
      *  what you are looking at rather than making you find it. */
-    private fun chooseSessionPopup(project: Project, entries: List<SessionRow>): com.intellij.openapi.ui.popup.JBPopup {
+    internal fun chooseSessionPopup(project: Project, entries: List<SessionRow>): com.intellij.openapi.ui.popup.JBPopup {
         val settings = com.cellobservatory.observatory.settings.ObservatorySettings.instance
         val pinned = settings.state.session?.takeIf { it.isNotBlank() }
-        val auto = project.basePath?.let { com.cellobservatory.observatory.core.SessionResolver.resolveSessionId(it) }
+        val auto = entries.firstOrNull { it.current }?.id
         val autoLabel = "Auto — newest for this workspace" + (auto?.let { " ($it)" } ?: "")
         val labelToId = LinkedHashMap<String, String?>()
-        val labelToRow = HashMap<String, SessionRow>()
         labelToId[autoLabel] = null
         var selected = autoLabel
         // Live session first (it is the answer most of the time), then everything else newest-first.
-        for (s in entries.sortedByDescending { it.current }) {
+        for (s in entries) {
             val mark = if (s.current) "● " else ""
             // The 8-char id keeps labels unique when two sessions share a title (the map is label-keyed).
-            val label = "$mark${s.displayName}  —  ${s.id.take(8)} · ${relTime(s.lastActiveMs)}" +
+            val label = "$mark${s.displayName}  —  ${s.id.take(8)}" +
+                // Agent + model on every chooser row: Claude unmarked, any
+                // other agent named, the model shown whenever the session recorded one.
+                (if (s.agent.isNotBlank() && s.agent != "claude") " · [${s.agent}]" else "") +
+                " · ${s.model.ifBlank { "model unknown" }} · ${s.workspace.ifBlank { "Unknown workspace" }} · ${s.edits} edit${if (s.edits == 1) "" else "s"} · ${fmtTok(s.tokens)} tok · ${fmtDur(s.durationMs)}" +
+                // The store's on-disk size — the same figure the TUI blobs show; omitted
+                // when zero so the chip never draws a misleading "0B" for a session that captured nothing.
+                (if (s.storeBytes > 0) " · ${compactBytes(s.storeBytes)}" else "") +
+                " · ${relTime(s.lastActiveMs)}" +
                 (if (s.current) " · active" else "")
             labelToId[label] = s.id
-            labelToRow[label] = s
             if (s.id == pinned) selected = label
         }
+        if (entries.isNotEmpty()) labelToId[DELETE_SESSION] = null // matched by label, never applied as a pin
         return com.intellij.openapi.ui.popup.JBPopupFactory.getInstance()
             .createPopupChooserBuilder(labelToId.keys.toList())
             .setTitle("Review which session?")
             .setSelectedValue(selected, true)
             .setItemChosenCallback { chosen ->
-                // Refused HERE too — this chooser lists every session, including an unreachable
-                // host's synthetic row, and picking one used to persist a pin that cannot be opened.
-                if (!refuseRemote(project, labelToRow[chosen])) applySessionChoice(project, labelToId[chosen])
+                if (chosen == DELETE_SESSION) chooseSessionToDelete(project, entries, null)
+                else applySessionChoice(project, labelToId[chosen])
             }
             .createPopup()
-    }
-
-    /**
-     * The machines this install looks for sessions on, over SSH.
-     *
-     * Driven entirely through the `remotes` verb, which validates with the same `parseRemoteSpec` the
-     * terminal's options window uses — both fields are interpolated into a shell that runs on ANOTHER
-     * computer, so there is one door and this goes through it rather than writing prefs.json here.
-     *
-     * Before this, `prefs.remotes` was editable only from the terminal dashboard: a feature all three
-     * front ends RENDER was configurable in exactly one of them.
-     */
-    fun manageRemotes(project: Project, anchor: javax.swing.JComponent?) {
-        com.intellij.util.concurrency.AppExecutorUtil.getAppExecutorService().submit {
-            val rows = ObservatoryCli.remotes(project.basePath)
-            ApplicationManager.getApplication().invokeLater {
-                if (project.isDisposed) return@invokeLater
-                // A CLI that could not answer is NOT an empty list — saying "no machines configured"
-                // over a prefs.json holding several is the failure this branch exists to prevent.
-                if (rows == null) {
-                    notify(
-                        project,
-                        "Could not read the configured machines — `claude-observatory remotes` did not answer. " +
-                            "Check the CLI on PATH (Settings → Tools → Claude Observatory).",
-                        NotificationType.WARNING,
-                    )
-                    return@invokeLater
-                }
-                val add = "＋  Add a machine…"
-                val labels = LinkedHashMap<String, String?>()
-                labels[add] = null
-                for (r in rows) {
-                    val mark = if (r.enabled) "●" else "○"
-                    val dir = if (r.configDir.isNotBlank()) "  ${r.configDir}" else ""
-                    val off = if (r.enabled) "" else "   (off)"
-                    labels["$mark  ${r.name}  —  ${r.host}$dir$off"] = r.name
-                }
-                val popup = com.intellij.openapi.ui.popup.JBPopupFactory.getInstance()
-                    .createPopupChooserBuilder(labels.keys.toList())
-                    .setTitle("Machines — sessions there can be browsed, never reverted from here")
-                    .setItemChosenCallback { chosen ->
-                        val name = labels[chosen]
-                        if (name == null) promptAddRemote(project) else editRemote(project, name, rows.firstOrNull { it.name == name }?.enabled != false)
-                    }
-                    .createPopup()
-                if (anchor != null && anchor.isShowing) popup.showInCenterOf(anchor)
-                else popup.showCenteredInCurrentWindow(project)
-            }
-        }
     }
 
     /**
@@ -1119,7 +1197,7 @@ object ReviewOps {
             ApplicationManager.getApplication().invokeLater {
                 if (project.isDisposed) return@invokeLater
                 if (info == null) {
-                    notify(project, "Could not read the store location — `claude-observatory store` did not answer.", NotificationType.WARNING)
+                    notify(project, "Could not read the store location — `oak store` did not answer.", NotificationType.WARNING)
                     return@invokeLater
                 }
                 val move = "Move it…"
@@ -1153,6 +1231,30 @@ object ReviewOps {
         }
     }
 
+    /** Opens a folder in the OS file manager: the platform's own reveal. A test swaps it, so no run spawns
+     *  a real file manager and each can see exactly which folder was asked for. */
+    @Volatile internal var openFolder: (File) -> Unit = { com.intellij.ide.actions.RevealFileAction.openDirectory(it) }
+
+    /**
+     * Open a session's store folder in the OS file manager — the ONE body behind every store affordance: a
+     * Sessions row's size (Overview), the review toolbar's Open Store Folder, and the Timeline chip's row.
+     * [path] is the store directory; blank or null means no session is selected. A session with no folder
+     * yet is SAID: the platform's reveal only logs a folder it could not open, so the click did nothing.
+     */
+    fun revealStoreFolder(project: Project, path: String?) {
+        val dir = path?.takeIf { it.isNotBlank() }?.let(::File)
+        if (dir == null || !dir.isDirectory) {
+            notify(
+                project,
+                if (dir == null) "No session is selected, so there is no store folder to open."
+                else "Session ${dir.name.take(8)} has no store folder yet — nothing from it has been captured.",
+                NotificationType.WARNING,
+            )
+            return
+        }
+        openFolder(dir)
+    }
+
     private fun applyStoreMove(project: Project, dir: String?) {
         com.intellij.util.concurrency.AppExecutorUtil.getAppExecutorService().submit {
             val res = ObservatoryCli.storeMove(project.basePath, dir)
@@ -1172,39 +1274,9 @@ object ReviewOps {
         }
     }
 
-    private fun promptAddRemote(project: Project) {
-        val line = Messages.showInputDialog(
-            project,
-            "name host [configDir]\n\nA single word is read as the host. Host is anything ssh accepts.\nKey auth only — the lookup runs with BatchMode, so an unreachable\nmachine fails fast instead of hanging on a password prompt.",
-            "Add a machine", null, "", null,
-        )?.trim().orEmpty()
-        if (line.isEmpty()) return
-        com.intellij.util.concurrency.AppExecutorUtil.getAppExecutorService().submit {
-            val res = ObservatoryCli.remoteAdd(project.basePath, line)
-            ApplicationManager.getApplication().invokeLater {
-                if (project.isDisposed) return@invokeLater
-                // The verb's own refusal reason, verbatim. Inventing a friendlier one here would mean
-                // two messages for one rule, and the reader acting on the wrong one.
-                if (res.error != null) notify(project, res.error, NotificationType.WARNING)
-                else { notify(project, "Added $line"); ObservatoryService.getInstance(project).refresh() }
-            }
-        }
-    }
 
-    private fun editRemote(project: Project, name: String, on: Boolean) {
-        val choices = arrayOf(if (on) "Turn off" else "Turn on", "Remove", "Cancel")
-        val pick = Messages.showDialog(project, name, "Machine", choices, 0, null)
-        if (pick < 0 || pick == 2) return
-        val flag = if (pick == 1) "--remove" else if (on) "--disable" else "--enable"
-        com.intellij.util.concurrency.AppExecutorUtil.getAppExecutorService().submit {
-            val res = ObservatoryCli.remoteChange(project.basePath, flag, name)
-            ApplicationManager.getApplication().invokeLater {
-                if (project.isDisposed) return@invokeLater
-                if (res.error != null) notify(project, res.error, NotificationType.WARNING)
-                else { notify(project, "${choices[pick]} $name"); ObservatoryService.getInstance(project).refresh() }
-            }
-        }
-    }
+
+
 
     // --- shared plumbing ---
 
@@ -1219,8 +1291,8 @@ object ReviewOps {
         if (!isDirty(file)) return true
         val choice = Messages.showYesNoDialog(
             project,
-            "${java.io.File(file).name} has unsaved changes — Claude Observatory ${verb.lowercase()}s by writing to disk.\nSave and continue?",
-            "Claude Observatory", "Save && Continue", "Cancel", Messages.getWarningIcon(),
+            "${java.io.File(file).name} has unsaved changes — OAK ${verb.lowercase()}s by writing to disk.\nSave and continue?",
+            "OAK", "Save && Continue", "Cancel", Messages.getWarningIcon(),
         )
         if (choice != Messages.YES) return false
         FileDocumentManager.getInstance().saveAllDocuments()
@@ -1231,7 +1303,7 @@ object ReviewOps {
         val names = dirtyFiles.joinToString("\n") { "• ${java.io.File(it).name}" }
         val choice = Messages.showYesNoDialog(
             project, "These files have unsaved changes:\n$names\nSave all and continue?",
-            "Claude Observatory", "Save && Continue", "Cancel", Messages.getWarningIcon(),
+            "OAK", "Save && Continue", "Cancel", Messages.getWarningIcon(),
         )
         if (choice != Messages.YES) return false
         FileDocumentManager.getInstance().saveAllDocuments()
@@ -1289,7 +1361,7 @@ object ReviewOps {
         // `commonDir` is core's; the CLI reports the same fact by leaving `sibling` null, so ask it once
         // up front rather than inferring "no fleet" from an empty tab later.
         val noRepo = !File(root).let { generateSequence(it) { d -> d.parentFile }.any { File(it, ".git").exists() } }
-        runBgCancellable(project, "Replaying a Claude Observatory demo") { indicator ->
+        runBgCancellable(project, "Replaying a OAK demo") { indicator ->
             indicator.isIndeterminate = true
             val res = ObservatoryCli.demoStreaming(emptyList(), root, { indicator.isCanceled }) { line ->
                 indicator.text2 = line
@@ -1309,11 +1381,11 @@ object ReviewOps {
                     // evidence it finished — reporting success there sends the tour on to narrate panels
                     // the aborted run never populated.
                     (session == null || !res.ok) && !cancelled ->
-                        notify(project, "The demo did not finish — ${res.stderr.take(160).ifBlank { "the claude-observatory CLI reported no reason" }}", NotificationType.ERROR)
+                        notify(project, "The demo did not finish — ${res.stderr.take(160).ifBlank { "the oak CLI reported no reason" }}", NotificationType.ERROR)
                     // Stopping is not a failure and not a dead end: what landed is real, and both ways
                     // out are one CLICK away, not merely named in prose.
                     cancelled -> NotificationGroupManager.getInstance()
-                        .getNotificationGroup("Claude Observatory")
+                        .getNotificationGroup("OAK")
                         .createNotification("Demo stopped. What landed is real and reviewable.", NotificationType.INFORMATION)
                         .addAction(com.intellij.openapi.actionSystem.ActionManager.getInstance().getAction("ClaudeObservatory.RestartDemo"))
                         .addAction(com.intellij.openapi.actionSystem.ActionManager.getInstance().getAction("ClaudeObservatory.ExitDemo"))
@@ -1322,7 +1394,7 @@ object ReviewOps {
                         // The fleet correlates on a repo key, so outside a git repo there is nothing to
                         // correlate — say so, rather than letting the tour's Fleet step describe two
                         // agents over an empty tab.
-                        if (noRepo) notify(project, "This folder is not a git repository, so the Fleet tab has no worktrees to correlate. Every other panel is populated.")
+                        if (noRepo) notify(project, "This folder is not a git repository, so the Workers tab has no worktrees to correlate. Every other panel is populated.")
                         TourController.getInstance(project).start { msg -> notify(project, msg, NotificationType.WARNING) }
                     }
                 }
@@ -1430,30 +1502,9 @@ object ReviewOps {
      * clears the override and deletes the session, leaving every panel pinned to a session that no
      * longer exists, which is the failure the override was introduced to avoid.
      */
-    /**
-     * Refuse a session this machine cannot review, and say which. Returns true when it was refused.
-     *
-     * ONE door for a rule that had three. The guard lived only in `ChangeMapPanel.pinSession`, while
-     * the Timeline popup and the "All sessions…" chooser both routed straight to
-     * [applySessionChoice] — so two of the three pickers persisted a pin to a session whose store and
-     * transcript are on another machine, blanking every panel and then explaining the emptiness
-     * wrongly. An unreachable host's synthetic row is worse still: its id starts with "!" and
-     * `storeDir` throws on it, so every later call fails.
-     */
-    fun refuseRemote(project: Project, row: SessionRow?): Boolean {
-        if (row == null || row.origin != "remote") return false
-        val where = row.machine.ifBlank { row.host.ifBlank { "another machine" } }
-        notify(
-            project,
-            if (row.id.startsWith("!")) "$where could not be reached — ${row.title ?: "no answer"}"
-            else "That session lives on $where. Sessions are reviewed where their files are.",
-            NotificationType.WARNING,
-        )
-        return true
-    }
-
     fun applySessionChoice(project: Project, id: String?) {
         val service = ObservatoryService.getInstance(project)
+        service.selectedFeed = null
         if (service.demoSessionOverride != null) {
             service.demoSessionOverride = id // its setter already forces the refresh
             return

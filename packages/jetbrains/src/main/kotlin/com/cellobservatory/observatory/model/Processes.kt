@@ -4,8 +4,8 @@ import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 
 /**
- * Kotlin mirror of core's background-shell view-model, parsed from `claude-observatory processes --json`:
- * the commands Claude launched with `run_in_background` and left running, carrying the detail the
+ * Kotlin mirror of core's background-shell view-model, parsed from `oak processes --json`:
+ * the commands the agent launched with `run_in_background` and left running, carrying the detail the
  * harness's own Background panel omits — runtime, exit code, output volume.
  *
  * There is deliberately NO OS pid here. The transcript never records one, and inferring it by scanning

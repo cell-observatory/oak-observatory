@@ -1,0 +1,12 @@
++- Session                                       +
+| Fix the demo · laptop · ? blocked · Opus · 900 |
+| tokens · 2 pending                             |
+| ↗ herdr   ⌕ review                             |
+| +- You                             1970-01-01 +|
+| |Read this conversation                       ||
+| +---------------------------------------------+|
+| Workers · 0/1 active                           |
+|   > 1 finished                                 |
+| Tasks · 1/1 open                               |
+|   v Run checks · in progress                   |
++------------------------------------------------+

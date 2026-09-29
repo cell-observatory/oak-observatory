@@ -49,7 +49,7 @@ class ExportReviewSummaryAction : SessionAction() {
         val s = sessionOrNotify(project) ?: return
         ReviewOps.openMarkdown(
             project, "claude-review-summary",
-            "Could not generate a review summary (is the claude-observatory CLI installed?)",
+            "Could not generate a review summary (is the oak CLI installed?)",
         ) { ObservatoryCli.summaryMarkdown(s, project.basePath) }
     }
 }
@@ -68,14 +68,14 @@ class CleanStoreAction : SessionAction() {
     }
 }
 
-/** Install the PreToolUse/PostToolUse capture hooks (`claude-observatory init`). */
+/** Install the PreToolUse/PostToolUse capture hooks (`oak init`). */
 class InstallHooksAction : SessionAction() {
     override fun actionPerformed(e: AnActionEvent) {
         ReviewOps.installHooks(e.project ?: return)
     }
 }
 
-/** Accept every pending Claude edit in the session. */
+/** Accept every pending agent edit in the session. */
 class AcceptAllEditsAction : SessionAction() {
     override fun actionPerformed(e: AnActionEvent) {
         val project = e.project ?: return
@@ -84,7 +84,7 @@ class AcceptAllEditsAction : SessionAction() {
     }
 }
 
-/** Revert every pending Claude edit in the session (with the dirty-buffer guard + confirm). */
+/** Revert every pending agent edit in the session (with the dirty-buffer guard + confirm). */
 class RevertAllEditsAction : SessionAction() {
     override fun actionPerformed(e: AnActionEvent) {
         val project = e.project ?: return
@@ -93,7 +93,7 @@ class RevertAllEditsAction : SessionAction() {
     }
 }
 
-/** Re-apply every undone Claude edit in the session (the forward mirror of Reject All). */
+/** Re-apply every undone agent edit in the session (the forward mirror of Reject All). */
 class RedoAllEditsAction : SessionAction() {
     override fun actionPerformed(e: AnActionEvent) {
         val project = e.project ?: return
@@ -113,7 +113,7 @@ class ClearResolvedEditsAction : SessionAction() {
     }
 }
 
-/** Toggle Spotlight — dim the unedited lines to foreground Claude's changes. */
+/** Toggle Spotlight — dim the unedited lines to foreground the agent's changes. */
 class SpotlightAction : SessionAction() {
     override fun actionPerformed(e: AnActionEvent) {
         InlineOverlay.getInstance(e.project ?: return).toggleHeatmap()

@@ -153,14 +153,14 @@ function parseTranscript(
     }
     d.think += think;
     if (firstSeen) {
-      d.msgs++;
+      if (!o.usageOnly) d.msgs++;
       d.out += out;
       d.inTok += inTok;
     }
     if (h) {
       h.think += think;
       if (firstSeen) {
-        h.msgs++;
+        if (!o.usageOnly) h.msgs++;
         h.out += out;
         h.inTok += inTok;
       }
@@ -169,10 +169,17 @@ function parseTranscript(
   return { sid, days, hours };
 }
 
-/** All transcript files under ~/.claude/projects (any project). */
-function transcriptFiles(): string[] {
+/** All transcript files under ~/.claude/projects (any project). `claudeOnly` omits codex's derived
+ *  transcripts — the shared Stats charts blend both (R13), but the Claude plan-window fallback must
+ *  not let codex tokens fill a Claude measured window. */
+function transcriptFiles(claudeOnly = false): string[] {
   const root = path.join(claudeConfigDir(), 'projects');
-  const out: string[] = [];
+  let out: string[] = [];
+  if (!claudeOnly) {
+    const { codexSessionSources } = require('./codex') as typeof import('./codex');
+    const { codexTranscriptFile } = require('./codex-events') as typeof import('./codex-events');
+    out = codexSessionSources().map((x) => codexTranscriptFile(x.file)).filter((x): x is string => !!x);
+  }
   let projects: string[];
   try {
     projects = fs.readdirSync(root);
@@ -197,10 +204,10 @@ function transcriptFiles(): string[] {
  * 30-day daily series plus session / today / 7-day / 30-day windows. Pass `activeSessionId` for the
  * "current session" window; `nowMs` is injectable for tests.
  */
-export function computeStats(activeSessionId?: string, nowMs?: number): StatsResult {
+export function computeStats(activeSessionId?: string, nowMs?: number, claudeOnly = false): StatsResult {
   const now = nowMs ?? Date.now();
   const cutoff = now - 31 * 86400000;
-  const cachePath = path.join(rootDir(), 'stats-cache.json');
+  const cachePath = path.join(rootDir(), claudeOnly ? 'stats-cache-claude.json' : 'stats-cache.json');
   // The cache VALUE is per-day/per-hour aggregates keyed in the machine's LOCAL zone. If the zone
   // changes (travel, or a differing TZ between subprocess and host) an unchanged file's cached buckets
   // would be reinterpreted under the new zone — so stamp the offset and invalidate on mismatch.
@@ -227,7 +234,7 @@ export function computeStats(activeSessionId?: string, nowMs?: number): StatsRes
   // The active session's own transcript is always parsed (even if aged out), so its "current session"
   // token/message numbers stay consistent with its edit count, which has no cutoff.
   const activeFile = activeSessionId ? `${activeSessionId}.jsonl` : null;
-  for (const file of transcriptFiles()) {
+  for (const file of transcriptFiles(claudeOnly)) {
     let st: fs.Stats;
     try {
       st = fs.statSync(file);

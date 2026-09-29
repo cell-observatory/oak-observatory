@@ -1,0 +1,25 @@
+<p>The <strong>Overview</strong> is the editor-side equivalent of the terminal app's Observatory and Review tabs — a master-detail board over your worktree fleet, in a panel. Its left nav has five tabs; selecting a row fills the right side with that thing's <a href="edits.html#the-change-map">change map</a>.</p>
+
+<h2>The tabs</h2>
+<ul>
+  <li><strong>Sessions</strong> — <a href="sessions-agents.html">sessions grouped by workspace</a>, the editor’s workspace first. Sessions belong to the machine where that workspace runs. Selecting a local session switches what the whole panel reviews.</li>
+  <li><strong>Workers</strong> — <a href="workflows-fleet.html">every running agent</a> across the repository's worktrees, with a live phase and sparkline.</li>
+  <li><strong>Workflows</strong> — every multi-agent <a href="workflows-fleet.html">run</a>, unfolding to its phases and agents.</li>
+  <li><strong>Tasks</strong> — the session's numbered <a href="tasks.html">task list</a>, each with its strict span.</li>
+  <li><strong>Processes</strong> — the background shells the session launched.</li>
+</ul>
+
+<figure><img src="media/overview-tabs.png" loading="lazy" alt="The Overview panel: the five tabs and the change map"><figcaption>The Overview: the tabs on the left, the change map on the right.</figcaption></figure>
+
+<p>In both VS Code and JetBrains, each Sessions header shows the workspace and session count. This workspace comes first, then other workspaces by recent conversation activity; rows are newest first within each group. Active only retains live sessions, pending edits and the review pin. Sessions older than a week fold under an expandable header. Sessions in which nothing happened are not listed (<a href="sessions-agents.html">Sessions and agents</a> gives the rule).</p>
+<p>The CLI lists sessions on the workspace host. Remote-SSH, devcontainer and Gateway windows therefore list that remote host’s sessions. Copied transcripts from another machine and bridge pointers without local conversation records are excluded. The editors do not gather other machines.</p>
+
+<h2>The change map</h2>
+<p>Selecting a row fills the right with its <a href="edits.html#the-change-map">change map</a> — the <strong>Folders</strong> strip, one tile per changed directory ranked by lines and colored by review status, and the churn-ranked <strong>Files</strong> ledger. A summary bar totals the scope, and selecting a row opens its <a href="feed.html">feed</a> in the Timeline's Feed tab, showing what it's doing (a session row also connects the tab, to read that session's conversation). Clicking a Folder tile steps the review nav to that folder's first pending edit; clicking a file opens its diff.</p>
+<p>The panel's toolbar carries inline controls, in place rather than as a pop-up: a <strong>search</strong> field (matched as a substring, or as a regular expression the moment the text carries regex syntax), a <strong>filter</strong> dropdown for the <a href="edits.html#filter-sort-and-age">file-type buckets and extensions</a>, and a <strong>sort</strong> dropdown (four orders — newest, oldest, name A→Z, name Z→A). The filter button names what it is narrowing by and the sort button names the order in force, so the toolbar reads back its own state. Each file shows the exact time of its last change beside it.</p>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div class="ct"><span class="ctitle">Group all five tabs</span>
+  <p>The nav can show every tab side by side in one group — Sessions, Workers, Workflows, Tasks, and Processes as columns you can drag and fold — since what is happening is one question, not five.</p></div>
+</div>

@@ -9,7 +9,7 @@ import com.intellij.ui.SimpleTextAttributes
 import java.awt.Color
 
 /**
- * Badges files that have pending Claude edits in the Project view — a small "●N" after the name in
+ * Badges files that have pending agent edits in the Project view — a small "●N" after the name in
  * the pending-amber accent (parity with the VS Code FileDecorationProvider). Count is O(1): it reads
  * ObservatoryService's log-cached pending-by-file map.
  */
@@ -26,6 +26,6 @@ class ObservatoryNodeDecorator : ProjectViewNodeDecorator {
         if (pending <= 0) return
         val accent = JBColor(Color(0xB8, 0x86, 0x0B), Color(0xE5, 0xC0, 0x7B)) // amber (light / dark)
         data.addText("  ●$pending", SimpleTextAttributes(SimpleTextAttributes.STYLE_PLAIN, accent))
-        data.tooltip = (data.tooltip?.let { "$it\n" } ?: "") + "$pending pending Claude edit(s)"
+        data.tooltip = (data.tooltip?.let { "$it\n" } ?: "") + "$pending pending agent edit(s)"
     }
 }

@@ -19,8 +19,8 @@ import javax.swing.JComponent
 import javax.swing.JPanel
 
 /**
- * The Observatory Timeline window's content: the session selector, then Prompts · Observations · Actions
- * — as three tabs, or as three columns side by side.
+ * The Observatory Timeline window's content: the session selector, then the four members
+ * — as four tabs (Feed · Prompts · Observations · Actions), or as four columns side by side.
  *
  * ONE tool-window content rather than three, and that is the point of the class.
  *
@@ -52,7 +52,7 @@ class TimelinePanel(private val project: Project) : JPanel(BorderLayout()) {
     private val cfg get() = com.cellobservatory.observatory.settings.ObservatorySettings.instance.state
 
     /**
-     * The three surfaces, each behind a [LazyPane].
+     * The four surfaces, each behind a [LazyPane].
      *
      * They are built when this window is first REALIZED rather than when the panel is constructed —
      * which is where the platform used to build them anyway (`createToolWindowContent` runs on the first
@@ -61,6 +61,7 @@ class TimelinePanel(private val project: Project) : JPanel(BorderLayout()) {
      * what a headless test does and what made this window untestable before.
      */
     private val panes: Map<String, JComponent> = linkedMapOf(
+        NavGrouping.FEED to LazyPane { FeedPanel(project) },
         NavGrouping.PROMPTS to LazyPane { PromptsPanel(project) },
         NavGrouping.OBSERVATIONS to LazyPane { ObservationsPanel(project) },
         NavGrouping.ACTIONS to LazyPane { ActionsPanel(project) },
@@ -70,12 +71,14 @@ class TimelinePanel(private val project: Project) : JPanel(BorderLayout()) {
         NavGrouping.PROMPTS to AllIcons.Actions.ListFiles,
         NavGrouping.OBSERVATIONS to AllIcons.Actions.IntentionBulb,
         NavGrouping.ACTIONS to AllIcons.Debugger.Console,
+        NavGrouping.FEED to AllIcons.Actions.Execute,
     )
 
     private val tips = mapOf(
         NavGrouping.PROMPTS to "What you asked for, in order — selecting one scopes the Overview",
-        NavGrouping.OBSERVATIONS to "What Claude noticed and reported while it worked",
+        NavGrouping.OBSERVATIONS to "What the agent noticed and reported while it worked",
         NavGrouping.ACTIONS to "Every tool call, newest first",
+        NavGrouping.FEED to "The conversation as it happened — prompts, replies, thinking, tool calls and diffs — or the activity of what the Overview selects",
     )
 
     private val tabs = JBTabbedPane()
@@ -85,9 +88,10 @@ class TimelinePanel(private val project: Project) : JPanel(BorderLayout()) {
         members = NavGrouping.TIMELINE_MEMBERS,
         title = { NavGrouping.TIMELINE_TITLES[it] ?: it },
         tip = { tips[it] },
-        // Prompts leads with the width: it is the list a reader picks from, and its rows carry the whole
-        // ask. Observations and Actions split what is left evenly.
-        defaultProportion = { i -> if (i == 0) 0.42f else 0.5f },
+        // The Feed leads and takes the biggest share: it carries the whole conversation. Prompts
+        // takes most of the remainder (its rows carry the whole ask); Observations · Actions split
+        // what is left.
+        defaultProportion = { i -> when (i) { 0 -> 0.4f; 1 -> 0.45f; else -> 0.5f } },
     )
 
     /** Where the tabs or the columns are mounted — swapped by [rebuild]. */
@@ -97,7 +101,7 @@ class TimelinePanel(private val project: Project) : JPanel(BorderLayout()) {
     private val sessionToolbar = ActionManager.getInstance()
         .createActionToolbar(
             "ClaudeObservatoryTimelineSession",
-            DefaultActionGroup(TimelineSessionAction(project)),
+            DefaultActionGroup(TimelineSessionAction(project), TimelineNewSessionAction(project)),
             true,
         ).apply {
             targetComponent = this@TimelinePanel
@@ -213,7 +217,7 @@ class TimelinePanel(private val project: Project) : JPanel(BorderLayout()) {
 
     private fun groupToggle(): ToggleAction = object : ToggleAction(
         "Group Tabs",
-        "Show Prompts, Observations and Actions side by side instead of as tabs",
+        "Show Feed, Prompts, Observations and Actions side by side instead of as tabs",
         AllIcons.Actions.SplitVertically,
     ), DumbAware {
         override fun getActionUpdateThread() = ActionUpdateThread.BGT // reads one flag

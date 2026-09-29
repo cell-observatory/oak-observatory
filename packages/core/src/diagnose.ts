@@ -1,5 +1,5 @@
 /**
- * Setup diagnostics — the rules and messaging behind `claude-observatory doctor`.
+ * Setup diagnostics — the rules and messaging behind `oak doctor`.
  *
  * Kept pure and environment-injected (binOnPath / jqPresent are probed by the CLI and passed in) so
  * it stays unit-testable and so any front-end can render the exact same checks via `doctor --json`.
@@ -9,10 +9,10 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { claudeConfigDir } from './paths';
-import { settingsPath, hooksInstalled, installedHookCommand, HOOK_MARKER } from './install';
+import { settingsPath, hooksInstalled, installedHookCommand, missingHookEvents, HOOK_MARKER, statuslineInstalled } from './install';
 import { resolveSessionId, hasAssistantRecord } from './session';
 import { findTranscript } from './observe';
-import { readLog } from './store';
+import { readLog, rootDir } from './store';
 
 export type CheckLevel = 'ok' | 'warn' | 'fail';
 
@@ -27,7 +27,7 @@ export interface Check {
 
 export interface DiagnoseInput {
   cwd: string;
-  /** Whether `claude-observatory` resolves on PATH — the capture hook depends on it. null = unknown. */
+  /** Whether `oak` resolves on PATH — the capture hook depends on it. null = unknown. */
   binOnPath?: boolean | null;
   /** Whether `jq` is available — the bundled status line needs it. null = unknown. */
   jqPresent?: boolean | null;
@@ -63,7 +63,7 @@ function writable(dir: string): boolean {
 /** Render checks as portable markdown (shown in an editor tab by both front-ends). */
 export function diagnoseMarkdown(checks: Check[]): string {
   const icon = (l: CheckLevel) => (l === 'ok' ? '✅' : l === 'warn' ? '⚠️' : '❌');
-  const lines: string[] = ['# Claude Observatory — setup check', ''];
+  const lines: string[] = ['# OAK — setup check', ''];
   for (const c of checks) {
     lines.push(`### ${icon(c.level)} ${c.label}`, c.detail);
     if (c.fix) lines.push('', `**Fix:** ${c.fix}`);
@@ -98,7 +98,7 @@ export function diagnose(input: DiagnoseInput): Check[] {
           label: 'settings.json is valid JSON',
           level: 'fail',
           detail: `${settingsPath()} is not valid JSON — capture hooks can't be read or installed.`,
-          fix: 'Fix the JSON (or restore the .bak beside it), then re-run `claude-observatory init`.',
+          fix: 'Fix the JSON (or restore the .bak beside it), then re-run `oak init`.',
         }
       : {
           id: 'settings-json',
@@ -110,30 +110,39 @@ export function diagnose(input: DiagnoseInput): Check[] {
 
   // The capture hooks are the whole mechanism — without them nothing is tracked.
   const installed = hooksInstalled();
+  const missing = installed ? missingHookEvents() : [];
   checks.push(
-    installed
+    installed && missing.length
+      ? {
+          id: 'hooks',
+          label: 'capture hooks installed',
+          level: 'warn',
+          detail: `installed by an older OAK; not hooked: ${missing.join(', ')}`,
+          fix: 'Run `oak init` with Claude Code CLOSED (a running session reverts mid-session hook edits).',
+        }
+      : installed
       ? { id: 'hooks', label: 'capture hooks installed', level: 'ok', detail: 'PreToolUse/PostToolUse hooks are present' }
       : {
           id: 'hooks',
           label: 'capture hooks installed',
           level: 'fail',
           detail: 'no capture hooks in settings.json — Claude edits are not being tracked.',
-          fix: 'Run `claude-observatory init` with Claude Code CLOSED (a running session reverts mid-session hook edits).',
+          fix: 'Run `oak init` with Claude Code CLOSED (a running session reverts mid-session hook edits).',
         }
   );
 
-  // The hook command is `claude-observatory capture …` resolved from PATH; if the bin is missing there,
+  // The hook command is `oak capture …` resolved from PATH; if the bin is missing there,
   // capture silently no-ops — the single most common "it's just not working" cause.
   if (input.binOnPath === false) {
     checks.push({
       id: 'bin-path',
-      label: '`claude-observatory` on PATH',
+      label: '`oak` on PATH',
       level: 'fail',
-      detail: 'the capture hook runs `claude-observatory` from PATH, but it does not resolve here — capture will silently do nothing.',
+      detail: 'the capture hook runs `oak` from PATH, but it does not resolve here — capture will silently do nothing.',
       fix: 'Add the global npm bin dir (`$(npm prefix -g)/bin`) to your PATH, or reinstall the CLI.',
     });
   } else if (input.binOnPath === true) {
-    checks.push({ id: 'bin-path', label: '`claude-observatory` on PATH', level: 'ok', detail: 'resolves on PATH' });
+    checks.push({ id: 'bin-path', label: '`oak` on PATH', level: 'ok', detail: 'resolves on PATH' });
   }
 
   // A legacy/absolute hook command is brittle across machines and repo moves.
@@ -144,7 +153,7 @@ export function diagnose(input: DiagnoseInput): Check[] {
       label: 'hook uses the portable marker',
       level: 'warn',
       detail: `the installed hook looks legacy/absolute: ${cmd}`,
-      fix: 'Re-run `claude-observatory init` to migrate to the portable PATH-based hook.',
+      fix: 'Re-run `oak init` to migrate to the portable PATH-based hook.',
     });
   }
 
@@ -169,8 +178,9 @@ export function diagnose(input: DiagnoseInput): Check[] {
   // "The directory is writable" and "a setting persists" are different claims, and only the second
   // one is what a channel switch depends on. A bind-mounted overlay or a network filesystem can
   // accept a write and not keep it, which makes `update --channel dev` report success and change
-  // nothing — the exact shape that looks like a broken feature rather than a broken mount.
-  checks.push(channelRoundTrips(cfg));
+  // nothing — the exact shape that looks like a broken feature rather than a broken mount. The probe
+  // is the file the channel really lives in: the store root's, which a moved store puts elsewhere.
+  checks.push(channelRoundTrips(rootDir()));
 
   // A resolvable session with real capture activity is the proof the whole chain works end-to-end.
   const session = resolveSessionId(input.cwd);
@@ -179,8 +189,8 @@ export function diagnose(input: DiagnoseInput): Check[] {
       id: 'session',
       label: 'active session resolves',
       level: 'warn',
-      detail: `no Claude Code session resolves for ${input.cwd}`,
-      fix: 'Run doctor from your workspace root, or start a Claude Code session there.',
+      detail: `no agent session resolves for ${input.cwd}`,
+      fix: 'Run doctor from your workspace root, or start a Claude Code or Codex session there.',
     });
   } else {
     const log = readLog(session);
@@ -240,28 +250,63 @@ export function diagnose(input: DiagnoseInput): Check[] {
     /* cwd unreadable — other checks already cover that */
   }
 
-  // The status line powers the 5h/week usage bars — nice-to-have, not required.
+  // The status line powers the 5h/week usage bars — nice-to-have, not required. Its usage cache
+  // appears only once Claude Code draws it, so one installed a moment ago has none yet: that is not
+  // "not installed", and telling the installers' closing doctor to install it again was wrong.
   const statuslineOn = fs.existsSync(path.join(cfg, 'statusline-last.json'));
+  const noJq = input.jqPresent === false ? ' (jq not found; the status line needs bash + jq)' : '';
   checks.push(
     statuslineOn
       ? { id: 'statusline', label: 'status line active', level: 'ok', detail: 'usage cache present (plan-usage bars will render)' }
+      : statuslineInstalled()
+      ? { id: 'statusline', label: 'status line active', level: noJq ? 'warn' : 'ok',
+          detail: `installed; its usage cache appears the next time Claude Code draws the status line${noJq}`,
+          ...(noJq ? { fix: 'Install jq.' } : {}) }
       : {
           id: 'statusline',
           label: 'status line active',
           level: 'warn',
           detail: `no usage cache yet — the 5h/week bars will be empty${input.jqPresent === false ? ' (jq not found; the status line needs bash + jq)' : ''}.`,
-          fix: 'Run `claude-observatory statusline` to install the bundled status line.',
+          fix: 'Run `oak statusline` to install the bundled status line.',
         }
   );
 
+  if (session) {
+    const { captureIntegrity } = require('./integrity') as typeof import('./integrity');
+    const health = captureIntegrity(session);
+    const top = health.skipReasons[0];
+    checks.push({ id: 'capture-integrity', label: 'capture integrity', level: health.healthy ? 'ok' : 'warn',
+      detail: `${health.records} records; ${health.issues.length} integrity findings; ${health.skipped} capture gaps${top ? ` (${top.count} × ${top.reason})` : ''}; ${health.inFlight} pending snapshots`,
+      ...(health.healthy ? {} : { fix: `oak integrity --session ${session} --json` }) });
+  }
+  if (session && (require('./session') as typeof import('./session')).describeSession(session).runtime.includes('codex')) {
+    const { codexHooksStatus } = require('./codex') as typeof import('./codex');
+    const { usageLine } = require('./observe') as typeof import('./observe');
+    const { isOurCommand } = require('./install') as typeof import('./install');
+    const cx = codexHooksStatus(isOurCommand);
+    const hooks = checks.findIndex((c) => c.id === 'hooks');
+    if (hooks >= 0) checks[hooks] = { id: 'hooks', label: 'Codex capture hooks', level: cx.trust === 'trusted' ? 'ok' : 'warn',
+      detail: `${cx.installed ? 'configured' : 'not configured'}; trust configuration: ${cx.trust}. Configuration does not prove lifecycle or edit capture.`,
+      ...(cx.trust === 'trusted' ? {} : { fix: 'oak init --codex' }) };
+    const activity = checks.findIndex(c => c.id === 'session');
+    const edits = readLog(session).length;
+    if (activity >= 0) checks[activity] = { id: 'session', label: 'Codex capture activity', level: edits ? 'ok' : 'warn',
+      detail: `session ${session} · ${edits} captured edit(s). ${edits ? 'Stored capture evidence is present; inspect integrity separately.' : 'No captured edits yet; configuration alone does not verify capture.'}` };
+    const statusline = checks.findIndex(c => c.id === 'statusline');
+    const usage = usageLine(input.cwd, session);
+    if (statusline >= 0) checks[statusline] = { id: 'statusline', label: 'Codex usage evidence',
+      level: usage.tokensIn !== null ? 'ok' : 'warn',
+      detail: 'Codex usage comes from its selected rollout. Account limits require quota events; missing values remain unavailable. A Claude status line is not required.' };
+    for (let i = checks.length - 1; i >= 0; i--) if (['settings-json', 'hook-shape'].includes(checks[i].id)) checks.splice(i, 1);
+  }
   return checks;
 }
 
 
 /** Write the channel marker, read it back, and restore it. Proves the setting SURVIVES, not merely
  *  that the write returned without an error. */
-function channelRoundTrips(cfg: string): Check {
-  const file = path.join(cfg, 'channel');
+function channelRoundTrips(dir: string): Check {
+  const file = path.join(dir, 'channel');
   let before: string | null = null;
   try {
     before = fs.readFileSync(file, 'utf8');
@@ -270,7 +315,7 @@ function channelRoundTrips(cfg: string): Check {
   }
   const probe = `${before && before.trim() === 'dev' ? 'stable' : 'dev'}\n`;
   try {
-    fs.mkdirSync(cfg, { recursive: true });
+    fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(file, probe);
     const back = fs.readFileSync(file, 'utf8');
     // Restore whatever was there before probing, including "absent".
@@ -282,7 +327,7 @@ function channelRoundTrips(cfg: string): Check {
         label: 'update channel persists',
         level: 'fail',
         detail: `${file} accepted a write but did not keep it — \`update --channel\` will report success and change nothing.`,
-        fix: 'That filesystem is not keeping writes (common on a bind-mounted or network config dir). Point CLAUDE_CONFIG_DIR at a real local path.',
+        fix: 'That filesystem is not keeping writes (common on a bind-mounted or network directory). Keep the store on a real local path: `oak store --move <dir>`, or point CLAUDE_CONFIG_DIR there.',
       };
     }
     return { id: 'channel-persist', label: 'update channel persists', level: 'ok', detail: `${file} round-trips` };
@@ -292,7 +337,7 @@ function channelRoundTrips(cfg: string): Check {
       label: 'update channel persists',
       level: 'fail',
       detail: `cannot write ${file} (${(e as NodeJS.ErrnoException).code ?? 'error'}) — switching channels will fail.`,
-      fix: 'Make the config dir writable by this user, or set CLAUDE_CONFIG_DIR to a writable path. In a devcontainer it is often bind-mounted read-only or owned by another uid.',
+      fix: 'Make that directory writable by this user, or keep the store elsewhere: `oak store --move <dir>`, or set CLAUDE_CONFIG_DIR to a writable path. In a devcontainer the config dir is often bind-mounted read-only or owned by another uid.',
     };
   }
 }

@@ -9,26 +9,26 @@ contract the machine-readable surface guarantees. Every claim below is grounded 
 
 ```
    packages/core  ──(re-exported from src/index.ts)──►  packages/cli
-   pure TS engine                                        `claude-observatory` bin
-   only runtime dep: `diff`                              main() = switch(argv[0]) → emitJson
+   pure TS engine                                        `oak` bin
+   runtime dependencies: `diff`, `smol-toml`            main() = switch(argv[0]) → emitJson
         │                                                        │
         │ import * as core                                       │ subprocess:  … --json
         ▼  (in-process)                                          ▼
    packages/vscode                                        packages/jetbrains (Kotlin)
    renders core's view-models directly;                   never imports core.
-   spawns `stats --json` for the heavy scan               • mutations + diff-reads → ObservatoryCli (over CLI)
-                                                           • store reads → StoreReader/SessionResolver (off disk)
+   spawns the CLI for sessions and heavy scans            • mutations + views + sessions → ObservatoryCli (over CLI)
+                                                           • store reads → StoreReader (off disk)
 ```
 
-- **`core` → `cli`.** The CLI imports `@claude-observatory/core` and is the single source of truth
+- **`core` → `cli`.** The CLI imports `@oak-observatory/core` and is the single source of truth
   both editors consume. `packages/cli/src/index.ts` is one `main()` with a `switch` on `argv[0]`;
   each `case` calls a `core` function and, for the machine surface, serializes with
   `emitJson(v) = process.stdout.write(JSON.stringify(v))`.
 - **`cli` → `vscode` (in-process).** `packages/vscode/src/extension.ts` does
-  `import * as core from '@claude-observatory/core'` and calls `core.buildEditTree`,
+  `import * as core from '@oak-observatory/core'` and calls `core.buildEditTree`,
   `core.undoEdit`, `core.setStatus`, `core.readLog`, `core.fileMemory`, … directly. It *spawns* the CLI
-  for the transcript-wide scans — `stats`, `prompts`, `feed`, and one `views` call carrying the
-  Overview's three heavy payloads (`changemap` + `multitask` + `processes`) — so a multi-gigabyte parse
+  for session listings and transcript-wide scans — `sessions`, `stats`, `prompts`, `feed`, and one
+  `views` call carrying the Overview's payloads (`changemap` + `multitask` + `processes` + `sessions`) — so a multi-gigabyte parse
   never runs on the UI thread.
 
   That last reason is load-bearing, not habit. Building the change map in-process was tried and
@@ -38,10 +38,11 @@ contract the machine-readable surface guarantees. Every claim below is grounded 
   exists to make. What WAS wasteful is paying for three processes to get three views: `views` runs
   them in one, each produced by its own command, so the payloads are identical to asking separately.
 - **`cli` → `jetbrains` (over the CLI).** The Kotlin plugin never links `core`. It shells out to
-  `claude-observatory … --json` via `core/ObservatoryCli.kt` for every **mutation**
+  `oak … --json` via `core/ObservatoryCli.kt` for every **mutation**
   (`keep`/`undo`/`redo`/`clean`) and every **diff-dependent read** (`locate`, `tree`, `observe`,
-  `stats`), and reads the raw store **off disk** via Kotlin ports (`StoreReader`, `SessionResolver`,
-  `ClaudePaths`). The undo engine's correctness deliberately lives in exactly one place — the TS core.
+  `stats`). Session lists and automatic selection also come from `sessions --json`; there is no
+  independent transcript-selection fallback. It reads the raw store **off disk** via Kotlin ports
+  (`StoreReader`, `ClaudePaths`). The undo engine's correctness lives in the TS core.
 
 ## The store
 
@@ -63,7 +64,11 @@ enumerator from mistaking one for a session):
 <root>/changemap-cache/<session_id>/<key>.json   the session's change map / fleet payload
 <root>/changemap-cache/<session_id>/placements.json  where each edit lands in the CURRENT file text
 <root>/changemap-cache/<session_id>/deltas.json      per-blob-pair line deltas (+/- for each edit)
+<root>/changemap-cache/<session_id>/transcript-facts-v<N>-<key>.json  the shared fold of one transcript
+<root>/changemap-cache/<session_id>/conversation.json  resume state behind `conversation --since`
+<root>/remote-cache/session-titles.json          claude.ai Remote Control titles by session id
 <root>/session-meta/<session_id>.json            title + row counts + risk sidecars
+<root>/session-meta/provenance/<path-hash>.json   transcript launch cwd + bridge classification
 <root>/usage-cursors/<hash(transcript path)>.json  byte cursor for incremental usage parsing
 ```
 
@@ -85,19 +90,40 @@ there is no staleness window, and changed content is simply a different key rath
   amount of versioning or boundary-checking can detect it. Cache the *inputs* keyed by content and redo
   the fold; the fold is cheap, and a content key cannot lie.
 
+`transcript-facts-v<N>-<key>.json` (`derived-transcript.ts`) is one transcript folded once and read by every
+view that needs actions, tasks, todos, subagents, processes, insights or reasoning, instead of each one
+re-parsing the file. Since version 7 it stores prose as timestamped byte offsets and lengths (version 8,
+the current one, adds the session's rename to the insights); the Feed selects
+its window before reading those source lines. Action reasoning and summaries remain in the facts,
+but full replies and thoughts are not duplicated there. The key hashes the schema version (`TRANSCRIPT_FACTS_VERSION`), the SOURCE of the fold
+functions themselves, the transcript path and whether sidechains are included — so an edited fold, like a
+bumped schema, addresses a different file instead of serving a stale hit, and the version also rides the
+file name, which is how `oak clean` reclaims the generation a bump supersedes. The record is checksummed
+and written tmp+rename at `0600` under a `0700` directory, and it is accepted only while the transcript's
+`(dev, ino, size, mtime, ctime)` and the sampled guard windows over the parsed region all still match.
+Retained facts are capped at 64 MiB in memory, and `withoutTranscriptFactsCache` re-runs the same folds
+from byte zero with no cache I/O — the seam the equality tests compare the cached answer against.
+
+`conversation.json` is the same idea for the conversation reader: the parser state that its byte
+cursor stands for, revalidated against the file's identity and a 64-byte prefix/suffix guard. A cold or
+foreign checkpoint costs a replay of the preceding turn; a guard that disagrees, or a cursor past the end
+of the file, means the transcript was REPLACED, and the read answers a fresh bounded window with
+`reset: true` instead of continuing a conversation that no longer exists.
+
 - `rootDir()` = `<config>/claude-observatory`; `storeDir(session)` = `<root>/<session_id>`;
   `logPath(session)` = `<storeDir>/log.jsonl`.
 - **Blobs are content-addressed:** `writeBlob` hashes the bytes with sha256 and writes
   `blobs/<sha>` only if absent — identical file states dedupe automatically. `readBlob(session, sha)`
   returns the raw `Buffer` (the `blob <sha>` CLI command streams it).
 - **Staging** is the two-phase capture handshake: `PreToolUse` writes a `StagingRecord` (the file's
-  pre-edit `beforeBlob`); `PostToolUse` reads it, snapshots the after state, appends the `EditRecord`,
+  pre-edit `beforeBlob`); `PostToolUse` (`PostToolUseFailure` when the tool failed) reads it, snapshots
+  the after state, appends the `EditRecord`,
   and deletes the staging file. Bash-driven changes use a per-Pre `__bash__<token>.json` manifest
   instead, keyed by the tree that Pre walked: Bash calls overlap constantly, so one shared manifest had
   a command's Post diffing its walk against another command's snapshot. Whatever a Post records
   advances every other pending snapshot whose tree CONTAINS that file, so no change is recorded twice.
 - **Skip markers** are the no-silent-fail escape hatch. When a capture *must* drop a real change — a
-  binary/oversized file (>5 MB), a missing before-snapshot (Pre didn't run), or a Bash working tree over
+  oversized file (text over 5 MB, binary over 25 MB), a missing before-snapshot (Pre didn't run), or a Bash working tree over
   the file cap — `appendSkip` writes a one-line `{op:"skip", file, reason, ts}` op instead of swallowing
   it. `readSkips(session)` folds them out separately and `status` surfaces the gap, so a dropped change is
   loud, not lost.
@@ -198,8 +224,9 @@ Computed by `computeStats(session?)` with an incremental on-disk cache keyed on 
 ```ts
 interface SessionMetaRow {
   id: string;
-  title: string | null;   // Claude's latest ai-title, else the first user prompt; null when neither exists
+  title: string | null;   // preferredSessionTitle: a rename, else the claude.ai Remote Control title, else the latest ai-title, else the first user prompt (Codex: codexSessionTitle); else "New Claude session" / "New Codex session"
   lastActiveMs: number;   // conversation recency: the TRANSCRIPT's mtime (log.jsonl's when it vanished)
+  lastTurnMs?: number | null; // when it last took a turn: its newest user/assistant record (Codex: response item); a resume's bookkeeping never moves it. Null: it never took one; absent: unknown (no readable file, or no turn in its last 8 MB)
   current: boolean;       // the session `resolveSessionId(cwd)` currently answers with
   edits: number;          // captured edits, from the store log
   pending: number;        // …of which still awaiting review
@@ -208,12 +235,22 @@ interface SessionMetaRow {
 interface SessionMeta { active: string | null; sessions: SessionMetaRow[] }
 ```
 
-`sessionMeta(cwd, reviewing?)` lists this workspace's sessions, newest conversation first, plus the
+`sessionMeta(cwd, reviewing?)` lists this machine's sessions grouped by workspace, the editor root first
+and the newest conversation first within each group, plus the
 session being reviewed (a conversation that only asked and read has no store, and would otherwise be
 missing from its own workspace's list). Each row costs one `stat` of the transcript plus cached facts,
 never a fresh parse of either file. Titles come from
-`fastSessionTitle`, a bounded scan — the transcript's last 4 MB for the newest `ai-title`, its first
-256 KB for the first real user prompt. Each scan's result is cached in a per-session sidecar at
+`fastSessionTitle`, a bounded scan — the transcript's last 4 MB for the newest `custom-title` (a rename
+made with `/rename`, or on claude.ai or the Claude app), the newest `ai-title` and the newest
+`bridge-session` id, then its first 256 KB for the first real user prompt. `preferredSessionTitle` states
+the order every surface uses: the rename, then the title claude.ai holds for the session's Remote Control
+id, then the `ai-title`, then the prompt. A Codex session is titled by `codexSessionTitle` instead, and
+`sessionViewTitle` gives the change map's summary and the Stats headers that same title. The sidecar
+caches the scan's parts, never the answer, because
+the claude.ai title comes from its own cache (`<root>/remote-cache/session-titles.json`, `remote-titles.ts`):
+a detached `oak titles --refresh --if-due` (in VS Code, an in-host refresh) fills it from
+`GET /v1/code/sessions` at most every five minutes, locked and throttled, and nothing on a read path
+touches the network. Each scan's result is cached in a per-session sidecar at
 `<root>/session-meta/<id>.json`, keyed to the transcript's `(mtime, size)` exactly as the stats cache is,
 and written through a pid-scoped temp file plus a rename, so a concurrent reader sees old-or-new and
 never a torn file. A cold CLI process answers a listing from those stats plus one sidecar read per
@@ -237,7 +274,7 @@ they must never drift. The mirrors:
 | TS source | Kotlin mirror | What it holds |
 | --- | --- | --- |
 | `core/src/store.ts` (`EditRecord`, `readLog`, blobs) | `core/StoreReader.kt` + `model/Models.kt` | reads `log.jsonl` off disk, folds `{op:"status"}` ops, reads blobs |
-| `core/src/session.ts` (`resolveSessionId`, `mangleCwd`, `hasAssistantRecord`) | `core/SessionResolver.kt` | cwd-mangle → newest `<session>.jsonl` **with an assistant record** (command-only `/effort`-style stubs and bridge-session records are demoted; newest wins only when no candidate has replied yet) → parent-dir walk |
+| `core/src/observe.ts` (`sessionMeta`) | `model/Sessions.kt` | parses `sessions --json`; preserves workspace order and uses its `active` id for automatic selection |
 | `core/src/paths.ts` (`claudeConfigDir`) | `core/ClaudePaths.kt` | resolves the config dir + store paths |
 | `core/src/tree.ts` (`EditTree` et al.) | `model/Tree.kt` (`EditTree` + `TreeParser`) | parses `tree --json` into `TreeFolderNode`/`TreeFileNode`/`TreeClassNode`/`TreeEditNode` |
 | `cmdObserve` payload | `model/Observe.kt` (`ObservePayload` + `ObserveParser`) | parses `observe` |
@@ -247,9 +284,10 @@ they must never drift. The mirrors:
 - `packages/jetbrains/src/test/kotlin/com/cellobservatory/observatory/core/StoreReaderTest.kt` —
   asserts append-only `log.jsonl` semantics: `EditRecord` lines + `{op:"status"}` folding (last op
   wins), tolerance of unparseable lines, and blob reads, against fixtures written in the TS format.
-- `packages/jetbrains/src/test/kotlin/com/cellobservatory/observatory/core/SessionResolverTest.kt` —
-  asserts `session.ts` behavior: cwd mangling, stub-proof selection (command-only and bridge-session
-  transcripts never outrank a real session; all-stub dirs fall back to newest), and the parent-dir walk.
+- `packages/jetbrains/src/test/kotlin/com/cellobservatory/observatory/model/SessionsRowsTest.kt` —
+  verifies the CLI listing contract, workspace order, statistics and rejection of legacy remote rows.
+- `packages/jetbrains/src/test/kotlin/com/cellobservatory/observatory/platform/SessionSelectionTest.kt` —
+  proves an empty CLI listing cannot fall back to a mirrored transcript on disk.
 
 If you change a store or session read, update the port **and** these tests in the same PR.
 
@@ -417,7 +455,7 @@ in the Overview's **Workflows** tab and in `multitask` / `changemap --json` (`ed
 per-agent rows (phase, sparkline, ±diff, tokens·time, nested subagents), the workflow runs, and the
 `FileCollision`s in the CLI, so both editors render it thin. To make "live" honest, JetBrains gained a
 `TranscriptWatcher` that watches the Claude Code **transcripts** — not just the edit store — bounded to the
-fleet's worktree-sibling project dirs, so every panel (Overview and the Timeline's three tabs) rebuilds on **any**
+fleet's worktree-sibling project dirs, so every panel (Overview and the Timeline's four tabs) rebuilds on **any**
 tool call — reads, bash, subagent spawns, to-dos — not only when Claude writes a file. (VS Code already
 rebuilt on transcript
 change; this brings JetBrains to parity — a window that silently updated on edits alone would be a
@@ -439,7 +477,7 @@ across all panels.
 pipeline — transcript lines appended to the real project dir, edits captured via the same
 `handleHookPayload` logic the hooks run, a subagent transcript, and a workflow run — inside an isolated
 `demo-<hex>` session and a marker-gated `observatory-demo/` folder. It doubles as the live showcase
-(`claude-observatory demo`) and the e2e fixture (`--fast`); `autoClearDemo` drops a fully reviewed demo
+(`oak demo`) and the e2e fixture (`--fast`); `autoClearDemo` drops a fully reviewed demo
 session's store so reviewing the demo leaves no residue, and `cleanDemo` removes every trace.
 
 ## The CLI `--json` contract
@@ -453,15 +491,16 @@ VS Code renderers key on them by name. Add fields; don't rename them. (`emitJson
 | `list --json` | `{ session, edits: [{ id, ts, tool, file, status, added, removed }] }` | scripts / terminal; JetBrains reads the same records off-disk via `StoreReader` |
 | `status --json` | `{ hooksInstalled, hookScript, session, store, lastCaptureTs, counts: { total, pending, kept, undone, cancelled } }` — counts exclude cancelled-out chains (reported separately), like every other surface | doctor / scripts / setup checks |
 | `views [--views <a,b,c>] [--root <d>]` | `{ [name]: payload \| null }` over the READ-ONLY views — default `changemap, multitask, prompts, processes, sessions, observations, risk, egress`; `stats` is also accepted by name, though nothing batches it by default. Each payload is **byte-identical** to that view's own command (all eight defaults pinned by e2e); a view that throws is `null` rather than fatal to the batch, and a mutating verb is refused outright. One process instead of one per view | The eight views the JetBrains Overview polls — `ObservatoryCli`'s private `ViewBatch`, consulted by each `*Json` accessor. `feed`, `tree`, `stats` and `usage` answer their own triggers and still spawn separately. VS Code takes `changemap` + `multitask` + `processes` from one batched spawn |
-| `sessions --json` | `{ active, sessions: [{ id, title, lastActiveMs, current, edits, pending, files, added, removed, tokens, durationMs, model, effort }] }` — this workspace's sessions, newest conversation first. Identity and ordering come from directory stats plus the sidecar-cached title scan; the counts come from the session's edit log, re-parsed only when its `(mtime, size)` moved and cached in the same sidecar. `added`/`removed` cost two blob reads per edit, so the sum is rebuilt in full each time from a per-BLOB-PAIR cache (`changemap-cache/<sid>/deltas.json`) — caching the total alone re-paid the whole log on every refresh of a live session (+0.71 s at 7,914 edits). A running total was tried and rejected: resuming from a derived number is inheriting it, so one bad entry is never recomputed and nothing can detect it (observed: 0 over 2,800 edits, permanently). A blob pair is content, so a hit is exact by construction. `tokens`/`durationMs`/`model`/`effort` ride `sessionUsage`'s persisted byte cursor, and both calls share one delta parse | Switch Session pickers + the Overview's Sessions tab — JetBrains via `ObservatoryCli.sessionsJson` → `SessionsParser`, VS Code via in-process `core.sessionMeta` |
+| `sessions --json` | `{ active, sessions: [{ id, workspace, title, lastActiveMs, lastTurnMs, current, edits, pending, files, added, removed, tokens, durationMs, model, effort }] }` — sessions belonging to this machine, grouped by workspace, the editor root first, other workspaces and their rows ordered by conversation recency. Claude provenance compares its recorded cwd with the project slug; absent foreign platform paths also identify mirrors. Bridge pointers without assistant records are excluded. Codex titles prefer `session_index.jsonl` thread names, then rollout titles and the first real prompt. A title that only hands the task to a markdown brief (`Execute TASK.md`, a prompt that reads a brief and carries it out) takes the heading on the brief's first line, read from the first 8 KB of the file (relative to the rollout's `cwd`, absolute, or under `~`) and cached on its stamp; a missing brief keeps the title. A prompt that is itself a brief takes its heading, and an Auto-review (`guardian`) thread is titled after the session it reviews. Counts and usage use existing incremental caches; Codex recency uses the raw rollout's mtime. | Both editors consume `sessions --json` (or the `sessions` member of `views --json`). The Overview adds workspace headers, active filtering and week-old folds; pickers show the workspace column. No background remote gather. Remote workspace extension hosts naturally list the remote host's local sessions. |
 | `tree [--root <d>] [--filter <q>]` | `EditTree` (`{ folders[], files[], hiddenIds[] }` → folder → file → class → edit w/ `added`/`removed`). `hiddenIds` is every record inside a cancelled-out chain, independent of `--filter` | The **JetBrains Review tree** (`TreeParser` → `EditsTreePanel`), plus scripts and the terminal. The plugin also derives its status bar, its File/Diff/Folder axes and its project-view badges from `hiddenIds`, so those counts agree with the tree they sit beside; VS Code renders the equivalent in-process |
-| `observe` | `{ session, recap, insights, suggestions, edits: [{ id, ts, tool, file, status, summary, reasoning, flags, memory, analysis }] }` | Observations — the Timeline window's middle tab in both editors (JetBrains `ObserveParser`; VS Code builds the equivalent in-process) |
+| `conversation --session <id> [--limit N] [--since <cursor>] [--root <d>] --json` | `{ events: [{ ts, update }], turns, agent, transcriptPath, cursor, truncated, reset? }` — the transcript as renderer-ready session updates: `user_prompt`, `agent_message_chunk`, `agent_thought_chunk`, `tool_call`/`tool_call_update` (carrying the captured record's `editId` where one was attributed), `plan`, `usage_update` and `turn_end`. An initial read delivers the last **N turns** (`--limit`, default 50), counted backwards from the end of the file rather than parsed from its start, and `truncated` reports the bytes cut above them (`0` = the whole transcript). `--since <cursor>` continues from the byte cursor the previous read returned and delivers **every** record appended after it, whatever the limit, with `truncated: 0`; `cursor` is `null` only when the session has no transcript. `reset: true` means the transcript was REPLACED, not appended to — the events are a fresh bounded window and the consumer must redraw rather than append. A cursor OAK did not issue costs a replay of the preceding turn, never a wrong render | The terminal's Observatory detail takes a bounded first read and tails it with `--since`. Both editors read their conversation through `feed --json` |
+| `observe` | `{ session, recap, insights, suggestions, edits: [{ id, ts, tool, file, status, summary, reasoning, flags, memory, analysis }] }` | Observations — the Timeline window's Observations tab in both editors (JetBrains `ObserveParser`; VS Code builds the equivalent in-process) |
 | `actions [--all]` | `{ session, summary{ total, byCategory, errors, firstTs, lastTs }, actions: [{ ts, tool, category, target, detail, ok, isError, reasoning, editId }], groups: [{ category, label, count, errors, actions[] }], subagents, subagentsSummary, fleet, fleetSummary }` | Actions — the Timeline window's last tab in **both editors** — VS Code in-process `parseActions`/`buildActionGroups`; JetBrains reads the same curated `actions` section out of the shared `multitask` payload through `ActionsParser` → `ActionsPanel`. `groups` is curated by default; `--all` includes reads/searches/meta. `subagents`/`subagentsSummary`/`fleet`/`fleetSummary` are additive 0.7.0 fields (same shapes as the `subagents`/`siblings` commands); existing parsers ignore them |
 | `subagents [--json]` (alias `agents`) | `{ session, summary, subagents: [{ agentId, agentType, description, status, ts, durationMs, tokens, toolUseCount, actions[], edits, summary }] }` | Subagents node in the Actions tab — **both editors**; each subagent's nested timeline is mined zero-token from `subagents/agent-<id>.jsonl` and correlated via the spawning tool call's `toolUseResult` |
 | `siblings [--json]` (alias `fleet`) | `{ session, summary, siblings: [{ id, self, active, lastMs, edits, pending, files[], moreFiles, risk{ total, high } }] }` | Fleet node in the Actions tab — **both editors** — plus an agent-facing digest a run can poll mid-flight; READ-ONLY / PATH-ONLY (no file contents cross agents). `--json` = siblings only; `--all` includes self |
 | `metrics [--json]` | `{ session, spanMs, actions{ total, errors, byCategory }, edits{ count, added, removed, pending, kept, undone }, subagents{…}, toolLatency{ count, medianMs, p95Ms, maxMs } }` | Session metrics roll-up — diff stats, action/error counts, per-subagent duration/tokens, and tool latency (from each `tool_use`→`tool_result` timestamp gap) |
 | `changemap [--root <d>] [--json]` | `{ summary, edits[], compactions[], files[], modules[], tasks[], rollupByTask[], rollupBySubagent[], rollupByWorkflow[], workflows[], prompts[], rollupByAgent[], agents[], unassigned }` — `files`/`modules` are the churn + worst-unreviewed-wins rollups (pre-labeled, churn-sorted); `tasks[]` carries the strict-span identities `rollupByTask` joins by `taskId`, and `unassigned` surfaces that rollup's `taskId: null` row directly so a renderer never digs it out; the three `rollupBy*` each keep their explicit `null` strict-unassigned/main-chain bucket (scripts still see the honest strict view); `prompts[]` slices the session by the user's own turns and is built for the active session only; `agents[]` is one full change-map per worktree-sibling (the master-detail per-agent view, most-recently-active first) with its `edits`/`prompts` projected out — the top-level `edits[]` is the one tools read | Overview panel (master-detail; Fleet/Workflows nav → change-map detail) — JetBrains `ChangeMapPanel` via the CLI, VS Code via one `views` spawn carrying this plus `multitask` and `processes` (same payload; both render as-given). `core.overviewChangeMap` is the shared composition both paths run, so neither front-end owns a second copy of it |
-| `prompts [--json]` \| `prompts --id <n> [--response] --json` | `{ session, summary{ total, withEdits, edits }, prompts: [{ id, index, ts, endTs, text, title, editIds[], edits, added, removed, pending, kept, undone, files, folders, tokens, tasks, actions, errors, agents[], workflows[], processes[], compactions, durationMs }] }`; `--id` narrows to `{ session, prompt }`, and `--response` returns `{ session, response: { promptId, index, text, turns, bytes, truncated } }` — Claude's own prose for that ask, its tool calls stripped, capped, with `truncated` reporting the bytes past the cap | Prompts — the Timeline window's first tab in both editors (JetBrains `PromptsParser`); selecting a row scopes the Overview to that ask, and the selection is shared with the nav bar's Prompt axis in both directions |
+| `prompts [--json]` \| `prompts --id <n> [--response] --json` | `{ session, summary{ total, withEdits, edits }, prompts: [{ id, index, ts, endTs, text, title, editIds[], edits, added, removed, pending, kept, undone, files, folders, tokens, tasks, actions, errors, agents[], workflows[], processes[], compactions, durationMs }] }`; `--id` narrows to `{ session, prompt }`, and `--response` returns `{ session, response: { promptId, index, text, turns, bytes, truncated } }` — Claude's own prose for that ask, its tool calls stripped, capped, with `truncated` reporting the bytes past the cap | Prompts — a Timeline window tab in both editors (JetBrains `PromptsParser`); selecting a row scopes the Overview to that ask, and the selection is shared with the nav bar's Prompt axis in both directions |
 | `review --prompt <id> [--no-patch] [--json]` | `{ session, prompt{ id, index, ts, endTs, title, text }, units: [{ id, members[], file, rel, tool, status, ts, added, removed, patch? }], cancelled: [same shape], cancelledIds[], hiddenIds[], ids[], summary{ units, pending, cancelled, added, removed }, patchesOmittedFrom, errors[] }` — `cancelled` are the chains that end where they started (never rows; one footer with a Dismiss over `cancelledIds`), and `hiddenIds` is what a renderer must not draw at ANY status — ONE ask's work as review units, each `patch` the unit's NET unified diff; `members` are the unit's RAW record ids and `ids` is the whole ask's mutation set, group-expanded and ascending (what `keep --ids`/`undo --ids` take). Patches are budgeted (8 MB); past it, `patch` is absent, `patchesOmittedFrom` names the first cut and `errors[]` says so — never a silent hole. Deliberately NOT batchable via `views` (it needs a prompt id, and `views` hands one argument list to every view) | Review — the per-ask tab in all three surfaces (JetBrains `ReviewParser` → `ReviewPanel`; VS Code builds the same payload in-process; the terminal instead scopes its Edits list to the ask — the payload's consumers are the two editors). This is also where the JetBrains plugin consumes core's same-code collapse at all — everywhere else it reads raw records off disk |
 | `multitask [--root <d>] [--json]` | `{ agents: [{ session, worktree, gitBranch, self, phase, phaseConfidence, sparkline[], todos, subagents[], files[], diff{ added, removed }, tokens, durationMs, risk, folded, loaded }], collisions: FileCollision[], worktrees[], workflows: WorkflowRun[], actions{ groups[], egress }, summary{ active, conflicts } }` | Overview Fleet/Workflows nav — **both editors** (render thin); assembled in the CLI from `listRepoSiblings` + per-agent `buildChangeMap` + `parseWorkflows`. Git-free / path-only. `folded` = quiet for over `FLEET_FOLD_MS` (a week) and collapsed in the nav; those rows are served from the disk cache but never rebuilt on the critical path, so `loaded: false` means **the numbers on this row are placeholders, not findings** — renderers must say "not loaded" rather than draw zeros. The session being viewed is never folded |
 | `tasklog` (always JSON) | `TaskLogEntry[]` — `{ taskId, content, agentIds[], subagentIds[], firstTs, lastTs, edits, added, removed, status }`, one row per stable `taskId` unioned across worktrees + subagents (`unassigned` excluded) | Cross-agent task log — **CLI only**; neither editor invokes it (they read `multitask.tasks`, which is session-scoped). Folds every worktree sibling's *cached* change map — calling the raw builder here cost 12.4 s for a 12 KB answer |
@@ -504,11 +543,11 @@ keep/undo, and the context-preloaded chat handoff — costs **zero extra Claude 
 
 **0.10.0: one Timeline window, two floating bars.** VS Code's three timeline-shaped views —
 `claudeObservatory.prompts`, `claudeObservatory.actions`, `claudeObservatory.observations` — were
-consolidated into a single `claudeObservatory.timeline` webview whose tab strip carries Prompts ·
+consolidated into a single `claudeObservatory.timeline` webview whose tab strip carries Feed · Prompts ·
 Observations · Actions. The three view ids no longer exist, which is the one breaking change in the
 release: VS Code stores view placement per profile, so anyone who had dragged those views somewhere gets
 a reset panel layout once. JetBrains already had the tabbed shape and keeps it, now as a single tool-window
-content rather than three. Neither window's tab layout is a workspace setting: which tab is forward,
+content with four tabs. Neither window's tab layout is a workspace setting: which tab is forward,
 whether the tabs are grouped into columns, and each column's width and fold state are **layout** choices,
 so VS Code rides them on the webview state object and JetBrains on the application-level
 `claude-observatory.xml`. The one shared *behaviour* setting, `editorReviewSurface`, is deliberately the
@@ -516,6 +555,72 @@ same key in both editors with `floating` and `none` spelled the same; only the s
 differ get words of their own (`bubble` in VS Code, `banner` and `both` in JetBrains). VS Code's floating
 bar is the same `EditPeek` comment thread as the review bubble in a body-less `bar` mode — one thread
 field, so the two surfaces cannot be on screen at once by construction.
+
+## Agent and conversation planes
+
+- **Data:** `core/src/herdr.ts` owns the typed socket adapter, protocol/version gate, snapshot,
+  subscriptions, agent start/prompt/focus operations, and machine forwarding. `herdr-api.d.ts`
+  is generated from the pinned schema. `herdr-install.ts` installs the pin; `herdr-link.ts`
+  joins pane identities with OAK sessions. `herdr-tabs.ts` names herdr's tabs by one set of rules:
+  the terminal app's pass over every machine, and `syncSessionTab` for one session's own tab, which
+  the capture hooks and the Claude Code status line start detached (`oak __tab-sync`) when the title
+  may have changed. On a saved machine the app's pass keeps the `btop` tab and has the machine run
+  `oak __tab-sync` itself (`--machine`), so one server's names are recorded once, by the OAK on the
+  machine that runs it. A session that machine holds no pane link for (its hooks never ran in the pane)
+  it cannot name: `__tab-sync` answers `unlinked`, and the app's pass names that tab by the app's own
+  record, as before. A name the app's own record says it gave a tab there (before the update, while that
+  machine's OAK lacked the verb, or while it held no link for the session) goes along as `--claimed`,
+  and the machine takes that claim on while the tab wears it. Both write `<root>/herdr-tabs.json` under
+  its lock, each only the claims it changed, and before it `<root>/herdr-tabs.at.json`, when the title
+  each claim names was read: a pass leaves alone a tab whose claim is newer than the session list it
+  works from, and one that reads between the two writes never sees a new claim with an old time.
+- **UI:** the TUI's herdr tab hosts the real herdr client in a local native terminal. herdr's
+  server owns the agent terminals. Observatory shows active panes plus unresolved local history,
+  with a pinned conversation detail. `i` focuses its thin reply composer. Editors expose the
+  transcript conversation through `oak feed --json` in the Feed tab of both VS Code and
+  JetBrains, alongside Review and Overview; new agents start in herdr-owned terminals.
+- **Control:** herdr owns pane creation, agent start, prompt submission, waiting and focus. OAK
+  submits through the single adapter; remote operations use herdr's machine forwarding. OAK adds
+  session identity and review metadata without claiming the agent's lifecycle state.
+- **Review:** Claude hooks and Codex hooks/transcript parsing produce the existing edit store.
+  `conversation.ts` reads native transcripts and joins tools with captured edits. Hook-only
+  lifecycle evidence lives in `capture-events.jsonl` for prompt attribution, permissions, and
+  workers; it is not an agent protocol replay. Legacy edit provenance remains readable so
+  uncertain before-states continue to refuse unsafe Undo.
+- **`core/src/codex.ts`** — Codex-native hooks (Codex ≥0.147.0 speaks Claude Code's payload
+  dialect): the payload adapter funnels into the same `handleHookPayload` pipeline
+  (`apply_patch` becomes per-file edit payloads), lifecycle events land in the hook journal,
+  and the rollout miner supplies prompts/tokens (with the cache split)/model/effort. The
+  installer replicates Codex's trust hash because Codex skips untrusted hooks.
+- **`core/src/models.ts`** — the `oak models` verb's engine: list what the local Ollama serves and
+  wire Codex to one (`rewireCodexConfigText` edits only the top-level model keys, append-only,
+  with a `.bak`; a live Codex probe confirms the wiring answers).
+
+`daemon.ts` and `tui/server.ts` implement only the local focus endpoint: versioned hello,
+watch, focus, and shutdown. `oak focus --session <id> --tab observatory|review|herdr` forwards to
+an attached OAK TUI. The endpoint has no terminal or agent ownership and no SSH transport.
+
+Comments and quotes remain drafts until an explicit send. Core locates the session's live pane,
+then calls the local prompt API or herdr's machine forwarding. Failed/unavailable submissions
+retain the draft; comments are consumed only on acknowledgement. Usage reads local measurements;
+machine configuration belongs to herdr, not OAK preferences.
+
+`herdr.lock` pins the upstream version, protocol, asset URLs and SHA-256 checksums. Core embeds
+that pin through `gen:herdr-lock`; `gen:herdr` regenerates the API declarations. The CLI distribution
+ships `dist/herdr-plugin/`; the pin travels compiled into the bundle. `ensureHerdr()` owns installation and integration
+setup and preserves newer installed binaries.
+
+The focus endpoint reports its protocol and build stamp before accepting operations. The TUI
+replaces an outdated endpoint at startup; `oak doctor --fix` performs the same repair and reports
+it. herdr agent terminals remain owned by herdr. Doctor also spawns a bounded echo child through
+node-pty, repairs a non-executable spawn helper with `--fix`, and retries the check.
+
+Observatory retains active panes and unresolved store sessions. Resolved, inactive sessions are
+archived rather than deleted; Shift+A includes them. Each machine groups its live sessions by herdr
+workspace, and a paneless session by project. Cursor movement previews a header; a click or Enter
+pins the transcript, and re-pinning a leaf parks its unsent draft with the session it was written for.
+The composer submits only on Enter. Remote polling defaults to 30 seconds per
+call (`OAK_HERDR_REMOTE_TIMEOUT_MS`), avoids overlapping requests and backs off after failures.
 
 ## See also
 

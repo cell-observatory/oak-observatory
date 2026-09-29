@@ -21,7 +21,7 @@ private const val CLUSTER_ID = "claudeObservatoryActions"
  *  a CustomStatusBarWidget hosting the ReviewNavBar's ActionToolbar, hidden whenever nothing is pending. */
 class ObservatoryActionsWidgetFactory : StatusBarWidgetFactory {
     override fun getId() = CLUSTER_ID
-    override fun getDisplayName() = "Claude Observatory: Review Actions"
+    override fun getDisplayName() = "OAK: Review Actions"
     override fun isAvailable(project: Project) = true
     override fun createWidget(project: Project): StatusBarWidget = ObservatoryActionsWidget(project)
     override fun canBeEnabledOn(statusBar: StatusBar) = true

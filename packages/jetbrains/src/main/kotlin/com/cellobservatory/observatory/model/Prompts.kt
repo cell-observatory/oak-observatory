@@ -5,10 +5,10 @@ import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 
 /**
- * Kotlin mirror of core's PROMPTS view-model, parsed from `claude-observatory prompts --json`: the
+ * Kotlin mirror of core's PROMPTS view-model, parsed from `oak prompts --json`: the
  * session as the list of things the USER asked for, each carrying what it produced.
  *
- * Every other axis here organizes work the way the AGENT saw it — tasks come from Claude's own
+ * Every other axis here organizes work the way the AGENT saw it — tasks come from the agent's own
  * to-dos, rollups come from files, folders, subagents and workflow runs. None of them answer the
  * question a person actually has: *what happened when I asked for X?*
  *
@@ -65,7 +65,7 @@ data class PromptsResult(
     val prompts: List<SessionPrompt>,
 )
 
-/** Claude's prose reply to one ask (core.PromptResponse) — its tool calls stripped, so the reader gets
+/** the agent's prose reply to one ask (core.PromptResponse) — its tool calls stripped, so the reader gets
  *  the narrative. Fetched on demand (it can be large), never on the list payload. */
 data class PromptResponse(
     val promptId: String,

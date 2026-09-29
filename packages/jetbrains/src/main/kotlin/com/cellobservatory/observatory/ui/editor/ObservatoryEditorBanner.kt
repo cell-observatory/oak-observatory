@@ -18,7 +18,7 @@ import java.util.function.Function
 import javax.swing.JComponent
 
 /**
- * Persistent review bar atop any editor whose file has pending Claude edits — parity with the VS Code
+ * Persistent review bar atop any editor whose file has pending agent edits — parity with the VS Code
  * editor-title buttons. Every action renders a tinted nav-bar icon + a word label, icon AND text both
  * clickable (Search · Prev/Next Edit · Prev/Next File · Keep · Undo · Accept File · Reject File ·
  * Clear Resolved · Spotlight). Per-file gated; kept live by
@@ -76,7 +76,7 @@ class ObservatoryEditorBanner : EditorNotificationProvider, DumbAware {
         panel.createActionLabel("Prev Edit") {
             val s = service.currentSession() ?: return@createActionLabel
             val prev = service.prevPendingEdit()
-            if (prev == null) ReviewOps.notify(project, "No pending Claude edits — all caught up")
+            if (prev == null) ReviewOps.notify(project, "No pending agent edits — all caught up")
             else Navigate.openFileAtEdit(project, s, prev)
         }.apply {
             setUseIconAsLink(true)
@@ -86,7 +86,7 @@ class ObservatoryEditorBanner : EditorNotificationProvider, DumbAware {
         panel.createActionLabel("Next Edit") {
             val s = service.currentSession() ?: return@createActionLabel
             val next = service.nextPendingEdit()
-            if (next == null) ReviewOps.notify(project, "No pending Claude edits — all caught up")
+            if (next == null) ReviewOps.notify(project, "No pending agent edits — all caught up")
             else Navigate.openFileAtEdit(project, s, next)
         }.apply {
             setUseIconAsLink(true)
@@ -160,7 +160,7 @@ class ObservatoryEditorBanner : EditorNotificationProvider, DumbAware {
         }.apply {
             setUseIconAsLink(true)
             setIcon(NavTint.SPOTLIGHT)
-            toolTipText = "Toggle file heatmap (spotlight Claude's edits)"
+            toolTipText = "Toggle file heatmap (spotlight the agent's edits)"
         }
         return panel
     }

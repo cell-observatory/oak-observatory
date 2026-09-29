@@ -41,8 +41,8 @@ function stampOf(p: string): string | null {
   try {
     const st = fs.statSync(p);
     return `${st.mtimeMs}:${st.size}`;
-  } catch {
-    return null;
+  } catch (e) {
+    return ['ENOENT', 'ENOTDIR'].includes((e as NodeJS.ErrnoException).code ?? '') ? 'absent' : null;
   }
 }
 
@@ -131,7 +131,15 @@ export function cachedByFiles<T>(kind: string, paths: string[], compute: () => T
  * on disk and each is wanted by 6-9 derivations); above it nothing more is gained and the cap stops
  * protecting anything — unbounded holds every session an editor host ever visits and lands at 1.27 GiB.
  */
-const TEXT_BUDGET_BYTES = 192 * 1024 * 1024;
+const TEXT_BUDGET_DEFAULT = 192 * 1024 * 1024;
+
+/** The retained-bytes budget, read live so a constrained host can shrink it (`OAK_TEXT_BUDGET_BYTES`)
+ *  and a test can force the oversized-file path without a 192 MiB fixture. An unset or unparseable
+ *  value keeps the measured default. */
+function textBudget(): number {
+  const e = Number(process.env.OAK_TEXT_BUDGET_BYTES);
+  return Number.isFinite(e) && e > 0 ? e : TEXT_BUDGET_DEFAULT;
+}
 
 /**
  * What one cached line costs beyond the parent string: an array slot plus a V8 sliced-string header.
@@ -155,6 +163,24 @@ interface TextEntry {
 /** Insertion order IS the LRU order (re-inserted on every hit), like `caches` above. */
 const textCache = new Map<string, TextEntry>();
 let textHeld = 0;
+
+/**
+ * ONE oversized file — bigger than the whole budget by itself — held in its own slot rather than
+ * discarded.
+ *
+ * The budget's "one file bigger than the whole budget → never retained" rule silently reopened the
+ * 6-9x re-read it exists to close the moment a single transcript outgrew it: a live 102 MiB session
+ * retains ~204 MiB at 2 B/char, over the 192 MiB cap, so `readLines` fell back to reading and
+ * splitting it afresh for every derivation (measured: feed --json did 1,157 MiB of I/O, the main
+ * transcript 8x). A session only ever grows, so this is the common case, not the tail.
+ *
+ * Exactly one such file is held — the most-recently read — so the extra hold is bounded at
+ * (budget + the one active transcript), which is the working set a TUI/editor mines at a time. A
+ * second oversized file (a fleet sibling as big) evicts the first; the normal LRU cache is untouched
+ * by it, and its own entries never evict this slot.
+ */
+let bigPath: string | null = null;
+let bigEntry: TextEntry | null = null;
 
 /**
  * (mtimeMs:size:ino) for one file, or null when it can't be stat'd.
@@ -183,9 +209,16 @@ function admit(p: string, stamp: string, text: string, lines: string[] | null): 
     textHeld -= prev.cost;
     textCache.delete(p);
   }
-  if (cost > TEXT_BUDGET_BYTES) return entry; // one file bigger than the whole budget — never retained
+  if (cost > textBudget()) {
+    // Bigger than the whole budget: keep it in the single oversized slot (see bigEntry) instead of
+    // discarding, so the several derivations of one command share one read. Replaces any prior
+    // oversized file; never enters the normal cache or charges its budget.
+    bigPath = p;
+    bigEntry = entry;
+    return entry;
+  }
   for (const [k, e] of textCache) {
-    if (textHeld + cost <= TEXT_BUDGET_BYTES) break;
+    if (textHeld + cost <= textBudget()) break;
     textCache.delete(k);
     textHeld -= e.cost;
   }
@@ -214,6 +247,7 @@ export function readText(p: string): string {
       touch(p, hit);
       return hit.text;
     }
+    if (bigEntry && bigPath === p && bigEntry.stamp === before) return bigEntry.text;
   }
   const text = fs.readFileSync(p, 'utf8');
   if (before === null) return text; // unstampable → readable but not cacheable
@@ -244,6 +278,14 @@ export function readLines(p: string): string[] {
       const lines = hit.text.split('\n');
       return admit(p, before, hit.text, lines).lines!;
     }
+    if (bigEntry && bigPath === p && bigEntry.stamp === before) {
+      if (bigEntry.lines) return bigEntry.lines;
+      // The oversized slot held text only (a readText hit); split once and keep it on the slot so the
+      // remaining derivations of this command share the array too.
+      bigEntry.lines = bigEntry.text.split('\n');
+      bigEntry.cost = 2 * bigEntry.text.length + LINE_OVERHEAD_BYTES * bigEntry.lines.length;
+      return bigEntry.lines;
+    }
   }
   const text = fs.readFileSync(p, 'utf8');
   const lines = text.split('\n');
@@ -258,4 +300,6 @@ export function clearFsCache(): void {
   caches.clear();
   textCache.clear();
   textHeld = 0;
+  bigPath = null;
+  bigEntry = null;
 }

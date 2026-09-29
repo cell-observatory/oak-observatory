@@ -1,0 +1,15 @@
+<p>A <strong>task</strong> is one item of the plan the agent tracked for the session — an entry in its own numbered to-do list. Where <a href="prompts.html">prompts</a> follow your side of the conversation, tasks follow the agent's plan, and reviewing by task lets you accept exactly the edits that produced one outcome.</p>
+
+<h2>Strict attribution</h2>
+<p>Attribution is <strong>strict</strong>: an edit belongs to a task only if it was captured while that task was in progress. Gaps are not filled, and an edit that fits no interval stays <strong>unassigned</strong> rather than being guessed onto the nearest item. The Tasks tab, the cross-agent task log, the analytics rollups, and the <code>task-keep</code> family of review commands all use this one model — so a number shown anywhere is the same number acted on everywhere.</p>
+
+<figure><img src="media/overview-tasks.png" loading="lazy" alt="The Overview's Tasks tab: the session's numbered tasks with a status glyph, the task number and subject, the in-progress task's active form in italics, and the added and removed lines and edit count of each task's strict span"><figcaption>The Tasks tab. Accept, Reject, and Clear on a row act on that strict span alone.</figcaption></figure>
+
+<h2>Why coverage is partial</h2>
+<p>Tasks cover a session <em>partially</em> by design, because the plan does not account for every moment of work. The <strong>unassigned</strong> bucket says so rather than hiding it — an honest gap beats a confident guess. If you want complete coverage, review by <a href="prompts.html">prompt</a> instead, since every edit was made while answering some ask.</p>
+
+<div class="callout info">
+  <span class="ico">ℹ</span>
+  <div class="ct"><span class="ctitle">One model, everywhere</span>
+  <p>The same strict spans drive <code>task-keep</code>, <code>task-undo</code>, and <code>task-clear</code> on the CLI and in both editors. Accepting a task accepts its strict span alone — never a neighbouring task's edits.</p></div>
+</div>

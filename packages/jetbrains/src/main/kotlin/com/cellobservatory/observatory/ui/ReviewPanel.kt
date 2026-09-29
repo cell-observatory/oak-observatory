@@ -47,7 +47,7 @@ class ReviewPanel(private val project: Project) : JPanel(BorderLayout()) {
     private val head = JBLabel().apply { border = JBUI.Borders.empty(6, 8, 2, 8) }
     private val openAll = JButton("Open all in editor").apply {
         isVisible = false
-        toolTipText = "Every pending change in this scope, stacked into one editor tab (ten diffs at a time)"
+        toolTipText = "Every pending change in this scope in one editor tab (ten diffs at a time) — stacked or side by side, with a Spotlight that dims unmodified lines"
     }
     private val keepAll = JButton("Keep all").apply { isVisible = false }
     private val undoAll = JButton("Undo all").apply { isVisible = false }
@@ -123,7 +123,7 @@ class ReviewPanel(private val project: Project) : JPanel(BorderLayout()) {
         val selGroup = DefaultActionGroup(
             selAction("Keep", NavTint.KEEP, { it.pending }) { s, rec -> ReviewOps.keep(project, s, rec.id) },
             selAction("Undo", NavTint.UNDO, { !it.undone }) { s, rec -> ReviewOps.undoOrRedo(project, s, rec, redo = false) },
-            selAction("Redo", AllIcons.Actions.Redo, { it.undone }) { s, rec -> ReviewOps.undoOrRedo(project, s, rec, redo = true) },
+            selAction("Redo", NavTint.REDO, { it.undone }) { s, rec -> ReviewOps.undoOrRedo(project, s, rec, redo = true) },
             selAction("Chat", NavTint.CHAT, { true }) { s, rec -> ReviewOps.chatAbout(project, s, rec.id) },
             selAction("Diff", AllIcons.Actions.Diff, { true }) { s, rec -> Diffs.show(project, s, rec) },
         )
@@ -173,6 +173,17 @@ class ReviewPanel(private val project: Project) : JPanel(BorderLayout()) {
                 } else {
                     tree.idFilter = if (promptId != null) result.ids.toSet() else null
                     tree.hiddenIds = result.hiddenIds.toSet()
+                    // The integrity evidence rides the review units, not the `tree --json` the tree
+                    // renders from — so feed it down, per RAW member id: the review-only badge (on
+                    // review's wider rule) and the authoritative capture tooltip (model/tool/turn).
+                    val reviewOnly = HashSet<Int>()
+                    val captureById = HashMap<Int, String>()
+                    for (u in result.units) for (m in u.members) {
+                        if (u.partial) reviewOnly.add(m)
+                        if (u.capture.isNotBlank()) captureById[m] = u.capture
+                    }
+                    tree.reviewOnlyIds = reviewOnly
+                    tree.captureById = captureById
                     tree.rebuild()
                     renderHead(session, result)
                 }
@@ -181,7 +192,7 @@ class ReviewPanel(private val project: Project) : JPanel(BorderLayout()) {
     }
 
     private fun renderEmpty() {
-        head.text = "<html><i>No session is under observation yet. Once Claude works in this project, this " +
+        head.text = "<html><i>No session is under observation yet. Once the agent works in this project, this " +
             "tab lists the session's changes as a tree — folder, file, class, unit — with Keep/Undo/Redo " +
             "on every row; picking a prompt in the Prompts window scopes it to that ask.</i></html>"
         openAll.isVisible = false
@@ -194,11 +205,13 @@ class ReviewPanel(private val project: Project) : JPanel(BorderLayout()) {
         cancelBtn.isVisible = false
         tree.idFilter = null
         tree.hiddenIds = emptySet()
+        tree.reviewOnlyIds = emptySet()
+        tree.captureById = emptyMap()
         tree.rebuild()
     }
 
     private fun renderError() {
-        head.text = "<html><i>No answer for <b>review</b> — the claude-observatory CLI on PATH did not return it " +
+        head.text = "<html><i>No answer for <b>review</b> — the oak CLI on PATH did not return it " +
             "(a CLI older than 0.9.4 has no <code>review</code> command).</i></html>"
         openAll.isVisible = false
         keepAll.isVisible = false

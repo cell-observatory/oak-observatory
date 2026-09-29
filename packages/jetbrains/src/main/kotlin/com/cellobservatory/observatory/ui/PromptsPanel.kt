@@ -109,11 +109,20 @@ class PromptsPanel(private val project: Project) : JPanel(BorderLayout()) {
     /** Guards the listener→selection→listener loop while the panel is repainting itself. */
     private var syncing = false
 
-    // --- Claude's response viewer (0.8.7): read the selected ask's reply below the list ---
-    private val responseHead = JBLabel("Select a prompt to read Claude's response").apply {
+    // --- the agent's response viewer (0.8.7): read the selected ask's reply below the list ---
+    private val responseHead = JBLabel("Select a prompt to read the agent's response").apply {
         font = JBUI.Fonts.label().deriveFont(Font.PLAIN, JBUI.Fonts.label().size2D - 1f)
         foreground = UIUtil.getContextHelpForeground()
         border = JBUI.Borders.empty(3, 8, 2, 8)
+        // Clicking the header seats the Feed tab on the agent's ANSWER
+        // — the row click already seats it on where the ask began.
+        toolTipText = "Click to jump the Feed tab to this answer"
+        cursor = java.awt.Cursor.getPredefinedCursor(java.awt.Cursor.HAND_CURSOR)
+        addMouseListener(object : java.awt.event.MouseAdapter() {
+            override fun mouseClicked(e: java.awt.event.MouseEvent) {
+                service().selectedPromptId?.let { service().requestResponseJump(it) }
+            }
+        })
     }
     private val responseText = com.intellij.ui.components.JBTextArea().apply {
         isEditable = false
@@ -135,7 +144,7 @@ class PromptsPanel(private val project: Project) : JPanel(BorderLayout()) {
             add(desc, BorderLayout.SOUTH)
         }
         add(north, BorderLayout.NORTH)
-        // List on top, Claude's response below — a draggable divider so the reader gives the reply as
+        // List on top, the agent's response below — a draggable divider so the reader gives the reply as
         // much room as they want (or collapses it). The list keeps the majority by default.
         val responsePane = JPanel(BorderLayout()).apply {
             add(responseHead, BorderLayout.NORTH)
@@ -212,14 +221,14 @@ class PromptsPanel(private val project: Project) : JPanel(BorderLayout()) {
     private fun showResponse(r: SessionPrompt?) {
         if (r == null) {
             responseWanted = null
-            responseHead.text = "Select a prompt to read Claude's response"
+            responseHead.text = "Select a prompt to read the agent's response"
             responseText.text = ""
             return
         }
         responseCache[r.id]?.let { responseWanted = r.id; paintResponse(r, it); return }
         if (responseWanted == r.id) return // a fetch for this ask is already in flight — don't duplicate it
         responseWanted = r.id
-        responseHead.text = "#${r.index} · reading Claude's response…"
+        responseHead.text = "#${r.index} · reading the agent's response…"
         responseText.text = ""
         val session = service().currentSession() ?: return
         val workDir = project.basePath
@@ -237,9 +246,9 @@ class PromptsPanel(private val project: Project) : JPanel(BorderLayout()) {
 
     private fun paintResponse(r: SessionPrompt, resp: PromptResponse) {
         responseHead.text = when {
-            resp.text.isBlank() -> "#${r.index} · Claude wrote no prose for this ask (it may have only run tools)"
-            resp.truncated > 0L -> "#${r.index} · Claude's response · ${resp.turns} turn${if (resp.turns == 1) "" else "s"} · ${resp.truncated / 1024} KB more not shown"
-            else -> "#${r.index} · Claude's response · ${resp.turns} turn${if (resp.turns == 1) "" else "s"}"
+            resp.text.isBlank() -> "#${r.index} · the agent wrote no prose for this ask (it may have only run tools)"
+            resp.truncated > 0L -> "#${r.index} · the agent's response · ${resp.turns} turn${if (resp.turns == 1) "" else "s"} · ${resp.truncated / 1024} KB more not shown"
+            else -> "#${r.index} · the agent's response · ${resp.turns} turn${if (resp.turns == 1) "" else "s"}"
         }
         responseText.text = resp.text
         responseText.caretPosition = 0 // start at the top, not wherever the last one left it
@@ -259,7 +268,7 @@ class PromptsPanel(private val project: Project) : JPanel(BorderLayout()) {
             list.emptyText.text = when {
                 res != null -> "No prompts recorded yet — this fills in with every prompt you send"
                 !service().promptsAttempted -> "Reading this session’s prompts…"
-                else -> "The claude-observatory CLI on PATH did not answer `prompts --json` — update it to list your prompts"
+                else -> "The oak CLI on PATH did not answer `prompts --json` — update it to list your prompts"
             }
             val s = res?.summary
             head.text = if (s == null) "" else

@@ -61,4 +61,47 @@ class SessionsRowsTest {
         // A synthesized row carries no recency at all; calling that "live" would put a ● on a guess.
         assertFalse(isSessionActive(0L, now))
     }
+
+    @Test
+    fun `local listing preserves CLI workspace order and all statistics`() {
+        val result = SessionsParser.parse("""{"active":"fixture-local","sessions":[
+          {"id":"fixture-local","title":"Native Codex title","workspace":"~/work/app","lastActiveMs":123,"tokens":700,"durationMs":60000,"model":"gpt-6","edits":0},
+          {"id":"fixture-other","workspace":"~/work/other","lastActiveMs":456}
+        ]}""")!!
+        assertEquals(listOf("~/work/app", "~/work/other"), result.sessions.map { it.workspace })
+        val first = result.sessions.first()
+        assertEquals("Native Codex title", first.displayName)
+        assertEquals(700L, first.tokens)
+        assertEquals(60000L, first.durationMs)
+        assertEquals("gpt-6", first.model)
+        assertEquals(0, first.edits)
+    }
+
+    @Test
+    fun `a row keeps the newest edit its listing counted, and a row from an older CLI leaves it unknown`() {
+        // The delete confirmed from a row passes it on as `--seen-through`: an edit captured after the listing
+        // is refused, even one that joined a change the count included. Absent is not 0,
+        // which would say the listing saw no edit at all.
+        val result = SessionsParser.parse("""{"sessions":[
+          {"id":"fixture-counted","lastActiveMs":123,"edits":2,"pending":2,"lastEdit":12},
+          {"id":"fixture-older-cli","lastActiveMs":456,"edits":2,"pending":2}
+        ]}""")!!
+        assertEquals(listOf(12L, null), result.sessions.map { it.lastEdit })
+    }
+
+    @Test
+    fun `old remote and bridge rows cannot reappear in editor pickers`() {
+        // The parser is the one guard: every row past it is a session on this machine.
+        val result = SessionsParser.parse("""{"sessions":[
+          {"id":"local","lastActiveMs":123},
+          {"id":"remote","origin":"remote","paneId":"pane","kind":"codex"},
+          {"id":"bridge","origin":"bridged","lastActiveMs":456}
+        ]}""")!!
+        assertEquals(listOf("local"), result.sessions.map { it.id })
+    }
+
+    @Test
+    fun `legacy rows without conversation recency are still refused`() {
+        assertEquals(null, SessionsParser.parse("""{"sessions":[{"id":"legacy","lastMs":123}]}"""))
+    }
 }

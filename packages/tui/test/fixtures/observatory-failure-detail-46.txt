@@ -1,0 +1,6 @@
+Select a session · local · 0 tokens · 0
+pending
+build-box · not reachable · herdr forwarding
+failed: ssh unavailable
+A click or Enter pins this conversation · ↑↓
+previews it here and in Review

@@ -1,0 +1,15 @@
+<p><strong>Observations</strong> is where an edit stops being a diff and becomes something you can judge — because it's paired with the reasoning the agent recorded next to it, and flagged when it contains something worth a second look.</p>
+
+<h2>Reasoning beside each edit</h2>
+<p><strong>Observations</strong> pairs each <a href="edits.html">edit</a> with the reasoning the agent recorded near it in the <a href="capture.html#transcript">transcript</a>, flags notable content such as debug statements, possible secrets, and large deletions, and shows each file's review history across sessions. Adjacent same-file edits are coalesced into one run, so a heavily edited file reads as a story rather than a wall of rows.</p>
+
+<figure><img src="media/win-observations.png" loading="lazy" alt="The Observations panel: the session recap, the coalesced change feed with adjacent same-file edits collapsed into one run, and the per-edit reasoning rows with their flags and file memory"><figcaption>Observations: the recap, then each edit with the reasoning recorded beside it.</figcaption></figure>
+
+<h2>Context</h2>
+<p>Its <strong>Context</strong> section names what shaped the session — skills invoked, plans written, memory read, a resumed <a href="compaction.html">compaction</a> — and labels every entry with how it is known: <code>transcript</code> when the session demonstrably used it, <code>file-present</code> when the file merely exists where <a href="claude-code.html">Claude Code</a> loads it. The two are never merged, because "used" and "was available" are different claims.</p>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div class="ct"><span class="ctitle">Flags are hints, not verdicts</span>
+  <p>A possible-secret flag or a large-deletion flag points your attention; it doesn't decide for you. The point is that nothing notable slips through unread in a long session.</p></div>
+</div>

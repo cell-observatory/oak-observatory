@@ -5,12 +5,21 @@ export * from './store';
 export * from './session';
 export * from './undo';
 export * from './format';
+export * from './derived';
+export * from './agent';
+export * from './capture-events';
+export * from './codex';
+export * from './codex-account';
+export * from './models';
 export * from './install';
+export * from './herdr-install';
 export * from './ranges';
 export * from './classes';
 export * from './scopes';
 export * from './units';
 export * from './observe';
+export * from './pricing';
+export * from './breakdown';
 export * from './stats';
 export * from './analyze';
 export * from './memory';
@@ -27,24 +36,41 @@ export * from './risk';
 export * from './egress';
 export * from './processes';
 export * from './prompts';
+export { unwrapPastedContent, personPromptText, personPromptOf, transcriptForSession } from './asks';
 export * from './feed';
+export * from './conversation';
 export * from './subagents';
 export * from './workflows';
 export * from './fleet';
 export { clearFsCache } from './fscache';
 export * from './metrics';
 export * from './changemap';
+export * from './filetype';
 export * from './taskLog';
 export * from './tasks';
-export { runCapture, handleHookPayload } from './capture';
+export { runCapture, handleHookPayload, captureMutex, readAttention, writeAttention, clearAttention, waitedMs, linkTab, readTabLink, type AttentionState } from './capture';
 export * from './demo';
 export * from './tour';
 export * from './trace';
 export * from './ignore';
 export * from './prefs';
 // The terminal app's rendering — the frame, layout, glyphs, key decoder, options screen and rich
-// diff — moved to `@claude-observatory/tui`. It is a FRONT END, like the two editor extensions, and
+// diff — moved to `@oak-observatory/tui`. It is a FRONT END, like the two editor extensions, and
 // core is the data layer all three consume. Nothing outside that package imported any of it.
-export * from './remote';
+export * from './accountUsage';
 export * from './watch';
 export { readText, readLines } from './fscache'; // clearFsCache is already exported above
+
+export * from './codex-events';
+export * from './integrity';
+
+export * from './deferred-capture';
+export * from './notify';
+export * from './search';
+export * from './daemon';
+export * from './comments';
+export * from './herdr';
+export * from './remote-titles';
+export * from './cli-entry';
+export * from './herdr-link';
+export * from './herdr-tabs';

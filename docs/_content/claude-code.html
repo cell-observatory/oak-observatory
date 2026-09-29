@@ -1,0 +1,9 @@
+<p>OAK captures <strong>Claude Code</strong> through local hooks and reads its native transcript outside the model loop. Capture adds no model tokens.</p>
+<h2>Setup</h2>
+<pre><code>oak init
+oak doctor --fix
+oak agent start --kind claude</code></pre>
+<p>Install capture hooks with Claude Code closed, then open a new session. Before/after hooks preserve file changes for review; transcripts supply the conversation, actions and reasoning.</p>
+<h2>Terminal and review</h2>
+<p>herdr manages the agent terminal and its permission prompts. Observatory reads the conversation; Review decides captured edits. Claude Code sessions started outside herdr remain reviewable through their captured store, while prompt submission requires a matching live pane.</p>
+<p><a href="codex.html">Codex</a> also has native capture support. See <a href="supported-agents.html">Supported agents</a> for the current integration scope.</p>

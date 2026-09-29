@@ -137,7 +137,7 @@ export function observatoryRoots(opts: { cwd: string; session: string }): WatchR
     // them are the READ path's own writes — changemap-cache, session-meta, usage-cursors and
     // stats-cache.json are all rewritten by the very views a refresh renders, so accepting them would
     // have a live surface refreshing because it refreshed.
-    relevant: (reported) => reported !== null && path.basename(reported) === 'log.jsonl',
+    relevant: (reported) => reported !== null && (path.basename(reported) === 'log.jsonl' || path.basename(reported) === 'capture-events.jsonl' || ['attention.json', 'agent.json'].includes(path.basename(reported))),
     fanout: (dir) => [dir, ...allStoreSessionIds().map((id) => storeDir(id))],
   };
   const activity: WatchRoot = {
@@ -171,7 +171,15 @@ export function observatoryRoots(opts: { cwd: string; session: string }): WatchR
       return out;
     },
   };
-  return [store, activity];
+  const { codexHome } = require('./codex') as typeof import('./codex');
+  // Only the codex directories that EXIST: on a Claude-only machine both are absent, and watching
+  // them "degraded: ENOENT" on the status line of every OAK run (docs sweep, 2026-09-23).
+  const codex = ['sessions', 'archived_sessions'].filter((name) => fs.existsSync(path.join(codexHome(), name))).map((name): WatchRoot => ({
+    dir: path.join(codexHome(), name), kind: 'activity',
+    relevant: (reported) => reported === null || reported.endsWith('.jsonl'),
+    fanout: (dir) => { const out = [dir]; let level = [dir]; for (let depth = 0; depth < 4; depth++) { level = level.flatMap(listDirs); out.push(...level); } return out; },
+  }));
+  return [store, activity, ...codex];
 }
 
 function listDirs(dir: string): string[] {

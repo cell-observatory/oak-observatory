@@ -1,0 +1,23 @@
+<p>Not every captured edit is worth reviewing: lockfiles, <code>dist/</code>, snapshots, generated clients. A <strong>.observatoryignore</strong> says which. It's the one file in the product where a typo costs <em>data</em> rather than visibility — so it's worth understanding exactly.</p>
+
+<h2>Syntax and nesting</h2>
+<p>It is <code>.gitignore</code> syntax — the same patterns, the same <code>!</code> negations, the same "last matching rule wins" — and it nests the same way, with three tiers in git's own precedence order:</p>
+<ul>
+  <li>the committed <code>.observatoryignore</code> in any directory,</li>
+  <li><code>.git/info/observatoryignore</code> for one checkout only,</li>
+  <li><code>~/.claude/.observatoryignore</code> for rules that follow you everywhere.</li>
+</ul>
+
+<h2>One mode: never recorded</h2>
+<p>It has <strong>one mode</strong>: a path that matches is <strong>never recorded</strong> — not captured, so not listed, not counted, and not revertible, because there is nothing to revert.</p>
+
+<div class="callout warn">
+  <span class="ico">⚠︎</span>
+  <div class="ct"><span class="ctitle">A rule reaches back</span>
+  <p>A rule you add later also reaches back: the edits it now covers are dropped from the <a href="capture.html#store">store</a> on the next capture, or when you press Refresh in the terminal app or either editor, and the count is reported. This is why a typo here costs data — a too-broad pattern silently drops history.</p></div>
+</div>
+
+<h2>It explains itself</h2>
+<p>Which is why it's introspectable. <code>oak ignore --check &lt;path&gt;</code> names the rule that decided, its file and its line, and takes <code>git check-ignore</code>'s own flags and exit codes. The bare verb additionally reports any rule that can <em>never</em> fire — the gitignore trap git's own tooling leaves you to work out.</p>
+<pre><code>oak ignore --check src/generated/client.ts
+oak ignore            # report dead rules that can never match</code></pre>

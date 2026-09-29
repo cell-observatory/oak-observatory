@@ -31,6 +31,9 @@ export type DemoView =
   | 'fileHistory'
   | 'actions'
   | 'observations'
+  // The Timeline's Feed tab — the conversation and the activity, one surface. Older renderers seeing
+  // this unknown view degrade to text-only by contract.
+  | 'feed'
   | 'editor';
 
 /** The Overview's left-nav tabs, in their shipped order. */
@@ -51,7 +54,7 @@ export type DemoAnchor =
   | 'folders-strip' // the churn-by-folder strip
   | 'files-ledger' // the churn-ranked file list
   | 'summary-bar' // the pending/accepted totals under the ledger
-  | 'feed' // the live/audit feed under the detail pane
+  | 'feed' // the Timeline's Feed tab body
   | 'nav-axes' // the review nav bar: Diff · File · Folder · Prompt
   | 'accept-prompt' // "Accept All in #N"
   | 'session-label' // which session the panels are showing
@@ -265,10 +268,10 @@ function allSteps(): DemoStep[] {
       id: 'sessions',
       title: 'Sessions — which one you are reviewing',
       body:
-        'The Overview begins with the question that precedes every other one: which session these panels are showing. Rows are this workspace\'s sessions by conversation recency, and selecting one switches the whole observatory to it.',
+        'The Overview begins with the question that precedes every other one: which session these panels are showing. Sessions are grouped by workspace on this machine, the editor’s workspace first. Rows follow conversation recency; selecting a local row switches the whole observatory. Each row shows its title and statistics.',
       view: 'overview',
       tab: 'sessions',
-      tip: 'Selecting a row switches what the whole observatory reviews.',
+      tip: 'Selecting a local row switches what the whole observatory reviews.',
       anchor: 'nav-tabs',
     },
     {
@@ -286,9 +289,9 @@ function allSteps(): DemoStep[] {
       id: 'timeline-session',
       title: 'Choosing which session the timeline shows',
       body:
-        'The selector above the Prompts list names the session the observatory is reviewing and lists the sessions still active in this workspace, so switching between two live conversations is one click. Every other session stays in the Overview Sessions tab.',
+        'The selector at the top of the Timeline names the session the observatory is reviewing. Picking another one switches every panel, so moving between two live conversations is one click. The Overview Sessions tab lists every session, grouped by workspace.',
       view: 'prompts',
-      tip: 'Active sessions only — the full list lives in the Overview.',
+      tip: 'Picking a session here switches every panel; the Overview lists them all.',
       anchor: 'session-picker',
     },
     {
@@ -311,14 +314,14 @@ function allSteps(): DemoStep[] {
       essential: true,
       title: 'Review — one ask, as a list',
       body:
-        'Selecting an ask — as you just did — scopes the Review list to exactly that prompt’s work. Repeated edits to the same code arrive combined into one unit — a superseded intermediate state never asks for a decision. The list holds no code: a row opens that unit’s NET diff in the editor, and "Open all in editor" reads the pending work as one concatenated view, each diff with its own Keep/Undo/Chat. Keep or undo act per unit, or on everything listed at once.',
+        'Selecting an ask — as you just did — scopes the Review list to exactly that prompt’s work. Repeated edits to the same code arrive combined into one unit — a superseded intermediate state never asks for a decision. The list holds no code: a row opens that unit’s NET diff in the editor, and "Open all in editor" reads the pending work as one concatenated view, each diff with its own Keep and Undo. Keep or undo act per unit, or on everything listed at once.',
       view: 'review',
       tip: 'One row per piece of code the ask changed, however many times Claude revised it.',
     },
     {
       id: 'fleet',
       essential: true,
-      title: 'Fleet — every agent working in this repo',
+      title: 'Workers — every agent working in this repo',
       body:
         'Claude running in several git worktrees of one repository unifies here, one row per agent, with a live phase, its branch, an activity sparkline, line counts, and its risk and outside-the-workspace counts. The demo runs two: this session on demo/pipeline, and a hotfix agent on demo/hotfix. The correlation reads git\'s pointer files and never runs git.',
       view: 'overview',
@@ -342,7 +345,7 @@ function allSteps(): DemoStep[] {
       id: 'subagents',
       title: 'Subagents nest under the agent that spawned them',
       body:
-        'The Fleet tab nests subagents beneath the agent that spawned them, each with its own task, to-dos and edits. Its edit was captured under the parent session, exactly as Claude Code records one, and attributed back to the subagent by the window of its own tool calls rather than by guesswork.',
+        'The Workers tab nests subagents beneath the agent that spawned them, each with its own task, to-dos and edits. Its edit was captured under the parent session, exactly as Claude Code records one, and attributed back to the subagent by the window of its own tool calls rather than by guesswork.',
       view: 'overview',
       tab: 'fleet',
       tip: 'The test writer is a subagent; its edit is attributed by its action window.',
@@ -393,7 +396,7 @@ function allSteps(): DemoStep[] {
       tab: 'processes',
       tip: 'Three shells: one running, one exited 0, one failed.',
       anchor: 'nav-tabs',
-      tryIt: 'Select a shell to tail its output in the feed below.',
+      tryIt: 'Select a shell to tail its output in the Timeline’s Feed tab.',
     },
     {
       id: 'folders-strip',
@@ -440,12 +443,11 @@ function allSteps(): DemoStep[] {
     },
     {
       id: 'feed',
-      title: 'The feed — live tail, or the audit log',
+      title: 'The Feed tab',
       body:
-        'The pane at the bottom follows whatever you have selected: an agent, a workflow run, a task or a shell. While that thing is still moving it tails; once it has finished it becomes the record of what happened, and it says which of the two you are reading.',
-      view: 'overview',
-      tab: 'processes',
-      tip: 'Follows the selected row — tailing while it runs, an audit log once it is done.',
+        'The Timeline’s Feed tab is the selected conversation as it happened: your prompts, the agent’s replies and thinking, every tool call with the diff it produced, and the permissions it asked for — followed as the transcript grows. Picking a worker, run, task or shell in the Overview points the same tab at that thing’s own activity. New sessions and explicit prompt submissions use herdr.',
+      view: 'feed',
+      tip: 'Select a session to read its conversation; open herdr to interact with the running agent.',
       anchor: 'feed',
     },
     {
@@ -472,7 +474,7 @@ function allSteps(): DemoStep[] {
       id: 'search',
       title: 'Search and Active only',
       body:
-        'Search filters the Review list and the Overview ledger by path, and Active only narrows the Overview to what is still moving \u2014 agents and runs in flight, edits still awaiting review. Both persist, so a large session can be worked in slices.',
+        'Search filters the Review list and the Overview ledger by path, and Active only narrows the Overview to what is still moving \u2014 agents and runs in flight, edits still awaiting review. Both persist, so a large session can be worked in slices. Reset scope, beside Search, clears the search, folder and prompt scopes at once.',
       view: 'overview',
       tab: 'fleet',
       tip: 'Search filters by path; Active only hides what has settled.',
@@ -507,7 +509,7 @@ function allSteps(): DemoStep[] {
       id: 'chat',
       title: 'Handing something back to Claude, at no cost',
       body:
-        'Any edit, action, agent or task can be turned into a ready-to-paste prompt carrying its context \u2014 the file, the reasoning, the surrounding actions. Assembling it reads files you already have, so it costs nothing until you send it.',
+        'Any edit, action, agent or task can be turned into a ready-to-paste prompt carrying its context \u2014 the file, the reasoning, the surrounding actions. It waits on the clipboard as a draft, and goes to the session\u2019s live agent through herdr only when you choose Send to agent. Assembling it reads files you already have, so it costs nothing until you send it.',
       view: 'actions',
       tip: 'Chat about this \u2014 assembles the context, spends no tokens.',
     },
@@ -569,7 +571,7 @@ function allSteps(): DemoStep[] {
       essential: true,
       title: 'Actions — every tool call, and what it reached',
       body:
-        'The complete timeline of what the session did, by category, with the failed calls filterable on their own. Below it, two audits: Risk names the commands worth a second look and the writes that landed outside your workspace, and Egress names the hosts, servers and outside files the session reached. Both report what was exercised, not what was approved.',
+        'The complete timeline of what the session did, by category, with the failed calls marked and counted in each one, and a risk flag on every command worth a second look. Below it, two audits: the writes that landed outside your workspace, and Egress, which names the hosts, servers and outside files the session reached. Both report what was exercised, not what was approved.',
       view: 'actions',
       tip: 'The timeline, plus the Risk and Egress audits over what the session reached.',
       tryIt: 'Find the failed sanity run, the rm -rf, and the report written outside the workspace.',
@@ -628,7 +630,7 @@ function allSteps(): DemoStep[] {
       id: 'doctor',
       title: 'When something looks wrong',
       body:
-        'Setup Check reports what the observatory can and cannot see \u2014 the hooks, the CLI on PATH, the config directory, the session it resolved, the status line. Store maintenance sits beside it: reclaim disk, or drop a session entirely without touching a file on disk.',
+        'Setup Check reports what the observatory can and cannot see \u2014 the hooks, the CLI on PATH, herdr, the config directory, the session it resolved, the status line. Store maintenance sits beside it: reclaim disk, or drop a session entirely without touching a file on disk.',
       view: 'observations',
       tip: 'Setup Check names what is wired and what is not.',
     },
@@ -654,10 +656,10 @@ function allSteps(): DemoStep[] {
       id: 'usage-bars',
       title: 'Context, and the limits you are working against',
       body:
-        'The context bar is live from the transcript: tokens currently in context against the model\u2019s window. The five-hour and weekly bars are account-wide plan limits that come only from Claude\u2019s own status line — the observatory cannot fetch them, so they carry an age when the reading is stale and say so when the status line has never written. The used-of-total figure beside them is a projection from the reported percentage, and is labelled an estimate because that is what it is.',
+        'The context bar is live from the transcript: tokens currently in context against the model\u2019s window. The five-hour and weekly bars are account-wide plan limits, read from your account\u2019s usage and from Claude\u2019s own status line, so they carry an age when the reading is stale and say so when there has never been one; the month bar follows your bill cycle. The used-of-total figures beside them are projections from the reported percentage, and the dollar figures are priced from token counts; each is marked with a tilde, because it is an estimate and never a bill.',
       view: 'stats',
       anchor: 'stats-usage',
-      tip: 'ctx is live; 5h and wk come from Claude\u2019s status line, with an age when stale.',
+      tip: 'ctx is live; 5h and wk come from your account\u2019s usage; mo follows your bill cycle.',
     },
     {
       id: 'review-scoreboard',

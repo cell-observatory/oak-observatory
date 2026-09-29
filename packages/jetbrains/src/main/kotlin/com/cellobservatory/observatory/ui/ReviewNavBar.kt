@@ -41,24 +41,31 @@ internal object NavTint {
 
     // ONE glyph+tint per OPERATION (user rule 2026-07-16), used by every surface — nav bars, panel
     // toolbars, context menus, the editor banner, the floating lens — so an operation always looks the
-    // same wherever it appears. Mirrors the VS Code codicons one-for-one: per-edit Keep ✓/Undo ↩ ·
-    // scoped Accept ✓✓/Reject ✕ · session-wide Accept All (commit)/Reject All (history).
+    // same wherever it appears. THE STANDARD VOCABULARY: ✓ accepts, ✗ rejects, and
+    // the curved rollback arrow means REDO — put a reverted edit back. Mirrors the VS Code codicons
+    // one-for-one: per-edit Keep ✓ (check)/Undo ✗ (close) · scoped Accept ✓✓ (check-all)/Reject ✗✗
+    // (close-all) · session-wide Accept All (commit/checklist)/Reject All ✗✗ (close-all) · Redo ↺
+    // (rollback/discard).
     //
     // The glyph names the OPERATION; the SCOPE comes from the axis group it sits in. Accept File,
     // Accept Folder and Accept Prompt therefore share ✓✓ on purpose — each sits beside its own axis
     // counter ("File 3/126", "Folder 1/23", "Prompt 2/9"), which is the annotation that says what the
-    // button acts on, and VS Code pairs the same three with codicon-check-all for the same reason.
-    // Since 0.8.9 those rows are icon-only, so the counter is doing that work alone; keep every scoped
-    // action inside an axis group that carries one, or its scope becomes unreadable. Demo verbs reuse
-    // two base glyphs (Preview, Cancel) UNTINTED — grey against these tints, and only ever on screen in
-    // demo mode. Row STATE badges stay neutral except kept-green (a reverted STATE is not a destructive
-    // ACTION — it never wears red).
+    // button acts on, and VS Code pairs the same three with codicon-check-all for the same reason;
+    // Reject File/Folder/Prompt/All share ✗✗ symmetrically. Since 0.8.9 those rows are icon-only, so
+    // the counter is doing that work alone; keep every scoped action inside an axis group that carries
+    // one, or its scope becomes unreadable. Demo verbs reuse two base glyphs (Preview, Cancel)
+    // UNTINTED — grey against these tints, and only ever on screen in demo mode. Row STATE badges stay
+    // neutral except kept-green (a reverted STATE is not a destructive ACTION — it never wears red).
     val KEEP: Icon = tint(AllIcons.Actions.Checked, GREEN)
     val ACCEPT_FILE: Icon = tint(Icons.CheckAll, GREEN)
     val ACCEPT_ALL: Icon = tint(AllIcons.Actions.Commit, GREEN)
-    val UNDO: Icon = tint(AllIcons.Actions.Rollback, RED)
-    val REJECT: Icon = tint(AllIcons.Actions.Cancel, RED)
-    val REVERT_ALL: Icon = tint(AllIcons.Vcs.History, RED)
+    val UNDO: Icon = tint(AllIcons.Actions.Cancel, RED)
+    val REJECT: Icon = tint(Icons.CloseAll, RED)
+    val REVERT_ALL: Icon = tint(Icons.CloseAll, RED)
+    /** Redo = put a reverted edit back. Wears the rollback arrow the vocabulary frees from Undo —
+     *  "the undo icon means redo" — untinted: restoring is neither accept nor
+     *  reject, and a red arrow beside a red ✗ would read as one more way to lose work. */
+    val REDO: Icon = AllIcons.Actions.Rollback
     /** Rewind = stepping BACK through the conversation, so a rewind glyph rather than another rollback:
      *  it sits next to Reject Prompt and the two must not read as the same operation at a glance. */
     val REWIND: Icon = tint(AllIcons.Actions.Undo, RED)
@@ -145,7 +152,7 @@ class ReviewNavBar(private val project: Project, private val onNavChange: () -> 
 
     /** Diff-axis Chat — hand the CURRENT edit's context to the user's Claude (mirrors the chat-context path). */
     fun chatEditAction(showText: Boolean = true): AnAction =
-        labelAct(showText, "Chat", "Chat about this edit — copies its context, opens your Claude", NavTint.CHAT, ::activeHasPending) {
+        labelAct(showText, "Chat", "Chat about this edit — copies its context, opens your agent", NavTint.CHAT, ::activeHasPending) {
             currentNavRec()?.let { rec -> withSession { s -> ReviewOps.chatAbout(project, s, rec.id) } }
         }
 

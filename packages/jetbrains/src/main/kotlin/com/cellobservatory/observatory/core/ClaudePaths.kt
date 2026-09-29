@@ -89,16 +89,28 @@ object ClaudePaths {
 
     fun blobPath(sessionId: String, sha: String): Path = storeDir(sessionId).resolve("blobs").resolve(sha)
 
-    /** Claude Code's project-dir mangling: every non-alphanumeric char becomes '-'. */
-    fun mangleCwd(cwd: String): String = cwd.replace(Regex("[^a-zA-Z0-9]"), "-")
+    /**
+     * Claude Code's project-dir mangling, as core's mangleCwd: every non-alphanumeric char becomes '-',
+     * and a name over 200 chars keeps its first 200 plus '-' and the path's base-36 hash (Claude Code
+     * 2.1.x). Kotlin's String.hashCode is the same 31-multiplier hash; abs is taken on a Long so
+     * Int.MIN_VALUE stays positive, as JavaScript's Math.abs keeps it.
+     */
+    fun mangleCwd(cwd: String): String {
+        val slug = cwd.replace(Regex("[^a-zA-Z0-9]"), "-")
+        if (slug.length <= 200) return slug
+        return slug.substring(0, 200) + "-" + kotlin.math.abs(cwd.hashCode().toLong()).toString(36)
+    }
 
     fun projectDir(cwd: String): Path = configDir().resolve("projects").resolve(mangleCwd(cwd))
 
     fun statuslineCache(): Path = configDir().resolve("statusline-last.json")
 
-    /** True if the capture hooks are wired into settings.json — same marker install.ts writes. */
+    /** True if the capture hooks are wired into settings.json — the marker install.ts writes. Both the
+     *  current `oak-observatory-hook` and the pre-rename `claude-observatory-hook` count, so an existing
+     *  install still reads as hooked until `oak init` migrates it in place. */
     fun hooksInstalled(): Boolean = runCatching {
-        java.nio.file.Files.readString(configDir().resolve("settings.json")).contains("claude-observatory-hook")
+        val s = java.nio.file.Files.readString(configDir().resolve("settings.json"))
+        s.contains("oak-observatory-hook") || s.contains("claude-observatory-hook")
     }.getOrDefault(false)
 
     /**

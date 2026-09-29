@@ -1,0 +1,13 @@
+<p>An <strong>action</strong> is one tool call the agent made. Where <a href="edits.html">edits</a> are the changes the <a href="capture.html#hook">hook</a> captured on disk, actions are the complete picture of what the agent <em>did</em> — reads, searches, shell commands, web fetches, spawns — reconstructed from the transcript.</p>
+
+<h2>What counts as an action</h2>
+<p>An <strong>action</strong> is one tool call parsed from the <a href="capture.html#transcript">transcript</a> — a read, a search, a shell command, a web fetch, a subagent spawn, or a plan update — correlated with its result. Edits are the actions the hook <em>also</em> captured on disk; every other action is reconstructed from the transcript alone.</p>
+
+<h2>Seeing them</h2>
+<p>The <a href="actions-view.html">Actions view</a> presents them as a typed timeline, grouped by kind, with low-signal categories collapsed and errors always surfaced. It opens with any <a href="conflicts.html">live conflicts</a> and closes with the two audits — <a href="risk.html">risk</a> and <a href="egress.html">egress</a> — because those are read off the same stream of actions.</p>
+
+<div class="callout tip">
+  <span class="ico">💡</span>
+  <div class="ct"><span class="ctitle">Actions are how the audits know</span>
+  <p>A destructive shell command, a read of a credential file, a fetch to a remote host — each is an action, and each is what <a href="risk.html">Risk</a> and <a href="egress.html">Egress</a> report on. The audits assert what <em>ran</em>, drawn from actions, never what was permitted.</p></div>
+</div>

@@ -47,7 +47,7 @@ class GroupedNavTest : BasePlatformTestCase() {
         ObservatorySettings.instance.state.overviewGroupedNav = false
         val strip = stripOf(ChangeMapPanel(project))
         // Processes is absent until `processes --json` answers, which it cannot here.
-        assertEquals(listOf("Sessions", "Fleet", "Workflows", "Tasks"), titles(strip))
+        assertEquals(listOf("Sessions", "Workers", "Workflows", "Tasks"), titles(strip))
     }
 
     fun testGroupedRendersTwoGroupTabsAndNoBadgeWriteRelabelsThem() {
@@ -56,7 +56,7 @@ class GroupedNavTest : BasePlatformTestCase() {
         val strip = stripOf(panel)
         // Construction already ran repaintSessions / repaintTasks / repaintNavCounts, so every badge write
         // this panel makes has happened by now. The group titles must still be the group titles.
-        assertEquals(listOf("Sessions · Fleet", "Workflows · Tasks · Processes"), titles(strip))
+        assertEquals(listOf("Sessions · Workers · Workflows · Tasks · Processes"), titles(strip))
         // And every member the guided tour may name still resolves to one of those two tabs.
         for (m in ChangeMapPanel.TOUR_TABS.filter { it != "processes" }) {
             assertNotNull("grouped mode cannot bring \"$m\" forward", panel.selectNavTab(m))
@@ -74,12 +74,12 @@ class GroupedNavTest : BasePlatformTestCase() {
         )
         assertFalse("it starts off", toggle.isSelected(e))
         toggle.setSelected(e, true)
-        assertEquals(listOf("Sessions · Fleet", "Workflows · Tasks · Processes"), titles(stripOf(panel)))
+        assertEquals(listOf("Sessions · Workers · Workflows · Tasks · Processes"), titles(stripOf(panel)))
         assertTrue(toggle.isSelected(e))
         toggle.setSelected(e, false)
         // Back to one tab per member, WITH their badges re-written — a rebuild that forgot to re-badge would
         // leave the names bare, which is indistinguishable here from correct, so assert the count instead.
-        assertEquals(listOf("Sessions", "Fleet", "Workflows", "Tasks"), titles(stripOf(panel)))
+        assertEquals(listOf("Sessions", "Workers", "Workflows", "Tasks"), titles(stripOf(panel)))
         assertFalse(toggle.isSelected(e))
     }
 

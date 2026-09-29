@@ -5,7 +5,7 @@ name: JetBrains
 #
 # `test` now boots a HEADLESS IDE (see src/test/.../platform/) and asserts the things only a running
 # IDE reveals — toolbar target components, action update() contracts, and the guided tour driven step by
-# step. Those tests need the `claude-observatory` CLI on PATH, so the CLI is built and linked first;
+# step. Those tests need the `oak` CLI on PATH, so the CLI is built and linked first;
 # without it they skip, and a check that silently tests nothing is worse than no check.
 #
 # `verifyPlugin` is the JetBrains Plugin Verifier against the compile baseline AND a newer IDE. The
@@ -35,8 +35,8 @@ jobs:
         with:
           node-version: 22
       # The headless-IDE tests drive the REAL CLI, so put it on PATH.
-      - run: npm ci && npm run build && npm link -w claude-observatory
-      - run: claude-observatory --version
+      - run: npm ci && npm run build && npm link -w oak-observatory
+      - run: oak --version
       - run: ./gradlew test buildPlugin --console=plain
         working-directory: packages/jetbrains
       - name: Plugin Verifier (binary compatibility across IDE versions)
@@ -49,5 +49,5 @@ jobs:
           path: packages/jetbrains/build/reports/pluginVerifier/**
       - uses: actions/upload-artifact@v4
         with:
-          name: claude-observatory-jetbrains
+          name: oak-observatory-jetbrains
           path: packages/jetbrains/build/distributions/*.zip

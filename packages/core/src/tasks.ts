@@ -8,7 +8,7 @@
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
-import { cachedByFiles, readLines } from './fscache';
+import { transcriptFacts } from './derived-transcript';
 import { findTranscript } from './observe';
 import { claudeConfigDir } from './paths';
 import { isSafeSessionId } from './store';
@@ -109,21 +109,26 @@ export function taskIdForSubject(subject: string): string {
  *  strict span model, (b) the task history — which survives the runtime archiving completed task
  *  files, unlike the live dir. Memoized per (mtime,size) like todoSnaps. */
 function mineTasks(transcriptPath: string): { snaps: TaskSnap[]; history: MinedTask[] } {
-  return cachedByFiles('taskMine', [transcriptPath], () => mineTasksUncached(transcriptPath));
+  const facts = transcriptFacts(transcriptPath).tasks;
+  return { snaps: facts.snaps, history: [...facts.state.values()].sort((a, b) => Number(a.id) - Number(b.id)) };
 }
 
-function mineTasksUncached(transcriptPath: string): { snaps: TaskSnap[]; history: MinedTask[] } {
-  let lines: string[];
-  try {
-    lines = readLines(transcriptPath);
-  } catch {
-    return { snaps: [], history: [] };
-  }
-  const state = new Map<string, MinedTask>(); // id → latest state, insertion-ordered by creation
-  // A TaskCreate's ASSIGNED id only appears in its tool_result ("Task #N created …"), so creations
-  // park here (keyed by tool_use id) until the matching result names them.
-  const pendingCreate = new Map<string, { t: MinedTask; ts: number }>();
-  const snaps: TaskSnap[] = [];
+export interface TaskFacts {
+  state: Map<string, MinedTask>;
+  pendingCreate: Map<string, { t: MinedTask; ts: number }>;
+  snaps: TaskSnap[];
+  namings: TaskNaming[];
+  pendingNames: Map<string, { ts: number; subject: string }>;
+  known: Map<string, string>;
+}
+
+export function newTaskFacts(): TaskFacts {
+  return { state: new Map(), pendingCreate: new Map(), snaps: [], namings: [], pendingNames: new Map(), known: new Map() };
+}
+
+export function foldTaskFacts(facts: TaskFacts, o: any): void {
+  foldTaskNames(facts, o);
+  const { state, pendingCreate, snaps } = facts;
   const toMs = (v: unknown): number => {
     if (typeof v === 'number' && isFinite(v)) return v > 1e12 ? v : v * 1000;
     if (typeof v === 'string') {
@@ -144,55 +149,44 @@ function mineTasksUncached(transcriptPath: string): { snaps: TaskSnap[]; history
     if (Array.isArray(c)) return c.map((b: any) => (b && typeof b.text === 'string' ? b.text : '')).join('\n');
     return '';
   };
-  for (const line of lines) {
-    const t = line.trim();
-    if (!t || (!t.includes('TaskCreate') && !t.includes('TaskUpdate') && !t.includes('tool_result'))) continue;
-    let o: any;
-    try {
-      o = JSON.parse(t);
-    } catch {
-      continue;
-    }
-    if (o.isSidechain === true) continue; // a subagent's tasks are not the main plan
-    const msg = o.message;
-    if (!msg || !Array.isArray(msg.content)) continue;
-    const ts = toMs(o.timestamp ?? o.ts);
-    for (const b of msg.content) {
-      if (!b) continue;
-      if (b.type === 'tool_use' && b.name === 'TaskCreate' && b.input && typeof b.input.subject === 'string') {
-        pendingCreate.set(String(b.id ?? ''), {
-          ts,
-          t: {
-            id: '',
-            subject: String(b.input.subject).trim(),
-            description: typeof b.input.description === 'string' ? b.input.description : '',
-            activeForm: typeof b.input.activeForm === 'string' && b.input.activeForm ? b.input.activeForm : null,
-            status: 'pending',
-          },
-        });
-      } else if (b.type === 'tool_use' && b.name === 'TaskUpdate' && b.input && b.input.taskId != null) {
-        const cur = state.get(String(b.input.taskId));
-        if (!cur) continue; // an update we can't anchor (create's result never parsed) — skip, never guess
-        if (b.input.status === 'deleted') state.delete(cur.id);
-        else {
-          if (typeof b.input.status === 'string') cur.status = b.input.status;
-          if (typeof b.input.subject === 'string' && b.input.subject) cur.subject = b.input.subject.trim();
-          if (typeof b.input.description === 'string') cur.description = b.input.description;
-          if (typeof b.input.activeForm === 'string' && b.input.activeForm) cur.activeForm = b.input.activeForm;
-        }
-        snap(ts);
-      } else if (b.type === 'tool_result' && b.tool_use_id != null && pendingCreate.has(String(b.tool_use_id))) {
-        const pc = pendingCreate.get(String(b.tool_use_id))!;
-        pendingCreate.delete(String(b.tool_use_id));
-        const m = resultText(b.content).match(/Task #(\d+) created/);
-        if (!m) continue; // creation failed (or an unrecognized runtime message) — no task to track
-        pc.t.id = m[1];
-        state.set(pc.t.id, pc.t);
-        snap(ts || pc.ts);
+  if (o.isSidechain === true) return; // a subagent's tasks are not the main plan
+  const msg = o.message;
+  if (!msg || !Array.isArray(msg.content)) return;
+  const ts = toMs(o.timestamp ?? o.ts);
+  for (const b of msg.content) {
+    if (!b) continue;
+    if (b.type === 'tool_use' && b.name === 'TaskCreate' && b.input && typeof b.input.subject === 'string') {
+      pendingCreate.set(String(b.id ?? ''), {
+        ts,
+        t: {
+          id: '',
+          subject: String(b.input.subject).trim(),
+          description: typeof b.input.description === 'string' ? b.input.description : '',
+          activeForm: typeof b.input.activeForm === 'string' && b.input.activeForm ? b.input.activeForm : null,
+          status: 'pending',
+        },
+      });
+    } else if (b.type === 'tool_use' && b.name === 'TaskUpdate' && b.input && b.input.taskId != null) {
+      const cur = state.get(String(b.input.taskId));
+      if (!cur) continue; // an update we can't anchor (create's result never parsed) — skip, never guess
+      if (b.input.status === 'deleted') state.delete(cur.id);
+      else {
+        if (typeof b.input.status === 'string') cur.status = b.input.status;
+        if (typeof b.input.subject === 'string' && b.input.subject) cur.subject = b.input.subject.trim();
+        if (typeof b.input.description === 'string') cur.description = b.input.description;
+        if (typeof b.input.activeForm === 'string' && b.input.activeForm) cur.activeForm = b.input.activeForm;
       }
+      snap(ts);
+    } else if (b.type === 'tool_result' && b.tool_use_id != null && pendingCreate.has(String(b.tool_use_id))) {
+      const pc = pendingCreate.get(String(b.tool_use_id))!;
+      pendingCreate.delete(String(b.tool_use_id));
+      const m = resultText(b.content).match(/Task #(\d+) created/);
+      if (!m) continue; // creation failed (or an unrecognized runtime message) — no task to track
+      pc.t.id = m[1];
+      state.set(pc.t.id, pc.t);
+      snap(ts || pc.ts);
     }
   }
-  return { snaps, history: [...state.values()].sort((a, b) => Number(a.id) - Number(b.id)) };
 }
 
 /** The task-list snapshots for the strict span model — changemap merges these with the TodoWrite
@@ -217,16 +211,11 @@ export interface TaskNaming {
  * every naming stays in it, so resolving as of a given timestamp answers what the number meant THEN.
  */
 export function taskNamings(transcriptPath: string): TaskNaming[] {
-  return cachedByFiles('taskNamings', [transcriptPath], () => taskNamingsUncached(transcriptPath));
+  return transcriptFacts(transcriptPath).tasks.namings.slice().sort((a, b) => a.ts - b.ts);
 }
 
-function taskNamingsUncached(transcriptPath: string): TaskNaming[] {
-  let lines: string[];
-  try {
-    lines = readLines(transcriptPath);
-  } catch {
-    return [];
-  }
+function foldTaskNames(facts: TaskFacts, o: any): void {
+  const { namings: out, pendingNames: pendingCreate, known } = facts;
   const stamp = (v: unknown): number => {
     if (typeof v === 'number' && isFinite(v)) return v > 1e12 ? v : v * 1000;
     if (typeof v === 'string') {
@@ -240,53 +229,39 @@ function taskNamingsUncached(transcriptPath: string): TaskNaming[] {
     if (Array.isArray(c)) return c.map((b: any) => (b && typeof b.text === 'string' ? b.text : '')).join('\n');
     return '';
   };
-  const out: TaskNaming[] = [];
-  const pendingCreate = new Map<string, { ts: number; subject: string }>();
-  const known = new Map<string, string>(); // id → the subject it holds right now, to skip no-op renames
-  for (const line of lines) {
-    const t = line.trim();
-    if (!t) continue;
-    let o: any;
-    try {
-      o = JSON.parse(t);
-    } catch {
-      continue;
-    }
-    if (o.isSidechain === true) continue; // a subagent's tasks are not the main plan
-    const msg = o.message;
-    if (!msg || !Array.isArray(msg.content)) continue;
-    const ts = stamp(o.timestamp ?? o.ts);
-    for (const b of msg.content) {
-      if (!b) continue;
-      if (b.type === 'tool_use' && b.name === 'TaskCreate' && b.input && typeof b.input.subject === 'string') {
-        pendingCreate.set(String(b.id ?? ''), { ts, subject: String(b.input.subject).trim() });
-      } else if (
-        b.type === 'tool_use' &&
-        b.name === 'TaskUpdate' &&
-        b.input &&
-        b.input.taskId != null &&
-        typeof b.input.subject === 'string' &&
-        b.input.subject.trim()
-      ) {
-        // A rename: from here on the number stands for the new text, and every earlier resolution keeps
-        // pointing at the old one.
-        const id = String(b.input.taskId);
-        const subject = b.input.subject.trim();
-        if (known.get(id) !== subject) {
-          known.set(id, subject);
-          out.push({ ts, id, subject });
-        }
-      } else if (b.type === 'tool_result' && b.tool_use_id != null && pendingCreate.has(String(b.tool_use_id))) {
-        const pc = pendingCreate.get(String(b.tool_use_id))!;
-        pendingCreate.delete(String(b.tool_use_id));
-        const m = text(b.content).match(/Task #(\d+) created/);
-        if (!m) continue; // creation failed — the number never came to mean anything
-        known.set(m[1], pc.subject);
-        out.push({ ts: ts || pc.ts, id: m[1], subject: pc.subject });
+  if (o.isSidechain === true) return; // a subagent's tasks are not the main plan
+  const msg = o.message;
+  if (!msg || !Array.isArray(msg.content)) return;
+  const ts = stamp(o.timestamp ?? o.ts);
+  for (const b of msg.content) {
+    if (!b) continue;
+    if (b.type === 'tool_use' && b.name === 'TaskCreate' && b.input && typeof b.input.subject === 'string') {
+      pendingCreate.set(String(b.id ?? ''), { ts, subject: String(b.input.subject).trim() });
+    } else if (
+      b.type === 'tool_use' &&
+      b.name === 'TaskUpdate' &&
+      b.input &&
+      b.input.taskId != null &&
+      typeof b.input.subject === 'string' &&
+      b.input.subject.trim()
+    ) {
+      // A rename: from here on the number stands for the new text, and every earlier resolution keeps
+      // pointing at the old one.
+      const id = String(b.input.taskId);
+      const subject = b.input.subject.trim();
+      if (known.get(id) !== subject) {
+        known.set(id, subject);
+        out.push({ ts, id, subject });
       }
+    } else if (b.type === 'tool_result' && b.tool_use_id != null && pendingCreate.has(String(b.tool_use_id))) {
+      const pc = pendingCreate.get(String(b.tool_use_id))!;
+      pendingCreate.delete(String(b.tool_use_id));
+      const m = text(b.content).match(/Task #(\d+) created/);
+      if (!m) continue; // creation failed — the number never came to mean anything
+      known.set(m[1], pc.subject);
+      out.push({ ts: ts || pc.ts, id: m[1], subject: pc.subject });
     }
   }
-  return out.sort((a, b) => a.ts - b.ts);
 }
 
 /** A task enriched for the Overview's Tasks tab: [taskId] joins it to rollupByTask / taskEditIds

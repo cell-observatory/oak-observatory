@@ -45,6 +45,8 @@
  *     `/d`, which only suppresses AutoRun, so reaching this needs a deliberate machine-wide setting.
  */
 import * as cp from 'child_process';
+import * as fs from 'fs';
+import * as os from 'os';
 import type { Readable, Writable } from 'stream';
 
 export interface LaunchOpts {
@@ -129,7 +131,12 @@ export function spawnTool(
 ): cp.ChildProcess {
   const [o, l] = split(options);
   const s = launchSpec(file, args, l);
-  return cp.spawn(s.file, s.args, { ...o, shell: s.shell });
+  // A detached child outlives its caller, and Windows refuses to delete or rename a directory that is
+  // any running process's cwd: started in the caller's cwd, a background refresh or a server pinned
+  // the user's project folder for as long as it ran. So on Windows, unless the caller names a cwd, it
+  // starts at home. POSIX does not pin a cwd, and there a detached child keeps the caller's, as before.
+  const home = o.detached && o.cwd === undefined && process.platform === 'win32' ? os.homedir() : undefined;
+  return cp.spawn(s.file, s.args, { ...o, ...(home && fs.existsSync(home) ? { cwd: home } : {}), shell: s.shell });
 }
 
 // Mirrors Node's own typings: an explicit string `encoding` narrows stdout/stderr to strings, so

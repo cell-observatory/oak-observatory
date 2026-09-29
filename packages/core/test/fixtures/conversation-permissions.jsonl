@@ -1,0 +1,2 @@
+{"ts":1789740002500,"kind":"permission_request","payload":{"toolCall":{"toolCallId":"permission-call-1","title":"Bash"},"options":[{"optionId":"allow","name":"Allow once"}]}}
+{"ts":1789740002600,"kind":"permission_outcome","payload":{"toolCallId":"permission-call-1","optionId":"allow"}}

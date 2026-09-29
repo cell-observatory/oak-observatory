@@ -24,7 +24,7 @@ class NavGroupingTest {
     @Test
     fun `grouped, the two groups partition the five members in shipped order`() {
         assertEquals(
-            listOf(NavGrouping.SESSIONS_FLEET, NavGrouping.RUNS),
+            listOf(NavGrouping.NAV_ALL),
             NavGrouping.GROUPS.keys.toList(),
         )
         assertEquals(members, NavGrouping.GROUPS.values.flatten())
@@ -33,11 +33,11 @@ class NavGroupingTest {
 
     @Test
     fun `grouped, each member resolves to the group that lists it`() {
-        assertEquals(NavGrouping.SESSIONS_FLEET, NavGrouping.groupOf(NavGrouping.SESSIONS, grouped = true))
-        assertEquals(NavGrouping.SESSIONS_FLEET, NavGrouping.groupOf(NavGrouping.FLEET, grouped = true))
-        assertEquals(NavGrouping.RUNS, NavGrouping.groupOf(NavGrouping.WORKFLOWS, grouped = true))
-        assertEquals(NavGrouping.RUNS, NavGrouping.groupOf(NavGrouping.TASKS, grouped = true))
-        assertEquals(NavGrouping.RUNS, NavGrouping.groupOf(NavGrouping.PROCESSES, grouped = true))
+        assertEquals(NavGrouping.NAV_ALL, NavGrouping.groupOf(NavGrouping.SESSIONS, grouped = true))
+        assertEquals(NavGrouping.NAV_ALL, NavGrouping.groupOf(NavGrouping.FLEET, grouped = true))
+        assertEquals(NavGrouping.NAV_ALL, NavGrouping.groupOf(NavGrouping.WORKFLOWS, grouped = true))
+        assertEquals(NavGrouping.NAV_ALL, NavGrouping.groupOf(NavGrouping.TASKS, grouped = true))
+        assertEquals(NavGrouping.NAV_ALL, NavGrouping.groupOf(NavGrouping.PROCESSES, grouped = true))
     }
 
     @Test

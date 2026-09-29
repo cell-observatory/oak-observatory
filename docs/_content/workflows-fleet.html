@@ -1,0 +1,22 @@
+<p>Above a single session sit two things OAK tracks specially: a <strong>workflow run</strong>, which is a scripted fan-out of many agents, and the <strong>fleet</strong>, which is every running agent on one board. Together they turn a swarm into something you can watch and account for.</p>
+
+<h2>Workflow run</h2>
+<p>A <strong>workflow run</strong> is a scripted fan-out of agents, one level above <a href="subagents-roles.html">subagents</a>, that <a href="claude-code.html">Claude Code</a>'s orchestration executes deterministically. The observatory mines each run from its own transcripts and state file: name, running or done state, per-phase progress, and per-agent tokens, time, and edits. An interrupted run that never recorded completion is not shown as running.</p>
+
+<figure><img src="media/overview-workflows.png" loading="lazy" alt="The Workflows tab: one row per multi-agent run with an informative name, a running or done badge, phase progress with tokens and elapsed time, and an activity sparkline, unfolding to per-phase groups and their agents"><figcaption>Workflow runs, with their phases and the agents inside them.</figcaption></figure>
+
+<h2>The fleet</h2>
+<p>The <strong>fleet</strong> is every running agent across the repository's <a href="worktrees.html">worktrees</a>, unified into one board. Each row carries a live phase, worktree and branch, an activity sparkline, line deltas, tokens and time, and risk. Tracking is read-only and path-only: file names cross between agents, file contents never do.</p>
+
+<figure><img src="media/multitasking.png" loading="lazy" alt="The Workers tab: per-agent rows across the repository's git worktrees, each with a live phase badge, worktree and branch, an activity sparkline, line deltas, tokens and time, and risk; subagents nest under their parent"><figcaption>The fleet. A phase inferred from inactivity carries a tilde.</figcaption></figure>
+
+<h2>Phase</h2>
+<p>A <strong>phase</strong> is a fleet row's live state: working, awaiting input, awaiting permission, idle, or done. A phase inferred rather than reported (from inactivity, or from a background agent’s completion notice not having arrived yet) is marked with <code>~</code> and presented as a heuristic, never asserted.</p>
+
+<h2>Process</h2>
+<p>A <strong>process</strong> is a background shell the session launched with <code>run_in_background</code>. Its identity is the harness's own shell id — a transcript records no operating-system process id, and the agent may be running over SSH or in a container, so inferring one from local processes would be wrong. A process with no recorded end reports its runtime up to the last moment the session is known to have existed.</p>
+
+<figure><img src="media/processes.png" loading="lazy" alt="The Processes tab: one row per background shell with its state, the harness's shell id, the shell's description, its runtime and how much output it produced; running shells sort first"><figcaption>Background shells, after the call that started them scrolled away.</figcaption></figure>
+
+<h2>Live conflict</h2>
+<p>A <strong>live conflict</strong> is one file holding pending edits from two or more siblings, at least one of them active. Detection is by path only. Live conflicts lead the <a href="actions-view.html">Actions view</a> because they need attention before the agents collide further — see <a href="conflicts.html">Conflicts</a>.</p>

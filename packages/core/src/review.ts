@@ -4,7 +4,7 @@
  * both editors export the identical markdown (e.g. to paste into a PR).
  */
 import { minOf, maxOf } from './store';
-import { reviewEdits, visibleEdits } from './groups';
+import { visibleEdits } from './groups';
 import { lineDelta } from './format';
 
 export interface ReviewFileSummary {
@@ -79,7 +79,7 @@ export function reviewSummary(session: string): ReviewSummary {
 export function reviewSummaryMarkdown(s: ReviewSummary): string {
   const pct = s.acceptanceRate === null ? '—' : `${Math.round(s.acceptanceRate * 100)}%`;
   const lines: string[] = [
-    '# Claude Observatory — review summary',
+    '# OAK — review summary',
     '',
     `- Session: \`${s.session}\``,
     `- Edits: **${s.total}** — ${s.pending} pending · ${s.kept} kept · ${s.undone} reverted`,

@@ -1,0 +1,37 @@
+Fix the demo · laptop · ? blocked · Opus · 900 tokens · 2 pending
+↗ herdr   ⌕ review
++- You                                                                  14:00:00 +
+|Fix the demo and make a plan.                                                   |
++--------------------------------------------------------------------------------+
+> thinking
++- Edit  /workspace/demo.ts                               +1 -1  +      14:00:01 +
+|Updated /workspace/demo.ts                                                      |
+|● Edit(/workspace/demo.ts)                                                      |
+|~                                                                               |
+|    -old                                                                        |
+|  1 +new                                                                        |
++--------------------------------------------------------------------------------+
+Plan
++ Edit the demo
+v Run checks
+> Report back
+The first turn is complete.
+— turn ended · end_turn · 1 edit
++- Edit #1  /workspace/demo.ts                                          +1 -1  + +
+|● Edit(/workspace/demo.ts)                                                      |
+|~                                                                               |
+|    -old                                                                        |
+|  1 +new                                                                        |
++--------------------------------------------------------------------------------+
++- You                                                                  14:01:00 +
+|Run the focused tests.                                                          |
++--------------------------------------------------------------------------------+
++- $ npm test -- --test-name-pattern conversation                +      14:01:01 +
+|2 tests passed                                                                  |
++--------------------------------------------------------------------------------+
+All focused tests pass.
+— turn ended · end_turn · 0 edits
+Workers · 0/1 active
+  > 1 finished
+Tasks · 1/1 open
+  v Run checks · in progress

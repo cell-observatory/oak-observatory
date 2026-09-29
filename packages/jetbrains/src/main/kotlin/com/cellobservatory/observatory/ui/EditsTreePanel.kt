@@ -1,6 +1,7 @@
 package com.cellobservatory.observatory.ui
 
 import com.cellobservatory.observatory.core.ClaudePaths
+import com.cellobservatory.observatory.model.compactBytes
 import com.cellobservatory.observatory.model.EditRecord
 import com.cellobservatory.observatory.model.EditTree
 import com.cellobservatory.observatory.model.TreeFileNode
@@ -62,18 +63,60 @@ class EditsTreePanel(private val project: Project, private val mode: Mode) :
         isRootVisible = false
         showsRootHandles = true
         selectionModel.selectionMode = TreeSelectionModel.SINGLE_TREE_SELECTION
-        emptyText.text = "No tracked Claude edits yet"
-        emptyText.appendLine("Run `claude-observatory init`, then let Claude Code edit.")
+        emptyText.text = "No tracked agent edits yet"
+        emptyText.appendLine("Run `oak init`, then let Claude Code edit.")
         cellRenderer = Renderer()
     }
     private val refreshListener = Runnable { rebuild() }
+
+    // EVERYTHING the init block's own calls touch must be declared ABOVE it: Kotlin runs property
+    // initializers in declaration order, and the init below calls buildToolbar() and rebuild() —
+    // when idFilter/hiddenIds/storeAction sat further down, they were still NULL here, the panel
+    // died mid-construction with its refresh listener already registered, and that half-built
+    // listener then threw on every service tick, aborting the fan-out and starving every
+    // later-registered panel of repaints: the WHOLE product blank (field failure, 2026-08-20;
+    // pinned by PanelConstructionTest).
+
+    /** When set, the tree shows ONLY these raw edit ids — the Review tab's prompt scope. Pruned
+     *  client-side over the shared view-model, so one `tree` payload serves every scope. */
+    @Volatile var idFilter: Set<Int>? = null
+
+    /** Ids the tree must NOT show whatever the scope says — the cancelled-out chains, which the
+     *  Review tab accounts for in its footer instead of as rows. */
+    @Volatile var hiddenIds: Set<Int> = emptySet()
+
+    /** Raw edit ids `review --json` marked review-only, and the authoritative capture-evidence
+     *  string per raw id (core.captureSummary). The tree renders from `tree --json`, whose per-edit
+     *  projection carries neither the full evidence (model/tool/turn) nor review's wider
+     *  review-only rule (it emits `partial` only for `rec.partial`, not `uncertainCreation`), so
+     *  the Review tab feeds both down here. Empty for any other host → the renderer falls back to
+     *  the record's own fields. Set by ReviewPanel before rebuild; mirrors the idFilter seam. */
+    @Volatile var reviewOnlyIds: Set<Int> = emptySet()
+    @Volatile var captureById: Map<Int, String> = emptyMap()
+
+    /** Open the reviewed session's store folder on disk, next to Export — where
+     *  every edit's before/after blobs and the review log live. The label carries the CURRENT size
+     *  (refreshed with the tree), so "how big has this session's store grown" reads on hover. */
+    private val storeAction: AnAction = action("Open Store Folder", AllIcons.Nodes.Folder) {
+        ReviewOps.revealStoreFolder(project, service().currentSession()?.let { com.cellobservatory.observatory.core.ClaudePaths.storeDir(it).toString() })
+    }
 
     init {
         setContent(JBScrollPane(tree))
         toolbar = buildToolbar()
         tree.addMouseListener(object : MouseAdapter() {
             override fun mouseClicked(e: MouseEvent) {
-                if (e.clickCount == 2) selectedEdit()?.let { activate(it) }
+                if (e.clickCount == 2) {
+                    val edit = selectedEdit()
+                    if (edit != null) {
+                        activate(edit)
+                    } else {
+                        // A FILE row: the filename opens the file itself — parity with the VS Code
+                        // Review list, whose filename click does the same. Edit rows keep opening
+                        // at the edit / as the diff.
+                        selectedFile()?.let { Navigate.openFile(project, it.file) }
+                    }
+                }
             }
         })
         PopupHandler.installPopupMenu(tree, buildPopupGroup(), "ClaudeObservatoryTreePopup")
@@ -104,14 +147,6 @@ class EditsTreePanel(private val project: Project, private val mode: Mode) :
         (tree.lastSelectedPathComponent as? DefaultMutableTreeNode)?.userObject as? NodeData.Folder
 
     // --- tree building (renders core's `tree --json` view-model; no local tree/class logic) ---
-
-    /** When set, the tree shows ONLY these raw edit ids — the Review tab's prompt scope. Pruned
-     *  client-side over the shared view-model, so one `tree` payload serves every scope. */
-    @Volatile var idFilter: Set<Int>? = null
-
-    /** Ids the tree must NOT show whatever the scope says — the cancelled-out chains, which the
-     *  Review tab accounts for in its footer instead of as rows. */
-    @Volatile var hiddenIds: Set<Int> = emptySet()
 
     /** Every edit id the payload carries — the base set when only [hiddenIds] is narrowing. */
     private fun allTreeIds(vm: EditTree?): Set<Int> {
@@ -164,6 +199,17 @@ class EditsTreePanel(private val project: Project, private val mode: Mode) :
         val q = service().filterQuery
         tree.emptyText.clear()
         when {
+            // The fetch FAILED — an empty tree must say so, not claim "no edits in this session yet":
+            // this plugin renders the CLI's answer, and a missing/older CLI otherwise presents as a
+            // convincing, silent blank (reported as exactly that from PyCharm, 2026-08-20).
+            vm0 == null && service().treeFetchFailed -> {
+                tree.emptyText.appendLine("No answer from the oak CLI — the Review tree could not be fetched.")
+                tree.emptyText.appendLine("Is the CLI installed and on PATH? Hit Refresh to retry.")
+                tree.emptyText.appendLine(
+                    "Run the Setup Check (doctor)",
+                    com.intellij.ui.SimpleTextAttributes.LINK_ATTRIBUTES
+                ) { ReviewOps.openDoctor(project) }
+            }
             // A prompt scope with nothing left is about the SCOPE, never about the session — the
             // "no edits in this session / switch session" copy would be false here, and its
             // session-switch link a trap inside the Review tab. Keyed on the PROMPT scope, not on
@@ -175,8 +221,8 @@ class EditsTreePanel(private val project: Project, private val mode: Mode) :
             }
             q.isNotBlank() -> tree.emptyText.appendLine("No edits match \"$q\"")
             !com.cellobservatory.observatory.core.ClaudePaths.hooksInstalled() -> {
-                tree.emptyText.appendLine("No tracked Claude edits yet")
-                tree.emptyText.appendLine("Run `claude-observatory init`, then let Claude Code edit.")
+                tree.emptyText.appendLine("No tracked agent edits yet")
+                tree.emptyText.appendLine("Run `oak init`, then let Claude Code edit.")
                 tryTheDemoLine()
             }
             else -> {
@@ -201,7 +247,7 @@ class EditsTreePanel(private val project: Project, private val mode: Mode) :
                 if (prior != null) {
                     tree.emptyText.appendLine("No edits in this session yet — the hooks are working.")
                     tree.emptyText.appendLine(
-                        "Switch to previous session (${prior.id.take(8)} · ${prior.edits} edits)",
+                        "Switch to previous session (${prior.id.take(8)} · ${prior.edits} edit${if (prior.edits == 1) "" else "s"})",
                         com.intellij.ui.SimpleTextAttributes.LINK_ATTRIBUTES
                     ) {
                         ReviewOps.applySessionChoice(project, prior.id)
@@ -213,19 +259,26 @@ class EditsTreePanel(private val project: Project, private val mode: Mode) :
                 } else {
                     tree.emptyText.appendLine("No edits in this session yet.")
                     tryTheDemoLine()
-                    tree.emptyText.appendLine("Let Claude edit a file and it will appear here.")
+                    tree.emptyText.appendLine("Let agent edit a file and it will appear here.")
                 }
             }
         }
         // The store ticks whenever ANY session on this machine writes, and `reload()` clears the
         // selection — so without this the reader's selected row (and every action that acts on it)
-        // vanished every couple of seconds while Claude worked anywhere. Re-select the same EDIT ID
+        // vanished every couple of seconds while the agent worked anywhere. Re-select the same EDIT ID
         // after the rebuild; no scrolling, or the tree would yank itself around under the reader.
         val keepId = selectedEdit()?.id
         root.removeAllChildren()
         if (vm != null) {
-            for (f in vm.folders) addFolderNode(root, f)
-            for (file in vm.files) addFileNode(root, file)
+            for (f in sortFolders(vm.folders.filter { folderVisible(it) })) addFolderNode(root, f)
+            for (file in sortFiles(vm.files.filter { fileVisible(it) })) addFileNode(root, file)
+        }
+        // The store button's label tracks the store it opens
+        // — refreshed here, where the tree already rebuilds on every store tick.
+        run {
+            val s = service().currentSession()
+            val sz = s?.let { storeSizeText(it) }
+            storeAction.templatePresentation.text = if (sz != null) "Open Store Folder ($sz)" else "Open Store Folder"
         }
         model.reload()
         expandAllBounded(tree)
@@ -245,11 +298,32 @@ class EditsTreePanel(private val project: Project, private val mode: Mode) :
         }
     }
 
+    // The filter control's regex/extension/type narrowing (the Search query is applied CLI-side, or
+    // client-side in regex mode via service.matchesFile) and the time/name sort — client-side over the
+    // parsed tree, so all three surfaces order and narrow the same way.
+    private fun fileVisible(f: TreeFileNode): Boolean = service().matchesFile(f.rel, f.ext, f.category)
+    private fun folderVisible(f: TreeFolderNode): Boolean = f.files.any { fileVisible(it) } || f.folders.any { folderVisible(it) }
+    private fun sortFiles(files: List<TreeFileNode>): List<TreeFileNode> = when (service().sortKey()) {
+        "name" -> files.sortedBy { it.rel }
+        "name-desc" -> files.sortedByDescending { it.rel }
+        "time-asc" -> files.sortedWith(compareBy<TreeFileNode> { it.maxTs }.thenBy { it.rel })
+        else -> files.sortedWith(compareByDescending<TreeFileNode> { it.maxTs }.thenBy { it.rel }) // time
+    }
+    private fun sortFolders(folders: List<TreeFolderNode>): List<TreeFolderNode> {
+        fun newest(fo: TreeFolderNode) = fo.files.maxOfOrNull { it.maxTs } ?: 0L
+        return when (service().sortKey()) {
+            "name" -> folders.sortedBy { it.label }
+            "name-desc" -> folders.sortedByDescending { it.label }
+            "time-asc" -> folders.sortedWith(compareBy<TreeFolderNode> { newest(it) }.thenBy { it.label })
+            else -> folders.sortedWith(compareByDescending<TreeFolderNode> { newest(it) }.thenBy { it.label }) // time
+        }
+    }
+
     private fun addFolderNode(parent: DefaultMutableTreeNode, f: TreeFolderNode) {
         val node = DefaultMutableTreeNode(NodeData.Folder(f.label, f.path, f.allEdits))
         parent.add(node)
-        for (sub in f.folders) addFolderNode(node, sub)
-        for (file in f.files) addFileNode(node, file)
+        for (sub in sortFolders(f.folders.filter { folderVisible(it) })) addFolderNode(node, sub)
+        for (file in sortFiles(f.files.filter { fileVisible(it) })) addFileNode(node, file)
     }
 
     private fun addFileNode(parent: DefaultMutableTreeNode, file: TreeFileNode) {
@@ -265,7 +339,8 @@ class EditsTreePanel(private val project: Project, private val mode: Mode) :
 
     // --- rendering ---
 
-    private class Renderer : ColoredTreeCellRenderer() {
+    // inner: the edit rows read the panel's reviewOnlyIds/captureById (the Review tab's evidence).
+    private inner class Renderer : ColoredTreeCellRenderer() {
         override fun customizeCellRenderer(
             tree: JTree, value: Any?, selected: Boolean, expanded: Boolean,
             leaf: Boolean, row: Int, hasFocus: Boolean,
@@ -280,7 +355,8 @@ class EditsTreePanel(private val project: Project, private val mode: Mode) :
                     icon = AllIcons.FileTypes.Any_type
                     append(File(node.file).name)
                     val pending = node.edits.count { it.pending }
-                    append("  ${node.edits.size} edit(s) · $pending pending", SimpleTextAttributes.GRAYED_ATTRIBUTES)
+                    val maxTs = node.edits.maxOfOrNull { it.ts } ?: 0L
+                    append("  ${node.edits.size} edit(s) · $pending pending" + (if (maxTs > 0) " · ${relTime(maxTs)}" else ""), SimpleTextAttributes.GRAYED_ATTRIBUTES)
                     toolTipText = node.file
                 }
                 is NodeData.Cls -> {
@@ -301,8 +377,17 @@ class EditsTreePanel(private val project: Project, private val mode: Mode) :
                         else -> SimpleTextAttributes.REGULAR_ATTRIBUTES
                     }
                     append("#${r.id}  +${node.added} −${node.removed}", style)
+                    if (r.reviewOnly || r.id in reviewOnlyIds) {
+                        // Marked BEFORE the reader acts: a partial record's undo refuses with the
+                        // stated reason, and without this badge it renders as an ordinary create.
+                        // `reviewOnlyIds` carries review --json's wider rule (uncertainCreation),
+                        // which the tree payload's own `partial` does not.
+                        append("  review-only", SimpleTextAttributes(SimpleTextAttributes.STYLE_BOLD, com.intellij.ui.JBColor.ORANGE))
+                    }
                     append("  ${r.status} · ${r.tool} · ${relTime(r.ts)}", SimpleTextAttributes.GRAYED_ATTRIBUTES)
-                    toolTipText = r.file
+                    // core.captureSummary (from review --json) when the Review tab supplied it —
+                    // it carries model/tool/turn the tree payload drops; else the record's own.
+                    toolTipText = "${r.file} — " + (captureById[r.id] ?: r.captureDescription)
                 }
             }
         }
@@ -312,7 +397,9 @@ class EditsTreePanel(private val project: Project, private val mode: Mode) :
 
     private fun buildToolbar(): javax.swing.JComponent {
         val group = DefaultActionGroup(
-            action("Search Edits", NavTint.SEARCH) { searchEdits() },
+            FilterSortActions.searchField(project),
+            FilterSortActions.filterGroup(project),
+            FilterSortActions.sortGroup(project),
             action("Review Previous Pending Edit", AllIcons.Actions.Back) { reviewPrev() },
             action("Review Next Pending Edit", AllIcons.Actions.Forward) { reviewNext() },
             action("Accept All Edits", NavTint.ACCEPT_ALL) {
@@ -321,7 +408,7 @@ class EditsTreePanel(private val project: Project, private val mode: Mode) :
             action("Reject All Edits", NavTint.REVERT_ALL) {
                 withSession { s -> ReviewOps.undoAll(project, s, service().log(), "this session") }
             },
-            action("Redo All Edits", AllIcons.Actions.Redo) {
+            action("Redo All Edits", NavTint.REDO) {
                 withSession { s -> ReviewOps.redoAll(project, s, service().log(), "this session") }
             },
             fileScopedAction("Accept All Edits in Current File", NavTint.ACCEPT_FILE) { s, vf ->
@@ -338,7 +425,7 @@ class EditsTreePanel(private val project: Project, private val mode: Mode) :
                 }
             },
             action("Switch Session", AllIcons.Vcs.Branch) { ReviewOps.chooseSession(project, tree) },
-            action("Refresh", AllIcons.Actions.Refresh) { service().refresh() },
+            action("Refresh", AllIcons.Actions.Refresh) { service().sweepIgnoredThen { service().refresh(force = true) } },
             toggle("Toggle Inline Review", AllIcons.Actions.Show,
                 { ObservatorySettings.instance.state.inlineReview },
                 { on ->
@@ -348,6 +435,7 @@ class EditsTreePanel(private val project: Project, private val mode: Mode) :
                     ReviewOps.status(project, "Inline review " + (if (on) "on" else "off"))
                 }),
             action("Export Review Summary", AllIcons.ToolbarDecorator.Export) { exportSummary() },
+            storeAction,
             action("Setup Check (doctor)", AllIcons.General.Information) { ReviewOps.openDoctor(project) },
         )
         // No demo buttons here. This toolbar is for reviewing the session in front of you; demo mode lives
@@ -385,7 +473,7 @@ class EditsTreePanel(private val project: Project, private val mode: Mode) :
         action("Undo", NavTint.UNDO) {
             selectedEdit()?.takeIf { !it.undone }?.let { rec -> withSession { s -> ReviewOps.undoOrRedo(project, s, rec, redo = false) } }
         },
-        action("Redo", AllIcons.Actions.Redo) {
+        action("Redo", NavTint.REDO) {
             selectedEdit()?.takeIf { it.undone }?.let { rec -> withSession { s -> ReviewOps.undoOrRedo(project, s, rec, redo = true) } }
         },
         // Zero-token handoff: assembles this edit's context onto the clipboard (parity with the
@@ -407,6 +495,9 @@ class EditsTreePanel(private val project: Project, private val mode: Mode) :
         action("Undo All in File", NavTint.REJECT) {
             selectedFile()?.let { f -> withSession { s -> ReviewOps.undoAll(project, s, f.edits, File(f.file).name, f.file) } }
         },
+        action("Redo All in File", NavTint.REDO) {
+            selectedFile()?.let { f -> withSession { s -> ReviewOps.redoAll(project, s, f.edits, File(f.file).name, f.file) } }
+        },
         action("Clear Resolved in File", NavTint.CLEAR) {
             selectedFile()?.let { f ->
                 withSession { s -> ReviewOps.clearResolvedScoped(project, s, f.edits.count { !it.pending }, File(f.file).name, f.file) }
@@ -419,6 +510,9 @@ class EditsTreePanel(private val project: Project, private val mode: Mode) :
         },
         action("Reject All in Folder", NavTint.REJECT) {
             selectedFolder()?.let { f -> withSession { s -> ReviewOps.undoAll(project, s, f.edits, f.label, f.path) } }
+        },
+        action("Redo All in Folder", NavTint.REDO) {
+            selectedFolder()?.let { f -> withSession { s -> ReviewOps.redoAll(project, s, f.edits, f.label, f.path) } }
         },
         action("Clear Resolved in Folder", NavTint.CLEAR) {
             selectedFolder()?.let { f ->
@@ -433,7 +527,7 @@ class EditsTreePanel(private val project: Project, private val mode: Mode) :
         ReviewOps.openMarkdown(
             project,
             "claude-review-summary",
-            "Could not generate a review summary (is the claude-observatory CLI installed?)",
+            "Could not generate a review summary (is the oak CLI installed?)",
         ) { com.cellobservatory.observatory.core.ObservatoryCli.summaryMarkdown(s, project.basePath) }
     }
 
@@ -453,13 +547,13 @@ class EditsTreePanel(private val project: Project, private val mode: Mode) :
     /** Step to the next (⏭) / previous (⏮) pending edit, cycling through all of them (parity with VS Code). */
     private fun reviewNext() = withSession { s ->
         val next = service().nextPendingEdit()
-        if (next == null) ReviewOps.notify(project, "No pending Claude edits — all caught up")
+        if (next == null) ReviewOps.notify(project, "No pending agent edits — all caught up")
         else Navigate.openFileAtEdit(project, s, next)
     }
 
     private fun reviewPrev() = withSession { s ->
         val prev = service().prevPendingEdit()
-        if (prev == null) ReviewOps.notify(project, "No pending Claude edits — all caught up")
+        if (prev == null) ReviewOps.notify(project, "No pending agent edits — all caught up")
         else Navigate.openFileAtEdit(project, s, prev)
     }
 
@@ -477,6 +571,18 @@ class EditsTreePanel(private val project: Project, private val mode: Mode) :
             override fun actionPerformed(e: AnActionEvent) = run()
         }
 
+    /** The store's on-disk footprint: the log plus one shallow pass over the blobs directory — a
+     *  single readdir, cheap enough to ride every tree refresh. */
+    private fun storeSizeText(session: String): String? = try {
+        val dir = com.cellobservatory.observatory.core.ClaudePaths.storeDir(session)
+        val log = dir.resolve("log.jsonl").toFile().let { if (it.exists()) it.length() else return null }
+        val blobs = dir.resolve("blobs").toFile()
+        val total = log + (blobs.listFiles()?.sumOf { it.length() } ?: 0L)
+        if (total > 0) compactBytes(total) else null
+    } catch (_: Exception) {
+        null
+    }
+
     /**
      * The empty state's way into demo mode — the entry point that decides whether a first-time reader
      * ever finds it. Offered even when the capture hooks are missing, because the replay drives the
@@ -487,7 +593,7 @@ class EditsTreePanel(private val project: Project, private val mode: Mode) :
     private fun tryTheDemoLine() {
         if (ReviewOps.demoPresent(project)) return
         tree.emptyText.appendLine(
-            "Try the demo — no Claude session needed",
+            "Try the demo — no agent session needed",
             com.intellij.ui.SimpleTextAttributes.LINK_ATTRIBUTES
         ) { ReviewOps.startDemo(project) }
     }

@@ -1,0 +1,59 @@
+<p>OAK is one npm package that carries the CLI, the terminal app, and the capture hook, plus two editor extensions that render the same record inside VS Code and JetBrains IDEs. Installing it is two steps: put the CLI on your machine, then let it wire up the hook and your editors.</p>
+
+<h2>Requirements</h2>
+<ul>
+  <li><strong>Node.js 20 or newer</strong>, with npm.</li>
+  <li><strong>herdr</strong>, the terminal backend the terminal app runs on, which you do not install yourself. The install scripts, <code>oak update</code> and <code>oak doctor --fix</code> install the version pinned in <code>herdr.lock</code>, currently 0.9.1, verify its checksum, set up its integrations, link OAK’s herdr plugin and widen herdr’s sidebar (its default 36-column ceiling stops the divider short of the session titles OAK gives herdr’s tabs; a width you set yourself is kept). A newer herdr already on the machine is kept. herdr ships for Linux and macOS on x86_64 and arm64, and for Windows on x86_64; Windows on ARM has no herdr build, and Windows support for herdr-backed pane listing, replies and agent start is untested in this release.</li>
+  <li><strong>Linux and macOS:</strong> <code>python3</code>, which herdr’s agent hooks need for sessions to join their panes, and which OAK’s herdr plugin runs on.</li>
+  <li><strong>Linux:</strong> <code>make</code> and a C++ compiler (<code>g++</code>, or whatever <code>$CXX</code> names; <code>build-essential</code> on Debian and Ubuntu), and an npm prefix with no space in its path. npm compiles node-pty, the helper the terminal app’s herdr tab runs herdr in, while it installs OAK, and npm 12 runs that build only when it is allowed with <code>--allow-scripts=node-pty</code> (the install scripts and <code>oak update</code> pass it for you). macOS and Windows use node-pty’s prebuilt binaries.</li>
+</ul>
+<p>Without node-pty the install still succeeds, but the herdr tab cannot start, and <code>oak doctor</code> warns and names what is missing: fix that, then reinstall OAK (re-run its installer, or <code>oak update --cli-only --force</code>). Meanwhile <code>oak attach</code> opens herdr without it, handing the terminal to herdr’s own client with OAK in a pane.</p>
+
+<h2>Install the CLI</h2>
+<p>The install script installs the CLI from the latest <a href="releases.html">release</a> after checking its published sha256, then the extensions for whatever editors are on the machine, the bundled status line (when <code>jq</code> is present), and herdr:</p>
+<pre><code>curl -fsSL https://raw.githubusercontent.com/cell-observatory/oak-observatory/main/scripts/bootstrap.sh | bash</code></pre>
+<p>On Windows, run its PowerShell peer in native PowerShell, with no bash or WSL:</p>
+<pre><code>irm https://raw.githubusercontent.com/cell-observatory/oak-observatory/main/install.ps1 | iex</code></pre>
+<p>Run in a terminal, either script offers to add the capture hooks; through a pipe it prints the <code>oak init</code> step instead, since it cannot prompt. To follow the rolling <a href="releases.html#pre-release">pre-release channel</a>, pass the channel through the pipe: append <code>-s -- --channel dev</code> to the bash line, or run the PowerShell one as <code>&amp; ([scriptblock]::Create((irm &lt;url&gt;))) -Channel dev</code>. The choice is remembered, so later updates follow it.</p>
+<p>Or install the CLI tarball from a release yourself. Each <a href="https://github.com/cell-observatory/oak-observatory/releases">release</a> attaches it as <code>oak-observatory-X.Y.Z.tgz</code>, for version X.Y.Z. Download it, then install the downloaded file (in Windows PowerShell 5.1, type <code>curl.exe</code>: <code>curl</code> there is an alias of <code>Invoke-WebRequest</code>):</p>
+<pre><code>curl -fLO https://github.com/cell-observatory/oak-observatory/releases/download/vX.Y.Z/oak-observatory-X.Y.Z.tgz
+npm install -g --allow-scripts=node-pty ./oak-observatory-X.Y.Z.tgz
+oak doctor --fix</code></pre>
+<p>This gives you the <code>oak</code> command, plus <code>oak-observatory</code> and the deprecated <code>claude-observatory</code> as aliases. npm 12 runs a dependency’s install script only when it is allowed, and <code>--allow-scripts=node-pty</code> allows the one OAK needs; earlier npm versions accept the flag. npm 12 also refuses a tarball URL on a host other than its registry’s, which is why the file is downloaded first. <code>oak doctor --fix</code> then installs herdr, its integrations and OAK’s herdr plugin.</p>
+<p>Verify either way:</p>
+<pre><code>oak --version
+oak doctor
+oak status</code></pre>
+
+<h2 id="upgrading-from-claude-observatory">Upgrading from claude-observatory</h2>
+<p>claude-observatory is now OAK. Version 0.9.5 and earlier, and the 0.10.0 pre-releases published under the old name, cannot update themselves across the rename: <code>claude-observatory update</code> stops with an npm <code>EEXIST</code> error (the old packages keep working), the old VS Code extension’s update notifier does not see this release, and a JetBrains IDE subscribed to the old plugin repository is offered a new plugin id rather than an update. Upgrade once, by hand:</p>
+<ol>
+  <li><strong>Re-run an install script</strong> from <a href="#install-the-cli">Install the CLI</a>. It removes the old <code>claude-observatory</code> npm package first, then installs OAK and the renamed editor extensions. To install by hand instead, first download the release tarball as above, so a failed download leaves the old CLI in place. Then run <code>npm uninstall -g claude-observatory</code>, install the downloaded file, and run <code>oak doctor --fix</code> and <code>oak install-extensions</code>. OAK needs Node.js 20 or newer (0.9.5 ran on 18), and on Linux the build tools under <a href="#requirements">Requirements</a>.</li>
+  <li><strong>Quit Claude Code, then run <code>oak init</code></strong>, even if you ran it on a pre-release. It rewrites the capture hooks to the new command and hooks six events beside <code>PreToolUse</code> and <code>PostToolUse</code>; until it runs, the file changes of a Bash command that fails are not recorded. <code>oak doctor</code> names any event that is not hooked, and <code>oak status</code> shows the hook count with the command to run.</li>
+  <li><strong>Editors:</strong> the new VS Code extension uninstalls the old one, and the new JetBrains plugin disables the old one and offers a restart. If you subscribed to the JetBrains plugin repository, replace its URL with <code>https://github.com/cell-observatory/oak-observatory/releases/latest/download/updatePlugins.xml</code>.</li>
+  <li><strong>Other machines:</strong> machines configured for the old SSH session listing are no longer read. Add each one with <code>oak machine add &lt;label&gt; &lt;ssh-target&gt;</code>.</li>
+</ol>
+<p>Your store (<code>~/.claude/claude-observatory</code>), prefs, editor settings (<code>claudeObservatory.*</code>) and <code>.observatoryignore</code> files carry over unchanged, and <code>claude-observatory</code> keeps working as a deprecated alias of <code>oak</code>. Saved Timeline column widths reset once in both editors, because the Timeline gains a fourth tab.</p>
+
+<h2>Turn on capture</h2>
+<p>Capture is what makes an <a href="sessions-agents.html">observed session</a> show up. <code>oak init</code> installs the local <a href="capture.html#hook">hook</a> that snapshots each file change — it prints nothing, returns immediately, and costs the agent no tokens. Run it with Claude Code closed: Claude Code snapshots its hooks when a session starts, and a session that is already running reverts hook edits made under it.</p>
+<pre><code>oak init</code></pre>
+<p>From here, every Claude Code session on this machine is recorded automatically (<code>oak init --project</code> writes the hook into one repository’s <code>.claude/settings.json</code> instead). When <code>codex</code> is on the PATH, <code>oak init</code> installs <a href="codex.html">Codex</a> capture too (<code>--no-codex</code> skips it), and <code>--with-statusline</code> adds the bundled status line. Run <code>oak status</code> at any time to confirm the hook is installed and see what has been captured.</p>
+
+<h2>Add the editor extensions</h2>
+<p>The same record renders inside your editor. <code>oak install-extensions</code> side-loads the VS Code and JetBrains extensions. The VS Code one then keeps itself updated; JetBrains updates once you add its plugin repository (the command prints that one-time step):</p>
+<pre><code>oak install-extensions</code></pre>
+<p>See <a href="editors.html">VS Code</a> and <a href="editors.html">JetBrains</a> for what each one surfaces. The extensions are thin renderers over the CLI, so every number matches the <a href="tui.html">terminal app</a>.</p>
+
+<h3>Other ways to install the extensions</h3>
+<p>Every <a href="releases.html">release</a> carries both editor packages as plain files, installable by hand with no CLI involved:</p>
+<ul>
+  <li><strong>VS Code family</strong> — download <code>oak-observatory-vscode-v&lt;version&gt;.vsix</code>, then Extensions view → <strong>⋯ → Install from VSIX…</strong></li>
+  <li><strong>JetBrains IDEs</strong> — download <code>oak-observatory-jetbrains-v&lt;version&gt;.zip</code>, then Settings → Plugins → <strong>⚙ → Install Plugin from Disk…</strong> and restart. For native auto-updates, add the plugin repository once under Settings → Plugins → ⚙ → Manage Plugin Repositories: <code>https://github.com/cell-observatory/oak-observatory/releases/latest/download/updatePlugins.xml</code></li>
+</ul>
+
+<div class="callout tip">
+  <span class="ico">→</span>
+  <div class="ct"><span class="ctitle">Next</span>
+  <p>With capture on, walk through <a href="first-review.html">your first review</a> to see a real change go from an agent's edit to a kept decision.</p></div>
+</div>

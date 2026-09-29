@@ -3,14 +3,15 @@
 `install-statusline.sh` is a **vendored copy** of
 [cell-observatory/claude-statusline](https://github.com/cell-observatory/claude-statusline)
 (self-contained installer; it embeds the whole status line). It ships inside the
-`claude-observatory` npm package so `claude-observatory statusline` can install the status line
+`oak-observatory` npm package so `oak statusline` can install the status line
 with no network and no second repo — the Usage bars in the VS Code / JetBrains front-ends read
 the `statusline-last.json` it writes.
 
 - Upstream stays the source of truth for statusline-only users.
-- Refresh this copy with `scripts/sync-statusline.sh` (run from the repo root) and commit the diff.
-- Vendored from upstream commit: `3ff1e1b` / v0.4.0-to-be (branch `0.4.0`, PR #2 — three rows:
-  clock/branch/path, then the session title + ↑↓↺ token counters fed by `claude-observatory usage
-  --json` with the ◷ duration at the end, then the usage bars; on Enterprise/API plans the `5h`/`wk`
-  segments show measured token totals and persist `five_meas`/`week_meas` for the Usage panels).
-  Re-run `scripts/sync-statusline.sh` after upstream merges/tags if the copy drifts.
+- Vendored from upstream commit `3ff1e1b` (branch `0.4.0`). This copy also carries changes upstream
+  does not have yet: the usage bars are drawn as rules under their figures, the rows wrap at the
+  terminal width, the session title follows OAK's order, the usage windows count each message
+  once and only this machine's own turns, in a herdr pane a changed title starts OAK's tab sync
+  (`oak __tab-sync`) in the background, and the rows render intact under Git Bash on Windows.
+- Refresh this copy with `bash scripts/sync-statusline.sh` from the repository root, then commit the
+  diff. The script lists the local changes a sync must keep.

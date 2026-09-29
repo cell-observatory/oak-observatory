@@ -1,0 +1,22 @@
+<p>The <strong>review tab</strong> carries the same review the editors do, in the terminal: each edit's diff in the agent's own colors, with the decision verbs one key away.</p>
+
+<h2>Per-edit diffs</h2>
+<p>Every <a href="edits.html">edit</a> opens as its own diff — the tool that made it, the before and after, and its churn — never one session-wide diff to untangle. Revisions of the same lines are already collapsed into one <a href="review-units.html">review unit</a>, so you read the net change.</p>
+
+<figure><img src="media/tui-review.png" loading="lazy" alt="The review tab in the terminal app: a change map and the prompts that drove the session across the top, a file-grouped stack of every edit on the lower left, and on the lower right the Diff pane, which shows an edit's diff once one is selected"><figcaption>The review tab — the change map, the prompts, and every edit stacked by file; selecting an edit opens its diff in the Diff pane.</figcaption></figure>
+
+<h2>The verbs</h2>
+<p>The same two verb pairs as everywhere else, on the keyboard: <a href="keep-undo.html"><strong>Keep</strong> and <strong>Undo</strong></a> act on one review unit; <strong>Accept</strong> and <strong>Reject</strong> act on a scope — a file, a task, a prompt, or the whole session.</p>
+<p>The change map acts too. A pending row carries <code>[ ✓ ]</code> keep and <code>[ ✗ ]</code> undo buttons and a reverted row <code>[ ↺ ]</code> redo, and the heading carries keep-all, undo-all and resolve; each asks its question on the same row. Map and Diff are separate panes, on <kbd>F4</kbd> and <kbd>F5</kbd>, and <kbd>F</kbd> folds or unfolds every file in Traces.</p>
+
+<h2>Sessions on another machine</h2>
+<p>A session that runs on a saved machine is reviewed on that machine. The tab reads its review there and runs every decision there — Keep, Undo, Redo, Resolve, diffs and review comments — over SSH with that machine's own <code>oak</code>, because the edit store and the files never leave it. No store, transcript or working file is copied between machines, and the session header names the machine (<code>on build-box</code>).</p>
+<p>The session picker (<kbd>b</kbd>) lists this machine's sessions first, then each saved machine's, under that machine's name; the find palette offers them too. They come from each machine's own session list, which OAK reads in the background and refreshes about every fifteen seconds. A machine that has not answered yet, or cannot be reached, is one line in the picker that says so. The session under the <a href="tui-observatory.html">Observatory</a>’s cursor, previewed or pinned, is the one this tab shows, as is a session opened with <kbd>r</kbd>. Started outside any repo with no <code>--session</code> or <code>--root</code>, this tab opens on the session that most recently took a turn on any machine, this one or a saved one (on a machine running this version, reopening a session, as herdr does when it restores its panes, is not a turn), as the machines first answer and until you choose a session or act in the tab. <code>oak --tab review --session &lt;id&gt;</code>, with or without <code>--once</code>, reviews a session this machine does not hold on the saved machine that lists it; when none does, <code>--once</code> fails and the panes say so, naming the machines asked. While the owning machine does not answer, the panes name the failure instead of showing an empty review; a sync mirror of the session on this machine is never read in its place. Scripts reach the same machine with <code>--machine &lt;label&gt;</code> (see the <a href="cli.html">CLI reference</a>).</p>
+
+<div class="callout info">
+  <span class="ico">ℹ</span>
+  <div class="ct"><span class="ctitle">The same decisions, everywhere</span>
+  <p>A Keep in the terminal is a Keep in <a href="editors.html">VS Code and JetBrains</a> — all three render one <a href="cli.html">CLI</a> backend, so a decision made here shows up resolved in the editors, and vice versa.</p></div>
+</div>
+
+<p>Automatic remote refreshes wait at least ten seconds, or twice the last read's duration when longer. Decisions bypass this delay for their next read. An older remote CLI that cannot expand review units produces an update-required error before acting. Remote status facts remain separate from the local session catalog. Observatory also reads its conversation, metadata and edit previews on the owning machine.</p>

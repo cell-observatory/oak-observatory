@@ -1,0 +1,20 @@
+{"timestamp":"2026-09-18T15:00:00.000Z","type":"session_meta","payload":{"id":"codex-conversation","cwd":"/workspace","originator":"codex_exec","model_provider":"openai"}}
+{"timestamp":"2026-09-18T15:00:00.500Z","type":"turn_context","payload":{"turn_id":"codex-turn-1","model":"gpt-5.3-codex","model_provider":"openai","model_context_window":10000}}
+{"timestamp":"2026-09-18T15:00:01.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"codex-turn-1"}}
+{"timestamp":"2026-09-18T15:00:02.000Z","type":"event_msg","payload":{"type":"user_message","turn_id":"codex-turn-1","message":"Patch the Codex demo and plan the checks."}}
+{"timestamp":"2026-09-18T15:00:03.000Z","type":"response_item","payload":{"type":"reasoning","turn_id":"codex-turn-1","summary":[{"text":"Inspecting the Codex fixture."}]}}
+{"timestamp":"2026-09-18T15:00:04.000Z","type":"response_item","payload":{"type":"function_call","turn_id":"codex-turn-1","call_id":"codex-edit-1","name":"apply_patch","arguments":"{\"input\":\"*** Begin Patch\\n*** Update File: /workspace/codex.ts\\n@@\\n-old\\n+new\\n*** End Patch\"}"}}
+{"timestamp":"2026-09-18T15:00:05.000Z","type":"response_item","payload":{"type":"function_call_output","turn_id":"codex-turn-1","call_id":"codex-edit-1","output":"Done!","exit_code":0}}
+{"timestamp":"2026-09-18T15:00:06.000Z","type":"response_item","payload":{"type":"custom_tool_call","turn_id":"codex-turn-1","call_id":"codex-plan-1","name":"TodoWrite","input":{"todos":[{"content":"Patch Codex demo","status":"completed"},{"content":"Run Codex checks","status":"in_progress"}]}}}
+{"timestamp":"2026-09-18T15:00:07.000Z","type":"response_item","payload":{"type":"custom_tool_call_output","turn_id":"codex-turn-1","call_id":"codex-plan-1","output":"Plan saved"}}
+{"timestamp":"2026-09-18T15:00:08.000Z","type":"event_msg","payload":{"type":"token_count","turn_id":"codex-turn-1","info":{"model_context_window":10000,"last_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":10,"total_tokens":130},"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":10}}}}
+{"timestamp":"2026-09-18T15:00:09.000Z","type":"event_msg","payload":{"type":"agent_message","turn_id":"codex-turn-1","message":"The Codex patch is ready."}}
+{"timestamp":"2026-09-18T15:00:10.000Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"codex-turn-1"}}
+{"timestamp":"2026-09-18T15:01:00.000Z","type":"turn_context","payload":{"turn_id":"codex-turn-2","model":"gpt-5.3-codex","model_provider":"openai","model_context_window":10000}}
+{"timestamp":"2026-09-18T15:01:01.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"codex-turn-2"}}
+{"timestamp":"2026-09-18T15:01:02.000Z","type":"event_msg","payload":{"type":"user_message","turn_id":"codex-turn-2","message":"Run the Codex checks."}}
+{"timestamp":"2026-09-18T15:01:03.000Z","type":"response_item","payload":{"type":"function_call","turn_id":"codex-turn-2","call_id":"codex-bash-1","name":"exec_command","arguments":"{\"cmd\":\"npm test -- codex\"}"}}
+{"timestamp":"2026-09-18T15:01:04.000Z","type":"response_item","payload":{"type":"function_call_output","turn_id":"codex-turn-2","call_id":"codex-bash-1","output":"codex tests passed","exit_code":0}}
+{"timestamp":"2026-09-18T15:01:05.000Z","type":"event_msg","payload":{"type":"token_count","turn_id":"codex-turn-2","info":{"model_context_window":10000,"last_token_usage":{"input_tokens":40,"cached_input_tokens":5,"output_tokens":5,"total_tokens":50},"total_token_usage":{"input_tokens":140,"cached_input_tokens":25,"output_tokens":15}}}}
+{"timestamp":"2026-09-18T15:01:06.000Z","type":"event_msg","payload":{"type":"agent_message","turn_id":"codex-turn-2","message":"Codex checks pass."}}
+{"timestamp":"2026-09-18T15:01:07.000Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"codex-turn-2"}}

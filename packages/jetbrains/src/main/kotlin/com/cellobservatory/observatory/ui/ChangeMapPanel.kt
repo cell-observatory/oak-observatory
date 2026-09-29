@@ -3,6 +3,8 @@ package com.cellobservatory.observatory.ui
 import com.cellobservatory.observatory.core.ChatRef
 import com.cellobservatory.observatory.core.ObservatoryCli
 import com.cellobservatory.observatory.core.StoreReader
+import com.cellobservatory.observatory.model.compactBytes
+import com.cellobservatory.observatory.model.relTime
 import com.cellobservatory.observatory.model.BackgroundProcess
 import com.cellobservatory.observatory.model.Feed
 import com.cellobservatory.observatory.model.FeedEntry
@@ -115,8 +117,8 @@ private val CM_REVERTED = JBColor.GRAY
      * reverting another, and this pair rewrites files on disk.
      */
     private data class LedgerCols(
-        val barEnd: Int, val addEnd: Int, val delEnd: Int,
-        val pendEnd: Int, val keptEnd: Int, val keepX: Int, val undoX: Int,
+        val nameEnd: Int, val addEnd: Int, val delEnd: Int,
+        val pendEnd: Int, val keptEnd: Int, val stackX: Int, val keepX: Int, val undoX: Int,
     )
 
     private fun ledgerColumns(width: Int): LedgerCols {
@@ -124,12 +126,15 @@ private val CM_REVERTED = JBColor.GRAY
         val actW = JBUI.scale(14)
         val undoX = width - actW
         val keepX = undoX - actW
-        val keptEnd = keepX - pad
+        val stackX = keepX - actW
+        val keptEnd = stackX - pad
         val pendEnd = keptEnd - JBUI.scale(26)
         val delEnd = pendEnd - JBUI.scale(30)
         val addEnd = delEnd - JBUI.scale(38)
-        val barEnd = addEnd - JBUI.scale(40)
-        return LedgerCols(barEnd, addEnd, delEnd, pendEnd, keptEnd, keepX, undoX)
+        // No churn bar any more — the name runs to this boundary instead of a
+        // proportional track (the terminal map's call: ranking already answers "which is biggest").
+        val nameEnd = addEnd - JBUI.scale(40)
+        return LedgerCols(nameEnd, addEnd, delEnd, pendEnd, keptEnd, stackX, keepX, undoX)
     }
 
     /** Which action a click at `x` landed on within a row of `width`, or null for neither. */
@@ -137,6 +142,7 @@ private val CM_REVERTED = JBColor.GRAY
         val c = ledgerColumns(width)
         val actW = JBUI.scale(14)
         return when {
+            x >= c.stackX && x < c.stackX + actW -> "stack"
             x >= c.keepX && x < c.keepX + actW -> "keep"
             x >= c.undoX && x < c.undoX + actW -> "undo"
             else -> null
@@ -149,7 +155,7 @@ internal val MT_ATTENTION = JBColor(Color(0xD9822B), Color(0xD9822B))
 internal val MT_WORKING = JBColor(Color(0x4C8BF5), Color(0x4C8BF5))
 internal val MT_DONE = JBColor(Color(0x3FB950), Color(0x3FB950))
 internal val MT_ERROR = JBColor(Color(0xE5534B), Color(0xE5534B))
-private val MT_AGENT = JBColor(Color(0x9A6AC2), Color(0x9A6AC2))
+internal val MT_AGENT = JBColor(Color(0x9A6AC2), Color(0x9A6AC2)) // internal: FeedPanel's reasoning rows use it too
 internal val MT_ADD = SimpleTextAttributes(SimpleTextAttributes.STYLE_PLAIN, MT_DONE)
 internal val MT_REM = SimpleTextAttributes(SimpleTextAttributes.STYLE_PLAIN, MT_ERROR)
 /** The module strip shows at most this many segments; the churn-ranked tail merges into "+K more". */
@@ -158,24 +164,26 @@ private const val MAX_SEGMENTS = 11
 // The SESSION-SCOPED left-nav panes. Their text is re-worded live (refreshScopeNotes) when a fleet row
 // from another session drives the detail, because none of them follows that selection.
 private const val TASKS_DESC =
-    "This session’s numbered task list (Claude’s TaskCreate/TaskUpdate plan) — with live statuses; each row shows the edits made while it was in progress."
+    "This session’s numbered task list (the agent’s TaskCreate/TaskUpdate plan) — with live statuses; each row shows the edits made while it was in progress."
 private const val PROCESSES_DESC =
-    "Background shells Claude launched with run_in_background and left running — state, runtime, and how much output each has produced."
+    "Background shells the agent launched with run_in_background and left running — state, runtime, and how much output each has produced."
 private const val PROCESSES_TIP =
     "The session's background shells — always THIS project's active session, never a selected sibling agent's. Identity is the harness's own shell id: the transcript records no OS pid, and inferring one from local processes would be wrong whenever the agent runs over SSH or in a container. Select one to follow its output."
 /** …and what that tooltip becomes while a SIBLING agent is selected: no count, and why. */
 private const val PROCESSES_UNSCOPED_TIP =
     "Background shells are read for the session under review, never for a selected sibling agent, so no count is shown while one is selected. Open that session from the Sessions tab to see its shells."
 private const val SESSIONS_DESC =
-    "Every recorded session on this machine, from every workspace, most recent conversation first — click one to review it instead of the live session. Each row names the workspace it came from."
+    "Sessions on this machine, grouped by workspace. This workspace is first; select a session to review its conversation and edits."
 private const val SESSIONS_TIP =
-    "Every workspace's sessions, ordered by when each conversation was last active, each row naming its workspace. A bridged row's conversation lives on Claude Code's bridge, not on this machine. Selecting a row PINS the review to that session (the same choice Switch Session makes) — unlike the other tabs, which only re-point the map and the feed."
+    "Sessions on this machine, grouped by workspace and ordered by conversation recency. Selecting a row PINS the review to that session (the same choice Switch Session makes) — unlike the other tabs, which only re-point the map and the Timeline's Feed tab."
+/** Why a pinned session can be missing from the listing, which spans every workspace on this machine. */
+internal const val UNLISTED_PIN = "not in this machine’s session list (deleted, empty, or a copy mirrored from another machine)"
 private const val FLEET_TIP =
     "Running agents across every worktree — siblings + their subagents — with the live file-conflict strip below. Select one to map its changes."
 private const val WORKFLOWS_TIP =
     "Claude Code Workflow runs — agents grouped by phase, with tokens/time/edits per run. Select one to map its changes."
 private const val TASKS_TIP =
-    "The session's task list (Claude's numbered TaskCreate/TaskUpdate tasks) — live statuses; completed tasks leave the list when the runtime archives them. Always THIS project's active session, never a selected sibling agent's."
+    "The session's task list (the agent's numbered TaskCreate/TaskUpdate tasks) — live statuses; completed tasks leave the list when the runtime archives them. Always THIS project's active session, never a selected sibling agent's."
 
 // The left nav has NO tab-index constants, deliberately. Prompts is not among its members since 0.8.7 —
 // it is the WINDOW to the left, so the list of asks and the view one of them scopes stay visible together.
@@ -191,7 +199,7 @@ private const val MEMBER_PROCESSES = com.cellobservatory.observatory.model.NavGr
 
 /** A member's bare name — the tab title (ungrouped) or column header (grouped) before any badge. */
 private val MEMBER_TITLES = mapOf(
-    MEMBER_SESSIONS to "Sessions", MEMBER_FLEET to "Fleet", MEMBER_WORKFLOWS to "Workflows",
+    MEMBER_SESSIONS to "Sessions", MEMBER_FLEET to "Workers", MEMBER_WORKFLOWS to "Workflows",
     MEMBER_TASKS to "Tasks", MEMBER_PROCESSES to "Processes",
 )
 
@@ -206,8 +214,8 @@ private val MEMBER_TIPS = mapOf(
  * and a task list is many.
  */
 private val GROUP_SPLIT_DEFAULTS = mapOf(
-    com.cellobservatory.observatory.model.NavGrouping.SESSIONS_FLEET to listOf(0.5f),
-    com.cellobservatory.observatory.model.NavGrouping.RUNS to listOf(0.34f, 0.5f),
+    // Five columns, roughly even: each divider is the LEFT pane’s share of what remains.
+    com.cellobservatory.observatory.model.NavGrouping.NAV_ALL to listOf(0.2f, 0.25f, 0.34f, 0.5f),
 )
 
 /** Below this width the Overview stacks its master and detail instead of splitting them side by side. */
@@ -250,6 +258,25 @@ private fun statusColor(status: String): JBColor = when (status) {
 /** Tag for the sessions-row "resolve" fragment — file-scoped so the (non-inner) renderer class and the
  *  panel's click handler share one identity to hit-test against. */
 private val SESSIONS_RESOLVE_TAG = Any()
+
+/** Tag for the sessions-row STORE-SIZE fragment (the size was missing from this
+ *  panel, and clicking it opens the folder — the same gesture the terminal and VS Code carry). */
+private val SESSIONS_STORE_TAG = Any()
+
+/** Tag for the sessions-row "conversation" fragment (0.10.0): reopen this conversation in the Timeline's
+ *  Feed tab — local rows only, since an agent must run where the worktree is. */
+private val SESSIONS_CONVERSATION_TAG = Any()
+
+/** Tag for the sessions-row "delete" fragment: remove this conversation from every Observatory
+ *  picker and purge its captured edits for good (`oak sessions --delete <id>`). Local rows only, beside
+ *  the continue fragment; the agent's own transcript is untouched, and `--undelete` lists it again,
+ *  without its edits. */
+private val SESSIONS_DELETE_TAG = Any()
+
+/** Client-property key carrying a fragment's click tag on its label, so the WRAPPING session renderer
+ *  (which flows badges onto new lines when the pane is narrow) can be hit-tested in 2-D — the single
+ *  line ColoredListCellRenderer's x-only `getFragmentTagAt` cannot survive a wrap. */
+private const val SESSIONS_FRAGMENT_TAG = "oak.sessions.fragmentTag"
 
 class ChangeMapPanel(private val project: Project) : SimpleToolWindowPanel(true, true) {
 
@@ -390,7 +417,7 @@ class ChangeMapPanel(private val project: Project) : SimpleToolWindowPanel(true,
         // four anchors each name ONE button on it, and this rings the whole row — coarser than VS Code,
         // which outlines the button itself. Stated in docs/DEMO.md rather than left to be discovered.
         "nav-axes", "accept-prompt", "session-label", "spotlight" -> toolbar
-        "feed" -> feedSplit.secondComponent
+        // ("feed" left in 0.10.0 — the Timeline's Feed tab owns that anchor now.)
         // The detail pane is rebuilt per selection, so these resolve against whichever one is mounted now.
         "folders-strip", "files-ledger", "summary-bar" ->
             (detailHost.components.firstOrNull() as? AgentDetail)?.tourAnchor(anchor)
@@ -468,6 +495,7 @@ class ChangeMapPanel(private val project: Project) : SimpleToolWindowPanel(true,
     private data class DoneTasksToggle(val count: Int, val open: Boolean)
     /** The "N older with pending edits · show all" collapse row in the Sessions tab (0.9.0). */
     private data class OlderSessionsToggle(val count: Int, val open: Boolean)
+    /** The "needs you" header over the raised hands (2026-09-15) — inert on click, like FilterInfo. */
     private var oldSessionsOpen = false
     @Volatile private var lastSessions: SessionsResult? = null // BGT-read by sessionLabelAction.update()
     private var tasksOpen = false
@@ -479,7 +507,7 @@ class ChangeMapPanel(private val project: Project) : SimpleToolWindowPanel(true,
     private var tourNavTab: String? = null
     private val tasksModel = javax.swing.DefaultListModel<Any>()
     private val tasksList = JBList(tasksModel).apply {
-        emptyText.text = "No tasks — this session plans with a task list only when Claude creates one"
+        emptyText.text = "No tasks — this session plans with a task list only when the agent creates one"
         cellRenderer = TaskRowRenderer()
     }
     // --- LEFT NAV, fourth tab: the background shells this session launched and left running. The tab is
@@ -493,13 +521,38 @@ class ChangeMapPanel(private val project: Project) : SimpleToolWindowPanel(true,
     /** The leading row of the Sessions tab: stop following one session and take whichever is newest.
      *  Without it, pinning would be a one-way door once the Switch Session dropdown was removed. */
     private object AutoSessionRow
+    private data class WorkspaceHeaderRow(val workspace: String, val count: Int)
 
     private val sessionsModel = DefaultListModel<Any>()
     private val sessionsList = JBList(sessionsModel).apply {
         emptyText.text = "Reading this workspace’s sessions…"
+        selectionModel = object : javax.swing.DefaultListSelectionModel() {
+            init { selectionMode = javax.swing.ListSelectionModel.SINGLE_SELECTION }
+            private fun selectable(index: Int): Boolean = index in 0 until sessionsModel.size() &&
+                sessionsModel.getElementAt(index).let { it !is WorkspaceHeaderRow }
+            override fun setSelectionInterval(index0: Int, index1: Int) {
+                if (index1 < 0) { clearSelection(); return }
+                val step = if (index1 < leadSelectionIndex) -1 else 1
+                var next = index1
+                while (next in 0 until sessionsModel.size() && !selectable(next)) next += step
+                if (selectable(next)) super.setSelectionInterval(next, next)
+            }
+            override fun addSelectionInterval(index0: Int, index1: Int) = setSelectionInterval(index0, index1)
+        }
         cellRenderer = SessionRowRenderer { com.cellobservatory.observatory.settings.ObservatorySettings.instance.state.session?.takeIf { s -> s.isNotBlank() } }
+        // The rows are VARIABLE height (they wrap), so a width change must re-measure them or the old
+        // wrap heights stick. Toggling fixedCellHeight invalidates the list UI's cached row sizes; the
+        // next paint re-queries the renderer at the new width and reflows.
+        addComponentListener(object : java.awt.event.ComponentAdapter() {
+            override fun componentResized(e: java.awt.event.ComponentEvent) {
+                fixedCellHeight = 1
+                fixedCellHeight = -1
+                revalidate()
+                repaint()
+            }
+        })
     }
-    /** Held so [repaintSessions] can disclose that the pinned session is not one of this workspace's. */
+    /** Held so [repaintSessions] can disclose that the pinned session is not in the listing. */
     private val sessionsDesc = descLabel(SESSIONS_DESC)
     private val sessionsPane: JComponent by lazy { descPane(sessionsDesc, JBScrollPane(sessionsList)) }
     // Each nav tab's pane is held as a field so the guided tour can address a tab by COMPONENT. The tab
@@ -520,14 +573,9 @@ class ChangeMapPanel(private val project: Project) : SimpleToolWindowPanel(true,
     /** The Processes pane, built up front but only added as a tab once the CLI answered for it. */
     private val processesPane: JComponent = descPane(processesDesc, JBScrollPane(processesList))
 
-    // --- RIGHT DETAIL: the change-map for the selected nav item, over that item's live feed / audit log ---
+    // --- RIGHT DETAIL: the change-map for the selected nav item. (Its feed lived under it until
+    //     0.10.0 — it renders in the Timeline's Feed tab now, so the map keeps the whole height.) ---
     private val detailHost = JPanel(BorderLayout())
-    private val feedPane = FeedPane()
-    /** Change map over feed. ONE splitter instance whose halves are swapped in place — rebuilding it on
-     *  every refresh would throw away wherever the user dragged the divider. */
-    private val feedSplit = OnePixelSplitter(true, 0.62f).apply { firstComponent = detailHost }
-    /** The feed for the current selection, from the shared throttled fetch (null while one is in flight). */
-    private var feed: Feed? = null
 
     // --- Active-only + Clear-completed (display-only; a thin filter over the same payload). Persist across
     //     repaints; Active only defaults ON and is remembered in settings (0.8.8) — this panel is about work
@@ -617,9 +665,8 @@ class ChangeMapPanel(private val project: Project) : SimpleToolWindowPanel(true,
      * UNGROUPED: five tabs, Sessions first — which session you are reviewing is the question that precedes
      * every other tab, and answering it re-points the whole observatory rather than just this panel.
      *
-     * GROUPED: two tabs, each rendering its members as columns. "Sessions · Fleet" keeps that same lead
-     * position. "Workflows · Tasks · Processes" nests its splitters so the Processes column can be appended
-     * later, exactly as its tab used to be.
+     * GROUPED: one tab rendering all five members as columns, Sessions in the same lead position. The
+     * splitters nest so the Processes column can be appended later, exactly as its tab used to be.
      *
      * [restore] names the member to bring forward afterwards; when null the currently selected member is
      * kept. A caller flipping the MODE must pass it, read before the flip — [selectedNavMember] answers for
@@ -690,7 +737,7 @@ class ChangeMapPanel(private val project: Project) : SimpleToolWindowPanel(true,
     private fun mountProcesses() {
         if (!::navTabs.isInitialized) return
         if (groupedNav) {
-            groupPanes[com.cellobservatory.observatory.model.NavGrouping.RUNS]?.mount(MEMBER_PROCESSES, processesPane)
+            groupPanes[com.cellobservatory.observatory.model.NavGrouping.NAV_ALL]?.mount(MEMBER_PROCESSES, processesPane)
         } else if (navTabs.indexOfComponent(processesPane) < 0) {
             navTabs.addTab(MEMBER_TITLES[MEMBER_PROCESSES] ?: MEMBER_PROCESSES, processesPane)
             navTabs.setToolTipTextAt(navTabs.tabCount - 1, PROCESSES_TIP)
@@ -753,7 +800,7 @@ class ChangeMapPanel(private val project: Project) : SimpleToolWindowPanel(true,
         }
         masterSplit = OnePixelSplitter(false, splitProp()).apply {
             firstComponent = navHost
-            secondComponent = feedSplit
+            secondComponent = detailHost
         }
         val split = masterSplit
         split.addComponentListener(object : ComponentAdapter() {
@@ -861,14 +908,33 @@ class ChangeMapPanel(private val project: Project) : SimpleToolWindowPanel(true,
         //     controls. The VERSION chip and the SETTINGS gear close the row, in that order — pinned to
         //     the right edge (VS Code parity: same pair, same order, same far-right position).
         val rightGroup = DefaultActionGroup().apply {
-            add(reviewNavBar.searchAction())
+            add(FilterSortActions.searchField(project)) // the inline search FIELD (not the pop-up dialog)
+            // Reset scope, RIGHT BESIDE Search: one button that widens the panel
+            // back to every tracked edit — Search text, the folder-tile filter, and the prompt scope
+            // all cleared at once. Until now each had its own exit (empty Search / re-click the tile /
+            // the Prompts window's Clear Scope) and none was discoverable from here. The service
+            // refresh it triggers re-syncs the Prompts window's own selection (repaint reads
+            // selectedPromptId fresh and clears the list when it is null).
+            add(
+                iconAction(
+                    "Reset Scope",
+                    AllIcons.General.Reset,
+                    "Reset scope — show every tracked edit (clears Search, the folder filter, and the prompt scope)",
+                ) {
+                    service().selectedPromptId = null
+                    service().setFilterSpec(emptyList(), emptyList()) // clear ext/type…
+                    service().setFilter("") // …and the query; refreshes every surface, detail starts unfiltered
+                },
+            )
+            add(FilterSortActions.filterGroup(project))
+            add(FilterSortActions.sortGroup(project))
             add(activeOnlyToggle())
             // Group Tabs is NOT here: it is about the tab strip, so it sits beside it (user rule
             // 2026-07-30). See navHost below.
             add(clearCompletedAction())
             addSeparator()
             add(reviewNavBar.spotlightAction())
-            add(action("Refresh", AllIcons.Actions.Refresh) { rebuild(force = true) })
+            add(action("Refresh", AllIcons.Actions.Refresh) { service().sweepIgnoredThen { rebuild(force = true) } })
             addSeparator()
             DemoVerbs.ALL.forEach { v -> add(demoAction(v.text, v.icon, v.wantDemo) { v.run(project) }) }
             addSeparator()
@@ -881,7 +947,7 @@ class ChangeMapPanel(private val project: Project) : SimpleToolWindowPanel(true,
                 iconAction(
                     "Settings",
                     AllIcons.General.Settings,
-                    "Claude Observatory settings — CLI paths, pinned session, and the editor review surface",
+                    "OAK settings — CLI paths, pinned session, and the editor review surface",
                 ) {
                     com.intellij.openapi.options.ShowSettingsUtil.getInstance()
                         .showSettingsDialog(project, ObservatoryConfigurable::class.java)
@@ -1032,6 +1098,16 @@ class ChangeMapPanel(private val project: Project) : SimpleToolWindowPanel(true,
                     // buttons, so the hit region is the label's own tail).
                     is SessionRow ->
                         if (row.pending > 0 && resolveFragmentHit(i, row, e)) resolveSessionRow(row)
+                        // The store-size fragment opens the folder instead of switching sessions —
+                        // the same click the terminal and VS Code answer.
+                        else if (row.storePath.isNotBlank() && storeFragmentHit(i, row, e))
+                            ReviewOps.revealStoreFolder(project, row.storePath)
+                        // The drive fragment: pin, reveal the Feed tab, reopen the conversation
+                        // there — refused while a turn RUNS (stop the current agent first).
+                        else if (conversationFragmentHit(i, row, e)) openConversationRow(row)
+                        // The delete fragment: remove this conversation from every picker (confirmed
+                        // first), instead of switching to it.
+                        else if (deleteFragmentHit(i, row, e)) deleteSessionRow(row)
                         else pinSession(row)
                     AutoSessionRow -> pinSession(null)
                     // Repaint from the REMEMBERED payload: a toggle is a display state, and refetching
@@ -1096,9 +1172,13 @@ class ChangeMapPanel(private val project: Project) : SimpleToolWindowPanel(true,
 
     private fun selectDetail(sel: NavSel) {
         selected = sel
-        // A new selection is a new feed: the shared fetch hands back null until this ref's tail lands, so
-        // the pane can never show the previously selected row's activity under this one.
-        feed = feedRef()?.let { service().feed(it) }
+        val ref = feedRef()
+        service().selectedFeed = ref?.let { ObservatoryService.FeedSel(it, service().currentSession()) }
+        if (ref != null && !suppressSel) {
+            com.intellij.openapi.wm.ToolWindowManager.getInstance(project)
+                .getToolWindow("Observatory Timeline")?.show(null)
+            TimelinePanel.of(project)?.selectMember(com.cellobservatory.observatory.model.NavGrouping.FEED)
+        }
         renderDetail()
         refreshScopeNotes()
         refreshOverviewToolbar()
@@ -1118,7 +1198,7 @@ class ChangeMapPanel(private val project: Project) : SimpleToolWindowPanel(true,
                 "Accepts its ${row.pending} pending edit(s), then clears this session's review records.\n\n" +
                 "Accepting changes NO file on disk — it records a verdict. Clearing the records cannot be undone, " +
                 "and the session itself is kept.",
-            "Claude Observatory",
+            "OAK",
             "Resolve Session",
             "Cancel",
             Messages.getWarningIcon(),
@@ -1140,6 +1220,9 @@ class ChangeMapPanel(private val project: Project) : SimpleToolWindowPanel(true,
             }
         )
     }
+
+    /** The delete fragment's action — the shared confirm-and-delete every session picker uses. */
+    private fun deleteSessionRow(row: SessionRow) = ReviewOps.confirmAndDeleteSession(project, row)
 
     /** The session the nav badges describe: a selected agent (or its parent, for a subagent row). */
     private fun scopedSession(): String? = when (val s = selected) {
@@ -1179,9 +1262,9 @@ class ChangeMapPanel(private val project: Project) : SimpleToolWindowPanel(true,
         setTabBadge(
             MEMBER_FLEET,
             when {
-                agents.isEmpty() -> "Fleet"
-                scopedSession() != null && agents.size > 1 -> "Fleet 1/${agents.size}"
-                else -> "Fleet ${agents.size}"
+                agents.isEmpty() -> "Workers"
+                scopedSession() != null && agents.size > 1 -> "Workers 1/${agents.size}"
+                else -> "Workers ${agents.size}"
             },
         )
         val runs = lastResult?.workflows?.size ?: 0
@@ -1199,8 +1282,8 @@ class ChangeMapPanel(private val project: Project) : SimpleToolWindowPanel(true,
     /** What `feed --kind task` resolves against: the row's STRICT 12-hex task id (core.taskIdForSubject).
      *  NEVER the task list's display number — core keys tasks by that strict id, so a display id resolves
      *  to nothing and the pane would report "no such task in this session" about a task this very panel is
-     *  listing. Blank on an older CLI that predates the field: there is then nothing to follow, and the
-     *  feed pane detaches rather than asking about an id core cannot answer for. */
+     *  listing. Blank on an older CLI that predates the field: there is then nothing to follow, and no
+     *  feed subject is published rather than asking about an id core cannot answer for. */
     private fun taskFeedId(row: TaskRow): String = row.task.taskId
 
     /**
@@ -1390,9 +1473,8 @@ class ChangeMapPanel(private val project: Project) : SimpleToolWindowPanel(true,
         val ps = service.processes(force)
         val rq = service.prompts(force)
         val ss = service.sessions(force)
-        // The feed rides this same tick — no timer of its own. A finished ('audit') feed is not refetched
-        // at all: the service hands the recorded one back, so a completed run stops costing a spawn.
-        val fd = feedRef()?.let { service.feed(it, force) }
+        // (The feed no longer rides this tick: the Timeline's FeedPanel is the ONE consumer of the
+        // service's feed slot — a second asker here would key-thrash it into a spawn per tick.)
         // Anything the batch could not build. Reported ONCE per distinct problem, because this runs on
         // every ~3-second tick and a warning that repeats forever is one the reader learns to dismiss
         // without reading. A view that fails renders as an empty panel otherwise — indistinguishable
@@ -1405,7 +1487,6 @@ class ChangeMapPanel(private val project: Project) : SimpleToolWindowPanel(true,
             }
             if (problems.isEmpty()) reportedProblems.clear()
             map = cm
-            feed = fd
             lastProcesses = ps
             lastPrompts = rq
             repaintNav(mt)
@@ -1583,7 +1664,7 @@ class ChangeMapPanel(private val project: Project) : SimpleToolWindowPanel(true,
     private fun processesEmptyText(res: ProcessesResult?): String = when {
         res != null -> "No background shells — this session never ran a command with run_in_background"
         !service().processesAttempted -> "Reading this session’s background shells…"
-        else -> "The claude-observatory CLI on PATH did not answer `processes --json` — update it to list background shells"
+        else -> "The oak CLI on PATH did not answer `processes --json` — update it to list background shells"
     }
 
     /** Paint the Tasks tab (the session's numbered task list) and badge the tab with done/total. Each row
@@ -1603,7 +1684,7 @@ class ChangeMapPanel(private val project: Project) : SimpleToolWindowPanel(true,
         tasksList.emptyText.text = when {
             tasks.isNotEmpty() && activeOnly ->
                 "Every task is finished — Active only is hiding ${done.size} completed task(s); untoggle it to see them"
-            else -> "No tasks — this session plans with a task list only when Claude creates one"
+            else -> "No tasks — this session plans with a task list only when the agent creates one"
         }
         active.forEach { tasksModel.addElement(TaskRow(it, rollBy[it.taskId])) }
         if (!activeOnly && done.isNotEmpty()) {
@@ -1620,56 +1701,43 @@ class ChangeMapPanel(private val project: Project) : SimpleToolWindowPanel(true,
         lastSessions = res
         val rows = res?.sessions ?: emptyList()
         sessionsList.emptyText.text = when {
-            res != null -> "No sessions for this workspace yet — this fills in when Claude Code first edits a file here"
-            !service().sessionsAttempted -> "Reading this workspace’s sessions…"
-            else -> "The claude-observatory CLI on PATH did not answer `sessions --json` — update it to list sessions"
+            res != null -> "No sessions on this machine yet"
+            !service().sessionsAttempted -> "Reading sessions…"
+            else -> "The oak CLI on PATH did not answer `sessions --json` — update it to list sessions"
         }
         sessionsModel.clear()
         if (res != null) sessionsModel.addElement(AutoSessionRow)
-        // A DAY by default (0.9.0), same rule as the VS Code list. This had grown to every session ever
-        // recorded here — 34 rows back to 20 days — and the ones you switch between are from today.
-        // Older rows collapse behind one header; FINISHED ones (nothing left to review) are not listed at
-        // all, because they are what Clear completed removes rather than something to scroll past.
-        val pinned = com.cellobservatory.observatory.settings.ObservatorySettings.instance.state.session
-            ?.takeIf { it.isNotBlank() }
+        val pinned = com.cellobservatory.observatory.settings.ObservatorySettings.instance.state.session?.takeIf { it.isNotBlank() }
         val now = System.currentTimeMillis()
-        val day = 86_400_000L
-        // A REMOTE row is always "recent" regardless of its clock. A host that could not be reached is
-        // emitted with lastActiveMs = 0 and no pending count, so the day window dropped it and the
-        // settled tally then counted it as a finished LOCAL session — the one row whose whole purpose
-        // is to say "this machine is down" was both invisible and miscounted.
-        val recent = rows.filter {
-            it.current || it.id == pinned || it.origin == "remote" || now - it.lastActiveMs <= day
+        var shown = 0
+        for (group in overviewSessionGroups(rows, pinned, now, activeOnly)) {
+            sessionsModel.addElement(WorkspaceHeaderRow(group.workspace, group.count))
+            group.recent.forEach { sessionsModel.addElement(it); shown++ }
+            if (group.older.isNotEmpty()) {
+                sessionsModel.addElement(OlderSessionsToggle(group.older.size, oldSessionsOpen))
+                if (oldSessionsOpen) group.older.forEach { sessionsModel.addElement(it); shown++ }
+            }
+            if (group.hidden > 0) sessionsModel.addElement(FilterInfo("${group.hidden} hidden by Active only"))
         }
-        val older = rows.filter { it !in recent && it.pending > 0 }
-        val settled = rows.count { it !in recent && it.pending == 0 }
-        recent.forEach { sessionsModel.addElement(it) }
-        if (older.isNotEmpty()) {
-            sessionsModel.addElement(OlderSessionsToggle(older.size, oldSessionsOpen))
-            if (oldSessionsOpen) older.forEach { sessionsModel.addElement(it) }
-        }
-        // Say what is NOT on screen: a list that silently drops rows is indistinguishable from a store
-        // that never had them, and this one drops the finished ones on purpose.
-        if (settled > 0) sessionsModel.addElement(FilterInfo("$settled finished session(s) older than a day not shown — clear them from Clean Store"))
-        setTabBadge(MEMBER_SESSIONS, if (rows.isEmpty()) "Sessions" else "Sessions ${recent.size}/${rows.size}")
+        setTabBadge(MEMBER_SESSIONS, if (rows.isEmpty()) "Sessions" else "Sessions $shown/${rows.size}")
         // Mark which row the observatory is on now (the pinned one, else the live one) without firing the
         // selection listener — restoring a highlight must never re-pin anything.
         val pinnedId = com.cellobservatory.observatory.settings.ObservatorySettings.instance.state.session
             ?.takeIf { it.isNotBlank() }
             ?: rows.firstOrNull { it.current }?.id
         suppressSel = true
-        val idx = rows.indexOfFirst { it.id == pinnedId }
-        // The model is [Auto] + rows when the CLI answered, so a row index is one short of its model
-        // index. Selecting `idx` highlighted the row ABOVE the session under review — and since the
-        // Enter handler acts on the selected value, it re-pinned that neighbour.
-        sessionsList.selectedIndex = if (idx < 0) -1 else idx + (if (res != null) 1 else 0)
+        val idx = (0 until sessionsModel.size()).firstOrNull {
+            val row = sessionsModel.getElementAt(it)
+            row is SessionRow && row.id == pinnedId
+        } ?: -1
+        sessionsList.selectedIndex = idx
         suppressSel = false
-        // Pinned to a session this workspace has no row for (another repo's, or one since dropped): the
-        // panels are showing it, so say which, instead of leaving every row unhighlighted with no reason.
-        // Only once a listing has ANSWERED: before that, "not in this workspace" is a claim about a
-        // payload we do not have. (Same three-state discipline as the empty text above.)
+        // Pinned to a session the listing has no row for: the panels are showing it, so say which, instead
+        // of leaving every row unhighlighted with no reason. Only once a listing has ANSWERED: before that,
+        // "not listed" is a claim about a payload we do not have. (Same three-state discipline as the
+        // empty text above.)
         sessionsDesc.text = if (res != null && pinnedId != null && idx < 0) {
-            "<html>$SESSIONS_DESC <b>Reviewing ${pinnedId.take(8)} — recorded for another workspace.</b></html>"
+            "<html>$SESSIONS_DESC <b>Reviewing ${pinnedId.take(8)} — $UNLISTED_PIN.</b></html>"
         } else {
             "<html>$SESSIONS_DESC</html>"
         }
@@ -1679,14 +1747,7 @@ class ChangeMapPanel(private val project: Project) : SimpleToolWindowPanel(true,
      *  newest. Writing the setting is the whole action: every surface re-reads it on the refresh that
      *  follows, so the edits, the change map, the feed and the audits all move together. */
     private fun pinSession(row: SessionRow?) {
-        // Two kinds of row in this list are NOT sessions this IDE can open, and both were clickable.
-        // An unreachable host is emitted with an id of "!<name>" carrying the ssh error as its title —
-        // the CLI refuses that id outright, so every subsequent call would fail. A REACHABLE remote
-        // session is a real id whose store and transcript are on the other machine, so pinning it
-        // persists a choice that blanks every window and then explains the emptiness wrongly. The
-        // terminal dashboard already refuses both and says which; this is the parity half.
-        // The SHARED guard — see ReviewOps.refuseRemote. This used to be the only picker that had it.
-        if (ReviewOps.refuseRemote(project, row)) return
+        // Every listed row is a session on this machine (the parser keeps only local rows).
         // Routed through the shared handler so that during a demo this moves the in-memory override
         // instead of writing a persisted pin that would outlive the demo it points at.
         if (ObservatoryService.getInstance(project).currentSession() == row?.id) return
@@ -1784,8 +1845,9 @@ class ChangeMapPanel(private val project: Project) : SimpleToolWindowPanel(true,
     // --- the right detail: change-map for the selected nav item ---
 
     private fun renderDetail() {
-        // A background shell edits nothing, so it has no change map: its feed IS the detail. Filling the
-        // map half with the session's map under such a row would attribute work it never did.
+        // A background shell edits nothing, so it has no change map. Its feed used to BE the detail
+        // here; the feed lives in the Timeline's Feed tab now, so this half says where it went (the
+        // selection auto-revealed that tab — the label is confirmation, not a dead end).
         val feedOnly = selected is NavSel.Process
         detailHost.removeAll()
         currentDetail = null
@@ -1800,7 +1862,13 @@ class ChangeMapPanel(private val project: Project) : SimpleToolWindowPanel(true,
             val scope = "${service().selectedPromptId ?: ""}|$selected"
             if (scope != stripScope) { stripScope = scope; stripExpanded = false }
             if (td == null) {
-                if (!feedOnly) detailHost.add(emptyLabel("No edits in this session yet — this fills in as Claude edits files"), BorderLayout.CENTER)
+                detailHost.add(
+                    emptyLabel(
+                        if (feedOnly) "A background shell edits nothing, so it has no change map — its activity is in the Timeline window’s Feed tab, which just opened."
+                        else "No edits in this session yet — this fills in as agent edits files"
+                    ),
+                    BorderLayout.CENTER,
+                )
             } else {
                 val detail = AgentDetail(td)
                 currentDetail = detail
@@ -1811,12 +1879,6 @@ class ChangeMapPanel(private val project: Project) : SimpleToolWindowPanel(true,
             Logger.getInstance(ChangeMapPanel::class.java).warn("Overview detail failed to render", t)
             detailHost.add(emptyLabel("Overview detail failed to render: ${t.message ?: t.javaClass.simpleName} — see idea.log"), BorderLayout.CENTER)
         }
-        // The bottom half follows whatever the nav selected; with nothing to follow the splitter is left
-        // with one half, which then takes the whole area.
-        val ref = feedRef()
-        feedPane.update(feed, ref != null)
-        feedSplit.firstComponent = if (feedOnly) null else detailHost
-        feedSplit.secondComponent = if (ref == null) null else feedPane
         detailHost.revalidate()
         detailHost.repaint()
     }
@@ -1890,7 +1952,7 @@ class ChangeMapPanel(private val project: Project) : SimpleToolWindowPanel(true,
     }
 
     /** The session-name label leading the top row — VS Code's `ov-sess-label`: the human-readable
-     *  session title (the Sessions rows' title — Claude's ai-title, else the first prompt) on ONE
+     *  session title (the Sessions rows' title — a rename, else the claude.ai title, else the agent's ai-title, else the first prompt) on ONE
      *  line, never wrapped and NEVER clipped (user call 2026-07-28): the whole name shows, and a tight
      *  row is the toolbar's problem (its overflow), not the title's. The tooltip carries the raw
      *  session id. A label, not a control: switching sessions is a Sessions-tab click. */
@@ -1901,8 +1963,8 @@ class ChangeMapPanel(private val project: Project) : SimpleToolWindowPanel(true,
             override fun update(e: AnActionEvent) {
                 val s = map?.summary
                 val sess = s?.session.orEmpty()
-                // The SAME source VS Code's label reads: the Sessions rows carry Claude's title for
-                // every session (ai-title, else first prompt — sidecar-cached in core). The change-map
+                // The SAME source VS Code's label reads: the Sessions rows carry the agent's title for
+                // every session (a rename, else the claude.ai title, else ai-title, else first prompt — core). The change-map
                 // summary's title alone is blank for sessions whose transcript insights carry neither,
                 // which is how the demo session rendered as its raw id.
                 val rowTitle = lastSessions?.sessions?.firstOrNull { it.id == sess }?.title?.trim().orEmpty()
@@ -1955,7 +2017,7 @@ class ChangeMapPanel(private val project: Project) : SimpleToolWindowPanel(true,
      *  actually running there; the CLI reports its own in the dropdown's rows). */
     private fun pluginVersion(): String =
         com.intellij.ide.plugins.PluginManagerCore.getPlugin(
-            com.intellij.openapi.extensions.PluginId.getId("com.cell-observatory.claude-observatory")
+            com.intellij.openapi.extensions.PluginId.getId("com.cell-observatory.oak-observatory")
         )?.version ?: ""
 
     /** The version chip closing the top row (VS Code's `ov-version`, pinned right): the running
@@ -1978,7 +2040,7 @@ class ChangeMapPanel(private val project: Project) : SimpleToolWindowPanel(true,
                 )
                 e.presentation.description =
                     (if (v?.updateAvailable == true && chLatest != null) "Update available — v$chLatest. " else "") +
-                        "Claude Observatory version — update, or switch between the stable and pre-release channels"
+                        "OAK version — update, or switch between the stable and pre-release channels"
             }
             override fun getChildren(e: AnActionEvent?): Array<AnAction> {
                 val v = versionInfo
@@ -1987,7 +2049,7 @@ class ChangeMapPanel(private val project: Project) : SimpleToolWindowPanel(true,
                         // the CLI does its own check, so clicking is always safe (VS Code parity).
                         action("Update Now", AllIcons.Actions.Download, "Update the CLI + both editor plugins; reports up to date when nothing is newer") { runUpdateCli(null) },
                         com.intellij.openapi.actionSystem.Separator.getInstance(),
-                        action("Checking for releases…", AllIcons.Actions.Refresh, "Fetch release info again (needs the claude-observatory CLI + network)") { refreshVersionInfo(force = true) },
+                        action("Checking for releases…", AllIcons.Actions.Refresh, "Fetch release info again (needs the oak CLI + network)") { refreshVersionInfo(force = true) },
                     )
                 val rows = mutableListOf<AnAction>()
                 val chLatest = if (v.channel == "dev") v.devLatest ?: v.stableLatest else v.stableLatest
@@ -2021,7 +2083,7 @@ class ChangeMapPanel(private val project: Project) : SimpleToolWindowPanel(true,
             }
         }.apply {
             templatePresentation.description =
-                "Claude Observatory version — update, or switch between the stable and pre-release channels"
+                "OAK version — update, or switch between the stable and pre-release channels"
         }
 
     /** Run the CLI's `update` (optionally switching `--channel`) in the background and report. The
@@ -2029,7 +2091,7 @@ class ChangeMapPanel(private val project: Project) : SimpleToolWindowPanel(true,
      *  was actually installed (the CLI prints its exact up-to-date summary line otherwise), and
      *  "Restart IDE" performs the restart — parity with VS Code's Reload-Window offer. */
     private fun runUpdateCli(channel: String?) {
-        val what = when (channel) { null -> "Updating Claude Observatory"; "dev" -> "Switching to the Pre-release channel"; else -> "Switching to the Stable channel" }
+        val what = when (channel) { null -> "Updating OAK"; "dev" -> "Switching to the Pre-release channel"; else -> "Switching to the Stable channel" }
         ReviewOps.notify(project, "$what — this refreshes the CLI and both editor plugins…")
         ApplicationManager.getApplication().executeOnPooledThread {
             // ASK FIRST, as data. Whether this plugin is about to be rewritten decides whether a
@@ -2044,14 +2106,14 @@ class ChangeMapPanel(private val project: Project) : SimpleToolWindowPanel(true,
             refreshVersionInfo(force = true)
             ApplicationManager.getApplication().invokeLater {
                 when {
-                    !ok -> ReviewOps.notify(project, "$what failed: ${out.take(300).ifBlank { "is the claude-observatory CLI installed?" }}", NotificationType.ERROR)
+                    !ok -> ReviewOps.notify(project, "$what failed: ${out.take(300).ifBlank { "is the oak CLI installed?" }}", NotificationType.ERROR)
                     !pluginWillMove ->
                         ReviewOps.notify(project, "$what done — already on the newest build, no restart needed.")
                     else -> {
                         val restart = Messages.showYesNoDialog(
                             project,
                             "$what done — the plugin on disk was replaced.\n\nRestart the IDE now to load the new build?",
-                            "Claude Observatory",
+                            "OAK",
                             "Restart IDE",
                             "Later",
                             Messages.getQuestionIcon(),
@@ -2079,7 +2141,7 @@ class ChangeMapPanel(private val project: Project) : SimpleToolWindowPanel(true,
                 withSession { s ->
                     ReviewOps.openMarkdown(
                         project, "claude-observatory-review-summary",
-                        "Could not export the review summary (is the claude-observatory CLI installed?)",
+                        "Could not export the review summary (is the oak CLI installed?)",
                     ) { ObservatoryCli.summaryMarkdown(s, project.basePath) }
                 }
             })
@@ -2087,8 +2149,8 @@ class ChangeMapPanel(private val project: Project) : SimpleToolWindowPanel(true,
                 withSession { s ->
                     ReviewOps.openJson(
                         project, "claude-observatory-trace",
-                        "Could not export the session trace — is the claude-observatory CLI installed? " +
-                            "For very large sessions, run `claude-observatory export --out trace.json` in a terminal.",
+                        "Could not export the session trace — is the oak CLI installed? " +
+                            "For very large sessions, run `oak export --out trace.json` in a terminal.",
                     ) { ObservatoryCli.traceJson(s, project.basePath) }
                 }
             })
@@ -2225,12 +2287,12 @@ class ChangeMapPanel(private val project: Project) : SimpleToolWindowPanel(true,
         }
     }
 
-    /** Pair the related nav tabs into two panes of side-by-side columns, and back. Layout ONLY — nothing is
+    /** Show every nav tab side by side as columns of one group, and back. Layout ONLY — nothing is
      *  filtered and the change-map detail is untouched. It lives beside the tab strip it rearranges (see
      *  navHost); icon-only there, because a label in that slot would push into the tabs themselves. */
     private fun groupedNavToggle(): ToggleAction = object : ToggleAction(
         "Group Tabs",
-        "Group related tabs side by side (Sessions · Fleet / Workflows · Tasks · Processes)",
+        "Group all tabs side by side (Sessions · Workers · Workflows · Tasks · Processes)",
         AllIcons.Actions.SplitVertically,
     ), DumbAware {
         override fun getActionUpdateThread() = ActionUpdateThread.BGT // reads one flag
@@ -2388,10 +2450,19 @@ class ChangeMapPanel(private val project: Project) : SimpleToolWindowPanel(true,
                 append("  +${s.added}", MT_ADD)
                 append(" −${s.removed}", MT_REM)
             }
+            // The spawn's OWN model · effort · ↑in·↓out·↺cache · runtime — parity with the terminal's spawn
+            // rows; the same statusline-style token split, greyed like the rest.
+            val me = listOfNotNull(s.model?.takeIf { it.isNotBlank() }, s.effort?.takeIf { it.isNotBlank() }).joinToString(" · ")
+            val meta = buildList {
+                if (me.isNotEmpty()) add(me)
+                if (s.tokensIn > 0 || s.tokensOut > 0 || s.tokensCacheRead > 0) add("↑${fmtTok(s.tokensIn)} ↓${fmtTok(s.tokensOut)} ↺${fmtTok(s.tokensCacheRead)}")
+                if (s.durationMs > 0) add(fmtDur(s.durationMs))
+            }
+            if (meta.isNotEmpty()) append("  ${meta.joinToString(" · ")}", SimpleTextAttributes.GRAYED_ATTRIBUTES)
             toolTipText = buildString {
                 append(title)
                 if (s.description != null && s.agentType != null) append("\n${s.description}")
-                append("\nphase ${s.phase}${if (heuristic) " (~ inferred from inactivity)" else ""} · agent ${s.agentId}")
+                append("\nphase ${s.phase}${if (heuristic) " (~ inferred: no completion notice or structural marker yet)" else ""} · agent ${s.agentId}")
                 if (s.todos.isNotEmpty()) {
                     append("\n")
                     s.todos.take(8).forEach { append("\n• [${it.status}] ${it.content}") }
@@ -2512,107 +2583,102 @@ class ChangeMapPanel(private val project: Project) : SimpleToolWindowPanel(true,
         }
     }
 
-    /** Paints one Sessions-tab row: ● live / ○ past · Claude's own title for the session · when its
+    /** Paints one Sessions-tab row: ● live / ○ past · the agent's own title for the session · when its
      *  conversation was last active. No pending count: the listing is deliberately stat-only (that count
      *  is what used to make opening this list slow), and the row you pick shows its own counts at once. */
-    private class SessionRowRenderer(private val pinned: () -> String?) : com.intellij.ui.ColoredListCellRenderer<Any>() {
-        override fun customizeCellRenderer(
-            list: javax.swing.JList<out Any>, value: Any?, index: Int, selected: Boolean, hasFocus: Boolean,
-        ) {
-            if (value is OlderSessionsToggle) {
-                append(
-                    "${value.count} older with pending edits · ${if (value.open) "hide" else "show all"}",
-                    SimpleTextAttributes.GRAYED_ATTRIBUTES,
-                )
-                toolTipText = "Sessions older than a day that still have edits awaiting review. " +
-                    "Finished ones are not listed — use Clean Store → Clear completed sessions to remove them."
-                return
-            }
-            if (value is FilterInfo) {
-                icon = AllIcons.General.Filter
-                append(value.text, SimpleTextAttributes.GRAYED_ATTRIBUTES)
-                return
-            }
-            if (value === AutoSessionRow) {
-                val following = pinned() == null
-                append(
-                    if (following) "● " else "○ ",
-                    SimpleTextAttributes(SimpleTextAttributes.STYLE_PLAIN, if (following) MT_WORKING else JBColor.GRAY),
-                )
-                append("Auto — newest session in this workspace", SimpleTextAttributes.REGULAR_ATTRIBUTES)
-                if (following) append("  following", SimpleTextAttributes.GRAYED_SMALL_ATTRIBUTES)
-                toolTipText = "Follow whichever session is newest, instead of staying on one you picked."
-                return
-            }
-            val row = value as? SessionRow ?: return
-            append(
-                if (row.current) "● " else "○ ",
-                SimpleTextAttributes(SimpleTextAttributes.STYLE_PLAIN, if (row.current) MT_WORKING else JBColor.GRAY),
-            )
-            append(row.displayName, SimpleTextAttributes.REGULAR_ATTRIBUTES)
-            // WHICH MACHINE, then which workspace. The list spans both — this machine's sessions and
-            // every configured remote's — so a row naming neither silently claims to be this project's,
-            // on this computer. The machine is rendered for LOCAL rows too: a marker that appears only
-            // for remotes makes its absence the load-bearing signal, and absence is what nobody notices.
-            if (row.machine.isNotBlank()) {
-                // One palette, one meaning: purple is "off this machine" — the hue the egress chip
-                // already uses — so a session you cannot review from here is obvious before you click
-                // it. Local stays grey; it is the common case, and the common case should not shout.
-                val machineColour = when {
-                    row.id.startsWith("!") -> JBColor(java.awt.Color(0xE5534B), java.awt.Color(0xE5534B))
-                    row.origin == "remote" -> JBColor(java.awt.Color(0x9A6AC2), java.awt.Color(0x9A6AC2))
-                    else -> JBColor.GRAY
+    /** A session row that WRAPS when the Sessions pane is narrow: every badge flows
+     *  onto the next line instead of being clipped. Built as one label per fragment in a [WrapLayout],
+     *  so each stays whole; the clickable fragments carry [SESSIONS_FRAGMENT_TAG] for the 2-D hit-test
+     *  in [sessionRowFragmentTag] — a single-line x-only hit-test cannot survive a wrap. */
+    private class SessionRowRenderer(private val pinned: () -> String?) : javax.swing.ListCellRenderer<Any> {
+        private val panel = JPanel(WrapLayout(java.awt.FlowLayout.LEFT, JBUI.scale(3), JBUI.scale(1))).apply {
+            isOpaque = true
+            border = JBUI.Borders.empty(2, 4)
+        }
+
+        private fun frag(text: String, color: java.awt.Color?, tag: Any? = null, small: Boolean = false): JBLabel {
+            val l = JBLabel(text)
+            color?.let { l.foreground = it }
+            if (small) l.font = com.intellij.util.ui.JBUI.Fonts.smallFont()
+            tag?.let { l.putClientProperty(SESSIONS_FRAGMENT_TAG, it) }
+            return l
+        }
+
+        override fun getListCellRendererComponent(
+            list: javax.swing.JList<out Any>, value: Any?, index: Int, selected: Boolean, cellHasFocus: Boolean,
+        ): java.awt.Component {
+            panel.removeAll()
+            panel.background = if (selected) list.selectionBackground else list.background
+            val fg: java.awt.Color = if (selected) list.selectionForeground else list.foreground
+            val gray: java.awt.Color = if (selected) list.selectionForeground else JBColor.GRAY
+            panel.toolTipText = null
+            when (value) {
+                is WorkspaceHeaderRow -> {
+                    panel.add(frag("${value.workspace} · ${value.count} " + if (value.count == 1) "session" else "sessions", gray, small = true))
                 }
-                append("  ${row.machine}", SimpleTextAttributes(SimpleTextAttributes.STYLE_PLAIN, machineColour))
+                is OlderSessionsToggle -> {
+                    panel.add(frag("${value.count} older sessions · ${if (value.open) "hide" else "show all"}", gray, small = true))
+                    panel.toolTipText = "Sessions last active more than a week ago."
+                }
+                is FilterInfo -> {
+                    val l = frag(value.text, gray, small = true)
+                    l.icon = AllIcons.General.Filter
+                    panel.add(l)
+                }
+                AutoSessionRow -> {
+                    val following = pinned() == null
+                    panel.add(frag(if (following) "●" else "○", if (following) MT_WORKING else JBColor.GRAY))
+                    panel.add(frag("Auto — newest session in this workspace", fg))
+                    if (following) panel.add(frag("following", gray, small = true))
+                    panel.toolTipText = "Follow whichever session is newest, instead of staying on one you picked."
+                }
+                is SessionRow -> buildSessionRow(value, fg, gray)
+                else -> {}
             }
-            if (row.workspace.isNotBlank()) {
-                append("  ${row.workspace}", SimpleTextAttributes.GRAYED_SMALL_ATTRIBUTES)
+            // WrapLayout wraps to the container's width, so hand it the list's width up front — the
+            // preferred HEIGHT it then reports is what the (variable-height) list uses for this row.
+            panel.size = java.awt.Dimension(list.width.coerceAtLeast(JBUI.scale(48)), 1)
+            return panel
+        }
+
+        private fun buildSessionRow(row: SessionRow, fg: java.awt.Color, gray: java.awt.Color) {
+            // A raised hand wears ⚠ and says what it waits on, on what, for how long (2026-09-15).
+            val hand = row.attention?.takeIf { it.kind != "idle-done" }
+            panel.add(
+                if (hand != null) frag("⚠", MT_ATTENTION)
+                else frag(if (row.current) "●" else "○", if (row.current) MT_WORKING else JBColor.GRAY),
+            )
+            panel.add(frag(row.displayName, fg))
+            if (hand != null) {
+                val what = hand.kind + (hand.message.takeIf { it.isNotBlank() }?.let { " · $it" } ?: "") +
+                    (if (hand.ts > 0) " · ${fmtDur(System.currentTimeMillis() - hand.ts)}" else "")
+                panel.add(frag(what, MT_ATTENTION, small = true))
             }
-            // …and what that machine means for reviewing it. A bridge pointer reported as "no edits"
-            // sends the reader to open a conversation that is not there; a remote is browsable only.
-            when (row.origin) {
-                "bridged" -> append("  not on this machine", SimpleTextAttributes(SimpleTextAttributes.STYLE_PLAIN, JBColor.GRAY))
-                "remote" -> append("  read-only", SimpleTextAttributes(SimpleTextAttributes.STYLE_PLAIN, JBColor.GRAY))
-                else -> Unit
+            if (row.agent.isNotBlank() && row.agent != "claude") panel.add(frag("[${row.agent}]", MT_ATTENTION, small = true))
+            panel.add(frag(row.model.ifBlank { "model unknown" }, gray, small = true))
+            if (row.added > 0 || row.removed > 0) {
+                panel.add(frag("+${row.added}", MT_ADD.fgColor))
+                panel.add(frag("−${row.removed}", MT_REM.fgColor))
             }
-            // The same badge set a FLEET row carries (0.9.0), in the same order and the same colours:
-            // what it changed, what it cost, what it ran on — then how long ago.
-            if (row.origin != "bridged" && (row.added > 0 || row.removed > 0)) {
-                append("  +${row.added}", MT_ADD)
-                append(" −${row.removed}", MT_REM)
-            }
-            // No edit/file counts: the ± lines beside them already say how much this session changed, and
-            // two more bare numbers in the same row read as noise. Only the REVIEW state earns a word.
-            if (row.origin == "bridged") {
-                // Nothing else to say: there is no local log for a conversation that lives elsewhere.
-            } else if (row.edits > 0) {
-                if (row.pending > 0) {
-                    append("  ${row.pending} pending", SimpleTextAttributes(SimpleTextAttributes.STYLE_PLAIN, CM_PENDING))
-                } else append("  reviewed", SimpleTextAttributes(SimpleTextAttributes.STYLE_PLAIN, CM_KEPT))
-            } else if (row.tokens == 0L) {
-                // Only claim "no edits" when there is nothing else to report either; a conversation that
-                // only asked and read still did work, and its tokens below say so.
-                append("  no edits", SimpleTextAttributes.GRAYED_SMALL_ATTRIBUTES)
-            }
-            if (row.tokens > 0 || row.durationMs > 0) {
-                append("  ${fmtTok(row.tokens)} tok · ${fmtDur(row.durationMs)}", SimpleTextAttributes.GRAYED_SMALL_ATTRIBUTES)
-            }
-            // Model / effort are structural facts the harness records. An unknown one is left OUT rather
-            // than defaulted: the default effort differs by build and model, so a placeholder is fiction.
-            if (row.model.isNotBlank() || row.effort.isNotBlank()) {
-                val chip = listOf(row.model, if (row.effort.isNotBlank()) "${row.effort} effort" else "")
-                    .filter { it.isNotBlank() }.joinToString(" · ")
-                append("  [$chip]", SimpleTextAttributes.GRAYED_SMALL_ATTRIBUTES)
-            }
-            append("  ${relTime(row.lastActiveMs)}" + if (row.current) "  · active" else "", SimpleTextAttributes.GRAYED_SMALL_ATTRIBUTES)
-            // A LABELLED affordance, drawn last. Tagged, because the click handler hit-tests the
-            // FRAGMENT, not a pixel column: the old `x > width - 52` zone was unscaled (half the label at
-            // 2x UI scale) and anchored to the list's right edge while the text is left-aligned — on a
-            // wide panel the visible word switched sessions and an invisible strip of empty space
-            // resolved them.
-            if (row.pending > 0) append("   resolve", SimpleTextAttributes.LINK_PLAIN_ATTRIBUTES, SESSIONS_RESOLVE_TAG)
-            toolTipText = "${row.displayName}\nsession ${row.id}" +
+            panel.add(frag("${row.edits} edit${if (row.edits == 1) "" else "s"}", gray, small = true))
+            if (row.pending > 0) panel.add(frag("${row.pending} pending", CM_PENDING))
+            else if (row.edits > 0) panel.add(frag("reviewed", CM_KEPT))
+            panel.add(frag("${fmtTok(row.tokens)} tok · ${fmtDur(row.durationMs)}", gray, small = true))
+            if (row.effort.isNotBlank()) panel.add(frag("${row.effort} effort", gray, small = true))
+            panel.add(frag(relTime(row.lastActiveMs) + if (row.current) " · active" else "", gray, small = true))
+            if (row.storeBytes > 0) panel.add(frag(compactBytes(row.storeBytes), gray, tag = SESSIONS_STORE_TAG, small = true))
+            // Drive: reopen this conversation in the Feed tab. Every listed row is local (the parser
+            // keeps only local rows), so it can be driven from here.
+            panel.add(frag("conversation", JBColor.namedColor("Link.activeForeground", MT_WORKING), tag = SESSIONS_CONVERSATION_TAG, small = true))
+            // Delete: remove this conversation from every picker and purge its captured edits. Red,
+            // beside continue, because it is destructive — its confirm says the transcript survives,
+            // names the edits still pending review, and says `--undelete` lists the session again
+            // without its edits. Hiding and the store purge act on this machine.
+            panel.add(frag("delete", MT_ERROR, tag = SESSIONS_DELETE_TAG, small = true))
+            if (row.pending > 0) panel.add(frag("resolve", JBColor.namedColor("Link.activeForeground", MT_WORKING), tag = SESSIONS_RESOLVE_TAG, small = true))
+            panel.toolTipText = "${row.displayName}\nsession ${row.id}" +
                 (if (row.current) "\nthe live session for this workspace" else "") +
+                (if (row.storeBytes > 0) "\nstore on disk: ${compactBytes(row.storeBytes)} — click the size to open its folder" else "") +
                 "\nClick to review this session — it becomes the subject of every observatory window."
         }
     }
@@ -2621,13 +2687,47 @@ class ChangeMapPanel(private val project: Project) : SimpleToolWindowPanel(true,
      *  the row with its REAL selection state (selection can change fonts, which moves fragment bounds),
      *  then asked which fragment owns the x — the same layout the paint used, so zone and label cannot
      *  disagree, at any UI scale. */
-    private fun resolveFragmentHit(index: Int, row: SessionRow, e: MouseEvent): Boolean {
-        val bounds = sessionsList.getCellBounds(index, index) ?: return false
+    private fun resolveFragmentHit(index: Int, row: SessionRow, e: MouseEvent): Boolean =
+        sessionRowFragmentTag(index, row, e) === SESSIONS_RESOLVE_TAG
+
+    private fun storeFragmentHit(index: Int, row: SessionRow, e: MouseEvent): Boolean =
+        sessionRowFragmentTag(index, row, e) === SESSIONS_STORE_TAG
+
+    private fun conversationFragmentHit(index: Int, row: SessionRow, e: MouseEvent): Boolean =
+        sessionRowFragmentTag(index, row, e) === SESSIONS_CONVERSATION_TAG
+
+    private fun deleteFragmentHit(index: Int, row: SessionRow, e: MouseEvent): Boolean =
+        sessionRowFragmentTag(index, row, e) === SESSIONS_DELETE_TAG
+
+    /** Open the selected session's conversation. */
+    private fun openConversationRow(row: SessionRow) {
+        pinSession(row)
+        service().selectedFeed = null
+        com.intellij.openapi.wm.ToolWindowManager.getInstance(project).getToolWindow("Observatory Timeline")?.show(null)
+        TimelinePanel.of(project)?.selectMember(com.cellobservatory.observatory.model.NavGrouping.FEED)
+    }
+
+    /** Which tagged fragment of a sessions row sits under the pointer — the ONE hit-test both the
+     *  resolve link and the store-size click share, so a fragment can never be drawn in one place
+     *  and pressed in another. */
+    private fun sessionRowFragmentTag(index: Int, row: SessionRow, e: MouseEvent): Any? {
+        val bounds = sessionsList.getCellBounds(index, index) ?: return null
+        // Configure the renderer for the row at its REAL selection state and lay it out at the cell's
+        // size — the SAME wrap the paint used — then find which fragment label owns the (x, y). 2-D,
+        // because the row wraps: a fragment that was on line one for a wide pane is on line three now.
         val comp = sessionsList.cellRenderer.getListCellRendererComponent(
             sessionsList, row, index, sessionsList.isSelectedIndex(index), false
-        ) as? com.intellij.ui.SimpleColoredComponent ?: return false
-        comp.setBounds(0, 0, bounds.width, bounds.height) // fragment layout depends on the component size
-        return comp.getFragmentTagAt(e.point.x - bounds.x) === SESSIONS_RESOLVE_TAG
+        ) as? java.awt.Container ?: return null
+        comp.setBounds(0, 0, bounds.width, bounds.height)
+        comp.doLayout()
+        // By the fragments' OWN laid-out bounds, not findComponentAt: that answers null for anything under
+        // an invisible parent, and the list UI parks its renderer inside an invisible CellRendererPane on
+        // every layout pass — each refresh re-fills this list — until the next paint takes it out. A click
+        // in between hit nothing, and the row switched sessions instead of opening its store folder.
+        val x = e.point.x - bounds.x
+        val y = e.point.y - bounds.y
+        return comp.components.firstOrNull { it.bounds.contains(x, y) }
+            ?.let { (it as? javax.swing.JComponent)?.getClientProperty(SESSIONS_FRAGMENT_TAG) }
     }
 
     /** Wraps a tree cell renderer so rows that carry activity bins — fleet agents, workflow runs + their
@@ -2686,8 +2786,8 @@ class ChangeMapPanel(private val project: Project) : SimpleToolWindowPanel(true,
 
         // Section captions (VS Code .cm-caption) + the bottom summary bar. The caption tooltips describe
         // each section; the summary names the current scope's pending/accepted/file/folder totals.
-        private val capFolders = caption("Folders", "Folders — the directories Claude changed. Color = review status (amber pending · green kept · red reverted); click a tile to filter the files below and open that folder in the nav bar.")
-        private val capFiles = caption("Files", "Files — every changed file, ranked by churn. Dot = review status, bar = relative churn, +N = lines, ⧗/✓ = pending/reviewed; click a row to open the edit.")
+        private val capFolders = caption("Folders", "Folders — the directories the agent changed. Color = review status (amber pending · green kept · red reverted); click a tile to filter the files below and open that folder in the nav bar.")
+        private val capFiles = caption("Files", "Files — every changed file, ranked by churn. Dot = review status, +N/−N = lines, ⧗/✓ = pending/reviewed; click a row to open the edit, ⧉ opens the file's changes stacked.")
         private val summaryLabel = JBLabel().apply { font = JBUI.Fonts.miniFont(); border = JBUI.Borders.empty(2, 4, 2, 4) }
         private var lastShown: List<ChangeMapFile> = emptyList()
 
@@ -2761,7 +2861,15 @@ class ChangeMapPanel(private val project: Project) : SimpleToolWindowPanel(true,
                         val f = list.model.getElementAt(i)
                         val act = ledgerActionAt(bounds.width, e.point.x - bounds.x)
                         if (act != null) {
-                            if (f.pending <= 0 || data.session.isBlank()) return
+                            if (data.session.isBlank()) return
+                            // ⧉ works on DECIDED files too — the stacked blocks carry verdicts.
+                            if (act == "stack") {
+                                if (f.maxId >= 0) StoreReader.findRecord(data.session, f.maxId)?.let {
+                                    Diffs.showFileStacked(project, data.session, it.file)
+                                }
+                                return
+                            }
+                            if (f.pending <= 0) return
                             if (act == "keep") ReviewOps.keepUnder(project, data.session, f.rel, f.file, f.pending)
                             else ReviewOps.undoUnder(project, data.session, f.rel, f.file, f.pending)
                             return
@@ -2782,13 +2890,20 @@ class ChangeMapPanel(private val project: Project) : SimpleToolWindowPanel(true,
             capFolders.isVisible = stripScroll.isVisible
             strip.update(data.modules, modFilter)
 
-            // The Search-edits filter narrows this ledger too (parity with the sidebar trees + VS Code),
-            // and so does Active only — a file with nothing pending is not work still awaiting review.
-            val q = ObservatoryService.getInstance(project).filterQuery
-            val shown = data.files.filter {
+            // The filter (Search query + regex/extension/type) narrows this ledger too (parity with the
+            // sidebar tree + VS Code), and so does Active only — a file with nothing pending is not work
+            // still awaiting review. Then the sort control orders it: by time (default) or by name.
+            val svc = ObservatoryService.getInstance(project)
+            val kept = data.files.filter {
                 (modFilter == null || it.moduleLabel == modFilter) &&
                     (!activeOnly || it.pending > 0) &&
-                    (q.isBlank() || it.rel.contains(q, ignoreCase = true))
+                    svc.matchesFile(it.rel, it.ext, it.category)
+            }
+            val shown = when (svc.sortKey()) {
+                "name" -> kept.sortedBy { it.rel }
+                "name-desc" -> kept.sortedByDescending { it.rel }
+                "time-asc" -> kept.sortedWith(compareBy<ChangeMapFile> { it.maxTs }.thenBy { it.rel })
+                else -> kept.sortedWith(compareByDescending<ChangeMapFile> { it.maxTs }.thenBy { it.rel }) // time
             }
             lastShown = shown
             capFiles.isVisible = shown.isNotEmpty()
@@ -2799,8 +2914,6 @@ class ChangeMapPanel(private val project: Project) : SimpleToolWindowPanel(true,
                 "No edits attributed to this agent yet"
             }
             listModel.clear()
-            val max = shown.maxOfOrNull { maxOf(1, it.churn) } ?: 1
-            ledgerRenderer.configure(max.coerceAtLeast(1))
             shown.forEach { listModel.addElement(it) }
 
             // Say WHY the ledger is narrowed — a silently filtered-empty list reads as a bug. Active only
@@ -2809,7 +2922,8 @@ class ChangeMapPanel(private val project: Project) : SimpleToolWindowPanel(true,
             val notes = mutableListOf<String>()
             if (activeOnly) notes.add("Active only · ${shown.size} of ${data.files.size} file(s) still pending — untoggle to see them all")
             modFilter?.let { mf -> data.modules.find { it.module == mf }?.let { notes.add("module ${it.label} — click again to clear") } }
-            if (q.isNotBlank()) notes.add("search “$q” · ${shown.size} file(s) — Search again (empty) to clear")
+            if (svc.filterQuery.isNotBlank()) notes.add("search “${svc.filterQuery}” · ${shown.size} file(s) — Search again (empty) to clear")
+            if (svc.filterExts.isNotEmpty() || svc.filterCats.isNotEmpty()) notes.add("filtered · ${shown.size} file(s) — Filter ▾ to change, Reset scope to clear")
             readout.text = notes.joinToString("  ·  ")
 
             refreshSummary()
@@ -2848,7 +2962,7 @@ class ChangeMapPanel(private val project: Project) : SimpleToolWindowPanel(true,
         private fun paintSummary(name: String?, pending: Int, kept: Int, undone: Int, nfiles: Int, nfolders: Int) {
             if (name == null && nfiles == 0) { summaryLabel.text = ""; return }
             val parts = mutableListOf<String>()
-            name?.let { parts.add("<b style='color:#4C8BF5'>${escHtml(clipText(it, 56))}</b>") }
+            name?.let { parts.add("<b style='color:#4C8BF5'>${escHtml(clip(it, 56))}</b>") }
             parts.add("<b style='color:#D9A441'>$pending</b> pending")
             parts.add("<b style='color:#3FB950'>$kept</b> accepted")
             if (undone > 0) parts.add("<b style='color:#8C8C8C'>$undone</b> reverted")
@@ -3024,18 +3138,13 @@ class ChangeMapPanel(private val project: Project) : SimpleToolWindowPanel(true,
             }
         }
 
-        /** One ledger row: status dot · file · module · bar · +added −removed · pending/accepted · ✓ ↩ */
+        /** One ledger row: status dot · file · module · +added −removed · pending/accepted · ⧉ ✓ ✗ */
         private inner class LedgerRenderer : JComponent(), ListCellRenderer<ChangeMapFile> {
             private var value: ChangeMapFile? = null
             private var selected = false
-            private var max = 1
 
             init {
                 preferredSize = Dimension(JBUI.scale(200), JBUI.scale(18))
-            }
-
-            fun configure(max: Int) {
-                this.max = max
             }
 
             override fun getListCellRendererComponent(
@@ -3045,11 +3154,11 @@ class ChangeMapPanel(private val project: Project) : SimpleToolWindowPanel(true,
                 selected = isSelected
                 toolTipText = buildString {
                     append(v.rel)
-                    append("\n+${v.added} −${v.removed} · ${v.cnt} unit(s) · ${v.pending}⧗ pending · ${v.kept}✓ accepted · ${v.undone}↩ reverted")
+                    append("\n+${v.added} −${v.removed} · ${v.cnt} unit(s) · ${v.pending}⧗ pending · ${v.kept}✓ accepted · ${v.undone}✗ reverted")
                     if (v.classes.isNotEmpty()) append("\n" + v.classes.take(4).joinToString(", "))
                     v.reason?.let { append("\n“$it”") }
                     v.risk?.let { append("\n⚠ $it") }
-                    append("\nDouble-click → open the diff · ✓ keep this file · ↩ undo this file")
+                    append("\nDouble-click → open the diff · ✓ keep this file · ✗ undo this file")
                 }
                 return this
             }
@@ -3072,29 +3181,31 @@ class ChangeMapPanel(private val project: Project) : SimpleToolWindowPanel(true,
                 g2.fillRoundRect(x, mid - JBUI.scale(3), JBUI.scale(6), JBUI.scale(6), 2, 2)
                 x += JBUI.scale(11)
 
+                // "N min ago" to the LEFT of the file — the most-recent edit time, grey, mini.
+                g2.font = JBUI.Fonts.miniFont()
+                g2.color = grey
+                val ageW = JBUI.scale(52)
+                g2.drawString(clip(g2, if (v.maxTs > 0) relTime(v.maxTs) else "—", ageW), x, mid + JBUI.scale(3))
+                x += ageW + JBUI.scale(6)
+
+                // Right-hand columns are laid out by ONE function, shared with the mouse — a cell
+                // renderer paints into a component that is never added to the hierarchy, so a click is
+                // resolved by arithmetic and nothing catches it when the two drift apart. These
+                // buttons revert files, so drift here means reverting a row nobody pointed at.
+                val cols = ledgerColumns(width)
+
+                // The name takes the width the churn bar used to hold (the
+                // bar's track read as a block of empty space).
                 g2.font = JBUI.Fonts.smallFont() // the file name reads at small; the metric columns stay mini
                 g2.color = fg
-                val nameW = JBUI.scale(120)
+                val modW = JBUI.scale(60)
+                val nameW = (cols.nameEnd - x - modW - JBUI.scale(10)).coerceAtLeast(JBUI.scale(120))
                 g2.drawString(clip(g2, v.file + (if (v.agent) " ●" else "") + (if (v.risk != null) " ⌐" else ""), nameW), x, mid + JBUI.scale(3))
                 x += nameW + JBUI.scale(4)
 
                 g2.font = JBUI.Fonts.miniFont()
                 g2.color = grey
-                val modW = JBUI.scale(60)
                 g2.drawString(clip(g2, v.moduleLabel, modW), x, mid + JBUI.scale(3))
-                x += modW + JBUI.scale(6)
-
-                // Right-hand columns are laid out by ONE function, shared with the mouse — a cell
-                // renderer paints into a component that is never added to the hierarchy, so a click is
-                // resolved by arithmetic and nothing catches it when the two drift apart. These two
-                // buttons revert files, so drift here means reverting a row nobody pointed at.
-                val cols = ledgerColumns(width)
-                val barW = (cols.barEnd - x).coerceAtLeast(JBUI.scale(16))
-                g2.color = JBColor.border()
-                g2.fillRoundRect(x, mid - JBUI.scale(2), barW, JBUI.scale(4), 3, 3)
-                val fill = (barW.toDouble() * maxOf(1, v.churn) / max).toInt().coerceAtLeast(2)
-                g2.color = col
-                g2.fillRoundRect(x, mid - JBUI.scale(2), fill, JBUI.scale(4), 3, 3)
 
                 // Added and removed, APART. Same change the terminal's map made: +900/−4 and +4/−900 are
                 // the same churn and are not remotely the same change to review.
@@ -3115,13 +3226,18 @@ class ChangeMapPanel(private val project: Project) : SimpleToolWindowPanel(true,
                 val kept = "${v.kept}✓"
                 g2.drawString(kept, cols.keptEnd - g2.fontMetrics.stringWidth(kept), baseline)
 
+                // The stacked opener: the file's changes as the STACKED layout —
+                // always live: the blocks carry verdicts, so a fully decided file still opens.
+                g2.color = if (selected) fg else MT_WORKING
+                g2.drawString("⧉", cols.stackX, baseline)
+
                 // The two actions. Greyed — not hidden — when there is nothing pending, so the row keeps
                 // its shape as counts change and the tooltip carries the reason.
                 val live = v.pending > 0
                 g2.color = if (!live) JBColor.border() else if (selected) fg else CM_KEPT
                 g2.drawString("✓", cols.keepX, baseline)
                 g2.color = if (!live) JBColor.border() else if (selected) fg else CM_REVERTED
-                g2.drawString("↩", cols.undoX, baseline)
+                g2.drawString("✗", cols.undoX, baseline)
             }
 
             private fun clip(g2: Graphics2D, s: String, w: Int): String {
@@ -3134,128 +3250,7 @@ class ChangeMapPanel(private val project: Project) : SimpleToolWindowPanel(true,
     }
 }
 
-/**
- * The Overview's bottom pane: what the selected agent / subagent / workflow / task / background shell is
- * DOING. Rows are core's, oldest first, and read downward like a terminal.
- *
- * `mode` decides the framing and comes from core, so both editors say the same thing about the same
- * source:
- *   · live  — it is still writing. The pane follows it on the panel's existing refresh tick and states
- *             how old the newest entry is ("updated 3s ago"), which is a fact; the word "live" on its own
- *             would be a latency claim a file tail cannot make.
- *   · audit — it has finished. What is on screen is a RECORD, labelled as one, and no longer polled.
- */
-private class FeedPane : JPanel(BorderLayout()) {
-    private val headline = JBLabel().apply { font = JBUI.Fonts.smallFont() }
-    private val subline = JBLabel().apply {
-        font = JBUI.Fonts.miniFont()
-        foreground = UIUtil.getContextHelpForeground()
-    }
-    private val model = DefaultListModel<FeedEntry>()
-    private val list = JBList(model).apply { cellRenderer = FeedRenderer() }
-    /** Row count at the last paint — the tail is followed only when it actually GREW, so a log the user
-     *  scrolled back through is never yanked to the bottom by an unchanged refresh. */
-    private var lastCount = -1
-    /** The feed currently on screen. The panel repaints on every refresh tick, but a fetch only lands
-     *  every few seconds: re-filling the list with rows it already holds would throw away wherever the
-     *  user had scrolled, so an unchanged feed only refreshes the header's age. */
-    private var shown: Feed? = null
-
-    init {
-        add(
-            JPanel().apply {
-                layout = BoxLayout(this, BoxLayout.Y_AXIS)
-                border = JBUI.Borders.empty(3, 6, 3, 6)
-                headline.alignmentX = Component.LEFT_ALIGNMENT
-                subline.alignmentX = Component.LEFT_ALIGNMENT
-                add(headline)
-                add(subline)
-            },
-            BorderLayout.NORTH,
-        )
-        add(JBScrollPane(list), BorderLayout.CENTER)
-    }
-
-    /** [active] is false when nothing is selected to follow (the pane is detached then — this just drops
-     *  the stale rows so a later selection can't flash the previous one's activity). */
-    fun update(feed: Feed?, active: Boolean) {
-        if (!active) {
-            model.clear()
-            lastCount = -1
-            shown = null
-            return
-        }
-        if (feed == null) {
-            headline.foreground = UIUtil.getContextHelpForeground()
-            headline.text = "Reading this item's activity…"
-            headline.toolTipText = null
-            subline.isVisible = false
-            model.clear()
-            lastCount = -1
-            shown = null
-            return
-        }
-        val live = feed.live
-        val age = if (feed.lastTs > 0) fmtAgo(System.currentTimeMillis() - feed.lastTs) else "no activity recorded"
-        headline.foreground = if (live) MT_DONE else UIUtil.getContextHelpForeground()
-        headline.text = (if (live) "● live · " else "▣ audit log · ") + clip(feed.title, 56) +
-            (if (live) "  ·  updated $age" else "  ·  last activity $age")
-        headline.toolTipText = if (live) {
-            "Still being written — this pane follows it on the panel's refresh tick. The age is of the newest entry; nothing here claims realtime."
-        } else {
-            "Finished — this is the recorded log of what it did, not a stream, so it is no longer polled."
-        }
-        // A cap that reads as completeness is a lie about what happened; say what was dropped, and say
-        // why an empty feed is empty (core's own note) rather than showing a blank pane.
-        val notes = mutableListOf<String>()
-        if (feed.truncated > 0) notes.add("${feed.truncated} earlier entr${if (feed.truncated == 1) "y" else "ies"} not shown")
-        feed.note?.takeIf { it.isNotBlank() }?.let { notes.add(it) }
-        subline.text = notes.joinToString("  ·  ")
-        subline.isVisible = notes.isNotEmpty()
-        list.emptyText.text = feed.note?.takeIf { it.isNotBlank() } ?: "Nothing recorded yet"
-        if (feed === shown) return // same rows as last paint — leave the list (and the scroll) alone
-        shown = feed
-        model.clear()
-        feed.entries.forEach { model.addElement(it) }
-        // Newest is at the BOTTOM, like a terminal — follow the tail when it grows.
-        if (model.size() > 0 && model.size() != lastCount) list.ensureIndexIsVisible(model.size() - 1)
-        lastCount = model.size()
-    }
-}
-
-/** One feed row. An 'output' row is a raw shell line — it carries NO timestamp of its own, so it renders
- *  monospace and without one, rather than being stamped with a time that was never recorded. 'action' /
- *  'reasoning' rows have a real ts; a call that reported an error is marked. */
-private class FeedRenderer : com.intellij.ui.ColoredListCellRenderer<FeedEntry>() {
-    override fun customizeCellRenderer(
-        list: JList<out FeedEntry>, value: FeedEntry?, index: Int, selected: Boolean, hasFocus: Boolean,
-    ) {
-        val e = value ?: return
-        if (e.kind == "output") {
-            font = FEED_MONO
-            append(e.label, SimpleTextAttributes.REGULAR_ATTRIBUTES)
-            toolTipText = e.label
-            return
-        }
-        font = JBUI.Fonts.label()
-        if (e.ts > 0) append(clockOf(e.ts) + "  ", SimpleTextAttributes.GRAYED_SMALL_ATTRIBUTES)
-        if (e.ok == false) append("✖ ", SimpleTextAttributes(SimpleTextAttributes.STYLE_BOLD, MT_ERROR))
-        append(
-            e.label,
-            if (e.kind == "reasoning") SimpleTextAttributes(SimpleTextAttributes.STYLE_ITALIC, MT_AGENT)
-            else SimpleTextAttributes.REGULAR_ATTRIBUTES,
-        )
-        e.detail?.takeIf { it.isNotBlank() }?.let {
-            append("  " + clip(it.replace(Regex("\\s+"), " "), 96), SimpleTextAttributes.GRAYED_ATTRIBUTES)
-        }
-        toolTipText = buildString {
-            append(e.label)
-            e.detail?.let { append("\n$it") }
-            if (e.ok == false) append("\nthis call reported an error")
-        }
-    }
-}
-
+// (FeedPane + FeedRenderer moved to ui/FeedPanel.kt in 0.10.0 — the feed renders in the Timeline now.)
 /** Paints one Processes-tab row: run state (green running · dim exit 0 · RED non-zero exit) · what the
  *  shell is for · runtime · output volume.
  *
@@ -3308,19 +3303,6 @@ private class ProcessRowRenderer : com.intellij.ui.ColoredListCellRenderer<Backg
         }
     }
 }
-
-/** The feed's raw-output rows are shell output: monospace, so columns and indentation survive. */
-private val FEED_MONO: java.awt.Font = JBUI.Fonts.create(java.awt.Font.MONOSPACED, JBUI.Fonts.label().size)
-
-/** Wall-clock stamp for a feed row, in the reader's own zone (the transcript's ms epoch is UTC). */
-private val FEED_CLOCK: java.time.format.DateTimeFormatter =
-    java.time.format.DateTimeFormatter.ofPattern("HH:mm:ss").withZone(java.time.ZoneId.systemDefault())
-
-private fun clockOf(ts: Long): String = FEED_CLOCK.format(java.time.Instant.ofEpochMilli(ts))
-
-/** ms since an event → "3s ago" / "4m ago" — a feed states the AGE of its newest entry instead of
- *  claiming a freshness it cannot verify. */
-private fun fmtAgo(ms: Long): String = if (ms < 1000) "just now" else "${fmtDur(ms)} ago"
 
 /** Bytes a background shell has written so far. */
 private fun fmtBytes(n: Long): String = when {
@@ -3383,14 +3365,7 @@ internal fun fmtDur(ms: Long): String {
 
 private fun baseName(path: String): String = path.trimEnd('/').substringAfterLast('/').ifBlank { path }
 
-private fun shortFile(path: String): String {
-    val parts = path.trimEnd('/').split('/')
-    return if (parts.size <= 2) path else ".../" + parts.takeLast(2).joinToString("/")
-}
-
 private fun clip(s: String, n: Int): String = if (s.length <= n) s else s.take(n - 1) + "…"
-
-private fun clipText(s: String, n: Int): String = if (s.length <= n) s else s.take(n - 1) + "…"
 
 /** Minimal HTML escape for text interpolated into a JBLabel's <html> body (the bottom summary name). */
 internal fun escHtml(s: String): String =

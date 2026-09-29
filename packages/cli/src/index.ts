@@ -1,33 +1,51 @@
 /**
- * claude-observatory — standalone, git-free, per-edit Keep/Undo for Claude Code.
+ * oak — standalone, git-free, per-edit Keep/Undo for Claude Code.
  *
  * Commands:
- *   init                 install the PreToolUse/PostToolUse capture hooks into ~/.claude/settings.json
+ *   init                 install the capture + attention hooks into ~/.claude/settings.json
  *   uninstall            remove those hooks again
  *   capture              internal hook entrypoint (invoked by Claude Code; never call by hand)
  *   list                 list edits in the active session
  *   diff <id>            colored before/after for one edit
- *   keep <id>            mark an edit kept (no disk change)
- *   undo <id> [--force]  surgically undo one edit; --force = per-file restore fallback
+ *   keep <id>            keep the whole change edit <id> belongs to (no disk change)
+ *   undo <id> [--force]  surgically undo the whole change edit <id> belongs to; --force = per-file restore
+ *   inbox                every session waiting on you, most urgent first (--next = the one to jump to)
+ *   notify               desktop notifications for raised hands (--message | --session … | --watch)
+ *   search <words…>      every conversation on this machine, ranked (asks + answers)
  *
  * Machine-readable surface (drives the JetBrains plugin): blob / locate / observe / usage, plus
  * --json on list / status / sessions / keep / undo / redo, and analyze / recap / suggest for the
  * opt-in `claude -p` layer. See `usage()` below.
  *
- * The `capture` path lazy-loads only the zero-dep capture module (no `diff`) so the hook stays fast.
+ * `oak capture` never reaches this file: the dist/index.js launcher (launch.ts) sends it to the lean
+ * capture bundle, so the hooks do not compile the whole CLI.
  */
-import type { EditRecord, InstallResult, StatMetrics, InstalledSurface, UpdateAction, UpdatePlan } from '@claude-observatory/core';
+import type { EditRecord, InstallResult, StatMetrics, InstalledSurface, UpdatePlan, HandKind, Check, HerdrReport } from '@oak-observatory/core';
 
 /** Version read from the package manifest at runtime — one source of truth, so it can never drift. */
 function version(): string {
   try {
     const fs = require('fs');
     const path = require('path');
-    // dist/index.js → ../package.json (same layout in the repo and the published tarball).
-    return JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version;
+    // dist/index.js → ../package.json (same layout in the repo and the published tarball); the
+    // bundle `oak machine add` pushes to a remote keeps package.json BESIDE index.js instead —
+    // without it that oak said 0.0.0 and `oak update` there planned an update forever.
+    for (const candidate of [path.join(__dirname, '..', 'package.json'), path.join(__dirname, 'package.json')]) {
+      try {
+        return JSON.parse(fs.readFileSync(candidate, 'utf8')).version;
+      } catch {
+        /* try the next layout */
+      }
+    }
+    return '0.0.0';
   } catch {
     return '0.0.0';
   }
+}
+
+/** Is this the copy `oak machine add` pushed? It keeps package.json beside the CLI, as version() reads it. */
+function machineBundle(): boolean {
+  return require('fs').existsSync(require('path').join(__dirname, 'package.json'));
 }
 
 function isTTY(): boolean {
@@ -44,7 +62,7 @@ const c = {
 };
 
 function fail(msg: string): never {
-  process.stderr.write(c.red('claude-observatory: ') + msg + '\n');
+  process.stderr.write(c.red('oak: ') + msg + '\n');
   process.exit(1);
 }
 
@@ -62,22 +80,48 @@ function emitJson(v: unknown): void {
  * observatory from nowhere means "show me what Claude is doing NOW", so the machine-wide newest
  * wins there (core.defaultTuiSession). Explicit `--session`, `--root` and the env pin all still win.
  */
-function getTuiSessionId(args: string[]): string {
-  const core = require('@claude-observatory/core') as typeof import('@claude-observatory/core');
-  const pinned =
-    args.includes('--session') ||
-    args.includes('--root') ||
-    process.env.CLAUDE_OBSERVATORY_SESSION ||
-    process.env.CLAUDE_CHANGES_SESSION;
-  if (!pinned) {
-    const id = core.defaultTuiSession(process.cwd());
-    if (id && core.isSafeSessionId(id)) return id;
+function getTuiSessionId(args: string[]): string | { session: string; elsewhere: true } {
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
+  const pinned = args.includes('--session') || process.env.CLAUDE_OBSERVATORY_SESSION || process.env.CLAUDE_CHANGES_SESSION;
+  if (pinned) {
+    const id = getSessionId(args);
+    // The dashboard is a whole-session view, so an EXPLICIT id it cannot open (a typo) must fail loudly
+    // rather than paint an empty board. A session this machine has is one with a transcript (Claude or
+    // Codex) or a store (a reviewed session whose transcript is gone). Verbs that legitimately pin an
+    // id with neither — `feed --feed-agent <subagent>` — never reach here (this is the tui path only).
+    // With saved machines, the session may run on one of them: the dashboard finds its owner from
+    // their catalogs, reviews it there, and fails just as loudly when none lists it.
+    if (id && !core.findTranscript(process.cwd(), id) && !require('fs').existsSync(core.storeDir(id))) {
+      if (savedMachineLabels().length) return { session: id, elsewhere: true };
+      fail(`no session "${id}" on this machine — \`oak sessions\` lists the ones it has.`);
+    }
+    return id;
   }
-  return getSessionId(args);
+  // `--root` means that workspace's own session, never the machine-wide newest the launch default reaches for.
+  const id = args.includes('--root') ? core.resolveSessionId(process.cwd()) : core.defaultTuiSession(process.cwd());
+  if (id && core.isSafeSessionId(id)) return id;
+  // No agent session on this machine yet — a first run. The TUI still opens (on the herdr tab, which
+  // starts one) and adopts the first session that appears; exiting here would make "install oak, get
+  // herdr" fail at the very first `oak`.
+  return '';
+}
+
+/** The enabled saved machines' labels, from herdr's own list: a local config read, no network. Empty
+ *  when herdr is missing or its list cannot be read. */
+function savedMachineLabels(): string[] {
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
+  const bin = core.findHerdrBin();
+  if (!bin) return [];
+  try {
+    const list = JSON.parse(String(core.spawnToolSync(bin, ['machine', 'list', '--json'], { encoding: 'utf8', timeout: 15000 }).stdout || '[]'));
+    return Array.isArray(list) ? list.filter((m) => m?.enabled === true && typeof m.label === 'string').map((m) => m.label) : [];
+  } catch {
+    return [];
+  }
 }
 
 function getSessionId(args: string[]): string {
-  const core = require('@claude-observatory/core') as typeof import('@claude-observatory/core');
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
   const i = args.indexOf('--session');
   const given = flagValue(args, '--session');
   let id: string | null = null;
@@ -102,16 +146,34 @@ function getSessionId(args: string[]): string {
 // --- init / uninstall: delegate the settings.json merge to the shared core installer ---
 
 function captureCommand(_project: boolean): string {
-  const { HOOK_MARKER } = require('@claude-observatory/core') as typeof import('@claude-observatory/core');
-  // Portable hook: relies on the globally-installed `claude-observatory` bin being on PATH. Survives
-  // moving/renaming the repo and works for teammates who `npm i -g`. The trailing shell-comment marker
-  // makes the hook recognizable for status/uninstall regardless of where the package lives.
-  return `claude-observatory capture #${HOOK_MARKER}`;
+  const { HOOK_MARKER } = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
+  // Portable hook: relies on the globally-installed `oak` bin being on PATH. Survives moving/renaming
+  // the repo and works for teammates who `npm i -g`. The trailing shell-comment marker makes the hook
+  // recognizable for status/uninstall regardless of where the package lives, and lets a re-run of
+  // `init` migrate a pre-rename `claude-observatory capture` hook to this one in place.
+  return `oak capture #${HOOK_MARKER}`;
 }
 
-function cmdInit(project: boolean, withStatusline = false): void {
-  const core = require('@claude-observatory/core') as typeof import('@claude-observatory/core');
+function cmdInit(project: boolean, withStatusline = false, repair = false, statuslineForce = false): void {
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
   const command = captureCommand(project);
+  if (repair) {
+    // The self-fix for older installs: the upsert install re-run over every file the ledger (plus
+    // the user scope) knows, collapsing doubled hooks to one canonical pair per event. Per-file
+    // results, because "fixed everywhere" without naming the files is not checkable.
+    const results = core.repairInstall(command);
+    for (const r of results) {
+      const label = `${r.path}${r.scope === 'project' ? c.dim(' (project)') : ''}`;
+      if (r.error && r.action !== 'skipped') process.stdout.write(c.red('✗ ') + `${label}: ${r.error}\n`);
+      else if (r.action === 'skipped') process.stdout.write(c.dim(`- ${label}: ${r.error}\n`));
+      else if (r.action === 'repaired') process.stdout.write(c.green('✓ ') + `${label}: repaired — one entry for each of the ${core.HEALTHY_HOOK_ENTRIES} capture events, current command\n`);
+      else if (r.action === 'installed') process.stdout.write(c.green('✓ ') + `${label}: installed\n`);
+      else process.stdout.write(`${label}: ${c.dim('already correct')}\n`);
+    }
+    const broken = results.filter((r) => r.error && r.action !== 'skipped').length;
+    if (broken) fail(`${broken} file(s) could not be repaired — fix the JSON above and re-run init --repair.`);
+    return;
+  }
   const target = project ? core.projectSettingsPath(process.cwd()) : core.settingsPath();
   let res: InstallResult;
   try {
@@ -119,17 +181,30 @@ function cmdInit(project: boolean, withStatusline = false): void {
   } catch {
     fail(`${target} is not valid JSON; fix it and re-run init.`);
   }
+  if (res.ledgerError) {
+    // The install itself succeeded; the RECORD of it did not. Said out loud because `uninstall`
+    // enumerates that record — an unrecorded install is one it can only find by the marker scan.
+    process.stdout.write(c.yellow('⚠ ') + `could not update the install ledger: ${res.ledgerError}\n`);
+  }
   // Companion status line (bundled): powers the 5h/week Usage bars in the sidebars. Install it in
   // the same run when asked; otherwise just point at it when it isn't active yet.
   const statuslineNote = withStatusline
     ? null
-    : statuslineActive()
+    : statuslineActive() || core.statuslineInstalled()
       ? null
-      : c.dim('tip: `claude-observatory statusline` installs the bundled status line (plan-usage bars in the sidebars).\n');
+      : c.dim('tip: `oak statusline` installs the bundled status line (plan-usage bars in the sidebars).\n');
+  // The codex leg and the statusline hand-off run on EVERY path from here — the old early return
+  // skipped codex entirely for upgraders ("already installed — nothing to do", which then wasn't
+  // true), and cmdStatusline's own process.exit made anything after it unreachable.
+  const finishInit = (): void => {
+    void maybeInitCodex().finally(() => {
+      if (withStatusline) cmdStatusline(statuslineForce ? ['--force'] : []);
+    });
+  };
   if (!res.changed) {
-    process.stdout.write(c.yellow('claude-observatory hooks already installed — nothing to do.\n'));
+    process.stdout.write(c.yellow('oak hooks already installed for Claude Code.\n'));
     if (statuslineNote) process.stdout.write(statuslineNote);
-    if (withStatusline) cmdStatusline();
+    finishInit();
     return;
   }
   process.stdout.write(
@@ -139,36 +214,209 @@ function cmdInit(project: boolean, withStatusline = false): void {
       c.dim(`  command: ${command}\n`) +
       (project
         ? c.yellow(
-            '  note: project hooks call `claude-observatory` on PATH — teammates need it installed ' +
-              '(npm i -g claude-observatory) for capture to run.\n'
-          )
+            '  note: project hooks call `oak` on PATH — teammates need it installed ' +
+              '(https://github.com/cell-observatory/oak-observatory#quickstart) for capture to run.\n'
+          ) +
+          c.dim('  this file is meant to be committed; the install is recorded in the install ledger (`status` lists every install).\n')
         : '') +
       `Edits made by Claude Code (Edit/Write/MultiEdit/NotebookEdit — plus files changed by Bash; ` +
       `set CLAUDE_OBSERVATORY_NO_BASH=1 to opt out) will now be tracked.\n`
   );
   if (statuslineNote) process.stdout.write(statuslineNote);
-  if (withStatusline) cmdStatusline();
+  finishInit();
+}
+
+
+function maybeInitCodex(): Promise<void> {
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
+  if (process.argv.includes('--no-codex')) return Promise.resolve();
+  const found = core.spawnToolSync(process.platform === 'win32' ? 'where' : 'which', ['codex'], { encoding: 'utf8' });
+  if (found.status !== 0 || !String(found.stdout).trim()) {
+    process.stdout.write(c.dim('codex: not on this machine — skipped (install codex, then `oak init --codex`).\n'));
+    return Promise.resolve();
+  }
+  process.stdout.write(c.dim('codex found — installing its capture hooks too (--no-codex skips):\n'));
+  cmdInitCodex(true);
+  // "Install everything automatically": when codex has NO model configured and
+  // local models exist, wire the newest one — loudly, with a backup, and only into the vacuum. A
+  // model the user already chose (directly, through a provider, or through a profile) is never
+  // touched; `models use` is the explicit switch, and `oak uninstall` removes what this wired. The
+  // promise is RETURNED so the caller can sequence the statusline hand-off (whose process.exit
+  // used to cut this wiring off mid-flight) after it.
+  return core.listOllamaModels().then((list) => {
+    if (!list?.length) return;
+    const chosen = core.codexModelChoice();
+    if (chosen) {
+      process.stdout.write(c.dim(`codex model: ${chosen} · ${list.length} local model(s) — \`oak models\` to list or switch.\n`));
+      return;
+    }
+    const pick = list[0].name;
+    const wired = core.wireCodexModel(pick, true);
+    process.stdout.write(
+      c.green('✓ ') + `codex had no model configured — wired to your newest local model, ${pick} (provider: ollama)\n` +
+        (wired.backupPath ? c.dim(`  backup: ${wired.backupPath}\n`) : '') +
+        c.dim('  `oak models use <name>` switches any time.\n')
+    );
+  }).catch((e) => {
+    // Opportunistic, but never silent: ollama being down is routine; a failed CONFIG WRITE is not.
+    process.stdout.write(c.dim(`codex model wiring skipped: ${String((e as Error)?.message || e)}\n`));
+  });
+}
+
+
+function cmdInitCodex(verify: boolean): void {
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
+  const command = `oak capture --agent codex #${core.HOOK_MARKER}`;
+  let res: import('@oak-observatory/core').CodexInstallResult;
+  try {
+    res = core.installCodexHooks(command, core.isOurCommand);
+  } catch (e) {
+    fail(String((e as Error)?.message || e));
+  }
+  const label = res.hooksJson === 'unchanged' ? c.yellow('already installed') : c.green(res.hooksJson);
+  process.stdout.write(c.green('✓ ') + `codex hooks ${label} → ${core.codexHooksJsonPath()}\n`);
+  if (res.stateWritten) {
+    process.stdout.write(
+      c.green('✓ ') + `trust state written → ${res.statePath}\n` +
+        c.dim(`  (append-only edit; your existing config lines are untouched${res.backupPath ? ` — backup: ${res.backupPath}` : ''})\n`)
+    );
+  }
+  if (res.foreignGroups > 0) process.stdout.write(c.dim(`  ${res.foreignGroups} foreign hook group(s) preserved untouched\n`));
+  if (!verify) {
+    process.stdout.write(c.yellow('⚠ verification skipped (--no-verify) — codex skips untrusted hooks SILENTLY; `oak status` shows the trust check.\n'));
+    return;
+  }
+  const status = core.codexHooksStatus(core.isOurCommand);
+  process.stdout.write(`configuration: ${status.installed ? 'installed' : 'incomplete'}; trust: ${status.trust}\n`);
+  process.stdout.write('No model was invoked. Lifecycle and edit capture are verified separately when your next Codex session runs.\n');
+
+}
+
+/**
+ * Local-model onboarding (no API keys — open-weight models over local
+ * ollama are the test bed, and switching between them must be one command).
+ *
+ * `models`            what ollama serves HERE (read live — a model pulled a second ago is listed),
+ *                     which one codex is wired to, and the switch hint.
+ * `models use <name>` pull it if missing (streamed), wire ~/.codex/config.toml to it (Orca
+ *                     manners: surgical line replacement + .bak), then PROBE — a live `codex exec`
+ *                     turn proves the wiring, because written-and-working is a claim only a
+ *                     completed turn can make.
+ */
+async function cmdModels(args: string[]): Promise<void> {
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
+  const sub = args.find((a) => !a.startsWith('-'));
+  const list = await core.listOllamaModels();
+  if (sub === 'use') {
+    const name = args[args.indexOf('use') + 1];
+    if (!name || name.startsWith('-')) fail('models use <name> — `oak models` lists what is available');
+    if (list === null) fail('ollama is not answering on 127.0.0.1:11434 — start it (`ollama serve`, or the ollama app) and re-run.');
+    if (!list.some((m) => m.name === name || m.name === `${name}:latest`)) {
+      process.stdout.write(c.dim(`${name} is not local yet — pulling via ollama (this streams; ctrl+c aborts safely):\n`));
+      const r = core.spawnToolSync('ollama', ['pull', name], { stdio: 'inherit' });
+      if (r.status !== 0) fail(`ollama pull ${name} failed — the name may not exist in the ollama library.`);
+    }
+    const wired = core.wireCodexModel(name);
+    process.stdout.write(
+      c.green('✓ ') + `codex wired to ${name} (provider: ollama)` +
+        (wired.previous && wired.previous !== name ? c.dim(`  (was ${wired.previous})`) : '') + '\n' +
+        (wired.backupPath ? c.dim(`  backup: ${wired.backupPath}\n`) : '')
+    );
+    process.stdout.write(c.dim('verifying: one live codex turn on the new model (a first load of a big model can take minutes)…\n'));
+    const probe = core.spawnToolSync('codex', ['exec', '--skip-git-repo-check', 'Reply with exactly: ok'], {
+      cwd: require('os').tmpdir(),
+      timeout: 300000, // first-load of a 20GB-class model + one turn — measured over 120s for laguna-xs.2
+      killSignal: 'SIGKILL',
+      encoding: 'utf8',
+    });
+    const outText = `${probe.stdout || ''}`;
+    const errCode = (probe.error as NodeJS.ErrnoException | undefined)?.code;
+    if (/\bok\b/i.test(outText.split('\n').slice(-8).join('\n'))) {
+      process.stdout.write(c.green(`✓ verified — ${name} answered a live turn through codex\n`));
+    } else if (errCode === 'ETIMEDOUT') {
+      // The failure modes need different advice, and lumping them under "is codex installed?"
+      // misdiagnosed a model that was simply still loading (measured, laguna-xs.2's first load).
+      process.stdout.write(c.yellow('⚠ the verify turn timed out — the model is likely still loading into memory.') + c.dim(' The wiring is done; try `codex` in a minute.\n'));
+    } else if (/session id:/.test(outText)) {
+      process.stdout.write(c.yellow('⚠ codex started but the model did not answer cleanly') + c.dim(' — try `codex`.\n'));
+    } else if (errCode === 'ENOENT') {
+      process.stdout.write(c.yellow('⚠ codex is not installed') + c.dim(' — the model is wired; install codex and the drive picks it up.\n'));
+    } else {
+      process.stdout.write(c.yellow('⚠ could not verify') + c.dim(` (${probe.error ? String(probe.error) : 'no codex output'})\n`));
+    }
+    return;
+  }
+  // The listing. Ollama not running is an ANSWER here, not an error exit — status pages never fail.
+  const { model: wiredModel } = core.codexConfiguredModel();
+  if (list === null) {
+    process.stdout.write(c.yellow('ollama: not answering on 127.0.0.1:11434') + c.dim(' — start it to serve local models (https://ollama.com).\n'));
+  } else if (!list.length) {
+    process.stdout.write('ollama is running but serves no models yet — `ollama pull <name>` (e.g. qwen3, gemma3, laguna-xs.2), then `oak models use <name>`.\n');
+  } else {
+    process.stdout.write(c.bold(`local models (ollama · newest first):\n`));
+    for (const m of list) {
+      const active = m.name === wiredModel;
+      const gb = (m.sizeBytes / 1e9).toFixed(1);
+      process.stdout.write(`  ${active ? c.green('● ') : '  '}${m.name.padEnd(28)} ${c.dim(`${gb} GB`)}${active ? c.green('  ← codex runs this') : ''}\n`);
+    }
+    process.stdout.write(c.dim('`oak models use <name>` switches codex (pulls first when missing). New pulls appear here with nothing to reinstall — capture is model-independent.\n'));
+  }
+  if (wiredModel && list?.every((m) => m.name !== wiredModel)) {
+    process.stdout.write(c.yellow(`⚠ codex is wired to "${wiredModel}", which ollama does not serve — \`models use <name>\` fixes the mismatch.\n`));
+  }
 }
 
 function cmdUninstall(args: string[]): void {
-  const core = require('@claude-observatory/core') as typeof import('@claude-observatory/core');
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
   const project = args.includes('--project');
   const all = args.includes('--all');
   const target = project ? core.projectSettingsPath(process.cwd()) : core.settingsPath();
-  let res: InstallResult;
-  try {
-    res = core.uninstallHooks(target);
-  } catch {
-    fail(`${target} is not valid JSON.`);
+  if (project) {
+    // Explicitly scoped: exactly this repo's settings file, nothing else.
+    let res: InstallResult;
+    try {
+      res = core.uninstallHooks(target);
+    } catch {
+      fail(`${target} is not valid JSON.`);
+    }
+    process.stdout.write(
+      res.changed
+        ? c.green('✓ ') + `removed capture hooks from ${res.settingsPath}\n`
+        : 'no oak hooks found.\n'
+    );
+  } else {
+    // Default: EVERY file the install ledger records, plus the user scope (the pre-ledger
+    // fallback) — per-file results, because a teardown that names what it cleaned is checkable
+    // and one that says "done" is not.
+    const results = core.uninstallEverywhere();
+    let removed = 0;
+    for (const r of results) {
+      const label = `${r.path}${r.scope === 'project' ? c.dim(' (project)') : ''}`;
+      if (r.error) process.stdout.write(c.red('✗ ') + `${label}: ${r.error}\n`);
+      else if (r.changed) {
+        removed++;
+        process.stdout.write(c.green('✓ ') + `removed capture hooks from ${label}\n`);
+      } else process.stdout.write(c.dim(`- ${label}: no hooks present\n`));
+    }
+    if (!removed && results.every((r) => !r.error)) process.stdout.write('no oak hooks found anywhere the ledger knows.\n');
+    // codex lives at fixed paths and is self-describing — no ledger needed to find it.
+    const cst = core.codexHooksStatus(core.isOurCommand);
+    if (cst.installed) {
+      const r = core.uninstallCodexHooks(core.isOurCommand);
+      process.stdout.write(
+        c.green('✓ ') +
+          (r.hooksJson === 'removed'
+            ? `removed ${core.codexHooksJsonPath()}\n`
+            : `removed our entries from ${core.codexHooksJsonPath()} (foreign hook groups kept)\n`) +
+          (r.stateRemoved ? c.green('✓ ') + `removed our trust-state tables from ${core.codexConfigTomlPath()}\n` : '')
+      );
+    }
+    const unwired = core.unwireCodexModel();
+    if (unwired) process.stdout.write(c.green('✓ ') + `removed the codex model lines oak init added (${unwired}) from ${core.codexConfigTomlPath()}\n`);
   }
-  process.stdout.write(
-    res.changed
-      ? c.green('✓ ') + `removed capture hooks from ${res.settingsPath}\n`
-      : 'no claude-observatory hooks found.\n'
-  );
   if (!all) {
     process.stdout.write(
-      c.dim('tip: `claude-observatory uninstall --all` also reverts the bundled status line + prints full teardown steps.\n')
+      c.dim('tip: `oak uninstall --all` also reverts the bundled status line + prints full teardown steps.\n')
     );
     return;
   }
@@ -196,18 +444,18 @@ function cmdUninstall(args: string[]): void {
   }
   // We can't remove the global CLI or the editor extensions from here — print the exact steps.
   process.stdout.write(
-    '\n' + c.bold('To finish removing Claude Observatory:\n') +
-      c.dim('  • CLI:        ') + 'npm rm -g claude-observatory\n' +
-      c.dim('  • VS Code:    ') + 'uninstall the “Claude Observatory” extension (Extensions view)\n' +
-      c.dim('  • JetBrains:  ') + 'Settings → Plugins → Claude Observatory → Uninstall\n' +
+    '\n' + c.bold('To finish removing OAK:\n') +
+      c.dim('  • CLI:        ') + 'npm rm -g oak-observatory\n' +
+      c.dim('  • VS Code:    ') + 'uninstall the “OAK” extension (Extensions view)\n' +
+      c.dim('  • JetBrains:  ') + 'Settings → Plugins → OAK → Uninstall\n' +
       (args.includes('--purge-store')
         ? ''
-        : c.dim('  • Stored edits: ') + '`claude-observatory clean --all`  (or re-run with `--purge-store`)\n')
+        : c.dim('  • Stored edits: ') + '`oak clean --all`  (or re-run with `--purge-store`)\n')
   );
 }
 
 function cmdStatus(args: string[] = []): void {
-  const core = require('@claude-observatory/core') as typeof import('@claude-observatory/core');
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
   const fs = require('fs');
   const installed = core.hooksInstalled();
   // Verify the installed hook points at a script that still exists — the #1 silent-failure mode
@@ -215,12 +463,12 @@ function cmdStatus(args: string[] = []): void {
   const cmd = core.installedHookCommand();
   const quoted = cmd ? cmd.match(/"([^"]+)"/) : null;
   // Legacy hooks embed an absolute script path (in quotes); the current portable hook is just
-  // `claude-observatory capture #marker` and resolves the bin on PATH — probe THAT instead, else the
+  // `oak capture #marker` and resolves the bin on PATH — probe THAT instead, else the
   // health check is silently inert (never fires) for every current install.
   const hookScript = quoted
     ? { path: quoted[1], ok: fs.existsSync(quoted[1]) }
     : cmd
-      ? { path: 'claude-observatory (on PATH)', ok: onPath('claude-observatory') === true }
+      ? { path: 'oak (on PATH)', ok: onPath('oak') === true }
       : null;
   const session = core.resolveSessionId(process.cwd());
   const log = session ? core.readLog(session) : [];
@@ -231,13 +479,24 @@ function cmdStatus(args: string[] = []): void {
   const shownLog = log.filter((r) => !statusHidden.has(r.id));
   const by = (s: string) => shownLog.filter((r) => r.status === s).length;
 
+  const installFiles = core.installStatus();
+  const codexStatus = core.codexHooksStatus(core.isOurCommand);
   if (args.includes('--json')) {
     emitJson({
       hooksInstalled: installed,
       hookScript,
+      // Every settings file the install ledger records (plus the user scope): path, scope,
+      // installed, command, and the entry count whose healthy value is exactly 2.
+      installFiles,
+      codexHooks: codexStatus,
       session,
       store: session ? core.storeDir(session) : null,
       lastCaptureTs: log.length ? core.maxOf(log.map((r) => r.ts)) : null,
+      // The oak server, from its pidfile (2026-09-16): alive means the pid is; `server status` asks it.
+      server: (() => {
+        const spid = core.readDaemonPid();
+        return { pid: spid, running: spid !== null && core.pidAlive(spid) };
+      })(),
       counts: session
         ? { total: shownLog.length, pending: by('pending'), kept: by('kept'), undone: by('undone'), cancelled: log.length - shownLog.length }
         : null,
@@ -247,12 +506,78 @@ function cmdStatus(args: string[] = []): void {
   }
 
   process.stdout.write(
-    `capture hooks:   ${installed ? c.green('installed') : c.red('not installed — run `claude-observatory init`')}\n`
+    `capture hooks:   ${installed ? c.green('installed') : c.red('not installed — run `oak init`')}\n`
   );
   if (hookScript) {
     process.stdout.write(
-      `hook script:     ${hookScript.path} ${hookScript.ok ? c.green('[ok]') : c.red('[not resolving — run `claude-observatory doctor`]')}\n`
+      `hook script:     ${hookScript.path} ${hookScript.ok ? c.green('[ok]') : c.red('[not resolving — run `oak doctor`]')}\n`
     );
+  }
+  // THE OAK SERVER: the local focus endpoint that routes navigation between attached OAK terminals.
+  // Read from its pidfile — a synchronous status must not open a socket — so "running" here means
+  // the pid is alive; `oak server status` asks the endpoint itself.
+  {
+    const spid = core.readDaemonPid();
+    const up = spid !== null && core.pidAlive(spid);
+    process.stdout.write(
+      `oak server:      ${up ? c.green(`running (pid ${spid})`) + c.dim(' — `oak server status` reports the focus endpoint') : spid !== null ? c.yellow(`stale pidfile (${spid}) — \`oak server start\` reclaims it`) : c.dim('not running — starts with oak tui')}\n`
+    );
+  }
+  // The ledger view: one line per settings file we have written. A single healthy user-scope row
+  // repeats what "capture hooks:" already said, so it stays quiet; anything else — project
+  // installs, a missing file, a doubled hook pair — is exactly what this table exists to show.
+  const noteworthy = installFiles.some((f) => f.scope === 'project' || (f.exists && f.installed && f.entries !== core.HEALTHY_HOOK_ENTRIES));
+  if (noteworthy) {
+    process.stdout.write('installed into:\n');
+    for (const f of installFiles) {
+      // The user file's repair is plain `oak init`, the command doctor names; only `--repair` reaches
+      // every project file the ledger lists, from wherever it runs.
+      const repair = f.scope === 'project' ? 'oak init --repair' : 'oak init';
+      const state = !f.exists
+        ? c.dim('file missing')
+        : f.installed
+          ? f.entries === core.HEALTHY_HOOK_ENTRIES
+            ? c.green('ok')
+            : c.yellow(`${f.entries < core.HEALTHY_HOOK_ENTRIES ? `incomplete: ${f.entries} of ${core.HEALTHY_HOOK_ENTRIES}` : f.entries} hook entries — run \`${repair}\``)
+          : c.dim('no hooks');
+      process.stdout.write(`  ${f.path} ${f.scope === 'project' ? c.dim('(project) ') : ''}${state}\n`);
+    }
+  }
+  // settings.json is contested shared state — say what ELSE manages hooks in it, so "my other
+  // tool broke" has a lead. Reported only; this installer never touches a foreign entry.
+  const foreign = installFiles.find((f) => f.scope === 'user')?.foreign ?? [];
+  if (foreign.length) {
+    process.stdout.write(
+      c.dim(`other tools' hooks: ${foreign.length} entr${foreign.length === 1 ? 'y' : 'ies'} (left untouched) — `) +
+        c.dim(foreign.map((cmd) => cmd.split(/\s+/)[0]).join(', ')) + '\n'
+    );
+  }
+  // The terminal app's pointer shapes ride OSC 22 through tmux's passthrough, which tmux ships OFF
+  // (2026-09-15) — said here, where a reader looks when something in the terminal app stays silent.
+  if (process.env.TMUX) {
+    try {
+      const r = core.spawnToolSync('tmux', ['show', '-gv', 'allow-passthrough'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+      const v = String(r.stdout ?? '').trim();
+      if (r.status === 0 && v !== 'on' && v !== 'all') {
+        process.stdout.write(c.yellow(`tmux:            allow-passthrough is ${v || 'off'} — the terminal app's mouse-pointer shapes need \`set -g allow-passthrough on\` in ~/.tmux.conf\n`));
+      }
+    } catch {
+      /* no tmux binary reachable — nothing to say */
+    }
+  }
+  // codex capture: trust is the load-bearing bit — codex SKIPS untrusted hooks with no warning, so a
+  // mismatch here is a live capture gap, not a cosmetic one.
+  if (codexStatus.installed) {
+    const trust =
+      codexStatus.trust === 'trusted'
+        ? c.green('trusted')
+        : c.red(`${codexStatus.trust} — codex skips untrusted hooks SILENTLY; re-run \`oak init --codex\``);
+    process.stdout.write(
+      `codex hooks:     installed → ${codexStatus.hooksJsonPath}  ${trust}\n` +
+        (codexStatus.foreignGroups ? c.dim(`                 ${codexStatus.foreignGroups} foreign hook group(s) untouched\n`) : '')
+    );
+  } else {
+    process.stdout.write(c.dim('codex hooks:     not installed (`oak init --codex` to capture codex sessions)\n'));
   }
   if (!session) {
     process.stdout.write(`active session:  ${c.dim('none for ' + process.cwd())}\n`);
@@ -278,7 +603,7 @@ function cmdStatus(args: string[] = []): void {
 
 /** Does `bin` resolve on PATH? Cross-platform; null if we couldn't determine it. */
 function onPath(bin: string): boolean | null {
-  const core = require('@claude-observatory/core') as typeof import('@claude-observatory/core');
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
   try {
     // Named `where.exe`, not `where`, so the launcher keeps it direct: this function's whole answer is
     // res.error ("couldn't determine") vs res.status ("not on PATH"), and a shell collapses the two.
@@ -297,15 +622,205 @@ function onPath(bin: string): boolean | null {
 }
 
 /** `doctor` — diagnose the whole setup (hooks, PATH, config dir, session, status line) with fixes. */
-function cmdDoctor(args: string[]): void {
-  const core = require('@claude-observatory/core') as typeof import('@claude-observatory/core');
+function cmdIntegrity(args: string[]): void {
+  const core = require('@oak-observatory/core') as Core;
+  const session = getSessionId(args);
+  const report = core.captureIntegrity(session);
+  if (args.includes('--json')) emitJson(report);
+  else {
+    process.stdout.write(`${report.records} records; ${report.skipped} capture gaps; ${report.issues.length} integrity findings\n`);
+    for (const issue of report.issues) process.stdout.write(`${issue.severity}: ${issue.message}${issue.file ? ` — ${issue.file}` : ''}\n`);
+  }
+}
+
+/**
+ * herdr's row in the doctor report — and, with `--fix`, the repair.
+ *
+ * herdr is a hard runtime dependency with no fallback path, so "is it there and is it the pinned
+ * one" belongs in the same report as the hooks and the PATH. A bare `oak doctor` only LOOKS: a
+ * diagnostic that installs a 26 MB binary because you asked it what was wrong is not a diagnostic.
+ * `--fix` runs the one function that owns all of it (binary, integrations, plugin, server).
+ */
+async function herdrCheck(fix: boolean): Promise<{ check: Check; report: HerdrReport | null }> {
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
+  const label = 'herdr (the terminal engine OAK runs on)';
+  const row = (level: Check['level'], detail: string, fixHint?: string): Check =>
+    ({ id: 'herdr', label, level, detail, ...(fixHint ? { fix: fixHint } : {}) });
+  // A herdr at or above the pin can still speak another protocol: a newer release that bumped it, or
+  // a server still running an older binary. Every Observatory snapshot then fails, and `--fix` never
+  // replaces a newer herdr, so the row says what does fix it — for the side that fails. The binary on
+  // disk and the running server are judged apart: when only the binary is off, the server still
+  // serves OAK, and stopping it (which closes every pane) would restart it on that binary.
+  const protocolRow = async (bin: string): Promise<Check | null> => {
+    const lock = core.readHerdrLock();
+    let v: import('@oak-observatory/core').HerdrVersion;
+    try {
+      v = await core.herdrVersion({ binary: bin, timeoutMs: 5000 });
+    } catch {
+      return null; // herdr did not answer `status`; the server rows below report an unreachable herdr
+    }
+    if (v.compatible) return null;
+    const pin = `this OAK speaks protocol ${lock.protocol} (herdr ${lock.version})`;
+    const why = (x: { protocol: number }) => (x.protocol !== lock.protocol ? `speaks protocol ${x.protocol}` : `is older than herdr ${lock.version}`);
+    const restart = '`herdr server stop` from a terminal outside herdr (this closes its panes), then `oak doctor --fix`';
+    const b = v.binary ?? v; // with no server running, `v` is the binary's own verdict
+    const server = `the running herdr server (${v.version})`;
+    if (!b.compatible) {
+      const fix = b.protocol > lock.protocol
+        ? `\`oak update\` for an OAK that speaks protocol ${b.protocol}, or install herdr ${lock.version}`
+        : `install herdr ${lock.version} (\`oak doctor --fix\` does)`;
+      const binary = `herdr ${b.version} at ${bin} ${why(b)}`;
+      if (!v.running) return row('fail', `${binary}; ${pin}`, fix);
+      if (v.serverCompatible) return row('fail', `${binary}; ${pin} — ${server} still serves OAK, so leave it running until then`, fix);
+      return row('fail', `${binary}, and ${server} ${why(v)}; ${pin}`, `${fix}; then ${restart}`);
+    }
+    // The binary on disk is fine, so a server restarted on it will be too.
+    if (!v.serverCompatible) return row('fail', `${server} ${why(v)}; ${pin}`, restart);
+    return row('fail', `herdr reports that ${server} cannot serve herdr ${b.version} at ${bin}`, restart);
+  };
+  try {
+    const pinned = core.readHerdrLock().version;
+    if (!fix) {
+      const probe = core.probeHerdr();
+      if (!probe.bin) return { check: row('fail', `not installed (OAK pins ${pinned})`, 'oak doctor --fix'), report: null };
+      if (!probe.current)
+        return { check: row('warn', `${probe.version} at ${probe.bin} is older than the pinned ${pinned}`, 'oak doctor --fix'), report: null };
+      return { check: (await protocolRow(probe.bin)) ?? row('ok', `${probe.version} at ${probe.bin}`), report: null };
+    }
+    const report = await core.ensureHerdr();
+    const downloaded = report.downloaded;
+    const detail =
+      `${report.version} at ${report.bin}` +
+      (report.upgraded ? ` (installed ${report.pinned})` : '') +
+      (downloaded ? ` · downloaded herdr ${report.pinned} (${(downloaded.bytes / 1_000_000).toFixed(1)} MB) from ${downloaded.url}` : '') +
+      ` · integrations ${Object.entries(report.integrations).map(([k, v]) => `${k}=${v}`).join(' ')}` +
+      ` · plugin ${report.pluginLinked ? 'linked' : 'not linked'}` +
+      (report.sidebarConfigured ? ' · sidebar widths set in config.toml' : '') +
+      (report.themeConfigured ? ' · herdr theme: gruvbox (set)' : '') +
+      (report.serverStarted ? ' · server started' : '');
+    // Warnings are not cosmetic here: no python3 means herdr's hooks exit silently and no session
+    // ever joins its pane, which looks like OAK being broken rather than a missing dependency.
+    return { check: (report.bin ? await protocolRow(report.bin) : null) ?? row(report.warnings.length ? 'warn' : 'ok', detail), report };
+  } catch (e) {
+    return { check: row('fail', String((e as Error)?.message || e), 'oak doctor --fix'), report: null };
+  }
+}
+
+/**
+ * Inspect only: does the running herdr server carry a Claude Code session identity?
+ *
+ * A server started from inside a session (an `oak doctor --fix` run by an agent, a bare `herdr` in a
+ * pane's shell) inherits `CLAUDE_CODE_CHILD_SESSION` and friends, and every pane it opens inherits
+ * them in turn — so each `claude` started there runs as a CHILD session: transcript saving off
+ * ("inherited CLAUDE_CODE_CHILD_SESSION marker"), nothing to `--resume`, no conversation for the
+ * Observatory, no session record for Remote Control. OAK strips the identity when IT starts the
+ * server (2026-09-22), but a server already running keeps what it was born with; the only cure is a
+ * restart, which closes every pane — so this row says so instead of doing it.
+ */
+function herdrIdentityCheck(): Check[] {
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
+  const label = 'herdr server environment';
+  const consequence = 'every Claude Code agent started in its panes inherits it and runs as a child session: transcript saving off, nothing to --resume, no conversation in the Observatory, no session record for Remote Control';
+  let found: ReturnType<typeof core.herdrServerIdentityLeak>;
+  try {
+    // herdr's own word on whether a server runs comes first: no server, nothing to inspect — and no
+    // warning to read on a platform (Windows) whose process environments cannot be read at all.
+    const bin = core.findHerdrBin();
+    const status = bin ? core.spawnToolSync(bin, ['status'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000 }) : null;
+    found = status && /status:\s*not running/.test(String(status.stdout ?? '')) ? { state: 'absent' } : core.herdrServerIdentityLeak();
+  } catch (e) {
+    found = { state: 'unknown', why: String((e as Error)?.message || e) };
+  }
+  switch (found.state) {
+    case 'absent':
+      return [{ id: 'herdr-env', label, level: 'ok', detail: 'no herdr server running' }];
+    case 'clean':
+      return [{ id: 'herdr-env', label, level: 'ok', detail: `the running herdr server (pid ${found.pid}) carries no Claude Code session identity` }];
+    case 'unknown':
+      // "Could not look" is said as such — never printed as a clean bill.
+      return [{
+        id: 'herdr-env', label, level: 'warn',
+        detail: `not inspected — ${found.why}. A server started from inside a Claude Code session carries that session's identity, and ${consequence}`,
+        fix: 'start herdr (or `oak doctor --fix`) from a plain terminal, never from inside a Claude Code session',
+      }];
+    case 'leak':
+      return [{
+        id: 'herdr-env', label, level: 'fail',
+        detail: `the running herdr server (pid ${found.pid}) carries a Claude Code session identity (${found.keys.join(', ')}) — ${consequence}`,
+        fix: 'from a terminal OUTSIDE herdr: `herdr server stop` (this closes every herdr pane and the agents in them), then `oak doctor --fix` to start it clean',
+      }];
+  }
+}
+
+/** A daemon in a login scope loses every pane when that login closes — only where logind stops the
+ *  scope then (`KillUserProcesses=yes`). Inspection only. */
+function herdrLoginScopeCheck(): Check {
+  const core = require('@oak-observatory/core') as Core;
+  const found = core.herdrServerLoginScope();
+  const row = { id: 'herdr-login-scope', label: 'herdr server login scope' };
+  const move = 'after closing your agents, from a terminal outside herdr: herdr server stop, then oak doctor --fix; loginctl enable-linger keeps the user manager alive after the last logout';
+  if (found.state === 'scope') {
+    if (found.killUserProcesses === false) return { ...row, level: 'ok',
+      detail: `the running herdr server (pid ${found.pid}) is in the login scope ${found.scope}; logind keeps it running after that login ends (KillUserProcesses=no)` };
+    if (found.killUserProcesses === true) return { ...row, level: 'warn',
+      detail: `the running herdr server (pid ${found.pid}) is inside a login scope; logind can stop it and every pane when that login ends`, fix: move };
+    return { ...row, level: 'warn',
+      detail: `the running herdr server (pid ${found.pid}) is in the login scope ${found.scope}, and logind's KillUserProcesses could not be read; if it is yes, logind stops the server and every pane when that login ends`,
+      fix: 'check with `busctl get-property org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager KillUserProcesses`; if it prints b true, ' + move };
+  }
+  if (found.state === 'not-applicable') return { ...row, level: 'ok', detail: 'not applicable: login scopes are logind\'s, and logind runs only on Linux' };
+  if (found.state === 'unknown') return { ...row, level: 'warn', detail: 'not inspected — ' + found.why };
+  return { ...row, level: 'ok', detail: found.state === 'absent' ? 'no herdr server running' : 'the running herdr server is outside every login scope' };
+}
+
+/** Inspect only: herdr's installed agent hooks parse JSON with python3. */
+function python3Check(report: HerdrReport | null): Check {
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
+  // herdr's Windows hooks are PowerShell: the pinned herdr.exe carries no python at all.
+  if (process.platform === 'win32')
+    return { id: 'python3', label: 'python3 (herdr agent hooks)', level: 'ok', detail: "not needed on Windows, where herdr's agent hooks run in PowerShell" };
+  const present = onPath('python3') === true;
+  let hooksInstalled = report !== null && Object.entries(report.integrations)
+    .some(([target, state]) => (target === 'claude' || target === 'codex') && (state === 'current' || state === 'installed'));
+  if (!report) {
+    const bin = core.findHerdrBin();
+    if (bin) {
+      try {
+        const status = core.spawnToolSync(bin, ['integration', 'status'], {
+          encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000,
+        });
+        hooksInstalled = /^\s*(?:claude|codex):\s*(?:current|outdated|needs repair)\b/m.test(String(status.stdout ?? ''));
+      } catch { /* herdr's own diagnostic reports an unavailable binary */ }
+    }
+  }
+  const missing = hooksInstalled && !present;
+  return {
+    id: 'python3', label: 'python3 (herdr agent hooks)', level: missing ? 'fail' : 'ok',
+    detail: present ? 'on PATH' : hooksInstalled ? 'not on PATH' : 'not on PATH; no installed herdr claude/codex integration needs it',
+    ...(missing ? { fix: "herdr's agent hooks need python3" } : {}),
+  };
+}
+
+async function cmdDoctor(args: string[]): Promise<void> {
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
   const checks = core.diagnose({
     cwd: process.cwd(),
-    binOnPath: onPath('claude-observatory'),
+    binOnPath: onPath('oak'),
     jqPresent: onPath('jq'),
   });
+  checks.push(core.diagnoseRemoteTitles());
+  const codexQuota = core.diagnoseCodexQuota();
+  if (codexQuota) checks.push(codexQuota);
+  const herdr = await herdrCheck(args.includes('--fix'));
+  checks.push(herdr.check);
+  checks.push(python3Check(herdr.report));
+  if (herdr.check.level !== 'fail') checks.push(...herdrIdentityCheck(), herdrLoginScopeCheck());
+  checks.push(await core.diagnoseFocusServer(args.includes('--fix')));
+  const tui = require('@oak-observatory/tui') as typeof import('@oak-observatory/tui');
+  checks.push(await tui.diagnoseNativeSpawn(args.includes('--fix'), { bundle: machineBundle() }));
+  if (herdr.check.level !== 'fail') checks.push(...await core.diagnoseHerdrForwarding({ binary: core.findHerdrBin() ?? undefined }));
   if (args.includes('--json')) {
-    emitJson({ version: version(), checks });
+    emitJson({ version: version(), checks, herdr: herdr.report });
     return;
   }
   if (args.includes('--markdown') || args.includes('--md')) {
@@ -314,12 +829,15 @@ function cmdDoctor(args: string[]): void {
   }
   const icon = (l: string) => (l === 'ok' ? c.green('✓') : l === 'warn' ? c.yellow('⚠') : c.red('✗'));
   process.stdout.write(
-    c.bold(`claude-observatory doctor`) +
-      c.dim(`  v${version()} · ${(require('@claude-observatory/core') as typeof import('@claude-observatory/core')).getUpdateChannel() === 'dev' ? 'pre-release (dev)' : 'stable'} channel\n\n`)
+    c.bold(`oak doctor`) +
+      c.dim(`  v${version()} · ${(require('@oak-observatory/core') as typeof import('@oak-observatory/core')).getUpdateChannel() === 'dev' ? 'pre-release (dev)' : 'stable'} channel\n\n`)
   );
   for (const ch of checks) {
     process.stdout.write(`${icon(ch.level)} ${ch.label}\n    ${c.dim(ch.detail)}\n`);
     if (ch.fix) process.stdout.write(`    ${c.cyan('→ ' + ch.fix)}\n`);
+    // One row cannot carry four different half-failures, and swallowing them is how a machine ends
+    // up with herdr installed, no python3, and nothing to explain why the observatory is empty.
+    if (ch.id === 'herdr') for (const w of herdr.report?.warnings ?? []) process.stdout.write(`    ${c.yellow('⚠ ' + w)}\n`);
   }
   const fails = checks.filter((ch) => ch.level === 'fail').length;
   const warns = checks.filter((ch) => ch.level === 'warn').length;
@@ -340,7 +858,7 @@ function cmdDoctor(args: string[]): void {
  * kept — `clean --drop` deletes one outright.
  */
 function cmdResolve(args: string[]): void {
-  const core = require('@claude-observatory/core') as Core;
+  const core = require('@oak-observatory/core') as Core;
   const session = getSessionId(args);
   const r = core.resolveSession(session);
   if (args.includes('--json')) {
@@ -367,7 +885,7 @@ function cmdResolve(args: string[]): void {
  * in the window rather than with the largest one.
  */
 function cmdWarm(args: string[]): void {
-  const core = require('@claude-observatory/core') as Core;
+  const core = require('@oak-observatory/core') as Core;
   const cwd = flagValue(args, '--root') ?? process.cwd();
   const spec = flagValue(args, '--since');
   const sinceMs = spec ? parseDuration(spec) : 24 * 60 * 60_000;
@@ -400,16 +918,7 @@ function cmdWarm(args: string[]): void {
   process.stdout.write(c.green('✓ ') + `warmed ${warmed.length} session(s) active in the last ${spec ?? '24h'}\n`);
 }
 
-/**
- * The machines this install looks for sessions on — list, add, remove, enable, disable.
- *
- * It exists so the feature is configurable everywhere it ships. `prefs.remotes` used to be reachable
- * only from the terminal dashboard's options window, which made "browse a session on another machine"
- * a terminal-only setting for a feature both editors render; they now drive this verb.
- *
- * Validation is `parseRemoteSpec`'s, not this file's. Both fields are interpolated into a shell that
- * runs on ANOTHER computer, so there is one door and everything comes through it.
- */
+
 /**
  * WHERE THE OBSERVATORY KEEPS ITS DATA — show it, or move it.
  *
@@ -419,7 +928,7 @@ function cmdWarm(args: string[]): void {
  * history somewhere the product no longer looks.
  */
 function cmdStore(args: string[]): void {
-  const core = require('@claude-observatory/core') as typeof import('@claude-observatory/core');
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
   const path = require('path') as typeof import('path');
   const flagAt = (f: string): string | undefined => {
     const i = args.indexOf(f);
@@ -452,81 +961,846 @@ function cmdStore(args: string[]): void {
   }
   process.stdout.write(`${dir}${moved ? c.dim('   (moved)') : c.dim('   (default)')}\n`);
   process.stdout.write(c.dim('  every session\u2019s edits, snapshots and derived caches live here\n'));
-  process.stdout.write(c.dim('  move it with: claude-observatory store --move <dir>   (--default puts it back)\n'));
+  process.stdout.write(c.dim('  move it with: oak store --move <dir>   (--default puts it back)\n'));
 }
 
-function cmdRemotes(args: string[]): void {
-  const core = require('@claude-observatory/core') as typeof import('@claude-observatory/core');
-  const json = args.includes('--json');
-  const prefs = core.readPrefs();
-  const list = [...(prefs.remotes ?? [])];
-  const save = (next: typeof list): void => {
-    const p = { ...prefs };
-    if (next.length) p.remotes = next;
-    else delete p.remotes;
-    core.writePrefs(p);
-  };
-  const valueOf = (flag: string): string | undefined => {
-    const i = args.indexOf(flag);
-    return i >= 0 ? args[i + 1] : undefined;
-  };
-  const byName = (name: string): number => list.findIndex((r) => r.name === name || r.host === name);
+/** SSH options every remote step of `machine add` shares — the same set the session listing uses:
+ *  never prompt (a password prompt in a script hangs forever), fail fast, trust a first-contact
+ *  host key, and reject a changed known key. */
+const SSH_OPTS = ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8', '-o', 'StrictHostKeyChecking=accept-new'];
 
-  const add = valueOf('--add');
-  if (add !== undefined) {
-    const r = core.parseRemoteSpec(add);
-    if ('error' in r) fail(r.error);
-    else {
-      // Same name twice is a REPLACE, not a duplicate: two rows with one name make every later
-      // --remove/--disable ambiguous, and the reader plainly meant to correct the one they had.
-      const at = byName(r.remote.name);
-      if (at >= 0) list[at] = { ...r.remote, enabled: list[at].enabled };
-      else list.push(r.remote);
-      save(list);
-      process.stdout.write(`${c.green('added')} ${r.remote.name} → ${r.remote.host}${r.remote.configDir ? `  (${r.remote.configDir})` : ''}\n`);
+/** The verbs `--machine <label>` runs on a saved machine: everything Review and Observatory read or decide
+ *  for a session whose store and files live there, and `__tab-sync`, with which the terminal app has a
+ *  saved machine name its own session's herdr tab. `prompt` and `agent start` are deliberately absent:
+ *  their `--machine` is herdr's (deliver to, or start in, that machine's pane) and keeps that meaning. */
+const MACHINE_VERBS = new Set(['views', 'review', 'list', 'sessions', 'conversation', 'feed', 'multitask', 'subagents', 'diff', 'keep', 'undo', 'redo', 'resolve', 'comment', 'quote', 'ignore', '__tab-sync']);
+/** End to end, for one command on a saved machine. A cold review read there takes seconds;
+ *  connection setup allows 8 s; OAK_MACHINE_TIMEOUT_MS can extend this command deadline. */
+const MACHINE_TIMEOUT_MS = 120_000;
+/** Where a non-interactive ssh finds the remote's `oak` and the `node` it runs on. Such a shell sources
+ *  no profile, so its PATH is the system's alone: `oak machine add` installs to ~/.local/bin, and npm or
+ *  Homebrew globals land in /opt/homebrew/bin (Apple silicon) or /usr/local/bin. */
+const MACHINE_PATH = '$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH';
+
+/**
+ * `oak <verb> … --machine <label>` — one session verb, run where the session's store and files are.
+ *
+ * Keep and undo revert files on disk, so a decision about a session on another machine can only run
+ * there, and its review can only be read there: the store and the transcript never leave it. This
+ * runs that machine's OWN installed `oak` over ssh with the `--machine` pair removed, and hands back
+ * its stdout byte for byte (the JSON a local run prints), its stderr and its exit status, so a caller
+ * treats a remote answer exactly like a local one. The ssh target is herdr's: OAK's machines ARE
+ * herdr's. The remote command runs under `env PATH=…`, never an interactive shell, whose banner on
+ * stdout would corrupt the JSON; each argument is single-quoted for the remote shell, so a comment or
+ * a path with spaces arrives as one argument, unexpanded.
+ */
+async function forwardToMachine(verb: string, args: string[]): Promise<void> {
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
+  const isMachine = (a: string) => a === '--machine' || a.startsWith('--machine=');
+  const at = args.findIndex(isMachine);
+  const inline = args[at]?.startsWith('--machine=');
+  const label = inline ? args[at].slice('--machine='.length) : args[at + 1];
+  if (!label || label.startsWith('-')) fail('`--machine` needs a saved machine label — see `oak machine list`');
+  const bin = core.findHerdrBin();
+  if (!bin) fail('herdr is not installed on this machine — run `oak doctor --fix` first');
+  let machines: import('@oak-observatory/core').HerdrMachine[];
+  try {
+    machines = await core.herdrMachines({ binary: bin, timeoutMs: 15000 });
+  } catch (e) {
+    fail(`could not read herdr's machine list: ${String((e as Error)?.message || e)}`);
+  }
+  if (args.filter(isMachine).length !== 1) fail('specify --machine only once');
+  const matches = machines.filter(x => x.label === label || x.id === label);
+  if (matches.length > 1) fail(`ambiguous saved machine "${label}" — use its unique id`);
+  const m = matches[0];
+  if (!m) fail(`no saved machine "${label}" — add it with \`oak machine add ${label} <ssh-target>\` (see \`oak machine list\`)`);
+  if (!m.enabled) fail(`saved machine "${label}" is disabled — enable it in herdr before reviewing it`);
+  if (!m.target || m.target.startsWith('-')) fail(`invalid ssh target for saved machine ${label}`);
+  const quote = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`;
+  const argv = [verb, ...args.filter((_, i) => i !== at && (inline || i !== at + 1))];
+  // A same-version dev tag cannot prove support. Check the requested features before an older
+  // CLI can ignore a flag, expand only part of a review unit, or return plain text instead of JSON.
+  const needsProtocol = args.includes('--units') || (verb === 'diff' && args.includes('--json')) || (verb === 'comment' && (args[0] === 'mark-sent' || args.some(a => a.startsWith('--text='))));
+  const marker = 'OAK_EXIT_' + require('crypto').randomBytes(12).toString('hex') + ':';
+  const conversationProtocol = verb === 'conversation';
+  const check = conversationProtocol
+    ? `if [ "$(oak __conversation-protocol 2>/dev/null)" != 1 ]; then printf '%s\n' ${quote('oak: update OAK on ' + m.label + ' — this build does not support the requested conversation protocol')} >&2; exit 78; fi; `
+    : needsProtocol
+    ? `if [ "$(oak __review-protocol 2>/dev/null)" != 1 ]; then printf '%s\n' ${quote('oak: update OAK on ' + m.label + ' — this build does not support the requested review protocol')} >&2; exit 78; fi; `
+    : '';
+  // The final, private stderr marker distinguishes the remote program's exit 255 from SSH's 255.
+  // It is removed below; the program's stdout, stderr and exit status remain unchanged.
+  const present = `if ! command -v oak >/dev/null 2>&1; then printf '\n${marker}missing\n' >&2; exit 127; fi; `;
+  const script = present + check + `oak "$@"; oak_status=$?; printf '\n${marker}%s\n' "$oak_status" >&2; exit "$oak_status"`;
+  // OAK_FORWARDED: the remote runs in its session's own workspace rather than the login directory
+  // (`enterSessionWorkspace`). OAK_FORWARDED_MACHINE: the label this side reaches it by, so a repair
+  // command the remote prints ("not recorded … --record-only") runs from here. An older build there
+  // ignores both.
+  const remote = `env PATH="${MACHINE_PATH}" CLAUDE_OBSERVATORY_NO_UPDATE_CHECK=1 OAK_FORWARDED=1 OAK_FORWARDED_MACHINE=${quote(label)} sh -c ${quote(script)} oak ${argv.map(quote).join(' ')}`;
+  const env = { ...process.env };
+  // An ssh_config SendEnv wildcard must not export this machine's store or agent identity.
+  for (const key of Object.keys(env)) {
+    if (key.startsWith('CLAUDE_CODE_') || ['CLAUDECODE', 'CLAUDE_CONFIG_DIR', 'CODEX_HOME',
+      'CLAUDE_OBSERVATORY_SESSION', 'HERDR_SOCKET_PATH', 'XDG_CONFIG_HOME'].includes(key)) delete env[key];
+  }
+  const configured = Number(process.env.OAK_MACHINE_TIMEOUT_MS);
+  const timeout = Number.isInteger(configured) && configured > 0 && configured <= 2147483647
+    ? configured : MACHINE_TIMEOUT_MS;
+  // -T: never a remote terminal, even where ssh_config asks for one (a pty turns \n into \r\n). stdin
+  // is forwarded only to a verb told to read it (`ignore --stdin`): unforwarded, the remote read no
+  // paths, and ssh must not swallow the caller's otherwise. `direct`: ssh is a real executable, and the
+  // Windows shell route would drop the command's double quotes.
+  const child = core.spawnTool('ssh', ['-T', ...SSH_OPTS, m.target, remote], { stdio: [args.includes('--stdin') ? 'inherit' : 'ignore', 'inherit', 'pipe'], direct: true, env });
+  const errChunks: Buffer[] = [];
+  child.stderr?.on('data', (d: Buffer) => errChunks.push(d));
+  let timedOut = false;
+  let killTimer: ReturnType<typeof setTimeout> | undefined;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    child.kill();
+    killTimer = setTimeout(() => child.kill('SIGKILL'), 1000);
+    killTimer.unref();
+  }, timeout);
+  child.on('error', (e: Error) => {
+    clearTimeout(timer);
+    fail(`could not run ssh: ${e.message}`);
+  });
+  child.on('close', (code: number | null) => {
+    clearTimeout(timer);
+    clearTimeout(killTimer);
+    let err = Buffer.concat(errChunks).toString('utf8');
+    const missing = err.endsWith(`\n${marker}missing\n`);
+    if (missing) err = err.slice(0, -(`\n${marker}missing\n`).length);
+    const receipt = err.match(new RegExp('\\n' + marker + '(\\d+)\\n$'));
+    if (receipt) err = err.slice(0, -receipt[0].length);
+    const reason = err.split('\n').map((l) => l.trim()).filter(Boolean)[0] ?? '';
+    const refuse = (status: number, msg: string): never => {
+      process.stderr.write(c.red('oak: ') + msg + '\n');
+      process.exit(status);
+    };
+    if (timedOut) refuse(124, `${m.label} did not finish within ${timeout / 1000} s (OAK_MACHINE_TIMEOUT_MS); a decision may already have run — refresh before retrying`);
+    // Without the completion receipt, 255 is an SSH failure, not a remote program result.
+    if (code === 255 && !receipt) refuse(255, `${m.label} is not reachable over ssh (${m.target})${reason ? `: ${reason}` : ''}`);
+    if (code === 127 && (missing || (!receipt && /(?:oak: (?:not found|No such file)|(?:env|sh):.*oak.*(?:not found|No such file))/.test(err)))) refuse(127, `OAK is not installed on ${m.label} — run \`oak machine add ${m.label} ${m.target}\` from here`);
+    process.stderr.write(err);
+    process.exit(code ?? 1);
+  });
+}
+
+/**
+ * The receiving end of `--machine`: a forwarded session verb runs in its session's own workspace.
+ *
+ * ssh starts the remote command in the login's home directory, and every transcript lookup that
+ * walks up from the working directory found nothing from there: a forwarded review came back
+ * untitled, with no reasoning, prompts or fleet, for any session not started in the home directory
+ * itself. The workspace is the one the session's own transcript records (a sync mirror of another
+ * machine's session is never read as one), so the command sees exactly what a run in that directory
+ * sees. `--root`, when given, still decides the views that take it.
+ */
+function enterSessionWorkspace(args: string[]): void {
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
+  const id = flagValue(args, '--session');
+  try {
+    const dir = id && core.isSafeSessionId(id) ? core.sessionWorkspace(id) : null;
+    if (dir) process.chdir(dir);
+  } catch {
+    /* no readable transcript, or its workspace is gone: the login directory stands, as before */
+  }
+}
+
+/**
+ * `machine add <label> <ssh-target>` / `machine list [--json]` — OAK's machines ARE herdr's.
+ *
+ * `herdr machine add` can install the remote binary itself, but it asks a human to approve that
+ * install, which needs an interactive TTY and therefore stalls inside a script. So OAK puts the
+ * PINNED binary there first — checksum-verified before it is copied, at the `~/.local/bin/herdr`
+ * path herdr's own remote discovery looks in — and herdr's step then finds a matching install and
+ * saves the machine with nothing to approve.
+ */
+/**
+ * `oak attach [machine]` — tmux over SSH: run agents and OAK ON the target, then attach this
+ * terminal to its herdr. Nothing is copied across machines; review (keep/undo write the remote's
+ * store and revert its files) runs where the work is. Idempotently ensures a pane labelled `oak`
+ * exists on the remote so the attach lands on a review surface, not a bare shell. OAK's machines
+ * ARE herdr's, so the ssh target comes from herdr's own machine list.
+ */
+async function cmdAttach(args: string[]): Promise<void> {
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
+  const bin = core.findHerdrBin();
+  if (!bin) fail('herdr is not installed on this machine — run `oak doctor --fix` first');
+  const label = args.find((a) => !a.startsWith('-'));
+  let target: string | undefined;
+  let session: string | undefined;
+  if (label) {
+    let machines: { label: string; id: string; target: string; session?: string }[] = [];
+    try { machines = JSON.parse(String(core.spawnToolSync(bin, ['machine', 'list', '--json'], { encoding: 'utf8', timeout: 15000 }).stdout || '[]')); }
+    catch { /* leave empty → the not-found message below */ }
+    const m = machines.find((x) => x.label === label || x.id === label);
+    if (!m) fail(`no saved machine "${label}" — add it with \`oak machine add ${label} <ssh-target>\` (see \`oak machine list\`)`);
+    target = m.target; session = m.session;
+  }
+  const where = label ?? 'this machine';
+  // Local and a saved machine both drive herdr's own CLI; only the `--machine` prefix differs.
+  const ask = (argv: string[]) => core.spawnToolSync(bin, [...(label ? ['--machine', label] : []), ...argv], { encoding: 'utf8', timeout: label ? 30000 : 8000 });
+  // Ensure OAK runs in a herdr pane, so attaching lands on the observatory, not a shell. Idempotent:
+  // reuse a tab already labelled `oak` (and focus it) rather than stacking a new one each attach.
+  let snap: { tabs?: { label?: string; tab_id?: string }[]; focused_workspace_id?: string } = {};
+  try { const j = JSON.parse(String(ask(['api', 'snapshot']).stdout || '{}')); snap = (j?.result?.snapshot ?? j?.snapshot ?? j ?? {}); }
+  catch { /* treat as no oak pane and create one */ }
+  const existing = (snap.tabs ?? []).find((t) => t.label === 'oak');
+  let oakTab: string | undefined = existing?.tab_id;
+  if (existing) {
+    process.stdout.write(c.dim(`OAK is already running in a herdr pane on ${where}\n`));
+  } else {
+    process.stdout.write(c.dim(`starting OAK in a herdr pane on ${where} …\n`));
+    try {
+      const created = JSON.parse(String(ask(['tab', 'create', '--label', 'oak', ...(snap.focused_workspace_id ? ['--workspace', snap.focused_workspace_id] : [])]).stdout || '{}'));
+      oakTab = created?.result?.tab?.tab_id ?? created?.tab?.tab_id;
+      const pane: string | undefined = created?.result?.root_pane?.pane_id ?? created?.root_pane?.pane_id;
+      if (pane) ask(['pane', 'send-text', pane, 'oak\n']);
+    } catch { process.stdout.write(c.dim(`(could not pre-start OAK on ${where}; run \`oak\` in a pane after attaching)\n`)); }
+  }
+  if (oakTab) { try { ask(['tab', 'focus', oakTab]); } catch { /* best-effort landing on the oak tab */ } }
+  // Inside herdr already? herdr refuses to nest, so don't hand off — the target is reachable in
+  // herdr's own machine/workspace sidebar (its `oak` tab is now ready there). oak attach bootstraps
+  // from a plain terminal outside herdr.
+  if (process.env.HERDR_PANE_ID) {
+    process.stdout.write(c.yellow('! ') + `you're already inside herdr — ${where}${target ? ` (${target})` : ''} is in herdr's machine sidebar; select it there (its \`oak\` tab is ready). Run \`oak attach\` from a plain terminal to open a fresh herdr.\n`);
+    return;
+  }
+  // Hand this terminal to herdr — a tmux-style attach; ctrl+b q detaches and returns here. Only a tab
+  // herdr confirmed is announced as up: an unreachable herdr creates none and says nothing.
+  process.stdout.write(
+    (oakTab ? c.green('✓ ') + `attaching to ${where}${target ? ` (${target})` : ''} — the \`oak\` tab is up`
+      : c.yellow('! ') + `attaching to ${where}${target ? ` (${target})` : ''} — OAK could not be started there; run \`oak\` in a pane once attached`) +
+      '; press ctrl+b then q to detach\n'
+  );
+  const attach = target ? ['--remote', target, ...(session && session !== 'default' ? ['--session', session] : [])] : [];
+  // herdr's client starts the server when none runs, and a server born from a Claude Code session's
+  // shell (an agent running `oak attach`, a `!` command) would stamp every pane's agent as a child
+  // session — the same strip the terminal's herdr tab applies.
+  const r = core.spawnToolSync(bin, attach, { stdio: 'inherit', env: core.stripSessionIdentity(process.env) });
+  process.exit(typeof r.status === 'number' ? r.status : 0);
+}
+async function cmdMachine(args: string[]): Promise<void> {
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
+  const fs = require('fs');
+  const os = require('os');
+  const path = require('path');
+  const bin = core.findHerdrBin();
+  if (!bin) fail('herdr is not installed on this machine — run `oak doctor --fix` first');
+  const sub = args[0];
+  if (sub === 'list') {
+    // A PASSTHROUGH, deliberately: herdr owns the machine list, and a second rendering of it here
+    // would be one more thing to keep in step for no new information.
+    const r = core.spawnToolSync(bin, ['machine', 'list', '--json'], { stdio: 'inherit' });
+    process.exit(r.status ?? 1);
+  }
+  if (sub !== 'add') fail('usage: oak machine add <label> <ssh-target>   |   oak machine list [--json]');
+  const positional = args.slice(1).filter((a) => !a.startsWith('-'));
+  let label = positional[0];
+  const target = positional[1];
+  if (!label || !target) fail('usage: oak machine add <label> <ssh-target>');
+  const lock = core.readHerdrLock();
+  const ssh = (script: string) =>
+    core.spawnToolSync('ssh', [...SSH_OPTS, target, script], { encoding: 'utf8', timeout: 120000 });
+  const why = (r: { stderr: string | Buffer; status: number | null }): string =>
+    String(r.stderr ?? '').split('\n').map((l) => l.trim()).filter(Boolean)[0] || `exit ${r.status ?? '?'}`;
+
+  process.stdout.write(c.dim(`probing ${target} …\n`));
+  const un = ssh('uname -s; uname -m');
+  if (un.status !== 0) fail(`could not reach ${target}: ${why(un)}`);
+  const [sysname = '', machine = ''] = String(un.stdout).trim().split('\n').map((l) => l.trim());
+  const key = core.herdrPlatformKeyFromUname(sysname, machine);
+  // Windows is a herdr release but not an ssh-remote one (its install is a zip + DLLs, and herdr's
+  // remote path is POSIX). Say which machine and why rather than failing three steps later.
+  if (!key) fail(`herdr publishes no ssh-installable binary for ${sysname || '?'}/${machine || '?'} — install it on ${target} yourself`);
+
+  const already = core.parseHerdrVersion(ssh('if [ -x "$HOME/.local/bin/herdr" ]; then "$HOME/.local/bin/herdr" --version; elif command -v herdr >/dev/null 2>&1; then herdr --version; fi').stdout);
+  if (already && core.compareVersions(already, lock.version) >= 0) {
+    process.stdout.write(c.dim(`${target} already runs herdr ${already}\n`));
+  } else {
+    // Same platform and already pinned here? Copy the bytes this machine verified at install time
+    // instead of pulling the identical asset down a second time.
+    const localProbe = core.probeHerdr({ lock });
+    const reuse = core.herdrPlatformKey() === key && localProbe.bin && localProbe.version === lock.version;
+    const tmpDir = reuse ? null : fs.mkdtempSync(path.join(os.tmpdir(), 'oak-herdr-'));
+    try {
+      let src = localProbe.bin as string;
+      if (tmpDir) {
+        process.stdout.write(c.dim(`downloading herdr ${lock.version} (${key}) …\n`));
+        src = path.join(tmpDir, 'herdr');
+        await core.downloadHerdrAsset(key, src, { lock });
+      }
+      const mk = ssh('mkdir -p "$HOME/.local/bin"');
+      if (mk.status !== 0) fail(`could not create ~/.local/bin on ${target}: ${why(mk)}`);
+      process.stdout.write(c.dim(`copying herdr ${lock.version} to ${target}:~/.local/bin/herdr …\n`));
+      const cp = core.spawnToolSync('scp', [...SSH_OPTS, src, `${target}:.local/bin/herdr.oak-new`], {
+        encoding: 'utf8',
+        timeout: 600000,
+      });
+      if (cp.status !== 0) fail(`scp to ${target} failed: ${why(cp)}`);
+      // Land it with a rename, never a write-in-place: overwriting a herdr that is currently running
+      // is ETXTBSY on Linux, while a rename swaps it cleanly under the running process.
+      const land = ssh('chmod 0755 "$HOME/.local/bin/herdr.oak-new" && mv "$HOME/.local/bin/herdr.oak-new" "$HOME/.local/bin/herdr"');
+      if (land.status !== 0) fail(`could not install herdr on ${target}: ${why(land)}`);
+      // macOS refuses to run a quarantined binary with a dialog no ssh session can answer. Stripping
+      // the attribute is best-effort: a file that never carried one makes xattr exit nonzero, which
+      // is not a failure of anything.
+      if (sysname.trim().toLowerCase() === 'darwin') ssh('xattr -d com.apple.quarantine "$HOME/.local/bin/herdr" >/dev/null 2>&1; true');
+      const got = core.parseHerdrVersion(ssh('"$HOME/.local/bin/herdr" --version').stdout);
+      if (got !== lock.version) fail(`installed herdr on ${target}, but it reports ${got ?? 'nothing'} (expected ${lock.version})`);
+      process.stdout.write(c.green('✓ ') + `herdr ${got} installed on ${target}\n`);
+    } finally {
+      if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  }
+
+  // Idempotent: `herdr machine add` appends a new entry every call, so a re-run (e.g. to update the
+  // oak stack) would duplicate the machine. Skip it when this target/label is already saved.
+  const saved = (() => { try { return JSON.parse(String(core.spawnToolSync(bin, ['machine', 'list', '--json'], { encoding: 'utf8', timeout: 15000 }).stdout || '[]')) as { id?: string; target?: string; label?: string }[]; } catch { return []; } })();
+  const byLabel = saved.find((m) => m.label === label);
+  const byTarget = saved.find((m) => m.target === target);
+  if (byLabel && byLabel.target !== target) {
+    // The same name for a different host is a conflict, not a no-op: silently keeping the old entry
+    // sent every later attach to the wrong machine.
+    fail(`machine ${label} is already saved as ${byLabel.target}, not ${target} — \`herdr machine remove ${byLabel.id ?? label}\` first, or pick another label`);
+  } else if (byTarget && byTarget.label !== label) {
+    process.stdout.write(c.dim(`${target} is already saved in herdr as ${byTarget.label} — using that label\n`));
+    label = byTarget.label as string;
+  } else if (byLabel || byTarget) {
+    process.stdout.write(c.dim(`machine ${label} → ${target} already saved in herdr\n`));
+  } else {
+    const add = core.spawnToolSync(bin, ['machine', 'add', target, '--label', label], { stdio: 'inherit' });
+    if (add.status !== 0) fail(`\`herdr machine add\` failed (exit ${add.status ?? '?'}) — the remote binary is installed; re-run once the reason above is fixed`);
+    process.stdout.write(c.green('✓ ') + `machine ${label} → ${target}\n`);
+  }
+  await installOakStack(target, __dirname);
+}
+
+/**
+ * Install the OAK stack on a remote machine so the tmux-attach model actually works there: the CLI
+ * bundle (verified to run standalone — no node_modules), its sidecar assets, and the capture hooks.
+ * herdr alone runs terminals but cannot render the observatory or capture edits. Node 20+ is OAK's
+ * only extra remote runtime need; without it we WARN and leave herdr working rather than fail the add.
+ * `distDir` is this bundle's own directory (`__dirname`), which holds the index.js launcher, cli.js
+ * (this CLI), capture.js + the sidecar assets.
+ */
+async function installOakStack(target: string, distDir: string): Promise<void> {
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
+  const path = require('path');
+  const ssh = (script: string) => core.spawnToolSync('ssh', [...SSH_OPTS, target, script], { encoding: 'utf8', timeout: 120000 });
+  const scp = (args: string[]) => core.spawnToolSync('scp', [...SSH_OPTS, ...args], { encoding: 'utf8', timeout: 600000 });
+  const why = (r: { stderr?: string | Buffer; status: number | null }): string =>
+    String(r.stderr ?? '').split('\n').map((l) => l.trim()).filter(Boolean)[0] || `exit ${r.status ?? '?'}`;
+
+  // Node 20+ is OAK's only extra remote runtime need. A stock host often has it user-local in
+  // ~/.local/bin, which a non-interactive ssh does NOT put on PATH — so check that path explicitly too.
+  const nodeV = ssh('command -v node >/dev/null 2>&1 && node --version || { [ -x "$HOME/.local/bin/node" ] && "$HOME/.local/bin/node" --version; } || true');
+  const major = /v(\d+)/.exec(String(nodeV.stdout || ''));
+  if (!major || Number(major[1]) < 20) {
+    process.stdout.write(c.yellow('! ') + `oak not installed on ${target}: needs Node.js 20+ (found ${String(nodeV.stdout).trim() || 'none'}). herdr is set up; install Node 20+ there and re-run \`oak machine add <label> ${target}\` to enable review + capture.\n`);
+    return;
+  }
+  process.stdout.write(c.dim(`installing oak + capture hooks on ${target} …\n`));
+  const mk = ssh('mkdir -p "$HOME/.local/lib/oak/herdr-plugin" "$HOME/.local/bin"');
+  if (mk.status !== 0) fail(`could not create ~/.local on ${target}: ${why(mk)}`);
+  // Put ~/.local/bin on PATH for login (.profile) and interactive (.bashrc) shells — a stock host does
+  // not, so `oak` and the capture hooks would not resolve in the agent's pane. Idempotent; printf is
+  // single-quoted so $HOME/$PATH land literally in the rc, evaluated when a shell starts.
+  // …and .zprofile: zsh (the macOS default) reads neither of the other two.
+  ssh('for rc in "$HOME/.profile" "$HOME/.bashrc" "$HOME/.zprofile"; do touch "$rc"; grep -q "oak: user-local bin on PATH" "$rc" || printf \'\\n# oak: user-local bin on PATH\\nexport PATH="$HOME/.local/bin:$PATH"\\n\' >> "$rc"; done');
+  // The index.js launcher is copied last, after the two bundles it loads, so a failed copy never
+  // leaves it pointing at a cli.js that is not there.
+  for (const f of ['cli.js', 'capture.js', 'THIRD_PARTY_NOTICES.md', 'index.js']) {
+    const cp = scp([path.join(distDir, f), `${target}:.local/lib/oak/${f}`]);
+    if (cp.status !== 0) fail(`could not copy oak/${f} to ${target}: ${why(cp)}`);
+  }
+  // The manifest rides beside the bundle so `oak --version` there is the real version (without it
+  // `oak update` on the remote planned an update forever). It is found
+  // where version() looks: ../package.json in an npm install, beside index.js in a bundle that
+  // `oak machine add` itself pushed (a remote adding a machine of its own).
+  const manifest = [path.join(distDir, '..', 'package.json'), path.join(distDir, 'package.json')].find((p) => require('fs').existsSync(p));
+  const cpManifest = scp([manifest ?? path.join(distDir, 'package.json'), `${target}:.local/lib/oak/package.json`]);
+  if (cpManifest.status !== 0) fail(`could not copy package.json to ${target}: ${why(cpManifest)}`);
+  const cpPlugin = scp(['-r', path.join(distDir, 'herdr-plugin') + '/.', `${target}:.local/lib/oak/herdr-plugin/`]);
+  if (cpPlugin.status !== 0) fail(`could not copy the herdr plugin to ${target}: ${why(cpPlugin)}`);
+  // Launcher that resolves node at RUN time — system node if on PATH, else the user-local one — so it
+  // works even from a hook's non-interactive shell. $HOME/$@ stay literal (printf is single-quoted).
+  const launch = ssh('printf \'#!/bin/sh\\nexec "$(command -v node 2>/dev/null || echo "$HOME/.local/bin/node")" "$HOME/.local/lib/oak/index.js" "$@"\\n\' > "$HOME/.local/bin/oak" && chmod 0755 "$HOME/.local/bin/oak"');
+  if (launch.status !== 0) fail(`could not install the oak launcher on ${target}: ${why(launch)}`);
+  // Capture hooks (claude + codex), then verify oak actually runs. Hooks are best-effort; a dead oak
+  // is a hard failure. `--no-codex` on the plain init: its codex step can also wire a local model, a
+  // config change that must never happen where nobody sees it; `init --codex` installs the hooks.
+  const init = ssh('PATH="$HOME/.local/bin:$PATH"; oak init --no-codex >/dev/null 2>&1 || true; oak init --codex >/dev/null 2>&1 || true; oak --version 2>&1');
+  if (!/oak\s+\S+/.test(String(init.stdout || ''))) fail(`installed oak on ${target}, but it did not run: ${why(init)}`);
+  process.stdout.write(c.green('\u2713 ') + `oak installed on ${target} (${String(init.stdout).trim()}) + capture hooks; ~/.local/bin on PATH\n`);
+}
+
+
+/**
+ * `oak inbox` — every session waiting on you, most urgent first: permission
+ * prompts, then questions (with their real options), then input waits, then finished turns. `--next
+ * [--after <id>]` prints the one to jump to — the rule the terminal app's `h` key and both editors'
+ * "next hand" commands share (JetBrains reaches it here, in one place, rather than mirroring it).
+ */
+function cmdInbox(args: string[]): void {
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
+  const root = flagValue(args, '--root') ?? process.cwd();
+  const inbox = core.attentionInbox(root, { includeDone: !args.includes('--no-done') });
+  if (args.includes('--next')) {
+    const after = flagValue(args, '--after') ?? null;
+    const id = core.nextAttention(inbox.hands.map((h) => ({ id: h.id, attention: { kind: h.kind, ts: h.ts } })), after);
+    // The whole row rides along, so a caller that needs the label (JetBrains' balloon) makes ONE call.
+    if (args.includes('--json')) emitJson({ next: id, hand: inbox.hands.find((h) => h.id === id) ?? null });
+    else process.stdout.write(id ? `${id}\n` : c.dim('nobody is waiting on you\n'));
+    return;
+  }
+  if (args.includes('--json')) {
+    emitJson(inbox);
+    return;
+  }
+  if (!inbox.hands.length) {
+    process.stdout.write(c.dim('nobody is waiting on you\n'));
+    return;
+  }
+  for (const h of inbox.hands) {
+    const kind = h.kind === 'idle-done' ? c.dim('done      ') : c.yellow(h.kind.padEnd(10));
+    const wait = h.kind === 'idle-done' ? '' : c.dim(`  ${core.compactDuration(h.waitingMs)} waiting`);
+    const agent = h.agent && h.agent !== 'claude' ? c.yellow(`[${h.agent}] `) : '';
+    const name = h.title ? `${c.bold(h.title)}  ${c.dim(h.id)}` : c.bold(h.id);
+    process.stdout.write(`${kind}  ${agent}${name}${h.message ? ` — ${h.message}` : ''}${wait}\n`);
+    if (h.question) {
+      process.stdout.write(c.dim(`            ${h.question.header ? `${h.question.header}: ` : ''}${h.question.question}\n`));
+      h.question.options.forEach((o, i) => process.stdout.write(c.dim(`              ${i + 1}. ${o.label}${o.description ? ` — ${o.description}` : ''}\n`)));
+    }
+  }
+  const waited = inbox.hands.reduce((s, h) => s + h.waitedTodayMs, 0);
+  if (waited > 0) process.stdout.write(c.dim(`\nleft waiting on you today: ${core.compactDuration(waited)}\n`));
+}
+
+/**
+ * `oak search <words…>` — every conversation on this machine, ranked:
+ * the asks you typed and the prose that answered them, across sessions and workspaces. Every word
+ * must appear; a hit in the ask outranks one in the answer. `--query <text>` is the same thing as one
+ * argument (the terminal app's door — a value, never a leading dash); `--days N` narrows to sessions
+ * active since; `--limit N` caps the rows (50).
+ */
+function cmdSearch(args: string[]): void {
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
+  const root = flagValue(args, '--root') ?? process.cwd();
+  const flagged = flagValue(args, '--query');
+  const words: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a.startsWith('--')) {
+      if (FLAGS_WITH_VALUES.has(a)) i++;
+      continue;
+    }
+    words.push(a);
+  }
+  const query = (flagged ?? words.join(' ')).trim();
+  if (!query) fail('search needs some words: oak search <words…> (or --query <text>)');
+  const days = Number(flagValue(args, '--days'));
+  const limit = Number(flagValue(args, '--limit'));
+  const res = core.searchConversations(root, query, {
+    limit: Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : undefined,
+    sinceMs: Number.isFinite(days) && days > 0 ? Date.now() - days * 86_400_000 : undefined,
+  });
+  if (args.includes('--json')) {
+    emitJson(res);
+    return;
+  }
+  if (!res.hits.length) {
+    process.stdout.write(c.dim(`nothing matches “${query}” across ${res.sessions} session${res.sessions === 1 ? '' : 's'} (${res.asks} asks, ${res.ms} ms)\n`));
+    return;
+  }
+  for (const h of res.hits) {
+    const name = h.title ? c.bold(h.title) : c.bold(h.session);
+    const agent = h.agent && h.agent !== 'claude' ? c.yellow(`[${h.agent}] `) : '';
+    process.stdout.write(`${agent}${name}  ${c.dim(`${h.session.slice(0, 8)} · ${core.relTime(h.ts)}${h.workspace ? ` · ${h.workspace}` : ''}`)}\n`);
+    process.stdout.write(`    ${c.dim(h.where === 'prompt' ? 'ask' : 'answer')}  ${h.snippet}\n`);
+  }
+  process.stdout.write(c.dim(`\n${res.hits.length} of the asks matching “${query}” · ${res.sessions} sessions, ${res.asks} asks, ${res.ms} ms${res.indexed ? ` (indexed ${res.indexed} session${res.indexed === 1 ? '' : 's'} on the way)` : ''}\n`));
+}
+
+/**
+ * `oak notify` — desktop notifications for raised hands.
+ *   --message <text> [--title <t>] [--sound]     pop one notification (the plumbing check)
+ *   --session <id> --kind <k> --ts <ms> [...]    announce a row IF DUE — the once-per-machine claim
+ *                                                 and cooldown every surface shares; JetBrains' door
+ *   --watch [--interval <s>]                      headless: announce every hand this workspace raises,
+ *                                                 from a plain terminal with no editor open
+ * Never answers anything: the notification says who is waiting; the answer stays in the agent's terminal.
+ */
+async function cmdNotify(args: string[]): Promise<void> {
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
+  const root = flagValue(args, '--root') ?? process.cwd();
+  if (args.includes('--watch')) {
+    const every = Math.max(1, Number(flagValue(args, '--interval') ?? 3) || 3);
+    const via = core.desktopNotifier();
+    process.stdout.write(
+      `watching ${root} — desktop notifications via ${via === 'none' ? c.red('nothing (no notify-send, gdbus or osascript found)') : via === 'osc9' ? 'this terminal (OSC 9)' : via} · every ${every}s · ctrl+c stops\n`
+    );
+    const tick = (): void => {
+      try {
+        for (const r of core.sessionMeta(root).sessions) {
+          if (core.announceAttention(r)) process.stdout.write(`${core.relTime(Date.now())}  ${r.title ?? r.id}  ${core.attentionLabel(r.attention!.kind)}${r.attention!.message ? ` — ${r.attention!.message}` : ''}\n`);
+        }
+      } catch (e) {
+        process.stderr.write(`notify: ${String((e as Error).message)}\n`);
+      }
+    };
+    tick();
+    setInterval(tick, every * 1000);
+    process.on('SIGINT', () => process.exit(0));
+    await new Promise<void>(() => {
+      /* runs until interrupted */
+    });
+    return;
+  }
+  const session = flagValue(args, '--session');
+  if (session) {
+    if (!core.isSafeSessionId(session)) fail(`notify: invalid session id "${session}"`);
+    const kind = flagValue(args, '--kind') as HandKind | undefined;
+    const ts = Number(flagValue(args, '--ts'));
+    if (!kind || !(core.HAND_KINDS as readonly string[]).includes(kind) || !Number.isFinite(ts)) fail('notify --session needs --kind <permission|question|input|idle-done> and --ts <ms>');
+    const sent = core.announceAttention({ id: session, title: flagValue(args, '--title') ?? null, agent: flagValue(args, '--agent') ?? '', attention: { kind, message: flagValue(args, '--message') ?? '', ts } });
+    if (args.includes('--json')) emitJson({ sent });
+    else process.stdout.write(sent ? 'notified\n' : c.dim('not due — already announced, inside the cooldown, or off in the options\n'));
+    return;
+  }
+  const message = flagValue(args, '--message');
+  if (!message) fail('notify needs --message <text> (with --title), or --session <id> --kind <k> --ts <ms>, or --watch');
+  const r = core.desktopNotify(flagValue(args, '--title') ?? 'OAK', message, { sound: args.includes('--sound') });
+  if (args.includes('--json')) emitJson(r);
+  else process.stdout.write(r.sent ? `sent via ${r.via === 'osc9' ? 'this terminal (OSC 9)' : r.via}\n` : c.red(`no desktop notifier on this machine (${r.via})\n`));
+}
+
+/** Ask an attached OAK terminal to select a conversation or review tab. */
+async function cmdFocus(args: string[]): Promise<void> {
+  const core = require('@oak-observatory/core') as Core;
+  let session = flagValue(args, '--session');
+  const pane = flagValue(args, '--pane');
+  if (!session && pane) {
+    const snapshot = await core.herdrSnapshot();
+    session = snapshot.panes.find(p => p.pane_id === pane)?.agent_session?.value;
+  }
+  const tab = (flagValue(args, '--tab') ?? 'observatory').toLowerCase();
+  if (!session || !core.isSafeSessionId(session)) return fail('focus needs --session <id>, or --pane <id> with a live session');
+  if (!['observatory', 'review', 'herdr'].includes(tab)) return fail('focus --tab: observatory | review | herdr');
+  const client = await core.connectDaemon({ client: 'focus' });
+  if (!client) return fail('no OAK focus endpoint — open oak tui first');
+  try {
+    await client.request({ op: 'focus', session, tab: tab as import('@oak-observatory/core').FocusTab });
+    if (args.includes('--json')) emitJson({ focused: true, session, tab });
+  } finally { client.close(); }
+}
+
+async function cmdServer(args: string[]): Promise<void> {
+  const unsupported = args.find(a => a.startsWith('--') && !['--daemon', '--json'].includes(a));
+  if (unsupported) return fail(`server does not support ${unsupported}; this is a local focus endpoint`);
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
+  if (args.includes('--daemon')) {
+    (require('@oak-observatory/tui') as typeof import('@oak-observatory/tui')).runServer(core);
+    return new Promise(() => {
+      /* the server lives until it shuts itself down */
+    });
+  }
+  const sub = args.find((a) => !a.startsWith('--')) ?? 'status';
+  const json = args.includes('--json');
+  if (sub === 'start') {
+    const r = await core.ensureDaemon({ client: 'cli' });
+    if (!r.client) return fail(r.why);
+    r.client.close();
+    const st = await core.daemonStatus();
+    if (json) emitJson({ ...st, spawned: r.spawned });
+    else process.stdout.write(`${r.spawned ? 'started' : 'already running'} — oak server pid ${st.pid} · ${st.sock}\n`);
+    return;
+  }
+  if (sub === 'stop') {
+    const r = await core.stopDaemon();
+    if (json) emitJson(r);
+    else process.stdout.write(r.stopped ? 'oak server stopped — focus endpoint closed\n' : c.dim(`${r.why}\n`));
+    if (!r.stopped && r.why !== 'no oak server is running') process.exitCode = 1;
+    return;
+  }
+  if (sub === 'status') {
+    const st = await core.daemonStatus();
+    if (json) return emitJson(st);
+    if (!st.running) {
+      process.stdout.write(c.dim(`no oak server is running${st.stale ? ` (a stale pidfile names ${st.pid} — \`oak server start\` reclaims it)` : ''}\n`));
+      return;
+    }
+    const same = st.build === core.buildStamp();
+    process.stdout.write(
+      `oak server pid ${st.pid} · protocol ${st.protocol} · up since ${core.relTime(st.started)} · ` +
+        `${same ? 'the same build as this oak' : c.yellow('an older build than this oak — `oak server stop` and reopen a tab to update it')}\n`
+    );
+
+    return;
+  }
+  return fail(`server: unknown subcommand "${sub}" — start | stop | status`);
+}
+
+/** A failed or unavailable prompt keeps a clipboard draft and printable text. */
+async function promptDraft(session: string, text: string, args: string[]): Promise<boolean> {
+  const core = require('@oak-observatory/core') as Core;
+  let result: { sent: boolean; reason?: string };
+  try { result = await core.promptSession(session, text, { machine: flagValue(args, '--machine') }); }
+  catch (error) { result = { sent: false, reason: String((error as Error).message || error) }; }
+  if (!result.sent) {
+    const choices = process.platform === 'darwin' ? [['pbcopy']] : process.platform === 'win32' ? [['clip.exe']] : [['wl-copy'], ['xclip', '-selection', 'clipboard'], ['xsel', '--clipboard', '--input']];
+    for (const [file, ...argv] of choices) {
+      const copied = core.spawnToolSync(file, argv, { input: text, encoding: 'utf8', timeout: 2000 });
+      if (!copied.error && copied.status === 0) break;
+    }
+  }
+  if (args.includes('--json')) emitJson({ ...result, text });
+  else if (result.sent) process.stdout.write('Sent to the agent.\n');
+  else { process.stderr.write(`Draft retained: ${result.reason}\n`); process.stdout.write(text + '\n'); }
+  return result.sent;
+}
+
+async function cmdPrompt(args: string[]): Promise<void> {
+  const session = flagValue(args, '--session'), text = flagValue(args, '--text');
+  if (!session || !text) return fail('prompt needs --session <id> --text <text>');
+  if (await promptDraft(session, text, args)) {
+    const ids = flagValue(args, '--comment-ids')?.split(',').filter(Boolean) ?? [];
+    if (ids.length) (require('@oak-observatory/core') as Core).markCommentsSent(session, ids);
+  }
+}
+
+async function cmdAgent(args: string[]): Promise<void> {
+  const core = require('@oak-observatory/core') as Core;
+  if (args[0] !== 'start') return fail('agent: start --kind claude|codex [--cwd <dir>] [--machine <label|ssh-target>]');
+  const kind = flagValue(args, '--kind');
+  if (kind !== 'claude' && kind !== 'codex') return fail('agent start needs --kind claude|codex');
+  const cwd = flagValue(args, '--cwd');
+  const machineArg = flagValue(args, '--machine');
+  if (machineArg) {
+    // Spin an agent up ON a remote machine from here, then drop into its OAK (the chosen flow).
+    // Auto-provisions an unknown machine (installs herdr + saves it) so a brand-new remote works
+    // from this one command. OAK's machines ARE herdr's.
+    const bin = core.findHerdrBin();
+    if (!bin) return fail('herdr is not installed on this machine — run `oak doctor --fix` first');
+    let machines: { label: string; id: string; target: string }[] = [];
+    try { machines = JSON.parse(String(core.spawnToolSync(bin, ['machine', 'list', '--json'], { encoding: 'utf8', timeout: 15000 }).stdout || '[]')); }
+    catch { /* none saved yet → provision below */ }
+    // By label, id OR ssh target: `--machine user@host` for a host saved under a label re-provisioned
+    // the whole stack and then failed, because herdr's --machine takes only a label or id.
+    let label = machines.find((m) => m.label === machineArg || m.id === machineArg || m.target === machineArg)?.label;
+    if (!label) {
+      process.stdout.write(c.dim(`${machineArg} is not a saved machine — setting it up first …\n`));
+      await cmdMachine(['add', machineArg, machineArg]); // installs herdr on the target and saves it
+      label = machineArg;
+    }
+    const ask = (argv: string[]) => core.spawnToolSync(bin, ['--machine', label as string, ...argv], { encoding: 'utf8', timeout: 60000 });
+    const created = JSON.parse(String(ask(['tab', 'create', '--label', kind, ...(cwd ? ['--cwd', cwd] : [])]).stdout || '{}'));
+    const pane: string | undefined = created?.result?.root_pane?.pane_id ?? created?.root_pane?.pane_id;
+    if (!pane) return fail(`could not open a herdr pane on ${label}`);
+    const name = `oak-${kind}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    ask(['agent', 'start', name, '--kind', kind, '--pane', pane]);
+    process.stdout.write(c.green('✓ ') + `started ${kind} on ${label} in herdr pane ${pane}\n`);
+    return cmdAttach([label]); // spawn + drop into OAK — lands on the oak tab to watch and review it
+  }
+  const result = await core.startAgentSession(kind, cwd ?? process.cwd());
+  if (args.includes('--json')) emitJson(result);
+  else process.stdout.write(`Started ${kind} in herdr pane ${result.pane}.\n`);
+}
+/** `oak quote` — the agent's last reply as a `> ` block for the composer (#6/#7). */
+async function cmdQuote(args: string[]): Promise<void> {
+  const core = require('@oak-observatory/core') as Core;
+  const session = flagValue(args, '--session');
+  if (!session) return fail('quote needs --session <id>');
+  const q = core.quoteAgentOutput(session);
+  if (!q) return fail('nothing to quote — the agent has not replied yet in this session');
+  const text = q + (flagValue(args, '--text') ?? '');
+  if (args.includes('--send')) await promptDraft(session, text, args);
+  else if (args.includes('--json')) emitJson({ text, sent: false });
+  else process.stdout.write(text);
+}
+
+/** `oak comment` — line comments on a pending edit, batched into one prompt. The editors' shell
+ *  door: JetBrains shells these; VS Code and the terminal app call core directly. add/list/rm/compose. */
+async function cmdComment(args: string[]): Promise<void> {
+  const core = require('@oak-observatory/core') as Core;
+  const sub = args.find((a) => !a.startsWith('--')) ?? 'list';
+  const session = flagValue(args, '--session');
+  const json = args.includes('--json');
+  const cwd = flagValue(args, '--cwd') ?? process.cwd();
+  if (!session) return fail('comment needs --session <id>');
+  const unit = flagValue(args, '--edit') !== undefined ? Number(flagValue(args, '--edit')) : undefined;
+  const file = flagValue(args, '--file');
+  if (sub === 'add') {
+    const line = flagValue(args, '--line') !== undefined ? Number(flagValue(args, '--line')) : 0;
+    const textArg = flagValue(args, '--text');
+    const positional = args.filter((a, i) => !a.startsWith('--') && a !== 'add' && !(i > 0 && FLAGS_WITH_VALUES.has(args[i - 1])));
+    const text = textArg ?? positional.join(' ');
+    if (unit === undefined || !Number.isFinite(unit)) return fail('comment add needs --edit <unit id>');
+    if (!text) return fail('comment add needs --text "<comment>"');
+    const c2 = core.addComment(session, { unit, line, text });
+    if (!c2) return fail(`no pending edit #${unit} in session ${session}`);
+    if (json) emitJson(c2);
+    else process.stdout.write(`added comment ${c2.id} on ${core.relPath(cwd, c2.file)}${c2.line ? `:${c2.line}` : ''}\n`);
+    return;
+  }
+  if (sub === 'list') {
+    const cs = core.listComments(session, { unit, file, unsentOnly: args.includes('--unsent') });
+    if (json) return emitJson({ comments: cs });
+    if (!cs.length) return void process.stdout.write(c.dim('no comments\n'));
+    for (const cm of cs) {
+      process.stdout.write(`${cm.sentAt ? c.dim('sent   ') : c.yellow('pending')} ${core.relPath(cwd, cm.file)}${cm.line ? `:${cm.line}` : ''}  ${cm.text}  ${c.dim(cm.id)}\n`);
     }
     return;
   }
-  for (const [flag, verb] of [['--remove', 'removed'], ['--enable', 'enabled'], ['--disable', 'disabled']] as const) {
-    const name = valueOf(flag);
-    if (name === undefined) continue;
-    const at = byName(name);
-    // Named-but-absent is an error, not a silent success: a typo'd host would otherwise report
-    // "disabled" and leave the machine being polled every time the picker opens.
-    if (at < 0) fail(`no configured machine called “${name}” — \`claude-observatory remotes\` lists them`);
-    if (flag === '--remove') list.splice(at, 1);
-    else list[at] = { ...list[at], enabled: flag === '--enable' };
-    save(list);
-    process.stdout.write(`${c.green(verb)} ${name}\n`);
+  if (sub === 'rm') {
+    const id = flagValue(args, '--id');
+    if (!id) return fail('comment rm needs --id <comment id>');
+    const ok = core.removeComment(session, id);
+    if (json) emitJson({ removed: ok });
+    else process.stdout.write(ok ? `removed ${id}\n` : c.dim(`no comment ${id}\n`));
+    if (!ok) process.exitCode = 1;
     return;
   }
+  if (sub === 'compose' || sub === 'send') {
+    const p = core.composeCommentPrompt(session, { unit, file, cwd });
+    if (!p) {
+      if (json) emitJson({ text: '', ids: [], files: [] });
+      else process.stdout.write(c.dim('no unsent comments to compose\n'));
+      return;
+    }
+    if (sub === 'send') {
+      if (await promptDraft(session, p.text, args)) core.markCommentsSent(session, p.ids);
+      return;
+    }
+    if (json) emitJson(p);
+    else process.stdout.write(p.text + '\n');
+    return;
+  }
+  if (sub === 'mark-sent') {
+    // The ledger step `send` and `prompt --comment-ids` take after a delivered prompt, for a reply that
+    // went out another way: through herdr from another machine, whose OAK holds none of these comments.
+    const ids = (flagValue(args, '--ids') ?? '').split(',').map((s) => s.trim()).filter(Boolean);
+    if (!ids.length) return fail('comment mark-sent needs --ids <comment id,…>');
+    const marked = core.listComments(session, { unsentOnly: true }).filter((cm) => ids.includes(cm.id)).length;
+    core.markCommentsSent(session, ids);
+    if (json) emitJson({ marked });
+    else process.stdout.write(`marked ${marked} comment(s) sent\n`);
+    return;
+  }
+  return fail(`comment: unknown subcommand "${sub}" — add | list | rm | compose | send | mark-sent`);
+}
 
-  if (json) {
-    emitJson({ remotes: list.map((r) => ({ ...r, enabled: r.enabled !== false })) });
+/**
+ * `titles` — the Remote Control titles OAK reads from claude.ai (core remote-titles.ts): the status of
+ * the last read by default; `--refresh` reads now; `--off` / `--on` set `prefs.remoteTitles`. The
+ * pollers run `--refresh --if-due` detached, which honours the throttle and must exit even if a request
+ * or an inherited handle never settles — the lock is reclaimed after a kill.
+ */
+function cmdTitles(args: string[]): void {
+  const core = require('@oak-observatory/core') as Core;
+  const fs = require('fs') as typeof import('fs');
+  if (args.includes('--refresh')) {
+    const quiet = args.includes('--if-due');
+    const deadline = setTimeout(() => process.exit(1), core.remoteTitlesDeadlineMs());
+    deadline.unref();
+    void core.refreshRemoteTitles({ force: !quiet }).then((ran) => {
+      clearTimeout(deadline);
+      if (quiet) return;
+      if (!ran) process.stdout.write(core.remoteTitlesEnabled() ? 'another refresh is running\n' : 'off (oak titles --on resumes)\n');
+      else process.stdout.write(core.diagnoseRemoteTitles().detail + '\n');
+    });
     return;
   }
-  if (!list.length) {
-    process.stdout.write('no machines configured — this install lists sessions on this computer only\n');
-    process.stdout.write(`  add one with: ${c.dim('claude-observatory remotes --add "name host"')}\n`);
-    process.stdout.write('  host is anything ssh accepts. Key auth only: the lookup runs with BatchMode,\n');
-    process.stdout.write('  so an unreachable machine fails fast instead of hanging on a password prompt.\n');
+  if (args.includes('--off') || args.includes('--on')) {
+    const prefs = core.readPrefs();
+    if (args.includes('--off')) {
+      prefs.remoteTitles = false;
+      fs.rmSync(core.remoteTitlesCachePath(), { force: true }); // no cached claude.ai title outlives the switch
+    } else delete prefs.remoteTitles;
+    core.writePrefs(prefs);
+    process.stdout.write(prefs.remoteTitles === false
+      ? 'Remote Control titles off: OAK no longer reads session titles from claude.ai, and names sessions from their transcripts.\n'
+      : 'Remote Control titles on: the next poll reads session titles from claude.ai.\n');
     return;
   }
-  const nameW = Math.max(...list.map((r) => r.name.length));
-  for (const r of list) {
-    const off = r.enabled === false;
-    process.stdout.write(
-      `${off ? c.dim('○') : c.green('●')} ${r.name.padEnd(nameW)}  ${r.host}` +
-        (r.configDir ? `  ${c.dim(r.configDir)}` : '') +
-        (off ? c.dim('   (off)') : '') +
-        '\n'
-    );
+  const cache = core.readRemoteTitles();
+  const check = core.diagnoseRemoteTitles();
+  if (args.includes('--json')) {
+    emitJson({
+      enabled: core.remoteTitlesEnabled(),
+      status: cache.attemptedAt ? cache.status ?? 'error' : 'never',
+      fetchedAt: cache.fetchedAt,
+      attemptedAt: cache.attemptedAt,
+      titles: Object.keys(cache.titles).length,
+      ...(cache.error ? { error: cache.error } : {}),
+      cache: core.remoteTitlesCachePath(),
+    });
+    return;
   }
-  process.stdout.write(c.dim('\nread-only: sessions there can be browsed, never reverted from here\n'));
+  process.stdout.write(`${check.label}: ${check.detail}\n` + (check.fix ? `  → ${check.fix}\n` : ''));
+}
+
+/**
+ * `__tab-sync <session>` — internal, hidden: the capture hooks and the Claude Code status line start it
+ * detached (core `kickTabSync`) when a session's title may have changed, and the terminal app on another
+ * machine runs it here with `--machine`, so this machine's record is the only one of its tabs' names. It
+ * names the herdr tab that holds the session's pane after the session's listed title (core
+ * `syncSessionTab`) and touches nothing else. `--claimed=<label>`: the name that app recorded giving the
+ * tab before this machine named its own, which this machine's record takes on while the tab wears it.
+ * Prints nothing, and exits by its deadline whatever herdr does. A session with no herdr pane link here
+ * (its hooks never ran in a herdr pane on this machine: not installed, or the session began before they
+ * were) asks herdr nothing and prints `unlinked`: the terminal app that asked names that tab itself.
+ */
+function cmdTabSync(args: string[]): void {
+  const core = require('@oak-observatory/core') as Core;
+  const session = args[0];
+  if (!session || !core.isSafeSessionId(session)) return;
+  if (!core.readHerdrPaneLink(session)) { process.stdout.write('unlinked\n'); return; }
+  const deadline = setTimeout(() => process.exit(0), 15000);
+  deadline.unref();
+  void core.syncSessionTab({ session, claimed: flagValue(args, '--claimed'), transport: core, herdrOptions: { timeoutMs: 4000 } })
+    .catch(() => { /* the tab keeps its name until the next sync */ })
+    .finally(() => clearTimeout(deadline));
 }
 
 function cmdSessions(args: string[] = []): void {
-  const core = require('@claude-observatory/core') as typeof import('@claude-observatory/core');
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
+  // Remove a session from every picker (and purge its stored edits). The agent's own transcript/rollout
+  // is left alone — hiding is what keeps it gone. `--undelete` puts it back in the pickers, but the
+  // purged edits are gone for good, so edits still pending review are purged only with --force, or with
+  // --force-pending <n> up to the n an editor's delete dialog named (more pending than that is refused).
+  // --seen-through <edit> is the newest edit id of the listing that dialog counted from (its row's
+  // `lastEdit`): a pending edit newer than that is refused too, even one that joined a counted change.
+  const del = flagValue(args, '--delete');
+  if (del) {
+    if (!core.isSafeSessionId(del)) fail(`--delete: invalid session id "${del}"`);
+    const named = flagValue(args, '--force-pending');
+    if (named !== undefined && !/^\d+$/.test(named)) fail(`--force-pending: expected the number of pending edits the confirmation named, got "${named}"`);
+    const seen = flagValue(args, '--seen-through');
+    if ((seen !== undefined || args.includes('--seen-through')) && !/^\d+$/.test(seen ?? ''))
+      fail(`--seen-through: expected the newest edit id of the listing the confirmation counted from, got "${seen ?? ''}"`);
+    const forced = args.includes('--force');
+    const pending = forced || named !== undefined ? 0 : core.sessionCounts(del).pending;
+    if (pending > 0)
+      fail(`${del} has ${pending} edit${pending === 1 ? '' : 's'} pending review; deleting the session purges ${pending === 1 ? 'that edit' : 'those edits'} for good. Review ${pending === 1 ? 'it' : 'them'} first, or pass --force.`);
+    try { core.deleteSession(del, { confirmedPending: forced ? Infinity : Number(named ?? 0), seenThrough: seen === undefined ? undefined : Number(seen) }); }
+    catch (e) { fail(String((e as Error)?.message || e)); }
+    if (args.includes('--json')) emitJson({ deleted: del });
+    else process.stdout.write(`removed session ${del} from Observatory and purged its captured edits (its transcript is untouched; \`oak sessions --undelete ${del}\` puts it back in the pickers, without those edits)\n`);
+    return;
+  }
+  const undel = flagValue(args, '--undelete');
+  if (undel) {
+    if (!core.isSafeSessionId(undel)) fail(`--undelete: invalid session id "${undel}"`);
+    if (!core.hiddenSessions().has(undel)) fail(`${undel} was not deleted`);
+    core.unhideSession(undel);
+    if (core.hiddenSessions().has(undel)) fail(`could not restore ${undel}`);
+    if (args.includes('--json')) emitJson({ undeleted: undel });
+    else process.stdout.write(`restored ${undel}\n`);
+    return;
+  }
   // EVERY workspace's sessions by conversation recency, titled from a bounded sidecar-cached scan —
   // no per-session log parse, no pending counts (recency + name is what the switch decision needs).
   // --session pins the listing to the session being reviewed, so a pinned conversation with no edits
@@ -535,51 +1809,31 @@ function cmdSessions(args: string[] = []): void {
   // transcripts, which live under the mangled launch cwd — so listed from outside the workspace the
   // rows fell back to bare session ids, which is what "the selector shows the id instead of the name"
   // was. The workspace is the session's, not the terminal's.
-  const meta = core.sessionMeta(flagValue(args, '--root') ?? process.cwd(), args.includes('--session') ? getSessionId(args) : null);
-  // `--remote` folds in every configured machine. OPT-IN, and only here: each host is an ssh, so a
-  // caller that just wants this machine's sessions must not pay for one — and the editors ask for it
-  // through their own async CLI spawn, which keeps the ssh off their UI thread entirely.
-  if (args.includes('--remote')) {
-    const prefs = core.readPrefs();
-    const rows = core.remoteRows((prefs.remotes ?? []).filter((r) => r.enabled !== false));
-    (meta.sessions as unknown as Record<string, unknown>[]).push(...(rows as unknown as Record<string, unknown>[]));
-    (meta.sessions as { lastActiveMs: number }[]).sort((a, b) => b.lastActiveMs - a.lastActiveMs);
-  }
+  const cwd = flagValue(args, '--root') ?? process.cwd();
+  const reviewing = args.includes('--session') ? getSessionId(args) : null;
+  const meta = core.sessionMeta(cwd, reviewing);
   if (args.includes('--json')) {
     emitJson(meta);
     return;
   }
   if (meta.sessions.length === 0) {
-    process.stdout.write(c.dim('no sessions for this workspace yet.\n'));
+    process.stdout.write(c.dim('no sessions on this machine yet.\n'));
     return;
   }
-  // Widest workspace label, so the column lines up instead of every row starting at its own column.
-  const wsW = Math.min(30, Math.max(0, ...meta.sessions.map((s) => (s.workspace || '').length)));
-  // …and the machine, in its own column beside it, for the same reason.
-  const mcW = Math.max(0, ...meta.sessions.map((s) => (s.machine || '').length));
+  let workspace: string | undefined;
   for (const s of meta.sessions) {
+    if (workspace !== s.workspace) {
+      workspace = s.workspace;
+      const count = meta.sessions.filter((r) => r.workspace === workspace).length;
+      process.stdout.write(`\n${c.bold(workspace || 'Unknown workspace')} · ${count} session${count === 1 ? '' : 's'}\n`);
+    }
     const mark = s.current ? c.green('● ') : '  ';
-    const machine = c.dim((s.machine || '?').padEnd(mcW));
-    const ws = c.dim((s.workspace || '?').padEnd(wsW));
-    const name = s.title ? `${c.bold(s.title)}  ${c.dim(s.id)}` : c.bold(s.id);
-    // A bridged session is not an empty one. Saying "no edits" about a conversation whose content is
-    // on Claude Code's bridge sends the reader to open something that is not there.
-    const did =
-      s.origin === 'bridged'
-        ? 'on the Claude Code bridge — not on this machine'
-        : s.edits
-          ? `${s.edits} edit(s)` + (s.files ? ` · ${s.files} file(s)` : '') + (s.pending ? ` · ${s.pending} pending` : ' · reviewed')
-          : 'no edits';
-    process.stdout.write(`${mark}${machine}  ${ws}  ${name}  ${c.dim(`${did} · ${core.relTime(s.lastActiveMs)}`)}\n`);
+    const agent = s.agent !== 'claude' ? `[${s.agent}] ` : '';
+    const stats = `${s.edits} edit${s.edits === 1 ? '' : 's'} · ${core.compactTokens(s.tokens)} tok · ${core.compactDuration(s.durationMs)} · ${s.model || 'model unknown'}`;
+    process.stdout.write(`${mark}${agent}${c.bold(s.title || s.id)}  ${c.dim(s.id)}  ${c.dim(stats + ' · ' + core.relTime(s.lastActiveMs))}\n`);
   }
-  const bridged = meta.sessions.filter((s) => s.origin === 'bridged').length;
-  process.stdout.write(
-    c.dim(
-      `\n● = resolves for this directory · every workspace is listed, with the machine it is on` +
-        (bridged ? ` · ${bridged} bridged (content lives on the bridge)` : '') +
-        '\nuse `--session <id>` to target another\n'
-    )
-  );
+  process.stdout.write(c.dim('\n● = resolves for this workspace · sessions on this machine, grouped by workspace\nuse `--session <id>` to target another\n'));
+
 }
 
 // --- review commands ---
@@ -596,8 +1850,15 @@ function relFile(file: string): string {
  *  FIRST: `path.resolve('')` is the cwd, which would silently widen an invalid scope to everything. */
 function canonUnder(under: string): string {
   const path = require('path');
-  const core = require('@claude-observatory/core') as typeof import('@claude-observatory/core');
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
   return core.canonPath(path.resolve(under));
+}
+
+/** `--ids … --units`: each id names a review UNIT (one row on a surface), so it widens to every record
+ *  of that unit. A surface with core in-process applies this rule before `--ids`; this is the same rule
+ *  run where the store is, for a caller that holds only the ids (the Review tab on another machine). */
+function expandUnits(core: Core, session: string, ids: number[], args: string[]): number[] {
+  return args.includes('--units') ? [...new Set(ids.flatMap((id) => core.groupMembers(session, id)))] : ids;
 }
 
 function statusLabel(s: string): string {
@@ -626,7 +1887,7 @@ const REVIEW_PATCH_BUDGET = 8 * 1024 * 1024;
  * batching it would respawn every view on each prompt selection, which is the opposite of the saving.
  */
 function cmdReview(args: string[]): void {
-  const core = require('@claude-observatory/core') as typeof import('@claude-observatory/core');
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
   // `--root` scopes this to the SESSION's workspace, not the terminal's — same rule every
   // transcript-derived view follows, and the reason a dashboard opened outside the workspace used to
   // render empty with no error.
@@ -686,6 +1947,16 @@ function cmdReview(args: string[]): void {
       ts: rec.ts,
       added: d.added,
       removed: d.removed,
+
+      // caught this projection dropping them — the raw log had the fields, `list --json` did not).
+      // `partial` is the one renderers act on: a review-only record must be marked BEFORE the
+      // reader tries to undo it, not explained after.
+      ...(rec.source ? { source: rec.source } : {}),
+      ...(rec.acpSessionId ? { acpSessionId: rec.acpSessionId } : {}),
+      ...(rec.promptId ? { promptId: rec.promptId } : {}),
+      ...((rec.partial || core.uncertainCreation(rec)) ? { partial: true } : {}),
+      capture: core.captureSummary(rec),
+      runtime: rec.runtime, model: rec.model, provenance: rec.provenance, attribution: rec.attribution, toolCallId: rec.toolCallId, nativeTurnId: rec.nativeTurnId,
       ...(patch === undefined ? {} : { patch }),
     };
   });
@@ -763,7 +2034,7 @@ function cmdReview(args: string[]): void {
 }
 
 function cmdList(args: string[]): void {
-  const core = require('@claude-observatory/core') as typeof import('@claude-observatory/core');
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
   const session = getSessionId(args);
   let log = core.reviewEdits(session); // collapse same-code pending edits into one review unit (like the tree)
 
@@ -853,7 +2124,7 @@ function cmdList(args: string[]): void {
 /** `timeline` — a newest-first chronological feed of edits (time · id · status · Δ · file), the
  *  terminal counterpart to the editors' Timeline. `list` groups by file; this is time-ordered. */
 function cmdTimeline(args: string[]): void {
-  const core = require('@claude-observatory/core') as Core;
+  const core = require('@oak-observatory/core') as Core;
   const session = getSessionId(args);
   const log = core.readLog(session);
   // This feed is deliberately RAW — every record, in the order it happened, because a phantom record
@@ -901,7 +2172,7 @@ function cmdTimeline(args: string[]): void {
 
 /** The full, typed action timeline (every tool call Claude made) — zero-token, mined from the transcript. */
 function cmdActions(args: string[]): void {
-  const core = require('@claude-observatory/core') as Core;
+  const core = require('@oak-observatory/core') as Core;
   const session = getSessionId(args);
   const actions = core.parseActions(process.cwd(), session);
   if (args.includes('--json')) {
@@ -962,7 +2233,7 @@ function cmdRisk(args: string[]): void {
   // and rendered empty with no error. `changemap`, `multitask` and `observations` already did
   // this; these did not, and the split is what made the failure look like data rather than a bug.
   const viewRoot = flagValue(args, '--root') ?? process.cwd();
-  const core = require('@claude-observatory/core') as Core;
+  const core = require('@oak-observatory/core') as Core;
   const session = getSessionId(args);
   const rri = args.indexOf('--root'); // the workspace boundary for "outside", like changemap/footprint
   const root = rri >= 0 && args[rri + 1] ? args[rri + 1] : viewRoot;
@@ -1010,7 +2281,7 @@ function cmdEgress(args: string[]): void {
   // and rendered empty with no error. `changemap`, `multitask` and `observations` already did
   // this; these did not, and the split is what made the failure look like data rather than a bug.
   const viewRoot = flagValue(args, '--root') ?? process.cwd();
-  const core = require('@claude-observatory/core') as Core;
+  const core = require('@oak-observatory/core') as Core;
   const session = getSessionId(args);
   if (noTranscript(session, args.includes('--json'), flagValue(args, '--root') ?? undefined)) return;
   const eri = args.indexOf('--root'); // the workspace boundary for the `file` channels below
@@ -1043,7 +2314,7 @@ function cmdEgress(args: string[]): void {
  *  an empty result means "we couldn't look", not "nothing happened" — and printing the second is a false
  *  statement of absence. Returns true when the caller should stop. */
 function noTranscript(session: string, json: boolean, root?: string): boolean {
-  const core = require('@claude-observatory/core') as Core;
+  const core = require('@oak-observatory/core') as Core;
   // `root`, not `process.cwd()`. This guard looked for the transcript under the TERMINAL's directory
   // while its caller had already been told, via `--root`, which workspace the session belongs to — so
   // every audit verb reported "no transcript" for a session whose transcript was sitting right where
@@ -1103,7 +2374,7 @@ function cmdProcesses(args: string[]): void {
   // and rendered empty with no error. `changemap`, `multitask` and `observations` already did
   // this; these did not, and the split is what made the failure look like data rather than a bug.
   const viewRoot = flagValue(args, '--root') ?? process.cwd();
-  const core = require('@claude-observatory/core') as Core;
+  const core = require('@oak-observatory/core') as Core;
   const session = getSessionId(args);
   if (noTranscript(session, args.includes('--json'), flagValue(args, '--root') ?? undefined)) return;
   const list = core.sessionProcesses(viewRoot, session);
@@ -1162,17 +2433,39 @@ function cmdFeed(args: string[]): void {
   // and rendered empty with no error. `changemap`, `multitask` and `observations` already did
   // this; these did not, and the split is what made the failure look like data rather than a bug.
   const viewRoot = flagValue(args, '--root') ?? process.cwd();
-  const core = require('@claude-observatory/core') as Core;
+  const core = require('@oak-observatory/core') as Core;
   const session = getSessionId(args);
-  const kind = (flagValue(args, '--kind') || 'session') as 'session' | 'agent' | 'workflow' | 'task' | 'process';
+  // `--feed-agent` is the Agent screen's channel for VIEWING a spawned subagent's own feed read-only.
+  // Feed-specific like `--feed-limit`, deliberately NOT the generic `--kind`/`--id`: the Agent batch
+  // also carries the `prompts` view, which reads `--id`, so a shared id would retarget IT (see the note
+  // on VIEWS_FOR.claude). When present it pins this view to that subagent's transcript.
+  const feedAgent = flagValue(args, '--feed-agent');
+  const kind = (feedAgent ? 'agent' : flagValue(args, '--kind') || 'session') as 'session' | 'agent' | 'workflow' | 'task' | 'process';
   if (!['session', 'agent', 'workflow', 'task', 'process'].includes(kind)) fail(`--kind must be session|agent|workflow|task|process (got "${kind}").`);
-  const id = flagValue(args, '--id') || '';
+  const id = feedAgent || flagValue(args, '--id') || '';
   if (kind !== 'session' && !id) fail(`--id <${kind} id> is required for --kind ${kind}.`);
-  const limitRaw = flagValue(args, '--limit');
+  // `--feed-limit` outranks `--limit` and is the Agent screen's channel: that screen IS the feed, and a
+  // 60-row window left ~1,300 entries unreachable on a long session.
+  // A dedicated flag so raising the Agent screen's depth
+  // never perturbs any other view that shares the batch's argv.
+  const limitRaw = flagValue(args, '--feed-limit') ?? flagValue(args, '--limit');
   const limit = limitRaw ? Math.max(1, Number(limitRaw) || 0) : undefined;
   const res = core.liveFeed(viewRoot, session, { kind, id }, limit ? { limit } : {});
   if (args.includes('--json')) {
-    emitJson(res);
+    // The session RECAP rides the feed payload (0.10.0): the terminal's Agent screen shows it
+    // directly above its prompt, and this is the view that surface already polls. `recapOf` is the
+    // product's single definition — the CLI, both editors and the dashboard cannot disagree — and
+    // `recapSource` travels with it, because an unlabelled recap reads as a considered summary
+    // when it may be the session's title or the last thing the agent said.
+    let recap: Record<string, unknown> = {};
+    if (kind === 'session') {
+      try {
+        recap = core.recapOf(session, core.transcriptInsights(viewRoot, session)) as unknown as Record<string, unknown>;
+      } catch {
+        /* no transcript yet — the surface renders its own empty state */
+      }
+    }
+    emitJson({ ...res, ...recap });
     return;
   }
   const age = res.lastTs ? core.relTime(res.lastTs) : 'no activity yet';
@@ -1183,6 +2476,7 @@ function cmdFeed(args: string[]): void {
   if (res.note) process.stdout.write(c.dim(`${res.note}\n`));
   process.stdout.write('\n');
   if (res.truncated) process.stdout.write(c.dim(`… ${res.truncated} earlier entr${res.truncated === 1 ? 'y' : 'ies'} not shown\n`));
+  const { wrapVisible, stripSgr } = require('@oak-observatory/tui') as typeof import('@oak-observatory/tui');
   for (const e of res.entries) {
     if (e.kind === 'output') {
       process.stdout.write(`${e.label}\n`);
@@ -1192,9 +2486,48 @@ function cmdFeed(args: string[]): void {
     // own clock (rolling past midnight mid-list). Both editors already format the same ts locally.
     const when = e.ts ? c.dim(new Date(e.ts).toTimeString().slice(0, 8) + ' ') : '';
     const mark = e.ok === false ? c.red('✗ ') : '  ';
-    process.stdout.write(`${when}${mark}${c.cyan(e.label)}${e.detail ? c.dim(' ' + e.detail.replace(/\s+/g, ' ').slice(0, 90)) : ''}\n`);
+    const words = e.kind === 'reasoning' ? e.reasoning : e.kind === 'prompt' ? e.promptText : undefined;
+    const line = `${when}${mark}${c.cyan(e.label)}${e.target ? ' ' + e.target : ''}${words ? ' — ' + words : ''}${e.detail ? '  ' + c.dim('[' + e.detail + ']') : ''}`;
+    for (const source of line.split('\n')) for (const part of wrapVisible(source, process.stdout.columns || 100))
+      process.stdout.write((e.reasoningKind === 'thinking' ? c.dim(stripSgr(part)) : part) + '\n');
   }
   if (!res.entries.length) process.stdout.write(c.dim('nothing recorded yet\n'));
+}
+
+/** `conversation` — the transcript as renderer-ready session updates. JSON is the pane contract. */
+function cmdConversation(args: string[]): void {
+  const core = require('@oak-observatory/core') as Core;
+  const session = getSessionId(args);
+  const root = flagValue(args, '--root') ?? process.cwd();
+  // Provenance only: diagnose a local sync copy without parsing or presenting its conversation.
+  if (args.includes('--source-info')) {
+    // The raw lookup: session listing and resolution skip sync mirrors, but provenance must find one to report it.
+    const transcript = core.findTranscript(root, session) ?? core.transcriptForSession(session) ?? core.describeSession(session).transcript;
+    return emitJson(transcript ? { ...core.isMirroredTranscript(transcript), syncedAt: require('fs').statSync(transcript).mtimeMs } : { mirrored: false });
+  }
+  const numberFlag = (name: string, minimum: number): number | undefined => {
+    const raw = flagValue(args, name);
+    if (raw === undefined) return undefined;
+    const value = Number(raw);
+    if (!Number.isSafeInteger(value) || value < minimum) fail(`\`${name} ${raw}\` must be an integer ≥ ${minimum}`);
+    return value;
+  };
+  const limit = numberFlag('--limit', 1);
+  const since = numberFlag('--since', 0);
+  const result = core.conversationEvents(session, { root, ...(limit !== undefined ? { limit } : {}), ...(since !== undefined ? { since } : {}),
+    ...(args.includes('--with-source') ? { includeSource: true } : {}), ...(flagValue(args, '--source') ? { source: flagValue(args, '--source')! } : {}) });
+  if (args.includes('--json')) return emitJson(result);
+  for (const event of result.events) {
+    const update = event.update as Record<string, unknown>;
+    const kind = String(update.sessionUpdate ?? '');
+    const content = update.content as { text?: unknown } | undefined;
+    if (kind === 'user_prompt') process.stdout.write(`> ${String(content?.text ?? '')}\n`);
+    else if (kind === 'agent_message_chunk') process.stdout.write(`${String(content?.text ?? '')}\n`);
+    else if (kind === 'agent_thought_chunk') process.stdout.write(c.dim(`thinking: ${String(content?.text ?? '')}\n`));
+    else if (kind === 'tool_call') process.stdout.write(c.dim(`[tool] ${String(update.title ?? update.kind ?? 'call')}\n`));
+    else if (kind === 'plan') process.stdout.write(c.dim(`[plan] ${((update.entries as { content?: string }[]) ?? []).map((e) => e.content ?? '').filter(Boolean).join(' · ')}\n`));
+    else if (kind === 'turn_end') process.stdout.write(c.dim(`— turn ended (${String(update.stopReason ?? '?')}) · ${Number(update.edits ?? 0)} edit(s) captured\n`));
+  }
 }
 
 /** `prompts` — the session broken into what the USER asked for, in order, each carrying what it
@@ -1207,7 +2540,7 @@ function cmdPrompts(args: string[]): void {
   // and rendered empty with no error. `changemap`, `multitask` and `observations` already did
   // this; these did not, and the split is what made the failure look like data rather than a bug.
   const viewRoot = flagValue(args, '--root') ?? process.cwd();
-  const core = require('@claude-observatory/core') as Core;
+  const core = require('@oak-observatory/core') as Core;
   const session = getSessionId(args);
   if (noTranscript(session, args.includes('--json'), flagValue(args, '--root') ?? undefined)) return;
   const reqs = core.sessionPrompts(viewRoot, session);
@@ -1332,7 +2665,7 @@ function fmtDur(ms: number): string {
 /** `subagents` (alias `agents`) — every subagent this session spawned, each with its own action
  *  timeline + metrics (duration / tokens), mined zero-token from subagents/*.jsonl. */
 function cmdSubagents(args: string[]): void {
-  const core = require('@claude-observatory/core') as Core;
+  const core = require('@oak-observatory/core') as Core;
   const session = getSessionId(args);
   const subs = core.parseSubagents(process.cwd(), session);
   const sum = core.summarizeSubagents(subs);
@@ -1382,7 +2715,7 @@ function cmdSubagents(args: string[]): void {
  *  edits, files touched, risk flags. Agent-facing digest (call it mid-run to see what siblings touch);
  *  --json defaults to siblings only (excludes self), --all includes self. */
 function cmdSiblings(args: string[]): void {
-  const core = require('@claude-observatory/core') as Core;
+  const core = require('@oak-observatory/core') as Core;
   const session = getSessionId(args);
   // --repo widens the scope from this project dir to every WORKTREE of the same git repo (§S3):
   // each sibling then carries its worktree/gitBranch/phase, and the summary's conflicts count comes
@@ -1424,7 +2757,7 @@ function cmdSiblings(args: string[]): void {
  *  task/todos + ±lines), and the cross-agent live file conflicts. One JSON payload; both editors render it
  *  thin, no client aggregation. Zero token, git-free, path-only. */
 function cmdMultitask(args: string[]): void {
-  const core = require('@claude-observatory/core') as Core;
+  const core = require('@oak-observatory/core') as Core;
   const session = getSessionId(args);
   const ri = args.indexOf('--root'); // repo-scoped: honor --root like changemap/tree (editors point it at the workspace)
   const cwd = flagValue(args, '--root') ?? process.cwd();
@@ -1438,6 +2771,14 @@ function cmdMultitask(args: string[]): void {
     const pd = transcript
       ? core.agentPhaseDetail(transcript)
       : { phase: 'idle' as const, confidence: 'heuristic' as const };
+    // The session's human title — the SAME source the session selector uses (preferredSessionTitle's
+    // order, normalized), bounded + sidecar-cached, so even a folded row pays a stat
+    // rather than a parse. Null → the renderer falls back to the branch. (The
+    // observatory lists sessions BY TITLE, not by "feat/acp".)
+    const title = transcript ? core.fastSessionTitle(transcript, sib.id) : null;
+    // The store's on-disk footprint and when the session last moved (for the "10m ago" the master shows before the
+    // title). `storeBytes` is cached on the store's shape, so a folded row still pays only a stat.
+    const storeBytes = core.storeBytes(sib.id);
     // FOLDED: a conversation more than FLEET_FOLD_MS old, and not the one under review. 24 of the 33
     // siblings in this repo qualify, and building their maps was most of what a cold refresh cost.
     // Serve one from the disk cache if it is already there; otherwise report the row as UNBUILT and
@@ -1450,6 +2791,9 @@ function cmdMultitask(args: string[]): void {
         session: sib.id,
         worktree: sib.worktree,
         gitBranch: sib.gitBranch,
+        title,
+        lastActiveMs: sib.lastMs,
+        storeBytes,
         self: sib.self,
         phase: pd.phase,
         phaseConfidence: pd.confidence,
@@ -1460,6 +2804,12 @@ function cmdMultitask(args: string[]): void {
         diff: { added: 0, removed: 0 },
         tokens: 0,
         durationMs: 0,
+        // PENDING (unresolved) edits and liveness — the two facts the observatory master filters on, so a
+        // folded-but-unreviewed session still shows. Both come from listRepoSiblings (sidecar-cached), so
+        // a folded row still pays only a stat. `edits` stays 0: its map is unbuilt, `pending` is not.
+        edits: 0,
+        pending: sib.pending,
+        active: sib.active === true,
         risk: sib.risk,
         outside: { reads: 0, writes: 0 },
         compactions: 0,
@@ -1495,15 +2845,28 @@ function cmdMultitask(args: string[]): void {
         running: s.running, // the digest's own liveness — dropping it left consumers deriving it from prose
         todos: s.todos,
         currentTask: s.currentTask,
+        ts: s.ts ?? 0, // spawn time — so the detail pane can order most-recent-first and show its age
+        model: s.model ?? '', // the spawn's OWN model/effort, from its transcript
+        effort: s.effort ?? '',
         edits: roll ? roll.edits : 0,
         added: roll ? roll.added : 0,
         removed: roll ? roll.removed : 0,
+        // What the subagent cost, so the Workers tab shows it the same metrics as its parent.
+        tokens: s.tokens ?? 0,
+        // The ↑in·↓out·↺cacheRead split the statusline shows.
+        tokensIn: s.tokensIn ?? 0,
+        tokensOut: s.tokensOut ?? 0,
+        tokensCacheRead: s.tokensCacheRead ?? 0,
+        durationMs: s.durationMs ?? 0,
       };
     });
     return {
       session: sib.id,
       worktree: sib.worktree,
       gitBranch: sib.gitBranch,
+      title,
+      lastActiveMs: sib.lastMs,
+      storeBytes,
       self: sib.self,
       phase: pd.phase,
       phaseConfidence: pd.confidence,
@@ -1512,6 +2875,16 @@ function cmdMultitask(args: string[]): void {
       subagents,
       files: sib.files,
       diff: { added: map.summary.added, removed: map.summary.removed },
+      // The agent's own edit count,
+      // and its live flag — the fleet's own `active`, so a row can group under "active" without the
+      // renderer re-deriving liveness from phase alone. `units` is edits after same-code collapse, the
+      // review count every other surface shows.
+      edits: map.summary.units ?? 0,
+      // PENDING (unresolved) edits — what the observatory master filters "has work to review" on, and what
+      // resolve zeroes; `units` counts kept/undone rows too, so it would keep a fully-resolved session on
+      // the list forever. `sib.pending` is the same count the fleet's grouping uses.
+      pending: sib.pending,
+      active: sib.active === true,
       tokens: usage.total,
       durationMs: usage.durationMs,
       risk: sib.risk,
@@ -1567,13 +2940,13 @@ function cmdMultitask(args: string[]): void {
 /** `tasklog` (§2.5) — the cross-agent task log: one row per stable taskId, unioned across every
  *  worktree-sibling + subagent of this repo. Always JSON (TaskLogEntry[]). Zero token, git-free. */
 function cmdTaskLog(_args: string[]): void {
-  const core = require('@claude-observatory/core') as Core;
+  const core = require('@oak-observatory/core') as Core;
   emitJson(core.crossAgentTaskLog(process.cwd()));
 }
 
 /** `metrics` — session numbers: ±lines, action/error counts, per-subagent duration/tokens, tool latency. */
 function cmdMetrics(args: string[]): void {
-  const core = require('@claude-observatory/core') as Core;
+  const core = require('@oak-observatory/core') as Core;
   const session = getSessionId(args);
   const m = core.sessionMetrics(process.cwd(), session);
   if (args.includes('--json')) {
@@ -1618,6 +2991,8 @@ function cmdMetrics(args: string[]): void {
  * loudly instead of acting on the wrong thing.
  */
 function flagValue(args: string[], name: string): string | undefined {
+  const inline = args.find(a => a.startsWith(name + '='));
+  if (inline !== undefined) return inline.slice(name.length + 1);
   const i = args.indexOf(name);
   if (i < 0) return undefined;
   const v = args[i + 1];
@@ -1625,7 +3000,10 @@ function flagValue(args: string[], name: string): string | undefined {
 }
 
 /** Flags that consume the token after them — so a numeric VALUE is never read as a positional id. */
-const VALUE_FLAGS = new Set(['--session', '--file', '--under', '--ids', '--root', '--filter', '--dir', '--channel', '--from-prompt']);
+// `--tab` is here because its VALUE is a tab id, and `review` is also a command name: without this
+// the parser reads `--tab review` as the flag followed by the review verb and refuses the whole
+// invocation. A value flag whose values collide with verbs has to be declared, not inferred.
+const VALUE_FLAGS = new Set(['--session', '--file', '--under', '--ids', '--root', '--filter', '--dir', '--channel', '--from-prompt', '--tab']);
 
 /**
  * The positional edit id if one was typed, else undefined — requireId's scan without the failure.
@@ -1653,7 +3031,7 @@ function refuseScopeWithId(args: string[], verb: string): void {
   if (id === undefined) return;
   fail(
     `\`${verb}\` was given both a scope flag and edit id ${id}, which mean different things.\n` +
-      `  For just that edit:   claude-observatory ${verb} ${id}\n` +
+      `  For just that edit:   oak ${verb} ${id}\n` +
       `  For the whole scope:  drop the id and re-run.`
   );
 }
@@ -1672,18 +3050,18 @@ function refuseScopeWithId(args: string[], verb: string): void {
  * all-digit prompt id (or a bare index) as a positional edit id.
  */
 function checkpointArg(
-  core: typeof import('@claude-observatory/core'),
+  core: typeof import('@oak-observatory/core'),
   args: string[],
   session: string,
   verb: string
-): import('@claude-observatory/core').CheckpointScope {
+): import('@oak-observatory/core').CheckpointScope {
   const ref = flagValue(args, '--from-prompt');
-  if (!ref) fail(`\`${verb} --from-prompt <id>\` requires a prompt id — run \`claude-observatory prompts\` to list them`);
+  if (!ref) fail(`\`${verb} --from-prompt <id>\` requires a prompt id — run \`oak prompts\` to list them`);
   const cwd = process.cwd();
   const windows = core.promptWindows(cwd, session);
   if (!windows.length) fail('no transcript for this session — the prompt boundaries come from it');
   if (!windows.some((w) => w.id === ref || String(w.index) === ref)) {
-    fail(`no prompt \`${ref}\` in this session — run \`claude-observatory prompts\` to list them (1..${windows.length})`);
+    fail(`no prompt \`${ref}\` in this session — run \`oak prompts\` to list them (1..${windows.length})`);
   }
   return core.checkpointScope(cwd, session, ref as string);
 }
@@ -1703,7 +3081,7 @@ function requireId(args: string[]): number {
       break;
     }
   }
-  if (!raw) fail('expected an edit id, e.g. `claude-observatory diff 3`');
+  if (!raw) fail('expected an edit id, e.g. `oak diff 3`');
   return parseInt(raw, 10);
 }
 
@@ -1734,7 +3112,7 @@ function refuseUnsupportedDryRun(args: string[], verb: string): void {
 }
 
 function cmdDiff(args: string[]): void {
-  const core = require('@claude-observatory/core') as typeof import('@claude-observatory/core');
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
   const session = getSessionId(args);
   const id = requireId(args);
   // The DISPLAY record first: every list shows collapsed review units, and `diff <id>` on a unit's
@@ -1743,6 +3121,7 @@ function cmdDiff(args: string[]): void {
   // hand-typed member id keeps meaning the single record it names.
   const rec = core.reviewEdits(session).find((r) => r.id === id) ?? core.findRecord(session, id);
   if (!rec) fail(`no edit #${id} in session ${session}`);
+  if (args.includes('--json')) return emitJson({ session, id, file: rec.file, patch: core.coloredDiff(session, rec as EditRecord, false) });
   process.stdout.write(core.coloredDiff(session, rec as EditRecord, isTTY()) + '\n');
   // `--patch` means "the patch and nothing else". The trailer below is a hint for a human at a
   // prompt; to anything that PARSES this output it is one more line of diff, and the dashboard
@@ -1758,11 +3137,11 @@ function cmdKeep(args: string[]): void {
   if (args.includes('--from-prompt')) {
     fail(
       '`keep --from-prompt <id>` is not supported — only `undo` and `redo` take a rewind scope.\n' +
-        '  For one ask\'s edits:   claude-observatory keep --ids <a,b,c>\n' +
-        '  For the whole session: claude-observatory keep --all'
+        '  For one ask\'s edits:   oak keep --ids <a,b,c>\n' +
+        '  For the whole session: oak keep --all'
     );
   }
-  const core = require('@claude-observatory/core') as typeof import('@claude-observatory/core');
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
   const session = getSessionId(args);
   const json = args.includes('--json');
   // Bulk: --all (every pending), --file <substr> (pending edits in matching files), or --under <path>
@@ -1776,7 +3155,7 @@ function cmdKeep(args: string[]): void {
     if (!raw) fail('`keep --ids <a,b,c>` requires a comma-separated id list');
     const ids = raw.split(',').map((x) => parseInt(x.trim(), 10)).filter((n) => Number.isFinite(n));
     if (!ids.length) fail('`keep --ids <a,b,c>` got no valid integer ids');
-    const kept = core.setStatusMany(session, ids, 'kept');
+    const kept = core.setStatusMany(session, expandUnits(core, session, ids, args), 'kept');
     core.autoClearDemo(session);
     if (json) {
       emitJson({ kept: kept.length, ids: kept });
@@ -1847,10 +3226,39 @@ function cmdKeep(args: string[]): void {
   process.stdout.write(c.green('✓ ') + `kept ${label} (${relFile(rec.file)})\n`);
 }
 
+/**
+ * `undo|redo --ids <a,b,c> --record-only` — record what an undo or redo ALREADY did on disk, touching
+ * no file: the repair a "not recorded" report names when the store stayed busy after the files changed.
+ * Exact ids (no unit widening): the report lists exactly the records whose files moved.
+ */
+function cmdRecordOnly(core: Core, session: string, args: string[], verb: 'undo' | 'redo'): void {
+  if (['--all', '--file', '--under', '--from-prompt', '--force', '--units'].some((f) => args.includes(f))) {
+    fail(`\`${verb} --record-only\` takes only --ids <a,b,c> — the edits a "not recorded" report named`);
+  }
+  const raw = flagValue(args, '--ids');
+  if (!raw) fail(`\`${verb} --record-only\` requires --ids <a,b,c> — the edits a "not recorded" report named`);
+  const ids = (raw as string).split(',').map((s) => parseInt(s.trim(), 10)).filter((n) => Number.isInteger(n));
+  if (!ids.length) fail(`\`${verb} --ids <a,b,c> --record-only\` got no valid integer ids`);
+  const unknown = ids.filter((id) => !core.findRecord(session, id));
+  if (unknown.length) fail(`no edit #${unknown.join(', #')} in session ${session}`);
+  const recorded = core.recordOnly(session, ids, verb);
+  const state = verb === 'undo' ? 'reverted' : 're-applied';
+  if (args.includes('--json')) {
+    emitJson({ recorded: recorded.length, ids: recorded });
+    return;
+  }
+  if (!recorded.length) {
+    process.stdout.write(c.dim(`nothing to record — those edits are already recorded as ${state}\n`));
+    return;
+  }
+  process.stdout.write(c.green('✓ ') + `recorded ${recorded.length} edit(s) as ${state} — no file was changed\n`);
+}
+
 function cmdUndo(args: string[]): void {
   refuseUnsupportedDryRun(args, 'undo');
-  const core = require('@claude-observatory/core') as typeof import('@claude-observatory/core');
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
   const session = getSessionId(args);
+  if (args.includes('--record-only')) return cmdRecordOnly(core, session, args, 'undo');
   // Bulk: --all (every pending in the session), --file <substr> (pending edits in matching files),
   // --under <path> (pending edits at-or-beneath a file/folder path — the editors' folder/file Revert),
   // or --ids <a,b,c> (an explicit pending-edit id set — the Overview's Folder-axis Reject, which acts
@@ -1879,6 +3287,7 @@ function cmdUndo(args: string[]): void {
       if (!raw) fail('`undo --ids <a,b,c>` requires a comma-separated id list');
       ids = raw.split(',').map((s) => parseInt(s.trim(), 10)).filter((n) => Number.isInteger(n));
       if (!ids.length) fail('`undo --ids <a,b,c>` got no valid integer ids');
+      ids = expandUnits(core, session, ids, args);
     }
     if (fp >= 0) {
       const scope = checkpointArg(core, args, session, 'undo');
@@ -1922,6 +3331,8 @@ function cmdUndo(args: string[]): void {
         ids: res.ids,
         ...(units === undefined ? {} : { units }),
         ...(res.firstConflict === undefined ? {} : { firstConflict: res.firstConflict }),
+        // Files reverted but not recorded: a JSON caller must say so (exit stays 0 so it can be parsed).
+        ...(res.unrecorded ? { unrecorded: res.unrecorded } : {}),
       });
       return;
     }
@@ -1932,7 +3343,7 @@ function cmdUndo(args: string[]): void {
       return;
     }
     process.stdout.write(
-      (res.conflicts || res.errors ? c.yellow('⚠ ') : c.green('✓ ')) +
+      (res.conflicts || res.errors || res.unrecorded ? c.yellow('⚠ ') : c.green('✓ ')) +
         `reverted ${res.undone} edit(s)${scope}` +
         (res.conflicts ? ` · ${res.conflicts} conflict(s) left (undo individually with --force)` : '') +
         (res.errors ? ` · ${res.errors} refused` : '') +
@@ -1943,6 +3354,10 @@ function cmdUndo(args: string[]): void {
     if (res.errors && res.firstError) process.stdout.write(c.yellow('  ↳ ') + res.firstError + '\n');
     // Same for a conflict: when it is a named-dependent refusal, the name and the closure are the remedy.
     if (res.conflicts && res.firstConflict) process.stdout.write(c.yellow('  ↳ ') + res.firstConflict + '\n');
+    if (res.unrecorded) {
+      process.stdout.write(c.red('✗ ') + res.unrecorded.message + '\n');
+      process.exit(1);
+    }
     return;
   }
   const id = requireId(args);
@@ -1974,6 +3389,7 @@ function cmdUndo(args: string[]): void {
       status: res.status,
       message: res.message,
       ...(res.dependents ? { dependents: res.dependents, closure: res.closure } : {}),
+      ...(res.unrecorded ? { unrecorded: res.unrecorded } : {}),
     });
     process.exit(res.status === 'conflict' ? 1 : res.ok ? 0 : 1);
   }
@@ -1995,7 +3411,7 @@ function cmdUndo(args: string[]): void {
  * deferred; this verb is the whole 0.9.4 surface.
  */
 function cmdAssign(args: string[]): void {
-  const core = require('@claude-observatory/core') as typeof import('@claude-observatory/core');
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
   const viewRoot = flagValue(args, '--root') ?? process.cwd();
   const session = getSessionId(args);
   const json = args.includes('--json');
@@ -2032,7 +3448,7 @@ function cmdAssign(args: string[]): void {
  * most recent one — statuses restored for a keep, files rewritten for an undo/redo.
  */
 function cmdOplog(args: string[]): void {
-  const core = require('@claude-observatory/core') as typeof import('@claude-observatory/core');
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
   const session = getSessionId(args);
   const json = args.includes('--json');
   const ops = core.readOperations(session);
@@ -2045,7 +3461,7 @@ function cmdOplog(args: string[]): void {
     const last = ops[0];
     const res = core.revertOperation(session, last);
     core.autoClearDemo(session); // a fully reviewed demo session leaves no residue
-    const scoped = res.result as { undone?: number; redone?: number; conflicts?: number } | undefined;
+    const scoped = res.result as { undone?: number; redone?: number; conflicts?: number; unrecorded?: { message: string } } | undefined;
     if (json) {
       emitJson({
         session,
@@ -2060,7 +3476,11 @@ function cmdOplog(args: string[]): void {
         ? `${res.restored} status(es) restored`
         : `${scoped?.undone ?? scoped?.redone ?? 0} edit(s) rewritten` +
           (scoped?.conflicts ? ` · ${scoped.conflicts} conflict(s) left` : '');
-    process.stdout.write(c.green('✓ ') + `reverted "${last.label}" — ${outcome}\n`);
+    process.stdout.write((scoped?.unrecorded ? c.yellow('⚠ ') : c.green('✓ ')) + `reverted "${last.label}" — ${outcome}\n`);
+    if (scoped?.unrecorded) {
+      process.stdout.write(c.red('✗ ') + scoped.unrecorded.message + '\n');
+      process.exit(1);
+    }
     return;
   }
   if (json) {
@@ -2078,8 +3498,9 @@ function cmdOplog(args: string[]): void {
 
 function cmdRedo(args: string[]): void {
   refuseUnsupportedDryRun(args, 'redo');
-  const core = require('@claude-observatory/core') as typeof import('@claude-observatory/core');
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
   const session = getSessionId(args);
+  if (args.includes('--record-only')) return cmdRecordOnly(core, session, args, 'redo');
   // Bulk: --all (every undone in the session) | --file <substr> | --under <path> | --ids <a,b,c> —
   // the forward mirror of `undo`'s selectors, via the shared core.redoScope.
   const fi = args.indexOf('--file');
@@ -2102,6 +3523,7 @@ function cmdRedo(args: string[]): void {
       if (!raw) fail('`redo --ids <a,b,c>` requires a comma-separated id list');
       bulkIds = raw.split(',').map((s) => parseInt(s.trim(), 10)).filter((n) => Number.isInteger(n));
       if (!bulkIds.length) fail('`redo --ids <a,b,c>` got no valid integer ids');
+      bulkIds = expandUnits(core, session, bulkIds, args);
     }
     if (fp >= 0) {
       // The prompt's WINDOW, scoped the same way the rewind scopes it — narrower than `redo --all`, which
@@ -2120,7 +3542,7 @@ function cmdRedo(args: string[]): void {
     }
     const bulk = core.redoScope(session, { under, fileSubstr: fileSub, ids: bulkIds });
     if (args.includes('--json')) {
-      emitJson({ redone: bulk.redone, conflicts: bulk.conflicts, total: bulk.total, ids: bulk.ids });
+      emitJson({ redone: bulk.redone, conflicts: bulk.conflicts, total: bulk.total, ids: bulk.ids, ...(bulk.unrecorded ? { unrecorded: bulk.unrecorded } : {}) });
       return;
     }
     const scope = fileSub ? ` in files matching "${fileSub}"` : under ? ` under ${relFile(under)}` : fp >= 0 ? ` from prompt ${flagValue(args, '--from-prompt')} onward` : bulkIds ? ` in ${bulkIds.length} selected edit(s)` : '';
@@ -2129,18 +3551,22 @@ function cmdRedo(args: string[]): void {
       return;
     }
     process.stdout.write(
-      (bulk.conflicts ? c.yellow('⚠ ') : c.green('✓ ')) +
+      (bulk.conflicts || bulk.unrecorded ? c.yellow('⚠ ') : c.green('✓ ')) +
         `re-applied ${bulk.redone} edit(s)${scope}` +
         (bulk.conflicts ? ` · ${bulk.conflicts} conflict(s) left (redo individually with --force)` : '') +
         '\n'
     );
+    if (bulk.unrecorded) {
+      process.stdout.write(c.red('✗ ') + bulk.unrecorded.message + '\n');
+      process.exit(1);
+    }
     return;
   }
   const id = requireId(args);
   const force = args.includes('--force');
   const res = force ? core.reapplyFile(session, id) : core.redoGroup(session, id);
   if (args.includes('--json')) {
-    emitJson({ ok: res.ok, status: res.status, message: res.message });
+    emitJson({ ok: res.ok, status: res.status, message: res.message, ...(res.unrecorded ? { unrecorded: res.unrecorded } : {}) });
     process.exit(res.status === 'conflict' ? 1 : res.ok ? 0 : 1);
   }
   if (res.status === 'conflict') {
@@ -2159,12 +3585,12 @@ function requireTaskId(args: string[], session: string): string {
   if (!found) {
     // `tasklog` unions taskIds across worktrees and subagents, so an id it lists may belong to a
     // SIBLING session and have no strict span here. `changemap.tasks[]` is the per-session source.
-    fail('expected a taskId, e.g. `claude-observatory task-keep <taskId>` (ids: `changemap` tasks[] / rollupByTask)');
+    fail('expected a taskId, e.g. `oak task-keep <taskId>` (ids: `changemap` tasks[] / rollupByTask)');
   }
   // A taskId this session never had is a MISTAKE, not an empty result. keepTask/undoTask answer both
   // with a bare zero, so `task-keep <garbage>` printed a green "kept 0 edit(s)" and exited 0 — the
   // caller could not tell a typo from a task that simply had nothing pending. (no-silent-fail)
-  const core = require('@claude-observatory/core') as Core;
+  const core = require('@oak-observatory/core') as Core;
   const known = core.sessionTaskIds(process.cwd(), session);
   if (!known.includes(found)) {
     fail(
@@ -2192,7 +3618,7 @@ function pickTaskIdArg(args: string[]): string | undefined {
  *  construction: only edits made while the task was actually in progress are in the set (core
  *  taskEditIds) — an edit that cannot be strictly placed is never included. */
 function cmdTaskKeep(args: string[]): void {
-  const core = require('@claude-observatory/core') as Core;
+  const core = require('@oak-observatory/core') as Core;
   const session = getSessionId(args);
   const taskId = requireTaskId(args, session);
   const res = core.keepTask(process.cwd(), session, taskId);
@@ -2212,7 +3638,7 @@ function cmdTaskKeep(args: string[]): void {
 /** `task-undo` (§6) — revert every PENDING edit in a task's STRICT in_progress span, newest-first.
  *  Same strict set as task-keep; each revert stays conflict-guarded per edit. */
 function cmdTaskUndo(args: string[]): void {
-  const core = require('@claude-observatory/core') as Core;
+  const core = require('@oak-observatory/core') as Core;
   const session = getSessionId(args);
   const taskId = requireTaskId(args, session);
   const res = core.undoTask(process.cwd(), session, taskId);
@@ -2220,24 +3646,28 @@ function cmdTaskUndo(args: string[]): void {
   if (args.includes('--json')) {
     // Same UndoScopeResult as the bulk path, so it gets the same JSON shape: a refusal that reaches one
     // caller and not the other is how a session that never empties gets no explanation.
-    emitJson({ undone: res.undone, conflicts: res.conflicts, errors: res.errors, firstError: res.firstError ?? null, total: res.total, ids: res.ids, ...(res.firstConflict === undefined ? {} : { firstConflict: res.firstConflict }) });
+    emitJson({ undone: res.undone, conflicts: res.conflicts, errors: res.errors, firstError: res.firstError ?? null, total: res.total, ids: res.ids, ...(res.firstConflict === undefined ? {} : { firstConflict: res.firstConflict }), ...(res.unrecorded ? { unrecorded: res.unrecorded } : {}) });
     return;
   }
   process.stdout.write(
-    (res.conflicts || res.errors ? c.yellow('⚠ ') : c.green('✓ ')) +
+    (res.conflicts || res.errors || res.unrecorded ? c.yellow('⚠ ') : c.green('✓ ')) +
       `reverted ${res.undone} edit(s) in task ${taskId}` +
       (res.conflicts ? ` · ${res.conflicts} conflict(s) left (undo individually with --force)` : '') +
       (res.errors ? ` · ${res.errors} refused` : '') +
       '\n'
   );
   if (res.errors && res.firstError) process.stdout.write(c.yellow('  ↳ ') + res.firstError + '\n');
+  if (res.unrecorded) {
+    process.stdout.write(c.red('✗ ') + res.unrecorded.message + '\n');
+    process.exit(1);
+  }
 }
 
 /** `task-clear` (§C) — drop the RESOLVED (kept/undone) edits of a task's STRICT edit set
  *  (core.taskEditIds → core.clearResolvedIds); pending edits are preserved. `--completed` clears
  *  every SETTLED task (edits present, none pending, none undone). */
 function cmdTaskClear(args: string[]): void {
-  const core = require('@claude-observatory/core') as Core;
+  const core = require('@oak-observatory/core') as Core;
   const session = getSessionId(args);
   const json = args.includes('--json');
   if (args.includes('--completed')) {
@@ -2278,7 +3708,7 @@ function cmdTaskClear(args: string[]): void {
  *  every panel updates live and review/undo genuinely work. `--fast` lands the whole scenario in
  *  well under a second (the automated-test mode); `--clean` removes every trace. Zero token. */
 async function cmdDemo(args: string[]): Promise<void> {
-  const core = require('@claude-observatory/core') as Core;
+  const core = require('@oak-observatory/core') as Core;
   const dir = flagValue(args, '--dir');
   const json = args.includes('--json');
   // The tour's script, printed rather than replayed. Both editors read the --json form, so the tour
@@ -2314,7 +3744,7 @@ async function cmdDemo(args: string[]): Promise<void> {
     process.stdout.write(c.dim(`\n${core.demoTrackBlurb(track)}\n`));
     process.stdout.write(
       c.dim(
-        `${steps.length} steps · start the session they describe with: claude-observatory demo\n` +
+        `${steps.length} steps · start the session they describe with: oak demo\n` +
           (track === 'everything'
             ? `  the short track is ${sizes.essentials} of these: demo --tour --essentials\n`
             : track === 'essentials'
@@ -2384,7 +3814,7 @@ async function cmdDemo(args: string[]): Promise<void> {
       `demo session ${res.session} is live — ${res.edits} pending edits in ${relFile(res.workspace)}` +
       (res.sibling ? ', plus a second agent on demo/hotfix' : '') +
       '\n' +
-      c.dim('  guided tour: claude-observatory demo --tour   ·   remove every trace: claude-observatory demo --clean\n')
+      c.dim('  guided tour: oak demo --tour   ·   remove every trace: oak demo --clean\n')
   );
 }
 
@@ -2403,7 +3833,7 @@ function cmdClean(args: string[]): void {
   // Before ANY branch reads its flags: every other scope here deletes sessions outright, and this verb's
   // sink is a recursive rm.
   refuseUnsupportedDryRun(args, 'clean');
-  const core = require('@claude-observatory/core') as typeof import('@claude-observatory/core');
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
   const json = args.includes('--json'); // structured results for front-ends/scripts (sibling to keep/undo)
   // Drop resolved (kept/undone) edits in the active session, keep pending. --under <path> scopes it to
   // a file/folder (the editors' folder/file Clear action).
@@ -2580,6 +4010,8 @@ function cmdClean(args: string[]): void {
   let maps = 0;
   let cursors = 0;
   if (!only) {
+    const normalized = core.pruneCodexDerivedCache();
+    bytes += normalized.bytes;
     // Blind spots the store-id loop below cannot see (all three found live on a real store):
     // 1. Cache dirs for sessions with NO store dir — version-bump orphans survive there forever, since
     //    nothing else visits them. Superseded VERSIONS only: a live-version cache for a transcript-only
@@ -2641,7 +4073,7 @@ function human(n: number): string {
 }
 
 function cmdStats(args: string[]): void {
-  const core = require('@claude-observatory/core') as typeof import('@claude-observatory/core');
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
   let sid: string | undefined;
   const i = args.indexOf('--session');
   if (i >= 0 && args[i + 1]) {
@@ -2685,7 +4117,7 @@ function cmdStats(args: string[]): void {
  *  summary) as ONE JSON document. Core composes it (`buildSessionTrace`), so the CLI and both
  *  editors export the identical thing. `--out <file>` writes it; otherwise it prints to stdout. */
 function cmdExport(args: string[]): void {
-  const core = require('@claude-observatory/core') as typeof import('@claude-observatory/core');
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
   const fs = require('fs');
   const path = require('path');
   const session = getSessionId(args);
@@ -2712,7 +4144,7 @@ function cmdExport(args: string[]): void {
 }
 
 function cmdSummary(args: string[]): void {
-  const core = require('@claude-observatory/core') as typeof import('@claude-observatory/core');
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
   const session = getSessionId(args);
   const s = core.reviewSummary(session);
   if (args.includes('--json')) {
@@ -2739,18 +4171,18 @@ function cmdSummary(args: string[]): void {
   if (s.reverted.length) {
     process.stdout.write('\n' + c.dim('reverted: ') + s.reverted.map((r) => '#' + r.id).join(' ') + '\n');
   }
-  process.stdout.write(c.dim('\nexport:  claude-observatory summary --markdown > review.md\n'));
-  process.stdout.write(c.dim('         claude-observatory export --out trace.json   (the full session trace)\n'));
+  process.stdout.write(c.dim('\nexport:  oak summary --markdown > review.md\n'));
+  process.stdout.write(c.dim('         oak export --out trace.json   (the full session trace)\n'));
 }
 
 // --- machine-readable commands for non-Node front-ends (JetBrains plugin, scripts) ---
 
 /** Raw blob bytes to stdout (diff panes, chat prompts). */
 function cmdBlob(args: string[]): void {
-  const core = require('@claude-observatory/core') as typeof import('@claude-observatory/core');
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
   const session = getSessionId(args);
   const sha = args.find((a) => /^[0-9a-f]{64}$/i.test(a));
-  if (!sha) fail('expected a 64-hex blob sha, e.g. `claude-observatory blob <sha>`');
+  if (!sha) fail('expected a 64-hex blob sha, e.g. `oak blob <sha>`');
   try {
     process.stdout.write(core.readBlob(session, sha));
   } catch {
@@ -2770,7 +4202,7 @@ function cmdBlob(args: string[]): void {
  * from a typo.
  */
 function cmdIgnore(args: string[]): void {
-  const core = require('@claude-observatory/core') as Core;
+  const core = require('@oak-observatory/core') as Core;
   const fs = require('fs') as typeof import('fs');
   const path = require('path') as typeof import('path');
   const json = args.includes('--json');
@@ -2804,7 +4236,9 @@ function cmdIgnore(args: string[]): void {
   }
   void flags;
 
-  if (targets.length) {
+  // `--stdin` asks about paths; with none read it answers that none is ignored (exit 1, as git
+  // check-ignore does), never falling through to the sweep below, which drops the session's records.
+  if (targets.length || stdin) {
     if (quiet && targets.length > 1) fail('`ignore -q` takes a single path (same rule as `git check-ignore -q`)');
     const abs = targets.map((t) => path.resolve(cwd, t));
     const ctx = core.ignoreContextFor(abs);
@@ -2858,9 +4292,9 @@ function cmdIgnore(args: string[]): void {
       process.exit(anyIgnored ? 0 : 1);
     }
 
-    // More than one path: one line each, like git's default. The rich explanation below is for the
-    // single-path case, where there is room to say WHY.
-    if (rows.length > 1) {
+    // More than one path (or none, from an empty --stdin): one line each, like git's default. The
+    // rich explanation below is for the single-path case, where there is room to say WHY.
+    if (rows.length !== 1) {
       for (const r of rows) {
         if (!r.d.ignored && !nonMatching) continue;
         const tag = r.d.ignored ? c.yellow('ignored') : c.green('shown  ');
@@ -2993,7 +4427,7 @@ function reportDeadRules(core: Core, cwd: string, sources: readonly string[]): v
 /** Current line indices of every pending edit in a file, mapped into the LIVE buffer text supplied
  *  on stdin (which may be unsaved). Powers inline overlays; always emits JSON. */
 function cmdLocate(args: string[]): void {
-  const core = require('@claude-observatory/core') as typeof import('@claude-observatory/core');
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
   const path = require('path');
   const fs = require('fs');
   const session = getSessionId(args);
@@ -3005,7 +4439,7 @@ function cmdLocate(args: string[]): void {
   try {
     current = fs.readFileSync(0, 'utf8'); // stdin
   } catch {
-    fail('locate reads the current buffer on stdin, e.g. `claude-observatory locate --file f.ts < f.ts`');
+    fail('locate reads the current buffer on stdin, e.g. `oak locate --file f.ts < f.ts`');
   }
   // readLog is chronological and .filter keeps that order — which is what lets locateEditsInCurrent
   // compose one-edit-wide hops instead of re-aligning the whole buffer once per edit.
@@ -3034,7 +4468,7 @@ function cmdLocate(args: string[]): void {
 
 /** The full folder→file→class→edit tree (with exact deltas) — the shared view-model for both editors. */
 function cmdTree(args: string[]): void {
-  const core = require('@claude-observatory/core') as typeof import('@claude-observatory/core');
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
   const session = getSessionId(args);
   const ri = args.indexOf('--root');
   const root = flagValue(args, '--root') ?? process.cwd();
@@ -3072,6 +4506,14 @@ function cmdViews(args: string[]): void {
   const vi = args.indexOf('--views');
   const DEFAULT = 'changemap,multitask,prompts,processes,sessions,observations,risk,egress';
   if (vi >= 0 && !flagValue(args, '--views')) fail('`views --views <a,b,c>` requires a comma-separated list');
+  // SERVE mode (perf, 2026-08-19): one long-lived process answers view batches over stdin — one JSON
+  // request line in ({views, args}), one JSON payload line out. The cold-spawn-per-poll design cost
+  // 2.9s per batch on a 39 MB session (measured): node start + SIX transcript parses + the store's
+  // blob diffs, re-derived from zero every 3 seconds because every in-process memo died with the
+  // process. Warm, the same batch is ~60 ms — fscache revalidates every lookup by stat, so a
+  // long-lived host serves exactly the same answers (that contract is what the VS Code extension
+  // already relies on). The dashboard keeps a cold-spawn fallback for a serve child that dies.
+  if (args.includes('--serve')) return serveViews();
   const names = (flagValue(args, '--views') ?? DEFAULT)
     .split(',')
     .map((n) => n.trim())
@@ -3082,44 +4524,79 @@ function cmdViews(args: string[]): void {
   // describing the wrong session entirely.
   const rest = vi >= 0 ? args.filter((_, i) => i !== vi && i !== vi + 1) : args;
   const viewArgs = rest.includes('--json') ? rest : [...rest, '--json'];
-  const out: Record<string, unknown> = {};
-  /** view -> why it is null. Emitted as `__problems` so a null can never pass for an empty answer. */
-  const problems: Record<string, string> = {};
-  const realWrite = process.stdout.write.bind(process.stdout);
-  const realExit = process.exit.bind(process);
-  for (const name of names) {
-    let buf = '';
-    (process.stdout as unknown as { write: (s: string) => boolean }).write = (chunk: string) => {
-      buf += chunk;
-      return true;
-    };
-    (process as unknown as { exit: (code?: number) => never }).exit = ((code?: number) => {
-      throw new Error(`view ${name} exited ${code ?? 0}`);
-    }) as (code?: number) => never;
-    try {
-      runView(name, viewArgs);
-      out[name] = buf ? JSON.parse(buf) : null;
-      if (out[name] === null) problems[name] = 'produced no output';
-    } catch (e) {
-      // A per-view failure used to become a bare `null`, indistinguishable from "this view is
-      // legitimately empty" — so an unreadable store (EACCES on log.jsonl, a mounted volume, a
-      // permissions repair) rendered as zeros with the status bar saying "ready". The view still
-      // resolves to null so one broken view cannot blank the other seven, but the REASON now rides
-      // alongside, and the dashboard raises it.
-      out[name] = null;
-      problems[name] = String((e as Error)?.message || e);
-    } finally {
-      (process.stdout as unknown as { write: typeof realWrite }).write = realWrite;
-      (process as unknown as { exit: typeof realExit }).exit = realExit;
+  emitJson(buildViews(names, viewArgs));
+}
+
+/** One batch of views as a value — the shared engine of `views` (one shot) and `views --serve`. */
+function buildViews(names: string[], viewArgs: string[]): Record<string, unknown> {
+  const core = require('@oak-observatory/core') as Core;
+  return core.withDerivedInventory(() => {
+    const out: Record<string, unknown> = {};
+    /** view -> why it is null. Emitted as `__problems` so a null can never pass for an empty answer. */
+    const problems: Record<string, string> = {};
+    const realWrite = process.stdout.write.bind(process.stdout);
+    const realExit = process.exit.bind(process);
+    for (const name of names) {
+      let buf = '';
+      (process.stdout as unknown as { write: (s: string) => boolean }).write = (chunk: string) => {
+        buf += chunk;
+        return true;
+      };
+      (process as unknown as { exit: (code?: number) => never }).exit = ((code?: number) => {
+        throw new Error(`view ${name} exited ${code ?? 0}`);
+      }) as (code?: number) => never;
+      try {
+        runView(name, viewArgs);
+        out[name] = buf ? JSON.parse(buf) : null;
+        if (out[name] === null) problems[name] = 'produced no output';
+      } catch (e) {
+        // A per-view failure used to become a bare `null`, indistinguishable from "this view is
+        // legitimately empty" — so an unreadable store (EACCES on log.jsonl, a mounted volume, a
+        // permissions repair) rendered as zeros with the status bar saying "ready". The view still
+        // resolves to null so one broken view cannot blank the other seven, but the REASON now rides
+        // alongside, and the dashboard raises it.
+        out[name] = null;
+        problems[name] = String((e as Error)?.message || e);
+      } finally {
+        (process.stdout as unknown as { write: typeof realWrite }).write = realWrite;
+        (process as unknown as { exit: typeof realExit }).exit = realExit;
+      }
     }
-  }
-  if (Object.keys(problems).length) out.__problems = problems;
-  // An ignore file that exists but cannot be read stops applying — including its `# capture: off`
-  // rules — and the matcher that discovers this runs HERE, in the child. The dashboard read its own
-  // (always empty) copy, so the report was inert on the one surface most likely to see it.
-  const igProblems = (require('@claude-observatory/core') as Core).ignoreProblems();
-  if (igProblems.length) out.__ignoreProblems = igProblems;
-  emitJson(out);
+    if (Object.keys(problems).length) out.__problems = problems;
+    // An ignore file that exists but cannot be read stops applying — including its `# capture: off`
+    // rules — and the matcher that discovers this runs HERE, in the child. The dashboard read its own
+    // (always empty) copy, so the report was inert on the one surface most likely to see it.
+    const igProblems = (require('@oak-observatory/core') as Core).ignoreProblems();
+    if (igProblems.length) out.__ignoreProblems = igProblems;
+    return out;
+  });
+}
+
+/** The `views --serve` loop: newline-delimited JSON requests on stdin, one payload line per request
+ *  on stdout. Stray writes from a view can never corrupt the protocol — the batch runs with stdout
+ *  captured (buildViews already redirects per view), and the response goes out through the REAL
+ *  writer in one piece. A malformed request answers with `__fatal` instead of dying: the dashboard
+ *  owns the child's lifecycle, and a silent exit would read as a hang. stdin closing ends the serve. */
+function serveViews(): void {
+  const realWrite = process.stdout.write.bind(process.stdout);
+  const rl = require('readline').createInterface({ input: process.stdin, terminal: false });
+  rl.on('line', (line: string) => {
+    let payload: Record<string, unknown>;
+    try {
+      const req = JSON.parse(line) as { views?: unknown; args?: unknown };
+      const names = Array.isArray(req.views) ? req.views.map(String) : [];
+      const reqArgs = Array.isArray(req.args) ? req.args.map(String) : [];
+      if (!names.length) throw new Error('request carries no views');
+      payload = buildViews(names, reqArgs.includes('--json') ? reqArgs : [...reqArgs, '--json']);
+    } catch (e) {
+      payload = { __fatal: String((e as Error)?.message || e) };
+    }
+    // This worker's resident size leads every answer, where the dashboard reads it without parsing the
+    // payload, to retire a worker grown too big. Asking `ps` instead spawned one every 5 s per worker
+    // wherever /proc is absent (macOS), and Windows had no probe at all.
+    realWrite(JSON.stringify({ __rss: process.memoryUsage.rss(), ...payload }) + '\n');
+  });
+  rl.on('close', () => process.exit(0));
 }
 
 /** The views `views` may batch. An allow-list on purpose: nothing that MUTATES belongs in a poll.
@@ -3130,6 +4607,8 @@ function cmdViews(args: string[]): void {
  *  make two calls. */
 function runView(name: string, args: string[]): void {
   switch (name) {
+    case 'integrity':
+      return cmdIntegrity(args);
     case 'changemap':
       return cmdChangeMap(args);
     // Both read-only, and both were missing: asking for them fell through to the throw below, which
@@ -3137,6 +4616,12 @@ function runView(name: string, args: string[]): void {
     // got a silently empty pane rather than an error.
     case 'feed':
       return cmdFeed(args);
+    case 'conversation':
+      return cmdConversation(args);
+    // Read-only too: the TUI's warm worker renders a conversation's edit previews through it (with `--json`,
+    // the patch `diff <id> --patch` prints) instead of a cold `oak diff` per edit.
+    case 'diff':
+      return cmdDiff(args);
     case 'list':
       return cmdList(args);
     case 'multitask':
@@ -3161,7 +4646,7 @@ function runView(name: string, args: string[]): void {
 }
 
 function cmdChangeMap(args: string[]): void {
-  const core = require('@claude-observatory/core') as Core;
+  const core = require('@oak-observatory/core') as Core;
   const session = getSessionId(args);
   const ri = args.indexOf('--root');
   const root = flagValue(args, '--root') ?? process.cwd();
@@ -3179,7 +4664,7 @@ function cmdChangeMap(args: string[]): void {
  *  action (`--tool-use-id`)/edit (`--edit`)/subagent (`--agent`)/task (`--task`), built in core (the
  *  single backend both editors call). Always JSON `{ prompt }`. NEVER spawns a process or calls a model. */
 function cmdChatContext(args: string[]): void {
-  const core = require('@claude-observatory/core') as Core;
+  const core = require('@oak-observatory/core') as Core;
   const session = getSessionId(args);
   const ref: { toolUseId?: string; editId?: number; agentId?: string; taskId?: string } = {};
   const tu = flagValue(args, '--tool-use-id');
@@ -3193,7 +4678,7 @@ function cmdChatContext(args: string[]): void {
   emitJson({ prompt: core.assembleChatContext(process.cwd(), session, ref) });
 }
 
-type Core = typeof import('@claude-observatory/core');
+type Core = typeof import('@oak-observatory/core');
 
 /** Build the Observations payload (recap + per-edit reasoning/flags/memory) once — shared by the
  *  machine `observe --json` surface and the human `insights` view. */
@@ -3234,7 +4719,7 @@ function buildObserve(core: Core, session: string, cwd: string) {
 
 /** One JSON payload for an Observations-style view: recap + per-edit reasoning/flags/memory. */
 function cmdObserve(args: string[]): void {
-  const core = require('@claude-observatory/core') as Core;
+  const core = require('@oak-observatory/core') as Core;
   emitJson(buildObserve(core, getSessionId(args), process.cwd()));
 }
 
@@ -3243,7 +4728,7 @@ function cmdObserve(args: string[]): void {
  *  Claude's reasoning, and the still-open next steps at the end. Always JSON; both editors render it
  *  thin (or recompute the same shape from the same core fns). Zero token. */
 function cmdObservations(args: string[]): void {
-  const core = require('@claude-observatory/core') as Core;
+  const core = require('@oak-observatory/core') as Core;
   const session = getSessionId(args);
   const ri = args.indexOf('--root'); // display-relative paths (editors point it at the workspace)
   const root = flagValue(args, '--root') ?? process.cwd();
@@ -3253,7 +4738,7 @@ function cmdObservations(args: string[]): void {
 /** `insights` — the human-readable Observations view (recap + per-edit summary/reasoning/flags/
  *  file-memory + next steps). The terminal counterpart to the editors' Observations panel. */
 function cmdInsights(args: string[]): void {
-  const core = require('@claude-observatory/core') as Core;
+  const core = require('@oak-observatory/core') as Core;
   const session = getSessionId(args);
   const p = buildObserve(core, session, process.cwd());
   if (args.includes('--json')) {
@@ -3283,11 +4768,66 @@ function cmdInsights(args: string[]): void {
   }
 }
 
+
+/** Same shape for the ACCOUNT pull: at most one detached `usage --pull-account` per interval,
+ *  claimed cross-process, never blocking the JSON this poll is about to print. */
+function kickAccountPull(): void {
+  try {
+    const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
+    if (!core.dueAccountUsagePull()) return;
+    core.spawnTool(process.execPath, [process.argv[1], 'usage', '--pull-account', '--json'], { detached: true, stdio: 'ignore' }).unref();
+  } catch {
+    /* a failed kick only means the cache stays stale until the next poll */
+  }
+}
+
+
 /** The UsageLine snapshot (ctx / 5h / week) + the session's input/output/cache token split + its
  *  model/effort/compaction vitals + the shared staleness threshold; always JSON. Both editors' Stats
  *  panels consume this. */
 function cmdUsage(args: string[]): void {
-  const core = require('@claude-observatory/core') as typeof import('@claude-observatory/core');
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
+  const bi = args.indexOf('--bill-day');
+  if (bi >= 0) {
+    // The bill cycle is anniversary-anchored and no payload carries the date — stated once here,
+    // read by the statusline's month segment and the breakdown's month buckets. 0 clears.
+    const v = Number(args[bi + 1]);
+    if (!Number.isInteger(v) || v < 0 || v > 31) fail('--bill-day takes a day of month 1-31 (0 clears it).');
+    const prefs = core.readPrefs();
+    if (v === 0) delete prefs.billDay;
+    else prefs.billDay = v;
+    core.writePrefs(prefs);
+    console.log(v === 0 ? 'Claude bill day cleared — Claude month figures use calendar months.' : `Claude bill day set to the ${v}${v === 1 ? 'st' : v === 2 ? 'nd' : v === 3 ? 'rd' : 'th'} — Claude month figures now follow your bill cycle (set it on each machine).`);
+    return;
+  }
+  const gbi = args.indexOf('--gpt-bill-day');
+  if (gbi >= 0) {
+    // Separate from --bill-day: the OpenAI subscription renews on its own day, and codex sends no
+    // date. Read by the gpt month segment (gptUsagePanel). 0 clears (calendar months).
+    const v = Number(args[gbi + 1]);
+    if (!Number.isInteger(v) || v < 0 || v > 31) fail('--gpt-bill-day takes a day of month 1-31 (0 clears it).');
+    const prefs = core.readPrefs();
+    if (v === 0) delete prefs.gptBillDay;
+    else prefs.gptBillDay = v;
+    core.writePrefs(prefs);
+    console.log(v === 0 ? 'GPT bill day cleared — GPT month figures use calendar months.' : `GPT bill day set to the ${v}${v === 1 ? 'st' : v === 2 ? 'nd' : v === 3 ? 'rd' : 'th'} — GPT month figures now follow your bill cycle (set it on each machine).`);
+    return;
+  }
+  if (args.includes('--breakdown')) return cmdUsageBreakdown(args);
+  // The detached account pull: one process fetches the account's own usage (pcts + resets +
+  // fable) and merges it into the statusline cache — the numbers stay live with NO claude
+  // session open. Hidden verb; every poller kicks it via the claim below.
+  if (args.includes('--pull-account')) {
+    return void core.pullProviderAccountUsage().then((ok) => {
+      if (!args.includes('--json')) console.log(ok ? 'account usage pulled.' : 'nothing pulled (no credentials, or the account answered nothing).');
+    });
+  }
+  kickAccountPull(); // …and the account pull that keeps 5h/wk live without a claude session
+  core.kickRemoteTitles(); // …and the Remote Control titles, on the same pollers (throttled, detached)
+  // …and the month scan, so the bill-cycle $ stays live in editor-only use. Skip it when the caller
+  // IS the statusline (OAK_STATUSLINE) — the statusline reads `oak usage --session` for its token line,
+  // and kicking there would have it spawn itself in a throttled loop.
+  if (!process.env.OAK_STATUSLINE) core.kickMonthRefresh(process.cwd());
   const si = args.indexOf('--session');
   const provided = si >= 0 && args[si + 1] ? args[si + 1] : undefined;
   // Guard a user-provided id like getSessionId does — usageLine derives a store path from it.
@@ -3297,18 +4837,128 @@ function cmdUsage(args: string[]): void {
   // editors' stats panels render under the session title; ctx/5h/week above are point-in-time limits.
   // vitals = which model/effort served the session, its compactions, and the context-fill series —
   // free here, since it shares the cursor sessionUsage just advanced.
+  // ACCOUNT-level windows for the IDE status-bar widget, one set per agent (flat keys — the
+  // JetBrains widget reads top-level numbers). The spread below is SESSION-scoped: for a codex
+  // session its fiveHourPct IS codex's window (usageFrom:'codex'), so the widget must never
+  // read those as claude's. claude* = the statusline cache (empty session id ⇒ the codex seam
+  // can't fire); gpt* = codex's own rollout windows, rolled-over ones dropped. Scoped to a Codex session
+  // only when the caller NAMED it: the JetBrains status bar asks with no --session, and scoping to the
+  // workspace's newest session there made it disagree with VS Code's unscoped status bar. The
+  // statusline (OAK_STATUSLINE) reads only `sessionTokens`, on every render, so it skips the panel,
+  // which totals Codex usage history.
+  const acct = core.usageLine(process.cwd(), '');
+  const gpt = process.env.OAK_STATUSLINE ? null
+    : core.gptUsagePanel(provided && core.describeSession(provided).runtime.includes('codex') ? provided : undefined);
   emitJson({
     ...core.usageLine(process.cwd(), sid),
+    claudeAccount: acct,
+    claudeFivePct: acct.fiveHourPct,
+    claudeFiveReset: acct.fiveReset,
+    claudeFiveTokens: acct.fiveTokens,
+    claudeFiveTotal: acct.fiveTotal,
+    claudeWeekPct: acct.weekPct,
+    claudeWeekReset: acct.weekReset,
+    // The Fable cap, flattened like the rest: the TUI reads `claudeAccount`, but the JetBrains
+    // status widget only reads top-level numbers, so without these it could not show the cap at all.
+    claudeFablePct: acct.fablePct,
+    claudeFableReset: acct.fableReset,
+    claudeFableLabel: acct.fableLabel,
+    claudeMonthCost: acct.monthCost,
+    claudeMonthCostTotal: acct.monthCostTotal,
+    claudeMonthPct: acct.monthTokens && acct.monthTokensTotal ? Math.min(100, (acct.monthTokens / acct.monthTokensTotal) * 100) : null,
+    claudeMonthReset: acct.monthReset,
+    claudeWeekTokens: acct.weekTokens,
+    claudeWeekTotal: acct.weekTotal,
+    gptFivePct: gpt?.fivePct ?? null,
+    gptFiveReset: gpt?.fiveReset ?? null,
+    gptWeekPct: gpt?.weekPct ?? null,
+    gptWeekReset: gpt?.weekReset ?? null,
+    gptCtxPct: gpt?.ctxPct ?? null,
+    gptCtxTokens: gpt?.ctxTokens ?? null,
+    gptCtxSize: gpt?.ctxSize ?? null,
+    gptWeekTok: gpt?.weekTok ?? null,
+    gptWeekTotal: gpt?.weekTotal ?? null,
+    gptMonthStart: gpt?.monthStart ?? null,
+    gptMonthReset: gpt?.monthReset ?? null,
+    gptMonthTok: gpt?.monthTok ?? null,
+    gptMonthTokTotal: gpt?.monthTokTotal ?? null,
+    gptMonthReads: gpt?.monthReads ?? null,
+    gptMonthCost: gpt?.monthCost ?? null,
+    gptMonthCostTotal: gpt?.monthCostTotal ?? null,
     sessionTokens: core.sessionUsage(process.cwd(), sid),
     vitals: core.sessionVitals(process.cwd(), sid),
     staleMs: core.USAGE_STALE_MS,
   });
 }
 
+/**
+ * `oak usage --breakdown`: the /usage-style detail Claude itself keeps —
+ * tokens and ~$ by week, month, model or session, for claude AND codex. Everything is measured
+ * from THIS machine's records (transcripts and codex rollouts) with the statusline scan's rules
+ * (cross-file message-id dedup, window-by-timestamp); dollars are API list prices, i.e. estimates
+ * of compute value, not a bill — subscription plans are flat-rate and the header says so.
+ */
+function cmdUsageBreakdown(args: string[]): void {
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
+  const argOf = (name: string): string | undefined => {
+    const i = args.indexOf(name);
+    return i >= 0 && args[i + 1] ? args[i + 1] : undefined;
+  };
+  const by = (argOf('--by') ?? 'week') as import('@oak-observatory/core').BreakdownBy;
+  if (!['week', 'month', 'model', 'session'].includes(by)) fail(`--by takes week, month, model or session (got "${by}").`);
+  const agent = argOf('--agent') ?? 'both';
+  if (!['claude', 'codex', 'both'].includes(agent)) fail(`--agent takes claude, codex or both (got "${agent}").`);
+  const weeksArg = argOf('--weeks');
+  if (weeksArg !== undefined) { const n = Number(weeksArg); if (!Number.isInteger(n) || n < 1 || n > 52) fail(`--weeks takes an integer 1-52 (got "${weeksArg}").`); }
+  const weeks = Math.max(1, Math.min(52, Number(weeksArg ?? (by === 'month' ? 26 : 8)) || 8));
+  const sinceMs = Date.now() - weeks * 7 * 86400_000;
+  // Week buckets follow the account's real reset cycle when the statusline cache knows it.
+  const u = core.usageLine(process.cwd(), '');
+  const anchorMs = u.weekReset ?? null;
+  const rows: import('@oak-observatory/core').AgentBreakdown[] = [];
+  const billDay = core.billDay();
+  if (agent !== 'codex') rows.push(core.claudeBreakdown(by, sinceMs, anchorMs, undefined, billDay));
+  if (agent !== 'claude') rows.push(core.codexBreakdown(by, sinceMs, core.codexUsageLive().weekReset, undefined, null));
+  const promo = core.activePromo();
+
+  if (args.includes('--json')) {
+    emitJson({ by, weeks, sinceMs, weekAnchorMs: anchorMs, promo, agents: rows });
+    return;
+  }
+
+  const money = (v: number): string => (v >= 100 ? `$${Math.round(v)}` : v >= 10 ? `$${v.toFixed(0)}` : `$${v.toFixed(1)}`);
+  const out: string[] = [];
+  out.push(`usage breakdown · by ${by} · last ${weeks} week${weeks > 1 ? 's' : ''} · this machine's records`);
+  out.push(`~$ are API list prices — an estimate of compute value, not a bill (subscriptions are flat-rate)`);
+  out.push(`the oldest bucket may be partial — records before the ${weeks}-week cutoff are not counted`);
+  if (promo) {
+    const until = new Date(promo.endMs).toISOString().slice(0, 10);
+    out.push(`plan note: the ${promo.label} weekly-limit promotion is live until ${until}; budgets shown elsewhere include it`);
+  }
+  for (const r of rows) {
+    out.push('');
+    out.push(`${r.agent === 'claude' ? 'claude' : 'gpt (codex)'} — ${fmtTok(r.totals.tokens)} tok · ${human(r.totals.cacheRead)} cache reads · ${r.totals.usdKnown ? '~' + money(r.totals.usd) : 'price unavailable'}${r.totals.usdApprox ? '*' : ''}`);
+    if (!r.buckets.length) {
+      out.push('  (no records in range)');
+      continue;
+    }
+    const w = Math.max(...r.buckets.map((b) => b.label.length), 6);
+    for (const b of r.buckets.slice(0, 40)) {
+      out.push(
+        `  ${b.label.padEnd(w)}  ${fmtTok(b.tokens).padStart(8)} tok  ${human(b.cacheRead).padStart(7)} reads  ${(b.usdKnown ? money(b.usd) : '—').padStart(7)}${b.usdApprox ? '*' : ' '}  ${String(b.messages).padStart(6)} msgs`
+      );
+    }
+    if (r.buckets.length > 40) out.push(`  … ${r.buckets.length - 40} more (use --json for all)`);
+  }
+  if (rows.some((r) => r.totals.usdApprox)) out.push('');
+  if (rows.some((r) => r.totals.usdApprox)) out.push('* includes an approximate or unavailable model rate; totals with unpriced usage show no dollar estimate');
+  console.log(out.join('\n'));
+}
+
 // --- opt-in `claude -p` analysis (token-spending; cached results are returned unless --fresh) ---
 
 function claudeBinFrom(args: string[]): string {
-  const core = require('@claude-observatory/core') as typeof import('@claude-observatory/core');
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
   const bi = args.indexOf('--claude-bin');
   return core.resolveClaudeBin(bi >= 0 ? args[bi + 1] : undefined);
 }
@@ -3319,7 +4969,7 @@ function emitAnalysis(a: { key: string; text: string; ts: number }, cached: bool
 }
 
 async function cmdAnalyze(args: string[]): Promise<void> {
-  const core = require('@claude-observatory/core') as typeof import('@claude-observatory/core');
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
   const session = getSessionId(args);
   const id = requireId(args);
   const json = args.includes('--json');
@@ -3331,7 +4981,7 @@ async function cmdAnalyze(args: string[]): Promise<void> {
 }
 
 async function cmdRecap(args: string[]): Promise<void> {
-  const core = require('@claude-observatory/core') as typeof import('@claude-observatory/core');
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
   const session = getSessionId(args);
   const json = args.includes('--json');
   const cached = args.includes('--fresh') ? null : core.cachedAnalysis(session, 'recap');
@@ -3351,23 +5001,25 @@ function statuslineInstallerPath(): string {
 
 /** True once the status line has written its cache — the signal the Usage bars need. */
 function statuslineActive(): boolean {
-  const core = require('@claude-observatory/core') as typeof import('@claude-observatory/core');
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
   const fs = require('fs');
   const path = require('path');
   return fs.existsSync(path.join(core.claudeConfigDir(), 'statusline-last.json'));
 }
 
 /** Install/refresh the bundled status line (idempotent; honors CLAUDE_CONFIG_DIR; needs bash+jq). */
-function cmdStatusline(): void {
+function cmdStatusline(args: string[] = []): void {
   const fs = require('fs');
-  const core = require('@claude-observatory/core') as typeof import('@claude-observatory/core');
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
   const script = statuslineInstallerPath();
   if (!fs.existsSync(script)) {
     fail(`bundled installer missing (${script}) — install from https://github.com/cell-observatory/claude-statusline`);
   }
   // `direct`: bash is a real .exe that libuv resolves unaided, and the hint below is reachable ONLY
   // through res.error — a shell would report a missing bash as exit 127 and kill that branch.
-  const res = core.spawnToolSync('bash', [script], { stdio: 'inherit', direct: true });
+  // `--force` passes through: the installer REFUSES to replace a statusLine that is not ours
+  // (ccusage's, Orca's) unless the caller explicitly said so.
+  const res = core.spawnToolSync('bash', [script, ...(args.includes('--force') ? ['--force'] : [])], { stdio: 'inherit', direct: true });
   if (res.error) {
     const winHint = process.platform === 'win32' ? ' — on Windows run this from Git Bash or WSL' : '';
     fail(`could not run bash: ${res.error.message} (the status line needs bash + jq${winHint})`);
@@ -3376,7 +5028,7 @@ function cmdStatusline(): void {
 }
 
 async function cmdSuggest(args: string[]): Promise<void> {
-  const core = require('@claude-observatory/core') as typeof import('@claude-observatory/core');
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
   const session = getSessionId(args);
   const json = args.includes('--json');
   const cached = args.includes('--fresh') ? null : core.cachedAnalysis(session, 'suggestions');
@@ -3387,7 +5039,7 @@ async function cmdSuggest(args: string[]): Promise<void> {
 
 // --- self-update: fetch the latest GitHub Release and reinstall the CLI (no registry, no deps) ---
 
-const RELEASE_REPO = 'cell-observatory/claude-observatory';
+const RELEASE_REPO = 'cell-observatory/oak-observatory';
 /** The releases API base — overridable so the update/channel integration test (and an enterprise
  *  release mirror) can stand in for github.com. Everything else about the flow stays identical:
  *  asset downloads follow the `browser_download_url`s the API payload itself carries. */
@@ -3395,11 +5047,15 @@ const RELEASES_API = process.env.CLAUDE_OBSERVATORY_RELEASES_API || `https://api
 // The VS Code-family extension id (publisher.name). We detect the extension by its install DIR (like
 // the JetBrains plugin dirs) so detection never depends on the editor CLI being on PATH; the CLI is
 // only needed to APPLY the update, and is resolved from app-bundle locations when it's off PATH.
-const VSCODE_EXT_ID = 'cell-observatory.claude-observatory-vscode';
-// The id before 0.8.6, when the publisher changed (claude-observatory → cell-observatory). Editors
-// treat it as a separate extension, so old-id installs must still be detected — and removed after a
-// successful update to the renamed .vsix, or every migrated editor ends up with two Observatories.
-const VSCODE_EXT_ID_OLD = 'claude-observatory.claude-observatory-vscode';
+const VSCODE_EXT_ID = 'cell-observatory.oak-observatory-vscode';
+// The id before the OAK rename (the extension shipped as `cell-observatory.claude-observatory-vscode`).
+// Editors treat it as a separate extension, so an old-id install must still be detected — and removed
+// after a successful update to the renamed .vsix, or a migrated editor ends up with two Observatories.
+const VSCODE_EXT_ID_OLD = 'cell-observatory.claude-observatory-vscode';
+// The global npm package name before the OAK rename. It declares the `claude-observatory` bin, which
+// this package also ships as the deprecated alias, so it must be uninstalled before an `npm i -g` of
+// this package can land — see updateCliBinary.
+const NPM_PKG_OLD = 'claude-observatory';
 // One row per VS Code-family editor: where it keeps installed extensions (relative to $HOME), the CLI
 // that drives `--install-extension`, and the macOS .app name used to locate that CLI when off PATH.
 // `app` is the macOS bundle name; `winApp` the Windows install FOLDER, which is not the same string —
@@ -3414,13 +5070,19 @@ const VSCODE_EDITORS: { label: string; extDirs: string[]; cli: string; app: stri
   // did not degrade anything gracefully, it made every Insiders user invisible to `update` and
   // `install-extensions`, which then reported "no editor detected" and did nothing, forever.
   { label: 'VS Code Insiders', extDirs: ['.vscode-insiders/extensions', '.vscode-server-insiders/extensions'], cli: 'code-insiders', app: 'Visual Studio Code - Insiders', winApp: 'Microsoft VS Code Insiders' },
-  { label: 'Cursor', extDirs: ['.cursor/extensions'], cli: 'cursor', app: 'Cursor', winApp: 'cursor' },
-  { label: 'VSCodium', extDirs: ['.vscodium/extensions'], cli: 'codium', app: 'VSCodium', winApp: 'VSCodium' },
-  { label: 'Windsurf', extDirs: ['.windsurf/extensions'], cli: 'windsurf', app: 'Windsurf', winApp: 'Windsurf' },
+  // The `-server` dirs are the Remote-SSH/remote-dev backends, same as `.vscode-server` above —
+  // without them a server-side install (e.g. `~/.cursor-server` on a GPU box) is invisible to
+  // `update`, which then silently skips the one install the user actually works in.
+  { label: 'Cursor', extDirs: ['.cursor/extensions', '.cursor-server/extensions'], cli: 'cursor', app: 'Cursor', winApp: 'cursor' },
+  { label: 'VSCodium', extDirs: ['.vscodium/extensions', '.vscodium-server/extensions'], cli: 'codium', app: 'VSCodium', winApp: 'VSCodium' },
+  { label: 'Windsurf', extDirs: ['.windsurf/extensions', '.windsurf-server/extensions'], cli: 'windsurf', app: 'Windsurf', winApp: 'Windsurf' },
 ];
 // The JetBrains plugin unzips to this dir inside each IDE's plugins/ folder; we drop a version
 // sentinel beside it so a later `update` can tell whether the installed plugin is already current.
-const JB_PLUGIN_DIRNAME = 'claude-observatory-jetbrains';
+const JB_PLUGIN_DIRNAME = 'oak-observatory-jetbrains';
+// The dir the plugin unzipped to before the OAK rename — removed on install so a migrated IDE does not
+// end up with the pre-rename plugin loaded beside the new one.
+const JB_PLUGIN_DIRNAME_OLD = 'claude-observatory-jetbrains';
 const JB_VERSION_SENTINEL = '.observatory-version';
 // The self-hosted JetBrains plugin repository, regenerated + attached to every GitHub Release by
 // .github/workflows/release.yml. Add it ONCE under Settings → Plugins → ⚙ → Manage Plugin
@@ -3438,7 +5100,7 @@ function httpGet(url: string, redirects = 5): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const req = https.get(
       url,
-      { headers: { 'User-Agent': 'claude-observatory', Accept: 'application/vnd.github+json' } },
+      { headers: { 'User-Agent': 'oak-observatory', Accept: 'application/vnd.github+json' } },
       (res: any) => {
         const { statusCode, headers } = res;
         if (statusCode >= 300 && statusCode < 400 && headers.location && redirects > 0) {
@@ -3487,9 +5149,14 @@ async function downloadAsset(asset: ReleaseAsset): Promise<string> {
   process.stdout.write(c.dim(`downloading ${asset.name} …\n`));
   const bytes = await httpGet(asset.browser_download_url);
   assertDigest(bytes, asset);
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-observatory-'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-observatory-'));
   const dest = path.join(dir, path.basename(asset.name));
   fs.writeFileSync(dest, bytes, { flag: 'wx', mode: 0o600 });
+  // Scratch for this run: removed when it succeeds (every update used to leave its downloads behind).
+  // A failed run keeps them, because its message names the file to install by hand.
+  process.once('exit', (code) => {
+    if (code === 0) try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
+  });
   return dest;
 }
 
@@ -3499,34 +5166,91 @@ async function updateCliBinary(assets: ReleaseAsset[], latest: string, current: 
   const tgz = assets.find((a) => /\.tgz$/.test(a.name));
   if (!tgz) fail(`release v${latest} has no CLI tarball asset to install.`);
   const dest = await downloadAsset(tgz!);
-  const core = require('@claude-observatory/core') as typeof import('@claude-observatory/core');
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
+  const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+  // A pre-rename global (`claude-observatory`) owns bin names this package also declares, and
+  // npm ≥7 refuses to hand a bin to a different package (EEXIST). Uninstall-first, never --force:
+  // --force leaves the old package behind with a dangling claim on the shared bins, and a later
+  // `npm uninstall -g claude-observatory` then deletes symlinks that belong to the NEW install.
+  const oldPkg = core.spawnToolSync(npm, ['ls', '-g', NPM_PKG_OLD], { stdio: 'pipe' });
+  if (oldPkg.status === 0) {
+    process.stdout.write(c.dim(`removing the old ${NPM_PKG_OLD} global package (renamed to oak-observatory)…\n`));
+    const un = core.spawnToolSync(npm, ['uninstall', '-g', NPM_PKG_OLD], { stdio: 'pipe' });
+    if (un.status !== 0)
+      process.stdout.write(
+        c.yellow('! ') + `could not remove it — if the install below fails, run: npm uninstall -g ${NPM_PKG_OLD}\n`
+      );
+  }
   process.stdout.write(c.dim('installing globally (npm i -g) …\n'));
   // npm is npm.cmd on Windows, which cannot be spawned without cmd.exe. The launcher also does the
-  // quoting `dest` needs (spaced Windows usernames put a space in every temp path).
-  const r = core.spawnToolSync(process.platform === 'win32' ? 'npm.cmd' : 'npm', ['i', '-g', dest], {
+  // quoting `dest` needs (spaced Windows usernames put a space in every temp path). --allow-scripts:
+  // npm 12 blocks dependency install scripts by default, and on Linux node-pty's is the only way it
+  // gets built (npm 10 and 11 accept the flag and change nothing).
+  const r = core.spawnToolSync(npm, ['i', '-g', dest, '--allow-scripts=node-pty'], {
     stdio: 'inherit',
   });
-  if (r.status !== 0) fail(`npm install failed (exit ${r.status ?? '?'}). Try: npm i -g ${dest}`);
+  if (r.status !== 0)
+    fail(
+      `npm install failed (exit ${r.status ?? '?'}). If npm said EEXIST, another global package already owns one of ` +
+        `OAK's commands (oak, oak-observatory, claude-observatory): uninstall it or remove the file npm named, then ` +
+        `re-run \`oak update\`. Otherwise try: npm i -g ${dest} --allow-scripts=node-pty`
+    );
   process.stdout.write(c.green('✓ ') + `updated the CLI ${current} → ${latest}\n`);
   refreshInstalledStatusline();
 }
 
+/**
+ * Finish an update in the CLI npm just installed. This process is still the OLD release: its
+ * compiled-in herdr pin is the old one, and npm has just re-extracted node-pty, which resets the macOS
+ * spawn-helper's mode. Found through npm's global root rather than `oak` on PATH, which can be
+ * another install (a linked checkout, a second Node).
+ */
+function finishInInstalledCli(): void {
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
+  const fs = require('fs');
+  const path = require('path');
+  let entry: string | null = null;
+  try {
+    // Not `npm root -g`: npm 11 and later print a UUID-shaped path segment as ***. A script npm runs is
+    // handed the real global prefix, whose lib/node_modules (node_modules on Windows) holds the package.
+    const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+    const prefix = String(core.spawnToolSync(npm, ['exec', '--silent', '-c', 'node -p process.env.npm_config_global_prefix'], { encoding: 'utf8' }).stdout ?? '').trim();
+    const pkg = path.join(prefix, process.platform === 'win32' ? '' : 'lib', 'node_modules', 'oak-observatory');
+    const bin = JSON.parse(fs.readFileSync(path.join(pkg, 'package.json'), 'utf8')).bin?.oak;
+    if (typeof bin === 'string') entry = path.join(pkg, bin);
+  } catch {
+    /* reported below */
+  }
+  const r = entry ? core.spawnToolSync(process.execPath, [entry, '__after-update'], { stdio: 'inherit' }) : null;
+  if (r?.status !== 0)
+    process.stdout.write(c.yellow('⚠ ') + 'the updated CLI did not finish setting up herdr and its terminal — run `oak doctor --fix`\n');
+}
+
+/** `__after-update`: the half of `oak update` that belongs to the NEW release (see finishInInstalledCli). */
+async function afterUpdate(): Promise<void> {
+  await ensureHerdrPin();
+  const tui = require('@oak-observatory/tui') as typeof import('@oak-observatory/tui');
+  const pty = await tui.diagnoseNativeSpawn(true);
+  if (pty.level !== 'ok') process.stdout.write(c.yellow('⚠ ') + `${pty.label}: ${pty.detail}\n` + (pty.fix ? c.dim(`  → ${pty.fix}\n`) : ''));
+  else if (pty.detail.startsWith('repaired')) process.stdout.write(c.green('✓ ') + `${pty.detail}\n`);
+}
+
 /** The bundled status line updates WITH the CLI. Updating the observatory used to leave the installed
- *  ~/.claude/statusline.sh stale until the user re-ran `claude-observatory statusline` by hand — one
+ *  ~/.claude/statusline.sh stale until the user re-ran `oak statusline` by hand — one
  *  update command now covers both. Runs the freshly-installed GLOBAL binary (not this process, whose
  *  bundled copy is the old version), and only when ours is actually installed. */
 function refreshInstalledStatusline(): void {
-  const core = require('@claude-observatory/core') as typeof import('@claude-observatory/core');
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
   if (!core.statuslineInstalled()) return; // some other status line (or none) — never touch it
   process.stdout.write(c.dim('refreshing the bundled status line…\n'));
   const r = core.spawnToolSync(
-    process.platform === 'win32' ? 'claude-observatory.cmd' : 'claude-observatory',
+    process.platform === 'win32' ? 'oak.cmd' : 'oak',
     ['statusline'],
     { stdio: 'inherit' }
   );
   if (r.status !== 0)
     process.stdout.write(
-      c.dim(`status line refresh did not complete — run \`claude-observatory statusline\` yourself.\n`)
+      c.dim(`status line refresh did not complete — run \`oak statusline\` yourself.\n`)
     );
 }
 
@@ -3636,7 +5360,7 @@ type EditorRow = {
 };
 
 function vscodeEditors(): EditorRow[] {
-  const core = require('@claude-observatory/core') as typeof import('@claude-observatory/core');
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
   const fs = require('fs');
   const path = require('path');
   const os = require('os');
@@ -3710,7 +5434,7 @@ function installedSurfaces(): InstalledSurface[] {
  *  cleanup, and report per editor. Returns how many succeeded. Shared by `update` (refresh what is
  *  there) and `install-extensions` (put it where it is missing) so the two cannot drift. */
 function applyVsix(targets: EditorRow[], vsixPath: string, version: string): number {
-  const core = require('@claude-observatory/core') as typeof import('@claude-observatory/core');
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
   let installed = 0;
   for (const h of targets) {
     // `h.cli` is `code`/`cursor`/… — a bare name on PATH, or an explicit `…\bin\code.cmd` on
@@ -3724,8 +5448,8 @@ function applyVsix(targets: EditorRow[], vsixPath: string, version: string): num
       // confirmed on disk — a --force reinstall of a pre-rename .vsix must not uninstall itself.
       if (h.hasOld && hasExtFolder(h.extDirs, VSCODE_EXT_ID)) {
         const u = core.spawnToolSync(h.cli as string, ['--uninstall-extension', VSCODE_EXT_ID_OLD], { stdio: 'pipe' });
-        if (u.status === 0) process.stdout.write(c.dim(`  removed the old ${VSCODE_EXT_ID_OLD} install (publisher changed in 0.8.6).\n`));
-        else process.stdout.write(c.yellow(`  ⚠ ${h.label} still has the pre-0.8.6 install — uninstall the older "Claude Observatory" entry in its Extensions view.\n`));
+        if (u.status === 0) process.stdout.write(c.dim(`  removed the old ${VSCODE_EXT_ID_OLD} install (renamed to OAK).\n`));
+        else process.stdout.write(c.yellow(`  ⚠ ${h.label} still has the old install — uninstall the older "Claude Observatory" entry in its Extensions view.\n`));
       }
     } else {
       process.stdout.write(c.yellow(`  ⚠ ${h.label} --install-extension failed — install the .vsix manually from the release\n`));
@@ -3756,7 +5480,7 @@ async function refreshVscodeExtension(
   assets: ReleaseAsset[],
   plan: UpdatePlan
 ): Promise<'updated' | 'current' | 'blocked' | 'absent'> {
-  const core = require('@claude-observatory/core') as typeof import('@claude-observatory/core');
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
   const here = plan.surfaces.filter((s) => s.surface === 'vscode');
   const installs = here.filter((s) => s.reason !== 'missing');
   if (installs.length === 0) return 'absent'; // genuinely not installed — the only OK silent case
@@ -3771,8 +5495,8 @@ async function refreshVscodeExtension(
     process.stdout.write(
       c.yellow('  ⚠ ') +
         `${s.label} extension ${s.from} is installed, but its CLI wasn't found on PATH or in the usual app locations — can't auto-update it.\n` +
-        c.dim(`    Fix: in ${s.label}, ⇧⌘P → "Shell Command: Install '${ed?.cliName || 'code'}' command in PATH", then re-run \`claude-observatory update\`;\n`) +
-        c.dim(`    or install claude-observatory-vscode-v${plan.target}.vsix from the release manually.\n`)
+        c.dim(`    Fix: in ${s.label}, ⇧⌘P → "Shell Command: Install '${ed?.cliName || 'code'}' command in PATH", then re-run \`oak update\`;\n`) +
+        c.dim(`    or install oak-observatory-vscode-v${plan.target}.vsix from the release manually.\n`)
     );
   }
   const actionable = stale.filter((s) => s.actionable);
@@ -3840,7 +5564,7 @@ function jetbrainsPluginDirs(): string[] {
 
 /** Extract a .zip into destDir (unzip on macOS/Linux; Expand-Archive on Windows). */
 function extractZip(zip: string, destDir: string): boolean {
-  const core = require('@claude-observatory/core') as typeof import('@claude-observatory/core');
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
   if (process.platform === 'win32') {
     // Both paths travel by ENVIRONMENT, never interpolated into the -Command string: a path holding
     // a `"`, a `$` (PowerShell expands those inside double quotes) or a `'` would otherwise rewrite
@@ -3856,10 +5580,10 @@ function extractZip(zip: string, destDir: string): boolean {
   return core.spawnToolSync('unzip', ['-qo', zip, '-d', destDir], { stdio: 'ignore', direct: true }).status === 0;
 }
 
-/** The installed JetBrains plugin version, read from its own jar (`lib/claude-observatory-jetbrains-
+/** The installed JetBrains plugin version, read from its own jar (`lib/oak-observatory-jetbrains-
  *  <version>.jar`, laid down by every install method — `install-jetbrains.sh`, the IDE's "Install Plugin
  *  from Disk", and `update`), falling back to the `.observatory-version` sentinel that `update` also
- *  writes. Returns null only when neither is present. `pluginDir` = `.../plugins/claude-observatory-jetbrains`.
+ *  writes. Returns null only when neither is present. `pluginDir` = `.../plugins/oak-observatory-jetbrains`.
  *  (Before this, only `update` wrote the sentinel, so script/IDE installs read as null → perpetually "stale".) */
 function jbInstalledVersion(pluginDir: string): string | null {
   const fs = require('fs');
@@ -3867,7 +5591,7 @@ function jbInstalledVersion(pluginDir: string): string | null {
   try {
     for (const f of fs.readdirSync(path.join(pluginDir, 'lib'))) {
       if (f.includes('searchableOptions')) continue; // the -searchableOptions.jar carries the version too
-      const m = /^claude-observatory-jetbrains-(\d+\.\d+\.\d+(?:[-.+][0-9A-Za-z.-]+)?)\.jar$/.exec(f);
+      const m = /^oak-observatory-jetbrains-(\d+\.\d+\.\d+(?:[-.+][0-9A-Za-z.-]+)?)\.jar$/.exec(f);
       if (m) return m[1];
     }
   } catch {
@@ -3896,7 +5620,7 @@ async function refreshJetbrainsPlugin(
   assets: ReleaseAsset[],
   plan: UpdatePlan
 ): Promise<'updated' | 'current' | 'blocked' | 'absent'> {
-  const core = require('@claude-observatory/core') as typeof import('@claude-observatory/core');
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
   const holders = plan.surfaces.filter((s) => s.surface === 'jetbrains');
   if (holders.length === 0) return 'absent';
   const stale = holders.filter((s) => s.reason !== 'current');
@@ -3933,6 +5657,7 @@ function applyJetbrainsZip(dirs: string[], zipPath: string, version: string): nu
     const pluginDir = path.join(d, JB_PLUGIN_DIRNAME);
     try {
       fs.rmSync(pluginDir, { recursive: true, force: true }); // drop files gone from the new build
+      fs.rmSync(path.join(d, JB_PLUGIN_DIRNAME_OLD), { recursive: true, force: true }); // remove the pre-rename plugin so a migrated IDE has one, not two
       if (!extractZip(zipPath, d)) throw new Error('extract failed');
       fs.writeFileSync(path.join(pluginDir, JB_VERSION_SENTINEL), version);
       process.stdout.write(c.green('✓ ') + `JetBrains plugin → ${version} (${d})\n`);
@@ -3991,7 +5716,7 @@ const CHANNEL_LABEL = { stable: 'stable', dev: 'pre-release (dev)' } as const;
  * .vsix's inner package.json to compare would be work for no benefit.
  */
 async function cmdInstallExtensions(args: string[]): Promise<void> {
-  const core = require('@claude-observatory/core') as typeof import('@claude-observatory/core');
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
   const fs = require('fs');
   const path = require('path');
   const checkOnly = args.includes('--check');
@@ -4190,14 +5915,40 @@ async function cmdInstallExtensions(args: string[]): Promise<void> {
  *  when nothing changed. Kept a function so BOTH exits from `cmdUpdate` (--cli-only and the full
  *  run) persist at the same point in the sequence, rather than one of them doing it early. */
 function persistChannel(requested: 'stable' | 'dev' | null): void {
-  const core = require('@claude-observatory/core') as typeof import('@claude-observatory/core');
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
   if (requested === null || requested === core.getUpdateChannel()) return;
   core.setUpdateChannel(requested);
   process.stdout.write(c.green('✓ ') + `switched to the ${CHANNEL_LABEL[requested]} channel\n`);
 }
 
+/**
+ * The herdr pin moves WITH oak. A release that bumps `herdr.lock` and leaves the old binary on disk
+ * would have the adapter talking to a protocol it was not built against — the one drift this pin
+ * exists to prevent.
+ *
+ * `startServer: false` on purpose: an update is not a request to launch something. A server that is
+ * already running keeps running (herdr's own `status` reports the stale binary), and the installers
+ * and `oak doctor --fix` are where a server gets started.
+ *
+ * Never fatal. The CLI update itself already succeeded; herdr's state is reported, not enforced.
+ */
+async function ensureHerdrPin(): Promise<void> {
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
+  try {
+    const report = await core.ensureHerdr({ startServer: false });
+    if (report.upgraded) process.stdout.write(c.green('✓ ') + `herdr ${report.version} installed (pinned by herdr.lock)\n`);
+    if (report.sidebarConfigured) process.stdout.write(c.green('✓ ') + `herdr sidebar widths set in its config.toml (a backup sits beside it)\n`);
+    if (report.themeConfigured) process.stdout.write(c.green('✓ ') + `herdr theme: gruvbox (set)\n`);
+    for (const w of report.warnings) process.stdout.write(c.yellow('⚠ ') + w + '\n');
+  } catch (e) {
+    process.stderr.write(
+      c.yellow('⚠ ') + `could not verify herdr: ${String((e as Error)?.message || e)} — run \`oak doctor --fix\`\n`
+    );
+  }
+}
+
 async function cmdUpdate(args: string[]): Promise<void> {
-  const core = require('@claude-observatory/core') as typeof import('@claude-observatory/core');
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
   const current = version();
   const cliOnly = args.includes('--cli-only');
   const checkOnly = args.includes('--check');
@@ -4223,7 +5974,9 @@ async function cmdUpdate(args: string[]): Promise<void> {
   const plan = core.resolveUpdatePlan(releases, channel, surfaces, { switching, force });
   if (!plan.release) fail('no published release found for the repository.');
   if (plan.degradedToStable)
-    process.stdout.write(c.dim('no pre-release published yet — the stable release is the newest there is.\n'));
+    process.stdout.write(c.dim(releases.some((r: any) => r?.prerelease === true && !r?.draft)
+      ? 'the stable release outranks the newest pre-release, so the pre-release channel serves it.\n'
+      : 'no pre-release published yet — the stable release is the newest there is.\n'));
   const latest = plan.target;
   const assets: ReleaseAsset[] = (plan.release as any).assets || [];
   const cliSurface = plan.surfaces.find((s) => s.surface === 'cli');
@@ -4273,7 +6026,7 @@ async function cmdUpdate(args: string[]): Promise<void> {
       // `update` refreshes only what is ALREADY installed; putting a present-but-empty editor in the
       // action list would promise an install this command is about to skip on purpose.
       if (s.reason === 'missing') {
-        process.stdout.write(c.dim(`${s.label}: not installed — \`claude-observatory install-extensions\` adds it\n`));
+        process.stdout.write(c.dim(`${s.label}: not installed — \`oak install-extensions\` adds it\n`));
         continue;
       }
       // 'ahead' is its own sentence. Reading "0.10.0 → 0.9.5" as an update is confusing; reading it
@@ -4294,18 +6047,20 @@ async function cmdUpdate(args: string[]): Promise<void> {
       const pre: any = releases.find((r: any) => r?.prerelease === true && !r?.draft);
       const preVer = core.versionOfRelease(pre);
       if (preVer)
-        process.stdout.write(c.dim(`pre-release channel: ${preVer} — switch with \`claude-observatory update --channel dev\`\n`));
+        process.stdout.write(c.dim(`pre-release channel: ${preVer} — switch with \`oak update --channel dev\`\n`));
     }
     process.stdout.write(
-      c.dim(switching ? `run \`claude-observatory update --channel ${requested}\` to apply.\n` : 'run `claude-observatory update` to apply.\n')
+      c.dim(switching ? `run \`oak update --channel ${requested}\` to apply.\n` : 'run `oak update` to apply.\n')
     );
     return;
   }
 
   if (cliOnly) {
     if (cliStale) await updateCliBinary(assets, latest, current);
-    else process.stdout.write(c.green('✓ ') + `claude-observatory CLI is up to date (${current})\n`);
+    else process.stdout.write(c.green('✓ ') + `oak CLI is up to date (${current})\n`);
     persistChannel(requested);
+    if (cliStale) finishInInstalledCli();
+    else await ensureHerdrPin();
     return;
   }
 
@@ -4318,6 +6073,8 @@ async function cmdUpdate(args: string[]): Promise<void> {
   // channel file is supposed to make impossible — and the failure toast made it look like nothing
   // had happened at all.
   persistChannel(requested);
+  if (cliStale) finishInInstalledCli();
+  else await ensureHerdrPin();
   if (vscode === 'blocked' || jetbrains === 'blocked') {
     // Something is installed but couldn't be updated — never let this pass as success/silence.
     // On STDERR, not stdout: this is the failure reason, and an editor surfacing this run reads
@@ -4350,7 +6107,7 @@ async function cmdUpdate(args: string[]): Promise<void> {
  *  `-v` / `--version` stay a pure one-line print so scripts can rely on them. */
 async function cmdVersion(args: string[]): Promise<void> {
   const cur = version();
-  const core = require('@claude-observatory/core') as typeof import('@claude-observatory/core');
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
   const json = args.includes('--json');
   if (!(args.includes('--check') || args.includes('--latest'))) {
     // Network-free forms. `--json` is what the editors' version chip renders BEFORE any fetch:
@@ -4359,7 +6116,7 @@ async function cmdVersion(args: string[]): Promise<void> {
       emitJson({ current: cur, channel: core.getUpdateChannel() });
       return;
     }
-    process.stdout.write(`claude-observatory ${cur}\n`);
+    process.stdout.write(`oak ${cur}\n`);
     return;
   }
   const channel = core.getUpdateChannel();
@@ -4399,26 +6156,45 @@ async function cmdVersion(args: string[]): Promise<void> {
   if (stranded) {
     process.stdout.write(
       c.dim(`the installed build is newer than anything the ${CHANNEL_LABEL[channel]} channel publishes — probably a local build.\n`) +
-        c.dim('run `claude-observatory update` to move onto the channel, or switch channels with `update --channel dev`.\n')
+        c.dim('run `oak update` to move onto the channel, or switch channels with `update --channel dev`.\n')
     );
   } else if (differs) {
-    process.stdout.write(c.dim('run `claude-observatory update` to apply, or `update --check` to see every surface.\n'));
+    process.stdout.write(c.dim('run `oak update` to apply, or `update --check` to see every surface.\n'));
   }
 }
 
 function usage(): void {
   process.stdout.write(
-    `claude-observatory — per-edit Keep/Undo for Claude Code\n\n` +
-      `  init [--project] [--with-statusline]\n` +
+    `oak — per-edit Keep/Undo for Claude Code\n\n` +
+      `  init [--project] [--with-statusline] [--force] [--repair] [--no-codex]\n` +
       `                       install capture hooks (--project = repo ./.claude/settings.json;\n` +
-      `                       --with-statusline also installs the bundled status line)\n` +
-      `  statusline           install/refresh the bundled claude-statusline (usage bars; needs bash+jq)\n` +
+      `                       --with-statusline also installs the bundled status line; --repair\n` +
+      `                       re-canonicalizes every recorded install — the fix for doubled hooks\n` +
+      `                       left by older versions)\n` +
+      `  init --codex [--no-verify]\n` +
+      `                       install capture hooks for codex (~/.codex/hooks.json + trust state;\n` +
+      `                       foreign entries preserved); checks hooks.json + trust locally, no model\n` +
+      `                       run — codex skips untrusted hooks silently, so status re-checks them\n` +
+      `  statusline [--force] install/refresh the bundled claude-statusline (usage bars; needs bash+jq);\n` +
+      `                       refuses to replace another tool's statusLine unless --force\n` +
       `  uninstall [--project] [--all] [--purge-store]\n` +
-      `                       remove the capture hooks (--all also reverts the bundled status line +\n` +
+      `                       remove the capture hooks from every install-ledger location (--project =\n` +
+      `                       only this repo's file; --all also reverts the bundled status line +\n` +
       `                       prints teardown steps; --purge-store also deletes the stored edits)\n` +
       `  status               show hooks + hook-path health + session + edit counts\n` +
-      `  doctor [--json]      diagnose setup (hooks, PATH, config dir, session, status line) with fixes;\n` +
-      `                       --markdown (--md) emits the report as Markdown\n` +
+      `  integrity [--session <id>] [--json]  inspect capture gaps and unsafe history; read-only\n` +
+      `  doctor [--json] [--fix]\n` +
+      `                       diagnose setup (hooks, PATH, config dir, session, status line, herdr,\n` +
+      `                       the herdr server's environment) with fixes; --markdown (--md) emits the\n` +
+      `                       report as Markdown; --fix installs the pinned herdr, its claude + codex\n` +
+      `                       integrations and OAK's plugin, sets missing sidebar widths and theme\n` +
+      `                       defaults (gruvbox), starts its server, repairs PTY helper permissions\n` +
+      `                       and stops outdated focus servers; reports slow SSH forwarding for saved machines\n` +
+      `  models [use <name>]\n` +
+      `                       local models: list what ollama serves here and which one codex runs\n` +
+      `                       (a fresh \`ollama pull\` appears with nothing to reinstall — capture is\n` +
+      `                       model-independent); \`use\` pulls it if missing, wires codex to it\n` +
+      `                       (surgical config edit + .bak), and verifies with one live turn\n` +
       `  install-extensions [--check] [--json] [--force] [--channel stable|dev]\n` +
       `                       install the editor extensions into whatever editors are on this machine\n` +
       `                       (VS Code family + JetBrains); --vsix/--jetbrains-zip use local build\n` +
@@ -4434,10 +6210,51 @@ function usage(): void {
       `                       skips the extensions; --force reinstalls even if already current;\n` +
       `                       --channel switches between stable and the rolling pre-release (dev)\n` +
       `                       and installs that channel's newest in the same run\n` +
-      `  sessions             this workspace's sessions, newest conversation first (● = this directory's)\n` +
-      `  remotes [--json]     the machines to look for sessions on, over SSH; --add "name host [dir]",\n` +
-      `                       --remove|--enable|--disable <name>. Read-only: sessions there can be\n` +
-      `                       browsed, never reverted from here\n` +
+      `  sessions [--delete <id> [--force | --force-pending <n>] [--seen-through <edit>] | --undelete <id>]\n` +
+      `                       this machine's sessions, grouped by workspace (● = this directory's), without\n` +
+      `                       those in which nothing happened (no edit, no tokens, no reply) unless still running;\n` +
+      `                       --json --machine <label|id> reads one machine's own captured sessions over SSH;\n` +
+      `                       delete hides a session and purges stored edits (pending ones only with --force,\n` +
+      `                       or with --force-pending <n> while no more than n are pending); --seen-through\n` +
+      `                       <edit> also refuses while an edit newer than that id is pending;\n` +
+      `                       undelete restores visibility, not the purged edits\n` +
+      `  prompt --session <id> --text "…" [--machine <label>] [--json]  explicitly submit to its live pane;\n` +
+      `                       without a live pane, retain the clipboard draft and print it\n` +
+      `  comment add|list|rm|compose|send|mark-sent --session <id>  add --edit <n> [--line <n>] --text "…";\n` +
+      `                       compose prints an unsent draft; send submits it and marks only acknowledged\n` +
+      `                       comments sent; mark-sent --ids <a,b> records a reply delivered another way.\n` +
+      `                       --json reports the result; --text=--note preserves text beginning with dashes\n` +
+      `  quote --session <id> [--text "note"] [--send] [--json]  quote the latest transcript reply;\n` +
+      `                       default is a draft; --send explicitly submits it through herdr\n` +
+      `  focus --session <id> --tab observatory|review|herdr  select a conversation in an attached OAK TUI\n` +
+      `                       --pane <id> resolves a live herdr pane to its session\n` +
+      `  server start|stop|status [--json]  local focus endpoint; herdr owns terminals and agents\n` +
+      `  inbox [--json]       every session waiting on you, most urgent first — permission prompts, questions\n` +
+      `                       (with their options), input waits, then finished turns; --next [--after <id>]\n` +
+      `                       names the one to jump to. Review tab: i opens the inbox, h jumps to the next session;\n` +
+      `                       on Observatory, i replies and h focuses herdr\n` +
+      `  search <words…>      every conversation on this machine, ranked: the asks you typed and the prose that\n` +
+      `                       answered them, across sessions and workspaces (every word must appear; a hit in\n` +
+      `                       the ask outranks one in the answer); --days <N>, --limit <N>, --json\n` +
+      `  notify               desktop notifications for raised hands: --message <text> [--title <t>] [--sound]\n` +
+      `                       pops one; --watch [--interval <s>] announces every hand this workspace raises\n` +
+      `                       (from a plain terminal with no editor open); the editors announce in-process\n` +
+      `  agent start --kind claude|codex [--cwd <dir>] [--machine <label>]  spin an agent up (add --machine to run it on a remote and attach)\n` +
+      `  attach [machine]          attach this terminal to herdr here, or on a saved machine over SSH (tmux-style)\n` +
+      `  machine add <label> <ssh-target> | machine list [--json]\n` +
+      `                       the machines herdr runs agents on: add installs the version pinned in herdr.lock\n` +
+      `                       over ssh (checksum-verified) and saves it non-interactively; a newer local herdr is left alone.\n` +
+      `                       list is herdr's own machine list\n` +
+      `  <verb> … --machine <label>\n` +
+      `                       views, review, list, sessions, conversation, feed, multitask, subagents, diff,\n` +
+      `                       keep, undo, redo, resolve, comment, quote and ignore run on that saved machine over ssh.\n` +
+      `                       Its own oak answers (from ~/.local/bin, /opt/homebrew/bin or\n` +
+      `                       /usr/local/bin), in the session's own workspace there, with output and exit\n` +
+      `                       status passed back unchanged. Review (its session picker lists every saved\n` +
+      `                       machine's sessions; --session and --once too) and Observatory read sessions on\n` +
+      `                       their owning machine.\n` +
+      `                       OAK_MACHINE_TIMEOUT_MS overrides the 120-second command deadline; unit and\n` +
+      `                       mark-sent operations and conversations require a compatible remote build\n` +
       `  list [filters]       list edits (grouped by file); filters: --pending|--kept|--undone, --file <substr>\n` +
       `  timeline [--json]    edits newest-first as a chronological feed (time · id · Δ · file)\n` +
       `  actions [--json]     the full action timeline: EVERY tool call Claude made (reads, greps, bash,\n` +
@@ -4466,20 +6283,25 @@ function usage(): void {
       `                       sparkline, ±lines, risk) + nested subagents (phase/current task) + live file conflicts\n` +
       `  tasklog                    cross-agent task log: one row per stable taskId, unioned across worktrees + subagents\n` +
       `  metrics [--json]     session numbers: ±lines, action/error counts, subagent duration/tokens, tool latency\n` +
-      `  diff <id>            show before/after for an edit\n` +
-      `  keep <id>            mark an edit kept; bulk: --all | --file <substr> | --under <path>\n` +
+      `  diff <id> [--json]   show before/after; JSON carries session, id, file and patch\n` +
+      `  keep <id>            keep the whole change (review unit) edit <id> belongs to;\n` +
+      `                       bulk: --all | --file <substr> | --under <path> | --ids <a,b,c>\n` +
       `                       an id and a bulk flag are mutually exclusive (they mean different things)\n` +
-      `  undo <id> [--force]  surgically undo an edit (--force = per-file restore);\n` +
+      `  undo <id> [--force]  surgically undo the whole change edit <id> belongs to (--force = per-file restore);\n` +
       `                       bulk (pending only): --all | --file <substr> | --under <path> | --ids <a,b,c>\n` +
       `                       --from-prompt <id> rewinds that ask and everything after it\n` +
       `                       (add --dry-run to count what it would revert without touching disk)\n` +
       `                       an id and a bulk flag are mutually exclusive\n` +
-      `  redo <id> [--force]  re-apply an undone edit;\n` +
+      `  redo <id> [--force]  re-apply the whole undone change edit <id> belongs to;\n` +
       `                       bulk (undone only): --all | --file <substr> | --under <path> | --ids <a,b,c>\n` +
       `                       --from-prompt <id> re-applies EVERY undone edit from that ask onward — including\n` +
       `                       ones you had reverted before the rewind. To restore only what one rewind moved,\n` +
       `                       pass that rewind's --json ids to --ids (what the editors' Redo button does)\n` +
       `                       an id and a bulk flag are mutually exclusive\n` +
+      `                       keep, undo and redo: --ids <a,b,c> acts on those edits alone; add --units to\n` +
+      `                       widen each id to its whole review unit, as a single <id> does\n` +
+      `                       undo and redo: --ids <a,b,c> --record-only records what an undo or redo already\n` +
+      `                       did on disk without touching a file (the repair a "not recorded" report names)\n` +
       `  oplog [--json]       YOUR bulk operations (keeps, reverts, redos), journaled with before-images,\n` +
       `                       newest first; --revert-last reverses the most recent one — statuses\n` +
       `                       restored for a keep, files rewritten for a revert/redo\n` +
@@ -4504,6 +6326,8 @@ function usage(): void {
       `  demo --status [--json] whether a demo is recorded for this folder\n` +
       `  resolve [--session <id>]  accept every pending edit in a session, then clear its records; --json\n` +
       `  warm [--root <d>]    pre-build recent sessions so switching to one is instant (--since <dur>); --json\n` +
+      `  store [--move <dir> | --default] [--json]\n` +
+      `                       show or move the observatory store; --default returns it to its default location\n` +
       `  clean [opts]         GC orphaned blobs (--session <id> scopes; --json for structured output);\n` +
       `                       --drop <id> | --older-than <Nd> | --all | --resolved [--under <path> | --ids <a,b,c>]\n` +
       `                       --completed [--stale <Nd>] [--dry-run]  drop FINISHED sessions (nothing\n` +
@@ -4523,20 +6347,25 @@ function usage(): void {
       `                       <source>:<line>:<pattern><TAB><path> machine format\n` +
       `  tui [--session <id>] [--root <d>] [--tick <s>] [--once] [--no-color] [--no-mouse]\n` +
       `       [--cols N] [--rows N]\n` +
-      `                       the terminal app (TUI) — the same review actions as the editors:\n` +
-      `                       Claude, Prompts, Traces, Detail and Dashboards. Keys: F1-F6 focus a window\n` +
-      `                       (press twice to zoom — except F1, whose second press hands the terminal\n` +
-      `                       to \`claude --resume\`) — they are the ONLY window keys; 0-9 then Enter\n` +
-      `                       names an EDIT id. Tab next, arrows move, [ ]\n` +
-      `                       tabs, m minimize, z zoom, = reset, a keep, u undo, A/U everything listed\n` +
-      `                       (with a counted confirm), R redo, e $EDITOR, s session, o options,\n` +
-      `                       / filter, ? keys, r refresh, q quit. Running the command with no verb\n` +
-      `                       opens this. --once prints ONE plain frame and exits, which is also what a\n` +
-      `                       pipe or a non-TTY gets\n\n` +
+      `                       herdr · Observatory · Review; --tab herdr|observatory|review selects a tab\n` +
+      `                       Observatory: arrows preview (Review follows), Enter pins, i replies,\n` +
+      `                       h focuses herdr, r reviews, Shift+A includes archived sessions.\n` +
+      `                       Review: a keep, u undo.\n` +
+      `                       Leader (default ctrl+a) then o opens herdr's focused conversation.\n` +
+      `                       Herdr's tab bar starts agents; ctrl+a n/p or 1-3 switches OAK tabs.\n` +
+      `                       Ctrl+q twice quits OAK on every tab (repeat within two seconds).\n` +
+      `                       Ctrl+a q twice also quits OAK, including from the herdr tab.\n` +
+      `                       ? lists keys; Options rebinds them. --once prints one frame.\n\n` +
       `machine-readable (for front-ends/scripts; list/status/sessions/keep/undo/redo also take --json):\n` +
       `  blob <sha>           raw blob bytes to stdout\n` +
       `  tree [--root <d>] [--filter <q>]   folder→file→class→edit view-model as JSON (both editors)\n` +
       `  changemap [--root <d>]             session change-map (edits + per-file/per-folder rollups + per-agent slices) as JSON\n` +
+      `  conversation --session <id> [--limit N] [--since <cursor>] [--machine <label>] --json\n` +
+      `                       transcript conversation as renderer-ready updates; returns the next byte cursor.\n` +
+      `                       --limit N is the last N TURNS of an initial read (default 50); \`truncated\`\n` +
+      `                       reports the bytes cut above them (0 = the whole transcript). --since delivers\n` +
+      `                       EVERY record appended after that cursor, whatever the limit; \`reset\`: true\n` +
+      `                       means the transcript was replaced, so redraw from these events, never append\n` +
       `  views [--views <a,b,c>] [--root <d>]\n` +
       `                       run several READ-ONLY views in ONE process and emit {name: payload} —\n` +
       `                       each is byte-identical to its own command. Default set: changemap,\n` +
@@ -4551,7 +6380,13 @@ function usage(): void {
       `  observations [--root <d>]   Observations view-model: recap + timeline runs (adjacent same-file\n` +
       `                       edits coalesced ×N, each with reasoning) + next steps, as JSON\n` +
       `  usage                ctx / 5h / week snapshot + session token split + model/effort/compaction\n` +
-      `                       vitals, as JSON\n\n` +
+      `                       vitals, as JSON; --breakdown [--by week|month|model|session]\n` +
+      `                       [--agent claude|codex|both] [--weeks N]; --bill-day N anchors Claude month\n` +
+      `                       figures to your bill cycle, --gpt-bill-day N does the same for GPT (0 clears)\n` +
+      `  titles [--json] [--refresh] [--off | --on]\n` +
+      `                       Remote Control titles read from claude.ai, so sessions carry the names the\n` +
+      `                       Claude app shows: the last refresh and what it cached; --refresh reads now;\n` +
+      `                       --off stops the reads and drops the cache, --on resumes them\n\n` +
       `opt-in, token-spending (runs \`claude -p\`; returns the cached result unless --fresh):\n` +
       `  analyze <id>         deep-analyze one edit    [--json --fresh --claude-bin <path>]\n` +
       `  recap                one-line session recap   [--json --fresh --claude-bin <path>]\n` +
@@ -4573,7 +6408,7 @@ function usage(): void {
 type UpdateCache = { checkedMs: number; latestTag: string | null; latestDevTag?: string | null };
 
 function updateCachePath(): string {
-  const core = require('@claude-observatory/core') as typeof import('@claude-observatory/core');
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
   return require('path').join(core.rootDir(), '.update-check');
 }
 
@@ -4596,7 +6431,7 @@ function readUpdateCache(): UpdateCache | null {
 function writeUpdateCache(v: UpdateCache): void {
   try {
     const fs = require('fs');
-    const core = require('@claude-observatory/core') as typeof import('@claude-observatory/core');
+    const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
     fs.mkdirSync(core.rootDir(), { recursive: true });
     fs.writeFileSync(updateCachePath(), JSON.stringify(v));
   } catch {
@@ -4608,7 +6443,7 @@ function writeUpdateCache(v: UpdateCache): void {
  *  Prints nothing; failures are swallowed so an offline machine just keeps the previous cached tag. */
 async function refreshUpdateCache(): Promise<void> {
   try {
-    const core = require('@claude-observatory/core') as typeof import('@claude-observatory/core');
+    const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
     const list = JSON.parse(
       (await httpGet(`${RELEASES_API}/releases?per_page=100`)).toString('utf8')
     );
@@ -4639,7 +6474,7 @@ function shouldCheckUpdates(cmd: string | undefined, rest: string[]): boolean {
   // that would fire INSIDE the alternate screen and be wiped with it, and the check `require`s core
   // before the dispatch switch — on the one path whose first frame has to be immediate. The TUI surfaces
   // the same information in its own status line instead.
-  const SKIP = new Set(['capture', '__update-check', 'update', 'demo', 'tui', 'version', '--version', '-v', 'help', '--help', '-h']);
+  const SKIP = new Set(['capture', '__update-check', '__after-update', 'update', 'demo', 'tui', 'version', '--version', '-v', 'help', '--help', '-h']);
   return cmd !== undefined && !SKIP.has(cmd);
 }
 
@@ -4647,7 +6482,7 @@ function shouldCheckUpdates(cmd: string | undefined, rest: string[]): boolean {
  *  and kick a detached refresh if the cached check is older than a day. Cheap and non-blocking. */
 function maybeCheckForUpdate(cmd: string | undefined, rest: string[]): void {
   if (!shouldCheckUpdates(cmd, rest)) return;
-  const core = require('@claude-observatory/core') as typeof import('@claude-observatory/core');
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
   const cache = readUpdateCache();
   const cur = version();
   // The nudge follows the ACTIVE channel: a dev-channel install compares against the rolling
@@ -4663,8 +6498,8 @@ function maybeCheckForUpdate(cmd: string | undefined, rest: string[]): void {
         process.stderr.write(
           c.dim(
             behind
-              ? `\nupdate available (${cur} → ${channelTag}) — run \`claude-observatory update\`\n`
-              : `\nthis build (${cur}) is not on your ${CHANNEL_LABEL[core.getUpdateChannel()]} channel (${channelTag}) — run \`claude-observatory update\`\n`
+              ? `\nupdate available (${cur} → ${channelTag}) — run \`oak update\`\n`
+              : `\nthis build (${cur}) is not on your ${CHANNEL_LABEL[core.getUpdateChannel()]} channel (${channelTag}) — run \`oak update\`\n`
           )
         );
       } catch {
@@ -4680,7 +6515,7 @@ function maybeCheckForUpdate(cmd: string | undefined, rest: string[]): void {
     try {
       // process.execPath ends in .exe on Windows, so the launcher keeps this DIRECT — routing a
       // detached spawn through cmd.exe would flash a console window once a day.
-      (require('@claude-observatory/core') as typeof import('@claude-observatory/core'))
+      (require('@oak-observatory/core') as typeof import('@oak-observatory/core'))
         .spawnTool(process.execPath, [__filename, '__update-check'], { detached: true, stdio: 'ignore' })
         .unref();
     } catch {
@@ -4693,9 +6528,13 @@ function maybeCheckForUpdate(cmd: string | undefined, rest: string[]): void {
  *  to tell a swallowed command apart from a flag's argument at the front door. Derived from
  *  the same switch that runs them, so the two cannot drift. */
 const KNOWN_VERBS = new Set([
-  'actions', 'agents', 'analyze', 'assign', 'blob', 'capabilities', 'capture', 'changemap', 'chat-context', 'clean', 'demo', 'diff', 'doctor', 'egress', 'export', 'feed', 'fleet', 'footprint', 'help', 'ignore', 'init', 'insights', 'install-extensions', 'keep', 'list', 'locate', 'metrics', 'multitask', 'observations', 'observe', 'oplog', 'processes', 'prompts', 'recap', 'remotes', 'review', 'store', 'redo', 'resolve', 'risk', 'sessions', 'siblings', 'stats', 'status', 'statusline', 'subagents', 'tui', 'suggest', 'summary', 'task-clear', 'task-keep', 'task-undo', 'tasklog', 'timeline', 'trace', 'tree', 'undo', 'uninstall', 'update', 'usage', 'version', 'views', 'warm',
+  'actions', 'agent', 'agents', 'analyze', 'assign', 'attach', 'blob', 'capabilities', 'capture', 'changemap', 'chat-context', 'clean', 'comment', 'conversation', 'quote', 'demo', 'diff', 'doctor', 'egress', 'export', 'feed', 'fleet', 'footprint', 'focus', 'help', 'ignore', 'inbox', 'init', 'integrity', 'insights', 'install-extensions', 'keep', 'list', 'locate', 'machine', 'metrics', 'models', 'multitask', 'notify', 'observations', 'observe', 'oplog', 'processes', 'prompt', 'prompts', 'recap', 'review', 'store', 'redo', 'resolve', 'risk', 'search', 'server', 'sessions', 'siblings', 'stats', 'status', 'statusline', 'subagents', 'tui', 'suggest', 'summary', 'task-clear', 'task-keep', 'task-undo', 'tasklog', 'timeline', 'titles', 'trace', 'tree', 'undo', 'uninstall', 'update', 'usage', 'version', 'views', 'warm',
 ]);
-const FLAGS_WITH_VALUES = new Set(['--root', '--session', '--tick', '--cols', '--rows', '--out', '--under', '--ids', '--file', '--since', '--stale', '--drop', '--older-than', '--check', '--views', '--channel', '--prompt']);
+// NOTE: this is the SECOND list of value-taking flags in this file (see `VALUE_FLAGS` above). They
+// serve different parsers — that one strips flag/value pairs, this one decides whether a bare token
+// is a verb — and a flag missing from EITHER fails in its own way. `--tab review` needs both: the
+// first so the pair is consumed, this one so `review` is not mistaken for the review command.
+const FLAGS_WITH_VALUES = new Set(['--root', '--session', '--tick', '--cols', '--rows', '--out', '--under', '--ids', '--file', '--since', '--stale', '--drop', '--older-than', '--check', '--views', '--channel', '--prompt', '--agent', '--cwd', '--resume', '--tab', '--delete', '--undelete', '--after', '--kind', '--ts', '--title', '--message', '--interval', '--query', '--days', '--limit', '--text', '--edit', '--line', '--id', '--machine', '--comment-ids', '--pane']);
 
 function main(): void {
   // Exit cleanly when output is piped to a consumer that closes early (`| head`, `| grep -q`, …)
@@ -4705,50 +6544,84 @@ function main(): void {
     throw err;
   });
 
+  // Detached refreshes (`titles --refresh`) relaunch THIS file, the oak CLI, never whatever script started
+  // the process: a harness can run the CLI in-process with its own argv[1]. Its own tiny module, so the
+  // capture hook's hot path loads nothing more.
+  require('@oak-observatory/core/dist/cli-entry').setOakCliEntry(__filename);
+
   const argv = process.argv.slice(2);
   const cmd = argv[0];
   const rest = argv.slice(1);
+  // Post-rename nudge: the product is now `oak` (package `oak-observatory`). The old
+  // `claude-observatory` command still works as a deprecated alias, but say so once — interactively
+  // only (a human at a TTY), and NEVER for the `capture` hook, which runs on every tool call and whose
+  // output Claude Code consumes.
+  try {
+    const invokedAs = require('path').basename(process.argv[1] || '');
+    if (invokedAs === 'claude-observatory' && cmd !== 'capture' && process.stderr.isTTY) {
+      process.stderr.write(
+        c.yellow('claude-observatory') +
+          c.dim(' is now ') +
+          c.bold('oak') +
+          c.dim(' — the old name still works but will be retired; try `') +
+          `oak ${argv.join(' ')}`.trim() +
+          c.dim('`.\n')
+      );
+    }
+  } catch {
+    /* a deprecation nudge must never break a command */
+  }
   // A subcommand invoked with --help/-h prints usage instead of erroring on a missing positional arg
   // (e.g. `diff --help`, `task-keep --help`); do it before the nudge so a help invocation stays quiet.
   if (cmd !== undefined && (rest.includes('--help') || rest.includes('-h'))) {
     usage();
     return;
   }
-  // The product's front door is the app. A bare `claude-observatory`, or one carrying only flags
+  // The product's front door is the app. A bare `oak`, or one carrying only flags
   // (`--root`, `--session`, `--no-mouse`), opens the dashboard rather than erroring on a leading flag
   // it would otherwise read as a command name. Named verbs still dispatch below, and `--help` and
   // `--version` keep answering for themselves — those are questions, not a request to open anything.
   const HELP_OR_VERSION = new Set(['-h', '--help', '-v', '--version']);
   if (cmd === undefined || (cmd.startsWith('-') && !HELP_OR_VERSION.has(cmd))) {
-    // A VERB typed after a flag is not a request to open the dashboard. `claude-observatory --root x
+    // A VERB typed after a flag is not a request to open the dashboard. `oak --root x
     // status` used to open the app and silently drop `status`, which reads as the flag being wrong.
     // Flags take a value, so only a token that is a known verb AND not the value of the flag before
     // it counts — otherwise `--session status` would be misread as the verb.
     const verb = argv.find((a, i) => !a.startsWith('-') && !(i > 0 && argv[i - 1].startsWith('-') && FLAGS_WITH_VALUES.has(argv[i - 1])) && KNOWN_VERBS.has(a));
     if (verb) {
-      fail(`\`${verb}\` is a command, so it goes first: \`claude-observatory ${verb} ${argv.filter((a) => a !== verb).join(' ')}\``);
+      fail(`\`${verb}\` is a command, so it goes first: \`oak ${verb} ${argv.filter((a) => a !== verb).join(' ')}\``);
     }
-    require('@claude-observatory/tui').runTui(require('@claude-observatory/core'), argv, getTuiSessionId);
+    require('@oak-observatory/tui').runTui(require('@oak-observatory/core'), argv, getTuiSessionId);
     return;
   }
+  // A session verb aimed at a saved machine runs THERE, where the session's store and files are.
+  if (MACHINE_VERBS.has(cmd) && rest.some(a => a === '--machine' || a.startsWith('--machine='))) {
+    void forwardToMachine(cmd, rest).catch((e) => fail(String(e?.message || e)));
+    return;
+  }
+  // …and arriving there, it runs where its session ran.
+  if (process.env.OAK_FORWARDED === '1' && MACHINE_VERBS.has(cmd)) enterSessionWorkspace(rest);
   maybeCheckForUpdate(cmd, rest); // register a once-a-day "update available" nudge (never blocks)
-  // A throw from a SYNC command should surface as `claude-observatory: <msg>`, not a raw Node stack.
+  // A throw from a SYNC command should surface as `oak: <msg>`, not a raw Node stack.
   // process.exit() throws nothing, so a command's own exit is never caught here; async commands keep
   // their own .catch(fail) below.
   try {
   switch (cmd) {
-    case 'capture': {
-      // Hot path: load only the zero-dep capture module, never the diff-based engine.
-      const { runCapture } = require('@claude-observatory/core/dist/capture');
-      runCapture();
-      process.exit(0);
+    case '__conversation-protocol':
+      process.stdout.write('1\n'); // bounded initial reads, remote byte cursors and replacement resets
       break;
-    }
+    case '__review-protocol':
+      process.stdout.write('1\n'); // units, sent-comment ledger, equals text values, and JSON diffs
+      break;
     case 'init':
-      cmdInit(rest.includes('--project'), rest.includes('--with-statusline'));
+      if (rest.includes('--codex')) {
+        cmdInitCodex(!rest.includes('--no-verify'));
+        break;
+      }
+      cmdInit(rest.includes('--project'), rest.includes('--with-statusline'), rest.includes('--repair'), rest.includes('--force'));
       break;
     case 'statusline':
-      cmdStatusline();
+      cmdStatusline(rest);
       break;
     case 'uninstall':
       cmdUninstall(rest);
@@ -4756,14 +6629,31 @@ function main(): void {
     case 'status':
       cmdStatus(rest);
       break;
+    case 'integrity':
+      cmdIntegrity(rest);
+      break;
     case 'doctor':
-      cmdDoctor(rest);
+      cmdDoctor(rest).catch((e) => fail(String(e?.message || e)));
       break;
     case 'sessions':
       cmdSessions(rest);
       break;
-    case 'remotes':
-      cmdRemotes(rest);
+    case 'attach':
+      cmdAttach(rest).catch((e) => fail(String(e?.message || e)));
+      break;
+    case 'machine':
+      cmdMachine(rest).catch((e) => fail(String(e?.message || e)));
+      break;
+    case 'inbox':
+      cmdInbox(rest);
+      break;
+    case 'search':
+      cmdSearch(rest);
+      break;
+    case 'notify':
+      // Like `drive`: an async command in the sync dispatcher — `--watch` keeps its own interval alive;
+      // the one-shot forms finish on their own.
+      void cmdNotify(rest).catch(fail);
       break;
     case 'store':
       cmdStore(rest);
@@ -4813,6 +6703,9 @@ function main(): void {
     case 'feed':
       cmdFeed(rest);
       break;
+    case 'conversation':
+      cmdConversation(rest);
+      break;
     case 'subagents':
     case 'agents':
       cmdSubagents(rest);
@@ -4830,6 +6723,31 @@ function main(): void {
     case 'metrics':
       cmdMetrics(rest);
       break;
+
+    case 'focus':
+      void cmdFocus(rest).catch(e => fail(String(e?.message || e)));
+      break;
+    case 'server':
+      void cmdServer(rest).catch(e => fail(String(e?.message || e)));
+      break;
+
+    case 'agent':
+      cmdAgent(rest).catch((e) => fail(String(e.message || e)));
+      return;
+    case 'prompt':
+      void cmdPrompt(rest).catch(e => fail(String(e?.message || e)));
+      break;
+    case 'comment':
+      void cmdComment(rest).catch(e => fail(String(e?.message || e)));
+      break;
+    case 'quote':
+      void cmdQuote(rest).catch(e => fail(String(e?.message || e)));
+      break;
+
+    case 'models':
+      void cmdModels(rest).catch(fail);
+      break;
+
     case 'diff':
       cmdDiff(rest);
       break;
@@ -4888,7 +6806,7 @@ function main(): void {
       cmdViews(rest);
       break;
     case 'tui':
-      require('@claude-observatory/tui').runTui(require('@claude-observatory/core'), rest, getTuiSessionId);
+      require('@oak-observatory/tui').runTui(require('@oak-observatory/core'), rest, getTuiSessionId);
       break;
     case 'changemap':
       cmdChangeMap(rest);
@@ -4908,6 +6826,9 @@ function main(): void {
     case 'usage':
       cmdUsage(rest);
       break;
+    case 'titles':
+      cmdTitles(rest);
+      break;
     case 'analyze':
       cmdAnalyze(rest).catch((e) => fail(String(e?.message || e)));
       break;
@@ -4924,12 +6845,20 @@ function main(): void {
       // Internal, hidden: spawned detached by maybeCheckForUpdate to refresh the update cache.
       void refreshUpdateCache();
       break;
+    case '__after-update':
+      // Internal, hidden: `oak update` runs this in the CLI it just installed (finishInInstalledCli).
+      afterUpdate().catch((e) => fail(String(e?.message || e)));
+      break;
+    case '__tab-sync':
+      // Internal, hidden: started detached by the capture hooks and the status line (core kickTabSync).
+      cmdTabSync(rest);
+      break;
     case 'suggest':
       cmdSuggest(rest).catch((e) => fail(String(e?.message || e)));
       break;
     case '--version':
     case '-v':
-      process.stdout.write(`claude-observatory ${version()}\n`);
+      process.stdout.write(`oak ${version()}\n`);
       break;
     case 'version':
       cmdVersion(rest).catch((e) => fail(String(e?.message || e)));
@@ -4939,8 +6868,16 @@ function main(): void {
     case 'help':
       usage();
       break;
-    default:
-      fail(`unknown command "${cmd}". Run \`claude-observatory help\`.`);
+    default: {
+      // Verbs earlier releases shipped (0.9.5's `remotes`; dev builds' `drive`, `acp-fidelity`): name the replacement.
+      const replaced: Record<string, string> = {
+        remotes: '`oak machine add <label> <ssh-target>` and `oak machine list`',
+        drive: '`oak agent start` and `oak prompt`',
+        'acp-fidelity': '`oak integrity`',
+      };
+      if (Object.prototype.hasOwnProperty.call(replaced, cmd)) fail(`\`${cmd}\` was removed in 0.10.0; use ${replaced[cmd]}.`);
+      fail(`unknown command "${cmd}". Run \`oak help\`.`);
+    }
   }
   } catch (e: any) {
     fail(String(e?.message || e));

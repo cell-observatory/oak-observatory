@@ -17,7 +17,7 @@
  */
 import * as fs from 'fs';
 import { findTranscript } from './observe';
-import { cachedByFiles, readLines } from './fscache';
+import { transcriptFacts } from './derived-transcript';
 
 export interface BackgroundProcess {
   /** The harness's background shell id (e.g. `bpkyyxbff`) — how the agent reads or kills it. */
@@ -59,10 +59,12 @@ function toMs(v: unknown): number {
   return 0;
 }
 
-/** Pull one tagged value out of a <task-notification> block. */
+/** Pull one tagged value out of a <task-notification> block: the first `<name>` that is closed. indexOf, not a
+ *  lazy `<name>([\s\S]*?)</name>`, which read to the end of the text from every unclosed opener. */
 function tag(text: string, name: string): string {
-  const m = new RegExp(`<${name}>([\\s\\S]*?)</${name}>`).exec(text);
-  return m ? m[1].trim() : '';
+  const open = text.indexOf(`<${name}>`);
+  const close = open < 0 ? -1 : text.indexOf(`</${name}>`, open + name.length + 2);
+  return close < 0 ? '' : text.slice(open + name.length + 2, close).trim();
 }
 
 /**
@@ -98,122 +100,120 @@ export function sessionProcesses(cwd: string, sessionId: string, nowMs?: number)
 
 /** The transcript-derived skeleton of every background shell — pure, so it memoizes cleanly. */
 function parseProcesses(transcript: string): BackgroundProcess[] {
-  return cachedByFiles('processes', [transcript], () => parseProcessesUncached(transcript));
+  return processesFromFacts(transcriptFacts(transcript).processes);
 }
 
-function parseProcessesUncached(transcript: string): BackgroundProcess[] {
-  let lines: string[];
-  try {
-    lines = readLines(transcript);
-  } catch {
-    return [];
-  }
-  // Keyed by tool_use id first (that is all the spawn knows), then re-keyed once the result names the
-  // background id — the completion notification only ever refers to the background id.
-  const byToolUse = new Map<string, BackgroundProcess>();
-  const byId = new Map<string, BackgroundProcess>();
-  // A completion can be logged BEFORE the result that binds its id (the harness writes the
-  // notification as soon as the shell exits, which can precede the turn that consumed the spawn), so
-  // unmatched ones are held and re-applied once every binding is known.
-  const pendingEnd: { id: string; toolUseId: string; ts: number; status: string; summary: string; outputFile: string }[] = [];
-  // `TaskStop` is an explicit kill — the only end some shells ever get.
-  const stopped = new Map<string, number>();
-  // Newest timestamp anywhere in the transcript: the last moment this session is KNOWN to have existed.
-  let lastRecordTs = 0;
+/** Compact cursor state; pending completions and kills remain unresolved until projection. */
+export interface ProcessFacts {
+  byToolUse: Map<string, BackgroundProcess>;
+  byId: Map<string, BackgroundProcess>;
+  pendingEnd: { id: string; toolUseId: string; ts: number; status: string; summary: string; outputFile: string }[];
+  stopped: Map<string, number>;
+  lastRecordTs: number;
+}
+export function newProcessFacts(): ProcessFacts {
+  return { byToolUse: new Map(), byId: new Map(), pendingEnd: [], stopped: new Map(), lastRecordTs: 0 };
+}
 
-  for (const line of lines) {
-    const t = line.trim();
-    if (!t) continue;
-    let o: any;
-    try {
-      o = JSON.parse(t);
-    } catch {
-      continue;
+/** Fold one record, retaining the original parser's notification ordering. */
+export function foldProcessFacts(facts: ProcessFacts, o: any): void {
+  const { byToolUse, byId, pendingEnd, stopped } = facts;
+  const ts = toMs(o.timestamp ?? o.ts);
+  if (ts > facts.lastRecordTs) facts.lastRecordTs = ts;
+
+  // The completion notification is its own record type, with no `message` at all.
+  if (typeof o.content === 'string' && o.content.includes('<task-notification>')) {
+    const id = tag(o.content, 'task-id');
+    const p = id ? byId.get(id) : undefined;
+    if (!p) {
+      pendingEnd.push({
+        id,
+        toolUseId: tag(o.content, 'tool-use-id'),
+        ts,
+        status: tag(o.content, 'status'),
+        summary: tag(o.content, 'summary'),
+        outputFile: tag(o.content, 'output-file'),
+      });
+      return;
     }
-    const ts = toMs(o.timestamp ?? o.ts);
-    if (ts > lastRecordTs) lastRecordTs = ts;
+    // The harness logs each completion TWICE — `enqueue` when the shell finished, `remove` when the
+    // next turn consumed the notification. The first is when it actually ended; taking the later one
+    // inflated runtimes by the agent's own think-time (up to 10x on a busy run).
+    if (p && !p.endedTs) {
+      const status = tag(o.content, 'status');
+      const summary = tag(o.content, 'summary');
+      const code = /exit code (-?\d+)/.exec(summary);
+      p.status = status || 'completed';
+      p.running = false;
+      p.endedTs = ts;
+      p.exitCode = code ? Number(code[1]) : null;
+      // A notification can also mean "killed"/"failed" — pass the harness's own word through.
+      if (!p.outputPath) p.outputPath = tag(o.content, 'output-file') || null;
+    }
+    return;
+  }
 
-    // The completion notification is its own record type, with no `message` at all.
-    if (typeof o.content === 'string' && o.content.includes('<task-notification>')) {
-      const id = tag(o.content, 'task-id');
-      const p = id ? byId.get(id) : undefined;
-      if (!p) {
-        pendingEnd.push({
-          id,
-          toolUseId: tag(o.content, 'tool-use-id'),
-          ts,
-          status: tag(o.content, 'status'),
-          summary: tag(o.content, 'summary'),
-          outputFile: tag(o.content, 'output-file'),
-        });
+  const msg = o.message;
+  if (!msg || !Array.isArray(msg.content) || o.isSidechain === true) return;
+
+  if (msg.role === 'assistant') {
+    for (const b of msg.content) {
+      if (b?.type === 'tool_use' && b.name === 'TaskStop') {
+        const killed = b.input && typeof b.input === 'object' && typeof b.input.task_id === 'string' ? b.input.task_id : '';
+        if (killed) stopped.set(killed, ts);
         continue;
       }
-      // The harness logs each completion TWICE — `enqueue` when the shell finished, `remove` when the
-      // next turn consumed the notification. The first is when it actually ended; taking the later one
-      // inflated runtimes by the agent's own think-time (up to 10x on a busy run).
-      if (p && !p.endedTs) {
-        const status = tag(o.content, 'status');
-        const summary = tag(o.content, 'summary');
-        const code = /exit code (-?\d+)/.exec(summary);
-        p.status = status || 'completed';
-        p.running = false;
-        p.endedTs = ts;
-        p.exitCode = code ? Number(code[1]) : null;
-        // A notification can also mean "killed"/"failed" — pass the harness's own word through.
-        if (!p.outputPath) p.outputPath = tag(o.content, 'output-file') || null;
-      }
-      continue;
+      if (b?.type !== 'tool_use' || b.name !== 'Bash') continue;
+      const input = b.input && typeof b.input === 'object' ? b.input : {};
+      if (input.run_in_background !== true) continue;
+      const rec: BackgroundProcess = {
+        id: '', // filled in from the result
+        toolUseId: typeof b.id === 'string' ? b.id : null,
+        command: typeof input.command === 'string' ? input.command : '',
+        description: typeof input.description === 'string' ? input.description : null,
+        startedTs: ts,
+        endedTs: 0,
+        running: true,
+        status: 'running',
+        exitCode: null,
+        runtimeMs: 0,
+        outputPath: null,
+        outputBytes: 0,
+        lastOutputTs: 0,
+      };
+      if (rec.toolUseId) byToolUse.set(rec.toolUseId, rec);
     }
+    return;
+  }
 
-    const msg = o.message;
-    if (!msg || !Array.isArray(msg.content) || o.isSidechain === true) continue;
-
-    if (msg.role === 'assistant') {
-      for (const b of msg.content) {
-        if (b?.type === 'tool_use' && b.name === 'TaskStop') {
-          const killed = b.input && typeof b.input === 'object' && typeof b.input.task_id === 'string' ? b.input.task_id : '';
-          if (killed) stopped.set(killed, ts);
-          continue;
-        }
-        if (b?.type !== 'tool_use' || b.name !== 'Bash') continue;
-        const input = b.input && typeof b.input === 'object' ? b.input : {};
-        if (input.run_in_background !== true) continue;
-        const rec: BackgroundProcess = {
-          id: '', // filled in from the result
-          toolUseId: typeof b.id === 'string' ? b.id : null,
-          command: typeof input.command === 'string' ? input.command : '',
-          description: typeof input.description === 'string' ? input.description : null,
-          startedTs: ts,
-          endedTs: 0,
-          running: true,
-          status: 'running',
-          exitCode: null,
-          runtimeMs: 0,
-          outputPath: null,
-          outputBytes: 0,
-          lastOutputTs: 0,
-        };
-        if (rec.toolUseId) byToolUse.set(rec.toolUseId, rec);
-      }
-      continue;
-    }
-
-    if (msg.role === 'user') {
-      // The result names the shell: `toolUseResult.backgroundTaskId`, with the output path in its text.
-      const bgId = o.toolUseResult && typeof o.toolUseResult.backgroundTaskId === 'string' ? o.toolUseResult.backgroundTaskId : '';
-      if (!bgId) continue;
-      for (const b of msg.content) {
-        if (b?.type !== 'tool_result' || typeof b.tool_use_id !== 'string') continue;
-        const rec = byToolUse.get(b.tool_use_id);
-        if (!rec) continue;
-        rec.id = bgId;
-        const text = typeof b.content === 'string' ? b.content : '';
-        const m = /Output is being written to: (\S+?)\.?(?:\s|$)/.exec(text);
-        if (m) rec.outputPath = m[1];
-        byId.set(bgId, rec);
-      }
+  if (msg.role === 'user') {
+    // The result names the shell: `toolUseResult.backgroundTaskId`, with the output path in its text.
+    const bgId = o.toolUseResult && typeof o.toolUseResult.backgroundTaskId === 'string' ? o.toolUseResult.backgroundTaskId : '';
+    if (!bgId) return;
+    for (const b of msg.content) {
+      if (b?.type !== 'tool_result' || typeof b.tool_use_id !== 'string') continue;
+      const rec = byToolUse.get(b.tool_use_id);
+      if (!rec) continue;
+      rec.id = bgId;
+      const text = typeof b.content === 'string' ? b.content : '';
+      const m = /Output is being written to: (\S+?)\.?(?:\s|$)/.exec(text);
+      if (m) rec.outputPath = m[1];
+      byId.set(bgId, rec);
     }
   }
+}
+
+
+/** Project onto copies: a read must not finalize pending ends in the persisted cursor. */
+export function processesFromFacts(facts: ProcessFacts): BackgroundProcess[] {
+  const copies = new Map<BackgroundProcess, BackgroundProcess>();
+  const copy = (p: BackgroundProcess): BackgroundProcess => {
+    if (!copies.has(p)) copies.set(p, { ...p });
+    return copies.get(p)!;
+  };
+  const byToolUse = new Map([...facts.byToolUse].map(([id, p]) => [id, copy(p)]));
+  const byId = new Map([...facts.byId].map(([id, p]) => [id, copy(p)]));
+  const { pendingEnd, stopped, lastRecordTs } = facts;
 
   // Ends that arrived before their binding, now resolvable by task-id or by the tool_use they answer.
   for (const e of pendingEnd) {

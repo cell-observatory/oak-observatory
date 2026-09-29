@@ -2,6 +2,7 @@ package com.cellobservatory.observatory.core
 
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -121,6 +122,23 @@ class StoreReaderTest {
     }
 
     @Test
+    fun `sessionExists answers from the store dir, any project transcript, or a proven absence`() {
+        // The store dir (created in setUp) is enough — the common pinned case.
+        assertTrue(StoreReader.sessionExists(session))
+        // No store dir, but a transcript in SOME project dir: the pin is application-wide, so a
+        // session from a different project than the one asking still exists.
+        val t = "transcript-only-session"
+        val proj = ClaudePaths.configDir().resolve("projects").resolve("-w-somewhere")
+        Files.createDirectories(proj)
+        Files.writeString(proj.resolve("$t.jsonl"), "{}\n")
+        assertTrue(StoreReader.sessionExists(t))
+        // Neither, anywhere — the PROVEN absence that lets a stale pin heal instead of blanking
+        // every panel (the currentSession() fallback rides exactly this answer).
+        assertFalse(StoreReader.sessionExists("deleted-session"))
+        assertFalse(StoreReader.sessionExists(""))
+    }
+
+    @Test
     fun `drive-letter case twins heal to one canonical path — the readLog mirror of issue 43`() {
         writeLog(
             """{"id":1,"ts":1000,"tool":"Bash","file":"C:\\repo\\ci.yml","beforeBlob":null,"afterBlob":"aa","status":"pending"}""",
@@ -147,4 +165,33 @@ class StoreReaderTest {
         assertEquals("/w/a.txt", ClaudePaths.storeKey("/w/a.txt"))
         assertEquals("/w/odd\\name", ClaudePaths.storeKey("/w/odd\\name"))
     }
+    @Test
+    fun `duplicate legacy IDs and later capture evidence match core targeting`() {
+        Files.writeString(ClaudePaths.logPath(session), """
+            {"id":1,"uid":"a","file":"/tmp/one","tool":"Edit","beforeBlob":"old","afterBlob":"new"}
+            {"id":1,"uid":"b","file":"/tmp/two","tool":"Edit","source":"acp","partial":true,"beforeBlob":null,"afterBlob":"two"}
+            {"op":"capture-evidence","id":2,"uid":"b","beforeBlob":"before","tool":"Write","toolCallId":"native","beforeState":"present"}
+            {"op":"status","id":2,"status":"undone"}
+        """.trimIndent())
+        val rows = StoreReader.readLog(session)
+        assertEquals(listOf(1, 2), rows.map { it.id })
+        assertEquals(listOf("pending", "undone"), rows.map { it.status })
+        assertEquals("before", rows[1].beforeBlob)
+        assertEquals("native", rows[1].toolCallId)
+        assertFalse(rows[1].reviewOnly)
+    }
+
+    @Test
+    fun `Codex census includes archived custom home sessions only when requested`() {
+        val home = cfg.resolve("codex")
+        val live = home.resolve("sessions/2026/09/09")
+        val archive = home.resolve("archived_sessions")
+        Files.createDirectories(live)
+        Files.createDirectories(archive)
+        Files.writeString(live.resolve("live.jsonl"), """{"type":"session_meta","payload":{"id":"live","cwd":"/tmp/work"}}""")
+        Files.writeString(archive.resolve("archive.jsonl"), """{"type":"session_meta","payload":{"id":"archived","cwd":"/tmp/work"}}""")
+        assertEquals(listOf("live"), StoreReader.codexSessions(home = home).map { it.first })
+        assertEquals(setOf("live", "archived"), StoreReader.codexSessions(true, home).map { it.first }.toSet())
+    }
+
 }

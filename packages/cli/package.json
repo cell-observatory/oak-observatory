@@ -1,10 +1,11 @@
 {
-  "name": "claude-observatory",
+  "name": "oak-observatory",
   "version": "0.10.0-dev.0",
-  "description": "Standalone, git-free, per-edit Keep/Undo for Claude Code on established and mission-critical codebases. Zero extra Claude tokens.",
+  "description": "Per-edit Keep/Undo for Claude Code and Codex, with local capture and review. No git or extra model tokens required.",
   "keywords": [
     "claude",
     "claude-code",
+    "codex",
     "undo",
     "keep",
     "diff",
@@ -16,6 +17,8 @@
   "license": "Apache-2.0",
   "author": "Cell Observatory",
   "bin": {
+    "oak": "dist/index.js",
+    "oak-observatory": "dist/index.js",
     "claude-observatory": "dist/index.js"
   },
   "files": [
@@ -25,26 +28,30 @@
     "LICENSE"
   ],
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   },
   "scripts": {
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "bundle": "esbuild src/index.ts src/capture.ts --bundle --platform=node --format=cjs --outdir=dist --banner:js=\"#!/usr/bin/env node\"",
-    "build": "npm run typecheck && npm run bundle",
+    "bundle": "esbuild cli=src/index.ts src/capture.ts --bundle --platform=node --format=cjs --outdir=dist --external:node-pty --banner:js=\"#!/usr/bin/env node\" && esbuild src/launch.ts --platform=node --format=cjs --outfile=dist/index.js --banner:js=\"#!/usr/bin/env node\" && node -e \"require('fs').chmodSync('dist/index.js',0o755)\"",
+    "stage:herdr": "node -e \"const f=require('fs');f.rmSync('dist/herdr.lock',{force:true});f.copyFileSync('../../THIRD_PARTY_NOTICES.md','dist/THIRD_PARTY_NOTICES.md');f.rmSync('dist/herdr-plugin',{recursive:true,force:true});f.cpSync('../herdr-plugin','dist/herdr-plugin',{recursive:true})\"",
+    "build": "npm run typecheck && npm run bundle && npm run stage:herdr",
     "prepublishOnly": "cd ../.. && npm run build"
   },
   "devDependencies": {
-    "@claude-observatory/core": "0.10.0-dev.0",
+    "@oak-observatory/core": "0.10.0-dev.0",
     "@types/node": "^26.1.2",
     "esbuild": "^0.28.1",
     "typescript": "^5.9.3"
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/cell-observatory/claude-observatory.git"
+    "url": "https://github.com/cell-observatory/oak-observatory.git"
   },
-  "homepage": "https://github.com/cell-observatory/claude-observatory#readme",
+  "homepage": "https://github.com/cell-observatory/oak-observatory#readme",
   "bugs": {
-    "url": "https://github.com/cell-observatory/claude-observatory/issues"
+    "url": "https://github.com/cell-observatory/oak-observatory/issues"
+  },
+  "optionalDependencies": {
+    "node-pty": "^1.1.0"
   }
 }

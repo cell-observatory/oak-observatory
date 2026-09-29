@@ -4,13 +4,21 @@ import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 
 /**
- * Kotlin mirror of core's EditTree view-model, parsed from `claude-observatory tree --json`.
+ * Kotlin mirror of core's EditTree view-model, parsed from `oak tree --json`.
  * Folder compaction, class grouping, exact deltas, and Search filtering are all computed server-side
  * in core.buildEditTree — this plugin only renders the result (no more local tree/class logic).
  */
 data class TreeEditNode(val rec: EditRecord, val added: Int, val removed: Int)
 data class TreeClassNode(val name: String, val edits: List<TreeEditNode>)
-data class TreeFileNode(val rel: String, val file: String, val classes: List<TreeClassNode>, val loose: List<TreeEditNode>) {
+data class TreeFileNode(
+    val rel: String,
+    val file: String,
+    val classes: List<TreeClassNode>,
+    val loose: List<TreeEditNode>,
+    val maxTs: Long = 0L, // most-recent edit time — the "N min ago" column + time sort
+    val ext: String = "", // extension filter key
+    val category: String = "other", // file-type filter key
+) {
     /** Every edit under this file (class-grouped + loose), for the file-scoped Undo-All action. */
     val allEdits: List<EditRecord> get() = classes.flatMap { c -> c.edits.map { it.rec } } + loose.map { it.rec }
 }
@@ -52,6 +60,9 @@ object TreeParser {
         o.get("file").asString,
         o.getAsJsonArray("classes").map { cls(it.asJsonObject) },
         o.getAsJsonArray("loose").map { edit(it.asJsonObject) },
+        o.get("maxTs")?.takeIf { !it.isJsonNull }?.asLong ?: 0L,
+        o.get("ext")?.takeIf { !it.isJsonNull }?.asString ?: "",
+        o.get("category")?.takeIf { !it.isJsonNull }?.asString ?: "other",
     )
 
     private fun cls(o: JsonObject): TreeClassNode =
@@ -66,6 +77,7 @@ object TreeParser {
             o.get("beforeBlob").let { if (it.isJsonNull) null else it.asString },
             o.get("afterBlob").let { if (it.isJsonNull) null else it.asString },
             o.get("status").asString,
+            partial = o.get("partial")?.let { !it.isJsonNull && it.asBoolean } ?: false,
         )
         return TreeEditNode(rec, o.get("added").asInt, o.get("removed").asInt)
     }
