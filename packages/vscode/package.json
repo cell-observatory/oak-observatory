@@ -1456,11 +1456,11 @@
   },
   "devDependencies": {
     "@oak-observatory/core": "0.11.0-dev.0",
-    "@types/node": "^26.1.2",
-    "@types/vscode": "^1.85.0",
+    "@types/node": "^26.6.3",
+    "@types/vscode": "^1.138.0",
     "@vscode/codicons": "^0.0.45",
-    "@vscode/vsce": "^3.0.0",
-    "esbuild": "^0.28.1",
+    "@vscode/vsce": "^4.0.0",
+    "esbuild": "^0.28.2",
     "typescript": "^5.9.3",
     "vscode-oniguruma": "^2.0.1",
     "vscode-textmate": "^9.3.2"
