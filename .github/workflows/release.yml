@@ -16,7 +16,7 @@ jobs:
   release:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:
           node-version: 22
@@ -57,11 +57,11 @@ jobs:
       - run: npm test
       - run: bash test/e2e.sh
       - run: npm run release
-      - uses: actions/setup-java@v5
+      - uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: 21
-      - uses: gradle/actions/setup-gradle@v4
+      - uses: gradle/actions/setup-gradle@v6
       - run: ./gradlew buildPlugin --console=plain
         working-directory: packages/jetbrains
       - name: Create GitHub Release with artifacts
