@@ -132,6 +132,9 @@ native.spawnNative = (...args) => {
  *  `missing` fails to start, as a tool that is not installed does (`exits`: and reports an exit after the error too, which
  *  Node says may happen). A run that is killed says so (`killed`) and exits as a killed process does, with no code. */
 const clipTools = {}, runs = [];
+const macClipboard = process.platform === 'darwin';
+const copyTool = macClipboard ? 'pbcopy' : 'wl-copy';
+const pasteTool = macClipboard ? 'pbpaste' : 'wl-paste';
 const tool = (name, { exit = 0, hold = false, missing = false, exits = false } = {}) => args => {
   const { EventEmitter } = require('events'), child = new EventEmitter();
   child.stdin = new EventEmitter();
@@ -1490,7 +1493,7 @@ const masterCols = Math.floor(140 * 0.3); // the Observatory master's width at 1
       assert.deepEqual([runs[2].text, state.toast?.text], ['Fix', 'copied 3 chars to clipboard via tmux']);
       // The system's tools, for copies too large for OSC 52, the same way.
       delete process.env.TMUX; runs.length = 0;
-      clipTools['wl-copy'] = tool('wl-copy', { hold: true });
+      clipTools[copyTool] = tool(copyTool, { hold: true });
       const big = ch => ch.repeat(60 * 1024);
       client.clipboard(big('a')); client.clipboard(big('b')); client.clipboard(big('c')); await wait();
       assert.deepEqual(runs.map(r => r.text[0]), ['a']);
@@ -1515,7 +1518,7 @@ const masterCols = Math.floor(140 * 0.3); // the Observatory master's width at 1
       await key('\x1b1');
       const client = spawns[0].client;
       delete process.env.TMUX;
-      clipTools['wl-copy'] = tool('wl-copy', { hold: true }); clipTools.xclip = tool('xclip', { hold: true });
+      clipTools[copyTool] = tool(copyTool, { hold: true }); clipTools.xclip = tool('xclip', { hold: true });
       const big = ch => ch.repeat(60 * 1024);
       const setTimer = global.setTimeout, valves = [];
       const stuck = async go => {
@@ -1524,13 +1527,13 @@ const masterCols = Math.floor(140 * 0.3); // the Observatory master's width at 1
       };
       await stuck(async () => { client.clipboard(big('d')); await wait(); });
       valves.shift()(); await wait();
-      assert.equal(runs[0].killed, true, 'its ten seconds up, wl-copy is stopped');
-      assert.equal(state.toast?.text, "herdr's copy did not reach the clipboard: wl-copy did not finish in 10 s", 'and a toast says so');
+      assert.equal(runs[0].killed, true, `its ten seconds up, ${copyTool} is stopped`);
+      assert.equal(state.toast?.text, `herdr's copy did not reach the clipboard: ${copyTool} did not finish in 10 s`, 'and a toast says so');
       assert.ok(state.toast.until - Date.now() > 2500, 'for as long as a refusal stands');
       client.clipboard(big('e')); await wait();
       runs[1].end(0); await wait();
       runs[0].end(1); await wait();
-      assert.deepEqual(runs.map(r => [r.name, r.text[0]]), [['wl-copy', 'd'], ['wl-copy', 'e']], 'and failing late, it runs no other tool with the older text');
+      assert.deepEqual(runs.map(r => [r.name, r.text[0]]), [[copyTool, 'd'], [copyTool, 'e']], 'and failing late, it runs no other tool with the older text');
       // Inside tmux, OAK's own copy: tmux is stopped at ten seconds, herdr's newer copy goes, and the stopped one says nothing
       // when it finishes.
       process.env.TMUX = '/fixture/tmux,1,0';
@@ -1555,24 +1558,24 @@ const masterCols = Math.floor(140 * 0.3); // the Observatory master's width at 1
       await key('\x1b1');
       const client = spawns[0].client;
       delete process.env.TMUX;
-      Object.assign(clipTools, { 'wl-copy': tool('wl-copy', { exit: 1 }), xclip: tool('xclip', { exit: 1 }), pbcopy: tool('pbcopy', { missing: true }) });
+      Object.assign(clipTools, { pbcopy: tool('pbcopy', { missing: true }), [copyTool]: tool(copyTool, { exit: 1 }), xclip: tool('xclip', { exit: 1 }) });
       client.clipboard('a'.repeat(60 * 1024)); await wait();
-      assert.equal(state.toast?.text, "herdr's copy is too large for the terminal (80KB, limit ~73KB), and wl-copy and xclip failed");
-      Object.assign(clipTools, { 'wl-copy': tool('wl-copy', { missing: true }), xclip: tool('xclip', { missing: true }) });
+      assert.equal(state.toast?.text, macClipboard ? "herdr's copy is too large for the terminal (80KB, limit ~73KB), and pbcopy failed" : "herdr's copy is too large for the terminal (80KB, limit ~73KB), and wl-copy and xclip failed");
+      Object.assign(clipTools, { [copyTool]: tool(copyTool, { missing: true }), xclip: tool('xclip', { missing: true }) });
       client.clipboard('a'.repeat(60 * 1024)); await wait();
-      assert.equal(state.toast?.text, "herdr's copy is too large for the terminal (80KB, limit ~73KB) — install wl-copy or xclip for big copies");
+      assert.equal(state.toast?.text, macClipboard ? "herdr's copy is too large for the terminal (80KB, limit ~73KB)" : "herdr's copy is too large for the terminal (80KB, limit ~73KB) — install wl-copy or xclip for big copies");
       // One that failed is named, and one that is not installed is named to install: on X11 wl-copy has no Wayland display,
       // and xclip would copy. The advice went with any tool that failed (2026-10-13).
-      Object.assign(clipTools, { 'wl-copy': tool('wl-copy', { exit: 1 }), xclip: tool('xclip', { missing: true }) });
+      Object.assign(clipTools, { [copyTool]: tool(copyTool, { exit: 1 }), xclip: tool('xclip', { missing: true }) });
       client.clipboard('a'.repeat(60 * 1024)); await wait();
-      assert.equal(state.toast?.text, "herdr's copy is too large for the terminal (80KB, limit ~73KB), and wl-copy failed — install xclip for big copies");
+      assert.equal(state.toast?.text, macClipboard ? "herdr's copy is too large for the terminal (80KB, limit ~73KB), and pbcopy failed" : "herdr's copy is too large for the terminal (80KB, limit ~73KB), and wl-copy failed — install xclip for big copies");
       // A tool that fails to start can report an exit after its error, as Node allows: the first decides, so it is named to
       // install, and the next tool runs once.
       runs.length = 0;
-      Object.assign(clipTools, { 'wl-copy': tool('wl-copy', { missing: true, exits: true }), xclip: tool('xclip', { exit: 1 }) });
+      Object.assign(clipTools, { [copyTool]: tool(copyTool, { missing: true, exits: true }), xclip: tool('xclip', { exit: 1 }) });
       client.clipboard('a'.repeat(60 * 1024)); await wait();
-      assert.deepEqual(runs.map(r => r.name), ['xclip']);
-      assert.equal(state.toast?.text, "herdr's copy is too large for the terminal (80KB, limit ~73KB), and xclip failed — install wl-copy for big copies");
+      assert.deepEqual(runs.map(r => r.name), macClipboard ? [] : ['xclip']);
+      assert.equal(state.toast?.text, macClipboard ? "herdr's copy is too large for the terminal (80KB, limit ~73KB)" : "herdr's copy is too large for the terminal (80KB, limit ~73KB), and xclip failed — install wl-copy for big copies");
       // A paste counts characters as a copy does: it said `pasted 2 chars` for one emoji.
       await key('\x02'); await key('m'); await key('/');
       const pasting = text => args => {
@@ -1581,10 +1584,10 @@ const masterCols = Math.floor(140 * 0.3); // the Observatory master's width at 1
         queueMicrotask(() => { child.stdout.emit('data', Buffer.from(text)); child.emit('exit', 0); });
         return child;
       };
-      clipTools['wl-paste'] = pasting('\u{1F600}');
+      clipTools[pasteTool] = pasting('\u{1F600}');
       await key('\x16');
       assert.equal(state.status, 'pasted 1 char');
-      clipTools['wl-paste'] = pasting('café');
+      clipTools[pasteTool] = pasting('café');
       await key('\x16');
       assert.equal(state.status, 'pasted 4 chars');
     } else if (check === 'copy-remote') {

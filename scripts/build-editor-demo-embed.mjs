@@ -6,8 +6,9 @@
 // extracting the wrong lines. Re-run whenever the homepage demo changes: node scripts/build-editor-demo-embed.mjs
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const src = fs.readFileSync(path.join(ROOT, 'docs', 'showcase.html'), 'utf8').split('\n');
 
 // Locate the slices by MARKERS, not line numbers, so edits to showcase.html can't silently shift them.

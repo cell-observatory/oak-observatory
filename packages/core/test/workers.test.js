@@ -117,9 +117,13 @@ test('workers: saved-machine rows retain their owner and reviewed machine comes 
 test('workers: Claude native status is shared across processes for ten seconds, then sees a new agent', t => {
   const f = fixture(t);
   const cp = require('node:child_process');
-  const bin = path.join(f.home, 'claude'), log = path.join(f.home, 'calls'), answer = path.join(f.home, 'answer');
+  const bin = path.join(f.home, process.platform === 'win32' ? 'claude.cmd' : 'claude'), log = path.join(f.home, 'calls'), answer = path.join(f.home, 'answer');
   fs.writeFileSync(answer, '[]');
-  fs.writeFileSync(bin, `#!/bin/sh\necho "$*" >> '${log}'\ncat '${answer}'\n`, { mode: 0o755 });
+  // A node script behind a launcher: a shell script here, a .cmd on Windows, where cmd.exe runs no shell script.
+  const script = path.join(f.home, 'claude.js');
+  fs.writeFileSync(script, `const fs = require('fs');\nfs.appendFileSync(${JSON.stringify(log)}, process.argv.slice(2).join(' ') + '\\n');\nprocess.stdout.write(fs.readFileSync(${JSON.stringify(answer)}, 'utf8'));\n`);
+  fs.writeFileSync(bin, process.platform === 'win32' ? `@"${process.execPath}" "${script}" %*\r\n`
+    : `#!/bin/sh\nexec "${process.execPath}" "${script}" "$@"\n`, { mode: 0o755 });
   const module = path.resolve(__dirname, '../dist/delegated');
   const now = Date.now();
   const read = at => {

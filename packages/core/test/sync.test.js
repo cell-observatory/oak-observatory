@@ -1623,7 +1623,7 @@ test('sync folder: a record is written by one machine: one of the same host name
   assert.equal((await as(X, () => core.syncNow(noMachine()))).status, 'ok');
   const writer = (home) => path.join(home, '.claude', 'claude-observatory', 'sync', 'writer');
   assert.match(fs.readFileSync(writer(X), 'utf8'), /^[0-9a-f]{32}\n$/, 'control: x made its writer id at its first push');
-  assert.equal(fs.statSync(writer(X)).mode & 0o777, 0o600);
+  if (process.platform !== 'win32') assert.equal(fs.statSync(writer(X)).mode & 0o777, 0o600); // no POSIX modes on Windows
   const shareNow = () => filesBelow(share).map((f) => `${path.relative(share, f)}:${fs.statSync(f).size}`);
   const quiet = shareNow();
   const backupLine = (r) => r.machines.find((m) => m.label.startsWith('backup'));

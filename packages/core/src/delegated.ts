@@ -223,7 +223,7 @@ export function agentPid(info: PaneProcessInfo | null | undefined, kind: Delegat
 /** Whether a recorded pid still runs the agent: alive, and on Linux its command line still names the agent's CLI (a
  *  pid the system has since given to another program is not the agent). */
 export function agentAlive(pid: number, kind: DelegatedKind): boolean {
-  if (!(require('./daemon') as typeof import('./daemon')).pidAlive(pid)) return false;
+  if (!(require('./daemon') as typeof import('./daemon')).pidAlive(pid, { reaped: true })) return false;
   try {
     return fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').includes(kind);
   } catch {

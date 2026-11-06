@@ -135,7 +135,8 @@ test('focus server stops once a store move takes its endpoint away, so the next 
   const two = start(() => file);
   two.check();
   assert.equal(two.closed(), false, 'control: its own socket keeps it');
-  fs.rmSync(file); fs.writeFileSync(file, 'x');
+  // Keep the old inode allocated: unlink/recreate can reuse a regular file's inode on ext4.
+  fs.renameSync(file, `${file}.old`); fs.writeFileSync(file, 'x');
   // Meanwhile a server started where the store is now holds the pidfile too.
   fs.writeFileSync(pidfile, '424242');
   two.check();

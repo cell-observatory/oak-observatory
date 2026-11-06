@@ -345,11 +345,12 @@ const actions = () => (state.overlay?.lines ?? []).filter(l => /^..action\s/.tes
     // click the tab bar. herdr takes kitty's super+b (98;9u) as its prefix, and so does OAK: m after it goes to OAK's tabs.
     await key('\x1b1'); await wait(200);
     assert.equal(state.herdrBack, null);
-    assert.match(lastFrame.join('\n'), /super\+b is herdr's prefix · click OAK's tab bar to leave/);
+    const prefix = process.platform === 'darwin' ? 'cmd' : 'super';
+    assert.match(lastFrame.join('\n'), new RegExp(`${prefix}\\+b is herdr's prefix · click OAK's tab bar to leave`));
     bytes.length = 0;
     await key('\x1b[98;9u');
     assert.deepEqual(bytes, [], 'super+b is held as the prefix');
-    assert.match(state.status, /^super\+b — m OAK tabs/);
+    assert.match(state.status, new RegExp(`^${prefix}\\+b — m OAK tabs`));
     await key('m');
     assert.equal(tab(), 'observatory');
     assert.deepEqual(bytes, []);

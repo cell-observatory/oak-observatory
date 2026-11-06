@@ -1,5 +1,6 @@
 // Fixtures for the local index's tests: a private HOME, Claude config and Codex home, and writers for the files the index
 // reads (Claude transcripts, Codex rollouts, OAK store sessions).
+const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -58,4 +59,11 @@ const text = (t) => ({ type: 'text', text: t });
 const thinking = (t) => ({ type: 'thinking', thinking: t });
 const cxUser = (t) => ({ type: 'response_item', timestamp: '2026-10-01T10:00:01Z', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: t }] } });
 
-module.exports = { indexFixture, ask, reply, text, thinking, cxUser };
+/** A child (cp.spawnSync) ended by its own SIGKILL. Windows has no signals: there libuv's kill is TerminateProcess with
+ *  exit code 1, so the child ends with status 1, no signal and nothing on stderr (a crash would print there). */
+function assertKilled(r) {
+  if (process.platform === 'win32') assert.deepEqual([r.status, r.signal, String(r.stderr)], [1, null, '']);
+  else assert.equal(r.signal, 'SIGKILL');
+}
+
+module.exports = { indexFixture, assertKilled, ask, reply, text, thinking, cxUser };

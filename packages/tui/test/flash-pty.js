@@ -21,16 +21,25 @@ test('PTY output: hidden panes, drawn text and periodic frames', { skip, timeout
   child.onData(data => { const bytes = Buffer.from(data); chunks.push({ at: Date.now(), offset: length, bytes }); length += bytes.length; term.write(data); });
   const closed = new Promise(resolve => child.onExit(e => { exited = true; resolve(e); }));
   const screen = () => Array.from({ length: 40 }, (_, i) => term.buffer.active.getLine(i)?.translateToString(true) || '').join('\n');
-  const until = async (re, description = String(re)) => {
+  const readLog = name => fs.existsSync(path.join(dir, name)) ? fs.readFileSync(path.join(dir, name), 'utf8').split('\n').slice(0, -1).filter(Boolean).map(JSON.parse) : [];
+  const until = async (condition, description = String(condition)) => {
     const deadline = Date.now() + 8000;
     while (Date.now() < deadline) {
       await wait(30);
-      if (re.test(screen())) return;
+      if (typeof condition === 'function' ? condition() : condition.test(screen())) return;
       assert.ok(!exited, `app exited waiting for ${description}:\n${screen()}`);
     }
     assert.fail(`timed out waiting for ${description}:\n${screen()}`);
   };
   const phase = name => { phases.push({ name, offset: length, at: Date.now() }); };
+  // Shell sleep is only a minimum: keep the phase until real bells have reached the app's handler.
+  const untilBells = async (count = 2, visible = false) => {
+    const current = phases.at(-1);
+    await until(() => readLog('pane.jsonl').filter(b => b.at >= current.at).length >= count
+      && readLog('sources.jsonl').filter(s => s.kind === 'pane-bell' && s.at >= current.at).length >= count
+      && (!visible || scan(Buffer.concat(chunks.map(c => c.bytes))).events.filter(e => e.kind === 'bell' && e.offset >= current.offset).length >= count),
+    `${count} pane bells during ${current.name}`);
+  };
   const click = async text => {
     fs.writeFileSync(path.join(dir, 'hold-updates'), '1');
     await wait(200);
@@ -49,29 +58,29 @@ test('PTY output: hidden panes, drawn text and periodic frames', { skip, timeout
   let driveError;
   try {
     await until(/HERDR PANE READY/);
-    phase('F1'); await wait(Number(process.env.OAK_FLASH_DWELL || 900)); screens.F1 = screen();
+    phase('F1'); await wait(Number(process.env.OAK_FLASH_DWELL || 900)); await untilBells(2, true); screens.F1 = screen();
     child.write('\x1bOQ'); await until(/\[ F2 observatory \]/);
     phase('F2'); child.write('\r'); await until(/CONVERSATION TEXT/);
-    await wait(Number(process.env.OAK_FLASH_DWELL || 900)); screens.F2 = screen();
+    await wait(Number(process.env.OAK_FLASH_DWELL || 900)); await untilBells(); screens.F2 = screen();
     await click('PROCESSNAME'); await until(/PROCESS ?TEXT/);
     phase('process-follow'); await wait(900); screens.process = screen();
     child.write('\x1bOR'); await until(/\[ F3 review \]/);
-    phase('F3'); await wait(Number(process.env.OAK_FLASH_DWELL || 900)); screens.F3 = screen();
+    phase('F3'); await wait(Number(process.env.OAK_FLASH_DWELL || 900)); await untilBells(); screens.F3 = screen();
     phase('palette'); child.write(':'); await until(/a command, or type to find/); await wait(350); screens.palette = screen();
     child.write('\x1b'); await wait(150);
     phase('command'); child.write(':doctor\r'); await until(/COMMAND/); await wait(350); screens.command = screen();
     child.write('\x1b'); await wait(150);
     child.write('?'); await until(/keys.*esc/); child.write('\x1b1'); await until(/\[ F1 herdr \]/);
-    phase('F1-covered'); await wait(500); screens.covered = screen();
-    phase('F1-return'); child.write('\x1b'); await until(/HERDR PANE READY/); await wait(500);
+    phase('F1-covered'); await untilBells(); screens.covered = screen();
+    phase('F1-return'); child.write('\x1b'); await until(/HERDR PANE READY/); await untilBells(1, true);
     phase('quit'); child.write('\x11\x11');
     await Promise.race([closed, wait(2000)]);
     assert.ok(exited, 'app exits normally');
   } catch (error) { driveError = error; child.kill(); await Promise.race([closed, wait(1000)]); }
   const bytes = Buffer.concat(chunks.map(c => c.bytes)), result = scan(bytes);
-  const sources = fs.existsSync(path.join(dir, 'sources.jsonl')) ? fs.readFileSync(path.join(dir, 'sources.jsonl'), 'utf8').trim().split('\n').map(JSON.parse) : [];
+  const sources = readLog('sources.jsonl');
   const writes = sources.filter(s => s.kind === 'write');
-  const paneBells = fs.existsSync(path.join(dir, 'pane.jsonl')) ? fs.readFileSync(path.join(dir, 'pane.jsonl'), 'utf8').trim().split('\n').map(JSON.parse) : [];
+  const paneBells = readLog('pane.jsonl');
   // PTY ONLCR adds CR to newlines; record source ranges in the actual output's coordinate system.
   let at = 0;
   for (const s of writes) { const b = Buffer.from(s.base64, 'base64').toString().replace(/\n/g, '\r\n'); s.start = at; at += Buffer.byteLength(b); s.end = at; }

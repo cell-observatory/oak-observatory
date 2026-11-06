@@ -110,7 +110,14 @@ function cacheSlot(transcript: string, includeSidechain: boolean): { file: strin
 }
 function identity(st: fs.Stats): string { return `${st.dev}:${st.ino}`; }
 function sameSource(c: Cursor, st: fs.Stats): boolean {
-  return c.dev === st.dev && c.ino === st.ino && c.size === st.size && c.mtimeMs === st.mtimeMs && c.ctimeMs === st.ctimeMs;
+  return c.dev === st.dev && samePath(c, st);
+}
+/** A PATH's stat against the cursor, which an open file's stat wrote: all but `dev`. On Windows 11 24H2 and Server
+ *  2025, libuv 1.49–1.50 (Node 22.16.0, 24.0–24.1) reads a path's st_dev from a misordered FILE_STAT_BASIC_INFORMATION
+ *  and an open file's from the volume serial, so the two never agreed: no read was stable, and the facts were neither
+ *  saved nor remembered (libuv 1.51.0 fixed it). A path names the file read while its `ino` and times are the same. */
+function samePath(c: Cursor, st: fs.Stats): boolean {
+  return c.ino === st.ino && c.size === st.size && c.mtimeMs === st.mtimeMs && c.ctimeMs === st.ctimeMs;
 }
 function guard(fd: number, position: number, length: number): Buffer {
   const buf = Buffer.alloc(length);
@@ -209,7 +216,7 @@ export function transcriptFacts(file: string, includeSidechain = false): Transcr
   if (!st.isFile()) return emptyFacts();
   const key = `${rootDir()}\0${transcript}\0${includeSidechain}`;
   const hit = uncached ? undefined : memory.get(key);
-  if (hit && sameSource(hit.cursor, st)) {
+  if (hit && samePath(hit.cursor, st)) {
     memory.delete(key); memory.set(key, hit);
     return hit.value;
   }
@@ -253,7 +260,7 @@ export function transcriptFacts(file: string, includeSidechain = false): Transcr
     const data = serialize(c);
     // Do not stamp a partial read or a concurrently replaced/rewritten file as a successful scan.
     let stable = position === st.size && sameSource(c, fs.fstatSync(fd));
-    try { stable = stable && sameSource(c, fs.statSync(transcript)); } catch { stable = false; }
+    try { stable = stable && samePath(c, fs.statSync(transcript)); } catch { stable = false; }
     if (slot && lease && stable && !unchanged) save(slot, lease, deflateRawSync(data, { level: 1 }));
     let value = c.facts;
     // A valid newline-less final record participates in this answer only. Reparse it exactly once

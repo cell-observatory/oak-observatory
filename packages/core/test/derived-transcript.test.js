@@ -192,6 +192,24 @@ test('derived facts: fresh-process hit reads guards, and append reads only new b
   cache.clearTranscriptFactsMemory(); assert.deepEqual(f.facts(), f.full());
 });
 
+test('derived facts: a path whose stat names another device than its open file\'s still saves and reuses its facts (Windows, Node 22.16)', t => {
+  // libuv 1.49–1.50 (Node 22.16.0, 24.0–24.1) on Windows 11 24H2 and Server 2025 reads a path's st_dev from a misordered
+  // FILE_STAT_BASIC_INFORMATION and an open file's from its volume serial, so fs.statSync and fs.fstatSync never agree on dev.
+  const f = fixture(t); largePrefix(f);
+  const statSync = fs.statSync;
+  fs.statSync = function (...args) { const st = statSync.apply(this, args); if (st) st.dev = typeof st.dev === 'bigint' ? st.dev + 1n : st.dev + 1; return st; };
+  try {
+    f.facts();
+    assert.equal(f.factsFiles().length, 1, 'the first read saved its facts');
+    const warm = countReads(f.file, f.facts);
+    assert.equal(warm.bytes, 0, 'a second read in the same process reuses the facts it remembered');
+    cache.clearTranscriptFactsMemory();
+    const fresh = countReads(f.file, f.facts);
+    assert.ok(fresh.bytes <= 512, `a read with nothing remembered loaded the saved facts, and read ${fresh.bytes} bytes`);
+    assert.deepEqual(fresh.value, f.full());
+  } finally { fs.statSync = statSync; }
+});
+
 test('derived facts: delayed task results, renames, deletion and todos cross the cursor', t => {
   const f = fixture(t);
   fs.writeFileSync(f.file, f.jsonl([f.row(0, 'user', 'plan'), f.call(1, 'create', 'TaskCreate', { subject: 'first', description: 'whole description' }),

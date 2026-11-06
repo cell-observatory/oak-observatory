@@ -161,17 +161,27 @@ test('first run: an explicit --session that does not exist still fails loudly', 
 // and a tab that could only say so was a dead tab the reader had to skip.
 test('nested in herdr: the tab bar is observatory · review, no herdr tab', async t => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-nested-'));
-  const herdr = await require('../../core/test/fixtures/pane-context.cjs')(t, home, 'valid');
+  // The pane's process is the app itself: Windows has no process table to find this test's process above it, only the
+  // pid herdr names. So the app starts before the pane is answered for, and the answer names it.
+  const herdr = await require('../../core/test/fixtures/pane-context.cjs')(t, home, 'valid', { awaitPid: true });
   try {
     const env = { ...process.env, HOME: home, USERPROFILE: home, CLAUDE_CONFIG_DIR: path.join(home, 'claude'), XDG_CONFIG_HOME: path.join(home, 'config'), HERDR_SOCKET_PATH: path.join(home, 'herdr.sock'), CLAUDE_OBSERVATORY_NO_UPDATE_CHECK: '1', COLUMNS: '100', LINES: '30' };
-    const bar = (extra) => {
-      const r = runCli(home, ['tui', '--once', '--no-mouse', '--tab', 'observatory'], { cwd: home, env: { ...env, ...extra } });
-      assert.equal(r.status, 0, `exit ${r.status}; stderr: ${r.stderr}`);
-      return r.stdout.replace(/\x1b\[[0-9;]*m/g, '').split('\n')[0];
+    const bar = async (extra) => {
+      const out = path.join(home, 'stdout'), err = path.join(home, 'stderr');
+      const fds = [fs.openSync(out, 'w'), fs.openSync(err, 'w')];
+      let status;
+      try {
+        const child = require('node:child_process').spawn(process.execPath, [CLI, 'tui', '--once', '--no-mouse', '--tab', 'observatory'],
+          { cwd: home, env: { ...env, ...extra }, stdio: ['ignore', ...fds], timeout: 60_000 });
+        herdr.update({ pid: child.pid });
+        status = await new Promise((resolve, reject) => { child.once('error', reject); child.once('close', resolve); });
+      } finally { fds.forEach(fd => fs.closeSync(fd)); }
+      assert.equal(status, 0, `exit ${status}; stderr: ${fs.readFileSync(err, 'utf8')}`);
+      return fs.readFileSync(out, 'utf8').replace(/\x1b\[[0-9;]*m/g, '').split('\n')[0];
     };
-    const plain = bar({});
+    const plain = await bar({});
     assert.match(plain, /herdr/, 'from a plain terminal the herdr tab is offered');
-    const nested = bar({ HERDR_PANE_ID: 'w1:p1', HERDR_TAB_ID: 'w1:t1', HERDR_WORKSPACE_ID: 'w1', HERDR_ENV: '1' });
+    const nested = await bar({ HERDR_PANE_ID: 'w1:p1', HERDR_TAB_ID: 'w1:t1', HERDR_WORKSPACE_ID: 'w1', HERDR_ENV: '1' });
     assert.doesNotMatch(nested, /herdr/, 'inside a herdr pane there is no herdr tab');
     assert.match(nested, /observatory/); assert.match(nested, /review/);
   } finally {

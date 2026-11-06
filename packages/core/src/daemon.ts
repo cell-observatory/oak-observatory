@@ -238,7 +238,7 @@ export function connectDaemon(opts: { client: string; timeoutMs?: number; inspec
 
 /** `reaped`: also count a zombie (exited, its parent has not collected it yet) as gone. Signal 0 still reaches a zombie, so
  *  an old server whose parent never collected it read as one that "did not stop", and blocked a new one from starting.
- *  It costs a `ps` outside Linux, so only the focus server's start, status and stop ask for it. */
+ *  It costs a `ps` outside Linux, so only the focus server and delegated agents ask for it. */
 export function pidAlive(pid: number, opts: { reaped?: boolean } = {}): boolean {
   if (!Number.isSafeInteger(pid) || pid <= 0) return false;
   try {

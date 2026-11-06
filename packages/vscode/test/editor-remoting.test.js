@@ -53,7 +53,7 @@ test('remote Diff uses native before/after viewer when the machine supplies both
   assert.deepEqual(commands[0].slice(0,3),['vscode.diff','old\n','new\n']);
 });
 
-test('mounted review opens verified real files and retains remote placement/action identity', async () => {
+test('mounted review opens verified real files and retains remote placement/action identity', { skip: process.platform === 'win32' && 'mounts are read from /proc/mounts or macOS mount: readMountTable reads none on Windows, so no review maps onto a mount there' }, async () => {
   const realCore = require('../../core/dist');
   const commands = [], opened = [], mounts = realCore.parseMountTable('//fixture@lab-a/fixture on /Volumes/fixture (smbfs, nodev)', 'mac');
   const unit = {id:7,file:'/home/fixture/Github/app/a.ts',status:'pending',members:[7]};

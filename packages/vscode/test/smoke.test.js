@@ -5438,32 +5438,39 @@ esac\nexit 0\n`, { mode: 0o755 });
         { rel: 'src/lexer.ts', count: 1, added: 3, removed: 1, status: 'pending', edits: [{ id: 7, added: 3, removed: 1, status: 'pending', ts: now }] }], nextSteps: [] } }));
       const remoteUnits = Array.from({ length: 3000 }, (_, i) => ({ id: i + 1, members: [i + 1], file: '/remote/src/f' + i + '.ts', rel: 'src/f' + i + '.ts', tool: 'Edit', status: 'pending', ts: now, added: 3, removed: 1 }));
       fs.writeFileSync(path.join(bin, 'review.json'), JSON.stringify({ review: { session: 'ra-1', units: remoteUnits, ids: remoteUnits.map(u => u.id), cancelled: [], cancelledIds: [], hiddenIds: [], errors: [], summary: { units: 3000, pending: 3000 } }, timeline: { edits: remoteUnits } }));
-      const q = (s) => `'${s.replace(/'/g, `'\\''`)}'`;
-      fs.writeFileSync(path.join(bin, 'herdr'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
-      fs.writeFileSync(path.join(bin, 'oak'), `#!/bin/sh
-printf '%s %s\\n' "$(date +%s%N)" "$*" >> ${q(log)}
-[ "$*" = 'machine list --json' ] && [ -f ${q(path.join(bin, 'labels-fail'))} ] && { echo 'oak: herdr is not running' >&2; exit 1; }
-case "$*" in
-  'machine list --json') printf '%s\\n' '[{"label":"lab-a","target":"fixture@lab-alias","enabled":true},{"label":"lab-b","enabled":true},{"label":"lab-off","enabled":false}]';;
-  'sessions --json --machine lab-a') sleep ${DELAY / 1000}; cat ${q(path.join(bin, 'a.json'))};;
-  'sessions --json --workers --machine lab-a') sleep ${DELAY / 1000}; cat ${q(path.join(bin, 'workers.json'))};;
-  'sessions --json --workers --machine lab-b'|'sessions --json --machine lab-b') sleep ${DELAY / 1000}; echo 'oak: ssh: connect to host lab-b port 22: Connection refused' >&2; exit 255;;
-  *'--machine lab-a'*) case "$1" in
-      views) case "$*" in *review*) cat ${q(path.join(bin, 'review.json'))};; *observations*) cat ${q(path.join(bin, 'obs.json'))};; *) echo '{}';; esac;;
-      feed) echo '{"mode":"audit","title":"Remote","lastTs":0,"entries":[]}';;
-      keep) echo '{"kept":1,"ids":[7]}';;
-      diff) echo '{"file":"/remote/src/lexer.ts","before":"old","after":"new","patch":"+new"}';;
-      editor-review) echo '{"workspace":"/remote","home":"/home/fixture","hostname":"lab-a","user":"fixture","shares":[],"installed":true}';;
-      quote) printf '%s\\n' '{"text":"> the remote reply","sent":false}';;
-      comment) printf '%s\\n' '{"text":"","ids":[],"files":[]}';;
-      *) echo '{}';;
-    esac;;
-  *) exec ${q(TREE_OAK)} "$@";;
-esac
-`, { mode: 0o755 });
+      // The fakes are one node script behind a launcher: a shell script here, a `.cmd` on Windows, where herdr is
+      // looked for as herdr.exe (only found, never run here).
+      const win = process.platform === 'win32';
+      fs.writeFileSync(path.join(bin, win ? 'herdr.exe' : 'herdr'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+      const fakeOak = path.join(bin, 'oak-fake.js');
+      fs.writeFileSync(fakeOak, `const C = ${JSON.stringify({ log, bin, delay: DELAY, cli: path.resolve(__dirname, '../../cli/dist/index.js') })};\n` + String.raw`
+const fs = require('fs'), path = require('path');
+const args = process.argv.slice(2), all = args.join(' ');
+fs.appendFileSync(C.log, Math.round((performance.timeOrigin + performance.now()) * 1e6) + ' ' + all + '\n');
+const cat = (f) => process.stdout.write(fs.readFileSync(path.join(C.bin, f)));
+const fail = (why, code) => { process.stderr.write(why + '\n'); process.exitCode = code; };
+if (all === 'machine list --json' && fs.existsSync(path.join(C.bin, 'labels-fail'))) fail('oak: herdr is not running', 1);
+else if (all === 'machine list --json') console.log('[{"label":"lab-a","target":"fixture@lab-alias","enabled":true},{"label":"lab-b","enabled":true},{"label":"lab-off","enabled":false}]');
+else if (all === 'sessions --json --machine lab-a') setTimeout(() => cat('a.json'), C.delay);
+else if (all === 'sessions --json --workers --machine lab-a') setTimeout(() => cat('workers.json'), C.delay);
+else if (all === 'sessions --json --workers --machine lab-b' || all === 'sessions --json --machine lab-b') setTimeout(() => fail('oak: ssh: connect to host lab-b port 22: Connection refused', 255), C.delay);
+else if (all.includes('--machine lab-a')) {
+  if (args[0] === 'views') { if (all.includes('review')) cat('review.json'); else if (all.includes('observations')) cat('obs.json'); else console.log('{}'); }
+  else console.log({
+    feed: '{"mode":"audit","title":"Remote","lastTs":0,"entries":[]}',
+    keep: '{"kept":1,"ids":[7]}',
+    diff: '{"file":"/remote/src/lexer.ts","before":"old","after":"new","patch":"+new"}',
+    'editor-review': '{"workspace":"/remote","home":"/home/fixture","hostname":"lab-a","user":"fixture","shares":[],"installed":true}',
+    quote: '{"text":"> the remote reply","sent":false}',
+    comment: '{"text":"","ids":[],"files":[]}',
+  }[args[0]] ?? '{}');
+} else process.exitCode = require('child_process').spawnSync(process.execPath, [C.cli, ...args], { stdio: 'inherit' }).status ?? 1;
+`);
+      const fakeBin = path.join(bin, win ? 'oak.cmd' : 'oak');
+      fs.writeFileSync(fakeBin, win ? `@"${process.execPath}" "${fakeOak}" %*\r\n` : `#!/bin/sh\nexec "${process.execPath}" "${fakeOak}" "$@"\n`, { mode: 0o755 });
       const lines = () => (fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map((l) => ({ at: Number(l.slice(0, l.indexOf(' '))) / 1e6, args: l.slice(l.indexOf(' ') + 1) })) : []);
       const settleUp = async (cond, ms = 15000) => { const end = Date.now() + ms; while (!cond() && Date.now() < end) await new Promise((r) => setTimeout(r, 10)); return cond(); };
-      const herdrless = process.env.PATH.split(path.delimiter).filter((d) => !fs.existsSync(path.join(d, 'herdr'))).join(path.delimiter);
+      const herdrless = process.env.PATH.split(path.delimiter).filter((d) => !fs.existsSync(path.join(d, win ? 'herdr.exe' : 'herdr'))).join(path.delimiter);
       const was = { path: process.env.PATH, bin: process.env.CLAUDE_OBSERVATORY_BIN, post: rqView.webview.postMessage, cmPost: cmView.webview.postMessage,
         err: vscode.window.showErrorMessage, cqp: vscode.window.createQuickPick, showing: { ...rqProvider.showing }, session: configValues['session'] ?? '' };
       const posts = [], cmPosts = [], errors = [], measured = {};
@@ -5476,7 +5483,7 @@ esac
       // holds its lease, and the next block's own catch-up would then be refused.
       const kids = new Set();
       const track = (c) => { kids.add(c); c.once('close', () => kids.delete(c)); return c; };
-      cp.execFile = function (file, args, ...rest) { if (Array.isArray(args) && args.join(' ') === 'machine list --json') order.push('machine list'); return track(execFile.call(this, file, args, ...rest)); };
+      cp.execFile = function (file, args, ...rest) { if ([file, ...(Array.isArray(args) ? args : [])].join(' ').endsWith(' machine list --json')) order.push('machine list'); return track(execFile.call(this, file, args, ...rest)); };
       cp.spawn = function (...a) { return track(spawn.apply(this, a)); };
       rqView.webview.postMessage = (m) => { posts.push(m); if (m.type === 'machines') { order.push('machines'); machinesAt = performance.now(); } return Promise.resolve(true); };
       cmView.webview.postMessage = (m) => { cmPosts.push(m); return Promise.resolve(true); };
@@ -5506,7 +5513,7 @@ esac
         rqMsgHandler({ type: 'wantMachines' });
         await settleUp(() => posts.some((m) => m.type === 'machines'));
         process.env.PATH = bin + path.delimiter + was.path;
-        process.env.CLAUDE_OBSERVATORY_BIN = path.join(bin, 'oak');
+        process.env.CLAUDE_OBSERVATORY_BIN = fakeBin;
         // The picker opened before any saved machine is known: it shows first, and the saved machines are read behind it.
         // herdr answers with an error here, which the open picker then shows (and which leaves nothing cached).
         fs.writeFileSync(path.join(bin, 'labels-fail'), '');

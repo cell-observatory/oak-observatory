@@ -529,8 +529,10 @@ for (const check of ['overlay-verbs', 'overlay-rebind', 'row-menu-key', 'row-men
   const outside = KEY_CHECK_OUTSIDE_REPO.has(check) ? fs.mkdtempSync(path.join(os.tmpdir(), 'oak-keys-cwd-')) : null;
   if (outside) t.after(() => fs.rmSync(outside, { recursive: true, force: true }));
   if (outside) assert.equal(core.repoRoot(outside), null, `control: ${outside} is in no repository`);
-  for (const cwd of [undefined, outside].filter((d) => d !== null)) {
-    const result = require('child_process').spawnSync(process.execPath, [path.join(__dirname, 'fixtures/keys-probe.cjs')], {
+  for (const cwd of [undefined, outside].filter((d) => d !== null)) for (const platform of check === 'herdr-prefix-none' ? ['linux', 'darwin'] : [null]) {
+    const probe = path.join(__dirname, 'fixtures/keys-probe.cjs');
+    const args = platform ? ['-e', `Object.defineProperty(process, 'platform', { value: ${JSON.stringify(platform)} }); process.argv[1] = ${JSON.stringify(probe)}; require(process.argv[1]);`] : [probe];
+    const result = require('child_process').spawnSync(process.execPath, args, {
       encoding: 'utf8', timeout: 30000, cwd, env: { ...process.env, NODE_TEST_CONTEXT: '', OAK_KEYS_CHECK: check, ...(KEY_CHECK_ENV[check] ?? {}) },
     });
     assert.equal(result.status, 0, `${cwd ? 'outside every repository' : 'here'}: ${result.stderr || result.error?.message}`);

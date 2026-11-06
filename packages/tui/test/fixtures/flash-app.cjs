@@ -23,6 +23,16 @@ fs.writeSync = (fd, data, ...args) => { if (fd === 1) trace(data); return sync(f
 const coreReal = require('../../../core/dist');
 const backend = require('../../dist/backend');
 const frame = require('../../dist/frame');
+const native = require('../../dist/native');
+const spawnNative = native.spawnNative;
+native.spawnNative = (...args) => {
+  const pane = spawnNative(...args);
+  if (pane) {
+    const onBell = pane.onBell.bind(pane);
+    pane.onBell = fn => onBell(() => { fn(); log('pane-bell', { at: realNow() }); });
+  }
+  return pane;
+};
 const { fixture, syncView } = require('./observatory');
 const data = fixture();
 data.observatory.machines = data.observatory.machines.slice(0, 1);

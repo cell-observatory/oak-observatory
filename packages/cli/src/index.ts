@@ -527,6 +527,12 @@ function cmdUninstall(args: string[]): void {
   const indexFolder = core.indexDir();
   const records = core.recordsRoot();
   const recordHosts = core.recordHosts();
+  let hostTag = '';
+  try {
+    hostTag = core.machineHostTag();
+  } catch {
+    /* no home (on Windows an empty USERPROFILE throws): no record log is known as this machine's */
+  }
   // A backup folder is outside the store, and may be shared with the user's other machines: named, never removed here.
   const backup = core.syncSettings().backup;
   // What the bundled status line keeps beside its cache between renders, which reverting it leaves: its calibration, and
@@ -560,7 +566,7 @@ function cmdUninstall(args: string[]): void {
         ? c.dim('  • Local database: ') + `delete ${indexFolder}  (OAK's searchable database of your sessions: it holds your prompts and the answers to them, and sessions kept after their files were removed)\n`
         : '') +
       (recordHosts.length
-        ? c.dim('  • Record logs: ') + `delete ${records}  (what the local database published of your sessions${recordHosts.some((h) => h !== core.machineHostTag()) ? ', and the copies oak sync keeps of other machines\'' : ''}: your prompts and the answers to them, which a new database reads back)\n`
+        ? c.dim('  • Record logs: ') + `delete ${records}  (what the local database published of your sessions${recordHosts.some((h) => h !== hostTag) ? ', and the copies oak sync keeps of other machines\'' : ''}: your prompts and the answers to them, which a new database reads back)\n`
         : '') +
       (backup?.kind === 'folder'
         ? c.dim('  • Backup folder: ') + `${core.backupFolderPath(backup.path)}  (the encrypted backup of each of your machines that uses it: delete it once none does)\n`

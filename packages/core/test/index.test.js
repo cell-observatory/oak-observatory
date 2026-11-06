@@ -8,7 +8,7 @@ const path = require('node:path');
 const { gitDir: makeGitDir } = require('../../../test/fixtures/git.cjs');
 const cp = require('node:child_process');
 const core = require(process.env.OAK_INDEX_TEST_DIST || '../dist');
-const { indexFixture, ask, reply, text, thinking, cxUser } = require('./fixtures/index-fixture.cjs');
+const { indexFixture, assertKilled, ask, reply, text, thinking, cxUser } = require('./fixtures/index-fixture.cjs');
 
 const DIST = path.dirname(require.resolve(process.env.OAK_INDEX_TEST_DIST || '../dist'));
 const available = core.indexRuntime().ok;
@@ -60,8 +60,9 @@ test('index: first WAL open waits for a writer to release its lock', { skip }, a
   const { DatabaseSync } = require('node:sqlite');
   const { Worker } = require('node:worker_threads');
   const reader = new DatabaseSync(file);
+  // Its COMMIT waits out the opener's brief lock on each WAL attempt, as OAK's own connections do.
+  reader.exec('PRAGMA busy_timeout = 5000');
   reader.exec('CREATE TABLE probe(x); INSERT INTO probe VALUES (1); BEGIN IMMEDIATE; INSERT INTO probe VALUES (2)');
-  t.after(() => reader.close());
   const worker = new Worker(`
     const { parentPort, workerData } = require('node:worker_threads');
     const core = require(workerData.dist);
@@ -79,17 +80,23 @@ test('index: first WAL open waits for a writer to release its lock', { skip }, a
       integrity: ix.ok && ix.db.prepare('PRAGMA integrity_check').get().integrity_check });
     if (ix.ok) ix.close();
   `, { eval: true, workerData: { file, dist: DIST } });
-  t.after(() => worker.terminate());
   let release;
   const released = new Promise(resolve => { release = resolve; });
-  const result = await new Promise((resolve, reject) => {
-    worker.on('error', reject);
-    worker.on('message', (m) => {
-      if (m === 'opening') setTimeout(() => { reader.exec('COMMIT'); release(); }, 250);
-      else resolve(m);
+  let result;
+  try {
+    result = await new Promise((resolve, reject) => {
+      worker.on('error', reject);
+      worker.on('message', (m) => {
+        if (m === 'opening') setTimeout(() => { reader.exec('COMMIT'); release(); }, 250);
+        else resolve(m);
+      });
     });
-  });
-  await released;
+    await released;
+  } finally {
+    // Closed before the fixture's after hook removes the folder: Windows deletes no file a handle holds open.
+    await worker.terminate();
+    reader.close();
+  }
   assert.equal(result.ok, true, result.reason);
   assert.equal(result.mode, 'wal');
   assert.equal(result.integrity, 'ok');
@@ -635,6 +642,70 @@ test('index: a catch-up that finds nothing to do writes nothing, so another read
   }
 });
 
+// An NTFS file id holds its record's sequence number in its top 16 bits: from sequence 32 on it passes 2^53, as every
+// id did on GitHub's Windows runners. node:sqlite would not read such an INTEGER back as a number, so on Windows no
+// catch-up finished and the usage read threw. Here every stat gives such an id.
+test('index: a file id past 2^53, as NTFS gives, reads back: the index catches up and then has nothing to do', { skip }, (t) => {
+  const f = indexFixture(t, core);
+  Object.defineProperty(fs.Stats.prototype, 'ino', { configurable: true, set(v) {
+    Object.defineProperty(this, 'ino', { value: 2 ** 53 + v * 2, writable: true, enumerable: true, configurable: true });
+  } });
+  t.after(() => delete fs.Stats.prototype.ino);
+  assert.ok(fs.statSync(f.dir).ino > Number.MAX_SAFE_INTEGER, 'control: stat gives an id past 2^53');
+  const file = f.claude('fixture-ntfs', f.work, [ask('Big ids'), reply('n1', [text('x')])]);
+  f.rollout('fixture-ntfs-codex', f.work, [cxUser('Big ids too')]); // its name does not carry its id: its head is kept
+  caughtUp().close();
+  const again = caughtUp();
+  try {
+    assert.equal(again.catchUp.updated, 0, 'every unit is current: none is derived again');
+    const dv = () => one(again.db, 'PRAGMA data_version').data_version;
+    const o = core.openIndex();
+    assert.ok(o.ok, o.reason);
+    try {
+      core.catchUpUsage(o.db, { session: 'fixture-ntfs', transcript: file });
+      const before = dv();
+      assert.deepEqual(core.catchUpUsage(o.db, { session: 'fixture-ntfs', transcript: file }), { ran: true, problems: [] });
+      assert.equal(dv(), before, 'the usage read found its transcript current: nothing written');
+    } finally {
+      o.close();
+    }
+  } finally {
+    again.close();
+  }
+  // A file that grew is read on from where its recorded stamp left it.
+  fs.appendFileSync(file, JSON.stringify({ cwd: f.work, sessionId: 'fixture-ntfs', ...ask('More') }) + '\n');
+  const grown = caughtUp();
+  assert.equal(grown.catchUp.updated, 1, 'the one that changed');
+  grown.close();
+});
+
+// On Windows 11 24H2 under libuv 1.49-1.50 (Node 22.16), a path's stat names another device than its open file's. The
+// usage read records a transcript's stamp from the open file and checks it against the path: still current, so a status
+// line's render takes no lease and writes nothing. Here every path stat gives such a device.
+test('index: the usage read finds its transcript current when a path names another device than its open file (Windows, Node 22.16)', { skip }, (t) => {
+  const f = indexFixture(t, core);
+  const file = f.claude('fixture-dev', f.work, [ask('Devices'), reply('d1', [text('x')])]);
+  caughtUp().close();
+  const statSync = fs.statSync;
+  fs.statSync = function (...args) { const st = statSync.apply(this, args); if (st) st.dev += 1; return st; };
+  t.after(() => { fs.statSync = statSync; });
+  const fd = fs.openSync(file, 'r');
+  try { assert.notEqual(fs.statSync(file).dev, fs.fstatSync(fd).dev, 'control: the path names another device'); } finally { fs.closeSync(fd); }
+  const watch = core.openIndex();
+  const o = core.openIndex();
+  assert.ok(watch.ok && o.ok, watch.reason || o.reason);
+  try {
+    core.catchUpUsage(o.db, { session: 'fixture-dev', transcript: file });
+    const dv = () => one(watch.db, 'PRAGMA data_version').data_version;
+    const before = dv();
+    assert.deepEqual(core.catchUpUsage(o.db, { session: 'fixture-dev', transcript: file }), { ran: true, problems: [] });
+    assert.equal(dv(), before, 'the transcript is current: no lease taken, nothing written');
+  } finally {
+    o.close();
+    watch.close();
+  }
+});
+
 // A catch-up looks at the files before it takes the lease (to know whether there is anything to do). Overtaken there by
 // another process's catch-up, it looks again under the lease: a session that process indexed meanwhile, which its first
 // look did not see, is not taken for gone (archived, and published so).
@@ -1091,15 +1162,16 @@ test('query: --machine self finds this machine\'s sessions under every tag it ha
   const f = indexFixture(t, core);
   f.claude('fixture-before', f.work, [ask('Before the rename'), reply('t1', [text('ok')])]);
   withIndex(() => {});
-  const home = process.env.HOME;
-  process.env.HOME = path.join(f.dir, 'renamed'); // the tag changes as it does with the host name
+  const home = [process.env.HOME, process.env.USERPROFILE];
+  // The tag changes as it does with the host name (os.homedir() reads USERPROFILE on Windows).
+  process.env.HOME = process.env.USERPROFILE = path.join(f.dir, 'renamed');
   try {
     f.claude('fixture-after', f.work, [ask('After the rename'), reply('t2', [text('ok')])]);
     const all = core.queryIndex('sessions', {}).rows;
     assert.equal(new Set(all.map((r) => r.machine)).size, 2, 'positive control: filed under two tags');
     assert.deepEqual(core.queryIndex('sessions', { machine: 'self' }).rows.map((r) => r.id).sort(), ['fixture-after', 'fixture-before']);
   } finally {
-    process.env.HOME = home;
+    [process.env.HOME, process.env.USERPROFILE] = home;
   }
 });
 
@@ -1528,7 +1600,7 @@ core.catchUp(o.db, { afterUnit: () => { if (++n === 2) process.exit(9); } });`],
   f.claude('fixture-big', f.work, Array.from({ length: 30000 }, (_, k) => k % 2 ? reply(`b-${k}`, [text(`Answer ${k} `.repeat(20))]) : ask(`Ask ${k}`)));
   const killed = cp.spawnSync(process.execPath, ['-e', `const core = require(${JSON.stringify(path.join(DIST, 'index.js'))}); const o = core.openIndex(); let n = 0;
 core.catchUp(o.db, { afterBatch: () => { if (++n === 7) process.kill(process.pid, 'SIGKILL'); } });`], { env: process.env });
-  assert.equal(killed.signal, 'SIGKILL');
+  assertKilled(killed);
   const partial = core.openIndex();
   const before = one(partial.db, "SELECT count(*) AS n FROM prompts WHERE session_id = 'fixture-big'").n;
   partial.close();
@@ -2049,19 +2121,22 @@ test('index: WAL open stops at the busy timeout and releases its failed handle',
   const file = path.join(f.dir, 'busy.sqlite');
   const { DatabaseSync } = require('node:sqlite');
   const holder = new DatabaseSync(file);
-  t.after(() => holder.close());
-  holder.exec('CREATE TABLE probe(x); BEGIN IMMEDIATE; INSERT INTO probe VALUES (1)');
-  const start = performance.now();
-  const blocked = core.openIndex(file);
-  const elapsed = performance.now() - start;
-  assert.equal(blocked.ok, false);
-  assert.match(blocked.reason, /database is locked/);
-  assert.ok(elapsed >= 4900 && elapsed < 6500, `bounded wait: ${elapsed} ms`);
-  holder.exec('COMMIT');
-  const opened = core.openIndex(file);
-  assert.equal(opened.ok, true, opened.reason);
-  assert.equal(opened.db.prepare('PRAGMA busy_timeout').get().timeout, 5000);
-  opened.close();
+  try {
+    holder.exec('CREATE TABLE probe(x); BEGIN IMMEDIATE; INSERT INTO probe VALUES (1)');
+    const start = performance.now();
+    const blocked = core.openIndex(file);
+    const elapsed = performance.now() - start;
+    assert.equal(blocked.ok, false);
+    assert.match(blocked.reason, /database is locked/);
+    assert.ok(elapsed >= 4900 && elapsed < 6500, `bounded wait: ${elapsed} ms`);
+    holder.exec('COMMIT');
+    const opened = core.openIndex(file);
+    assert.equal(opened.ok, true, opened.reason);
+    assert.equal(opened.db.prepare('PRAGMA busy_timeout').get().timeout, 5000);
+    opened.close();
+  } finally {
+    holder.close(); // before the fixture's after hook removes the folder: Windows deletes no file a handle holds open
+  }
 });
 
 function accountUsageFixture(t) {
@@ -2129,7 +2204,7 @@ test('account usage: bill days follow usage records to a synthetic machine with 
   withIndex((db) => { remote = db.prepare("SELECT * FROM usage_messages WHERE machine_id = 'bbbbbbbbbbbb'").all(); });
   process.env.CLAUDE_CONFIG_DIR = path.join(f.dir, 'machine-b', '.claude');
   process.env.CODEX_HOME = path.join(f.dir, 'machine-b', '.codex');
-  process.env.HOME = path.join(f.dir, 'machine-b');
+  process.env.HOME = process.env.USERPROFILE = path.join(f.dir, 'machine-b'); // os.homedir() reads USERPROFILE on Windows
   core.clearRootMemo(); core.clearFsCache();
   fs.mkdirSync(process.env.CODEX_HOME, { recursive: true });
   fs.writeFileSync(path.join(process.env.CODEX_HOME, 'auth.json'), JSON.stringify({ tokens: { account_id: 'synthetic-account' } }));
@@ -2256,7 +2331,7 @@ test('account usage: two synthetic Claude machines print identical estimates and
     return [u.weekPct, u.weekReset, u.weekTokens, u.weekReads, u.weekCost, u.weekTotal, u.monthTokens, u.monthTokensTotal, u.monthReads, u.monthCost, u.monthReset, core.monthUsd(u)];
   };
   const before = printed();
-  process.env.HOME = path.join(f.dir, 'claude-machine-b');
+  process.env.HOME = process.env.USERPROFILE = path.join(f.dir, 'claude-machine-b'); // os.homedir() reads USERPROFILE on Windows
   process.env.CLAUDE_CONFIG_DIR = path.join(process.env.HOME, '.claude');
   process.env.CODEX_HOME = path.join(process.env.HOME, '.codex');
   core.clearRootMemo(); core.clearFsCache();

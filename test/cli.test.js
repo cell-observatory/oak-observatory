@@ -969,7 +969,8 @@ test('CLI doctor: a signal during the forwarding check stops herdr\'s commands f
   // Windows runs them in doctor's console, which ctrl+c reaches as well: nothing to install there.
   const windows = await doctor(b, { platform: 'win32' }).run(['--json']);
   assert.deepEqual([windows.acted, windows.handlers], [['forwarding, 0 handlers in place'], []]);
-  const r = await doctor(b, { platform: 'linux' }).run(['--json']);
+  // No login shell is run for the `oak` row: the one here is this machine's, and Windows has no /bin/sh to run.
+  const r = await doctor(b, { platform: 'linux', spawn: () => ({ status: 1, stdout: '' }) }).run(['--json']);
   assert.deepEqual(r.acted, ['forwarding, 4 handlers in place'], 'installed before the check starts herdr, not after');
   assert.deepEqual(r.handlers.map(([signal]) => signal), ['SIGTERM', 'SIGINT', 'SIGHUP', 'SIGQUIT'], 'one handler for each signal that stops ssh');
   for (const [signal, handler] of r.handlers) {
@@ -1298,7 +1299,7 @@ function machineFixture(t) {
 }
 const onMachine = (f, args) => run(f.b, process.execPath, [cli, ...args, '--machine', 'build-box']);
 
-test('CLI --machine: worker follow polls the owner, prints the exact end and exits', { skip: process.platform === 'win32' && 'POSIX fake ssh' }, async t => {
+test('CLI --machine: worker follow polls the owner, prints the exact end and exits', { skip: process.platform === 'win32' && 'POSIX fake ssh', timeout: 20000 }, async t => {
   const f = machineFixture(t), remote = f.b.env.FAKE_REMOTE_HOME;
   const work = path.join(remote, 'worker-project');
   fs.mkdirSync(work);
@@ -1312,15 +1313,16 @@ test('CLI --machine: worker follow polls the owner, prints the exact end and exi
   const child = cp.spawn(process.execPath, [cli, 'feed', '--kind', 'agent', '--id', 'w1', '--session', 'worker-parent', '--follow', '--machine', 'build-box'], { env: f.b.env });
   t.after(() => child.kill());
   let out = '', err = '';
-  child.stdout.on('data', d => { out += d; }); child.stderr.on('data', d => { err += d; });
-  const exit = new Promise(resolve => child.once('exit', resolve));
-  for (let n = 0; n < 200 && !out.includes('REMOTE WORKER'); n++) await new Promise(r => setTimeout(r, 25));
+  const ready = new Promise(resolve => child.stdout.on('data', d => { out += d; if (out.includes('REMOTE WORKER')) resolve(); }));
+  child.stderr.on('data', d => { err += d; });
+  const closed = new Promise((resolve, reject) => { child.once('error', reject); child.once('close', resolve); });
+  // The original 5 s startup + 15 s follow budget is shared; stdout, not elapsed time, starts the next step.
+  await Promise.race([ready, closed.then(code => assert.fail(`worker follower closed before its first snapshot (${code}): ${err}`))]);
   assert.match(out, /REMOTE WORKER/, err);
   fs.appendFileSync(worker, line('REMOTE SECOND STEP', true));
   fs.appendFileSync(parent, JSON.stringify({ type: 'queue-operation', operation: 'enqueue', timestamp: '2026-10-01T10:05:00.123Z',
     content: '<task-notification><task-id>w1</task-id><status>completed</status></task-notification>' }) + '\n');
-  const timeout = setTimeout(() => child.kill(), 15000);
-  try { assert.equal(await exit, 0, err); } finally { clearTimeout(timeout); }
+  assert.equal(await closed, 0, err);
   assert.match(out, /REMOTE SECOND STEP/);
   assert.match(out, /Worker ended at 2026-10-01T10:05:00.123Z/);
   assert.doesNotMatch(out, /REMOTE PARENT/);

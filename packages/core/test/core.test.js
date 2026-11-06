@@ -4454,7 +4454,8 @@ test('store: a lock dated ahead of this clock alone, as a store whose clock runs
 test('machine usage, remote titles and notify: on a file system whose clock runs ahead of this one, a claim or lock just taken holds', (t) => {
   machineUsageHome();
   const bin = tmpDir('cc-herdr-bin-');
-  fs.writeFileSync(path.join(bin, 'herdr'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  // Only found, never run: herdr is looked for as herdr.exe on Windows.
+  fs.writeFileSync(path.join(bin, process.platform === 'win32' ? 'herdr.exe' : 'herdr'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
   const was = process.env.PATH;
   process.env.PATH = bin;
   t.after(() => { process.env.PATH = was; });
@@ -7198,18 +7199,21 @@ test('codex: installer — Orca manners on hooks.json, append-only trust state, 
 test('codex: a hook turned off in Codex stays off through a reinstall, and is reported apart from trust', () => {
   freshHome();
   const prevCodexHome = process.env.CODEX_HOME;
-  const ch = tmpWork();
+  // A Windows path needs TOML escaping; a literal backslash exercises it on POSIX too.
+  const ch = path.join(tmpWork(), 'codex\\home');
+  fs.mkdirSync(ch, { recursive: true });
   process.env.CODEX_HOME = ch;
   try {
     const command = `oak capture --agent codex #${core.HOOK_MARKER}`;
     core.installCodexHooks(command, core.isOurCommand);
     const cfg = path.join(ch, 'config.toml');
-    const table = (ev) => `[hooks.state."${core.codexHookKey(core.codexHooksJsonPath(), ev, 0)}"]`;
+    const table = (ev) => `[hooks.state.${JSON.stringify(core.codexHookKey(core.codexHooksJsonPath(), ev, 0))}]`;
     const states = () => require('smol-toml').parse(fs.readFileSync(cfg, 'utf8')).hooks.state;
     const state = (ev) => states()[core.codexHookKey(core.codexHooksJsonPath(), ev, 0)];
     // Turning a hook off in Codex writes `enabled = false` into that hook's state table.
     const text = fs.readFileSync(cfg, 'utf8');
     const at = text.indexOf(table('PostToolUse'));
+    assert.ok(at >= 0, 'the TOML-escaped PostToolUse table is found before changing its switch');
     const end = text.indexOf('\n', text.indexOf('trusted_hash', at));
     fs.writeFileSync(cfg, text.slice(0, end) + '\nenabled = false' + text.slice(end));
     let st = core.codexHooksStatus(core.isOurCommand);
@@ -17062,7 +17066,8 @@ test('spawn: every child is asked to start with no console window on Windows (wi
   assert.deepEqual(seen, [
     ['spawnSync', false, true], ['spawnSync', false, false], ['spawnSync', false, true],
     ['spawn', false, true], ['spawn', true, true], ['spawn', true, false],
-    ['execFile', false, true], ['spawn', true, true], ['execFile', false, false],
+    // execFileTool keeps execFile for a detached child on Windows, where one detached gets a console of its own.
+    ['execFile', false, true], process.platform === 'win32' ? ['execFile', false, true] : ['spawn', true, true], ['execFile', false, false],
   ]);
 });
 
@@ -17207,7 +17212,8 @@ test('failure: a saved machine\'s reason is one line, Node\'s error line when it
   assert.ok(typeError.length > 3000 && typeError.includes('could not update"; const plan'), 'control: the report is long, its source line included');
   assert.equal(core.failureLine(typeError), "TypeError: Cannot read properties of undefined (reading 'surfaces')");
   assert.equal(core.failureLine(crash("require('./no-such-module');\n")), "Error: Cannot find module './no-such-module'", 'its require stack is not the reason');
-  assert.equal(core.failureLine(crash("require('fs').readFileSync('/no/such/file');\n")), "Error: ENOENT: no such file or directory, open '/no/such/file'");
+  // Windows names the file on the drive the crashed `oak` ran in: C:\no\such\file.
+  assert.equal(core.failureLine(crash("require('fs').readFileSync('/no/such/file');\n")), `Error: ENOENT: no such file or directory, open '${path.resolve(dir, '/no/such/file')}'`);
   assert.match(core.failureLine(crash("import('./nope.mjs').catch((e) => { throw e; });\n")), /^Error \[ERR_MODULE_NOT_FOUND\]: Cannot find module '.*nope\.mjs'/);
   assert.match(core.failureLine(crash("Promise.reject('a string');\n")), /^\[?UnhandledPromiseRejection: This error originated .*"a string"/);
   fs.rmSync(dir, { recursive: true, force: true });
@@ -19166,7 +19172,7 @@ test('statusline: the codex config edit is TOML-safe and refuses a foreign statu
   run();
   const marked = fs.readFileSync(cfg, 'utf8');
   assert.equal((marked.match(/\[\s*tui\s*\]/g) || []).length, 1, 'no second [tui] after a byte order mark');
-  assert.deepEqual([marked.startsWith('\uFEFF[tui]\nstatus_line = '), (marked.match(/\uFEFF/g) || []).length], [true, 1]);
+  assert.deepEqual([marked.startsWith(`\uFEFF[tui]${os.EOL}status_line = `), (marked.match(/\uFEFF/g) || []).length], [true, 1]);
 });
 
 test('statusline: uninstall --all removes the Codex status line the installer set, and only that (2026-10-07)', (t) => {
@@ -19191,13 +19197,14 @@ test('statusline: uninstall --all removes the Codex status line the installer se
     assert.equal(core.uninstallCodexStatusline(cfg), true);
     return fs.readFileSync(cfg, 'utf8');
   };
-  // A table the installer added, and one of the person's it added its keys to: each file comes back as it was.
+  // Python writes native line ends. Uninstall preserves those bytes, including on Windows.
+  // A table the installer added, and one of the person's it added its keys to: only our content goes.
   const plain = 'model = "gpt-5.2"\n';
   const back = roundTrip(plain);
   if (back === null) return t.skip('python3 is not installed');
-  assert.equal(back, plain);
+  assert.equal(back, plain.replace(/\n/g, os.EOL));
   for (const before of ['model = "gpt-5.2"\n\n[tui]\ntheme = "dark"\n\n[profiles.x]\nmodel = "o3"\n', '\uFEFF[tui]\ntheme = "dark"\n', '\uFEFFmodel = "gpt-5.2"\n', 'model = "gpt-5.2"\n  \n']) {
-    assert.equal(roundTrip(before), before, JSON.stringify(before));
+    assert.equal(roundTrip(before), before.replace(/\n/g, os.EOL), JSON.stringify(before));
   }
   assert.equal(core.uninstallCodexStatusline(cfg), false, 'nothing of ours left: unchanged');
   // A key the person added under the installer's [tui]: the header stays, so the key is not moved to the root.
@@ -19205,7 +19212,7 @@ test('statusline: uninstall --all removes the Codex status line the installer se
   install();
   fs.appendFileSync(cfg, 'theme = "dark"\n');
   assert.equal(core.uninstallCodexStatusline(cfg), true);
-  assert.equal(fs.readFileSync(cfg, 'utf8'), 'model = "gpt-5.2"\n\n[tui]  # oak-statusline\ntheme = "dark"\n');
+  assert.equal(fs.readFileSync(cfg, 'utf8'), `model = "gpt-5.2"${os.EOL}${os.EOL}[tui]  # oak-statusline${os.EOL}theme = "dark"\n`);
   assert.equal(core.uninstallCodexStatusline(cfg), false);
   // The same with CRLF line ends, as Windows' Python writes the file (text mode): the installer's table goes with
   // the blank line before it, and a header with a key the person added under it stays, so that key is not moved
@@ -22344,8 +22351,8 @@ function statuslineBarDefs() {
   const sh = fs.readFileSync(path.resolve(__dirname, '../../cli/statusline/install-statusline.sh'), 'utf8').split('\n');
   const from = sh.findIndex((l) => /^cat > "\$CLAUDE_DIR\/statusline\.sh" <<'STATUSLINE_EOF'$/.test(l));
   const gen = sh.slice(from + 1, sh.indexOf('STATUSLINE_EOF', from + 1));
-  const l0 = gen.findIndex((l) => l.startsWith('if ! locale charmap'));
-  const l1 = gen.indexOf('fi', l0);
+  const l0 = gen.findIndex((l) => l.startsWith('_utf8='));
+  const l1 = gen.indexOf('unset _utf8', l0);
   const a = gen.findIndex((l) => l.startsWith("DIM=$'"));
   const b = gen.findIndex((l, i) => i > a && l.startsWith('to_epoch() {'));
   assert.ok(from > 0 && l0 > 0 && l1 > l0 && a > l1 && b > a, 'the locale block, then the colours, uc and bar, still sit where they did');
@@ -22416,6 +22423,13 @@ test('statusline: each bar is a progress bar painted in very dim colours, its fi
   assert.equal(vis(fig), '  ~6.2M/14.9M +123M↺   ', 'the figures centred in the box');
   assert.equal(parse(fig)[3], '  ~6.2M/14', '42% of 23 cells is 10, the edge falling between two of them');
   assert.equal(vis(grown), ' ~6.2M/14.9M +123M↺ ', 'one cell of air each side when the figures outgrow the width');
+  // A charmap report is not proof that bash is slicing characters (Git Bash counted bytes).
+  // Also work when `locale` is absent: the renderer needs only bash's own character probe.
+  for (const locale of ["locale() { echo UTF-8; }", "locale() { return 127; }"]) {
+    const bytes = `export LC_ALL=C\n${locale}\n${defs}`;
+    assert.equal(shellBars(bytes, 'truecolor', [['42', '~6.2M/14.9M +123M↺', 23]])[0], fig,
+      'a byte-counting shell selects a working UTF-8 locale without trusting the locale command');
+  }
   // COLOUR DEPTH, from COLORTERM: 24-bit for truecolor, the one value Claude Code paints 24-bit for;
   // otherwise the 256-colour cells, where every fill is the nearest grey and the label and share keep
   // the hue. Under 24bit Claude Code maps 24-bit codes onto the 256-colour cube (the neutral #5f5f5f,
@@ -22445,9 +22459,9 @@ test('statusline: the width it wraps by skips colour codes of any length, in a l
   const gen = sh.split('\n');
   const a = gen.findIndex((l) => l.startsWith('vw() {'));
   const b = gen.findIndex((l, i) => i > a && l.endsWith('"${#o}"; }'));
-  const l0 = gen.findIndex((l) => l.startsWith('if ! locale charmap'));
+  const l0 = gen.findIndex((l) => l.startsWith('_utf8='));
   assert.ok(a > 0 && b > a && l0 > 0, 'vw and the locale block are where they were');
-  const defs = [...gen.slice(l0, gen.indexOf('fi', l0) + 1), ...gen.slice(a, b + 1)].join('\n');
+  const defs = [...gen.slice(l0, gen.indexOf('unset _utf8', l0) + 1), ...gen.slice(a, b + 1)].join('\n');
   const E = '\x1b';
   const cases = [
     ['abc', 3], ['~6.2M/14.9M +123M↺ ·', 20], [`${E}[38;2;228;228;228m${E}[48;2;30;64;40mab${E}[48;2;30;30;34mc${E}[0m`, 3],
@@ -22591,7 +22605,7 @@ test('tui/statusline: a measured month with no usage yet is a 0% bar, as the she
  *  runs the line on `input`, and returns line 3 with the cache it left; `port` draws the terminal app's port
  *  from that cache (core's usageLine, the dashboard's mapping, the widths it measures for both lines). Null
  *  where python3 or jq is missing. */
-function quotaLineRig() {
+function quotaLineRig(now) {
   const dirOf = (name) => (process.env.PATH || '').split(path.delimiter).find((d) => d && ['', '.exe'].some((x) => fs.existsSync(path.join(d, name + x))));
   if (!dirOf('python3') || !dirOf('jq')) return null;
   const home = freshHome();
@@ -22602,6 +22616,12 @@ function quotaLineRig() {
   delete env.HERDR_PANE_ID;
   const inst = cp.spawnSync('bash', [path.resolve(__dirname, '../../cli/statusline/install-statusline.sh'), '--force'], { env, encoding: 'utf8' });
   assert.equal(inst.status, 0, `installer runs — ${(inst.stderr || '').trim()}`);
+  if (now !== undefined) {
+    // One clock for the shell, its Python scan and the terminal port, even on a slow runner.
+    const file = path.join(cdir, 'statusline.sh');
+    fs.writeFileSync(file, `date() { if [ "$*" = +%s ]; then echo ${now}; else command date "$@"; fi; }\n` + fs.readFileSync(file, 'utf8'));
+    env.STATUSLINE_NOW = String(now);
+  }
   const render = (state, input, cache, extra = {}, bash = 'bash') => {
     fs.writeFileSync(path.join(cdir, 'statusline-usage.json'), JSON.stringify(state));
     fs.writeFileSync(path.join(cdir, 'statusline-last.json'), JSON.stringify(cache));
@@ -22613,7 +22633,7 @@ function quotaLineRig() {
     const prev = process.env.CLAUDE_CONFIG_DIR;
     process.env.CLAUDE_CONFIG_DIR = cdir;
     try {
-      const d = tui.statuslineDataFor({ now: Date.now(), usage: core.usageLine(home, ''), views: {}, session: '' });
+      const d = tui.statuslineDataFor({ now: now === undefined ? Date.now() : now * 1000, usage: core.usageLine(home, ''), views: {}, session: '' });
       const m = tui.statuslineMetrics(d, '256');
       return tui.statuslineGauges(d, '256', false, false, m.field, undefined, undefined, m.label);
     } finally {
@@ -24414,9 +24434,10 @@ test('statusline: an account with no five-hour limit draws no 5h segment, on the
   // (five_seen_at), and draws no 5h segment, with no gap where it was, while the newest of those answers is a no-limit
   // one. Only answers decide, never a share: no session's share, cached share or saved machine's share brings the window
   // back, however new; an answer with a 5h window does, here or, through core, on a saved machine.
-  const rig = quotaLineRig();
-  if (!rig) return t.skip('python3 or jq is not installed');
   const now = Math.floor(Date.now() / 1000);
+  t.mock.method(Date, 'now', () => now * 1000);
+  const rig = quotaLineRig(now);
+  if (!rig) return t.skip('python3 or jq is not installed');
   const r5 = now + 4 * 3600 + 30, r7 = now + 3 * 86400 + 6 * 3600 + 30;
   const state = { v: 2, last_scan: now, tpp5: 60000, tpp7: 300000, tppE5: 60000, tppE7: 300000, a30: 0, mo_start: now - 10 * 86400, mo_end: now + 20 * 86400 + 30, fc: {} };
   const idle = { session_id: 's', model: { display_name: 'Opus 5' }, cwd: rig.home, transcript_path: '/dev/null' };
@@ -25051,21 +25072,22 @@ function accountMachines() {
     ], { tpp5: 26_091, tppE5: 19_300, tpp7: 31_889, tppE7: 21_500 }, { base: 15, usd: 20 }),
   };
   const as = (m, fn) => {
-    const prev = [process.env.CLAUDE_CONFIG_DIR, process.env.HOME];
+    const prev = [process.env.CLAUDE_CONFIG_DIR, process.env.HOME, process.env.USERPROFILE];
     process.env.CLAUDE_CONFIG_DIR = m.rig.cdir;
-    process.env.HOME = m.rig.home;
+    process.env.HOME = process.env.USERPROFILE = m.rig.home;
     try {
       return fn();
     } finally {
       if (prev[0] === undefined) delete process.env.CLAUDE_CONFIG_DIR; else process.env.CLAUDE_CONFIG_DIR = prev[0];
       process.env.HOME = prev[1];
+      if (prev[2] === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = prev[2];
     }
   };
   const read = (m, f) => JSON.parse(fs.readFileSync(path.join(m.rig.cdir, f), 'utf8'));
   const render = (m, extra = {}, bash) => {
     const input = { session_id: 's', model: { display_name: 'Opus 5' }, cwd: m.rig.home, transcript_path: repliedTranscript(m.rig.home, 'live', Math.floor(Date.now() / 1000) - 30),
       rate_limits: { five_hour: { used_percentage: 11, resets_at: r5 }, seven_day: { used_percentage: 9, resets_at: r7 } } };
-    const r = m.rig.render(read(m, 'statusline-usage.json'), input, read(m, 'statusline-last.json'), { HOME: m.home, ...extra }, bash);
+    const r = m.rig.render(read(m, 'statusline-usage.json'), input, read(m, 'statusline-last.json'), { HOME: m.home, USERPROFILE: m.home, ...extra }, bash);
     return { ...r, state: read(m, 'statusline-usage.json') };
   };
   const brief = (m) => as(m, () => core.machineUsageBrief(m.rig.home));
@@ -25099,6 +25121,7 @@ test('statusline: two machines on one account calibrate their estimates against 
   assert.ok(b1.after.five_total > 15 * l1.after.five_total, `control: budgets ${b1.after.five_total} and ${l1.after.five_total} differ fifteenfold`);
   // The pull: each machine's brief, which now carries what it measured of its own turns, reaches the other.
   const bb = two.brief(big), lb = two.brief(lap);
+  assert.notEqual(bb.own.host, lb.own.host, 'the fixtures represent two distinct machines on Windows too');
   assert.deepStrictEqual([bb.own.five.tok, bb.own.week.tok, bb.own.month.tok, lb.own.five.tok, lb.own.week.tok, lb.own.month.tok],
     [3_920_000, 15_500_000, 138_300_000, 287_000, 287_000, 616_000], 'each sends its own turns alone: the laptop\'s 16.4M from another home stay out');
   two.pull(big, 'laptop', lb);
@@ -25208,7 +25231,7 @@ test('statusline: a saved machine adds to the estimates only for the same accoun
     prep(bb);
     fs.writeFileSync(answer, JSON.stringify({ sessionTokens: { input: 1200, output: 340, cacheRead: 56000, total: 57540 }, claudeAccount: two.as(lap, () => core.usageLine(lap.rig.home, '')) }));
     fs.rmSync(calls, { force: true });
-    const r = lap.rig.render({ ...from, last_scan: 0 }, { cwd: lap.rig.home }, cache, { HOME: lap.home, PATH: bin + path.delimiter + lap.rig.env.PATH }, bash);
+    const r = lap.rig.render({ ...from, last_scan: 0 }, { cwd: lap.rig.home }, cache, { HOME: lap.home, USERPROFILE: lap.home, PATH: bin + path.delimiter + lap.rig.env.PATH }, bash);
     return { ...r, calls: fs.readFileSync(calls, 'utf8').trim().split('\n') };
   };
   const monthly = refresh();
@@ -26576,7 +26599,7 @@ test('options: the SYNC section says sync\'s state and leaves its settings to th
     ['sync.machine:build-box', 'on'], ['sync.machine:old-box', 'off'], ['sync.project', 'on'], ['sync.project:git:github.com/org/lib', 'off']]);
   const row = (id) => mine.find((r) => r.id === id);
   // The backup's path and key, and the run's refusal of its record with the next step, in the CLI's words.
-  assert.equal(row('sync.setup').detail, `/mnt/share/oak-backup · key a11b-f2dc-f733-a548 · ${status.last.machines[1].text}`);
+  assert.equal(row('sync.setup').detail, `${status.backup.path} · key a11b-f2dc-f733-a548 · ${status.last.machines[1].text}`);
   assert.match(row('sync.setup').help, /runs `oak sync setup` here/);
   assert.match(row('sync.restore').help, /oak sync setup --restore/);
   // The run's time, and the last run in a line: each machine's line and the warnings are the overlay's (`oak sync status`).
@@ -29547,9 +29570,15 @@ test('notify: on macOS terminal-notifier off PATH is found in Homebrew\'s direct
   // A relative PATH entry names a folder that depends on the working folder: skipped, even with the tool in it.
   const rel = path.join(dir, 'rel'); fs.mkdirSync(rel);
   fs.writeFileSync(path.join(rel, 'terminal-notifier'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
-  process.env.PATH = path.relative(process.cwd(), rel);
-  assert.ok(!path.isAbsolute(process.env.PATH));
-  assert.equal(core.terminalNotifierPath(), null, 'a relative PATH entry is skipped');
+  // Read from the folder that holds it: on Windows the temp folder can be on another drive than this one, and no
+  // relative path leads there.
+  const cwd = process.cwd();
+  process.chdir(dir);
+  try {
+    process.env.PATH = 'rel';
+    assert.ok(fs.existsSync(path.join(process.env.PATH, 'terminal-notifier')), 'control: from here the entry names the tool');
+    assert.equal(core.terminalNotifierPath(), null, 'a relative PATH entry is skipped');
+  } finally { process.chdir(cwd); }
   process.env.PATH = onPathDir;
   const tool = path.join(brew, 'terminal-notifier');
   fs.writeFileSync(tool, '#!/bin/sh\nexit 0\n', { mode: 0o755 });

@@ -1,8 +1,8 @@
 // `oak tui --root <dir>` in the INTERACTIVE app: every session it picks on its own is the named workspace's
 // (core.defaultTuiSession(dir, true)), never the newest one anywhere: the first one it adopts with none at
 // launch, the newer one it hints at once a review lands, and the one it moves to when the reader deletes the
-// session under review. herdr, the backend and the CLI children are faked; prints the defaultTuiSession calls,
-// each with the step it was made in, and what the app did with the answers, as JSON.
+// session under review. herdr, the backend, the conversation reader and the CLI children are faked; prints the
+// defaultTuiSession calls, each with the step it was made in, and what the app did with the answers, as JSON.
 const fs = require('fs'), os = require('os'), path = require('path');
 const repo = path.resolve(__dirname, '../../../..');
 const home = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-root-probe-'));
@@ -20,6 +20,12 @@ frame.renderDashFrame = (s, ...rest) => { state = s; return draw(s, ...rest); };
 let notify;
 backend.createBackend = () => ({ close() {}, watcherMode: () => 'native', updateSkew: () => false, onData(fn) { notify = fn; },
   request() {}, diff: async () => '', run: async () => '{}' });
+// The conversation reader too: the real one keeps a warm reader child working in the named folder, which Windows will not
+// remove while that child runs. Its session listings never land.
+backend.createConversationReader = () => ({
+  sessions: () => new Promise(() => {}), read: async () => ({ events: [], cursor: null }), diff: async () => '',
+  fleet: async () => ({ subagents: [], todos: [] }), markCommentsSent: async () => {}, close() {},
+});
 // Each step's answer: the named workspace's session, then a newer one of it.
 let step = 'launch', answer = 'root-first';
 const calls = [], deleted = [];

@@ -103,7 +103,7 @@ test('remote Open all stays stacked here, reads once per page and acts on a late
   assert.ok(h.calls.filter(c=>c[1][0]==='diff').every(c=>c[1].includes('--ids')));
 });
 
-test('page mount mapping checks each distinct file and share once, refusing other hosts and symlink escapes', () => {
+test('page mount mapping checks each distinct file and share once, refusing other hosts and symlink escapes', { skip: process.platform === 'win32' && 'mounts are read from /proc/mounts or macOS mount: readMountTable reads none on Windows, so no review maps onto a mount there' }, () => {
   const cli = fs.readFileSync(process.env.OA1_CLI_SOURCE || path.join(__dirname, '../../cli/src/index.ts'), 'utf8');
   const tree = ts.createSourceFile('index.ts', cli, ts.ScriptTarget.Latest, true);
   const fn = tree.statements.find(n=>n.name?.text==='cmdEditorReview').getText(tree);

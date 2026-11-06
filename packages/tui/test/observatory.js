@@ -2413,11 +2413,15 @@ for (const check of ['drag-master', 'drag-detail', 'drag-button', 'click-release
 // prefix pressed during its drag), and what a copy says and runs: a toast for every outcome, one process at a time on
 // each path and stopped after ten seconds, and messages that name herdr's copy and the tool that failed (2026-10-13).
 for (const check of ['herdr-hold', 'copy-outcomes', 'copy-lanes', 'copy-stuck', 'copy-messages', 'copy-remote', 'copy-remote-narrow', 'copy-remote-ready', 'copy-remote-toast-ends']) test(`terminal app pointer and copies: ${check}`, () => {
-  const result = require('child_process').spawnSync(process.execPath, [path.join(__dirname, 'fixtures/observatory-app-probe.cjs')], {
-    encoding: 'utf8', timeout: 15000, env: { ...process.env, NODE_TEST_CONTEXT: '', OAK_APP_FIX_CHECK: check },
-  });
-  assert.equal(result.status, 0, result.stderr || result.error?.message);
-  assert.match(result.stderr, new RegExp(`PASS: ${check}`));
+  for (const platform of ['copy-lanes', 'copy-stuck', 'copy-messages'].includes(check) ? ['linux', 'darwin'] : [null]) {
+    const probe = path.join(__dirname, 'fixtures/observatory-app-probe.cjs');
+    const args = platform ? ['-e', `Object.defineProperty(process, 'platform', { value: ${JSON.stringify(platform)} }); process.argv[1] = ${JSON.stringify(probe)}; require(process.argv[1]);`] : [probe];
+    const result = require('child_process').spawnSync(process.execPath, args, {
+      encoding: 'utf8', timeout: 15000, env: { ...process.env, NODE_TEST_CONTEXT: '', OAK_APP_FIX_CHECK: check },
+    });
+    assert.equal(result.status, 0, `${platform ?? process.platform}: ${result.stderr || result.error?.message}`);
+    assert.match(result.stderr, new RegExp(`PASS: ${check}`));
+  }
 });
 
 test('the app never relaunches its own host to refresh titles: only an oak CLI entry the CLI registered is launched (2026-09-24)', t => {

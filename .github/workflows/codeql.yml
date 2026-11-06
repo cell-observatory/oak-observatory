@@ -20,8 +20,12 @@ permissions:
 jobs:
   analyze:
     name: Analyze (${{ matrix.language }})
-    # The organization's self-hosted Linux runners (the labels every one of them carries).
+    # The organization's self-hosted Linux runners (the labels every one of them carries), in a fresh container whose
+    # Node the TypeScript extractor needs, as uid 1000, the runner accounts' own.
     runs-on: [self-hosted, Linux, X64]
+    container:
+      image: mcr.microsoft.com/devcontainers/javascript-node:22-bookworm
+      options: --user 1000:1000
     strategy:
       fail-fast: false
       matrix:

@@ -34,7 +34,8 @@ if (!isMainThread) {
     });
   });
   server.on('error', error => parentPort.postMessage({ error: error.message }));
-  server.listen(workerData.socketPath, () => parentPort.postMessage({ ready: true }));
+  // Where herdr's clients connect: the marker itself, or on Windows the named pipe it names.
+  server.listen(require('../../dist/herdr').herdrConnectPath({ HERDR_SOCKET_PATH: workerData.socketPath }), () => parentPort.postMessage({ ready: true }));
   parentPort.on('message', message => Object.assign(workerData, message));
 } else {
   module.exports = async function paneServer(t, dir, scenario, options = {}) {

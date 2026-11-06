@@ -718,6 +718,18 @@ the release notes.
   only when herdr confirms this process runs there, without delaying the first paint, and `oak doctor` names a stale one.
 - An OAK focus server that has exited but that its parent app has not yet collected (a zombie) now counts as stopped.
   `oak doctor` reported it as an outdated server that "did not stop", and a new server would not start over it.
+- On macOS, a delegated agent whose process has ended but has not been collected by its parent (a zombie) now shows as
+  gone. It stayed waiting.
+- On Windows, the local database catches up. NTFS gives most files an id above 2^53, which the database stored but
+  could not read back as a number, so no catch-up finished and `oak usage` read no totals from the index.
+- On Windows 11 24H2 and Windows Server 2025 with Node 22.16 or 24.0–24.1, OAK keeps each transcript's derived facts
+  between reads, and the status line's usage read writes nothing when nothing changed. Those Node versions report
+  another device for a file's path than for the open file, so no read counted as complete and every view re-read
+  whole transcripts.
+- On Windows, the status line draws its bars and widths by character. It now checks that Bash itself counts
+  characters before it takes a UTF-8 locale; where Bash counted bytes, ↺ was split and every bar misdrawn.
+- `oak uninstall --all` no longer stops with an error on a machine whose home folder the system cannot name (on
+  Windows, an empty USERPROFILE).
 - The Observatory's and editors' Processes lists no longer show a worker's background shells as running for good.
   OAK now reads the end a worker's transcript records for its shell, and a shell that never reported one stops
   counting as running once its worker has ended and the shell has gone quiet ("no end recorded"). An idle

@@ -76,6 +76,7 @@ const says = () => (/no data to draw/.test(drawn) ? 'no data to draw' : /buildin
   notify({ sessions: listing, list: { edits: [] } }, null, Date.now(), 'fresh-session');
   await wait();
   write(JSON.stringify({ before, adopted, stale, rerun, listings: listings.map((l) => l.session), landed: { views: review(), says: says() } }) + '\n');
+  process.chdir(repo); // Windows will not remove the folder this process works in
   fs.rmSync(home, { recursive: true, force: true });
   exit(0);
 })().catch(error => { process.stderr.write(String(error?.stack || error) + '\n'); exit(1); });

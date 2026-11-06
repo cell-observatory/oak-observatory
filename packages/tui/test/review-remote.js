@@ -1702,7 +1702,7 @@ exec "${process.execPath}" "${CLI}" "$@"
         }, talk, tab);
       });
       it(`${tab}: a session that only said the words appears after the pause, with an excerpt; the saved machine's too`, async () => {
-        await drive('nvim', [], async ({ press, lines }) => {
+        await drive('nvim', [], async ({ press, lines, fx }) => {
           await open(press, lines);
           await press(...'zebrafish');
           await until(lines, /said I renamed the zebrafish/);
@@ -1710,7 +1710,10 @@ exec "${process.execPath}" "${CLI}" "$@"
           assert.equal(p.rows.length, 1, lines().join('\n'));
           assert.match(p.rows[0], /Tidy the parser\s.*said I renamed the zebrafish column/, 'the row is named by its ask, and the excerpt is one line, cut at a word');
           assert.doesNotMatch(p.rows[0], /…/);
-          assert.match(p.box, /1 more by what was said/);
+          assert.match(p.box, /searching… build-box/, 'the local excerpt arrives while the remote is still searching');
+          fs.writeFileSync(path.join(fx.dir, 'release-search'), '');
+          await until(lines, /1 more by what was said/);
+          assert.match(picker(lines).box, /1 more by what was said/);
           await press(...Array('zebrafish'.length).fill('\x7f'));
           await press(...'quokka');
           await until(lines, /said The quokka importer/);
@@ -1720,7 +1723,15 @@ exec "${process.execPath}" "${CLI}" "$@"
           await press(...'Zebrafish');
           await until(lines, /said I renamed the zebrafish/);
           assert.match(picker(lines).rows.join('\n'), /Tidy the parser\s.*said I renamed the zebrafish column/, lines().join('\n'));
-        }, talk, tab);
+        }, (fx) => {
+          talk(fx);
+          const release = path.join(fx.dir, 'release-search');
+          fs.writeFileSync(path.join(fx.remote, '.local/bin/oak'), `#!/bin/sh\nif [ "$1" = search ] && [ "$3" = --query=zebrafish ]; then
+            while [ ! -f '${release}' ]; do sleep 0.1; done
+          fi
+          exec "${process.execPath}" "${CLI}" "$@"\n`, { mode: 0o755 });
+          fx.cleanup = () => fs.writeFileSync(release, '');
+        }, tab);
       });
     }
     it('a fast typist starts one search per machine, for the whole word, and nothing while still typing', async () => {

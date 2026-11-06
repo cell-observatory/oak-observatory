@@ -101,6 +101,10 @@ function stat(file: string): fs.Stats | null {
 
 const stampOf = (st: fs.Stats | null): string => (st ? `${st.dev}:${st.ino}:${st.size}:${st.mtimeMs}` : '-');
 
+/** The `ino` column as stat gave it: a Windows (NTFS) file id passes 2^53, which node:sqlite refuses to read back as a
+ *  number; as REAL it is the exact double that was stored. */
+const INO = 'CAST(ino AS REAL) AS ino';
+
 /** What one session holds on this machine, by the stamps of its files. */
 interface SessionSources {
   id: string;
@@ -157,7 +161,7 @@ function walkFiles(dir: string, depth: number, accept: (name: string) => boolean
  *  not carry its id is ever read for it). */
 function rolloutHeadCached(db: DatabaseSync, file: string, st: fs.Stats): CodexRolloutHead | null {
   const key = `rollout-head:${file}`;
-  const row = db.prepare('SELECT ino, size, mtime_ms, state FROM ingest_state WHERE source = ?').get(key) as { ino: number; size: number; mtime_ms: number; state: string } | undefined;
+  const row = db.prepare(`SELECT ${INO}, size, mtime_ms, state FROM ingest_state WHERE source = ?`).get(key) as { ino: number; size: number; mtime_ms: number; state: string } | undefined;
   if (row && row.ino === st.ino && row.size === st.size && row.mtime_ms === st.mtimeMs) {
     try {
       return JSON.parse(row.state) as CodexRolloutHead | null;
@@ -568,7 +572,7 @@ interface StateRow {
 }
 
 function getState(r: Run, source: string): StateRow | undefined {
-  return r.db.prepare('SELECT source, dev, ino, size, mtime_ms, cursor, head_sha, anchor_sha, state FROM ingest_state WHERE source = ?').get(source) as StateRow | undefined;
+  return r.db.prepare(`SELECT source, dev, ${INO}, size, mtime_ms, cursor, head_sha, anchor_sha, state FROM ingest_state WHERE source = ?`).get(source) as StateRow | undefined;
 }
 
 function putState(r: Run, row: { source: string; kind: string; machine: string; session: string | null; st?: Stamp | null; cursor?: number; head?: string | null; anchor?: string | null; state?: string | null }): void {
@@ -3356,11 +3360,13 @@ function usageCurrent(db: DatabaseSync, opts: { session?: string | null; transcr
   if ((db.prepare('SELECT state FROM ingest_state WHERE source = ?').get(`unit:usage-machine:${me}`) as { state: string | null } | undefined)?.state !== stamp) return false;
   const id = opts.session && isSafeSessionId(opts.session) ? opts.session : null;
   const files = id && opts.transcript ? [opts.transcript, ...workerTranscripts(opts.transcript, id)] : [];
-  const read = db.prepare('SELECT dev, ino, size, mtime_ms, state FROM ingest_state WHERE source = ?');
+  // The stamp was recorded from the open file (fstat) and is checked here against the path (stat): all but the device,
+  // which a path names otherwise on Windows 11 24H2 under libuv 1.49-1.50 (Node 22.16), as in derived-transcript's samePath.
+  const read = db.prepare(`SELECT ${INO}, size, mtime_ms, state FROM ingest_state WHERE source = ?`);
   for (const file of files) {
     const st = stat(file);
-    const prev = read.get(`usage:${file}`) as { dev: number; ino: number; size: number; mtime_ms: number; state: string | null } | undefined;
-    if (!st || !prev || prev.state !== 'done' || prev.dev !== st.dev || prev.ino !== st.ino || prev.size !== st.size || prev.mtime_ms !== st.mtimeMs) return false;
+    const prev = read.get(`usage:${file}`) as { ino: number; size: number; mtime_ms: number; state: string | null } | undefined;
+    if (!st || !prev || prev.state !== 'done' || prev.ino !== st.ino || prev.size !== st.size || prev.mtime_ms !== st.mtimeMs) return false;
   }
   if (getMeta(db, 'usage_priced') !== PRICE_VERSION) return false;
   return !db.prepare("SELECT 1 FROM ingest_state WHERE kind = 'pub-waiting' AND updated_ms <= ? LIMIT 1").get(now - PUBLISH_MS);

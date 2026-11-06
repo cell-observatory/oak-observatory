@@ -14,13 +14,18 @@ permissions:
 jobs:
   package:
     name: build .vsix + CLI .tgz
-    # The organization's self-hosted Linux runners (the labels every one of them carries). The workflows that publish
-    # (release, dev-release, pages) stay on GitHub-hosted runners.
+    # The organization's self-hosted Linux runners (the labels every one of them carries). The job runs in a fresh
+    # container: a clean filesystem, PATH and home, as on a GitHub-hosted runner, and nothing of the machine's own
+    # accounts. It runs as uid 1000, the runner accounts' own on every runner machine, so what it writes stays theirs
+    # to clean up, and the tests run as an ordinary user, as on a hosted runner. The workflows that publish (release,
+    # dev-release, pages) stay on GitHub-hosted runners.
     runs-on: [self-hosted, Linux, X64]
+    # The dev-container Node image: Debian with git, python3, make and g++ (node-pty compiles from source on Linux), jq
+    # in /usr/bin (the status-line tests run with only the system folders on PATH), a C.UTF-8 locale, and user 1000.
+    container:
+      image: mcr.microsoft.com/devcontainers/javascript-node:22-bookworm
+      options: --user 1000:1000
     steps:
-      # Self-hosted runners keep their home between jobs: give this one a fresh home, as a hosted runner has.
-      - name: A fresh home for this job
-        run: mkdir -p "$RUNNER_TEMP/home" && echo "HOME=$RUNNER_TEMP/home" >> "$GITHUB_ENV"
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:

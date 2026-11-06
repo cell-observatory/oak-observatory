@@ -159,7 +159,8 @@ test('agent start --worktree and close --remove-worktree use the recorded tree i
   const brief = path.join(f.dir, 'brief.md'); fs.writeFileSync(brief, '# Synthetic work\n');
   const rec = await core.startDelegatedAgent({ kind: 'codex', brief, cwd: f.work, worktree: true, name: 'agent-x', writableRoots: ['/cache'], sleep: async () => {} });
   assert.equal(calls.find(([m]) => m === 'tab.create')[1].cwd, rec.worktree.path);
-  assert.ok(calls.find(([m]) => m === 'agent.start')[1].args.includes(`sandbox_workspace_write.writable_roots=${JSON.stringify([path.resolve('/cache'), rec.out])}`));
+  // A root-relative root is the agent's: on Windows it takes the drive of the tree it runs in, not this test's.
+  assert.ok(calls.find(([m]) => m === 'agent.start')[1].args.includes(`sandbox_workspace_write.writable_roots=${JSON.stringify([path.resolve(rec.cwd, '/cache'), rec.out])}`));
   assert.equal(core.readDelegated(rec.id).worktree.path, rec.cwd);
   const closed = await core.closeDelegatedAgent(rec.id, { removeWorktree: true });
   assert.ok(closed.closedMs);

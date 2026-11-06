@@ -95,13 +95,15 @@ cat > "$CLAUDE_DIR/statusline.sh" <<'STATUSLINE_EOF'
 # Schema: https://code.claude.com/docs/en/statusline.md
 
 # Bar glyphs are multibyte; slicing them counts CHARACTERS only under a UTF-8 locale.
-# Over SSH the locale is often C/POSIX (byte-counting), which would corrupt the bars,
-# so pick a UTF-8 locale when the current one isn't already UTF-8.
-if ! locale charmap 2>/dev/null | grep -qi 'utf'; then
+# Check bash itself: an external locale command does not prove how this shell slices.
+# A candidate must actually make bash count the glyph as one character.
+_utf8=$'\342\206\272'
+if [ "${#_utf8}" -ne 1 ]; then
   for L in C.UTF-8 en_US.UTF-8 C.utf8 en_US.utf8; do
-    if locale -a 2>/dev/null | grep -qix "$L"; then export LC_ALL="$L"; break; fi
+    if (export LC_ALL="$L"; [ "${#_utf8}" -eq 1 ]) 2>/dev/null; then export LC_ALL="$L"; break; fi
   done
 fi
+unset _utf8
 
 # Under Git Bash or Cygwin (how Claude Code runs this on Windows) a native jq.exe or python.exe ends
 # its lines with CRLF (jq's own --binary flag exists for this), and every value read from them kept

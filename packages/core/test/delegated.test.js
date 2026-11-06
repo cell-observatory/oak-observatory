@@ -6,7 +6,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const cp = require('node:child_process');
 const core = require('../dist');
-const { indexFixture } = require('./fixtures/index-fixture.cjs');
+const { indexFixture, assertKilled } = require('./fixtures/index-fixture.cjs');
 const { fakeHerdr, processInfo } = require('./fake-herdr');
 
 const skipIndex = !core.indexRuntime().ok && `no node:sqlite with FTS5 in ${process.version}`;
@@ -120,7 +120,7 @@ test('delegated: a hook killed while writing its session link leaves the next ho
     };
     require(${JSON.stringify(path.resolve(__dirname, '../dist/delegated-link'))}).linkDelegated('s-first', { OAK_DELEGATED: 'a1' });
   `]);
-  assert.equal(killed.signal, 'SIGKILL');
+  assertKilled(killed);
   core.linkDelegated('s-retried', { OAK_DELEGATED: 'a1' });
   core.linkDelegated('s-nested', { OAK_DELEGATED: 'a1' });
   assert.equal(core.readDelegated('a1').session, 's-retried', 'a complete link wins and nested agents cannot replace it');
@@ -134,12 +134,12 @@ test('delegated: a record writer killed before rename leaves the previous record
     fs.renameSync = () => process.kill(process.pid, 'SIGKILL');
     require(${JSON.stringify(path.resolve(__dirname, '../dist/delegated'))}).writeDelegated(${JSON.stringify({ ...rec, state: 'done' })});
   `]);
-  assert.equal(killed.signal, 'SIGKILL');
+  assertKilled(killed);
   assert.equal(core.readDelegated('a1').state, 'starting');
   assert.deepEqual(core.listDelegatedRecords().map((r) => r.id), ['a1'], 'an orphan temporary record is ignored');
 });
 
-test('delegated: a Codex agent by its rollout; one whose process ended without a report is gone', (t) => {
+test('delegated: a Codex agent by its rollout; one whose process ended without a report is gone', async (t) => {
   const f = indexFixture(t, core);
   const agent = liveAgent(t, 'codex');
   record(f, { id: 'c1', kind: 'codex', pid: agent.pid, session: '0199aaaa-0000-7000-8000-000000000001' });
@@ -148,12 +148,37 @@ test('delegated: a Codex agent by its rollout; one whose process ended without a
   assert.equal(stateOf('c1').state, 'working', 'task_started with no completion');
   fs.appendFileSync(file, JSON.stringify(ev('task_complete')) + '\n');
   assert.equal(stateOf('c1').state, 'waiting', 'task_complete');
+  const exited = new Promise(resolve => agent.once('exit', resolve));
   agent.kill('SIGKILL');
-  cp.spawnSync(process.execPath, ['-e', 'setTimeout(() => {}, 200)']);
+  await exited;
   const gone = stateOf('c1');
   assert.equal(gone.state, 'gone', 'its process ended and no report');
   fs.writeFileSync(path.join(f.dir, 'out', 'report.md'), 'late\n');
   assert.equal(stateOf('c1').state, 'gone', 'gone is final');
+});
+
+test('delegated: a zombie agent is gone on macOS before its parent reaps it', (t) => {
+  const f = indexFixture(t, core);
+  record(f, { kind: 'codex', pid: 424242, state: 'waiting' });
+  const platform = Object.getOwnPropertyDescriptor(process, 'platform');
+  Object.defineProperty(process, 'platform', { value: 'darwin' });
+  t.after(() => Object.defineProperty(process, 'platform', platform));
+  t.mock.method(process, 'kill', (pid, signal) => {
+    assert.equal(pid, 424242); assert.equal(signal, 0);
+  });
+  const read = fs.readFileSync;
+  t.mock.method(fs, 'readFileSync', (file, ...args) => {
+    if (String(file).startsWith('/proc/')) throw Object.assign(new Error('no /proc on macOS'), { code: 'ENOENT' });
+    return read(file, ...args);
+  });
+  let stat = 'S';
+  t.mock.method(require('../dist/spawn'), 'spawnToolSync', (command, args) => {
+    assert.equal(command, 'ps'); assert.deepEqual(args, ['-o', 'stat=', '-p', '424242']);
+    return { status: 0, stdout: `  ${stat}\n` };
+  });
+  assert.equal(core.agentAlive(424242, 'codex'), true, 'a running process without /proc is alive');
+  stat = 'Z';
+  assert.equal(stateOf('a1').state, 'gone', 'signal 0 reaches a zombie, but it cannot work or write its report');
 });
 
 test('delegated: a Codex turn that stopped on a provider error is errored, with its text and time, until the prompt is sent again', (t) => {
