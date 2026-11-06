@@ -366,10 +366,10 @@ test('workflows: every setup-node step is the current major, and Pages builds on
 
 test('workflows: Gradle and the JDK are set up before release.sh builds the JetBrains plugin, and packaging runs on Node 22', () => {
   // Set up after `npm run release`, the wrapper downloaded Gradle uncached and with no retry. @vscode/vsce 4 and
-  // its @azure dependencies need Node 22; vscode.yml keeps the runner's own JDK on purpose.
+  // its @azure dependencies need Node 22. vscode.yml runs on a self-hosted runner, which has no default JDK.
   assert.match(read('scripts/release.sh'), /gradlew buildPlugin/, 'release.sh builds the plugin itself');
   for (const [file, steps] of [['release.yml', ['actions/setup-java@', 'gradle/actions/setup-gradle@']],
-    ['dev-release.yml', ['actions/setup-java@', 'gradle/actions/setup-gradle@']], ['vscode.yml', ['gradle/actions/setup-gradle@']]]) {
+    ['dev-release.yml', ['actions/setup-java@', 'gradle/actions/setup-gradle@']], ['vscode.yml', ['actions/setup-java@', 'gradle/actions/setup-gradle@']]]) {
     const src = read(`.github/workflows/${file}`), release = src.indexOf('- run: npm run release');
     assert.ok(release > 0, `${file} runs npm run release`);
     for (const step of steps) assert.ok(src.includes(step) && src.indexOf(step) < release, `${file}: ${step} comes before npm run release`);

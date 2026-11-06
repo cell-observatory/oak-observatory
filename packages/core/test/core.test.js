@@ -19787,8 +19787,8 @@ test('installers: every install path goes through the CLI, and offers both chann
 
 test('installers: install.ps1 parses as PowerShell', { skip: !hasPwsh() }, () => {
   // A syntax error in this file is invisible until a Windows user pipes it into iex and it half-runs.
-  // pwsh ships on ubuntu-latest and windows-latest runners, so CI checks it even though a mac dev
-  // machine usually cannot.
+  // pwsh ships on the windows-latest runner, so CI checks it even though a mac dev machine usually
+  // cannot.
   const ps1 = path.resolve(__dirname, '../../../install.ps1');
   const script =
     "$e = $null; [void][System.Management.Automation.Language.Parser]::ParseFile('" +

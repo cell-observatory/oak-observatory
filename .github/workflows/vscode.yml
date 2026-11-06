@@ -14,8 +14,13 @@ permissions:
 jobs:
   package:
     name: build .vsix + CLI .tgz
-    runs-on: ubuntu-latest
+    # The organization's self-hosted Linux runners (the labels every one of them carries). The workflows that publish
+    # (release, dev-release, pages) stay on GitHub-hosted runners.
+    runs-on: [self-hosted, Linux, X64]
     steps:
+      # Self-hosted runners keep their home between jobs: give this one a fresh home, as a hosted runner has.
+      - name: A fresh home for this job
+        run: mkdir -p "$RUNNER_TEMP/home" && echo "HOME=$RUNNER_TEMP/home" >> "$GITHUB_ENV"
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:
@@ -27,8 +32,12 @@ jobs:
       # so any blip on services.gradle.org reds this job on a commit that is perfectly fine — which is
       # what a 503 did here. setup-gradle caches the distribution and the Gradle user home, which is
       # why jetbrains.yml (which already uses it) sailed through the same outage on the same commit.
-      # Nothing else about the build changes: release.sh still drives ./gradlew, and the JDK stays the
-      # runner's default, which is what this job has always used.
+      # Nothing else about the build changes: release.sh still drives ./gradlew. A self-hosted runner has no
+      # default JDK to rely on, so this sets up the one the plugin's toolchain asks for, as jetbrains.yml does.
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 21
       - uses: gradle/actions/setup-gradle@v5
       - run: npm run release
       - uses: actions/upload-artifact@v7

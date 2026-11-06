@@ -20,7 +20,8 @@ permissions:
 jobs:
   analyze:
     name: Analyze (${{ matrix.language }})
-    runs-on: ubuntu-latest
+    # The organization's self-hosted Linux runners (the labels every one of them carries).
+    runs-on: [self-hosted, Linux, X64]
     strategy:
       fail-fast: false
       matrix:

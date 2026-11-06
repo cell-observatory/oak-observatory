@@ -24,8 +24,13 @@ jobs:
         # lane that emits it, "the update no longer prints a deprecation warning" (#45) is a claim
         # CI cannot check. The reporter was on 24.18.
         node: ['22.16', 24]
-    runs-on: ubuntu-latest
+    # The organization's self-hosted Linux runners (the labels every one of them carries). The workflows that publish
+    # (release, dev-release, pages) stay on GitHub-hosted runners.
+    runs-on: [self-hosted, Linux, X64]
     steps:
+      # Self-hosted runners keep their home between jobs: give this one a fresh home, as a hosted runner has.
+      - name: A fresh home for this job
+        run: mkdir -p "$RUNNER_TEMP/home" && echo "HOME=$RUNNER_TEMP/home" >> "$GITHUB_ENV"
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:
