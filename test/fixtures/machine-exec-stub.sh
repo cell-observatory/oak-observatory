@@ -31,7 +31,12 @@ case "$tool" in
       printf '%b' "${SSH_FAKE_G:-controlmaster false\ncontrolpersist no\n}"
       exit 0
     fi
-    { echo ssh; for a in "$@"; do printf '%s\n' "$a"; done; echo .; } >> "$MACHINE_EXEC_LOG"
+    # One write per call: the record goes to a file of its own, then onto the log by one `cat`. Line by
+    # line (bash's printf writes each line apart), two ssh run at once, as a refresh asks every machine,
+    # interleaved their records and the log read back as different calls (macOS CI, 2026-11-06).
+    rec=$(mktemp "$MACHINE_EXEC_LOG.XXXXXX")
+    { echo ssh; for a in "$@"; do printf '%s\n' "$a"; done; echo .; } > "$rec"
+    cat "$rec" >> "$MACHINE_EXEC_LOG"; rm -f "$rec"
     down=
     for a in "$@"; do [ -n "${SSH_FAKE_DOWN:-}" ] && [ "$a" = "$SSH_FAKE_DOWN" ] && down=255; done
     if [ -n "${SSH_FAKE_EXIT:-}$down" ]; then
