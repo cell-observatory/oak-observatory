@@ -991,6 +991,35 @@ test('CLI doctor: tells the PTY row when it runs from the copy `oak machine add`
   assert.deepEqual((await doctor(b).run(['--json'])).native.map((o) => o.bundle), [false], 'control: an npm install keeps package.json above dist/');
 });
 
+// On Windows node-pty's ConPTY keeps a worker thread running after the PTY check's child has exited
+// (microsoft/node-pty#887): `oak doctor --json` and `--markdown` never ended, and a caller waited out its own timeout.
+// The fake node-pty here leaves a timer running the same way.
+test('CLI doctor: --json and --markdown end once printed, though node-pty leaves a handle running after its check', t => {
+  const b = fixture(t);
+  const fake = path.join(b.home, 'fake-node-pty');
+  fs.mkdirSync(fake);
+  fs.writeFileSync(path.join(fake, 'package.json'), '{"name":"node-pty","main":"index.js"}');
+  fs.writeFileSync(path.join(fake, 'index.js'), `exports.spawn = () => {
+  require('fs').appendFileSync(${JSON.stringify(path.join(b.home, 'spawned'))}, 'x');
+  setInterval(() => {}, 60_000);
+  return { onData() {}, onExit(fn) { setImmediate(() => fn({ exitCode: 0 })); }, kill() {} };
+};\n`);
+  const preload = path.join(b.home, 'fake-node-pty.cjs');
+  fs.writeFileSync(preload, `const Module = require('module');
+const resolve = Module._resolveFilename;
+Module._resolveFilename = function (request, ...rest) {
+  return request === 'node-pty/package.json' ? ${JSON.stringify(path.join(fake, 'package.json'))} : resolve.call(this, request, ...rest);
+};\n`);
+  b.env = { ...b.env, HERDR_BIN: path.join(b.home, 'absent-herdr'), HERDR_SOCKET_PATH: path.join(b.home, 'no-socket'), OAK_NO_BACKGROUND: '1' };
+  const json = run(b, process.execPath, ['--require', preload, cli, 'doctor', '--json'], { timeout: 30_000 });
+  assert.equal(json.status, 0, json.stderr);
+  assert.equal(JSON.parse(json.stdout).checks.find((c) => c.id === 'native-spawn')?.level, 'ok');
+  assert.equal(fs.readFileSync(path.join(b.home, 'spawned'), 'utf8'), 'x', 'control: the check ran the fake');
+  const md = run(b, process.execPath, ['--require', preload, cli, 'doctor', '--markdown'], { timeout: 30_000 });
+  assert.equal(md.status, 0, md.stderr);
+  assert.match(md.stdout, /Native terminal PTY spawn/);
+});
+
 test('CLI doctor: names an `oak` a login shell finds before this installation, since Codex runs its hooks through one (2026-10-06)', { skip: process.platform === 'win32' && 'POSIX login shell' }, async t => {
   // On the Mac it happened on, a login shell found a release in Homebrew's prefix before ~/.local/bin, where
   // the checkout's link was: every Codex hook ran the release, and nothing said so.
@@ -1310,23 +1339,27 @@ test('CLI --machine: worker follow polls the owner, prints the exact end and exi
     sessionId: 'worker-parent', isSidechain: sidechain, message: { role: 'assistant', content: [{ type: 'text', text }] } }) + '\n';
   fs.writeFileSync(parent, line('REMOTE PARENT'));
   fs.writeFileSync(worker, line('REMOTE WORKER', true));
-  const child = cp.spawn(process.execPath, [cli, 'feed', '--kind', 'agent', '--id', 'w1', '--session', 'worker-parent', '--follow', '--machine', 'build-box'], { env: f.b.env });
+  const child = cp.spawn(process.execPath, ['--require', path.join(__dirname, 'fixtures/worker-poll-clock.cjs'), cli,
+    'feed', '--kind', 'agent', '--id', 'w1', '--session', 'worker-parent', '--follow', '--machine', 'build-box'], { env: f.b.env, stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
   t.after(() => child.kill());
   let out = '', err = '';
   const ready = new Promise(resolve => child.stdout.on('data', d => { out += d; if (out.includes('REMOTE WORKER')) resolve(); }));
   child.stderr.on('data', d => { err += d; });
   const closed = new Promise((resolve, reject) => { child.once('error', reject); child.once('close', resolve); });
-  // The original 5 s startup + 15 s follow budget is shared; stdout, not elapsed time, starts the next step.
-  await Promise.race([ready, closed.then(code => assert.fail(`worker follower closed before its first snapshot (${code}): ${err}`))]);
+  const polling = new Promise(resolve => child.once('message', resolve));
+  // Wait for the first snapshot and its scheduled poll; advance that poll only after writing the end.
+  await Promise.race([Promise.all([ready, polling]), closed.then(code => assert.fail(`worker follower closed before its first snapshot (${code}): ${err}`))]);
+  assert.deepEqual(await polling, { pollMs: 10000 });
   assert.match(out, /REMOTE WORKER/, err);
   fs.appendFileSync(worker, line('REMOTE SECOND STEP', true));
   fs.appendFileSync(parent, JSON.stringify({ type: 'queue-operation', operation: 'enqueue', timestamp: '2026-10-01T10:05:00.123Z',
     content: '<task-notification><task-id>w1</task-id><status>completed</status></task-notification>' }) + '\n');
+  child.send('poll');
   assert.equal(await closed, 0, err);
   assert.match(out, /REMOTE SECOND STEP/);
   assert.match(out, /Worker ended at 2026-10-01T10:05:00.123Z/);
   assert.doesNotMatch(out, /REMOTE PARENT/);
-  assert.equal(f.sshCalls().length, 2, 'two snapshots ten seconds apart, with no remote follower');
+  assert.equal(f.sshCalls().length, 2, 'two snapshots across a poll, with no remote follower');
   assert.ok(f.sshCalls().every(args => !args.join(' ').includes("'--follow'")));
 });
 

@@ -25,7 +25,9 @@ jobs:
     runs-on: [self-hosted, Linux, X64]
     container:
       image: mcr.microsoft.com/devcontainers/javascript-node:22-bookworm
-      options: --user 1000:1000
+      # --init: the runner starts the container on `tail -f /dev/null`, which never collects an ended process, so a test
+      # that stops a child would see it linger as a zombie; docker's init is process 1 instead and collects them.
+      options: --user 1000:1000 --init
     strategy:
       fail-fast: false
       matrix:

@@ -730,6 +730,10 @@ the release notes.
   characters before it takes a UTF-8 locale; where Bash counted bytes, ↺ was split and every bar misdrawn.
 - `oak uninstall --all` no longer stops with an error on a machine whose home folder the system cannot name (on
   Windows, an empty USERPROFILE).
+- On Windows, `oak doctor --json` and `--markdown` end once their report is written. The terminal check left a
+  console worker running, so the process never exited and the editors' Doctor waited out its timeout.
+- In VS Code on Windows, moving the store records the folder with the drive letter as Windows spells it. The folder
+  dialog's lower-case drive letter got past the check that refuses a move into the current store.
 - The Observatory's and editors' Processes lists no longer show a worker's background shells as running for good.
   OAK now reads the end a worker's transcript records for its shell, and a shell that never reported one stops
   counting as running once its worker has ended and the shell has gone quiet ("no end recorded"). An idle

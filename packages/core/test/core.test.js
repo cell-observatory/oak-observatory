@@ -25087,7 +25087,10 @@ function accountMachines() {
   const render = (m, extra = {}, bash) => {
     const input = { session_id: 's', model: { display_name: 'Opus 5' }, cwd: m.rig.home, transcript_path: repliedTranscript(m.rig.home, 'live', Math.floor(Date.now() / 1000) - 30),
       rate_limits: { five_hour: { used_percentage: 11, resets_at: r5 }, seven_day: { used_percentage: 9, resets_at: r7 } } };
-    const r = m.rig.render(read(m, 'statusline-usage.json'), input, read(m, 'statusline-last.json'), { HOME: m.home, USERPROFILE: m.home, ...extra }, bash);
+    // These homes name synthetic transcript origins. Git Bash must not convert USERPROFILE to a path under its
+    // install directory: native Python would then recognize no home and count the other machine's turns as ours.
+    const r = m.rig.render(read(m, 'statusline-usage.json'), input, read(m, 'statusline-last.json'),
+      { HOME: m.home, USERPROFILE: m.home, MSYS2_ENV_CONV_EXCL: 'USERPROFILE', ...extra }, bash);
     return { ...r, state: read(m, 'statusline-usage.json') };
   };
   const brief = (m) => as(m, () => core.machineUsageBrief(m.rig.home));
@@ -25231,7 +25234,8 @@ test('statusline: a saved machine adds to the estimates only for the same accoun
     prep(bb);
     fs.writeFileSync(answer, JSON.stringify({ sessionTokens: { input: 1200, output: 340, cacheRead: 56000, total: 57540 }, claudeAccount: two.as(lap, () => core.usageLine(lap.rig.home, '')) }));
     fs.rmSync(calls, { force: true });
-    const r = lap.rig.render({ ...from, last_scan: 0 }, { cwd: lap.rig.home }, cache, { HOME: lap.home, USERPROFILE: lap.home, PATH: bin + path.delimiter + lap.rig.env.PATH }, bash);
+    const r = lap.rig.render({ ...from, last_scan: 0 }, { cwd: lap.rig.home }, cache,
+      { HOME: lap.home, USERPROFILE: lap.home, MSYS2_ENV_CONV_EXCL: 'USERPROFILE', PATH: bin + path.delimiter + lap.rig.env.PATH }, bash);
     return { ...r, calls: fs.readFileSync(calls, 'utf8').trim().split('\n') };
   };
   const monthly = refresh();

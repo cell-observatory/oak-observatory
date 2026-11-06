@@ -398,12 +398,15 @@ test('extension: three views, click commands, inline annotations, chat, status s
   Module._load = function (req, ...rest) {
     return req === 'vscode' ? vscode : origLoad.call(this, req, ...rest);
   };
+  // Disposed when the test ends, as VS Code does when the window closes: they hold the local index open and watch a folder
+  // under HOME, and Windows refuses to remove a folder while either is open.
+  const subscriptions = [];
   try {
     const ext = require(BUNDLE);
     // globalState backs the tour's remembered float/dock preference.
     const globalState = new Map();
     ext.activate({
-      subscriptions: [],
+      subscriptions,
       extensionUri: Uri.file(ws),
       globalState: { get: (k, d) => (globalState.has(k) ? globalState.get(k) : d), update: (k, v) => { globalState.set(k, v); return Promise.resolve(); } },
     });
@@ -5624,9 +5627,10 @@ else if (all.includes('--machine lab-a')) {
         assert.match(obs().note, /^On lab-a — read there with oak observations --machine lab-a at /, 'and says where it was read');
         assert.ok(obs().rows.some((r) => r.label === 'src/lexer.ts' && r.acts.some((x) => x.v === 'remoteKeep')), JSON.stringify(obs().rows.map((r) => [r.label, r.acts])));
         assert.ok(await settleUp(() => lines().slice(mark).some((l) => l.args.startsWith('views --views changemap,multitask,processes --json --session ra-1 --machine lab-a'))), 'the Overview reads it there');
+        // Each read waited for, as each is a process of its own that logs its call once it has started: in no set order.
+        assert.ok(await settleUp(() => lines().slice(mark).some((l) => /^feed --json --machine lab-a --session ra-1 /.test(l.args))), 'the Feed reads it there');
+        assert.ok(await settleUp(() => lines().slice(mark).some((l) => l.args === 'views --views prompts --json --session ra-1 --machine lab-a')), 'the Prompts tab reads it there');
         const there = lines().slice(mark).map((l) => l.args);
-        assert.ok(there.some((x) => /^feed --json --machine lab-a --session ra-1 /.test(x)), 'the Feed reads it there');
-        assert.ok(there.some((x) => x === 'views --views prompts --json --session ra-1 --machine lab-a'), 'the Prompts tab reads it there');
         // This machine's own list is still read here, for the selector (`--session` only marks which row is current).
         assert.ok(!there.some((x) => /--session ra-1/.test(x) && !/--machine lab-a/.test(x) && !/^sessions --json --root /.test(x)), `nothing of it is read here: ${there.filter((x) => /ra-1/.test(x)).join(' | ')}`);
         // Stats counts what awaits review there from its listing row, and Review says where its review runs.
@@ -6706,6 +6710,7 @@ else if (all.includes('--machine lab-a')) {
       }
     }
   } finally {
+    for (const d of subscriptions) d.dispose();
     Module._load = origLoad;
   }
 });

@@ -1,5 +1,6 @@
 // Small protocol-22 snapshots: local and remote pane ids deliberately overlap, and so do workspace ids,
 // which each machine labels its own way.
+const { backupFolderPath } = require('../../../core/dist');
 const pane = (id, session, status, agent = 'claude', workspace = 'w1') => ({
   pane_id: id, tab_id: 'tab', workspace_id: workspace, terminal_id: id, revision: 1, focused: id === 'p1',
   agent, agent_status: status, title: session, cwd: '/workspace',
@@ -30,7 +31,6 @@ function fixture() {
  *  backup folder whose record under this machine's name the run refused (with the CLI's sentence and next step), one
  *  open conflict and one warning. `over` replaces top-level fields. */
 function syncView(over = {}) {
-  const backup = require('path').resolve('/mnt/share/oak-backup');
   const at = Date.parse('2026-09-18T14:00:30Z');
   const run = (label, status, extra = {}) => ({ label, status, pulled: { files: 0, bytes: 0 }, conflicts: 0, pending: { files: 0, bytes: 0 }, errors: [], ...extra });
   const refusal = 'the backup folder holds a record under this machine\'s name (its host name and home folder) that this machine has not written: last written 2026-09-17T10:00:00.000Z by laptop (home /home/u). If this machine is a reinstall of that one, `oak sync setup --restore` (or `oak sync setup` on a terminal) takes the record over and restores from it; if it is another machine, give it another host name, since the folder names each machine by its host name and home folder. Until then nothing is restored from the folder or written to it';
@@ -38,8 +38,8 @@ function syncView(over = {}) {
     syncStatus: 1, setUp: true, auto: true, running: false,
     last: { at, durationMs: 900, status: 'partial', warnings: ['cleanupPeriodDays is not set on laptop, so Claude Code there keeps transcripts and plans 30 days; older ones are not planned'],
       machines: [run('build-box', 'ok', { host: 'h1', pulled: { files: 3, bytes: 1200 }, conflicts: 1, lastOkAt: at, text: '3 files, 1KB' }),
-        run(`backup (${backup})`, 'failed', { detail: refusal, record: 'unclaimed', text: `failed: ${refusal}` })] },
-    backup: { kind: 'folder', path: backup }, placements: {}, exclude: { machines: [], projects: [] },
+        run(`backup (${backupFolderPath('/mnt/share/oak-backup')})`, 'failed', { detail: refusal, record: 'unclaimed', text: `failed: ${refusal}` })] },
+    backup: { kind: 'folder', path: '/mnt/share/oak-backup' }, placements: {}, exclude: { machines: [], projects: [] },
     conflicts: [{ id: 'c0ffee000001', family: 'plans', name: 'm.md', from: 'build-box', host: 'h1', at, peerSha256: null, peerSize: 10,
       copy: '/home/u/.claude/claude-observatory/sync/conflicts/build-box/plans/m.md', localSha256: null, reason: 'overlap', file: '/home/u/.claude/plans/m.md' }],
     index: [], cache: { files: 0, bytes: 0, capMB: 2048 }, key: { present: true, fingerprint: 'a11b-f2dc-f733-a548' },

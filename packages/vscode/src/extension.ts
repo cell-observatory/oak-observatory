@@ -14712,7 +14712,9 @@ export function activate(context: vscode.ExtensionContext): void {
           canSelectFolders: true, canSelectFiles: false, canSelectMany: false, openLabel: 'Move the store here',
         });
         if (!chosen?.length) return;
-        target = chosen[0].fsPath;
+        // Canonical (#43), as the OS and every other surface spell it: moveStore compares the target with the store's
+        // own path to refuse a move into itself, and records it as given.
+        target = canonFsPath(chosen[0]);
       } else {
         target = path.join(core.claudeConfigDir(), 'claude-observatory');
       }

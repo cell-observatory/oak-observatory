@@ -82,11 +82,12 @@ let writingJson = false;
 /** Machine-readable output for non-Node front-ends (the JetBrains plugin drives these). A verb that
  *  emits JSON and then sets an exit status sets `process.exitCode` and returns, never `process.exit()`:
  *  exit drops whatever a pipe has not taken yet, which cut the JSON off at the pipe's buffer (8 KB on
- *  macOS) whenever the reader was slower than the writer. */
-function emitJson(v: unknown): void {
+ *  macOS) whenever the reader was slower than the writer. One that must end the process exits from
+ *  `written`, which runs once stdout has taken the JSON. */
+function emitJson(v: unknown, written?: () => void): void {
   writingJson = true;
   try {
-    process.stdout.write(JSON.stringify(v));
+    process.stdout.write(JSON.stringify(v), written);
   } finally {
     writingJson = false;
   }
@@ -1083,12 +1084,15 @@ async function cmdDoctor(args: string[]): Promise<void> {
   const savedMachines = checks.filter((ch) => ch.id.startsWith('herdr-forwarding:')).length;
   checks.push(...core.diagnoseSync(Date.now(), { savedMachines }));
   checks.push(core.diagnoseIndex());
+  // Every report ends the process, as the terminal's below does: on Windows node-pty's ConPTY keeps a worker thread
+  // running after the PTY check's child has exited (microsoft/node-pty#887), and doctor would never end on its own.
+  const done = () => process.exit();
   if (args.includes('--json')) {
-    emitJson({ version: version(), checks, herdr: herdr.report });
+    emitJson({ version: version(), checks, herdr: herdr.report }, done);
     return;
   }
   if (args.includes('--markdown') || args.includes('--md')) {
-    process.stdout.write(core.diagnoseMarkdown(checks));
+    process.stdout.write(core.diagnoseMarkdown(checks), done);
     return;
   }
   const icon = (l: string) => (l === 'ok' ? c.green('✓') : l === 'warn' ? c.yellow('⚠') : c.red('✗'));

@@ -30,7 +30,7 @@ placeholder, so no copyright holder is asserted here beyond "the herdr authors".
 ## smol-toml
 
 - Source: <https://github.com/squirrelchat/smol-toml>
-- Version: 1.9.0; license: BSD-3-Clause.
+- Version: 1.9.1; license: BSD-3-Clause.
 - Bundled into the CLI (`packages/cli/dist/cli.js`, and its capture hook,
   `packages/cli/dist/capture.js`) and VS Code extension (`packages/vscode/dist/extension.js`) to
   parse and edit TOML configuration; also an installed runtime dependency of core.
