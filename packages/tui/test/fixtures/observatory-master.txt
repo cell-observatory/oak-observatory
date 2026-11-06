@@ -1,21 +1,19 @@
 laptop
-  demo
+  demo [W window]
     v claude · p1
         Fix the demo
         + blocked · Opus · 900 tok · 2 pending · 14:00:00
     v claude · p2
         Run checks
         | working · Opus · 900 tok · 0 pending · 14:00:00
-  docs
+  docs [W window]
     v claude · p3
         Waiting for prompt
         + idle · Opus · 900 tok · 0 pending · 14:00:00
-build-box
-  review
-    v codex · p1
-        Remote review
-        * done · GPT · 900 tok · 3 pending · 14:00:00
+build-box [W window]
+  review [W window]
     v codex · p2
         Unknown state
         ~ unknown · GPT · 900 tok · 0 pending · 14:00:00
+   > 1 done · 3 pending
 > earlier · 1

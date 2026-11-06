@@ -19,8 +19,19 @@ updates:
       # deliberately: tsconfig.base.json already uses node16 resolution, which is all 7.x requires.
       - dependency-name: typescript
         update-types: ["version-update:semver-major"]
+      # @types/vscode's declared range must not exceed engines.vscode (^1.85.0): vsce refuses to
+      # package when it does, and Dependabot raises the declared range on every update, patches
+      # included. The lockfile already resolves newer types within ^1.85.0; move both together
+      # when the engine floor moves.
+      - dependency-name: "@types/vscode"
 
   - package-ecosystem: github-actions
+    ignore:
+      # gradle/actions 6 moved its caching into gradle-actions-caching, a component under Gradle's Terms of
+      # Use rather than the MIT License, which setup-gradle loads whenever caching is on. Taking 6 means
+      # accepting those terms for this repository's CI, so it is a decision, not a routine bump: stay on 5.
+      - dependency-name: gradle/actions
+        update-types: ["version-update:semver-major"]
     directory: /
     schedule:
       interval: weekly

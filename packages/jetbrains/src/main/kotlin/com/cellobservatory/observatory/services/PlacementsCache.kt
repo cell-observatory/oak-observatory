@@ -54,13 +54,15 @@ class PlacementsCache(private val project: Project) : Disposable {
     fun placementsFor(file: String, text: String, textKey: String): List<Placement>? {
         val service = ObservatoryService.getInstance(project)
         val session = service.currentSession() ?: return emptyList()
-        val fileKey = ClaudePaths.storeKey(file) // hoisted: runs per keystroke-burst placement check
-        if (service.log().none { it.pending && it.file == fileKey }) return emptyList()
+        val mapped = com.cellobservatory.observatory.ui.RemoteEditorReview.mountedFile(project, file)
+        if (service.currentMachine() != null && mapped == null) return emptyList()
+        val fileKey = mapped?.remote ?: ClaudePaths.storeKey(file) // hoisted: runs per keystroke-burst placement check
+        if (service.reviewRecords().none { (it.pending || mapped != null && it.undone) && it.file == fileKey }) return emptyList()
         // Accepted gap vs VS Code (0.9.0): the sibling keys per-file on the pending CHAIN, so a keep in
         // one file does not re-locate every open file. Here the whole-log key stands because the recompute
         // is already off-thread (pooled, 350ms quiet, superseded-checked) — the VS Code hazard was an EDT
         // stall, which this path structurally lacks; the cost is redundant background locates only.
-        val key = "$file|$textKey|$session:${StoreReader.logKey(session)}"
+        val key = "$file|$textKey|${service.currentMachine()}|$session:${if (mapped != null) service.remoteReview()?.lastSuccess else StoreReader.logKey(session)}"
         cache[key]?.let { return it }
         newest[file] = key
         if (inflight.add(key)) {
@@ -72,7 +74,7 @@ class PlacementsCache(private val project: Project) : Disposable {
                     return@schedule
                 }
                 try {
-                    val placements = ObservatoryCli.locate(session, file, text, project.basePath)
+                    val placements = ObservatoryCli.onMachine(mapped?.machine) { ObservatoryCli.locate(session, fileKey, text, project.basePath, includeUndone = mapped != null) }
                     put(key, placements)
                 } finally {
                     inflight.remove(key)

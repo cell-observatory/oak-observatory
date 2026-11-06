@@ -11,14 +11,14 @@
  * monospace font on macOS; and review states carried by SHAPE as well as colour, so accept and reject
  * never depend on hue.
  */
-import { displayWidth, fitVisible, fuzzyMatch, highlightVisible, middleOut, sanitizeCell, trimTrailing, wrapVisible } from './textwidth';
+import { displayWidth, fitVisible, fuzzyMatch, highlightVisible, middleOut, reverseVisibleSpan, sanitizeCell, stripSgr, trimTrailing, wrapVisible } from './textwidth';
 import {
   resolveLayout, PANE_SPECS, TAB_SCREEN, BAR_ENTRIES, chromeBottom, statuslineWant,
   type Layout, type PaneBox, type PaneId,
 } from './layout';
 import { observatoryMasterRows, observatoryDetailRows, observatoryReplyRow } from './observatory-rows';
-import type { ObservatoryState, ObservatorySelection } from './observatory';
-import { relTime, compactTokens, compactDuration, agentKindLabel, mdInline, mdClassify, mdIsFence, mdIsTableRow, mdIsTableSep, realSessionTitle, type UsageLine } from '@oak-observatory/core';
+import type { ObservatoryState, ObservatorySelection, SyncView } from './observatory';
+import { relTime, compactTokens, compactDuration, agentKindLabel, mdInline, mdClassify, mdIsFence, mdIsTableRow, mdIsTableSep, realSessionTitle, graphemeHead, type UsageLine } from '@oak-observatory/core';
 
 /**
  * One prose line as ANSI markdown — the CLI's slice (core owns the tokenizer; this is the
@@ -117,13 +117,17 @@ export const KEY_BINDINGS: ReadonlySet<string> = new Set([
   'P', 'N',
   // STRUCTURAL keys. Not rebindable, on purpose: several are the only way out of a mode, and a
   // settings screen that lets a reader lock themselves into a dashboard has handed them a footgun.
-  // Six window keys over six panes — Map and Diff are separate panes (0.10.0).
-  'f1', 'f2', 'f3', 'f4', 'f5', 'f6', 'tab', '<', ',', '>', '.', '_', '[', ']',
+  // F1–F3 are OAK's three tabs (TAB_KEYS), on every tab; F4–F9 are six window keys over six panes — Map
+  // and Diff are separate panes (0.10.0).
+  'f1', 'f2', 'f3', 'f4', 'f5', 'f6', 'f7', 'f8', 'f9', 'tab', '<', ',', '>', '.', '_', '[', ']',
   'up', 'down', 'left', 'right', 'pgup', 'pgdn', 'enter', 'escape', 'backspace', 'delete', ' ',
   '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
-  // Answering a confirmation. `r`/`f` answer the Claude-launch wall (`r` is also the refresh verb's
-  // fallback below; `f` exists ONLY as that wall's answer).
-  'y', 'Y', 'N', 'f',
+  // Answering a confirmation, and the Claude-launch wall's `r`/`f`. `:` opens the palette.
+  'y', 'Y', 'N', 'f', ':',
+  // The Observatory's own keys (core's RESERVED_KEYS keeps a Review verb off them), and shift+Tab.
+  'c', 't', 'v', 'B', 'H', 'J', 'K', 'L', 'R', 'W', 'X', '|', '-', 'backtab',
+  // Review's E: the terminal editor, as `e` is, while no verb is bound to it.
+  'E',
   // ^C and ^D both arrive named, with `ctrl` set
   'c', 'd',
   // …plus every VERB, at its default key. Derived rather than listed, so a new action or a changed
@@ -136,31 +140,98 @@ export const KEY_BINDINGS: ReadonlySet<string> = new Set([
  * hand-written width threshold — a `cols >= 96` once selected a 100-column string fit to `cols - 1`,
  * so every width from 96 to 100 silently cut the last keys and the row read "q qui".
  */
+/**
+ * The key rows, as templates over the reader's keymap: `{keep}` is whatever key `keep` is bound to, so a
+ * rebind made in the options window changes every row that names it. The exported ladders are the
+ * templates filled with the default keys (what the tests and a frame without a keymap see).
+ */
+const fillKeys = (templates: readonly string[], keyOf: (action: string) => string): string[] => {
+  // `{editorPair}`: the terminal editor's key, with E beside it while no verb has E (Review's E runs the terminal editor too).
+  const pair = (): string => (REBINDABLE.some((r) => keyOf(r.action) === 'E') ? keyOf('editor') : `${keyOf('editor')}/E`);
+  return templates.map((t) => t.replace(/\{([A-Za-z-]+)\}/g, (_, action: string) => (action === 'editorPair' ? pair() : keyOf(action))));
+};
+const defaultKey = (action: string): string => REBINDABLE.find((r) => r.action === action)?.fallback ?? '?';
+
 /** The OBSERVATORY tab's own key hints — its session blobs and master/detail panes answer to different
  *  keys than the review dock, so its footer says so. Widest-that-fits, like KEY_HINTS. */
-export const OBS_HINTS: readonly string[] = [
-  '↑↓ session · ←→ pane · ↵/d/f pin · i reply · esc leave reply · h ↗herdr · r ⌕review · A archived · F1/F2 zoom · Tab OAK tab · ? keys',
-  '↑↓ · ←→ · ↵ pin · i reply/esc leave · h/r · A archived · F1/F2 zoom · ?',
-  '↑↓ · ↵ pin · i reply/esc leave · h/r · ?',
-  'i reply · esc leave · ?',
+const OBS_HINT_TEMPLATES: readonly string[] = [
+  '↑↓ session · ←→ pane · ↵ pin · c reply · esc leave reply · t ↗herdr · W window · R resolve · X stop · B archived · F4/F5 zoom · : palette · Tab tabs · {help} keys',
+  '↑↓ · ←→ · ↵ pin · c reply/esc leave · t herdr · W window · R/X · B archived · : · {help}',
+  '↑↓ · ↵ pin · c reply/esc leave · W window · t herdr · {help}',
+  'c reply · esc leave · {help}',
 ];
-export const HERDR_HINTS: readonly string[] = [
-  "herdr's tab bar below starts agents · ctrl+b is herdr's prefix · ctrl+a n/p tabs · ctrl+q ×2 quit",
-  "herdr's tab bar below starts agents · ctrl+b is herdr's prefix · ctrl+q ×2 quit",
-  "herdr bar starts agents · ^B herdr · ^A n/p · ^Q ×2 quit",
-  '^B herdr · ^A n/p · ^Q ×2 quit',
-  '^A n/p · ^Q ×2 quit',
-];
+export const OBS_HINTS: readonly string[] = fillKeys(OBS_HINT_TEMPLATES, defaultKey);
+/** OAK's tab keys, as the decoder names them, and the tab each raises: from every tab, the herdr tab included. */
+export const TAB_KEYS: Readonly<Record<string, string>> = { f1: 'herdr', f2: 'observatory', f3: 'review' };
+const TAB_KEY_NAMES: Readonly<Record<string, string>> = { f1: 'herdr', f2: 'Observatory', f3: 'Review' };
+/** The tab keys `free` (those herdr's config leaves to OAK on its tab) as the herdr tab's hints name them: `F1–F3 OAK tabs`,
+ *  or with the tabs they raise when `named` (`F1–F3 herdr/Observatory/Review`); only the free ones (`F1/F3`); '' for none. */
+export function tabKeysHint(free: readonly string[], named = false): string {
+  if (!free.length) return '';
+  const keys = free.length === 3 ? 'F1–F3' : free.map((k) => k.toUpperCase()).join('/');
+  return `${keys} ${named ? free.map((k) => TAB_KEY_NAMES[k]).join('/') : 'OAK tabs'}`;
+}
+/** The herdr tab's key hints, naming herdr's prefix as its config sets it (each one, `ctrl+space or ctrl+s`,
+ *  where it lists several), the key after it that goes back to OAK's tabs (`m`, or `M` or `V` when herdr's config
+ *  took `m`; null when it took all three, and only a click on OAK's tab bar or a tab key leaves), and the tab keys
+ *  herdr's config leaves to OAK (`tabs`, f1 to f3). */
+export function herdrHints(prefix: string, tmux = false, back: string | null = 'm', tabs: readonly string[] = Object.keys(TAB_KEYS)): string[] {
+  // Inside tmux a prefix tmux also uses reaches herdr only when pressed twice; which one tmux uses is
+  // tmux's setting, so the row says so rather than assuming ctrl+b.
+  const twice = tmux ? ' (twice if tmux uses it too)' : '';
+  const leave = back ? `${prefix} ${back} OAK's tabs` : "click OAK's tab bar to leave";
+  const short = back ? `${prefix} ${back} OAK tabs` : 'click a tab to leave';
+  // A herdr prefix of ctrl+q is herdr's here, pressed twice too, so OAK's quit is on its own tabs.
+  const herdrQ = prefix.split(' or ').includes('ctrl+q'); // one of the prefixes, when herdr's config lists several
+  const quit = herdrQ ? "quit on OAK's tabs" : 'ctrl+q ×2 quit';
+  const q = herdrQ ? "quit on OAK's tabs" : '^Q ×2 quit';
+  // F1 raises the tab this row is on, so it is named only inside the whole range (F1–F3), never as a way out on its own.
+  const out = tabs.length === Object.keys(TAB_KEYS).length ? tabs : tabs.filter((k) => k !== 'f1');
+  const named = tabKeysHint(out, true), keys = tabKeysHint(out);
+  const prefixes = `${prefix} ${prefix.includes(' or ') ? "are herdr's prefixes" : "is herdr's prefix"}${twice}`;
+  // Whole segments, so a narrower tier drops a part rather than cutting one; no tab keys free, no segment for them.
+  const row = (...parts: string[]): string => parts.filter(Boolean).join(' · ');
+  return [...new Set([
+    row("herdr's tab bar below starts agents", prefixes, leave, named, quit),
+    row("herdr's tab bar below starts agents", prefixes, leave, keys, quit),
+    // Inside tmux the prefix's note outranks the agents hint: pressed once there, the prefix may never reach herdr.
+    twice ? row(prefixes, leave, keys, quit) : '',
+    row("herdr's tab bar below starts agents", leave, keys, quit),
+    row('herdr bar starts agents', short, keys, q),
+    row(short, keys, q),
+    back && keys ? row(`${prefix} ${back} or ${keys}`, q) : '',
+    row(keys, q),
+    q,
+  ].filter(Boolean))];
+}
+/** The status row after herdr's prefix on the herdr tab, widest first: the keys OAK takes after it (`oak`, the ones herdr's
+ *  config leaves unbound) and its tab keys (`tabs`, likewise), then that every other key is herdr's. With none of them left,
+ *  a click on OAK's tab bar is the way out. */
+export function herdrPrefixHints(label: string, oak: readonly string[], tabs: readonly string[]): string[] {
+  const what: Readonly<Record<string, string>> = { m: 'OAK tabs', M: 'Observatory', V: 'Review' };
+  const offer = (tabKeys: string): string => [...oak.map((k) => `${k} ${what[k] ?? ''}`.trim()), tabKeys].filter(Boolean).join(' · ') || "click OAK's tab bar to leave";
+  const named = tabKeysHint(tabs, true), keys = tabKeysHint(tabs), bare = keys.replace(/ OAK tabs$/, '');
+  return [...new Set([
+    `${label} — ${offer(named)} · any other key is herdr's`,
+    `${label} — ${offer(keys)} · any other key is herdr's`,
+    `${label} — ${offer(keys)}`,
+    `${label} — ${offer(bare)}`,
+    `${label} — ${[oak.join('/'), keys].filter(Boolean).join(' · ') || 'click a tab to leave'}`,
+    [oak.join('/'), keys].filter(Boolean).join(' · ') || 'click a tab to leave',
+  ])];
+}
+export const HERDR_HINTS: readonly string[] = herdrHints('ctrl+b');
 export const NATIVE_HINTS: readonly string[] = [
-  'keys go to the program · ctrl+a n/p or 1-3 OAK tabs · ctrl+a q quit',
-  'program keys · ^A n/p OAK · ^A q quit',
-  '^A n/p · ^A q quit',
+  'keys go to the program · ctrl+q ×2 quit',
+  'program keys · ^Q ×2 quit',
+  '^Q ×2 quit',
 ];
-export const KEY_HINTS: readonly string[] = [
-  'F2-F6 window (twice zooms) · 0-9 edit · Tab next tab · ↑↓ move · ←→ face · space fold · x mark · a keep · u undo · e $EDITOR · b sessions · o options · ? keys',
-  'F2-F6 window · Tab · ↑↓ · ←→ · space fold · a/u · e · o · ?',
-  '? keys · ^C^C quit',
+const KEY_HINT_TEMPLATES: readonly string[] = [
+  'F4-F7 window (twice zooms) · 0-9 edit · Tab tabs · ↑↓ move · space fold · {mark} mark · {keep} keep · {undo} undo · {redo} redo · {editorPair} terminal editor · W GUI editor · {session} sessions · : palette · {help} keys',
+  'F4-F7 window · Tab · ↑↓ · space fold · {keep}/{undo}/{redo} · {editorPair} · W · : · {help}',
+  '{help} keys · ^C^C quit',
 ];
+export const KEY_HINTS: readonly string[] = fillKeys(KEY_HINT_TEMPLATES, defaultKey);
 
 export const SCREENS: { id: ScreenId; label: string }[] = [
   // N15: the one review surface, labelled like the editors' Review tab. The internal id stays
@@ -183,20 +254,32 @@ export interface DashState {
    *  show the worker's work — while the repo-wide Workers list, which does not depend on the session, is
    *  unaffected. Null = unscoped (the terminal's own session, as today). */
   scopeWorker?: ObservatorySelection | null;
+  observatoryFold?: string;
   observatory?: ObservatoryState;
+  /** `oak sync status --json`, read when sync's own files change (its status, conflicts, lock and prefs.json): the
+   *  Observatory says each machine's last run under it, the inbox lists the open conflicts, and the options window's
+   *  SYNC section reads it. Absent until it is read; it shows only while sync is in use here. */
+  sync?: SyncView;
   /** Set while the reviewed session is read from ANOTHER machine (its label): the Review panes say
    *  where they are reading from, and name the failure (`error`) when that machine does not answer,
    *  rather than a "building…" that never ends. Absent for this machine's sessions. */
   reviewMachine?: { label: string; error?: string };
   /** The reviewed session's facts from its own machine; never the Observatory's local catalog. */
   reviewSession?: Record<string, unknown>;
-  /** Set while the reviewed session is on neither this machine nor any saved machine known to hold it:
-   *  what the Review panes say instead of reading this machine's store for a session it does not have. */
+  /** Set while the reviewed session is on neither this machine nor any saved machine known to hold it, or
+   *  while there is no session to review at all: what the Review panes say instead of reading this
+   *  machine's store for a session it does not have. */
   reviewFinding?: string;
   /** BSP leaf requesting conversation rows; omitted by single-pane callers. */
   observatoryPane?: string;
-  /** Shift+A includes archived sessions (no live pane and no pending edits). */
+  /** B includes archived sessions (no live pane and no pending edits). */
   allSessions?: boolean;
+  /** herdr's prefix as its config names it, and the key after it that returns to OAK's tabs (null when
+   *  herdr's config binds all of OAK's), for the herdr tab's key row. */
+  herdrPrefix?: string;
+  herdrBack?: string | null;
+  /** OAK's tab keys (f1 to f3) herdr's config leaves to OAK on its tab, for that tab's key row. */
+  herdrTabs?: readonly string[];
   /** How the `agents` producer draws: `mini` is the compact sidebar — active agents,
    *  a status dot and a name, nothing else — and undefined is the full Workers board (every agent, its
    *  subagents nested, grouped by agent kind). */
@@ -218,16 +301,24 @@ export interface DashState {
   sessionTitle: string;
   filter: string;
   status: string;
+  /** Until when `status` is an ANSWER (to a key, or news): it then outranks the rows that otherwise stand
+   *  on the status line — the error, the size note, the zoomed edit's bar. Compared against `now`. */
+  statusUntil?: number;
+  /** When `status` last changed, or a key said it again (not `ready`), which the status row compares with a toast's `at`
+   *  (statusWithToast). */
+  statusAt?: number;
   /** A transient, RIGHT-ALIGNED note on the status row — "copied 214 chars to clipboard" — shown
    *  until `until` (compared against `now`, so a snapshot renders itself). The left status is the
    *  durable message; the toast is the confirmation that fades. */
-  toast?: { text: string; until: number } | null;
+  toast?: { text: string; until: number; at?: number } | null;
+  /** When a decision last failed (keep, undo, redo or resolve), which the status row compares with a toast's `at`. */
+  errorAt?: number;
   /** Captured child stderr. Shown, never discarded. */
   error: string | null;
   /** A pending question. `under` names a change-map path when the action is scoped to a whole file or
    *  folder rather than to an id set — the count in `label` is what the reader is answering about. */
   confirm: {
-    verb: 'keep' | 'undo' | 'redo' | 'resolve' | 'kill' | 'delete';
+    verb: 'keep' | 'undo' | 'redo' | 'resolve' | 'kill' | 'delete' | 'refresh' | 'reset' | 'keep yours' | 'take over';
     ids: number[];
     under?: string;
     /** True when the question is about the WHOLE session rather than an id set or a path — the map
@@ -236,10 +327,18 @@ export interface DashState {
     /** The session the action targets, when it is NOT the one under review — the observatory blob's
      *  resolve/kill act on the SELECTED session, not the terminal's own. */
     session?: string;
-    /** delete: how many edits still pending review the question named; the delete purges no more than that. */
+    /** delete: how many edits still pending review the question named; the delete purges no more than that.
+     *  refresh: how many recorded edits the ignore sweep would drop. */
     pending?: number;
+    /** refresh: the machine whose store the sweep runs on, when it is not this one. */
+    machine?: string;
     /** delete: the newest edit id of the listing that count came from; a pending edit newer than it is refused. */
     seenThrough?: number;
+    /** keep yours: the oak sync conflict whose other copy goes (`oak sync resolve <id>`). */
+    conflict?: string;
+    /** A notice that arrived while the question stood (a refresh count another machine answered late), said after
+     *  the answer: until then the status row is the question's. */
+    after?: string;
     label: string;
   } | null;
   /** Injected: relTime's reference point, so a snapshot compares one render against itself. */
@@ -253,8 +352,9 @@ export interface DashState {
    *  reviewing what it changed, not everything the session ever did. */
   promptScope?: { index: number; ids: ReadonlySet<number> } | null;
   /** A full-body overlay — the diff view, or a picker. Rendered instead of the list.
-   *  `cursor` is present only for a picker, where a row can be chosen. */
-  overlay: { title: string; lines: readonly string[]; scroll: number; cursor?: number; perm?: boolean } | null;
+   *  `cursor` is present only for a picker, where a row can be chosen. `head` is a line held under the
+   *  title that the list scrolls beneath (the session picker's search box). */
+  overlay: { title: string; head?: string; lines: readonly string[]; scroll: number; cursor?: number; perm?: boolean } | null;
   /** True while the reader is typing a filter. Distinct from a non-empty `filter`, because the
    *  prompt has to appear the moment the mode opens — an invisible mode that eats keystrokes is
    *  indistinguishable from a frozen dashboard. */
@@ -286,6 +386,7 @@ export interface DashState {
   /** The tab the pointer is resting on, or null. Drives the model tooltip and NOTHING else — a
    *  fact reachable only by hovering would be a fact a `--no-mouse` reader cannot have. */
   hoverTab?: number | null;
+  hoverUsage?: boolean;
   /** The selected edit's diff, for Detail's Diff face. Fetched on demand, never on the poll.
    *  The RAW patch is kept, not pre-rendered lines: the pane re-renders it at whatever width the
    *  layout resolves to, so a resize reflows the diff instead of leaving it fitted to the old one. */
@@ -414,7 +515,7 @@ export interface TabState {
   /** The focused tree pane's id when `root` is set — the tree's analogue of `panes.focus`. */
   treeFocus?: string;
   /** When set (a pane id), that pane fills the whole tree body — the tree's zoom, toggled by the
-   *  leader's `z`. Cleared by any structural change (close/split). */
+   *  Observatory's zoom key. Cleared by any structural change (close/split). */
   treeZoom?: string | null;
   /** A `native` tab's command line — the CLI it runs under a PTY (`['bash']`, `['claude','--resume',id]`).
    *  Spawned lazily by the runtime; the tab shows an empty state until then, and "exited" after. */
@@ -429,6 +530,9 @@ export interface FrameOpts {
   rows: number;
   color: ColorDepth | boolean;
   glyphs?: Glyphs;
+  /** Told, as a tab's frame is drawn, the row its bottom text begins on (the status row when it speaks, else the
+   *  usage bar) and the status text whole, which its row cuts at the terminal's edge: drag-to-copy selects there. */
+  bottom?: (first: number, status: string) => void;
 }
 
 /** One body line, the edit ids it resolves to, and what it points at. */
@@ -447,6 +551,7 @@ export interface DashRow {
    *  `agentId` marks a spawn-subagent row in the DETAIL pane: a click drives the whole SESSION's live
    *  feed (which carries that spawn's activity), not a per-spawn feed — it is the discriminator that
    *  routes the click, not a separate drive target. */
+  workspaceWindow?: ObservatorySelection;
   scope?: ObservatorySelection & { agentId?: string };
   /** Clickable action buttons on this row — the session blob's feed/review/resolve/kill.
    *  `x`/`w` are offsets into `cells`, so paint and hit-test read the same geometry. */
@@ -495,6 +600,10 @@ export function statuslineDataFor(state: DashState): StatuslineData {
     tokensIn: u?.tokensIn ?? undefined,
     tokensOut: u?.tokensOut ?? undefined,
     tokensCacheRead: u?.tokensCacheRead ?? undefined,
+    treeAgents: u?.tokensTree?.agents,
+    treeIn: u?.tokensTree?.input,
+    treeOut: u?.tokensTree?.output,
+    treeCacheRead: u?.tokensTree?.cacheRead,
     durationMs: num(sess?.durationMs) || undefined,
     // ctx PREFERS the session's own usage (`u.ctx`) — the exact figure claude's own status line shows
 
@@ -509,6 +618,7 @@ export function statuslineDataFor(state: DashState): StatuslineData {
     fiveEst: u?.fiveTokens ?? null,
     fiveTotal: u?.fiveTotal ?? null,
     fiveMeasured: u?.localWindows?.find((w) => /5h/i.test(w.label))?.tokens ?? null,
+    fiveNone: u?.fiveNoneAt != null,
     weekPct: u?.weekPct ?? null,
     weekResetMs: u?.weekReset ?? null,
     weekEst: u?.weekTokens ?? null,
@@ -520,6 +630,10 @@ export function statuslineDataFor(state: DashState): StatuslineData {
     fableEst: u?.fableTokens ?? null,
     fableTotal: u?.fableTotal ?? null,
     fableReads: u?.fableReads ?? null,
+    fiveMachine: u?.fiveMachine ?? null,
+    weekMachine: u?.weekMachine ?? null,
+    fableMachine: u?.fableMachine ?? null,
+    monthMachine: u?.monthMachine ?? null,
   };
   if (u?.fiveMeasuredAll) data.fiveMeasured = u.fiveMeasuredAll;
   if (u?.weekMeasuredAll) data.weekMeasured = u.weekMeasuredAll;
@@ -567,7 +681,7 @@ export function statuslineDataFor(state: DashState): StatuslineData {
 export function statuslineFor(state: DashState, cols: number, g: Glyphs, depth: ColorDepth, want: number): string[] {
   if (want <= 0) return [];
   // The bottom bar is the compact per-provider usage readout now: claude and gpt,
-  // each `5h · wk · mo` in the same painted style as the shell statusline's quota gauges. The identity
+  // each `wk · mo` in the same painted style as the shell statusline's quota gauges. The identity
   // and session detail this row used to carry live in the tab bar and the session header; the ctx
   // window it also carried moved to the Agent tab's prompt box. `usageBoth` is BOTH providers at once
   // (state.usage is only the active session's), refreshed on the same 60s throttle.
@@ -587,23 +701,28 @@ export function statuslineFor(state: DashState, cols: number, g: Glyphs, depth: 
   };
   if (!b) return pad2([fit(grey('usage —'))]);
   // ONE combined readout now: claude and gpt
-  // together on a SINGLE line, as BAR-LESS `5h: N% reset` chips, so both providers fit a line the
+  // together on a SINGLE line, as BAR-LESS `wk: N% reset` chips, so both providers fit a line the
   // gauge bars never could. Both editors' status bars carry that chip shape and this exact order —
-  // `5h · wk · mo` (VS Code `setWin`/`claudeWin`, JetBrains `UsageWidget.apply`). The account's
+  // `wk · mo` (VS Code `setWin`/`claudeWin`, JetBrains `UsageWidget.apply`). No bar shows the 5-hour
+  // window, for any plan: the Stats panels, `oak usage` and the Claude Code status line keep it. The account's
   // per-model weekly cap is not a chip on any of the three; the editors name it in
   // their status-bar tooltips and Stats panels. When the line overruns the terminal it does NOT grow
   // the chrome — it compacts, dropping the reset times first (the percentages are the point), then
-  // fit-truncates as a last resort. So the block is exactly one row at every width; the old fixed
-  // 3-line statusline's leftover blank space is gone.
+  // the months' dollar figures, then fit-truncates as a last resort. So the block is exactly one row
+  // at every width; the old fixed 3-line statusline's leftover blank space is gone.
   // A window with no share AND no token count is DROPPED, not shown as `label —` (a plan without
   // the window has nothing to show there — codex's prolite plan reports no 5-hour window, only
   // weekly). The editors already hide such a window (VS Code's setWin, JB's chunk); this matches them.
-  const win3 = (w: { five: import('@oak-observatory/core').BriefWindow; week: import('@oak-observatory/core').BriefWindow; month: import('@oak-observatory/core').BriefWindow }, compact: boolean): string => {
+  // The month ends with its dollar figure, the Claude Code status line's (core monthUsd): `~$13` estimated at list
+  // prices, `$13` where it is the charge Claude Code reported. A line too wide without its reset times drops the figures
+  // after the shares (`money` false) before any is cut short; a month that is its figure alone keeps it.
+  const win3 = (w: { week: import('@oak-observatory/core').BriefWindow; month: import('@oak-observatory/core').BriefWindow }, compact: boolean, money = true): string => {
     const chips: string[] = [];
     const add = (label: string, x: import('@oak-observatory/core').BriefWindow): void => {
-      if (x.pct != null || x.tok != null) chips.push(usageText(label, x, depth, themed, state.now, !compact));
+      const usd = x.usd ? orange(x.usd) : '';
+      if (x.pct != null || x.tok != null) chips.push(usageText(label, x, depth, themed, state.now, !compact) + (usd && money ? ` ${usd}` : ''));
+      else if (usd) chips.push(`${grey(`${label}:`)} ${usd}`);
     };
-    add('5h', w.five);
     add('wk', w.week);
     add('mo', w.month);
     return chips.join(sep);
@@ -611,32 +730,67 @@ export function statuslineFor(state: DashState, cols: number, g: Glyphs, depth: 
   // No Claude window to show: none carries a share or a token count — `win3`'s own rule. A plan with no
   // quota (Enterprise, API) still measures the month's tokens, and dropping the whole group for it
   // whenever gpt had data hid them.
-  const noClaude = [b.claude.five, b.claude.week, b.claude.month].every((x) => x.pct == null && x.tok == null);
+  const noClaude = [b.claude.week, b.claude.month].every((x) => x.pct == null && x.tok == null && !x.usd);
+  // Likewise gpt: a reading with no week and no month (a 5-hour window alone) draws no group, as the editors hide it.
+  const gpt = b.gpt && [b.gpt.week, b.gpt.month].some((x) => x.pct != null || x.tok != null || x.usd) ? b.gpt : null;
   // Claude leads when it has data, OR when there is no gpt data either — then it carries the "install
   // the statusline" hint. A codex-only machine with gpt numbers is never nagged about a statusline it
   // does not use (the whole point of the second provider). The two providers are divided by a bar.
-  const build = (compact: boolean): string => {
+  const build = (compact: boolean, machine = b.claude.machine, money = true): string => {
     const parts: string[] = [];
-    if (!noClaude || !b.gpt) {
-      const c = win3(b.claude, compact);
+    if (!noClaude || !gpt) {
+      const c = win3(b.claude, compact, money);
+      // A saved machine's reading of the account names that machine: `✳ claude (build-box) wk: 1% …`.
+      const from = c && machine ? ` ${grey(`(${machine})`)}` : '';
       // The install hint only without a cache: a window reset leaves an installed status line with nothing to show yet.
-      parts.push(c ? `${orange('✳ claude')} ${c}` : `${orange('✳ claude')} ${grey(state.usage?.statuslineCache ? '—' : 'run oak statusline')}`);
+      parts.push(c ? `${orange('✳ claude')}${from} ${c}` : `${orange('✳ claude')} ${grey(state.usage?.statuslineCache ? '—' : 'run oak statusline')}`);
     }
-    if (b.gpt) parts.push(`${blue('⬡ gpt')} ${win3(b.gpt, compact)}`);
+    if (gpt) parts.push(`${blue('⬡ gpt')} ${win3(gpt, compact, money)}`);
     return parts.join(`  ${grey('|')}  `);
   };
   const full = build(false);
-  const line = displayWidth(full) <= cols ? full : build(true); // drop reset times to keep it one line
+  let line = displayWidth(full) <= cols ? full : build(true); // drop reset times to keep it one line
+  if (displayWidth(line) > cols) line = build(true, b.claude.machine, false); // then the dollar figures
+  // Still too wide with a saved machine's name: the name gives up its room before any window does, cut to what
+  // the windows leave and never below one character, so the reading still says it is another machine's.
+  if (b.claude.machine && displayWidth(line) > cols) {
+    const room = cols - displayWidth(build(true, '', false)) - 3;
+    line = build(true, fitVisible(b.claude.machine, Math.max(1, room)).trimEnd(), false);
+  }
   return pad2([fit(line)]);
 }
 
-/** The status row with its transient toast flush right — or just the status when none is live.
- *  Both fitted by display width; on a frame too narrow for both, the toast wins (it is the newer
- *  fact and the shorter one). */
+/** The status row with its transient toast flush right, or just the status when none is live, both fitted by display
+ *  width. The rule, as the narrow-row table test in native.js states it too:
+ *  On a status row too narrow for both the status and a toast, the toast takes the row (it is the newer fact and the
+ *  shorter one) unless the row shows a question (a confirmation's [y/n] or the go-to prompt), a status said after the
+ *  toast (a new text, or a key's answer said again, never the idle `ready`), or the error of a keep, undo, redo or
+ *  resolve that failed after the toast; that then takes the row whole. Only what the row shows counts: an error, the
+ *  size note or the zoomed edit's bar standing in the status's place is not the status said, and a question the map
+ *  draws is not on the row. A status with nothing to show (empty, or escapes alone) leaves the row to the toast, and a
+ *  row with room for both draws both.
+ *  The status and the toast say what others wrote (herdr's line, a session's title), so both are cleaned here, on every
+ *  frame and for the measure `treeReclaimsRow` takes: their controls show as spaces, and of the escapes only colour
+ *  passes. */
 export function statusWithToast(left: string, state: DashState, cols: number): string {
-  const toast = state.toast && state.now < state.toast.until ? state.toast.text : '';
+  if (state.hoverUsage && !state.confirm && !state.goto) {
+    const notes: string[] = [];
+    const c = state.usage?.machineMeasured?.machines;
+    const freshness = state.usageBoth?.claude.usageFreshness || state.usageBoth?.gpt?.usageFreshness || state.usage?.usageFreshness;
+    if (freshness) notes.push(freshness);
+    if (c) notes.push(`Claude estimates include usage measured on ${c}`);
+    const g = state.usageBoth?.gpt;
+    if (g?.measuredMachines) notes.push(`GPT estimates include usage measured on ${g.measuredMachines}`);
+    if (notes.length) left = notes.join(' · ');
+  }
+  left = sanitizeCell(left);
+  const toast = state.toast && state.now < state.toast.until ? sanitizeCell(state.toast.text) : '';
   if (!toast) return fitVisible(left, cols);
   const tw = displayWidth(toast);
+  const asks = (!!state.confirm && stripSgr(left).endsWith('[y/n]')) || (!!state.goto && stripSgr(left).startsWith('go to edit #'));
+  const said = state.status !== 'ready' && left === sanitizeCell(state.status) && (state.statusAt ?? 0) > (state.toast?.at ?? 0);
+  const failed = !!state.error && stripSgr(left) === stripSgr(sanitizeCell(`! ${state.error}`)) && (state.errorAt ?? 0) > (state.toast?.at ?? 0);
+  if (stripSgr(left).trim() && displayWidth(left) + 2 + tw > cols && (asks || said || failed)) return fitVisible(left, cols);
   if (tw + 2 >= cols) return fitVisible(toast, cols);
   const leftFit = fitVisible(left, cols - tw - 2);
   return leftFit + ' '.repeat(Math.max(1, cols - displayWidth(leftFit) - tw)) + toast;
@@ -840,6 +994,9 @@ const glyphId = (g: Glyphs): number => {
   return id;
 };
 
+/** The Agent strip's window key, which pressed again opens the conversation (BAR_ENTRIES). */
+const AGENT_KEY = `F${BAR_ENTRIES.find((e) => e.pane === 'claude')!.key}`;
+
 export function rowsFor(state: DashState, cols = 100, g: Glyphs = defaultGlyphs(), depth: ColorDepth = 'none'): DashRow[] {
   // The detail memo is isolated from master animation buckets AND unrelated views object churn.
   if (state.screen === 'session-detail') return observatoryDetailRows(state, cols, g, depth);
@@ -1031,9 +1188,9 @@ function rowsForUncached(state: DashState, cols = 100, g: Glyphs = defaultGlyphs
       }
     }
     // The cancelled-out footer. It is a ROW, not a note, and its ids are every cancelled record —
-    // so `a` on it dismisses them all through the verb the reader already knows, with no new key.
+    // so keep on it dismisses them all through the verb the reader already knows, with no new key.
     if (cancelledUnits) {
-      const label = `${cancelledUnits} cancelled-out chain${cancelledUnits === 1 ? '' : 's'} — created then deleted, or put back: nothing to review (a dismisses)`;
+      const label = `${cancelledUnits} cancelled-out chain${cancelledUnits === 1 ? '' : 's'} — created then deleted, or put back: nothing to review (${keyFor(state, 'keep')} dismisses)`;
       rows.push({
         ids: cancelledIds,
         key: 'cancelled',
@@ -1060,9 +1217,15 @@ function rowsForUncached(state: DashState, cols = 100, g: Glyphs = defaultGlyphs
       }
     }
   } else if (state.screen === 'prompts') {
+    // A session whose transcript is gone lists the asks the local index kept, and says so above them (as both editors do).
+    const pv = view<{ prompts?: unknown[]; fromIndex?: unknown; note?: unknown }>(state, 'prompts');
+    if (pv?.fromIndex === true && str(pv.note) && arr(pv.prompts).length) {
+      const note = wrapVisible(str(pv.note), Math.max(8, cols - 2));
+      for (let i = 0; i < note.length; i++) rows.push({ ids: [], key: `pnote:${i}`, cells: tint(note[i], 'undone', depth), cont: i > 0 });
+    }
     // Newest first: the most recent ask is the one being reviewed, so making the reader scroll to
     // the end to reach it inverts the common case. `slice()` first — the view's array is shared.
-    for (const p of arr(view<{ prompts?: unknown[] }>(state, 'prompts')?.prompts).slice().reverse()) {
+    for (const p of arr(pv?.prompts).slice().reverse()) {
       // The FULL ask, not the 64-cap title: it wraps below, so the whole thing is readable rather than
       // a sentence cut mid-word. Title is the fallback for a prompt with no text.
       const title = str(p.text) || str(p.title);
@@ -1096,7 +1259,7 @@ function rowsForUncached(state: DashState, cols = 100, g: Glyphs = defaultGlyphs
     // The agent's own window: row one is who is working and on what; the rows beneath are a LIVE
     // TAIL of the session feed — Claude's activity as it lands, newest at the bottom, followed
     // automatically unless the reader is inside the pane (app.ts followClaudeTail). Overlong lines
-    // wrap at render (paneVisible), never clip. The `F1 again` invitation rides the last row only
+    // wrap at render (paneVisible), never clip. The `F8 again` invitation (AGENT_KEY) rides the last row only
     // when the tail is quiet — a live pane spends its rows on the work.
     const sess = arr(view<{ sessions?: unknown[] }>(state, 'sessions')?.sessions).find((s) => str(s.id) === state.session) as
       | Record<string, unknown>
@@ -1158,7 +1321,7 @@ function rowsForUncached(state: DashState, cols = 100, g: Glyphs = defaultGlyphs
           const text = `${stamp}${head}${words ? mdAnsiInlineDim(words.replace(/\s+/g, ' '), depth, e.reasoningKind === 'thinking') : ''}${detail ? `  ${(depth === 'none' ? '[' + detail + ']' : '\x1b[2m[' + detail + ']\x1b[22m')}` : ''}`;
           const wrapped = wrapVisible(text, Math.max(8, cols - 2));
           const cut = middleOut(wrapped, e.reasoningKind === 'thinking' ? THOUGHT_ROWS : wrapped.length);
-          const parts = [...cut.head, ...(cut.hidden ? [`${g.fold} +${cut.hidden} more rows — F1 again ${g.wrap} the conversation`] : []), ...cut.tail];
+          const parts = [...cut.head, ...(cut.hidden ? [`${g.fold} +${cut.hidden} more rows — ${AGENT_KEY} again ${g.wrap} the conversation`] : []), ...cut.tail];
           parts.forEach((part, k) => {
             const cells = depth === 'none' || (kind === 'reasoning' && e.reasoningKind !== 'thinking') ? part : `\x1b[2m${part}\x1b[0m`;
             rows.push(k === 0 ? { ids: [], key: `clf${i}`, cells } : { ids: [], key: `clf${i}:${k}`, cells, cont: true });
@@ -1173,7 +1336,7 @@ function rowsForUncached(state: DashState, cols = 100, g: Glyphs = defaultGlyphs
         const key = `agent:${ts}:${paneRun}`;
         const b = agentBlob(state, e, {
           g, depth, width: Math.max(20, cols - 2), open: !state.open.has(key), lastThought: paneThought.get(str(e.detail)),
-          thoughtRows: THOUGHT_ROWS, more: `F1 again ${g.wrap} the conversation`,
+          thoughtRows: THOUGHT_ROWS, more: `${AGENT_KEY} again ${g.wrap} the conversation`,
         });
         paneThought.set(str(e.detail), b.thought);
         const eid = num(e.editId);
@@ -1187,10 +1350,10 @@ function rowsForUncached(state: DashState, cols = 100, g: Glyphs = defaultGlyphs
       // No pinned last-message rows any more — the transcript itself ends with
       // what the agent said, and the pinned copy repeated it.
       if (!shown) {
-        // OUR panel for every session kind: F1-again opens the drive
+        // OUR panel for every session kind: its key again (AGENT_KEY) opens the drive
         // surface — leaving it never stops the agent. The native handover survives as `r`, and only
         // where it means anything: a hook-observed Claude session with a transcript to resume.
-        const f1 = `F1 again ${g.wrap} conversation · h ${g.wrap} herdr`;
+        const f1 = `${AGENT_KEY} again ${g.wrap} conversation · h ${g.wrap} herdr`;
         rows.push({
           ids: [],
           key: 'cl3',
@@ -1514,7 +1677,7 @@ function rowsForUncached(state: DashState, cols = 100, g: Glyphs = defaultGlyphs
 
       // they are the rows a hook-observed session could never have, and the reason to look.
       const shown = str(en.kind) === 'permission' ? tint(label, 'pending', depth) : label;
-      rows.push({ ids: [], key: `f${num(en.ts)}${label.slice(0, 12)}`, cells: `${relTime(num(en.ts), state.now).padEnd(12)} ${shown}` });
+      rows.push({ ids: [], key: `f${num(en.ts)}${graphemeHead(label, 12)}`, cells: `${relTime(num(en.ts), state.now).padEnd(12)} ${shown}` });
     }
   } else if (state.screen === 'observations') {
     const ob = view<{ runs?: unknown[]; nextSteps?: unknown[] }>(state, 'observations');
@@ -1531,7 +1694,7 @@ function rowsForUncached(state: DashState, cols = 100, g: Glyphs = defaultGlyphs
     for (const n of arr(ob?.nextSteps)) {
       const t = typeof n === 'string' ? n : str((n as Record<string, unknown>).text);
       if (!t || !keep(t)) continue;
-      rows.push({ ids: [], key: `ns${t.slice(0, 24)}`, cells: `${tint(g.closed, 'pending', depth)} ${t}` });
+      rows.push({ ids: [], key: `ns${graphemeHead(t, 24)}`, cells: `${tint(g.closed, 'pending', depth)} ${t}` });
     }
   } else if (state.screen === 'processes') {
     const pr = view<{ processes?: unknown[] }>(state, 'processes');
@@ -1539,7 +1702,7 @@ function rowsForUncached(state: DashState, cols = 100, g: Glyphs = defaultGlyphs
       const cmd = str(x.command) || str(x.cmd) || str(x.id);
       if (!keep(cmd)) continue;
       const st = str(x.status) || str(x.state);
-      rows.push({ ids: [], key: `pr${str(x.id) || cmd.slice(0, 16)}`, cells: `${statusGlyph(st, g)} ${st.padEnd(10)} ${cmd}` });
+      rows.push({ ids: [], key: `pr${str(x.id) || graphemeHead(cmd, 16)}`, cells: `${statusGlyph(st, g)} ${st.padEnd(10)} ${cmd}` });
     }
   } else if (state.screen === 'audit') {
     const risk = view<{ risky?: unknown[]; outsideWrites?: unknown[] }>(state, 'risk');
@@ -1548,7 +1711,7 @@ function rowsForUncached(state: DashState, cols = 100, g: Glyphs = defaultGlyphs
       const target = str(r.target);
       if (!keep(target)) continue;
       const lvl = str(r.level).toUpperCase();
-      rows.push({ ids: [], key: `r${num(r.ts)}${target.slice(0, 12)}`, cells: `${tint(lvl === 'HIGH' ? '!!!' : '!!', 'risk', depth)} ${lvl.padEnd(6)} ${str(r.tool).padEnd(8)} ${target}` });
+      rows.push({ ids: [], key: `r${num(r.ts)}${graphemeHead(target, 12)}`, cells: `${tint(lvl === 'HIGH' ? '!!!' : '!!', 'risk', depth)} ${lvl.padEnd(6)} ${str(r.tool).padEnd(8)} ${target}` });
     }
     for (const w of arr(risk?.outsideWrites)) {
       const file = str(w.file);
@@ -1588,7 +1751,8 @@ export function selectionIds(state: DashState, scope: 'one' | 'all'): number[] {
  */
 /** The key currently bound to `action` — the reader's, or the default when no keymap was handed over. */
 function keyFor(state: DashState, action: string): string {
-  if (state.keys) for (const [k, a] of state.keys) if (a === action) return k;
+  // A Map from the runtime; a test fixture may hand over something else, which reads as the defaults.
+  if (state.keys instanceof Map) for (const [k, a] of state.keys) if (a === action) return k;
   return REBINDABLE.find((r) => r.action === action)?.fallback ?? '?';
 }
 
@@ -1628,7 +1792,7 @@ function sessionChipText(state: DashState): { title: string; id: string; machine
   const title = state.sessionTitle || short;
   // The machine a session is reviewed ON when that is not this one: every keep and undo below runs
   // there, against its files, so which machine is as much a part of "which session" as the id is.
-  return { title, id: state.sessionTitle && short !== state.sessionTitle ? short : '', machine: state.reviewMachine?.label ?? '' };
+  return { title: sanitizeCell(title), id: state.sessionTitle && short !== state.sessionTitle ? short : '', machine: sanitizeCell(state.reviewMachine?.label ?? '') };
 }
 
 /** The chip's `on <machine>` part — the palette's egress hue, "off this machine", as in the picker. */
@@ -1700,7 +1864,10 @@ function attention(state: DashState, cols: number, g: Glyphs, depth: ColorDepth)
   const cmView = view<{ summary?: Record<string, unknown> }>(state, 'changemap');
   const cm = cmView?.summary ?? {};
   // Who needs you, first and in every tier (2026-09-15): the count of sessions whose hand is up.
-  const hands = arr(view<{ sessions?: unknown[] }>(state, 'sessions')?.sessions).filter((x) => handOf(x as Record<string, unknown>) !== null).length;
+  // Other machines' hands as the listing carries them (`syncedHands`) count too, as the inbox lists them.
+  const listing = view<{ sessions?: unknown[]; syncedHands?: unknown[] }>(state, 'sessions');
+  const hands = arr(listing?.sessions).filter((x) => handOf(x as Record<string, unknown>) !== null).length
+    + arr(listing?.syncedHands).filter((x) => (x as { kind?: unknown }).kind !== 'idle-done').length;
   const risk = view<{ high?: unknown; count?: unknown }>(state, 'risk');
   const eg = view<{ remote?: unknown }>(state, 'egress');
   const mtView = view<{ summary?: Record<string, unknown> }>(state, 'multitask');
@@ -1954,6 +2121,13 @@ const focusBand = (depth: ColorDepth): string => {
     : `\x1b[48;5;${g.c256}m\x1b[38;5;${t.c256}m`;
 };
 
+/** The cursor row's reverse video, over the whole row. A row that carries its own colours closes each with a reset,
+ *  and `\x1b[7m${line}\x1b[0m` ended at the first of them: the session picker banded a session's time and none of its
+ *  name, and a file row in Traces its fold arrow alone. The band is opened again after every escape in the row. */
+function cursorBand(line: string): string {
+  return `${reverseVisibleSpan(line, 0, Number.MAX_SAFE_INTEGER)}\x1b[0m`;
+}
+
 /** The title row: focus marker, jump key, name, an ASCII rule to the counter, then the counter.
  *  The rule is what makes each pane's horizontal EXTENT visible with no colour at all. */
 function paneTitle(state: DashState, box: PaneBox, g: Glyphs, depth: ColorDepth): string {
@@ -2003,9 +2177,11 @@ export function tabParts(t: TabState | undefined, i: number, _g: Glyphs): { dot:
   return { dot: '', body: t?.name ?? String(i + 1), key: 'accent' };
 }
 
-/** The same numbered label is measured by the layout and drawn by the strip. */
+/** The same label is measured by the layout and drawn by the strip: the tab's key (`TAB_KEYS`), then its name. */
 export function tabLabel(t: TabState | undefined, i: number, g: Glyphs): string {
-  return tabParts(t, i, g).body;
+  const key = Object.keys(TAB_KEYS).find((k) => TAB_KEYS[k] === t?.id);
+  const body = tabParts(t, i, g).body;
+  return key ? `${key.toUpperCase()} ${body}` : body;
 }
 
 function tabStrip(state: DashState, lay: Layout, cols: number, g: Glyphs, depth: ColorDepth): string {
@@ -2021,7 +2197,7 @@ function tabStrip(state: DashState, lay: Layout, cols: number, g: Glyphs, depth:
   const { pre, post } = lay.tabbarMore;
   if (pre) put(pre.x, paint(`-${pre.hidden} `, { fg: 'faint' }, depth));
   for (const s of lay.tabbar) {
-    const label = tabLabel(tabs[s.index], s.index, g);
+    const label = s.label; // what the layout measured: the tab's key and name, or its name where the keys do not fit
     const padding = Math.max(0, s.w - displayWidth(label));
     const left = Math.floor(padding / 2);
     const cell = ' '.repeat(left) + label + ' '.repeat(padding - left);
@@ -2298,7 +2474,8 @@ export function paneVisible(
     for (const part of parts.slice(1)) out.push({ text: `  ${g.wrap}${part}`, row });
   };
 
-  if (state.views === null) {
+  // A finding wins over a payload: with no session to review, the payload holds only the Observatory's catalog.
+  if (state.reviewFinding || state.views === null) {
     const away = state.reviewMachine;
     if (state.reviewFinding) push(`  ${state.reviewFinding}`, -1);
     else if (!away) out.push({ text: '  building…', row: -1 });
@@ -2395,10 +2572,14 @@ export function paneVisible(
     };
     const feed = feeds[screen];
     const missing = feed !== undefined && view(state, feed) === null;
+    // A view that answered with a refusal (`{"transcript":null,"error":…}`) says why, in the CLI's words — not "yet".
+    const refused = feed !== undefined ? str(view<{ error?: unknown }>(state, feed)?.error) : '';
     const why = state.filter
       ? `nothing on ${title} matching /${state.filter} — esc clears the filter`
       : missing
           ? `${title} has no data to draw: the “${feed}” view did not arrive in this refresh`
+          : refused
+            ? `nothing on ${title} — the oak CLI answered: ${refused}`
           : screen === 'workflows'
             ? 'no Workflow-tool runs in this session — plain subagent fan-outs appear on Workers'
             : `nothing on ${title} yet — it fills in as the agent works`;
@@ -2586,14 +2767,16 @@ export function agentBlob(
       // hardcoded to 'pending' wore the unanswered mark forever — including on the answer itself,
       // which is a settled fact. An ask nothing ever answered still shows pending, which is the
       // one thing that mark is genuinely for.
+      // A call with no result yet is never a settled ✓: it is the one the session waits on while it waits on a person
+      // (`waiting`), and running otherwise.
       const mark =
         e.ok === false
           ? depth === 'none' ? g.undone : tint(g.undone, 'risk', depth)
           : e.ok === true
             ? depth === 'none' ? g.kept : tint(g.kept, 'kept', depth)
-            : kind === 'permission'
+            : kind === 'permission' || e.waiting === true
               ? depth === 'none' ? g.pending : tint(g.pending, 'pending', depth)
-              : depth === 'none' ? g.kept : tint(g.kept, 'kept', depth);
+              : depth === 'none' ? g.dot.live : tint(g.dot.live, 'live', depth);
       const clean = scrub(label);
       const sp = clean.indexOf(' ');
       const verb = sp > 0 ? clean.slice(0, sp) : clean;
@@ -2844,7 +3027,7 @@ function paneBody(state: DashState, box: PaneBox, g: Glyphs, depth: ColorDepth):
     // faint band was tried (as "context") and read as a second selected item both times a user
     // looked at it — the cursor position persists per pane regardless, so nothing is lost.
     if (box.focused) {
-      out.push(`\x1b[7m${line}\x1b[0m`);
+      out.push(cursorBand(line));
       continue;
     }
     out.push(line);
@@ -3123,19 +3306,21 @@ function renderPanes(state: DashState, opts: FrameOpts, lay: Layout, g: Glyphs, 
   const mapShown = lay.boxes.some((b) => paneScreenOf(state, b) === 'map');
   const status = state.confirm && !(mapShown && mapOwnsConfirm(state))
     ? tint(`${state.confirm.verb}${state.confirm.ids.length ? ` ${state.confirm.ids.length} edit(s)` : ''} — ${state.confirm.label}?  [y/n]`, 'pending', depth)
-    : state.error
-      ? tint(`! ${state.error}`, 'risk', depth)
-      : state.goto
-        ? tint(`go to edit #${state.goto}_`, 'accent', depth)
-        : blocked
-          ? tint(`at this size: ${blocked}`, 'undone', depth)
-          : zoomedEditBar(state, lay, cols, depth) ??
-            // 'ready' is the IDLE SENTINEL, not a message. Printing it spent a row of the frame
-            // telling the reader that nothing had happened.
-            (state.status === 'ready' ? '' : state.status);
+    : state.goto
+      ? tint(`go to edit #${state.goto}_`, 'accent', depth)
+      : answering(state)
+        ? state.status
+        : state.error
+          ? tint(`! ${state.error}`, 'risk', depth)
+          : blocked
+            ? tint(`at this size: ${blocked}`, 'undone', depth)
+            : zoomedEditBar(state, lay, cols, depth) ??
+              // 'ready' is the IDLE SENTINEL, not a message. Printing it spent a row of the frame
+              // telling the reader that nothing had happened.
+              (state.status === 'ready' ? '' : state.status);
   // The shared bottom chrome (divider · status · statusline · keys). The status row reclaims its line
   // from the band when it speaks — bottomChrome's splice, so the divider is never eaten.
-  return bottomChrome(state, out, cols, rows, status, dockKeys(state, cols), g, depth);
+  return bottomChrome(state, out, cols, rows, status, dockKeys(state, cols), g, depth, opts.bottom);
 }
 
 /**
@@ -3406,11 +3591,16 @@ export function renderTreeBody(
  * rest onto `out`, returning `out.slice(0, rows)`. renderPanes/renderTreeFrame/renderNativeFrame all
  * spelled this out by hand, byte-for-byte, before — which is how a fix to one could miss the others.
  */
-function bottomChrome(state: DashState, out: string[], cols: number, rows: number, status: string, keys: string, g: Glyphs, depth: ColorDepth): string[] {
+function bottomChrome(state: DashState, out: string[], cols: number, rows: number, status: string, keys: string, g: Glyphs, depth: ColorDepth, bottom?: FrameOpts['bottom']): string[] {
+  // The status row says what others wrote too (herdr's line, a machine's ssh): its line breaks and other controls show
+  // as spaces, and of the escapes only colour passes, so the row stays one row and nothing in it drives the terminal.
+  // statusWithToast cleans what it draws; the text a drag to the row's edge copies (`bottom`) is cleaned here.
+  status = sanitizeCell(status);
   const statusRow = statusWithToast(status, state, cols);
   const speaks = statusRow.trim().length > 0;
   if (speaks) out.splice(out.length - 1, 1);
   out.push(chromeDivider(cols, g, depth));
+  bottom?.(out.length, speaks ? status : '');
   if (speaks) out.push(statusRow);
   for (const line of statuslineFor(state, cols, g, depth, statuslineWant(rows))) out.push(line);
   out.push(fitVisible(depth === 'none' ? keys : `\x1b[2m${keys}\x1b[0m`, cols - 1));
@@ -3422,7 +3612,7 @@ function bottomChrome(state: DashState, out: string[], cols: number, rows: numbe
 function dockKeys(state: DashState, cols: number): string {
   // The observatory tab draws its OWN ladder (session blobs, not dock windows).
   const onObs = (state.tabs as { id?: string }[] | undefined)?.[state.activeTab ?? 0]?.id === 'observatory';
-  const hints = onObs ? OBS_HINTS : KEY_HINTS;
+  const hints = fillKeys(onObs ? OBS_HINT_TEMPLATES : KEY_HINT_TEMPLATES, (a) => keyFor(state, a));
   return state.filterOpen || state.filter
     ? `/${state.filter}${state.filterOpen ? '_' : ''}`
     : state.goto
@@ -3446,13 +3636,20 @@ export function treeStatusText(state: DashState, depth: ColorDepth): string {
         'pending',
         depth
       )
-    : state.error
-      ? tint(`! ${state.error}`, 'risk', depth)
-      : state.goto
-        ? tint(`go to edit #${state.goto}_`, 'accent', depth)
-        : state.status === 'ready'
-          ? ''
-          : state.status;
+    : state.goto
+      ? tint(`go to edit #${state.goto}_`, 'accent', depth)
+      : answering(state)
+        ? state.status
+        : state.error
+          ? tint(`! ${state.error}`, 'risk', depth)
+          : state.status === 'ready'
+            ? ''
+            : state.status;
+}
+
+/** Is the status line's text an answer still inside its hold (DashState.statusUntil)? */
+function answering(state: DashState): boolean {
+  return state.status !== 'ready' && !!state.status && state.statusUntil !== undefined && state.now < state.statusUntil;
 }
 
 /** Does a tree tab's bottom chrome RECLAIM the last body row for the status line? The renderer shaves
@@ -3485,7 +3682,7 @@ function renderTreeFrame(
   const bodyLines = renderTreeBody(state, root, cols, treeBodyH, focus, g, depth, zoom);
   while (bodyLines.length < bodyH) bodyLines.push(fitVisible('', cols));
   for (const line of bodyLines) out.push(line);
-  return bottomChrome(state, out, cols, rows, status, dockKeys(state, cols), g, depth);
+  return bottomChrome(state, out, cols, rows, status, dockKeys(state, cols), g, depth, opts.bottom);
 }
 
 /**
@@ -3500,9 +3697,10 @@ function renderNativeFrame(state: DashState, opts: FrameOpts, lay: Layout, g: Gl
   const grid = state.nativeGrid ?? [];
   for (let i = 0; i < bodyH; i++) out.push(fitVisible(grid[i] ?? '', cols));
   const status = state.nativeNote ? tint(state.nativeNote, 'accent', depth) : state.status === 'ready' ? '' : state.status;
-  const hints = state.tabs?.[state.activeTab ?? 0]?.id === 'herdr' ? (process.env.TMUX ? HERDR_HINTS.map(hint => hint.replace('ctrl+b is', 'ctrl+b ctrl+b is').replace('^B herdr', '^B ^B herdr')) : HERDR_HINTS) : NATIVE_HINTS;
+  const hints = state.tabs?.[state.activeTab ?? 0]?.id === 'herdr'
+    ? herdrHints(state.herdrPrefix ?? 'ctrl+b', !!process.env.TMUX, state.herdrBack === undefined ? 'm' : state.herdrBack, state.herdrTabs) : NATIVE_HINTS;
   const keys = hints.find(s => displayWidth(s) <= cols - 1) ?? '?';
-  return bottomChrome(state, out, cols, rows, status, keys, g, depth);
+  return bottomChrome(state, out, cols, rows, status, keys, g, depth, opts.bottom);
 }
 
 // The filter control's picker — the file-type buckets and extensions actually PRESENT in the change
@@ -3565,6 +3763,46 @@ export function filterSummary(state: DashState): string {
   return bits.join(', ');
 }
 
+/** The chrome an overlay keeps above its title (see renderDashFrame). One function, so the app's scroll
+ *  arithmetic measures the frame that is drawn rather than assuming its height. */
+function overlayHead(state: DashState, lay: Layout | null, cols: number, g: Glyphs, depth: ColorDepth): string[] {
+  const activeTab = state.tabs?.[state.activeTab ?? 0];
+  return lay && activeTab?.root
+    ? tabBar(state, lay, cols, g, depth)
+    : lay
+    ? [
+        ...(tabBar(state, lay, cols, g, depth)),
+        windowBar(lay, cols, g, depth),
+        ...(lay.navBox
+      ? boxAround('session', [sessionRow(state, Math.max(20, cols - 2), g, depth)], cols, false, g, depth)
+      : [sessionRow(state, cols, g, depth)]),
+      ]
+    : [sessionBar(state, cols, g, depth), attention(state, cols, g, depth), navRow(state, cols, g, depth)];
+}
+
+/** How many lines an overlay's list gets under its title: the rows left by the chrome the frame draws.
+ *  A constant (`rows - 6`) was one short of the boxed session row and the window bar, so a picker's
+ *  cursor sat below the last line drawn and the rows at the end of the list never came into view. */
+export function overlayListRows(state: DashState, lay: Layout | null, cols: number, rows: number, g: Glyphs): number {
+  return Math.max(1, rows - overlayHead(state, lay, cols, g, 'none').length - chromeBottom(rows) - 1 - (state.overlay?.head !== undefined ? 1 : 0));
+}
+
+/** The first overlay line to draw so that line `cursor` is wholly on screen: `scroll` when it already
+ *  is, otherwise the nearest start that shows it. Counted in the lines the renderer draws, since a line
+ *  wider than the terminal wraps onto more than one (the renderer's own rule, below). */
+export function overlayScroll(lines: readonly string[], cursor: number, scroll: number, budget: number, cols: number): number {
+  if (cursor < scroll) return Math.max(0, cursor);
+  const height = (r: number): number => {
+    const raw = lines[r] ?? '';
+    return displayWidth(raw) <= cols ? 1 : Math.max(1, wrapVisible(raw, Math.max(1, cols - 2)).length);
+  };
+  let start = scroll;
+  let used = 0;
+  for (let r = start; r <= cursor; r++) used += height(r);
+  while (used > budget && start < cursor) used -= height(start++);
+  return start;
+}
+
 export function renderDashFrame(state: DashState, opts: FrameOpts): string[] {
   const { cols, rows } = opts;
   const depth = depthOf(opts.color);
@@ -3584,6 +3822,7 @@ export function renderDashFrame(state: DashState, opts: FrameOpts): string[] {
         // this is the render path every snapshot, probe and one-shot goes through, and a tab bar
         // that appears only in the live app is a tab bar nothing can test.
         tabs: state.tabs?.map((t, i) => tabLabel(t, i, g)),
+        tabNames: state.tabs?.map((t, i) => tabParts(t, i, g).body),
         activeTab: state.activeTab,
       })
     : null;
@@ -3602,16 +3841,10 @@ export function renderDashFrame(state: DashState, opts: FrameOpts): string[] {
   // eight-screen nav here told the reader their windows had vanished the moment they pressed `s`.
   // The window bar leads, exactly as it does in the pane frame — but the legacy screen nav does NOT,
   // because it is a tab strip rather than a map of the frame, and that frame's own lead is its
-  // session line.
-  const out: string[] = lay
-    ? [
-        ...(tabBar(state, lay, cols, g, depth)),
-        windowBar(lay, cols, g, depth),
-        ...(lay.navBox
-      ? boxAround('session', [sessionRow(state, Math.max(20, cols - 2), g, depth)], cols, false, g, depth)
-      : [sessionRow(state, cols, g, depth)]),
-      ]
-    : [sessionBar(state, cols, g, depth), attention(state, cols, g, depth), navRow(state, cols, g, depth)];
+  // session line. Over a TREE tab (the Observatory) the overlay keeps that tab's own chrome: the window
+  // bar, session row and key row below name the Review dock, and advertised Review keys (a, u, e) that
+  // the Observatory does not answer.
+  const out = overlayHead(state, lay, cols, g, depth);
 
   // Derived from the chrome actually emitted above, not from a constant: the pane frame carries two
   // top rows and the legacy one carries three, and a hard-coded 5 leaves the taller of them a line
@@ -3621,7 +3854,9 @@ export function renderDashFrame(state: DashState, opts: FrameOpts): string[] {
     // The diff takes the whole body. Its lines already carry the CLI's own colouring, so they are
     // width-fitted but never re-styled — what is shown is exactly what `diff <id>` prints.
     const o = state.overlay;
-    out.push(fitVisible(tint(o.title, 'accent', depth), cols));
+    out.push(fitVisible(tint(sanitizeCell(o.title), 'accent', depth), cols));
+    const listRows = bodyRows - 1 - (o.head !== undefined ? 1 : 0);
+    if (o.head !== undefined) out.push(fitVisible(sanitizeCell(o.head), cols));
     // Expand to visual lines first: a diff line wider than the terminal WRAPS onto a continuation
     // that reclaims the full width. Fitting it cut the tail off silently, and a diff you cannot read
     // to the end is a diff you cannot review. Only the visible window is expanded.
@@ -3632,15 +3867,16 @@ export function renderDashFrame(state: DashState, opts: FrameOpts): string[] {
     // ever bit pickers (the diff overlay has no cursor) and only when something wrapped, which is why
     // it survived: a picker row that fits is its own visual line and the two indexes agree.
     const owner: number[] = [];
-    for (let r = o.scroll; r < o.lines.length && slice.length < bodyRows - 1; r++) {
-      const raw = o.lines[r] ?? '';
+    for (let r = o.scroll; r < o.lines.length && slice.length < listRows; r++) {
+      // Titles, search excerpts and command output are cell text too: scrub before measuring or wrapping.
+      const raw = sanitizeCell(o.lines[r] ?? '');
       if (displayWidth(raw) <= cols) { slice.push(raw); owner.push(r); continue; }
       const parts = wrapVisible(raw, Math.max(1, cols - 2));
       slice.push(parts[0] ?? '');
       owner.push(r);
       for (const part of parts.slice(1)) { slice.push(`${g.wrap}${part}`); owner.push(r); }
     }
-    for (let i = 0; i < bodyRows - 1; i++) {
+    for (let i = 0; i < listRows; i++) {
       const line = slice[i] ?? '';
       // Every visual line of the selected row is marked, so a wrapped selection reads as one block.
       const picked = o.cursor !== undefined && owner[i] === o.cursor;
@@ -3648,7 +3884,7 @@ export function renderDashFrame(state: DashState, opts: FrameOpts): string[] {
       // prepending shifts every column right by one and collides with the marker a picker row may
       // already carry (the current session's own '>'), so two different meanings share a glyph AND
       // the columns stop lining up.
-      const marked = picked ? (depth === 'none' ? `>${line.slice(1)}` : `\x1b[7m${line}\x1b[0m`) : line;
+      const marked = picked ? (depth === 'none' ? `>${line.slice(1)}` : cursorBand(line)) : line;
       out.push(fitVisible(marked, cols));
     }
   } else if (state.views === null) {
@@ -3674,7 +3910,7 @@ export function renderDashFrame(state: DashState, opts: FrameOpts): string[] {
       }
       const selected = start + i === state.cursor;
       const text = sanitizeCell(r.cells);
-      out.push(fitVisible(selected && depth !== 'none' ? `\x1b[7m ${text}\x1b[0m` : selected ? `>${text}` : ` ${text}`, cols));
+      out.push(fitVisible(selected && depth !== 'none' ? cursorBand(` ${text}`) : selected ? `>${text}` : ` ${text}`, cols));
     }
     if (all.length === 0 && bodyRows > 0) {
       out[3] = fitVisible(
@@ -3686,9 +3922,11 @@ export function renderDashFrame(state: DashState, opts: FrameOpts): string[] {
     }
   }
 
+  // A key's answer holds over a standing error here as it does under the panes (DashState.statusUntil): over the
+  // picker, ^D on another machine's row said nothing while a read's failure stood.
   const statusText = state.confirm
     ? tint(`${state.confirm.verb}${state.confirm.ids.length ? ` ${state.confirm.ids.length} edit(s)` : ''} — ${state.confirm.label}?  [y/n]`, 'pending', depth)
-    : state.error
+    : state.error && !answering(state)
       ? tint(`! ${state.error}`, 'risk', depth)
       : state.status;
   out.push(chromeDivider(cols, g, depth));
@@ -3701,9 +3939,11 @@ export function renderDashFrame(state: DashState, opts: FrameOpts): string[] {
   // The SAME ladder the pane frame uses. This path had its own copy, which still advertised the
   // window keys as digits long after the digits had been given to edits — so opening any overlay
   // replaced the key row with instructions for a keymap that no longer existed.
-  const keys = state.filterOpen || state.filter
+  const keys = activeTab?.root
+    ? dockKeys(state, cols)
+    : state.filterOpen || state.filter
     ? `/${state.filter}${state.filterOpen ? '_' : ''}`
-    : KEY_HINTS.find((s) => displayWidth(s) <= budget) ?? '?';
+    : fillKeys(KEY_HINT_TEMPLATES, (a) => keyFor(state, a)).find((s) => displayWidth(s) <= budget) ?? '?';
   out.push(fitVisible(depth === 'none' ? keys : `\x1b[2m${keys}\x1b[0m`, budget));
   return out.slice(0, rows);
 }

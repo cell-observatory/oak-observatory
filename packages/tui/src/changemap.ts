@@ -26,7 +26,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { displayWidth, fitVisible } from './textwidth';
 import { Glyphs, ColorDepth, churn, riskMark, tint } from './glyphs';
-import { relTime, type SortKey } from '@oak-observatory/core';
+import { graphemes, relTime, type SortKey } from '@oak-observatory/core';
 
 /** The subset of a `changemap --json` file row this module needs. */
 export interface MapFile {
@@ -476,9 +476,10 @@ export function renderMapToolbar(tree: MapNode, cols: number, depth: ColorDepth,
   if (!btns.length) return fitVisible(base + readout, cols);
   let line = base;
   let at = displayWidth(base);
-  // Drop the readout into the gap before the first button, truncated to whatever fits there.
+  // Drop the readout into the gap before the first button, truncated to whatever fits there: measured in columns and
+  // cut where a character ends, as a typed filter can hold a wide character or an emoji.
   if (readout && btns[0].x > at) {
-    const shown = readout.slice(0, Math.max(0, btns[0].x - at));
+    const shown = fitVisible(readout, btns[0].x - at);
     line += shown;
     at += displayWidth(shown);
   }
@@ -642,11 +643,11 @@ export function renderMapRow(row: MapRow, cols: number, g: Glyphs, depth: ColorD
   return [first, ...parts.slice(1).map((t) => fitVisible(`${contIndent}${t}`, cols))];
 }
 
-/** Break a name at exactly `w` columns, keeping every character. Paths have no spaces to break on. */
+/** Break a name at exactly `w` columns, keeping every character whole. Paths have no spaces to break on. */
 function hardWrapName(s: string, w: number): string[] {
   const out: string[] = [];
   let line = '';
-  for (const ch of s) {
+  for (const ch of graphemes(s)) {
     if (displayWidth(line + ch) > w) { out.push(line); line = ''; }
     line += ch;
   }

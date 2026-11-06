@@ -21,8 +21,8 @@ internal object ReviewSelection {
      */
     fun currentEditIn(project: Project, path: String): EditRecord? {
         val service = ObservatoryService.getInstance(project)
-        val key = ClaudePaths.storeKey(path) // hoisted: this runs per toolbar tick over every record
+        val key = com.cellobservatory.observatory.ui.RemoteEditorReview.fileKey(project, path) // hoisted: this runs per toolbar tick over every record
         return service.currentPendingEdit()?.takeIf { it.file == key }
-            ?: service.log().filter { it.pending && it.file == key }.minByOrNull { it.id }
+            ?: service.reviewRecords().filter { it.pending && it.file == key }.minByOrNull { it.id }
     }
 }

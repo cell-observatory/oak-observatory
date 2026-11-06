@@ -3,7 +3,6 @@ package com.cellobservatory.observatory.platform
 import com.cellobservatory.observatory.core.ClaudePaths
 import com.cellobservatory.observatory.services.ObservatoryService
 import com.cellobservatory.observatory.ui.FeedPanel
-import com.intellij.testFramework.fixtures.BasePlatformTestCase
 import java.nio.file.Files
 
 /**
@@ -17,9 +16,37 @@ import java.nio.file.Files
  *   · a session-KIND pick survives, because a fleet row IS a session of its own and switching TO it
  *     is exactly what the pick asked for.
  */
-class FeedPanelTest : BasePlatformTestCase() {
+class FeedPanelTest : ObservatoryPlatformTestCase() {
 
     private lateinit var cfg: java.nio.file.Path
+
+    fun testRemoteWorkerFeedUsesTheOwnerAndReportsReadErrors() {
+        if (System.getProperty("os.name").startsWith("Windows")) return
+        val settings = com.cellobservatory.observatory.settings.ObservatorySettings.instance.state
+        val previous = settings.observatoryBin
+        val binary = cfg.resolve("fake-oak")
+        val args = cfg.resolve("argv")
+        val payload = cfg.resolve("reply")
+        val note = "Worker ended at 2026-10-01T10:05:00.123Z (completed)."
+        Files.writeString(payload, """{"workerLogVersion":1,"ref":{"kind":"agent","id":"w1"},"title":"Remote worker","entries":[],"mode":"audit","note":"$note"}""")
+        Files.writeString(binary, "#!/bin/sh\nprintf '%s\\n' \"\$@\" > '$args'\ncat '$payload'\n")
+        binary.toFile().setExecutable(true)
+        settings.observatoryBin = binary.toString()
+        try {
+            val json = com.cellobservatory.observatory.core.ObservatoryCli.feedJson("remote-parent", "agent", "w1", 60, cfg.toString(), "build-box")!!
+            val argv = Files.readAllLines(args)
+            assertEquals("build-box", argv[argv.indexOf("--machine") + 1])
+            assertEquals("remote-parent", argv[argv.indexOf("--session") + 1])
+            assertFalse("a local root must never retarget a remote log", argv.contains("--root"))
+            assertEquals(note, com.cellobservatory.observatory.model.FeedParser.parse(json)?.note)
+            Files.writeString(payload, "{}")
+            val old = com.cellobservatory.observatory.core.ObservatoryCli.feedJson("remote-parent", "agent", "w1", 60, cfg.toString(), "build-box")!!
+            assertTrue(com.cellobservatory.observatory.model.FeedParser.parse(old)!!.note!!.contains("update OAK"))
+            Files.writeString(binary, "#!/bin/sh\nprintf 'not reachable over ssh' >&2\nexit 255\n")
+            val down = com.cellobservatory.observatory.core.ObservatoryCli.feedJson("remote-parent", "agent", "w1", 60, cfg.toString(), "build-box")!!
+            assertTrue(com.cellobservatory.observatory.model.FeedParser.parse(down)!!.note!!.contains("not reachable over ssh"))
+        } finally { settings.observatoryBin = previous }
+    }
 
     override fun setUp() {
         super.setUp()
@@ -85,6 +112,37 @@ class FeedPanelTest : BasePlatformTestCase() {
         assertTrue("with a word count instead of clipped prose", thought.first().contains("10 words"))
         val opened = texts(entry("thinking"), toggled = true)
         assertTrue("the toggle unfolds the whole thought", opened.size > 1 && opened.any { it.contains("second line with") })
+    }
+
+    /** A Trojan Source line in an edit's inline diff: a right-to-left override in it, drawn as it is, shows as nothing and
+     *  reorders the line around it. Each hidden character shows as the mark that names it, greyed. */
+    fun testAHiddenCharacterInAnInlineDiffShowsAsTheMarkThatNamesIt() {
+        val entry = com.cellobservatory.observatory.model.FeedEntry(
+            ts = 1L, kind = "action", label = "Edit", target = "auth.js", detail = null, ok = null, category = "edit", note = null,
+            reasoning = null, reasoningKind = null, promptText = null, cmd = null, editId = 7, previewId = null,
+        )
+        val row = FeedPanel.Registry.Row(entry, "1:0", false, listOf("+if (ok\u202E) {} // \u200Bnote"), 0)
+        val comp = com.cellobservatory.observatory.ui.FeedBlobRenderer { true }
+            .getListCellRendererComponent(com.intellij.ui.components.JBList<FeedPanel.Registry.Row>(), row, 0, false, false) as java.awt.Container
+        val line = comp.components.filterIsInstance<com.intellij.ui.SimpleColoredComponent>().single { it.toString().contains("if (ok") }
+        val runs = ArrayList<Pair<String, com.intellij.ui.SimpleTextAttributes>>()
+        val fragments = line.iterator()
+        while (fragments.hasNext()) runs.add(fragments.next() to fragments.textAttributes)
+        assertEquals("each shows, greyed: ${runs.map { it.first }}", listOf("⟨U+202E⟩", "⟨U+200B⟩"),
+            runs.filter { it.second == com.intellij.ui.SimpleTextAttributes.GRAYED_ITALIC_ATTRIBUTES }.map { it.first })
+        assertFalse("none is left to reorder the line: $line", line.toString().contains('\u202E') || line.toString().contains('\u200B'))
+        assertTrue("the rest of the line reads as it was", line.toString().contains("+if (ok⟨U+202E⟩) {} // ⟨U+200B⟩note"))
+        // A joiner hidden inside an identifier shows too; an emoji family, an Indic conjunct and a Persian word keep theirs.
+        val kept = listOf("\uD83D\uDC68\u200D\uD83D\uDC69\u200D\uD83D\uDC67", "\u0915\u094D\u200D\u0937", "\u06A9\u062A\u0627\u0628\u200C\u0647\u0627")
+        val joined = FeedPanel.Registry.Row(entry, "1:1", false, listOf("+if (is\u200Dadmin && foo\u200Cbar && a\u200D1) {} // " + kept.joinToString(" ")), 0)
+        val joinedLine = (com.cellobservatory.observatory.ui.FeedBlobRenderer { true }
+            .getListCellRendererComponent(com.intellij.ui.components.JBList<FeedPanel.Registry.Row>(), joined, 0, false, false) as java.awt.Container)
+            .components.filterIsInstance<com.intellij.ui.SimpleColoredComponent>().single { it.toString().contains("if (is") }
+        val joinedRuns = ArrayList<String>()
+        val joinedFragments = joinedLine.iterator()
+        while (joinedFragments.hasNext()) { val text = joinedFragments.next(); if (joinedFragments.textAttributes == com.intellij.ui.SimpleTextAttributes.GRAYED_ITALIC_ATTRIBUTES) joinedRuns.add(text) }
+        assertEquals("each joiner inside an identifier shows, greyed: $joinedLine", listOf("⟨U+200D⟩", "⟨U+200C⟩", "⟨U+200D⟩"), joinedRuns)
+        assertTrue("an emoji, a conjunct and a Persian word keep their joiners: $joinedLine", kept.all { joinedLine.toString().contains(it) })
     }
 
     private fun feed(json: String) = com.cellobservatory.observatory.model.FeedParser.parse(json)!!
@@ -208,6 +266,55 @@ class FeedPanelTest : BasePlatformTestCase() {
         svc.demoSessionOverride = null
     }
 
+
+    fun testPromptJumpsAfterSwitchingFromRemoteToLocalWithTheOverviewOpen() {
+        if (System.getProperty("os.name").startsWith("Windows")) return
+        val svc = ObservatoryService.getInstance(project)
+        val settings = com.cellobservatory.observatory.settings.ObservatorySettings.instance.state
+        val oldBin = settings.observatoryBin
+        val oldSession = settings.session
+        val binary = cfg.resolve("switch-oak").toFile()
+        binary.writeText("""#!/bin/sh
+case "${'$'}*" in *--machine*) prompt=remote-ask;; *) prompt=local-ask;; esac
+case "${'$'}1" in
+prompts) printf '{"session":"switch-session","prompts":[{"id":"%s","index":1,"ts":20,"endTs":40,"text":"Question"}]}' "${'$'}prompt";;
+feed) printf '{"entries":[{"ts":10,"kind":"action"},{"ts":20,"kind":"prompt"},{"ts":30,"kind":"reasoning"}]}' ;;
+*) printf '{}';;
+esac
+""")
+        binary.setExecutable(true)
+        try {
+            settings.observatoryBin = binary.path
+            Files.createDirectories(ClaudePaths.storeDir("switch-session"))
+            project.basePath?.let { java.io.File(it).mkdirs() }
+            com.cellobservatory.observatory.ui.ChangeMapPanel(project)
+            val panel = FeedPanel(project)
+            val list = FeedPanel::class.java.getDeclaredField("list").apply { isAccessible = true }.get(panel) as javax.swing.JList<*>
+            fun jump(id: String) {
+                svc.selectedPromptId = id
+                val deadline = System.currentTimeMillis() + 10_000
+                while (list.selectedIndex != 1 && System.currentTimeMillis() < deadline) {
+                    panel.refresh()
+                    com.intellij.testFramework.PlatformTestUtil.dispatchAllEventsInIdeEventQueue()
+                    Thread.sleep(10)
+                }
+                assertEquals(id, svc.prompts()?.prompts?.single()?.id)
+                assertEquals("$id lands on its own row after the real CLI reads", 1, list.selectedIndex)
+            }
+            com.cellobservatory.observatory.ui.ReviewOps.applyRemoteSessionChoice(project, "lab-a", "switch-session")
+            jump("remote-ask")
+            list.clearSelection()
+            com.cellobservatory.observatory.ui.ReviewOps.applySessionChoice(project, "switch-session")
+            jump("local-ask")
+            svc.requestResponseJump("local-ask")
+            panel.refresh()
+            assertEquals("the local response jump still works", 2, list.selectedIndex)
+        } finally {
+            svc.remotePin = null
+            settings.session = oldSession
+            settings.observatoryBin = oldBin
+        }
+    }
 
     fun testOpeningTheCurrentConversationClearsThePickedWorker() {
         val svc = ObservatoryService.getInstance(project)

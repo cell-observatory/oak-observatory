@@ -21,6 +21,11 @@ const WORKERS_READ_MS = 3000;
  *  every 15 s cost a saved machine one ssh round trip per pending pane every 15 s. */
 const TOKEN_TTL_MS = 120000;
 const REMOTE_BACKOFF_MAX_MS = 120000;
+/** How long what a pane's screen showed stands before the pane is read again with no newer revision: herdr 0.9.1 gives
+ *  every pane revision 0 whatever its screen does (measured on a sandboxed server, with a client attached and without),
+ *  so the revision alone would never call for a second read. The saved machines' poll: a pane there costs at most one
+ *  forwarded read per poll. */
+const SCREEN_READ_MS = REMOTE_POLL_MS;
 /** How long a saved machine whose OAK cannot name its own tabs (from before `__tab-sync`) has them named
  *  from here before it is asked again; and a session's tab there that its OAK cannot name, because it
  *  holds no herdr pane link for the session. */
@@ -56,6 +61,9 @@ export function remoteSnapshot(value: unknown): HerdrApi.SessionSnapshot {
 export function createObservatory(core: Core, state: DashState, opts: {
   cwd: string;
   changed(): void;
+  visibleProcesses?(paneId: string): string[];
+  processesVisible?(): boolean;
+  workersVisible?(): boolean;
   status(message: string): void;
   /** Injection keeps runtime tests entirely in process, including watcher and timer behavior. */
   reader?: ConversationReader;
@@ -67,15 +75,23 @@ export function createObservatory(core: Core, state: DashState, opts: {
   /** True while the host keeps `state.views.sessions` current itself (the app's own poll reads this
    *  machine's catalog): a store write then needs no second listing from here. */
   catalogFresh?: () => boolean;
+  /** Each session list read here, which the host keeps as this machine's: a saved machine's review payload carries it. */
+  catalog?: (sessions: unknown) => void;
 }) {
   let closed = false;
   const reader = opts.reader ?? createConversationReader(core, opts.cwd);
   const reads = new Map<string, { selection: ObservatorySelection; promise: Promise<void> }>();
+  const processReads = new Map<string, Promise<void>>();
+  const processNext = new Map<string, { selection: ObservatorySelection; label?: string; at: number }>();
+  const workerLogs = new Map<string, { selection: ObservatorySelection; files: string[]; stamp: string }>();
   const sources = new Map<string, string | undefined>();
   const conversationErrors = new Map<string, string>();
   const mirrorNotices = new Map<string, string>();
-  const metadataPolls = new Map<string, { flight?: Promise<void>; nextAt: number }>();
+  const metadataPolls = new Map<string, { flight?: Promise<void>; nextAt: number; workers?: boolean }>();
   const workerNextAt = new Map<string, number>();
+  /** The Workers failure the status row last said for each detail: said once, not on every read. A conversation pinned
+   *  from a saved machine that is down failed this read every REMOTE_READ_MS, each time over the status row. */
+  const workersSaid = new Map<string, string>();
   const enrichments = new Map<string, Promise<void>>();
   // The worker refresh (every 3 s per pinned detail) spawned a whole-fleet `multitask` read — 8 MB and
   // ~1 s of CPU — to use one session's subagents/todos. Gate it on the session's own stamps: the
@@ -108,13 +124,21 @@ export function createObservatory(core: Core, state: DashState, opts: {
       do {
         sessionsRerun = false;
         const root = opts.cwd;
+        // The session the listing is read for. Review moving to another while it was read (the first session to appear,
+        // adopted, or the picker's) cleared the views for that session's own read. One on this machine lists the sessions
+        // too: this listing, and a rerun asked for before the move, would land there as a payload of sessions alone, which
+        // Review drew as "… has no data to draw" until that read came. A saved machine's read lists none of this
+        // machine's: while Review reads there, only a store write lists them, and its payload carries the host's catalog
+        // (until that read fails, after which the listing lands here, as it did).
+        const session = state.session;
         let sessions: unknown;
         const started = Date.now();
-        try { sessions = reader.sessions ? await reader.sessions(state.session, root) : core.sessionMeta(root, state.session); }
+        try { sessions = reader.sessions ? await reader.sessions(session, root) : core.sessionMeta(root, session); }
         catch (error) { opts.status(`session store: ${errorText(error)}`); break; }
-        if (closed) break;
+        if (closed || (state.session !== session && opts.catalogFresh?.())) break;
         sessionsRead(sessions, started);
-        state.views = { ...state.views, sessions };
+        opts.catalog?.(sessions);
+        if (state.views !== null || !state.reviewMachine || state.reviewMachine.error) state.views = { ...state.views, sessions };
         changed();
       } while (sessionsRerun);
     } finally { sessionsInFlight = false; }
@@ -129,6 +153,55 @@ export function createObservatory(core: Core, state: DashState, opts: {
   let subscribed = '';
   const reported = new Map<string, { pending: number; at: number }>();
   const linked = new Set<string>();
+  /** Per pane, the key of the report that took it back from Codex's memory thread (see publishStore). */
+  const healed = new Map<string, string>();
+  /** publishStore's reports that failed, by key: when each may go out again, its last wait, and the error the status
+   *  row has said for it. A report waits REMOTE_POLL_MS after a failure, twice that after the next, up to
+   *  REMOTE_BACKOFF_MAX_MS, and the same error is said once, not on every pass. A saved machine that cannot be
+   *  reached is said nowhere here, since the Observatory marks the machine, and every report to it waits under the
+   *  machine's own key: each would otherwise wait out a connection timeout on every pass. */
+  const failedReports = new Map<string, { at: number; wait: number; said?: string }>();
+  const reportDue = (key: string): boolean => Date.now() >= (failedReports.get(key)?.at ?? 0);
+  function reportFailed(key: string, error: unknown, what?: string): void {
+    const last = failedReports.get(key);
+    const wait = last ? Math.min(last.wait * 2, REMOTE_BACKOFF_MAX_MS) : REMOTE_POLL_MS;
+    const said = what ? `${what}: ${errorText(error)}` : undefined;
+    failedReports.set(key, { at: Date.now() + wait, wait, said });
+    if (said && said !== last?.said) opts.status(said);
+  }
+  /** A failure said on the status row, taken back once what failed works again, if the row still says it: said once,
+   *  it stood there after the machine was back. Another report or read that failed in the same words says them again
+   *  at its next failure: taken back, they are on the row no longer. */
+  const unsay = (said: string | undefined): void => {
+    if (!said || state.status !== said) return;
+    opts.status('ready');
+    for (const report of failedReports.values()) if (report.said === said) report.said = undefined;
+    for (const [paneId, text] of workersSaid) if (text === said) workersSaid.delete(paneId);
+  };
+  /** A closed pane is no longer a target. Keep its session and pending edits, but only a fresh herdr
+   *  snapshot may give it a pane again; a saved capture link must not restart the report loop. */
+  function forgetMissingPane(machineId: string, paneId: string, error: unknown): boolean {
+    if (!(error instanceof core.HerdrError) || error.code !== 'pane_not_found') return false;
+    const m = state.observatory?.machines.find(m => m.id === machineId);
+    if (closed || !m?.snapshot) return true;
+    const key = `${machineId}:${paneId}`;
+    reported.delete(key);
+    for (const report of failedReports.keys()) {
+      if (report !== key && !(m.local && report.startsWith(`${paneId}:`))) continue;
+      unsay(failedReports.get(report)?.said);
+      failedReports.delete(report);
+    }
+    if (m.local) {
+      for (const report of linked) if (report.startsWith(`${paneId}:`)) linked.delete(report);
+      healed.delete(paneId);
+    }
+    screens.delete(`${machineId}\n${paneId}`);
+    const snapshot = { ...m.snapshot, panes: m.snapshot.panes.filter(p => p.pane_id !== paneId),
+      agents: m.snapshot.agents.filter(a => a.pane_id !== paneId) };
+    state.observatory = { ...state.observatory!, machines: state.observatory!.machines.map(x => x === m ? { ...m, snapshot } : x) };
+    changed();
+    return true;
+  }
   const identities = new Map<string, { ino: number; size: number; mtimeMs: number }>();
   const retryAt = new Map<string, number>();
   // Media captures set OAK_MACHINE_LABEL to a neutral name; normal sessions use the host name.
@@ -228,9 +301,10 @@ export function createObservatory(core: Core, state: DashState, opts: {
   const changed = () => { if (!closed) opts.changed(); };
   const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
   function owner(selection: ObservatorySelection): string | undefined {
+    const pinned = state.observatory?.machines.find(m => m.id === selection.machineId);
+    if (selection.agentId && pinned) return pinned.local ? undefined : pinned.label;
     const found = sessionMachine(state, selection.session);
     if (found?.local) return undefined;
-    const pinned = state.observatory?.machines.find(m => m.id === selection.machineId);
     return (pinned && !pinned.local ? pinned.label : undefined) ?? found?.label
       ?? state.observatory?.owners?.[selection.session];
   }
@@ -253,12 +327,14 @@ export function createObservatory(core: Core, state: DashState, opts: {
     let poll = metadataPolls.get(m.id);
     if (!poll) { poll = { nextAt: 0 }; metadataPolls.set(m.id, poll); }
     if (poll.flight) return poll.flight;
-    if (Date.now() < poll.nextAt) return Promise.resolve();
+    const workers = opts.workersVisible?.() ?? false;
+    if (Date.now() < poll.nextAt && (!workers || poll.workers)) return Promise.resolve();
+    poll.workers = workers;
     const started = Date.now();
     const current = () => !closed && state.observatory?.machines.some(x => x.id === m.id && x.label === label);
     poll.flight = (async () => {
       try {
-        const sessions = await reader.sessions(state.session, m.snapshot?.panes[0]?.cwd || opts.cwd, label) as ObservatoryMachine['sessions'];
+        const sessions = await reader.sessions(state.session, m.snapshot?.panes[0]?.cwd || opts.cwd, label, workers) as ObservatoryMachine['sessions'];
         if (!sessions || !Array.isArray(sessions.sessions)) throw new Error('Sessions read returned invalid JSON');
         if (!current()) return;
         sessionsRead(sessions, started);
@@ -294,11 +370,81 @@ export function createObservatory(core: Core, state: DashState, opts: {
       }
     } catch { /* provenance failure cannot hide the original transport failure */ }
   }
+  // A Codex pane whose state hangs on its screen (paneScreenDecides: herdr calls it blocked, its turn is open with no hand
+  // raised, and its rollout has gone quiet, as during a long command) shows what its screen does (paneAgentState). Its
+  // visible screen is read through herdr when a snapshot shows the pane at a newer revision or its last reading is
+  // SCREEN_READ_MS old, off the listing's path, one read at a time per machine, the pane read longest ago first. The pass
+  // that starts reads runs on each snapshot and every second between them, so a rollout that has just gone quiet, or a
+  // session row that has just come in, is read at once. What a read found stays on the pane while its newer screen is
+  // read, and through the rollout's writes while the turn stays open with no hand raised (codexTurnBlocked), so a
+  // working pane does not blink to blocked at every poll or quiet spell; a pane that leaves that state, or a machine with
+  // no snapshot, forgets it. A read that fails is no evidence, said nowhere: herdr's word stands.
+  const screens = new Map<string, { revision: number; working: boolean; at: number }>();
+  const screenFlights = new Map<string, Promise<void>>();
+  /** While readScreens waits, a reading taken since it began stands, however long the reads take: each pane is read once. */
+  let freshFrom = Infinity;
+  /** `m` with what its panes' screens showed on them (`screenWorking`, the revision that showed Codex at work), the
+   *  same object when nothing changes; a pane whose screen decides it and has not been read at its revision is read. */
+  function withScreens(m: ObservatoryMachine): ObservatoryMachine {
+    const panes = m.snapshot?.panes ?? [];
+    const rows = (m.local ? (state.views?.sessions as ObservatoryMachine['sessions'])?.sessions : m.sessions?.sessions) ?? [];
+    const now = Date.now(), live = new Set<string>();
+    let due: HerdrApi.PaneInfo | undefined, dueAt = Infinity;
+    const next = panes.map(pane => {
+      const key = `${m.id}\n${pane.pane_id}`;
+      let working: number | undefined;
+      const row = pane.agent_status === 'blocked' ? rows.find(r => r.id === pane.agent_session?.value) : undefined;
+      if (row && core.codexTurnBlocked(pane, row)) {
+        live.add(key);
+        const seen = screens.get(key);
+        if (seen?.working) working = seen.revision;
+        const fresh = seen && seen.revision === pane.revision && (now - seen.at < SCREEN_READ_MS || seen.at >= freshFrom);
+        if (core.paneScreenDecides(pane, row, now) && !fresh && (seen?.at ?? 0) < dueAt) { due = pane; dueAt = seen?.at ?? 0; }
+      }
+      return (pane as { screenWorking?: number }).screenWorking === working ? pane : { ...pane, screenWorking: working };
+    });
+    for (const key of screens.keys()) if (key.startsWith(`${m.id}\n`) && !live.has(key)) screens.delete(key);
+    if (due && !screenFlights.has(m.id)) {
+      const flight = readScreen(m, due).finally(() => { screenFlights.delete(m.id); showScreens(m.id); });
+      screenFlights.set(m.id, flight);
+    }
+    return next.every((pane, i) => pane === panes[i]) ? m : { ...m, snapshot: { ...m.snapshot!, panes: next } };
+  }
+  /** Read `pane`'s visible screen as text, as herdr's CLI does (`pane read --source visible --format text`), on a saved
+   *  machine through that CLI with the remote budget, and keep what it shows with the revision it was read at. */
+  async function readScreen(m: ObservatoryMachine, pane: HerdrApi.PaneInfo): Promise<void> {
+    let working = false;
+    try {
+      const text = m.local
+        ? (await core.herdrRequest('pane.read', { pane_id: pane.pane_id, source: 'visible', format: 'text', strip_ansi: true }, options)).read.text
+        : await core.herdrOnMachine(m.label, ['pane', 'read', pane.pane_id, '--source', 'visible', '--format', 'text'], { ...remoteOptions, text: true });
+      working = typeof text === 'string' && core.codexScreenWorking(text);
+    } catch (error) { if (forgetMissingPane(m.id, pane.pane_id, error)) return; /* no evidence */ }
+    screens.set(`${m.id}\n${pane.pane_id}`, { revision: pane.revision, working, at: Date.now() });
+  }
+  /** Put what the screens read show on machine `id` as the state holds it now, and start its next read. */
+  function showScreens(id: string): void {
+    const m = closed ? undefined : state.observatory?.machines.find(x => x.id === id);
+    const next = m && withScreens(m);
+    if (!m || next === m) return;
+    state.observatory = { ...state.observatory!, machines: state.observatory!.machines.map(x => x === m ? next! : x) };
+    changed();
+  }
+  /** The screen pass over every machine as the state holds it now. */
+  const showAllScreens = (): void => { for (const m of state.observatory?.machines ?? []) showScreens(m.id); };
+  /** Settles once every pane whose screen decides it has been read, so a one-shot frame shows what the live app shows. */
+  async function readScreens(): Promise<void> {
+    freshFrom = Date.now();
+    try {
+      showAllScreens();
+      while (screenFlights.size) await Promise.all(screenFlights.values());
+    } finally { freshFrom = Infinity; }
+  }
   function machine(next: ObservatoryMachine): void {
     if (closed) return;
     const old = state.observatory!;
     const previous = old.machines.find(m => m.id === next.id && m.label === next.label);
-    next = { sessions: previous?.sessions, sessionsError: previous?.sessionsError, ...next };
+    next = withScreens({ sessions: previous?.sessions, sessionsError: previous?.sessionsError, ...next });
     const owners = { ...old.owners };
     for (const pane of next.snapshot?.panes ?? []) {
       const session = pane.agent_session?.value;
@@ -311,6 +457,11 @@ export function createObservatory(core: Core, state: DashState, opts: {
     state.observatory = { ...old, machines, owners };
     followPanes(next);
     if (!next.local) void refreshMachineSessions(next.label);
+    // A Codex pane herdr has just called blocked reads as a question waiting until its row shows the permission
+    // prompt OAK's hook recorded first (paneAgentState): this machine's sessions are listed again now, not at the
+    // app's next poll, or an approval prompt read as a question until then.
+    else if (next.snapshot?.panes.some(p => p.agent_status === 'blocked' && (p.agent_session?.agent || p.agent) === 'codex'
+      && previous?.snapshot?.panes.find(q => q.pane_id === p.pane_id)?.agent_status !== 'blocked')) void refreshSessions();
     changed();
   }
   /**
@@ -326,6 +477,7 @@ export function createObservatory(core: Core, state: DashState, opts: {
     if (!next.snapshot) return;
     for (const [leafId, detail] of Object.entries(state.observatory!.details)) {
       const sel = detail.selection;
+      if (sel.agentId) continue;
       if (!sel.paneId || sel.machineId !== next.id) continue;
       const pane = next.snapshot.panes.find(p => p.pane_id === sel.paneId);
       const session = pane?.agent_session?.value;
@@ -364,8 +516,22 @@ export function createObservatory(core: Core, state: DashState, opts: {
       onError: error => machine({ id: 'local', label: localLabel, local: true, error: errorText(error) }),
     });
   }
+  let fleetFlight: Promise<void> | undefined;
+  let fleetAt = 0;
+  function refreshMachineWorkers(): void {
+    if (!reader.workerFleet || closed || fleetFlight || Date.now() < fleetAt) return;
+    fleetFlight = reader.workerFleet(state.session, opts.cwd).then(value => {
+      const sessions = value as ObservatoryMachine['sessions'];
+      if (closed || !Array.isArray(sessions?.workers)) return;
+      state.observatory!.machines = state.observatory!.machines.map(m => m.local ? { ...m, sessions } : m);
+      changed();
+    }).catch(() => {
+      if (!closed) state.observatory!.machines = state.observatory!.machines.map(m => m.local ? { ...m, sessions: undefined } : m);
+    }).finally(() => { fleetAt = Date.now() + WORKERS_READ_MS; fleetFlight = undefined; });
+  }
   function refreshLocal(): Promise<void> {
     if (closed) return Promise.resolve();
+    refreshMachineWorkers();
     if (localFlight) { localAgain = true; return localFlight; }
     localFlight = (async () => {
       do {
@@ -392,6 +558,12 @@ export function createObservatory(core: Core, state: DashState, opts: {
         poll.active = false;
         // Retain the latch until the transport settles, even if the machine is re-enabled.
         if (!poll.flight) remotePolls.delete(id);
+      }
+      // A machine that left the list (removed, or disabled) takes its reports' waits with it: back, it starts again
+      // from the first wait rather than the longest one it had reached.
+      for (const key of failedReports.keys()) {
+        const id = key.startsWith('machine:') ? key.slice('machine:'.length) : undefined;
+        if (id !== undefined && !remotes.some(r => r.id === id)) failedReports.delete(key);
       }
       state.observatory = { ...state.observatory!, machineError: undefined,
         machines: state.observatory!.machines.filter(m => m.local || remotes.some(r => r.id === m.id)) };
@@ -456,6 +628,16 @@ export function createObservatory(core: Core, state: DashState, opts: {
     }
   }
 
+  /** Codex memory-writing threads among the sessions, by id, once each: publishStore runs on every refresh and
+   *  read each linked Codex session's agent record again. A session with no record yet is asked again. */
+  const memoryThreads = new Map<string, boolean>();
+  const isMemoryThread = (id: string): boolean => {
+    const known = memoryThreads.get(id);
+    if (known !== undefined) return known;
+    const memory = core.isCodexMemorySession(id);
+    if (memory || core.readCodexAgentMeta(id)) memoryThreads.set(id, memory);
+    return memory;
+  };
   function publishStore(): Promise<void> {
     if (closed || opts.readOnly) return Promise.resolve();
     if (publishFlight) { publishAgain = true; return publishFlight; }
@@ -466,23 +648,41 @@ export function createObservatory(core: Core, state: DashState, opts: {
         const store = (state.views?.sessions as { sessions?: { id: string; agent: string }[] } | undefined)?.sessions ?? [];
         // Multiple sessions may have used one pane. Only its newest explicit capture link can bind
         // it; never overwrite an identity herdr already reports or target a different server socket.
+        // The one exception is Codex's memory-writing thread, which an OAK before 0.11.0 linked to the
+        // pane of the session that ran it: its link binds nothing, and the pane goes back to that session.
         const latest = new Map<string, { session: string; kind: string; link: NonNullable<ReturnType<Core['readHerdrPaneLink']>> }>();
         for (const row of store) {
           const link = core.readHerdrPaneLink(row.id);
-          if (!link || (link.socketPath && link.socketPath !== core.herdrSocketPath())) continue;
+          if (!link || (link.socketPath && link.socketPath !== core.herdrSocketPath()) || (row.agent === 'codex' && isMemoryThread(row.id))) continue;
           if (!latest.has(link.paneId) || latest.get(link.paneId)!.link.at < link.at)
             latest.set(link.paneId, { session: row.id, kind: row.agent, link });
         }
         for (const pane of local?.panes ?? []) {
+          if (!state.observatory!.machines.find(m => m.local)?.snapshot?.panes.some(p => p.pane_id === pane.pane_id)) continue;
           const item = latest.get(pane.pane_id);
-          if (!item || pane.agent_session || !item.kind) continue;
-          const key = `${pane.pane_id}:${item.session}:${item.link.at}`;
-          if (linked.has(key)) continue;
+          const held = pane.agent_session?.value;
+          const replace = !!held && held !== item?.session && item?.kind === 'codex' && isMemoryThread(held);
+          // Held by its session again, the pane can be taken again: the report that gave it back is forgotten,
+          // so the next takeover is reported too. It was made once per thread and link, and a thread that took
+          // the pane a second time kept it.
+          if (item && held === item.session && healed.has(pane.pane_id)) {
+            linked.delete(healed.get(pane.pane_id)!);
+            healed.delete(pane.pane_id);
+          }
+          if (!item || (pane.agent_session && !replace) || !item.kind) continue;
+          // Taking a pane back from a memory thread is a report of its own. This app may have reported the
+          // session there itself before the thread took the pane (its snapshot did not yet show the hook's own
+          // report), and having made that report once must not stop this one.
+          const key = `${pane.pane_id}:${item.session}:${item.link.at}${replace ? `:${held}` : ''}`;
+          if (linked.has(key) || !reportDue(key)) continue;
           try {
-            await core.reportHerdrSession(item.session, item.kind, item.link, options, core);
+            await core.reportHerdrSession(item.session, item.kind, item.link, options, core, replace);
             linked.add(key);
+            unsay(failedReports.get(key)?.said);
+            failedReports.delete(key);
+            if (replace) healed.set(pane.pane_id, key);
             void refreshLocal();
-          } catch (error) { opts.status(`herdr identity: ${errorText(error)}`); }
+          } catch (error) { if (!forgetMissingPane('local', pane.pane_id, error)) reportFailed(key, error, 'herdr identity'); }
         }
         for (const session of observatorySessions(state)) {
           if (!session.paneId) continue;
@@ -491,14 +691,24 @@ export function createObservatory(core: Core, state: DashState, opts: {
           const old = reported.get(key);
           if ((!pending && !old) || (old?.pending === pending && Date.now() - old.at < TOKEN_TTL_MS / 2)) continue;
           const m = state.observatory!.machines.find(m => m.id === session.machineId)!;
+          if (!m.snapshot?.panes.some(p => p.pane_id === session.paneId)) continue;
+          const away = `machine:${m.id}`;
+          if (!reportDue(key) || !reportDue(away)) continue;
           try {
             if (m.local) await core.herdrRequest('pane.report_metadata', {
               pane_id: session.paneId, source: 'oak', tokens: { pending: pending ? String(pending) : null }, ttl_ms: TOKEN_TTL_MS,
             }, options);
             else await core.herdrOnMachine(m.label, ['pane', 'report-metadata', session.paneId, '--source', 'oak',
-              ...(pending ? ['--token', `pending=${pending}`] : ['--clear-token', 'pending']), '--ttl-ms', String(TOKEN_TTL_MS)], remoteOptions);
+              ...(pending ? ['--token', `pending=${pending}`] : ['--clear-token', 'pending']), '--ttl-ms', String(TOKEN_TTL_MS)], { ...remoteOptions, emptyOk: true });
             reported.set(key, { pending, at: Date.now() });
-          } catch (error) { opts.status(`herdr review tokens: ${errorText(error)}`); }
+            unsay(failedReports.get(key)?.said);
+            failedReports.delete(key);
+            failedReports.delete(away);
+          } catch (error) {
+            if (forgetMissingPane(m.id, session.paneId, error)) continue;
+            if (!m.local && core.herdrUnreachable(error)) reportFailed(away, error);
+            else reportFailed(key, error, 'herdr review tokens');
+          }
         }
       } while (publishAgain && !closed);
     })().finally(() => { publishFlight = undefined; });
@@ -513,26 +723,45 @@ export function createObservatory(core: Core, state: DashState, opts: {
     if (enrichments.has(paneId)) return enrichments.get(paneId);
     const detail = state.observatory?.details[paneId];
     if (!detail || detail.loading || !detail.transcriptPath || closed) return;
+    if (detail.selection.agentId) return;
     const label = owner(detail.selection);
     if (sources.get(paneId) !== label) return;
+    // The previews this read last published: the Workers read below must not take them for another read's.
+    let published = detail.previews;
     const current = () => !closed && state.observatory?.details[paneId]?.selection === detail.selection
-      && state.observatory.details[paneId].previews === detail.previews && owner(detail.selection) === label;
+      && state.observatory.details[paneId].previews === published && owner(detail.selection) === label;
     const promise = (async () => {
       const ids = new Set<number>();
       for (const { update } of detail.events) {
         if (update.sessionUpdate === 'turn_end') update.records.slice(0, 8).forEach(r => ids.add(r.id));
         if (update.sessionUpdate === 'tool_call' && update.editId) ids.add(update.editId);
       }
-      // A bounded queue avoids spawning one process per historical edit at the same instant.
       const missing = [...ids].filter(id => detail.previews[id] === undefined);
       const previews = { ...detail.previews };
-      await Promise.all([...(Array.from({ length: Math.min(4, missing.length) }, async () => {
-        while (missing.length && current()) {
-          const id = missing.shift()!;
-          try { previews[id] = await reader.diff(detail.selection.session, id, label); }
-          catch (error) { previews[id] = `(edit content unavailable${label ? ` on ${label}: ${errorText(error)}` : ' · open Review'})`; }
+      const unavailable = (why: unknown) => `(edit content unavailable${label ? ` on ${label}: ${errorText(why)}` : ' · open Review'})`;
+      await Promise.all([(async () => {
+        // A saved machine answers them all in one read: one ssh call each was 289 calls for one window of a
+        // 2,600-edit session. An OAK there from before that read answers undefined, and each is asked alone.
+        if (label && reader.diffs && missing.length) {
+          try {
+            const batch = await reader.diffs(detail.selection.session, [...missing], label);
+            if (batch) for (const id of missing.splice(0)) previews[id] = batch.patches[id] ?? unavailable(batch.errors[id] ?? `no edit #${id}`);
+          } catch (error) { for (const id of missing.splice(0)) previews[id] = unavailable(error); }
         }
-      })), (async () => {
+        // A bounded queue avoids spawning one process per historical edit at the same instant.
+        await Promise.all(Array.from({ length: Math.min(4, missing.length) }, async () => {
+          while (missing.length && current()) {
+            const id = missing.shift()!;
+            try { previews[id] = await reader.diff(detail.selection.session, id, label); }
+            catch (error) { previews[id] = unavailable(error); }
+          }
+        }));
+        // Drawn now, not when the Workers read below ends: over ssh that read is the slower one.
+        if (current() && Object.keys(previews).length > Object.keys(published).length) {
+          setDetail(paneId, { ...state.observatory!.details[paneId], previews });
+          published = previews;
+        }
+      })(), (async () => {
         if (!workers) return;
         try {
           if (Date.now() < (workerNextAt.get(paneId) ?? 0)) return;
@@ -542,7 +771,7 @@ export function createObservatory(core: Core, state: DashState, opts: {
           const started = Date.now();
           workerNextAt.set(paneId, Infinity);
           let fleet: Record<string, unknown>;
-          try { fleet = await reader.fleet(detail.selection.session, detail.selection.root || opts.cwd, label); }
+          try { fleet = await reader.fleet(detail.selection.session, detail.selection.root || opts.cwd, label); unsay(workersSaid.get(paneId)); workersSaid.delete(paneId); }
           finally {
             const took = Date.now() - started;
             workerNextAt.set(paneId, label ? Date.now() + Math.max(REMOTE_READ_MS, took) : started + Math.max(WORKERS_READ_MS, 2 * took));
@@ -553,10 +782,11 @@ export function createObservatory(core: Core, state: DashState, opts: {
             for (const event of next.events) if (event.update.sessionUpdate === 'plan') fleet.todos = event.update.entries;
             if (JSON.stringify(fleet) !== JSON.stringify(next.fleet)) setDetail(paneId, { ...next, fleet });
           }
-        } catch (error) { if (current()) opts.status(`Workers: ${errorText(error)}`); }
+        } catch (error) {
+          const said = `Workers: ${errorText(error)}`;
+          if (current() && workersSaid.get(paneId) !== said) { workersSaid.set(paneId, said); opts.status(said); }
+        }
       })()]);
-      if (current() && Object.keys(previews).length > Object.keys(detail.previews).length)
-        setDetail(paneId, { ...state.observatory!.details[paneId], previews });
     })().finally(() => { enrichments.delete(paneId); });
     enrichments.set(paneId, promise);
     return promise;
@@ -599,7 +829,8 @@ export function createObservatory(core: Core, state: DashState, opts: {
     try {
       if (machine.local) await core.herdrAgent.prompt({ target, text }, options);
       else {
-        const result = await core.herdrOnMachine(machine.label, ['agent', 'prompt', target, text], remoteOptions) as { error?: { message?: string } } | null;
+        // Sent once the person pressed Enter: quitting the app, or closing its terminal, leaves it to finish.
+        const result = await core.herdrOnMachine(machine.label, ['agent', 'prompt', target, text], { ...remoteOptions, keepOnExit: true }) as { error?: { message?: string } } | null;
         if (result?.error) throw new Error(result.error.message || 'remote prompt failed');
       }
       if (detail.reply?.commentIds?.length) {
@@ -618,12 +849,64 @@ export function createObservatory(core: Core, state: DashState, opts: {
       if (current?.selection === detail.selection)
         setDetail(paneId, { ...current, optimistic: current.optimistic?.filter(p => p !== pending),
           reply: { ...current.reply!, text, caret: text.length, sending: false, error: message } });
-      opts.status(`Reply failed: ${message}`);
+      // Not sent: the text stays in the reply box, a draft, as `oak prompt` keeps it.
+      opts.status(`Draft retained: ${message}`);
     }
+  }
+  function loadWorker(paneId: string): Promise<void> {
+    const detail = state.observatory!.details[paneId];
+    const selection = detail.selection, label = owner(selection);
+    const flight = reads.get(paneId);
+    if (flight?.selection === selection) return flight.promise;
+    const files = label ? [] : core.workerFeedPaths(selection.root || opts.cwd, selection.session, selection.agentId!);
+    const stamp = files.map(stampOf).join('|');
+    const current = () => !closed && state.observatory?.details[paneId]?.selection === selection && owner(selection) === label;
+    sources.set(paneId, label);
+    const promise = (async () => {
+      try {
+        if (!reader.feed) throw new Error('Worker log reader is unavailable.');
+        const feed = await reader.feed(selection.session, selection.root || opts.cwd, selection.agentId!, label);
+        if (!current()) return;
+        if (!Array.isArray(feed.entries) || feed.ref?.kind !== 'agent' || feed.ref.id !== selection.agentId) throw new Error('OAK returned an invalid worker log.');
+        if (label && feed.workerLogVersion !== 1) throw new Error(`Update OAK on ${label} for live worker logs.`);
+        workerLogs.set(paneId, { selection, files, stamp });
+        setDetail(paneId, { ...state.observatory!.details[paneId], feed, loading: false, error: undefined, loadedAt: Date.now() });
+      } catch (error) {
+        if (current()) setDetail(paneId, { ...state.observatory!.details[paneId], loading: false, error: `Worker log unavailable: ${errorText(error)}` });
+      } finally { if (current()) retryAt.set(paneId, Date.now() + (label ? REMOTE_READ_MS : 2000)); }
+    })().finally(() => { if (reads.get(paneId)?.promise === promise) reads.delete(paneId); });
+    reads.set(paneId, { selection, promise });
+    return promise;
+  }
+  function refreshProcesses(paneId: string, force = false): Promise<void> {
+    const detail = state.observatory?.details[paneId];
+    if (!detail || closed || !reader.processes || opts.processesVisible?.() === false) return Promise.resolve();
+    const flight = processReads.get(paneId);
+    if (flight) return flight;
+    const selection = detail.selection, label = owner(selection);
+    const held = processNext.get(paneId);
+    if (!force && held?.selection === selection && held.label === label && Date.now() < held.at) return Promise.resolve();
+    const current = () => !closed && state.observatory?.details[paneId]?.selection === selection && owner(selection) === label;
+    const promise = reader.processes(selection.session, selection.root || opts.cwd, selection.processId, opts.visibleProcesses?.(paneId) ?? [], label).then(processes => {
+      if (!current()) return;
+      if (!Array.isArray(processes.processes)) throw new Error('Invalid process list');
+      setDetail(paneId, { ...state.observatory!.details[paneId], processes, processError: undefined,
+        ...(selection.processId ? { loading: false } : {}) });
+    }).catch(error => {
+      if (current()) setDetail(paneId, { ...state.observatory!.details[paneId], processError: errorText(error), ...(selection.processId ? { loading: false } : {}) });
+    }).finally(() => {
+      processReads.delete(paneId);
+      if (current()) processNext.set(paneId, { selection, label, at: Date.now() + (label ? 10000 : 2000) });
+    });
+    processReads.set(paneId, promise);
+    return promise;
   }
   function load(paneId: string): Promise<void> {
     let previous = state.observatory?.details[paneId];
     if (!previous || closed) return Promise.resolve();
+    const processes = refreshProcesses(paneId, true);
+    if (previous.selection.processId) return processes;
+    if (previous.selection.agentId) return loadWorker(paneId);
     const selection = previous.selection;
     const label = owner(selection);
     const changedOwner = sources.has(paneId) && sources.get(paneId) !== label;
@@ -677,9 +960,18 @@ export function createObservatory(core: Core, state: DashState, opts: {
   async function tail(): Promise<void> {
     await Promise.all(Object.entries(state.observatory?.details ?? {}).map(async ([paneId, detail]) => {
       if (closed) return;
+      const processes = refreshProcesses(paneId);
       const label = owner(detail.selection);
+      if (detail.selection.processId) { await processes; return; }
       if (sources.has(paneId) && sources.get(paneId) !== label) { await load(paneId); return; }
       if (reads.has(paneId)) return;
+      if (detail.selection.agentId) {
+        const held = workerLogs.get(paneId);
+        if ((label || detail.error) && Date.now() < (retryAt.get(paneId) ?? 0)) return;
+        if (!label && !detail.error && held?.selection === detail.selection && held.stamp === held.files.map(stampOf).join('|')) return;
+        await loadWorker(paneId);
+        return;
+      }
       if (label) {
         void refreshMachineSessions(label);
         if (Date.now() < (retryAt.get(paneId) ?? 0)) return;
@@ -737,6 +1029,12 @@ export function createObservatory(core: Core, state: DashState, opts: {
   /** Settles once every pinned leaf's workers, tasks and edit previews are read (a read already in
    *  flight is joined, not repeated), so a one-shot frame can wait for them. */
   function refreshWorkers(): Promise<void> {
+    if (opts.workersVisible?.()) for (const m of state.observatory?.machines ?? []) {
+      if (!m.local && !metadataPolls.get(m.id)?.workers) void refreshMachineSessions(m.label);
+    }
+    // A detail that closed takes the Workers failure it said with it, off the status row too (no read of it would work
+    // again to take it back): opened again, its failure is said again.
+    for (const [paneId, said] of workersSaid) if (!state.observatory?.details[paneId]) { unsay(said); workersSaid.delete(paneId); }
     return Promise.all(Object.keys(state.observatory?.details ?? {}).map(paneId => enrich(paneId))).then(() => undefined);
   }
 
@@ -756,10 +1054,11 @@ export function createObservatory(core: Core, state: DashState, opts: {
     timers.push(setInterval(() => { void refreshLocal(); void refreshRemotes(); void publishStore(); }, REMOTE_POLL_MS));
     timers.push(setInterval(tail, 750));
     timers.push(setInterval(refreshWorkers, 3000));
+    timers.push(setInterval(showAllScreens, 1000));
     timers.forEach(timer => timer.unref());
   }
   return {
-    start: () => Promise.all([refreshLocal(), refreshRemotes()]), refreshLocal, refreshRemotes, refreshSessions, refreshWorkers, publishStore, load, tail, focusReply, editReply, sendReply,
+    start: () => Promise.all([refreshLocal().then(() => fleetFlight), refreshRemotes()]), refreshLocal, refreshRemotes, refreshSessions, refreshWorkers, readScreens, publishStore, load, tail, refreshProcesses, focusReply, editReply, sendReply,
     /** The host read this machine's session list itself, starting at `startedAt` (see `listedAt`). */
     sessionsRead,
     async current(): Promise<ObservatorySelection> {
@@ -770,13 +1069,15 @@ export function createObservatory(core: Core, state: DashState, opts: {
     },
     async focus(selection: ObservatorySelection): Promise<void> {
       const session = observatorySessions(state).find(s => s.session === selection.session && (!selection.machineId || s.machineId === selection.machineId));
-      const m = state.observatory?.machines.find(m => m.id === session?.machineId);
-      if (!session?.paneId || !m) throw new Error('This session has no live herdr pane.');
-      if (m.local) await core.herdrRequest('pane.focus', { pane_id: session.paneId }, options);
+      // A delegated agent's row names its pane and machine itself, before its session has a row of its own.
+      const m = state.observatory?.machines.find(m => m.id === (session?.machineId ?? selection.machineId));
+      const paneId = session?.paneId ?? selection.paneId;
+      if (!paneId || !m) throw new Error('This session has no live herdr pane.');
+      if (m.local) await core.herdrRequest('pane.focus', { pane_id: paneId }, options);
       else {
         // Protocol 22's CLI pane focus accepts a DIRECTION, not an id. agent focus accepts either
         // a name or pane id and forwards the correct pane.focus operation to the remote machine.
-        const target = m.snapshot?.agents.find(a => a.pane_id === session.paneId)?.name || session.paneId;
+        const target = m.snapshot?.agents.find(a => a.pane_id === paneId)?.name || paneId;
         const result = await core.herdrOnMachine(m.label, ['agent', 'focus', target], remoteOptions) as { error?: { message?: string } } | null;
         if (result?.error) throw new Error(result.error.message || 'remote focus failed');
       }

@@ -7,7 +7,6 @@ import com.intellij.openapi.actionSystem.AnActionEvent
 import com.intellij.openapi.actionSystem.ToggleAction
 import com.intellij.openapi.actionSystem.impl.ActionToolbarImpl
 import com.intellij.openapi.actionSystem.impl.SimpleDataContext
-import com.intellij.testFramework.fixtures.BasePlatformTestCase
 import java.awt.Container
 import javax.swing.JTabbedPane
 
@@ -20,7 +19,7 @@ import javax.swing.JTabbedPane
  * in a compile or a pure unit test can see that, so this builds the panel both ways and reads the titles
  * back after the badge writes have run.
  */
-class GroupedNavTest : BasePlatformTestCase() {
+class GroupedNavTest : ObservatoryPlatformTestCase() {
 
     private var saved = false
 
@@ -45,9 +44,10 @@ class GroupedNavTest : BasePlatformTestCase() {
 
     fun testUngroupedKeepsOneTabPerMember() {
         ObservatorySettings.instance.state.overviewGroupedNav = false
-        val strip = stripOf(ChangeMapPanel(project))
-        // Processes is absent until `processes --json` answers, which it cannot here.
-        assertEquals(listOf("Sessions", "Workers", "Workflows", "Tasks"), titles(strip))
+        val panel = ChangeMapPanel(project)
+        val strip = stripOf(panel)
+        assertEquals(listOf("Sessions", "Workers", "Processes", "Tasks", "Workflows"), titles(strip))
+        assertNotNull("Processes is present before the CLI answers", panel.selectNavTab("processes"))
     }
 
     fun testGroupedRendersTwoGroupTabsAndNoBadgeWriteRelabelsThem() {
@@ -56,9 +56,9 @@ class GroupedNavTest : BasePlatformTestCase() {
         val strip = stripOf(panel)
         // Construction already ran repaintSessions / repaintTasks / repaintNavCounts, so every badge write
         // this panel makes has happened by now. The group titles must still be the group titles.
-        assertEquals(listOf("Sessions · Workers · Workflows · Tasks · Processes"), titles(strip))
+        assertEquals(listOf("Sessions · Workers · Processes · Tasks · Workflows"), titles(strip))
         // And every member the guided tour may name still resolves to one of those two tabs.
-        for (m in ChangeMapPanel.TOUR_TABS.filter { it != "processes" }) {
+        for (m in ChangeMapPanel.TOUR_TABS) {
             assertNotNull("grouped mode cannot bring \"$m\" forward", panel.selectNavTab(m))
         }
         assertEquals("the five member names are unchanged", 5, ChangeMapPanel.TOUR_TABS.size)
@@ -74,12 +74,12 @@ class GroupedNavTest : BasePlatformTestCase() {
         )
         assertFalse("it starts off", toggle.isSelected(e))
         toggle.setSelected(e, true)
-        assertEquals(listOf("Sessions · Workers · Workflows · Tasks · Processes"), titles(stripOf(panel)))
+        assertEquals(listOf("Sessions · Workers · Processes · Tasks · Workflows"), titles(stripOf(panel)))
         assertTrue(toggle.isSelected(e))
         toggle.setSelected(e, false)
         // Back to one tab per member, WITH their badges re-written — a rebuild that forgot to re-badge would
         // leave the names bare, which is indistinguishable here from correct, so assert the count instead.
-        assertEquals(listOf("Sessions", "Workers", "Workflows", "Tasks"), titles(stripOf(panel)))
+        assertEquals(listOf("Sessions", "Workers", "Processes", "Tasks", "Workflows"), titles(stripOf(panel)))
         assertFalse(toggle.isSelected(e))
     }
 

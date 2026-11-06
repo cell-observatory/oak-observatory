@@ -2,6 +2,7 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
+const { gitDir: makeGitDir } = require('../../../test/fixtures/git.cjs');
 const os = require('node:os');
 const cp = require('node:child_process');
 const crypto = require('node:crypto');
@@ -21,7 +22,7 @@ function fixture(t) {
   process.env.CODEX_HOME = path.join(base, 'codex');
   const cwd = path.join(base, 'workspace'), session = 'facts-session';
   fs.mkdirSync(cwd, { recursive: true });
-  fs.mkdirSync(path.join(cwd, '.git'));
+  makeGitDir(path.join(cwd, '.git'));
   fs.mkdirSync(core.projectDir(cwd), { recursive: true });
   core.ensureStore(session); fs.writeFileSync(core.logPath(session), '');
   const file = path.join(core.projectDir(cwd), session + '.jsonl');
@@ -532,7 +533,7 @@ test('derived facts: persisted relative edit paths resolve in the consuming proc
 
 // The schema version is part of the cache FILE NAME, so the
 // generation a bump supersedes is addressed by nothing — it used to survive every `oak clean`
-// forever, one dead file per transcript per bump (471 files / 47.6 MB measured on a real store).
+// forever, one dead file per transcript per bump (hundreds of files on a real store).
 test('derived facts: a schema bump leaves no stale generation behind after a prune', t => {
   const f = fixture(t);
   fs.writeFileSync(f.file, f.jsonl([f.call(0, 'read-one', 'Read', { file_path: 'a.ts' })]));

@@ -660,14 +660,14 @@ class PortParserTest {
         val json = """
             {"session":"s1","summary":{"total":2,"withEdits":1,"edits":3},
              "prompts":[
-               {"id":"0381d2f21f10","index":1,"ts":1000,"endTs":5000,
-                "text":"fold all of that into 0.8.6 and ship it","title":"fold all of that into 0.8.6 and ship it",
+               {"id":"0000000000a1","index":1,"ts":1000,"endTs":5000,
+                "text":"add retry logic to the uploader and ship it","title":"add retry logic to the uploader and ship it",
                 "editIds":[4,5,9],"edits":3,"added":0,"removed":0,"pending":2,"kept":1,"undone":0,
                 "files":2,"folders":1,"tokens":135000,"tasks":4,
                 "actions":14,"errors":1,"agents":["toolu_a1"],"workflows":["wf_1"],"processes":["toolu_b1","toolu_b2"],
                 "compactions":1,"durationMs":4000},
-               {"id":"b66dc615f487","index":2,"ts":5000,"endTs":0,
-                "text":"is everything installed locally?","title":"is everything installed locally?",
+               {"id":"0000000000a2","index":2,"ts":5000,"endTs":0,
+                "text":"did the uploader tests pass?","title":"did the uploader tests pass?",
                 "editIds":[],"edits":0,"added":0,"removed":0,"pending":0,"kept":0,"undone":0,
                 "actions":3,"errors":0,"agents":[],"workflows":[],"processes":[],"compactions":0,"durationMs":57000}
              ]}
@@ -678,7 +678,7 @@ class PortParserTest {
         assertEquals(1, res.summary.withEdits)
         assertEquals(3, res.summary.edits)
         val first = res.prompts[0]
-        assertEquals("0381d2f21f10", first.id)
+        assertEquals("0000000000a1", first.id)
         assertEquals(1, first.index) // 1-based, the way a person counts their own turns
         assertEquals(listOf(4, 5, 9), first.editIds) // the review scope the Prompt axis acts on
         assertEquals(2, first.pending)
@@ -718,9 +718,9 @@ class PortParserTest {
     fun `PromptsParser reads Claude's response to one ask`() {
         // Mirrors `prompts --id N --response --json` — the prose a reviewer expands to read.
         val resp = PromptsParser.parseResponse(
-            """{"session":"s1","response":{"promptId":"0381d2f21f10","index":1,"text":"Here is what I did…","turns":3,"bytes":18,"truncated":0}}""",
+            """{"session":"s1","response":{"promptId":"0000000000a1","index":1,"text":"Here is what I did…","turns":3,"bytes":18,"truncated":0}}""",
         )!!
-        assertEquals("0381d2f21f10", resp.promptId)
+        assertEquals("0000000000a1", resp.promptId)
         assertEquals(1, resp.index)
         assertEquals("Here is what I did…", resp.text)
         assertEquals(3, resp.turns)

@@ -93,6 +93,69 @@ test('focus server routes only validated focus requests to attached watchers', t
   watcher.destroy(); sender.destroy();
 });
 
+test('focus server stops once a store move takes its endpoint away, so the next terminal starts one where the store went', t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-focus-move-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  /** One server over an in-memory transport, its endpoint `sock()`; returns what a test needs to drive it. */
+  const start = (sock) => {
+    let accept, closed = false;
+    const server = new EventEmitter();
+    server.listen = (_path, ready) => ready();
+    server.close = () => { closed = true; };
+    const timers = [];
+    const module = { exports: {} };
+    const fakeCore = { ...core, daemonPaths: () => ({ dir, sockDir: dir, sock: sock(), pid: path.join(dir, 'pid') }),
+      readDaemonPid: () => null, reclaimStaleDaemon: () => false };
+    const context = { exports: module.exports, module,
+      require: name => name === 'net' ? { createServer: fn => { accept = fn; return server; } } : name === 'fs' ? { ...fs, chmodSync: () => {} } : require(name),
+      process: { ...process, platform: 'linux', on() {}, stderr: { write() {} }, exit: code => { throw Error(`exit ${code}`); } },
+      setTimeout: (fn, ms) => { const timer = { fn, ms, unref() {} }; timers.push(timer); return timer; }, clearTimeout() {} };
+    vm.runInNewContext(fs.readFileSync(path.resolve(__dirname, '../dist/server.js'), 'utf8'), context);
+    module.exports.runServer(fakeCore);
+    const terminal = new Socket(); accept(terminal);
+    terminal.receive({ op: 'hello', protocol: core.DAEMON_PROTOCOL });
+    terminal.receive({ op: 'watch', id: 1 });
+    return { terminal, closed: () => closed, check: () => timers.filter(timer => timer.ms === 2000).at(-1).fn() };
+  };
+  // The store's location names another endpoint (a move, or a new path too long for a socket).
+  let at = path.join(dir, 'focus.sock');
+  const one = start(() => at);
+  one.check();
+  assert.equal(one.closed(), false, 'control: a store that stayed keeps its server');
+  at = path.join(dir, 'moved', 'focus.sock');
+  one.check();
+  assert.equal(one.closed(), true, 'a store that moved stops it');
+  assert.deepEqual(one.terminal.messages.at(-1), { event: 'bye' }, 'and its terminal is told, so it reconnects');
+  // The same path, but not the socket it bound: a copied store leaves the socket out. (Windows has no socket file,
+  // and the server checks none there.)
+  if (process.platform === 'win32') return;
+  const file = path.join(dir, 'same.sock');
+  const pidfile = path.join(dir, 'pid');
+  fs.writeFileSync(file, '');
+  const two = start(() => file);
+  two.check();
+  assert.equal(two.closed(), false, 'control: its own socket keeps it');
+  fs.rmSync(file); fs.writeFileSync(file, 'x');
+  // Meanwhile a server started where the store is now holds the pidfile too.
+  fs.writeFileSync(pidfile, '424242');
+  two.check();
+  assert.equal(two.closed(), true, 'another file where its socket was stops it');
+  // Stopping, it removes its own socket and pidfile only: removed by path, the new server's endpoint went with them, and
+  // it ran on unreachable, its pidfile gone, so the next terminal started a second one.
+  assert.equal(fs.readFileSync(file, 'utf8'), 'x', "the socket that replaced it is left to its server");
+  assert.equal(fs.readFileSync(pidfile, 'utf8'), '424242', "and so is that server's pidfile");
+  // Its socket gone, with nothing in its place (a move by copying leaves it out): it stops too.
+  fs.writeFileSync(file, '');
+  const three = start(() => file);
+  three.check();
+  assert.equal(three.closed(), false, 'control: its own socket keeps it');
+  assert.equal(fs.readFileSync(pidfile, 'utf8'), String(process.pid), 'control: the pidfile is its own');
+  fs.rmSync(file);
+  three.check();
+  assert.equal(three.closed(), true, 'a socket that is gone stops it');
+  assert.equal(fs.existsSync(pidfile), false, 'and its own pidfile goes with it');
+});
+
 test('focus: a socket fallback directory that is a symbolic link is refused, never chmodded', { skip: process.platform === 'win32' && 'the ownership check is POSIX only' }, t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-focus-link-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
@@ -122,7 +185,7 @@ test('focus: live socket round trip', async t => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-focus-live-'));
   const previous = process.env.CLAUDE_CONFIG_DIR;
   process.env.CLAUDE_CONFIG_DIR = dir;
-  t.after(() => { if (previous === undefined) delete process.env.CLAUDE_CONFIG_DIR; else process.env.CLAUDE_CONFIG_DIR = previous; fs.rmSync(dir, { recursive: true, force: true }); });
+  t.after(() => { if (previous === undefined) delete process.env.CLAUDE_CONFIG_DIR; else process.env.CLAUDE_CONFIG_DIR = previous; (() => { try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }); } catch { /* a child's late write: never skip the stop hooks after this one */ } })(); });
   const paths = core.daemonPaths(); fs.mkdirSync(paths.sockDir, { recursive: true });
   const sockets = new Set();
   const server = net.createServer(socket => {
@@ -148,4 +211,92 @@ test('focus: live socket round trip', async t => {
   const seen = []; client.on(event => { if (event.event === 'focus') seen.push(event); });
   assert.equal((await client.request({ op: 'focus', session: 'native-session', tab: 'observatory' })).event, 'ok');
   assert.deepEqual(seen, [{ event: 'focus', session: 'native-session', tab: 'observatory' }]);
+});
+
+// A zombie (exited, its parent never collected it) still answers signal 0. On the Mac an old focus server whose parent
+// app had not collected it read as one that "did not stop", so `oak doctor` reported a problem that was not there and a
+// new server would not start over it (2026-11-05).
+test('focus server: a zombie counts as stopped where the server is started, stopped and reported', { skip: process.platform === 'win32' && 'POSIX processes' }, async t => {
+  const { spawn } = require('node:child_process');
+  // The shell backgrounds a short process, then becomes `sleep`, which never collects it: a zombie for as long as it sleeps.
+  const parent = spawn('/bin/sh', ['-c', 'sleep 0 & echo $!; exec sleep 30'], { stdio: ['ignore', 'pipe', 'ignore'] });
+  t.after(() => parent.kill('SIGKILL'));
+  const zombie = Number((await new Promise(resolve => parent.stdout.once('data', resolve))).toString().trim());
+  for (let i = 0; i < 50; i++) {
+    const r = require('node:child_process').spawnSync('ps', ['-o', 'stat=', '-p', String(zombie)], { encoding: 'utf8' });
+    if (/^\s*Z/.test(r.stdout)) break;
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  assert.match(require('node:child_process').spawnSync('ps', ['-o', 'stat=', '-p', String(zombie)], { encoding: 'utf8' }).stdout, /^\s*Z/, 'control: the child is a zombie');
+  assert.equal(core.pidAlive(zombie), true, 'signal 0 alone still reaches it');
+  assert.equal(core.pidAlive(zombie, { reaped: true }), false, 'a zombie is gone for the focus server');
+  assert.equal(core.pidAlive(parent.pid, { reaped: true }), true, 'a running process is not');
+
+  // The pidfile names the zombie and nothing listens: a stale pidfile, which stop and a new start both clear.
+  const paths = core.daemonPaths();
+  for (const dir of new Set([paths.dir, paths.sockDir])) fs.mkdirSync(dir, { recursive: true });
+  const leftBehind = () => { fs.writeFileSync(paths.pid, String(zombie)); fs.writeFileSync(paths.sock, ''); };
+  leftBehind();
+  const status = await core.daemonStatus();
+  assert.deepEqual([status.running, status.pid, status.stale], [false, zombie, true], 'status: a stale pidfile, not a server');
+  assert.equal(core.reclaimStaleDaemon(), true, 'start: the zombie\'s pidfile and socket are reclaimed');
+  assert.deepEqual([fs.existsSync(paths.pid), fs.existsSync(paths.sock)], [false, false]);
+  leftBehind();
+  assert.deepEqual(await core.stopDaemon(), { stopped: false, why: 'no oak server is running' });
+  assert.equal(fs.existsSync(paths.pid), false, 'stop: the pidfile is reclaimed');
+
+  // The server itself starts over a pidfile that names the zombie.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-focus-zombie-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const transport = new EventEmitter();
+  transport.listen = (_path, ready) => ready();
+  transport.close = () => {};
+  let reclaimed = false;
+  const module = { exports: {} };
+  const fakeCore = { ...core, daemonPaths: () => ({ dir, sockDir: dir, sock: path.join(dir, 'focus.sock'), pid: path.join(dir, 'pid') }),
+    readDaemonPid: () => zombie, reclaimStaleDaemon: () => { reclaimed = true; return true; } };
+  vm.runInNewContext(fs.readFileSync(path.resolve(__dirname, '../dist/server.js'), 'utf8'), { exports: module.exports, module,
+    require: name => name === 'net' ? { createServer: () => transport } : name === 'fs' ? { ...fs, chmodSync: () => {} } : require(name),
+    process: { ...process, on() {}, stderr: { write() {} }, exit: code => { throw Error(`exit ${code}`); } },
+    setTimeout: () => ({ unref() {} }), clearTimeout: () => {} });
+  module.exports.runServer(fakeCore);
+  assert.equal(reclaimed, true, 'start: the server reclaims the zombie\'s pidfile instead of exiting "already running"');
+  assert.equal(fs.readFileSync(path.join(dir, 'pid'), 'utf8'), String(process.pid));
+
+  // A server that answers, then becomes a zombie once told to shut down: stop says it stopped, and does not wait it out.
+  const sockets = new Set();
+  const server = net.createServer(socket => {
+    sockets.add(socket); socket.on('close', () => sockets.delete(socket));
+    socket.write(JSON.stringify({ event: 'hello', protocol: core.DAEMON_PROTOCOL, pid: zombie }) + '\n');
+    socket.on('data', chunk => { if (String(chunk).includes('"shutdown"')) socket.destroy(); });
+  });
+  t.after(async () => { for (const socket of sockets) socket.destroy(); if (server.listening) await new Promise(resolve => server.close(resolve)); });
+  try { await new Promise((resolve, reject) => { server.once('error', reject); server.listen(paths.sock, resolve); }); }
+  catch (error) {
+    if (!['EPERM', 'EACCES', 'EAFNOSUPPORT'].includes(error.code)) throw error;
+    const reason = `SKIP FOCUS SOCKET: Unix socket binding unavailable (${error.code}); stop over a live connection not verified.`;
+    console.error(reason); t.skip(reason); return;
+  }
+  const began = Date.now();
+  assert.deepEqual(await core.stopDaemon(6000), { stopped: true, why: '' });
+  assert.ok(Date.now() - began < 3000, `stop returns once the server is a zombie, not at its deadline (${Date.now() - began} ms)`);
+});
+
+// `/proc/<pid>/stat` is `pid (name) state …`, and the name may hold `) ` itself: read from the first `)`, a live process
+// named `s) Z s` is a zombie, and a zombie named `z) S z` is alive.
+test('focus server: a process name holding ") " does not decide whether it is a zombie', { skip: process.platform !== 'linux' && '/proc is Linux only' }, async t => {
+  const { spawn, spawnSync } = require('node:child_process');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-zombie-name-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const sleep = spawnSync('/bin/sh', ['-c', 'command -v sleep'], { encoding: 'utf8' }).stdout.trim();
+  for (const name of ['z) S z', 's) Z s']) fs.symlinkSync(sleep, path.join(dir, name));
+  const parent = spawn('/bin/sh', ['-c', '"$1" 0 & echo $!; exec "$2" 30', 'sh', path.join(dir, 'z) S z'), path.join(dir, 's) Z s')], { stdio: ['ignore', 'pipe', 'ignore'] });
+  t.after(() => parent.kill('SIGKILL'));
+  const zombie = Number((await new Promise(resolve => parent.stdout.once('data', resolve))).toString().trim());
+  const stat = pid => { try { return fs.readFileSync(`/proc/${pid}/stat`, 'utf8'); } catch { return ''; } };
+  for (let i = 0; i < 50 && !(stat(zombie).startsWith(`${zombie} (z) S z) Z `) && stat(parent.pid).startsWith(`${parent.pid} (s) Z s) `)); i++) await new Promise(resolve => setTimeout(resolve, 20));
+  assert.match(stat(zombie), /^\d+ \(z\) S z\) Z /, 'control: a zombie named "z) S z"');
+  assert.match(stat(parent.pid), /^\d+ \(s\) Z s\) S /, 'control: a sleeping process named "s) Z s"');
+  assert.equal(core.pidAlive(zombie, { reaped: true }), false, 'the zombie is gone');
+  assert.equal(core.pidAlive(parent.pid, { reaped: true }), true, 'the sleeping process is alive');
 });

@@ -4,6 +4,8 @@ import com.cellobservatory.observatory.core.StoreReader
 import com.cellobservatory.observatory.model.Feed
 import com.cellobservatory.observatory.model.FeedEntry
 import com.cellobservatory.observatory.model.Md
+import com.cellobservatory.observatory.model.graphemeHead
+import com.cellobservatory.observatory.model.revealedRuns
 import com.cellobservatory.observatory.services.ObservatoryService
 import com.intellij.openapi.project.Project
 import com.intellij.ui.SimpleTextAttributes
@@ -161,16 +163,20 @@ class FeedPanel(private val project: Project) : JPanel(BorderLayout()) {
                 val idx = list.locationToIndex(e.point)
                 if (idx < 0) return
                 val row = model.getElementAt(idx) ?: return
+                val ref = currentRef() ?: return
+                if (subjectKey != "${ref.machine.orEmpty()}\u0000${ref.session}\u0000${ref.kind}\u0000${ref.id}") return
                 if (e.clickCount == 2) {
                     val id = row.entry.editId ?: row.entry.previewId
                     if (id != null) {
                         val session = currentRef()?.session ?: return
+                        (currentRef()?.machine ?: service.currentMachine())?.let { RemoteEditorReview.open(project, it, session, edit = id); return }
                         // The STACKED layout for that file's changes, not the side-by-side view
                         // — scoped to the subject session's own store.
                         StoreReader.findRecord(session, id)?.let { Diffs.showFileStacked(project, session, it.file) }
                         return
                     }
                     // No edit behind it — a path-like target still opens as a file.
+                    if (currentRef()?.machine != null || service.currentMachine() != null) return
                     val t = row.entry.target ?: return
                     if (!pathishTarget(t)) return
                     val ws = service.workspaceRoot
@@ -209,7 +215,7 @@ class FeedPanel(private val project: Project) : JPanel(BorderLayout()) {
         if (picked != null) return picked.copy(limit = pageDepth)
         if (sel != null) service.selectedFeed = null // stale pick from another session — drop it
         val session = current ?: return null
-        return ObservatoryService.FeedRef(session, "session", "", limit = pageDepth)
+        return ObservatoryService.FeedRef(session, "session", "", limit = pageDepth, machine = service.currentMachine())
     }
 
     fun refresh(force: Boolean = false) {
@@ -226,7 +232,7 @@ class FeedPanel(private val project: Project) : JPanel(BorderLayout()) {
         }
         if (service.selectedFeed != null) pendingPrompt = null
         val ref = currentRef()
-        val key = ref?.let { "${it.session}\u0000${it.kind}\u0000${it.id}" }
+        val key = ref?.let { "${it.machine.orEmpty()}\u0000${it.session}\u0000${it.kind}\u0000${it.id}" }
         if (key != subjectKey) {
             // A new subject: its blobs open fresh, its depth starts over, the old scroll means nothing.
             subjectKey = key
@@ -536,7 +542,9 @@ internal class FeedBlobRenderer(private val isOpen: (String) -> Boolean) : ListC
                     panel.add(line {
                         font = FEED_MONO_F
                         val attrs = if (band != null) SimpleTextAttributes.REGULAR_ATTRIBUTES else SimpleTextAttributes.GRAYED_ATTRIBUTES
-                        append("      " + clipStr(dl, 160), attrs)
+                        // A bidirectional control or zero-width character in the file shows as the mark that names it
+                        // (`⟨U+202E⟩`), greyed: drawn as it is, it shows as nothing and reorders the line around it.
+                        for ((run, mark) in revealedRuns("      " + clipStr(dl, 160))) append(run, if (mark) SimpleTextAttributes.GRAYED_ITALIC_ATTRIBUTES else attrs)
                         if (band != null) {
                             isOpaque = true
                             background = band
@@ -641,7 +649,7 @@ internal val FEED_CLOCK_F: java.time.format.DateTimeFormatter =
 
 private fun clockOfMs(ts: Long): String = FEED_CLOCK_F.format(java.time.Instant.ofEpochMilli(ts))
 
-private fun clipStr(s: String, n: Int): String = if (s.length <= n) s else s.take(n - 1) + "…"
+private fun clipStr(s: String, n: Int): String = if (s.length <= n) s else graphemeHead(s, n - 1) + "…"
 
 /** A header line that WRAPS at the panel's width instead of cutting its text — read-only, unframed,
  *  hidden until it has something to say. */

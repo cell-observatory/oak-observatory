@@ -37,7 +37,7 @@ function runtime(t) {
   let paints = 0;
   const app = createObservatory({ ...core, findHerdrBin: () => null,
     conversationEvents() { throw new Error('main-thread full read'); }, conversationTail() { throw new Error('main-thread tail'); },
-  }, state, { cwd: dir, watch: false, timers: false, changed() { paints++; }, status() {} });
+  }, state, { cwd: dir, watch: false, timers: false, processesVisible: () => false, changed() { paints++; }, status() {} });
   t.after(() => { app.close(); fs.rmSync(dir, { recursive: true, force: true }); });
   const payload = { events: [], cursor: 8, turns: 0, agent: 'claude', transcriptPath: file };
   return { state, app, calls, payload, file, paints: () => paints };
@@ -109,15 +109,28 @@ test('remote conversation reader forwards conversation, metadata, previews and w
       assert.equal(call.options.env.OAK_MACHINE_TIMEOUT_MS, '45000');
       call.reply(payload); assert.deepEqual(await result, payload);
     }
-    const sessions = reader.sessions('fixture-session', '/remote', 'build-box');
-    assert.deepEqual(calls.at(-1).args.slice(1), ['sessions', '--json', '--session', 'fixture-session', '--root', '/remote', '--machine', 'build-box']);
+    const sessions = reader.sessions('fixture-session', '/remote', 'build-box', true); await tick();
+    assert.deepEqual(calls.at(-1).args.slice(1), ['sessions', '--json', '--workers', '--session', 'fixture-session', '--root', '/remote', '--machine', 'build-box']);
     calls.at(-1).reply({ sessions: [{ id: 'fixture-session', title: 'Remote title' }] });
     assert.equal((await sessions).sessions[0].title, 'Remote title');
     const diff = reader.diff('fixture-session', 7, 'build-box');
     assert.deepEqual(calls.at(-1).args.slice(1), ['diff', '7', '--patch', '--session', 'fixture-session', '--machine', 'build-box']);
     calls.at(-1).child.stdout.emit('data', Buffer.from('+remote\n')); calls.at(-1).child.emit('close', 0); assert.equal(await diff, '+remote\n');
+    // Every preview in one read; an OAK there from before it refuses more than ten ids, or answers its review page.
+    const diffs = reader.diffs('fixture-session', [7, 8], 'build-box');
+    assert.deepEqual(calls.at(-1).args.slice(1), ['diff', '--ids', '7,8', '--patch', '--session', 'fixture-session', '--machine', 'build-box']);
+    calls.at(-1).reply({ patches: { 7: '+seven\n' }, errors: { 8: 'no edit #8 in session fixture-session' } });
+    assert.deepEqual(await diffs, { patches: { 7: '+seven\n' }, errors: { 8: 'no edit #8 in session fixture-session' } });
+    for (const old of [{ status: 1, stderr: 'oak: diff --ids accepts 1–10 positive edit ids' }, { status: 0, stdout: '{"records":[]}' }]) {
+      const read = reader.diffs('fixture-session', [7], 'build-box');
+      if (old.stderr) calls.at(-1).child.stderr.emit('data', Buffer.from(old.stderr)); else calls.at(-1).child.stdout.emit('data', Buffer.from(old.stdout));
+      calls.at(-1).child.emit('close', old.status); assert.equal(await read, undefined);
+    }
+    const down = reader.diffs('fixture-session', [7], 'build-box');
+    calls.at(-1).child.stderr.emit('data', Buffer.from('ssh: build-box: unreachable')); calls.at(-1).child.emit('close', 255);
+    await assert.rejects(down, /unreachable/);
     const fleet = reader.fleet('fixture-session', '/remote', 'build-box');
-    assert.equal(calls.at(-1).args[1], 'multitask'); assert.deepEqual(calls.at(-1).args.slice(-2), ['--machine', 'build-box']);
+    assert.deepEqual(calls.at(-1).args.slice(1), ['multitask', '--json', '--only-session', '--session', 'fixture-session', '--root', '/remote', '--machine', 'build-box']);
     calls.at(-1).reply({ agents: [] }); await new Promise(resolve => setImmediate(resolve));
     assert.equal(calls.at(-1).args[1], 'subagents'); assert.deepEqual(calls.at(-1).args.slice(-2), ['--machine', 'build-box']);
     calls.at(-1).reply({ subagents: [{ agentId: 'worker' }] }); assert.equal((await fleet).subagents[0].agentId, 'worker');
@@ -131,7 +144,7 @@ test('remote conversation reader forwards conversation, metadata, previews and w
 });
 
 // A pinned, working session read its conversation, previews, workers and the session list with a cold
-// `oak` start each: 180+ processes and over a core a minute. This machine's reads go
+// `oak` start each: nearly two hundred processes a minute, and more than a core. This machine's reads go
 // through ONE warm worker now; a view it could not build is asked of a cold child, whose error is the one
 // reported; another machine's reads never reach it.
 test('conversation reader: this machine\'s reads ride one warm worker; a view it cannot build falls back cold', async () => {
@@ -150,7 +163,7 @@ test('conversation reader: this machine\'s reads ride one warm worker; a view it
     served[2].answer({ diff: { session: 'fixture-session', id: 7, file: '/local/a.ts', patch: '@@ -1 +1 @@\n-a\n+b' } });
     assert.equal(await diff, '@@ -1 +1 @@\n-a\n+b\n', 'the patch `oak diff 7 --patch` prints');
     const fleet = reader.fleet('fixture-session', '/local'); await tick();
-    assert.deepEqual([served[3].views, served[3].args], [['multitask'], ['--session', 'fixture-session', '--root', '/local']]);
+    assert.deepEqual([served[3].views, served[3].args], [['multitask'], ['--only-session', '--session', 'fixture-session', '--root', '/local']]);
     served[3].answer({ multitask: { agents: [{ session: 'fixture-session', subagents: [{ agentId: 'w1' }], todos: [] }] } });
     assert.equal((await fleet).subagents[0].agentId, 'w1');
     const sessions = reader.sessions('fixture-session', '/local'); await tick();
@@ -168,6 +181,41 @@ test('conversation reader: this machine\'s reads ride one warm worker; a view it
     const remote = reader.read('fixture-session', '/remote', undefined, 'build-box'); await tick();
     assert.equal(served.length, 6); assert.equal(calls.at(-1).args.at(-1), 'build-box');
     calls.at(-1).reply({ events: [], cursor: 1 }); await remote;
+  } finally { reader.close(); }
+});
+
+// A saved machine's live panes are read on their owner; cached session records cannot know a newly
+// launched agent. The runtime coalesces and throttles these background reads per machine.
+test('conversation reader: saved-machine workers read their owner instead of a warm historical catalog', async () => {
+  const { core, calls, served } = transport({ warm: true });
+  const reader = createConversationReader(core, '/local');
+  try {
+    const first = reader.sessions('fixture-session', '/remote', 'build-box', true); await tick();
+    assert.equal(served.length, 0, 'the warm historical catalog cannot supply live herdr panes');
+    assert.deepEqual(calls[0].args.slice(1), ['sessions', '--json', '--workers', '--session', 'fixture-session', '--root', '/remote', '--machine', 'build-box']);
+    calls[0].reply({ sessions: [{ id: 'remote-1', title: 'Live there' }], workers: [{ session: 'remote-1', title: 'Verify widgets', state: 'working' }] });
+    const result = await first;
+    assert.equal(result.sessions[0].title, 'Live there');
+    assert.equal(result.workers[0].title, 'Verify widgets');
+  } finally { reader.close(); }
+});
+
+// Whether a session has a local copy of another machine's transcript cost a cold `oak` start each time it was asked; the
+// warm worker answers it, and a cold child only when the worker cannot.
+test('conversation reader: the check for a local copy of a transcript rides the warm worker; a cold child only when it cannot answer', async () => {
+  const { core, calls, served } = transport({ warm: true });
+  const reader = createConversationReader(core, '/local');
+  try {
+    const first = reader.mirror('fixture-session', '/local'); await tick();
+    assert.deepEqual([served[0].views, served[0].args], [['conversation'], ['--source-info', '--session', 'fixture-session', '--root', '/local']]);
+    served[0].answer({ conversation: { mirrored: true, syncedAt: 1_800_000_000_000 } });
+    assert.deepEqual(await first, { mirrored: true, syncedAt: 1_800_000_000_000 });
+    assert.equal(calls.length, 0, 'no cold child');
+    const second = reader.mirror('fixture-session', '/local'); await tick();
+    served[1].answer({ conversation: null, __problems: { conversation: 'view conversation exited 1' } }); await tick();
+    assert.deepEqual(calls[0].args.slice(1), ['conversation', '--source-info', '--json', '--session', 'fixture-session', '--root', '/local']);
+    calls[0].reply({ mirrored: false });
+    assert.deepEqual(await second, { mirrored: false });
   } finally { reader.close(); }
 });
 
@@ -283,4 +331,45 @@ test('remote conversation reader names deadlines, kills a stuck child and reject
   assert.equal(timers[1].ms, 1000); timers[1].fn();
   assert.deepEqual(signals, ['SIGTERM', 'SIGKILL']);
   calls[0].child.emit('close', 0); reader.close();
+});
+
+for (const machine of [undefined, 'build-box']) test(`process list errors remain unavailable, not empty: ${machine || 'local'}`, async () => {
+  const { core, calls } = transport();
+  const reader = createConversationReader(core, '/local');
+  try {
+    const pending = reader.processes('missing', '/local', undefined, [], machine);
+    const rejected = assert.rejects(pending, /no transcript found/);
+    await tick();
+    calls[0].reply({ session: 'missing', transcript: null, error: 'no transcript found for this session under this directory' });
+    await rejected;
+  } finally { reader.close(); }
+});
+
+test('Workers reader uses the warm view and retains its cold fallback', async () => {
+  const { core, calls, served } = transport({ warm: true });
+  const reader = createConversationReader(core, '/workspace');
+  try {
+    const first = reader.workerFleet('s', '/workspace'); await tick();
+    assert.deepEqual(served[0]?.views, ['fleet']);
+    const payload = { sessions: [], workers: [{ session: 's' }], findings: { count: 1 } };
+    served[0].answer({ fleet: payload });
+    assert.deepEqual(await first, payload);
+    assert.equal(calls.length, 0);
+    const fallback = reader.workerFleet('s', '/workspace'); await tick();
+    served[1].answer({ fleet: null }); await tick();
+    assert.deepEqual(calls[0].args.slice(1), ['fleet', '--json', '--root', '/workspace', '--session', 's']);
+    calls[0].reply(payload); assert.deepEqual(await fallback, payload);
+  } finally { reader.close(); }
+});
+
+test('saved Sessions request Workers only when requested by a visible pane', async () => {
+  const { core, calls } = transport(); const reader = createConversationReader(core, '/local');
+  try {
+    for (const workers of [false, true, false]) {
+      const result = reader.sessions('s', '/remote', 'lab', workers); await tick();
+      assert.equal(calls.at(-1).args.includes('--workers'), workers);
+      calls.at(-1).reply({ sessions: [{ id: 's' }], ...(workers ? { workers: [{ session: 's' }] } : {}) });
+      assert.equal((await result).sessions[0].id, 's');
+    }
+  } finally { reader.close(); }
 });

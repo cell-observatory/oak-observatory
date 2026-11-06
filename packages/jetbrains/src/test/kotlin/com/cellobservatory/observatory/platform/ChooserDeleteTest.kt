@@ -14,7 +14,6 @@ import com.intellij.openapi.ui.TestDialogManager
 import com.intellij.openapi.util.Disposer
 import com.intellij.openapi.util.SystemInfo
 import com.intellij.testFramework.PlatformTestUtil
-import com.intellij.testFramework.fixtures.BasePlatformTestCase
 import com.intellij.util.ui.UIUtil
 import java.io.File
 import java.nio.file.Files
@@ -26,7 +25,7 @@ import javax.swing.JList
  * allow. The chooser carries a delete row; the delete it leads to is the Sessions tab's own, confirmed,
  * and it removes the session through this tree's CLI, in a throwaway config dir.
  */
-class ChooserDeleteTest : BasePlatformTestCase() {
+class ChooserDeleteTest : ObservatoryPlatformTestCase() {
 
     private lateinit var cfg: File
     private lateinit var work: File

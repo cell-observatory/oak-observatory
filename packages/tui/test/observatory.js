@@ -9,11 +9,121 @@ const path = require('node:path');
 const os = require('node:os');
 const core = require('../../core/dist');
 const tui = require('../dist');
-const { fixture, pane, snapshot } = require('./fixtures/observatory');
+const { fixture, pane, snapshot, syncView } = require('./fixtures/observatory');
 const { workspaceFixture } = require('../../core/test/fixtures/workspace-fixture.cjs');
 // Rows print clock times in the reader's local zone (relTime); the goldens are written in UTC.
 process.env.TZ = 'UTC';
 const g = tui.glyphs('ascii');
+
+test('tab labels: Observatory filters placeholders on each machine before Workers arrives', () => {
+  for (const label of ['1', '', '   ', 'claude', 'codex', 'Demo checks', '2024']) {
+    const state = fixture();
+    for (const machine of state.observatory.machines) {
+      machine.snapshot.tabs = [{ tab_id: 'elsewhere', workspace_id: 'other', number: 1, label: '1' },
+        { tab_id: 'tab', workspace_id: 'w1', number: 8, label }];
+    }
+    const named = ['Demo checks', '2024'].includes(label);
+    const rows = tui.observatorySessions(state);
+    assert.equal(rows.find(r => r.session === 'claude-conversation').label, named ? label : 'Fix the demo');
+    assert.equal(rows.find(r => r.session === 'remote-done').label, named ? label : 'Remote review');
+    assert.equal(tui.statuslineDataFor(state).title, 'Fix the demo');
+  }
+});
+
+for (const check of ['once-tab-labels', 'live-tab-labels']) test(`tab labels: ${check} keeps session titles and user tab names`, () => {
+  const result = require('child_process').spawnSync(process.execPath, [path.join(__dirname, 'fixtures/observatory-app-probe.cjs')], {
+    encoding: 'utf8', timeout: 10000, env: { ...process.env, NODE_TEST_CONTEXT: '', OAK_APP_FIX_CHECK: check },
+  });
+  assert.equal(result.status, 0, result.stderr || result.error?.message);
+  assert.match(result.stderr, new RegExp(`PASS: ${check}`));
+});
+
+test('Observatory process refresh reads only visible tails on the owner, throttles and rejects stale selection', async t => {
+  const state = tui.selectAndPin(fixture(), 'remote-done', 'obs-detail', 'build', { processId: 'shell-0' });
+  const calls = [];
+  const process = { id: 'shell-0', command: 'synthetic build', running: true, status: 'running', runtimeMs: 10, exitCode: null };
+  const fake = fakeRuntime(state, {}, { watch: false, visibleProcesses: () => ['shell-1'], reader: { ...testReader(),
+    processes: async (...args) => { calls.push(args); return { processes: [process], previews: {}, selected: { process, outputTail: 'OWNER OUTPUT' } }; },
+  } });
+  t.after(() => fake.runtime.close());
+  await fake.runtime.load('obs-detail');
+  assert.deepEqual(calls[0].slice(2), ['shell-0', ['shell-1'], 'build-box']);
+  await fake.runtime.tail(); await fake.runtime.tail();
+  assert.equal(calls.length, 1, 'a saved-machine read waits ten seconds');
+  assert.match(tui.observatoryDetailRows(state, 120, g, 'none').map(r => r.cells).join('\n'), /OWNER OUTPUT/);
+  const pending = deferred();
+  const late = fakeRuntime(state, {}, { watch: false, reader: { ...testReader(), processes: () => pending.promise } });
+  t.after(() => late.runtime.close());
+  const loading = late.runtime.load('obs-detail');
+  Object.assign(state, tui.selectAndPin(state, 'claude-conversation'));
+  pending.resolve({ processes: [process], previews: {}, selected: { process, outputTail: 'STALE' } });
+  await loading;
+  assert.equal(state.observatory.details['obs-detail'].processes, undefined);
+});
+
+test('worker selection opens its own live log in the detail pane and cannot reply to the parent', async t => {
+  const { indexFixture, reply, text } = require('../../core/test/fixtures/index-fixture.cjs');
+  const b = indexFixture(t, core);
+  const parent = b.claude('claude-conversation', b.work, [reply('parent', [text('PARENT TEXT')])]);
+  const file = path.join(path.dirname(parent), 'claude-conversation/subagents/agent-w1.jsonl');
+  b.write(file, [{ ...reply('worker', [text('WORKER TEXT')]), isSidechain: true }]);
+  const state = tui.selectAndPin(fixture(), 'claude-conversation', 'obs-detail', 'local', { agentId: 'w1' });
+  state.observatory.details['obs-detail'].selection.root = b.work;
+  let reads = 0;
+  const fake = fakeRuntime(state, {}, { watch: false, reader: { ...testReader(),
+    feed: async (session, root, id) => { reads++; return core.liveFeed(root, session, { kind: 'agent', id }); },
+  } });
+  t.after(() => fake.runtime.close());
+  await fake.runtime.load('obs-detail');
+  assert.equal(state.observatory.details['obs-detail'].selection.agentId, 'w1');
+  const render = () => tui.observatoryDetailRows(state, 120, g, 'none').map(r => r.cells).join('\n');
+  assert.match(render(), /WORKER TEXT/);
+  assert.doesNotMatch(render(), /PARENT TEXT/);
+  assert.equal(tui.observatoryReplyRow(state, 'obs-detail', 100, 0), undefined);
+  await fake.runtime.tail();
+  assert.equal(reads, 1, 'an unchanged worker log makes no child request');
+  fs.appendFileSync(file, b.lines([{ ...reply('next', [text('WORKER NEXT')]), isSidechain: true }]));
+  await fake.runtime.tail();
+  assert.match(render(), /WORKER NEXT/);
+  fs.appendFileSync(parent, b.lines([{ type: 'queue-operation', operation: 'enqueue', timestamp: '2026-10-01T11:00:00.123Z',
+    content: '<task-notification><task-id>w1</task-id><status>completed</status></task-notification>' }]));
+  await fake.runtime.tail();
+  assert.match(render(), /Worker ended at 2026-10-01T11:00:00.123Z/);
+  assert.ok(!fake.calls.some(call => /tab.create|pane.split|pane.send_text/.test(call.method)), 'a worker log creates no terminal and sends no input');
+  const back = tui.selectAndPin(state, 'claude-conversation');
+  assert.equal(back.observatory.details['obs-detail'].selection.agentId, undefined);
+  assert.equal(back.observatory.details['obs-detail'].feed, undefined);
+});
+
+test('remote worker log reads the owner, throttles polls, rejects stale selections and reports failures', async t => {
+  const state = tui.selectAndPin(fixture(), 'remote-done', 'obs-detail', 'build', { agentId: 'r1' });
+  // A local copy of the parent must not retarget an explicitly selected remote worker.
+  state.observatory.machines[0].snapshot.panes.push(pane('copy', 'remote-done', 'idle'));
+  const calls = [];
+  const fake = fakeRuntime(state, {}, { watch: false, reader: { ...testReader(),
+    feed: async (...args) => { calls.push(args); return { workerLogVersion: 1, ref: { kind: 'agent', id: args[2] }, entries: [{ label: 'Remote log', kind: 'reasoning', reasoning: 'Remote worker activity' }], mode: 'live' }; },
+  } });
+  t.after(() => fake.runtime.close());
+  await fake.runtime.load('obs-detail');
+  assert.equal(calls[0][3], 'build-box');
+  assert.equal(calls[0][2], 'r1');
+  await fake.runtime.tail(); await fake.runtime.tail();
+  assert.equal(calls.length, 1, 'remote snapshots wait ten seconds');
+  assert.match(JSON.stringify(state.observatory.details['obs-detail'].feed), /Remote worker activity/);
+  const pending = deferred();
+  const late = fakeRuntime(state, {}, { watch: false, reader: { ...testReader(), feed: () => pending.promise } });
+  t.after(() => late.runtime.close());
+  const loading = late.runtime.load('obs-detail');
+  Object.assign(state, tui.selectAndPin(state, 'claude-conversation'));
+  pending.resolve({ ref: { kind: 'agent', id: 'r1' }, entries: [], workerLogVersion: 1 });
+  await loading;
+  assert.equal(state.observatory.details['obs-detail'].feed, undefined);
+  Object.assign(state, tui.selectAndPin(state, 'remote-done', 'obs-detail', 'build', { agentId: 'r1' }));
+  const down = fakeRuntime(state, {}, { watch: false, reader: { ...testReader(), feed: async () => { throw new Error('build-box is not reachable over ssh'); } } });
+  t.after(() => down.runtime.close());
+  await down.runtime.load('obs-detail');
+  assert.match(state.observatory.details['obs-detail'].error, /not reachable over ssh/);
+});
 // The master is memoized on the identity of what it reads, which the runtime and the app replace rather
 // than mutate. These tests edit a fixture in place between renders, so each render hands it new arrays.
 const fresh = state => ({ ...state, observatory: state.observatory && { ...state.observatory, machines: state.observatory.machines.map(m => ({ ...m })) },
@@ -61,20 +171,78 @@ test('Observatory master: two machines, authoritative pane states, unresolved re
   const rows = render(state);
   const text = lines(rows);
   golden('observatory-master', text);
-  for (const status of ['blocked', 'working', 'idle', 'done', 'unknown']) assert.ok(text.includes(status));
+  for (const status of ['blocked', 'working', 'idle', 'unknown']) assert.ok(text.includes(status));
+  // remote-done's pane reads done, so it folds under build-box with its pending count (df1 brief: a done session folds
+  // even with pending edits); its fold, opened, shows herdr's done over the session's own idle phase.
+  assert.match(lines(render({ ...state, open: new Set(['done:build']) })), /Remote review\n +\* done · GPT/);
   // An idle, unresolved (paneless, pending) session folds into `earlier`; it is retained, not lost.
   assert.ok(text.includes('earlier'));
   assert.ok(!text.includes('Recover edits'), 'an idle unresolved session is folded, not inline');
   assert.ok(lines(render({ ...state, open: new Set(['earlier']) })).includes('Recover edits'), 'opening earlier reveals it');
   assert.ok(!text.includes('Finished yesterday'));
   assert.ok(lines(render({ ...state, allSessions: true, open: new Set(['archived']) })).includes('Finished yesterday'));
-  assert.deepEqual(rows.filter(r => r.key.startsWith('machine:')).map(r => r.cells), ['laptop', 'build-box']);
+  assert.deepEqual(rows.filter(r => r.key.startsWith('machine:')).map(r => r.cells.replace(' [W window]', '')), ['laptop', 'build-box']);
   assert.ok(text.indexOf('claude · p1') < text.indexOf('Fix the demo'));
   // The master lists sessions; a pinned session's detail lists its Workers (2026-09-26).
   assert.ok(!rows.some(r => r.cells.includes('Workers')));
   assert.ok(!text.includes('laptop · claude'), 'machine is a tree node, not an agent label');
   state.views.remoteSessions = { rows: [{ id: 'old-ssh-row', title: 'Retired remote merge' }] };
   assert.ok(!lines(render({ ...state, allSessions: true })).includes('Retired remote merge'));
+});
+
+// oak sync, while it is in use here: under this machine its last run and its backup, under each saved machine what the run
+// pulled from it or why it could not, in the CLI's words (each line's `text`), whole; a machine that never chose to sync
+// sees none of it.
+test('Observatory master: oak sync\'s last run under each machine, in the CLI\'s words, wrapped whole, and only while sync is in use', () => {
+  const state = fixture();
+  state.sync = syncView();
+  const rows = render(state, 60);
+  const of = (key) => rows.filter(r => r.key === key || r.key.startsWith(`${key}:wrap:`)).map(r => r.cells.trim()).join(' ');
+  assert.equal(of('machine:local:sync'), 'sync · last run 14:00:30 (partial) · 1 conflict in the inbox · 1 warning in the options');
+  assert.equal(of('machine:local:backup'), `backup · /mnt/share/oak-backup · key a11b-f2dc-f733-a548 · ${state.sync.last.machines[1].text}`,
+    'the refusal and its next step, whole');
+  assert.equal(of('machine:build:sync'), 'sync · pulled 3 files, 1KB at 14:00:30');
+  for (const r of rows) assert.ok(tui.displayWidth(r.cells) <= 60, `"${r.cells}" fits the pane`);
+  // Continuations of the machine's row, which the arrows step over as over a session's stat row.
+  const syncRows = rows.filter(r => /^machine:[^:]+:(sync|backup)/.test(r.key));
+  assert.ok(syncRows.length > 3, 'control: the backup line wraps');
+  for (const r of syncRows) assert.equal(r.cont, true, r.key);
+  // Under its own machine, between the machine and its workspaces.
+  const keys = rows.map(r => r.key);
+  assert.equal(keys.indexOf('machine:local:sync'), keys.indexOf('machine:local') + 1);
+  assert.ok(keys.indexOf('machine:build') < keys.indexOf('machine:build:sync') && keys.indexOf('machine:build:sync') < keys.indexOf('workspace:build:herdr:w1'));
+  // A machine the run could not reach says why, and when it last gave something.
+  state.sync = syncView();
+  state.sync.last.machines[0] = { ...state.sync.last.machines[0], status: 'unreachable', detail: 'Connection refused', text: 'could not be reached over ssh: Connection refused (last pulled 13:00:00)' };
+  assert.equal(render(state, 200).find(r => r.key === 'machine:build:sync').cells, '  sync · could not be reached over ssh: Connection refused (last pulled 13:00:00)');
+  // Running now; a backup on a saved machine; and a saved machine the last run did not ask.
+  state.sync = syncView({ running: true, backup: { kind: 'machine', label: 'build-box' }, conflicts: [] });
+  state.sync.last = { ...state.sync.last, warnings: [], machines: [] };
+  const run = render(state, 200);
+  assert.equal(run.find(r => r.key === 'machine:local:sync').cells, '  sync · running now');
+  assert.equal(run.find(r => r.key === 'machine:local:backup').cells, '  backup · build-box');
+  assert.equal(run.find(r => r.key === 'machine:build:sync').cells, '  sync · not asked in the last run (14:00:30)');
+  // Not in use (no run here, no backup chosen, no conflict open): the master is as it was, row for row.
+  state.sync = syncView({ setUp: false, last: null, backup: null, conflicts: [] });
+  assert.equal(lines(render(state)), lines(render(fixture())));
+  assert.ok(!lines(render(state)).includes('sync ·'));
+});
+
+// A saved machine's sessions read from this machine's index (oak sync brought its records; no ssh) say so under it, with
+// when that run read it; one read from the machine itself says nothing more.
+test('Observatory master: a saved machine\'s sessions read from the local index say so under it, with when oak sync read it', () => {
+  const state = fixture();
+  const build = state.observatory.machines.find((m) => !m.local);
+  const at = Date.UTC(2026, 8, 18, 13, 55);
+  build.sessions = { ...(build.sessions ?? { sessions: [] }), fromIndex: true, syncedAt: at };
+  const rows = render(state, 200);
+  const keys = rows.map((r) => r.key);
+  assert.equal(rows.find((r) => r.key === `machine:${build.id}:records`)?.cells, '  sessions · from its records, synced 13:55:00');
+  assert.equal(rows.find((r) => r.key === `machine:${build.id}:records`).cont, true, 'a continuation of the machine\'s row');
+  assert.equal(keys.indexOf(`machine:${build.id}:records`) > keys.indexOf(`machine:${build.id}`), true);
+  delete build.sessions.fromIndex;
+  assert.ok(!render(state, 200).some((r) => r.key === `machine:${build.id}:records`), 'read from the machine: nothing more');
+  assert.ok(!render(state, 200).some((r) => r.key === 'machine:local:records'), 'nor under this machine');
 });
 
 // 0.10.0 made every timestamp a clock time ("Timestamps now show the exact time, not an age"); the
@@ -89,17 +257,19 @@ test('Observatory master: a session\'s last activity reads as a clock time, as i
 const workspaceOfRow = (rows, session) => {
   const at = rows.findIndex(r => r.scope?.session === session && r.key.startsWith('session:') && !r.cont);
   assert.ok(at >= 0, `${session} is listed`);
-  return rows.slice(0, at).findLast(r => r.key.startsWith('workspace:')).cells.trim();
+  return rows.slice(0, at).findLast(r => r.key.startsWith('workspace:')).cells.replace(' [W window]', '').trim();
 };
-const workspaceHeaders = (state, machineId) => render(state).filter(r => r.key.startsWith(`workspace:${machineId}:`)).map(r => r.cells.trim());
+const workspaceHeaders = (state, machineId) => render(state).filter(r => r.key.startsWith(`workspace:${machineId}:`)).map(r => r.cells.replace(' [W window]', '').trim());
 
 test('Observatory master: each machine groups its panes by herdr workspace, labelled as that machine labels it', () => {
   const state = fixture();
   const rows = render(state);
-  assert.deepEqual(rows.filter(r => r.key.startsWith('workspace:')).map(r => [r.key, r.cells]),
+  assert.deepEqual(rows.filter(r => r.key.startsWith('workspace:')).map(r => [r.key, r.cells.replace(' [W window]', '')]),
     [['workspace:local:herdr:w1', '  demo'], ['workspace:local:herdr:w2', '  docs'], ['workspace:build:herdr:w1', '  review']],
     'the same workspace id carries each machine\'s own label');
-  assert.deepEqual(['claude-conversation', 'working', 'idle', 'remote-done', 'unknown'].map(s => workspaceOfRow(rows, s)), ['demo', 'demo', 'docs', 'review', 'review']);
+  // remote-done is done, so it is listed in build-box's done fold, opened here, under its workspace's label (df1 brief).
+  const opened = render({ ...state, open: new Set(['done:build']) });
+  assert.deepEqual(['claude-conversation', 'working', 'idle', 'remote-done', 'unknown'].map(s => workspaceOfRow(opened, s)), ['demo', 'demo', 'docs', 'review', 'review']);
   assert.equal(rows.find(r => r.key === 'pane:local:p3').cells, '    v claude · p3', 'the agent kind and pane id stay on the pane line');
   assert.equal(rows.find(r => r.key === 'pane:local:p3').scope.session, 'idle', 'the pane line belongs to the session it runs');
   assert.equal(rows.find(r => r.key === 'workspace:local:herdr:w2').scope, undefined, 'a workspace header is not a session');
@@ -121,7 +291,8 @@ test('Observatory master: workspaces and their sessions run newest first; the wa
   const sessionsIn = () => render(state).filter(r => r.key.startsWith('session:local:') && !r.cont && r.key.split(':').length === 4).map(r => r.scope.session);
   meta('idle').lastActiveMs = state.now;
   assert.deepEqual(workspaceHeaders(state, 'local'), ['demo', 'docs'], 'a live agent counts as now, ahead of a newer quiet session');
-  p1.agent_status = 'idle'; p2.agent_status = 'done';
+  // Quiet, not done: a done session folds whatever it has pending (df1 brief), and this test checks recency inline.
+  p1.agent_status = 'idle'; p2.agent_status = 'idle';
   assert.deepEqual(workspaceHeaders(state, 'local'), ['docs', 'demo'], 'with every agent quiet, the newest session leads');
   meta('working').lastActiveMs = state.now - 1000; meta('claude-conversation').lastActiveMs = state.now - 5000;
   assert.deepEqual(sessionsIn(), ['idle', 'working', 'claude-conversation'], 'inside a workspace, newest first');
@@ -190,6 +361,220 @@ test('Observatory master: a selected session stays in its open fold, and surface
   assert.ok(fold >= 0 && open.at[0] > fold, 'open fold: the selection stays where the arrows found it');
 });
 
+// A session's workers that are still at it (core's `activeWorkers`) are grouped under it, so they show without
+// opening the session and never flood the list: a summary row counting them by state, collapsed by default, and
+// open, a sub-group per state (waiting first), each worker two rows as a session is: its title, then its stat row.
+const activeWorker = (agentId, title, phase, extra = {}) => ({ agentId, title, phase, phaseConfidence: 'high', model: 'Opus 5.5', edits: 3,
+  pending: 3, added: 120, removed: 4, tokens: 1_200_000, lastActiveMs: Date.parse('2026-09-18T14:00:40Z'), ...extra });
+const someWorkers = () => [
+  activeWorker('a1', 'Review brain code', 'awaiting-permission', { edits: 0, pending: 0, added: 0, removed: 0, tokens: 400_000, lastActiveMs: Date.parse('2026-09-18T13:59:10Z') }),
+  activeWorker('a2', 'Review spine code', 'working'),
+  activeWorker('a3', 'Review spine schematic', 'awaiting-input', { edits: 1, pending: 1, added: 12, removed: 0, tokens: 350_000, lastActiveMs: Date.parse('2026-09-18T13:59:30Z') }),
+  activeWorker('a4', 'Assess brain 3D rendering', 'working', { edits: 7, pending: 5, added: 2100, removed: 88, tokens: 2_600_000, lastActiveMs: Date.parse('2026-09-18T14:00:55Z') }),
+];
+const group = (rows, session = 'session:local:p2:working') => {
+  const from = rows.findIndex(r => r.key === `${session}:state`) + 1;
+  let to = from;
+  while (rows[to] && !/^(pane|workspace|machine|session):/.test(rows[to].key.replace(/^session:[^:]*:[^:]*:[^:]*:worker:.*/, 'w'))) to++;
+  return rows.slice(from, to);
+};
+
+test('Observatory master: a session\'s active workers sit under it in one group, collapsed by default (2026-10-23)', () => {
+  const state = fixture();
+  state.views.sessions.sessions[1].activeWorkers = someWorkers();
+  const rows = render(state);
+  // Collapsed: one summary row under the session's stat row, counting them by state, working first.
+  assert.deepEqual(group(rows).map(r => r.cells), ['        > 4 workers · | 2 working · + 2 blocked']);
+  const summary = group(rows)[0];
+  assert.deepEqual([summary.key, summary.openPath, summary.scope.session, summary.scope.machineId, summary.scope.workers], ['workers:local:working', 'workers:local:working', 'working', 'local', 'all']);
+  assert.equal(rows.filter(r => r.key.startsWith('workers:')).length, 1, 'no other session has a group');
+  // Open: a sub-group per state, a person needed first, each worker its title and then its stat row in the
+  // session row's terms; two cells deeper per level.
+  const open = render({ ...state, open: new Set(['workers:local:working']) }, 100);
+  assert.deepEqual(group(open).map(r => r.cells), [
+    '        v 4 workers · | 2 working · + 2 blocked',
+    '          + blocked (2)',
+    '            Review brain code',
+    '              + blocked · Opus 5.5 · 400k tok · 0 pending · 13:59:10',
+    '            Review spine schematic',
+    '              + blocked · Opus 5.5 · 1 edit · +12 −0 · 350k tok · 1 pending · 13:59:30',
+    '          | working (2)',
+    '            Review spine code',
+    '              | working · Opus 5.5 · 3 edits · +120 −4 · 1.2M tok · 3 pending · 14:00:40',
+    '            Assess brain 3D rendering',
+    '              | working · Opus 5.5 · 7 edits · +2k −88 · 2.6M tok · 5 pending · 14:00:55',
+  ]);
+  const rowOf = key => open.find(r => r.key === key);
+  assert.deepEqual([rowOf('workers:local:working:blocked').scope.workers, rowOf('workers:local:working:working').scope.workers], ['blocked', 'working'], 'each header is a row of its own to pick');
+  const title = rowOf('session:local:p2:working:worker:a2'), line = rowOf('session:local:p2:working:worker:a2:state');
+  assert.deepEqual([title.scope.session, title.scope.machineId, title.scope.agentId, !!title.cont], ['working', 'local', 'a2', false]);
+  assert.deepEqual([line.scope.agentId, line.cont], ['a2', true], 'its stat row continues its title');
+  // A state with no worker in it has no header.
+  state.views.sessions.sessions[1].activeWorkers = someWorkers().filter(w => w.phase === 'working');
+  assert.deepEqual(group(render({ ...state, open: new Set(['workers:local:working']) }, 100)).map(r => r.cells.trim().split(' · ')[0]),
+    ['v 2 workers', '| working (2)', 'Review spine code', '| working', 'Assess brain 3D rendering', '| working']);
+  // The ascii tier's fold marks; the unicode tier's own.
+  state.views.sessions.sessions[1].activeWorkers = someWorkers();
+  const uni = tui.rowsFor(fresh({ ...state, open: new Set(['workers:local:working']) }), 82, tui.glyphs('unicode'), 'none');
+  assert.match(group(uni)[0].cells, /^ {8}▾ 4 workers · ⠼|^ {8}▾ 4 workers · [⠋⠙⠹⠸⠼⠴⠦⠧] 2 working · [◐◓◑◒] 2 blocked$/);
+});
+
+test('Observatory master: a worker group\'s spinners and colours are the session rows\' own, wherever a row wraps (2026-10-23)', () => {
+  const state = { ...fixture(), open: new Set(['workers:local:working']) };
+  state.views.sessions.sessions[1].activeWorkers = someWorkers();
+  const cell = row => row.cells.trimStart().split(' · ')[0];
+  for (const now of [state.now, state.now + 120, state.now + 380]) {
+    const rows = tui.rowsFor({ ...fresh(state), now }, 120, g, 'truecolor');
+    const k = key => rows.find(r => r.key === key);
+    const working = cell(k('session:local:p2:working:state')), blocked = cell(k('session:local:p1:claude-conversation:state'));
+    assert.equal(cell(k('session:local:p2:working:worker:a2:state')), working, 'a working worker, as a working session draws it');
+    assert.equal(cell(k('session:local:p2:working:worker:a1:state')), blocked, 'one waiting on a person: the blocked face, word and all, as herdr says it');
+    // A row with colour in it closes it at its end.
+    assert.equal(k('workers:local:working:working').cells, `          ${working} (2)\x1b[0m`);
+    assert.equal(k('workers:local:working').cells, `        ${tui.glyphs('ascii').open} 4 workers · ${working.replace('working', '2 working')} · ${blocked.replace('blocked', '2 blocked')}\x1b[0m`);
+  }
+  // Every spinner moves with the frame: the summary's two, each header's and each worker's.
+  const frame = now => tui.rowsFor({ ...fresh(state), now }, 120, g, 'none');
+  const a = frame(state.now), b = frame(state.now + 380);
+  for (const key of ['workers:local:working', 'workers:local:working:blocked', 'workers:local:working:working', 'session:local:p2:working:worker:a1:state', 'session:local:p2:working:worker:a2:state'])
+    assert.notEqual(a.find(r => r.key === key).cells, b.find(r => r.key === key).cells, `${key} animates`);
+  // However narrow the pane, no stand-in is left undrawn on a row it wrapped onto.
+  for (const width of [24, 30, 41, 60]) {
+    const rows = tui.rowsFor({ ...fresh(state), now: state.now }, width, g, 'none');
+    assert.ok(!rows.some(r => /[]/.test(r.cells)), `${width} columns: ${lines(rows.filter(r => /[]/.test(r.cells)))}`);
+  }
+  // A long title wraps under its own indent, every word kept.
+  const long = 'Audit every capture hook for the permission prompts a subagent raises and the calls they wait on';
+  state.views.sessions.sessions[1].activeWorkers = [activeWorker('w1', long, 'working')];
+  const narrow = render(state, 40);
+  const at = narrow.findIndex(r => r.key === 'session:local:p2:working:worker:w1');
+  const title = narrow.slice(at).filter((r, i) => i === 0 || r.key.startsWith('session:local:p2:working:worker:w1:wrap:'));
+  assert.ok(title.length > 2 && title.every(r => r.cells.startsWith('            ') && tui.displayWidth(r.cells) <= 40), lines(title));
+  assert.equal(title.map(r => r.cells.trim()).join(' '), long);
+});
+
+test('Observatory master: a worker group keeps its fold across a re-poll; a finished worker drops out, the last takes the group (2026-10-23)', () => {
+  const state = { ...fixture(), open: new Set(['workers:local:working']) };
+  state.views.sessions.sessions[1].activeWorkers = someWorkers();
+  const titles = st => group(render(st)).filter(r => /:worker:[^:]+$/.test(r.key)).map(r => r.cells.trim());
+  assert.deepEqual(titles(state), ['Review brain code', 'Review spine schematic', 'Review spine code', 'Assess brain 3D rendering']);
+  // The next poll's listing is a new payload: the group is still open.
+  state.views = { ...state.views, sessions: { sessions: state.views.sessions.sessions.map(r => ({ ...r, activeWorkers: r.activeWorkers?.map(w => ({ ...w })) })) } };
+  assert.equal(titles(state).length, 4, 'still open');
+  // A worker that finished is no longer in the listing: its rows go, and the counts with it.
+  state.views.sessions.sessions[1].activeWorkers = someWorkers().filter(w => w.agentId !== 'a3');
+  assert.deepEqual(titles(state), ['Review brain code', 'Review spine code', 'Assess brain 3D rendering']);
+  assert.equal(group(render(state))[0].cells, '        v 3 workers · | 2 working · + 1 blocked');
+  // A finished worker an older OAK still lists is not drawn either: the group counts only those still at it.
+  state.views.sessions.sessions[1].activeWorkers = [...someWorkers().slice(0, 2), activeWorker('a9', 'Done already', 'done')];
+  assert.equal(group(render(state))[0].cells, '        v 2 workers · | 1 working · + 1 blocked');
+  state.views.sessions.sessions[1].activeWorkers = [];
+  assert.deepEqual(group(render(state)), [], 'the last one finished: no group');
+});
+
+test('Observatory master: the mark follows the picked row of a worker group, and falls back to its session (2026-10-23)', () => {
+  const state = { ...fixture(), open: new Set(['workers:local:working']) };
+  state.views.sessions.sessions[1].activeWorkers = someWorkers();
+  // The unicode tier, whose fold marks are not the selection's `>`.
+  const draw = st => tui.rowsFor(fresh(st), 100, tui.glyphs('unicode'), 'none');
+  const marked = scope => draw({ ...state, scopeWorker: { ...tui.observatorySelection(state, 'working', 'local'), ...scope } })
+    .filter(r => r.cells.trimStart().startsWith('> ')).map(r => r.key);
+  assert.deepEqual(marked({}), ['session:local:p2:working']);
+  assert.deepEqual(marked({ workers: 'all' }), ['workers:local:working']);
+  assert.deepEqual(marked({ workers: 'blocked' }), ['workers:local:working:blocked']);
+  assert.deepEqual(marked({ agentId: 'a4' }), ['session:local:p2:working:worker:a4']);
+  assert.deepEqual(marked({ agentId: 'gone' }), ['session:local:p2:working'], 'a worker that finished since: its session');
+  assert.deepEqual(draw({ ...state, open: new Set(), scopeWorker: { ...tui.observatorySelection(state, 'working', 'local'), agentId: 'a4' } })
+    .filter(r => r.cells.trimStart().startsWith('> ')).map(r => r.key), ['session:local:p2:working'], 'a closed group: its session');
+});
+
+test('Observatory master: a saved machine\'s session groups its workers too, from that machine\'s listing (2026-10-23)', () => {
+  const state = { ...fixture(), open: new Set(['workers:build:remote-done']) };
+  state.observatory.machines[1].sessions.sessions[0].activeWorkers = [activeWorker('r1', 'Remote worker', 'awaiting-input')];
+  const rows = render(state, 100);
+  assert.deepEqual(group(rows, 'session:build:p1:remote-done').map(r => r.cells), [
+    '        v 1 worker · + 1 blocked',
+    '          + blocked (1)',
+    '            Remote worker',
+    '              + blocked · Opus 5.5 · 3 edits · +120 −4 · 1.2M tok · 3 pending · 14:00:40',
+  ]);
+  assert.deepEqual(['session', 'machineId', 'agentId'].map(k => rows.find(r => r.key === 'session:build:p1:remote-done:worker:r1').scope[k]), ['remote-done', 'build', 'r1']);
+});
+
+test('Observatory master: a session with two workers working and three finished counts two, and lists only the working (2026-10-23)', t => {
+  const { root } = isolated(t);
+  const S = 'fixture-five-workers', now = Date.now();
+  const dir = path.join(core.projectDir(root), S, 'subagents');
+  fs.mkdirSync(dir, { recursive: true });
+  const line = records => records.map(r => JSON.stringify(r)).join('\n') + '\n';
+  const at = ms => new Date(now - ms).toISOString();
+  const ids = ['working-1', 'working-2', 'finished-1', 'finished-2', 'finished-3'];
+  fs.writeFileSync(path.join(core.projectDir(root), `${S}.jsonl`), line([
+    { type: 'user', cwd: root, sessionId: S, timestamp: at(600e3), message: { role: 'user', content: 'Fan out' } },
+    ...ids.flatMap((id, i) => [
+      { type: 'assistant', cwd: root, sessionId: S, timestamp: at(500e3 - i * 1000), message: { id: `s${i}`, role: 'assistant', model: 'claude-opus-4-5-20251101', content: [{ type: 'tool_use', id: `t${i}`, name: 'Agent', input: { description: `Task ${id}`, run_in_background: true } }], usage: { input_tokens: 10, output_tokens: 5 } } },
+      { type: 'user', cwd: root, sessionId: S, timestamp: at(500e3 - i * 1000), toolUseResult: { status: 'async_launched', isAsync: true, agentId: id }, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: `t${i}`, content: 'launched' }] } }]),
+    ...ids.filter(id => id.startsWith('finished')).map(id => ({ type: 'queue-operation', operation: 'enqueue', cwd: root, sessionId: S, timestamp: at(30e3), content: `<task-notification>\n<task-id>${id}</task-id>\n<status>completed</status>\n</task-notification>` })),
+  ]));
+  for (const id of ids) {
+    const file = path.join(dir, `agent-${id}.jsonl`);
+    fs.writeFileSync(file, line(id.startsWith('working')
+      ? [{ isSidechain: true, agentId: id, type: 'assistant', timestamp: at(2000), message: { id: `m-${id}`, role: 'assistant', model: 'claude-opus-4-5-20251101', content: [{ type: 'tool_use', id: `c-${id}`, name: 'Read', input: { file_path: 'x' } }], usage: { input_tokens: 10, output_tokens: 5 } } },
+        { isSidechain: true, agentId: id, type: 'user', timestamp: at(1000), message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: `c-${id}`, content: 'ok' }] } }]
+      : [{ isSidechain: true, agentId: id, type: 'assistant', timestamp: at(60e3), message: { id: `m-${id}`, role: 'assistant', model: 'claude-opus-4-5-20251101', content: [{ type: 'text', text: 'Done.' }] } }]));
+    if (id.startsWith('finished')) fs.utimesSync(file, (now - 60e3) / 1000, (now - 60e3) / 1000);
+  }
+  const listed = core.sessionMeta(root).sessions.find(r => r.id === S);
+  assert.deepEqual(listed.activeWorkers.map(w => [w.agentId, w.phase]).sort(), [['working-1', 'working'], ['working-2', 'working']]);
+  const state = fixture();
+  state.views.sessions.sessions[1] = { ...state.views.sessions.sessions[1], activeWorkers: listed.activeWorkers };
+  const uni = (open) => tui.rowsFor(fresh({ ...state, open: new Set(open) }), 82, tui.glyphs('unicode'), 'none');
+  const collapsed = group(uni([]));
+  assert.equal(collapsed.length, 1);
+  assert.match(collapsed[0].cells, /^ {8}▸ 2 workers · [⠋⠙⠹⠸⠼⠴⠦⠧] 2 working$/, 'two, both working: no finished count, no total that holds them');
+  const open = group(uni(['workers:local:working'])).map(r => r.cells.trim());
+  assert.match(open[1], /^[⠋⠙⠹⠸⠼⠴⠦⠧] working \(2\)$/);
+  assert.equal(open.filter(c => / \(\d+\)$/.test(c)).length, 1, 'only the working sub-group');
+  assert.deepEqual(open.filter((c, i) => i > 1 && i % 2 === 0), ['Task working-2', 'Task working-1'], 'newest spawn first');
+});
+
+test('Observatory master: a paneless session with a worker still at it shows under its machine, not in a fold (2026-10-23)', () => {
+  const state = fixture();
+  const where = st => { const rows = render(st); return { rows, at: rows.findIndex(r => r.key === 'session:unresolved::unresolved') }; };
+  assert.equal(where(state).at, -1, 'control: a quiet unresolved session folds into earlier');
+  state.views.sessions.sessions.find(r => r.id === 'unresolved').activeWorkers = [activeWorker('w1', 'Still going', 'working')];
+  const busy = where(state);
+  assert.ok(busy.at >= 0 && busy.at < busy.rows.findIndex(r => r.key === 'machine:build'), 'listed under its machine');
+  assert.equal(busy.rows[busy.at + 2].cells.trim().split(' · ')[0], '> 1 worker', 'with its group under it');
+});
+
+test('Observatory master: a paneless session with nothing pending, not the current one, is kept while a worker of it is at it (2026-10-23)', () => {
+  const state = fixture();
+  const listed = st => render(st).findIndex(r => r.key === 'session:unresolved::archived');
+  assert.equal(listed(state), -1, 'control: a quiet, resolved paneless session is archived');
+  state.views.sessions.sessions.find(r => r.id === 'archived').activeWorkers = [activeWorker('w1', 'Still going', 'working')];
+  const rows = render(state), at = listed(state);
+  assert.ok(at >= 0 && at < rows.findIndex(r => r.key === 'machine:build'), 'listed under its machine');
+  assert.equal(rows[at + 2].cells.trim().split(' · ')[0], '> 1 worker', 'with its group under it');
+  assert.ok(!rows.some(r => r.key === 'archived'), 'and not archived as well');
+});
+
+test('Observatory master: a worker whose phase is inferred wears ~ on its state, one a record states does not (2026-10-23)', () => {
+  const state = { ...fixture(), open: new Set(['workers:local:working']) };
+  state.views.sessions.sessions[1].activeWorkers = [activeWorker('g1', 'Long build', 'awaiting-permission', { phaseConfidence: 'heuristic' }),
+    activeWorker('q1', 'Asked a question', 'awaiting-input'), activeWorker('w1', 'Quiet background', 'working', { phaseConfidence: 'heuristic' })];
+  const line = id => render(state, 100).find(r => r.key === `session:local:p2:working:worker:${id}:state`).cells.trim().split(' · ')[0];
+  assert.deepEqual(['g1', 'q1', 'w1'].map(line), ['+ blocked~', '+ blocked', '| working~']);
+});
+
+test('Observatory master: a picked state header whose workers have all moved on leaves the mark on its session (2026-10-23)', () => {
+  const state = { ...fixture(), open: new Set(['workers:local:working']) };
+  state.views.sessions.sessions[1].activeWorkers = someWorkers().filter(w => w.phase === 'working');
+  const marked = draw => draw.filter(r => r.cells.trimStart().startsWith('> ')).map(r => r.key);
+  const rows = tui.rowsFor(fresh({ ...state, scopeWorker: { ...tui.observatorySelection(state, 'working', 'local'), workers: 'blocked' } }), 100, tui.glyphs('unicode'), 'none');
+  assert.deepEqual(marked(rows), ['session:local:p2:working']);
+});
+
 test('Observatory reply: re-pinning a leaf parks its unsent draft with its session; pinning that session again restores it', () => {
   let state = pin(fixture(), 'working');
   state.observatory.details['obs-detail'].reply = { text: 'half-typed answer', caret: 4, focused: true, commentIds: ['c1'] };
@@ -215,7 +600,7 @@ test('Observatory master: unreachable machines stay visible; closing resolved pa
 
 for (const width of [22, 46]) test(`Observatory polish: loading/failure and wrapped master content at ${width} columns`, () => {
   const state = fixture();
-  state.views.sessions.sessions[0].title = 'drive-agents-editor-polish with every word preserved';
+  state.views.sessions.sessions[0].title = 'tidy-fixture-importer-pass with every word preserved';
   state.observatory.machines[0].snapshot.panes.push({ ...pane('p4', 'waiting', 'idle'), agent_session: null });
   state.observatory.machines[1] = { id: 'build', label: 'build-box' };
   for (const phase of ['connecting', 'failed']) {
@@ -254,6 +639,8 @@ test('Observatory detail: preview headers, pin holds while browsing, per-leaf pi
   state.scopeWorker = tui.observatorySelection(state, 'claude-conversation');
   assert.match(lines(render(state)), /Fix the demo.*laptop.*blocked.*Opus/);
   assert.ok(!state.observatory.details['obs-detail'], 'preview performs no conversation load');
+  state.open = new Set(['detail:obs-detail:claude-conversation:Workers']);
+  assert.match(lines(render(state)), /Inspect the grid[\s\S]*Processes · 0[\s\S]*Tasks/);
   state = pin(state);
   const detail = state.observatory.details['obs-detail'];
   detail.loading = false; detail.cursor = 10; detail.events = [turn()];
@@ -373,7 +760,7 @@ test('Observatory detail: a prompt is a box like its calls, who and when on its 
     const inside = body.map(l => l.slice(1, -1).trim());
     assert.deepEqual(inside.join(' ').split(/\s+/), words, `${label}: every word, in order, none cut`);
     assert.match(inside[inside.findIndex(l => l.endsWith('band')) + 1], /^and its/, `${label}: the ask's own second line starts a row`);
-    assert.ok(!plain.some(l => l.includes('…')), `${label}: wrapped, never cut`);
+    assert.ok(!body.some(l => l.includes('…')), `${label}: wrapped, never cut`);
     // A drag takes the words: the edges hold none, and the sides are drawn, not text.
     const box = rows.slice(top, bottom + 1);
     assert.deepEqual(box.map(r => r.copy), [null, ...body.map(() => [1, width - 2]), null], label);
@@ -586,6 +973,34 @@ function remoteTimeoutEnv(t, value) {
   });
 }
 
+// Started in a folder with no session of its own, the app names no session: the Observatory reads this machine's listing and
+// each saved machine's with none named (every session there), and lists both, as it does from a folder with a session.
+test('Observatory with no session named: this machine\'s listing and a saved machine\'s sessions are read and listed (2026-10-08)', async () => {
+  const state = fixture();
+  const listing = state.views.sessions, remote = state.observatory.machines[1];
+  state.session = '';
+  state.views = null;
+  state.observatory = { machines: [{ id: 'local', label: 'laptop', local: true }], details: {} };
+  const asked = [];
+  const reader = { ...testReader(), sessions: async (session, root, machine) => { asked.push([session, machine ?? 'this machine']); return machine ? remote.sessions : listing; } };
+  const fake = { ...core, findHerdrBin: () => '/herdr', herdrSocketPath: () => '/fake.sock', herdrSnapshot: async () => snapshot([]),
+    herdrMachines: async () => [{ id: 'build', label: 'build-box', enabled: true }],
+    herdrOnMachine: async () => ({ result: { type: 'session_snapshot', snapshot: remote.snapshot } }),
+    herdrRequest: async () => ({ type: 'ok' }), herdrSubscribe: () => ({ close() {} }), readHerdrPaneLink: () => null };
+  const runtime = tui.createObservatory(fake, state, { cwd: '/elsewhere', reader, changed() {}, status() {}, timers: false, watch: false, readOnly: true });
+  try {
+    await runtime.start();
+    await runtime.refreshSessions();
+    for (let i = 0; i < 5; i++) await flushAsync();
+    assert.deepEqual(asked.sort(), [['', 'build-box'], ['', 'this machine']], 'each listing is read with no session named');
+    const listed = tui.observatorySessions(state).map(s => `${s.machineId}:${s.session}`).sort();
+    assert.ok(listed.includes('build:remote-done') && listed.includes('build:unknown'), `the saved machine's sessions: ${listed}`);
+    assert.ok(listed.includes('unresolved:unresolved'), `this machine's own, with pending edits: ${listed}`);
+    // Its done session is listed in its done fold, opened as the reader opens it (df1 brief).
+    assert.match(lines(render({ ...state, open: new Set(['done:build']) }, 82)), /build-box[\s\S]*Remote review/);
+  } finally { runtime.close(); }
+});
+
 test('Observatory detail follows its pane: a restarted agent in the pinned pane retargets the conversation (2026-09-22)', async () => {
   const state = fixture();
   const fake = fakeRuntime(state);
@@ -721,6 +1136,8 @@ test('Observatory remote placeholder: pending first poll, failure, retry, recove
     assert.equal(state.observatory.machines.find(m => m.id === 'build').error, 'actual failure', 'retry retains last result');
     fetch.resolve({ result: { snapshot: snapshot([pane('remote', 'remote-done', 'done')]) } }); await retry;
     assert.equal(state.observatory.machines.find(m => m.id === 'build').error, undefined);
+    assert.match(lines(render(state, 46)), /1 done/);
+    state.open = new Set(['done:build']);
     assert.match(lines(render(state, 46)), /remote-done/); // no remote catalog yet: use its pane title
     t.mock.timers.tick(15000);
     fetch = deferred();
@@ -759,6 +1176,8 @@ test('Observatory remote timeout: default, env validation and every forwarded co
       verbs.delete('tab create');
       assert.deepEqual(verbs, new Set(['api snapshot', 'pane report-metadata', 'agent focus', 'agent prompt']));
       assert.ok(forwarded.every(c => c.options.timeoutMs === expected), `env ${value}: forwarded timeout ${expected}`);
+      // Only the reply finishes after the app ends (keepOnExit); its reads stop with it.
+      assert.deepEqual(forwarded.filter(c => c.options.keepOnExit).map(c => c.argv.slice(0, 2).join(' ')), ['agent prompt']);
       assert.ok(local.length && local.every(o => o.timeoutMs === 4000), 'local requests and machine discovery retain their budget');
     } finally { fake.runtime.close(); }
   }
@@ -971,6 +1390,9 @@ test('Observatory reply: pin/live/blocked gates, focus, immediate send, failure 
     request.reject(new Error('agent_blocked')); await failed;
     const detail = state.observatory.details['obs-detail'];
     assert.equal(detail.reply.text, 'Restore on refusal'); assert.match(detail.reply.error, /agent_blocked/);
+    // Kept as a draft, in the words `oak prompt` uses for one, never as a failure.
+    assert.equal(fake.statuses.at(-1), 'Draft retained: agent_blocked');
+    assert.match(lines(render({ ...state, screen: 'session-detail' })), /Draft retained: agent_blocked/);
     assert.equal(detail.optimistic.length, 1, 'failed bubble removed, accepted bubble retained');
     request = deferred(); const late = fake.runtime.sendReply('obs-detail');
     Object.assign(state, pin(state, 'working'));
@@ -1090,13 +1512,348 @@ for (const session of ['claude-conversation', 'unresolved']) test(`Observatory d
     assert.ok(!state.observatory.details['obs-detail'].reply?.focused);
     for (const glyphs of [g, { ...g, boxes: false }]) {
       const frame = detailFrame(state, glyphs);
-      assert.doesNotMatch(frame, /Reply disabled|[Nn]o live pane|[Bb]locked · answer in herdr|i reply/);
+      assert.doesNotMatch(frame, /Reply disabled|[Nn]o live pane|[Bb]locked · answer in herdr|c reply/);
       assert.equal(frame.split('\n').length, 12);
       const pl = { ...detailRoot, rect: { x: 0, y: 0, w: 50, h: 12 }, focused: true };
       assert.equal(tui.treePaneBodyHeight(state, pl, glyphs), glyphs.boxes ? 10 : 11, 'no blank composer row');
     }
     golden(`observatory-reply-hidden-${session === 'unresolved' ? 'no-pane' : 'blocked'}`, detailFrame(state));
   } finally { fake.runtime.close(); }
+});
+
+// A Codex agent asked a question and kept working: herdr calls its pane blocked (Codex's title says "Action
+// Required"), while its row says the turn still runs. The list reads working, spinner moving, with the question in
+// the waiting state's glyph and tint; the reply still waits for the answer in herdr.
+function asking({ row = {}, agent = 'codex' } = {}) {
+  const state = fixture();
+  state.views.sessions.sessions.push({ id: 'codex-asking', title: 'Assess the processing step', pending: 0, agent: 'codex', model: 'GPT', tokens: 900,
+    lastActiveMs: state.now - 10_000, phase: 'working', machine: 'laptop', turnOpen: true, attention: null, ...row });
+  state.observatory.machines[0].snapshot = snapshot([...state.observatory.machines[0].snapshot.panes, pane('p4', 'codex-asking', 'blocked', agent)]);
+  return state;
+}
+const askingLine = (state, depth = 'none', width = 82) => tui.rowsFor(fresh(state), width, g, depth).find(r => r.key === 'session:local:p4:codex-asking:state')?.cells;
+
+test('Observatory master: a Codex agent working with a question waiting reads working · ? question, not blocked', () => {
+  const state = asking();
+  assert.match(askingLine(state), /^ {8}\S working · \? question · GPT · 900 tok · 0 pending · 14:00:50$/);
+  assert.notEqual(askingLine(state).trim()[0], askingLine({ ...state, now: state.now + 120 }).trim()[0], 'its spinner moves');
+  assert.ok(['|', '/', '-', '\\'].includes(askingLine(state).trim()[0]), 'the working spinner, not the blocked pulse');
+  const colour = askingLine(state, 'truecolor');
+  assert.ok(colour.includes(` ${tui.tint('working', 'live', 'truecolor')} · ${tui.tint('? question', 'agent', 'truecolor')} · `),
+    'working in its own tint, the question in the waiting state\'s');
+  assert.equal(tui.agentStateFace('blocked', g).key, 'agent', 'control: the waiting state\'s tint');
+  for (const glyphs of [tui.glyphs('safe'), tui.glyphs('ascii')]) {
+    assert.match(tui.stripSgr(tui.rowsFor(fresh(state), 82, glyphs, 'none').find(r => r.key === 'session:local:p4:codex-asking:state').cells), / working · \? question · /);
+  }
+  // The other blocked pane, a Claude one, is herdr's blocked as before.
+  assert.match(lines(render(state)), /Fix the demo\n\s+\S blocked · Opus/);
+  // The detail header says the same, without the spinner.
+  const header = lines(render({ ...pin(state, 'codex-asking'), screen: 'session-detail' }, 120)).split('\n')[0];
+  assert.match(header, /^Assess the processing step · laptop · > working · \? question · GPT · 900 tokens · 0 pending$/);
+});
+
+test('Observatory master: blocked stays blocked when the turn ended, went quiet, raised a hand, or the pane is Claude\'s', () => {
+  const blocked = /^ {8}\S blocked · GPT · /;
+  assert.match(askingLine(asking({ row: { turnOpen: false } })), blocked, 'the turn ended');
+  assert.match(askingLine(asking({ row: { turnOpen: undefined } })), blocked, 'an older OAK, or a rollout that could not say');
+  assert.match(askingLine(asking({ row: { lastActiveMs: fixture().now - 91_000 } })), blocked, 'quiet past the window');
+  assert.match(askingLine(asking({ row: { attention: { kind: 'permission', message: 'Bash', ts: fixture().now } } })), blocked, 'a permission prompt stands');
+  assert.match(askingLine(asking({ agent: 'claude' })), blocked, 'a Claude pane');
+  const stale = asking({ row: { lastActiveMs: fixture().now - 91_000 } });
+  const header = lines(render({ ...pin(stale, 'codex-asking'), screen: 'session-detail' }, 120)).split('\n')[0];
+  assert.match(header, /· laptop · \? blocked · GPT ·/);
+  assert.doesNotMatch(header, /question/);
+});
+
+test('Observatory reply: a question waiting holds the reply for an answer in herdr, and says so', async () => {
+  const state = pin(asking(), 'codex-asking');
+  const calls = [];
+  const fake = fakeRuntime(state, { herdrAgent: { prompt: (...args) => { calls.push(args); return Promise.resolve({ type: 'agent_prompted' }); } } });
+  try {
+    assert.equal(tui.observatoryReply(state, 'obs-detail').reason, 'Question waiting · answer in herdr');
+    assert.equal(tui.observatoryReplyRow(state, 'obs-detail', 50, 'none'), undefined, 'no reply box');
+    fake.runtime.focusReply('obs-detail');
+    assert.equal(fake.statuses.at(-1), 'Question waiting · answer in herdr');
+    await fake.runtime.sendReply('obs-detail');
+    assert.equal(calls.length, 0, 'nothing is sent to the pane');
+    // Once the turn ends, the reason is herdr's blocked again.
+    state.views.sessions.sessions.find(r => r.id === 'codex-asking').turnOpen = false;
+    assert.equal(tui.observatoryReply(state, 'obs-detail').reason, 'Blocked · answer in herdr');
+  } finally { fake.runtime.close(); }
+});
+
+// Codex's PermissionRequest hook raises the hand before Codex shows the approval and herdr calls the pane blocked. While
+// the app polls the listing itself (catalogFresh), the row read before the hand reads as a question waiting until the
+// next poll: the flip is the runtime's cue to list this machine's sessions again at once, and only the flip.
+test('Observatory: a Codex pane herdr has just called blocked lists this machine\'s sessions again at once', async () => {
+  const state = asking();
+  const panes = state.observatory.machines[0].snapshot.panes;
+  const at = status => snapshot([...panes.filter(p => p.pane_id !== 'p4'), pane('p4', 'codex-asking', status, 'codex')]);
+  let reads = 0;
+  const hand = { kind: 'permission', message: 'Bash', ts: state.now };
+  const fake = fakeRuntime(state, { herdrMachines: async () => [] }, { catalogFresh: () => true,
+    reader: { ...testReader(), sessions: async () => { reads++; return { sessions: state.views.sessions.sessions.map(r => r.id === 'codex-asking' ? { ...r, attention: hand } : r) }; } } });
+  try {
+    fake.snapshot(at('working'));
+    await fake.runtime.refreshLocal(); await flushAsync();
+    assert.equal(reads, 0, 'control: a working pane lists nothing here (the app\'s poll does)');
+    fake.snapshot(at('blocked'));
+    await fake.runtime.refreshLocal(); await flushAsync();
+    assert.equal(reads, 1, 'the flip to blocked lists the sessions');
+    assert.match(askingLine(state), /^ {8}\S blocked · GPT · /, 'the approval reads blocked, its hand raised');
+    await fake.runtime.refreshLocal(); await flushAsync();
+    assert.equal(reads, 1, 'a pane that stays blocked lists nothing more');
+  } finally { fake.runtime.close(); }
+});
+
+// A long command writes nothing to Codex's rollout, so past the window the row read herdr's blocked while Codex's screen
+// plainly showed it working. Such a pane's screen is read through herdr (`pane.read`, as text), only in that state and once
+// for each revision herdr gives the pane: the row reads working · ? question while Codex's timer is above its prompt, and
+// herdr's blocked once it is gone. Every read reaches a scripted herdr (fake-herdr.js), never a real one.
+const codexScreens = {
+  working: '• Ran the build\n\nWorking (10m 4s • esc to interrupt) · Running hook\n\n• Queued follow-up inputs\n  ? 1 question\n    shift+← to answer\n\n› Ask Codex to do anything\n\n  model-x high · ~/project · Context 40% used\n',
+  finished: '• Built it.\n\n─ Worked for 10m 4s ─────────\n\n› Ask Codex to do anything\n',
+};
+const paneRead = (pane_id, text) => ({ type: 'pane_read', read: { pane_id, workspace_id: 'w1', tab_id: 'tab', source: 'visible', format: 'text', text, revision: 1, truncated: false } });
+
+/** This machine's Codex pane `p4`, blocked in herdr, its rollout ten minutes quiet, its turn open and no hand, read
+ *  against the clock the runtime reads; its screen comes from a scripted herdr (`screen.text`, failing while
+ *  `screen.fail`), and `changeScreen` gives the next snapshot a new revision for it. */
+async function quietCodex(t, runtimeOptions = {}) {
+  const { fakeHerdr } = require('../../core/test/fake-herdr');
+  const screen = { text: codexScreens.working, fail: false, snapshotFails: false };
+  const herdr = await fakeHerdr(t, { 'pane.read': ({ pane_id }) => {
+    if (screen.fail) throw screen.fail instanceof Error ? screen.fail : Object.assign(new Error('screen unavailable'), { code: 'read_failed' });
+    return paneRead(pane_id, screen.text);
+  } });
+  if (!herdr) return null;
+  const state = asking();
+  state.now = Date.now();
+  const row = state.views.sessions.sessions.find(r => r.id === 'codex-asking');
+  row.lastActiveMs = state.now - 600_000;
+  // Revision 0, as herdr 0.9.1 gives every pane: what its screen showed is still evidence.
+  const panes = state.observatory.machines[0].snapshot.panes.map(p => p.pane_id === 'p4' ? { ...p, revision: 0 } : p);
+  let current = snapshot(panes), revision = 0;
+  const statuses = [];
+  const fake = { ...core, findHerdrBin: () => '/herdr', herdrMachines: async () => [],
+    herdrSnapshot: async () => { if (screen.snapshotFails) throw new Error('herdr is not answering'); return current; },
+    herdrRequest: (method, params, o) => core.herdrRequest(method, params, { ...o, socketPath: herdr.socketPath }),
+    herdrSubscribe: () => ({ close() {} }), readHerdrPaneLink: () => null, observatoryRoots: () => [], sessionMeta: () => state.views.sessions };
+  const runtime = tui.createObservatory(fake, state, { cwd: '/workspace', reader: testReader(fake), changed() {}, status: m => statuses.push(m), timers: false, watch: false, readOnly: true, ...runtimeOptions });
+  t.after(() => runtime.close());
+  return { state, row, runtime, screen, statuses,
+    changeScreen: () => { current = snapshot(panes.map(p => p.pane_id === 'p4' ? { ...p, revision: ++revision } : p)); },
+    reads: () => herdr.calls('pane.read'),
+    refresh: async () => { await runtime.refreshLocal(); await runtime.readScreens(); } };
+}
+
+test('Observatory: a Codex pane quiet past the window shows what its screen shows, read once for each revision (2026-10-29)', { timeout: 30000 }, async t => {
+  const fx = await quietCodex(t);
+  if (!fx) return;
+  const { state, row, runtime, screen, statuses, changeScreen, reads, refresh } = fx;
+  assert.match(askingLine(state), / blocked · GPT · /, 'control: quiet past the window, with nothing read, herdr\'s blocked');
+  await refresh();
+  assert.deepEqual(reads(), [{ pane_id: 'p4', source: 'visible', format: 'text', strip_ansi: true }], 'only that pane is read, as herdr\'s CLI reads it: the blocked Claude pane is not');
+  assert.match(askingLine(state), / working · \? question · GPT · /, 'Codex\'s timer above its prompt: working, the question beside it');
+  await refresh();
+  assert.equal(reads().length, 1, 'the same revision: its screen is not read again');
+  assert.match(askingLine(state), / working · \? question · /);
+  // A newer screen is read again; until that read lands, the pane keeps what the last one found.
+  screen.text = codexScreens.finished; changeScreen();
+  await runtime.refreshLocal();
+  assert.match(askingLine(state), / working · \? question · /, 'no blink to blocked while its newer screen is read');
+  await runtime.readScreens();
+  assert.equal(reads().length, 2);
+  assert.match(askingLine(state), / blocked · GPT · /, 'the timer gone from its screen: herdr\'s blocked');
+  // A read that fails is no evidence, said nowhere, and not asked again for the same screen.
+  screen.text = codexScreens.working; screen.fail = true; changeScreen();
+  await refresh();
+  assert.equal(reads().length, 3);
+  assert.match(askingLine(state), / blocked · GPT · /, 'herdr\'s word stands');
+  await refresh();
+  assert.equal(reads().length, 3, 'a failed read is not repeated for the same screen');
+  assert.deepEqual(statuses, [], 'and the status row says nothing of it');
+  screen.fail = false;
+  // Out of that state no screen is read, whatever it shows: written within the window, a hand raised, the turn ended.
+  for (const [why, edit] of [['written within the window', { lastActiveMs: Date.now() - 10_000 }],
+    ['a permission prompt raised', { attention: { kind: 'permission', message: 'Bash', ts: Date.now() } }], ['the turn ended', { turnOpen: false }]]) {
+    const saved = { ...row };
+    Object.assign(row, edit); changeScreen();
+    await refresh();
+    assert.equal(reads().length, 3, why);
+    Object.assign(row, saved);
+  }
+  // Back in that state, the newest screen is read.
+  changeScreen();
+  await refresh();
+  assert.equal(reads().length, 4);
+  assert.match(askingLine(state), / working · \? question · /);
+});
+
+// What a screen showed lasts while herdr's blocked sits on the open turn: through the rollout's writes (a quiet spell after
+// one keeps it until the newer screen is read), and the pass between snapshots reads a pane whose window ran out since the
+// last one. A hand raised, the turn ended or a snapshot that fails forgets it, and nothing is carried back from before.
+test('Observatory: a Codex pane\'s screen reading lasts through the rollout\'s writes, and goes with its turn, its hand or its machine (2026-10-29)', { timeout: 30000 }, async t => {
+  const fx = await quietCodex(t);
+  if (!fx) return;
+  const { state, row, runtime, screen, changeScreen, reads, refresh } = fx;
+  await refresh();
+  assert.equal(reads().length, 1);
+  assert.match(askingLine(state), / working · \? question · /, 'control: read, Codex at work');
+  // The rollout written: the window decides and nothing is read. Quiet again on a newer screen, the reading from before
+  // the write stands until that screen is read.
+  row.lastActiveMs = Date.now() - 10_000; changeScreen();
+  await refresh();
+  assert.equal(reads().length, 1, 'written within the window: no screen is read');
+  row.lastActiveMs = Date.now() - 600_000; changeScreen();
+  await runtime.refreshLocal();
+  assert.match(askingLine(state), / working · \? question · /, 'quiet again: no blink to blocked while the newer screen is read');
+  await runtime.readScreens();
+  assert.equal(reads().length, 2);
+  // The window runs out between snapshots: the pass, which runs every second, reads the pane at once.
+  row.lastActiveMs = Date.now() - 10_000; changeScreen();
+  await refresh();
+  assert.equal(reads().length, 2, 'control: within the window, nothing read');
+  row.lastActiveMs = Date.now() - 600_000;
+  await runtime.readScreens();
+  assert.equal(reads().length, 3, 'quiet past the window since the last snapshot: read with no snapshot after it');
+  // A hand raised, the turn ended, or a snapshot that failed: the reading goes, and back in that state the pane is herdr's
+  // blocked until its screen is read again.
+  const leave = { 'a permission prompt raised': () => { row.attention = { kind: 'permission', message: 'Bash', ts: Date.now() }; },
+    'the turn ended': () => { row.turnOpen = false; }, 'a snapshot that failed': () => { screen.snapshotFails = true; } };
+  for (const [why, away] of Object.entries(leave)) {
+    const saved = { ...row }, before = reads().length;
+    away(); changeScreen();
+    await refresh();
+    assert.equal(reads().length, before, `${why}: no screen is read`);
+    Object.assign(row, saved); screen.snapshotFails = false; changeScreen();
+    await runtime.refreshLocal();
+    assert.match(askingLine(state), / blocked · GPT · /, `${why}, then back: nothing carried over from before`);
+    await runtime.readScreens();
+    assert.equal(reads().length, before + 1);
+    assert.match(askingLine(state), / working · \? question · /);
+  }
+});
+
+test('Observatory: the screen pass runs on its own every second between snapshots (2026-10-29)', { timeout: 30000 }, async t => {
+  const fx = await quietCodex(t, { timers: true });
+  if (!fx) return;
+  const { row, runtime, reads } = fx;
+  row.lastActiveMs = Date.now() - 10_000;
+  await runtime.refreshLocal();
+  assert.equal(reads().length, 0, 'control: within the window, nothing is read');
+  row.lastActiveMs = Date.now() - 600_000;
+  for (let i = 0; i < 60 && !reads().length; i++) await new Promise(resolve => setTimeout(resolve, 50));
+  assert.equal(reads().length, 1, 'quiet past the window, it is read within the second, with no snapshot after it');
+});
+
+// herdr 0.9.1 gives every pane revision 0 whatever its screen does (measured on a sandboxed server, with a client
+// attached and without), so a reading also lapses: a pane still in that state is read again 15 seconds on, not before.
+test('Observatory: a screen reading lapses after 15 seconds, since herdr 0.9.1 gives every pane revision 0 (2026-10-29)', { timeout: 30000 }, async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  const fx = await quietCodex(t);
+  if (!fx) return;
+  const { state, screen, reads, refresh } = fx;
+  await refresh();
+  assert.equal(reads().length, 1);
+  assert.match(askingLine(state), / working · \? question · /, 'control: read, Codex at work');
+  t.mock.timers.tick(14_000);
+  await refresh();
+  assert.equal(reads().length, 1, 'the same revision, read 14 seconds ago: not read again');
+  screen.text = codexScreens.finished;
+  t.mock.timers.tick(1_500);
+  await refresh();
+  assert.equal(reads().length, 2, 'the same revision, read over 15 seconds ago: read again');
+  assert.match(askingLine(state), / blocked · GPT · /, 'and what the screen shows now stands');
+});
+
+// A one-shot frame waits for the screens it needs, and stops there: two quiet panes whose reads each take longer than a
+// reading lasts are each read once, not one after the other for ever.
+test('Observatory: readScreens settles with each pane read once, however long its reads take (2026-10-29)', { timeout: 30000 }, async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  const { fakeHerdr } = require('../../core/test/fake-herdr');
+  const herdr = await fakeHerdr(t, { 'pane.read': ({ pane_id }) => { t.mock.timers.tick(16_000); return paneRead(pane_id, codexScreens.working); } });
+  if (!herdr) return;
+  const state = asking();
+  state.now = Date.now();
+  const quiet = { turnOpen: true, attention: null, lastActiveMs: state.now - 600_000 };
+  Object.assign(state.views.sessions.sessions.find(r => r.id === 'codex-asking'), quiet);
+  state.views.sessions.sessions.push({ id: 'codex-second', title: 'Second long build', pending: 0, agent: 'codex', model: 'GPT', tokens: 900, machine: 'laptop', ...quiet });
+  const local = snapshot([...state.observatory.machines[0].snapshot.panes, pane('p5', 'codex-second', 'blocked', 'codex')]);
+  const fake = { ...core, findHerdrBin: () => '/herdr', herdrMachines: async () => [], herdrSnapshot: async () => local,
+    herdrRequest: (method, params, o) => core.herdrRequest(method, params, { ...o, socketPath: herdr.socketPath }),
+    herdrSubscribe: () => ({ close() {} }), readHerdrPaneLink: () => null, observatoryRoots: () => [], sessionMeta: () => state.views.sessions };
+  const runtime = tui.createObservatory(fake, state, { cwd: '/workspace', reader: testReader(fake), changed() {}, status() {}, timers: false, watch: false, readOnly: true });
+  t.after(() => runtime.close());
+  await runtime.refreshLocal();
+  await runtime.readScreens();
+  assert.deepEqual(herdr.calls('pane.read').map(r => r.pane_id), ['p4', 'p5'], 'each pane read once');
+});
+
+test('Observatory: screens are read one at a time on a machine, the pane read longest ago first (2026-10-29)', { timeout: 30000 }, async () => {
+  const state = asking();
+  state.now = Date.now();
+  const quiet = { turnOpen: true, attention: null, lastActiveMs: state.now - 600_000 };
+  Object.assign(state.views.sessions.sessions.find(r => r.id === 'codex-asking'), quiet);
+  state.views.sessions.sessions.push({ id: 'codex-second', title: 'Second long build', pending: 0, agent: 'codex', model: 'GPT', tokens: 900, machine: 'laptop', ...quiet });
+  const panes = [...state.observatory.machines[0].snapshot.panes, pane('p5', 'codex-second', 'blocked', 'codex')];
+  let current = snapshot(panes), revision = 1;
+  const held = [];
+  const fake = fakeRuntime(state, {
+    herdrSnapshot: async () => current,
+    herdrRequest: (method, params) => method === 'pane.read' ? new Promise(resolve => held.push({ pane: params.pane_id, answer: () => resolve(paneRead(params.pane_id, codexScreens.working)) }))
+      : Promise.resolve({ type: 'ok' }),
+  }, { readOnly: true });
+  try {
+    await fake.runtime.refreshLocal();
+    assert.deepEqual(held.map(h => h.pane), ['p4'], 'one read at a time on this machine');
+    await fake.runtime.refreshLocal();
+    assert.deepEqual(held.map(h => h.pane), ['p4'], 'another snapshot while it is out starts no second read');
+    held[0].answer(); await flushAsync(); await flushAsync();
+    assert.deepEqual(held.map(h => h.pane), ['p4', 'p5'], 'the next pane once the first is read');
+    held[1].answer(); await flushAsync(); await flushAsync();
+    const change = ids => { revision++; current = snapshot(current.panes.map(p => ids.includes(p.pane_id) ? { ...p, revision } : p)); };
+    // p4's screen changes and is read again, which leaves p5's reading the older one, though p5 comes after p4.
+    await new Promise(resolve => setTimeout(resolve, 5));
+    change(['p4']); await fake.runtime.refreshLocal();
+    assert.equal(held[2].pane, 'p4');
+    held[2].answer(); await flushAsync(); await flushAsync();
+    assert.equal(held.length, 3, 'control: p5\'s screen has not changed, so it is not read');
+    change(['p4', 'p5']); await fake.runtime.refreshLocal();
+    assert.deepEqual(held.slice(3).map(h => h.pane), ['p5'], 'both changed: the pane read longest ago first, and one at a time');
+  } finally { fake.runtime.close(); }
+});
+
+test('Observatory: a saved machine\'s Codex pane has its screen read there, through herdr\'s CLI with the remote budget (2026-10-29)', { timeout: 30000 }, async t => {
+  const { fakeHerdr } = require('../../core/test/fake-herdr');
+  const herdr = await fakeHerdr(t, { 'pane.read': ({ pane_id }) => paneRead(pane_id, codexScreens.working) });
+  if (!herdr) return;
+  remoteTimeoutEnv(t, '45000');
+  const state = fixture();
+  state.now = Date.now();
+  const remote = state.observatory.machines[1];
+  remote.snapshot.panes[0].agent_status = 'blocked';
+  Object.assign(remote.sessions.sessions[0], { turnOpen: true, attention: null, lastActiveMs: state.now - 600_000 });
+  const forwarded = [], asked = [];
+  const fake = { ...core, findHerdrBin: () => '/herdr', herdrSnapshot: async () => state.observatory.machines[0].snapshot,
+    herdrMachines: async () => [{ id: 'build', label: 'build-box', enabled: true }],
+    herdrOnMachine: async (label, argv, o) => {
+      if (argv[0] === 'api') return { result: { type: 'session_snapshot', snapshot: remote.snapshot } };
+      forwarded.push({ label, argv, text: o.text, timeoutMs: o.timeoutMs });
+      return core.herdrOnMachine(label, argv, { ...o, binary: herdr.binary });
+    },
+    herdrRequest: async method => { asked.push(method); throw new Error(`${method}: this machine's herdr has nothing to answer here`); },
+    herdrSubscribe: () => ({ close() {} }), readHerdrPaneLink: () => null, observatoryRoots: () => [], sessionMeta: () => state.views.sessions };
+  const runtime = tui.createObservatory(fake, state, { cwd: '/workspace', reader: testReader(fake), changed() {}, status() {}, timers: false, watch: false, readOnly: true });
+  t.after(() => runtime.close());
+  const remoteLine = () => render(state).find(r => r.key === 'session:build:p1:remote-done:state').cells;
+  assert.match(remoteLine(), / blocked · GPT · /, 'control: herdr\'s blocked before its screen is read');
+  await runtime.refreshRemotes();
+  await runtime.readScreens();
+  assert.deepEqual(forwarded, [{ label: 'build-box', argv: ['pane', 'read', 'p1', '--source', 'visible', '--format', 'text'], text: true, timeoutMs: 45000 }]);
+  assert.deepEqual(herdr.calls('pane.read'), [{ pane_id: 'p1', source: 'visible', format: 'text', strip_ansi: true, machine: 'build-box' }], 'the CLI asks that machine\'s herdr');
+  assert.match(remoteLine(), / working · \? question · GPT · /);
+  assert.deepEqual(asked, [], 'nothing is read from this machine\'s herdr for it');
 });
 
 test('Observatory reply stays at the detail bottom with independent scroll and a full editable draft', () => {
@@ -1131,10 +1888,10 @@ test('Native footers select complete measured tiers for herdr and shell', t => {
     assert.equal(footer.trimEnd(), hints.find(s => tui.displayWidth(s) <= cols - 1));
     assert.ok(tui.displayWidth(footer) < cols);
   }
-  assert.match(tui.OBS_HINTS.join('\n'), /i reply.*esc/);
+  assert.match(tui.OBS_HINTS.join('\n'), /c reply.*esc/);
 });
 
-test('Observatory navigation: herdr leader and openConversation use the same select-and-pin transition', async () => {
+test("Observatory navigation: herdr's prefix then M and openConversation use the same select-and-pin transition", async () => {
   const state = fixture();
   const { runtime, calls } = fakeRuntime(state);
   try {
@@ -1198,9 +1955,102 @@ test('Observatory store watcher: exact identity link, oak pending token and expl
   } finally { fake.runtime.close(); }
 });
 
+test('Observatory store watcher: a pane an older OAK gave Codex\'s memory thread goes back to the newest session linked there', async () => {
+  const state = fixture();
+  // herdr holds the memory thread in the pane; its link (the newest) and the root thread's both name it.
+  state.observatory.machines[0].snapshot.panes.push({ ...pane('p-mem', 'memory-thread', 'idle'), agent_session: { value: 'memory-thread' } });
+  state.views.sessions.sessions.push({ id: 'root-thread', agent: 'codex', pending: 0 }, { id: 'memory-thread', agent: 'codex', pending: 0 }, { id: 'claude-row', agent: 'claude', pending: 0 });
+  const links = { 'root-thread': { paneId: 'p-mem', socketPath: '/fake.sock', at: 3, sessionStartSource: 'startup' }, 'memory-thread': { paneId: 'p-mem', socketPath: '/fake.sock', at: 5 },
+    'claude-row': { paneId: 'p-claude', socketPath: '/fake.sock', at: 1 } };
+  const identities = [], asked = [];
+  const fake = fakeRuntime(state, { readHerdrPaneLink: session => links[session] ?? null, isCodexMemorySession: session => (asked.push(session), session === 'memory-thread'),
+    reportHerdrSession: async (...args) => identities.push(args) });
+  try {
+    await fake.runtime.start(); await fake.runtime.publishStore();
+    assert.deepEqual(identities.map(a => [a[0], a[1], a[2], a[5]]), [['root-thread', 'codex', links['root-thread'], true]], 'the root thread, replacing');
+    // Only a Codex row can be the memory thread: a Claude row's agent.json is never read for it.
+    assert.ok(asked.includes('root-thread') && !asked.includes('claude-row'), `asked about ${asked}`);
+  } finally { fake.runtime.close(); }
+  // Control: a pane herdr gives any other session is never taken.
+  const other = fixture();
+  other.observatory.machines[0].snapshot.panes.push({ ...pane('p-mem', 'someone-else', 'idle'), agent_session: { value: 'someone-else' } });
+  other.views.sessions.sessions.push({ id: 'root-thread', agent: 'codex', pending: 0 });
+  const none = [];
+  const control = fakeRuntime(other, { readHerdrPaneLink: session => links[session] ?? null, isCodexMemorySession: () => false,
+    reportHerdrSession: async (...args) => none.push(args) });
+  try { await control.runtime.start(); await control.runtime.publishStore(); assert.deepEqual(none, []); }
+  finally { control.runtime.close(); }
+});
+
+test('Observatory store watcher: a pane this app reported for the root thread before Codex\'s memory thread took it goes back to the root thread (2026-10-06)', async () => {
+  const state = fixture();
+  // The root thread's link arrived before herdr showed its hook's own report, so this app reported it.
+  const root = { ...pane('p-root', 'root-thread', 'idle', 'codex'), agent_session: null };
+  state.observatory.machines[0].snapshot.panes.push(root);
+  state.views.sessions.sessions.push({ id: 'root-thread', agent: 'codex', pending: 0 }, { id: 'memory-thread', agent: 'codex', pending: 0 });
+  const links = { 'root-thread': { paneId: 'p-root', socketPath: '/fake.sock', at: 3, sessionStartSource: 'startup' } };
+  const identities = [];
+  const fake = fakeRuntime(state, { readHerdrPaneLink: session => links[session] ?? null, isCodexMemorySession: session => session === 'memory-thread',
+    reportHerdrSession: async (...args) => identities.push(args) });
+  const reports = () => identities.map(a => [a[0], a[5]]);
+  try {
+    await fake.runtime.start(); await fake.runtime.publishStore();
+    assert.deepEqual(reports(), [['root-thread', false]]);
+    // An older OAK's hook reports Codex's memory thread in that pane: it goes back to the root thread.
+    root.agent_session = { agent: 'codex', kind: 'id', value: 'memory-thread', source: 'herdr:codex' };
+    await fake.runtime.publishStore();
+    assert.deepEqual(reports(), [['root-thread', false], ['root-thread', true]], 'replacing, once the thread holds the pane');
+    // Asked once per thread holding it, not on every pass while herdr has not caught up.
+    await fake.runtime.publishStore();
+    assert.equal(identities.length, 2);
+  } finally { fake.runtime.close(); }
+});
+
+test('Observatory store watcher: a pane Codex\'s memory thread takes again, after it went back, goes back again (2026-10-07)', async () => {
+  const state = fixture();
+  const held = (value) => ({ agent: 'codex', kind: 'id', value, source: 'herdr:codex' });
+  const root = { ...pane('p-root', 'root-thread', 'idle', 'codex'), agent_session: held('memory-thread') };
+  state.observatory.machines[0].snapshot.panes.push(root);
+  state.views.sessions.sessions.push({ id: 'root-thread', agent: 'codex', pending: 0 }, { id: 'memory-thread', agent: 'codex', pending: 0 });
+  const links = { 'root-thread': { paneId: 'p-root', socketPath: '/fake.sock', at: 3, sessionStartSource: 'startup' } };
+  const identities = [];
+  const fake = fakeRuntime(state, { readHerdrPaneLink: session => links[session] ?? null, isCodexMemorySession: session => session === 'memory-thread',
+    reportHerdrSession: async (...args) => identities.push(args) });
+  const reports = () => identities.map(a => [a[0], a[5]]);
+  try {
+    await fake.runtime.start(); await fake.runtime.publishStore();
+    assert.deepEqual(reports(), [['root-thread', true]], 'the pane goes back to the root thread');
+    // herdr shows the root thread there again; at a later turn the memory thread takes the pane again.
+    root.agent_session = held('root-thread');
+    await fake.runtime.publishStore();
+    root.agent_session = held('memory-thread');
+    await fake.runtime.publishStore();
+    assert.deepEqual(reports(), [['root-thread', true], ['root-thread', true]], 'and back again');
+    await fake.runtime.publishStore();
+    assert.equal(identities.length, 2, 'once per takeover, while herdr has not caught up');
+  } finally { fake.runtime.close(); }
+});
+
+test('Observatory store watcher: each Codex session\'s agent record is read once to tell its memory thread, not on every pass (2026-10-07)', async () => {
+  const state = fixture();
+  state.observatory.machines[0].snapshot.panes.push({ ...pane('p-codex', 'codex-a', 'idle', 'codex'), agent_session: null });
+  state.views.sessions.sessions.push({ id: 'codex-a', agent: 'codex', pending: 0 }, { id: 'codex-b', agent: 'codex', pending: 0 });
+  const links = { 'codex-a': { paneId: 'p-codex', socketPath: '/fake.sock', at: 3 }, 'codex-b': { paneId: 'p-codex', socketPath: '/fake.sock', at: 2 } };
+  const asked = [];
+  const fake = fakeRuntime(state, { readHerdrPaneLink: session => links[session] ?? null, isCodexMemorySession: session => (asked.push(session), false),
+    readCodexAgentMeta: session => (session === 'codex-a' ? { agent: 'codex', cwd: '/work' } : null), reportHerdrSession: async () => {} });
+  try {
+    await fake.runtime.start();
+    for (let i = 0; i < 3; i++) await fake.runtime.publishStore();
+    assert.equal(asked.filter(s => s === 'codex-a').length, 1, 'a session with its record is asked once');
+    assert.ok(asked.filter(s => s === 'codex-b').length >= 3, 'one with no record yet is asked again, on every pass');
+  } finally { fake.runtime.close(); }
+});
+
 test('Observatory capture identity sidecar: both kinds without OAK_TAB and herdr:<kind> source', async t => {
   isolated(t);
   process.env.HERDR_PANE_ID = 'pane-capture'; process.env.HERDR_SOCKET_PATH = '/capture.sock';
+  t.mock.method(require('../../core/dist/herdr-context'), 'herdrPaneContextSync', () => ({ nested: true, paneId: 'pane-capture', socketPath: '/capture.sock' }));
   core.linkTab('claude-capture'); core.linkTab('codex-capture');
   for (const session of ['claude-capture', 'codex-capture']) {
     const link = core.readHerdrPaneLink(session);
@@ -1296,13 +2146,12 @@ test('Observatory visible navigation retires Agent/Feed and keeps the herdr pref
   assert.ok(!tui.SCREENS.some(s => s.id === 'feed' || s.id === 'claude'));
   assert.ok(!tui.TAB_SCREEN.dashboards.includes('feed'));
   assert.ok(!tui.helpLines({}).join('\n').includes('Agent screen'));
-  assert.match(tui.helpLines({}).join('\n'), /ctrl\+a o/);
+  assert.match(tui.helpLines({}).join('\n'), /ctrl\+b M +from the herdr tab, pin its focused pane's session/);
   assert.ok(!tui.OBS_HINTS.join('\n').includes('feed'));
   const app = fs.readFileSync(path.join(__dirname, '../src/app.ts'), 'utf8');
   assert.match(app, /id: 'herdr', kind: 'native'/);
   assert.ok(!app.includes("id: 'agent',"));
-  assert.match(app, /ev.key === 'o' && tabs\[active\]\?\.id === 'herdr'/);
-  // Prefix ownership is exercised by native-keys/native-kitty below, including split reads.
+  // Prefix ownership is exercised by native-keys/native-kitty below and keys-probe's herdr-prefix, including split reads.
 });
 
 async function checkLiveHerdr(t, transport = core) {
@@ -1450,6 +2299,49 @@ test('Observatory reply draft retains body and detail rows; body inputs still in
   } finally { fake.runtime.close(); }
 });
 
+// A call with no result yet is never drawn settled (the ✓ a finished one wears): while the pinned session waits on a
+// person (its pane blocked) it is the call it waits on, `?`; otherwise it is running, the live dot (2026-11-02).
+test('Observatory detail: a call with no result is `?` while its session waits on a person, running otherwise, never ✓', () => {
+  const { observatoryDetailRows } = require('../dist/observatory-rows');
+  const markOf = (session) => {
+    const state = pin(fixture(), session);
+    Object.assign(state.observatory.details['obs-detail'], { loading: false, events: [
+      { ts: 1, update: { sessionUpdate: 'user_prompt', content: { type: 'text', text: 'Clean the build' } } },
+      { ts: 2, update: { sessionUpdate: 'tool_call', toolCallId: 'b1', title: 'Bash', kind: 'execute', status: 'pending', rawInput: { command: 'rm -rf build' } } }] });
+    const rows = observatoryDetailRows(state, 80, g, 'none').map((r) => r.cells);
+    assert.match(rows[0], session ? /> working/ : /\? blocked/, 'control: the session\'s state');
+    return / (\S) +\d{4}-\d\d-\d\d \+$/.exec(rows.find((r) => r.includes('$ rm -rf build')))?.[1];
+  };
+  assert.equal(markOf(undefined), g.pending, 'blocked: the call it waits on');
+  assert.equal(markOf('working'), g.dot.live, 'running');
+  assert.notEqual(g.dot.live, g.kept);
+  // One detail drawn waiting and then not, with no new event between (the session went back to work): its rows are not
+  // the ones drawn while it waited, which the rows' memo would keep without the waiting in its key.
+  const { conversationRows } = require('../dist/observatory-rows');
+  const state = pin(fixture(), 'working');
+  const detail = { ...state.observatory.details['obs-detail'], loading: false, events: [
+    { ts: 2, update: { sessionUpdate: 'tool_call', toolCallId: 'b2', title: 'Bash', kind: 'execute', status: 'pending', rawInput: { command: 'make test' } } }] };
+  const mark = (waiting) => / (\S) +\d{4}-\d\d-\d\d \+$/.exec(conversationRows(state, detail, 80, g, 'none', waiting).map((r) => r.cells).find((r) => r.includes('$ make test')))?.[1];
+  assert.equal(mark(true), g.pending);
+  assert.equal(mark(false), g.dot.live, 'drawn again once it does not wait');
+});
+
+test('Observatory: a prompt bubble wraps a family emoji whole, at every width', () => {
+  // A row broke between any two code points, so an ask that wrapped at a family emoji showed part of it on each row.
+  const { conversationRows } = require('../dist/observatory-rows');
+  const fam = '\u{1F468}\u200d\u{1F469}\u200d\u{1F467}\u200d\u{1F466}';
+  const cutInside = (t) => /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/.test(t) || (/[\u{1F466}-\u{1F469}]/u.test(t) && !t.includes(fam));
+  const state = pin(fixture(), 'working');
+  const detail = state.observatory.details['obs-detail'];
+  for (let k = 0; k <= 34; k++) { // every offset, so the family runs past each width's edge
+    for (const cols of [22, 26, 30, 34]) {
+      const events = [{ ts: 1, update: { sessionUpdate: 'user_prompt', content: { type: 'text', text: `${'x'.repeat(k)}${fam}${'y'.repeat(30)}` } } }];
+      const rows = conversationRows(state, { ...detail, loading: false, events }, cols, g, 'none').map((r) => r.cells);
+      assert.ok(rows.every((r) => !cutInside(r)) && rows.some((r) => r.includes(fam)), `${cols} columns, the family at ${k}: ${JSON.stringify(rows)}`);
+    }
+  }
+});
+
 test('Observatory machine label override survives local refresh and subscription errors', async t => {
   const old = process.env.OAK_MACHINE_LABEL;
   t.after(() => { if (old === undefined) delete process.env.OAK_MACHINE_LABEL; else process.env.OAK_MACHINE_LABEL = old; });
@@ -1469,16 +2361,38 @@ test('herdr footer explains tmux send-prefix and preserves the ordinary hint', t
   const state = fixture(); state.panes = state.tabs[0].panes; state.nativeGrid = ['fixture terminal'];
   process.env.TMUX = '/fixture/tmux';
   const draw = () => tui.renderDashFrame(state, { cols: 140, rows: 30, color: 'none', glyphs: g }).join('\n');
-  assert.match(draw(), /ctrl\+b ctrl\+b is herdr's prefix/);
+  assert.match(draw(), /ctrl\+b is herdr's prefix \(twice if tmux uses it too\)/);
   delete process.env.TMUX;
-  assert.match(draw(), /herdr's tab bar below starts agents · ctrl\+b is herdr's prefix/);
+  assert.match(draw(), /herdr's tab bar below starts agents · ctrl\+b is herdr's prefix · ctrl\+b m OAK's tabs/);
+  // The prefix is herdr's configured one, not a hard-coded ctrl+b.
+  state.herdrPrefix = 'ctrl+g';
+  assert.match(draw(), /ctrl\+g is herdr's prefix · ctrl\+g m OAK's tabs/);
+  // herdr's config took m: M is the way back; took both: only a click leaves.
+  state.herdrBack = 'M';
+  assert.match(draw(), /ctrl\+g M OAK's tabs/);
+  state.herdrBack = null;
+  assert.match(draw(), /click OAK's tab bar to leave/);
+  assert.doesNotMatch(draw(), /ctrl\+g m/);
 });
 
-for (const check of ['views', 'fallback', 'launch-failed', 'launch-refused', 'tick-pref', 'tick-flag', 'identity', 'hand-observatory', 'help', 'delete', 'fixed-tabs', 'native-mouse', 'native-keys', 'native-kitty', 'leader-quit', 'repeat-keys', 'usage', 'once', 'once-newest', 'detail-scroll',
-  'ctrl-q-herdr', 'ctrl-q-observatory', 'ctrl-q-review', 'ctrl-q-reply', 'ctrl-q-overlay', 'ctrl-q-palette', 'ctrl-q-confirm', 'ctrl-q-timeout', 'ctrl-q-leader', 'ctrl-q-shared',
-  'click-pin', 'click-split', 'workspace-nav']) test(`Observatory app regression: ${check}`, () => {
+for (const check of ['views', 'fallback', 'launch-failed', 'launch-refused', 'tick-pref', 'tick-flag', 'identity', 'hand-observatory', 'hand-wait', 'synced-hand', 'synced-hand-unsaved', 'help', 'delete', 'delete-folder',
+  'sync-inbox', 'sync-options', 'sync-cursor', 'sync-stamp', 'sync-none', 'sync-saved', 'fixed-tabs', 'native-mouse', 'native-keys', 'native-kitty', 'prefix-quit', 'repeat-keys', 'usage', 'once', 'once-newest', 'once-screen', 'detail-scroll',
+  'ctrl-q-herdr', 'ctrl-q-observatory', 'ctrl-q-review', 'ctrl-q-reply', 'ctrl-q-overlay', 'ctrl-q-palette', 'ctrl-q-confirm', 'ctrl-q-timeout', 'ctrl-q-prefix', 'ctrl-q-shared',
+  'click-pin', 'click-split', 'done-fold', 'workspace-nav', 'worker-rows', 'worker-preview', 'worker-vanish']) test(`Observatory app regression: ${check}`, () => {
   const result = require('child_process').spawnSync(process.execPath, [path.join(__dirname, 'fixtures/observatory-app-probe.cjs')], {
-    encoding: 'utf8', timeout: 10000, env: { ...process.env, NODE_TEST_CONTEXT: '', OAK_APP_FIX_CHECK: check },
+    // The sync checks walk the options window a key at a time, as a reader does: seconds, more on a loaded machine.
+    encoding: 'utf8', timeout: check.startsWith('sync-') ? 30000 : 10000, env: { ...process.env, NODE_TEST_CONTEXT: '', OAK_APP_FIX_CHECK: check },
+  });
+  assert.equal(result.status, 0, result.stderr || result.error?.message);
+  assert.match(result.stderr, new RegExp(`PASS: ${check}`));
+});
+
+// F1 to F3 raise herdr, the Observatory and Review from every tab, in every form a terminal sends them, over every overlay
+// and before herdr sees them, unless herdr's config binds them; herdr's prefix then V opens Review on the focused pane's
+// session, read on the machine that runs it (2026-10-23).
+for (const check of ['tab-keys', 'tab-keys-overlays', 'tab-keys-herdr-config', 'tab-keys-nested', 'review-key']) test(`terminal app tab keys: ${check}`, () => {
+  const result = require('child_process').spawnSync(process.execPath, [path.join(__dirname, 'fixtures/observatory-app-probe.cjs')], {
+    encoding: 'utf8', timeout: 30000, env: { ...process.env, NODE_TEST_CONTEXT: '', OAK_APP_FIX_CHECK: check },
   });
   assert.equal(result.status, 0, result.stderr || result.error?.message);
   assert.match(result.stderr, new RegExp(`PASS: ${check}`));
@@ -1495,6 +2409,17 @@ for (const check of ['drag-master', 'drag-detail', 'drag-button', 'click-release
   assert.match(result.stderr, new RegExp(`PASS: ${check}`));
 });
 
+// Who holds a press on the herdr tab (herdr's rows as far as OAK shows them, a tab left with a button down, herdr's
+// prefix pressed during its drag), and what a copy says and runs: a toast for every outcome, one process at a time on
+// each path and stopped after ten seconds, and messages that name herdr's copy and the tool that failed (2026-10-13).
+for (const check of ['herdr-hold', 'copy-outcomes', 'copy-lanes', 'copy-stuck', 'copy-messages', 'copy-remote', 'copy-remote-narrow', 'copy-remote-ready', 'copy-remote-toast-ends']) test(`terminal app pointer and copies: ${check}`, () => {
+  const result = require('child_process').spawnSync(process.execPath, [path.join(__dirname, 'fixtures/observatory-app-probe.cjs')], {
+    encoding: 'utf8', timeout: 15000, env: { ...process.env, NODE_TEST_CONTEXT: '', OAK_APP_FIX_CHECK: check },
+  });
+  assert.equal(result.status, 0, result.stderr || result.error?.message);
+  assert.match(result.stderr, new RegExp(`PASS: ${check}`));
+});
+
 test('the app never relaunches its own host to refresh titles: only an oak CLI entry the CLI registered is launched (2026-09-24)', t => {
   // The probe runs the app on core directly, so its argv[1] is the probe. A refresh launched through argv[1]
   // reran the whole probe, which kicked again from a fresh HOME (so the claim never held), forever.
@@ -1504,7 +2429,7 @@ test('the app never relaunches its own host to refresh titles: only an oak CLI e
     const log = path.join(dir, `${name}.jsonl`);
     const result = require('child_process').spawnSync(process.execPath,
       ['--require', path.join(__dirname, 'fixtures/spawn-recorder.cjs'), path.join(__dirname, 'fixtures/observatory-app-probe.cjs')],
-      { encoding: 'utf8', timeout: 10000, env: { ...process.env, NODE_TEST_CONTEXT: '', OAK_APP_FIX_CHECK: '', OAK_SPAWN_LOG: log, ...env } });
+      { encoding: 'utf8', timeout: 10000, env: { ...process.env, NODE_TEST_CONTEXT: '', OAK_APP_FIX_CHECK: '', OAK_SPAWN_LOG: log, OAK_NO_BACKGROUND: '', ...env } });
     assert.equal(result.status, 0, result.stderr || result.error?.message);
     const calls = fs.existsSync(log) ? fs.readFileSync(log, 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line)) : [];
     return calls.filter(c => c.args.includes('titles') && c.args.includes('--refresh')).map(c => [c.file === process.execPath, c.args, c.detached]);
@@ -1737,6 +2662,34 @@ test('remote source: first window, incremental cursor, reset, diff ownership, th
   assert.equal(calls.at(-1)[2], 12, 'only the owning file supplies cursors');
 });
 
+// A saved machine's previews come in one read, and are drawn when it answers: they waited for the Workers read
+// beside them, the slower one over ssh. An OAK there from before that read answers undefined, and each is asked alone.
+test('remote source: previews come in one read and draw before the Workers read ends; an older OAK is asked per edit (2026-11-05)', async t => {
+  isolated(t);
+  for (const older of [false, true]) {
+    const state = pin(fixture(), 'remote-done'); state.screen = 'session-detail';
+    const batches = [], singles = [], workers = deferred();
+    const reader = {
+      read: async () => ({ events: [turn([{ id: 7, file: 'a.ts' }, { id: 8, file: 'b.ts' }, { id: 9, file: 'c.ts' }])], cursor: 1, transcriptPath: '/absent-on-this-host/source.jsonl', agent: 'claude' }),
+      sessions: async () => ({ sessions: [] }),
+      diffs: async (...args) => { batches.push(args); return older ? undefined : { patches: { 7: '+seven', 8: '+eight' }, errors: { 9: 'no edit #9 in session remote-done' } }; },
+      diff: async (...args) => { singles.push(args); return `+single ${args[1]}`; },
+      fleet: () => workers.promise,
+      mirror: async () => ({ mirrored: false }), close() {},
+    };
+    const fake = fakeRuntime(state, {}, { reader, watch: false }); t.after(() => fake.runtime.close());
+    await fake.runtime.load('obs-detail'); await flushAsync(); await flushAsync();
+    const detail = () => state.observatory.details['obs-detail'];
+    assert.deepEqual(batches, [['remote-done', [7, 8, 9], 'build-box']]);
+    assert.deepEqual(singles.map(args => args[1]), older ? [7, 8, 9] : []);
+    assert.deepEqual(detail().previews, older ? { 7: '+single 7', 8: '+single 8', 9: '+single 9' }
+      : { 7: '+seven', 8: '+eight', 9: '(edit content unavailable on build-box: no edit #9 in session remote-done)' }, 'drawn while the Workers read is out');
+    workers.resolve({ todos: [], subagents: [{ agentId: 'w1' }] }); await flushAsync();
+    assert.equal(detail().fleet.subagents[0].agentId, 'w1', 'and the Workers read lands beside them');
+    assert.equal(Object.keys(detail().previews).length, 3);
+  }
+});
+
 test('remote source: owner changes discard an old answer and a local pane wins without a remote cursor', async t => {
   const { root, file, session } = transcript(t, 'claude');
   const state = pin(fixture(), session), first = deferred(), calls = [];
@@ -1840,6 +2793,21 @@ test('remote tab titles: metadata completion queues behind a running tidy pass',
   held.resolve(); await flushAsync();
   assert.equal(maximum, 1); assert.equal(passes.length, 2);
   assert.equal(passes[1].title, 'Arrived title');
+});
+
+test('Observatory detail: buttons a narrow pane breaks across rows keep their own offsets, so a click fires the button under it (2026-10-07)', () => {
+  const { observatoryDetailRows } = require('../dist/observatory-rows');
+  const state = pin(fixture(), 'working');
+  const jumps = (cols) => observatoryDetailRows(state, cols, g, 'none').filter((r) => r.key.startsWith('detail:jumps'));
+  assert.equal(jumps(80).length, 1, 'one row where they fit');
+  for (const cols of [36, 30, 20, 12]) {
+    const rows = jumps(cols);
+    assert.ok(rows.length > 1, `${cols} columns break them`);
+    // Every button is drawn where its row says, whole, and each once.
+    assert.deepEqual(rows.flatMap((r) => r.buttons.map((b) => [b.action, r.cells.slice(b.x, b.x + b.w)])),
+      [['herdr', '↗ herdr'], ['review', '⌕ review'], ['resolve', '⚑ resolve'], ['kill', '■ stop']], `at ${cols} columns`);
+    for (const r of rows) assert.ok(tui.displayWidth(r.cells) <= cols, `${JSON.stringify(r.cells)} fits in ${cols}`);
+  }
 });
 
 test('placeholder titles: "New Claude session" names nothing — a pane title, the change map title and the short id outrank it (2026-09-24)', () => {
@@ -2006,7 +2974,7 @@ async function twoStores(t, { link = true } = {}) {
     + rec({ type: 'ai-title', aiTitle: 'Parser tidy-up', sessionId: S }));
   const OAK = path.resolve(__dirname, '../../cli/dist/index.js');
   if (link) {
-    const linked = cp.spawnSync(process.execPath, ['-e', `require(${JSON.stringify(path.resolve(__dirname, '../../core/dist'))}).linkHerdrPane(${JSON.stringify(S)})`],
+    const linked = cp.spawnSync(process.execPath, ['-e', `const c = require(${JSON.stringify(path.resolve(__dirname, '../../core/dist'))}); const f = require('fs'), p = require('path'); f.mkdirSync(c.storeDir(${JSON.stringify(S)}), { recursive: true }); f.writeFileSync(p.join(c.storeDir(${JSON.stringify(S)}), 'herdr.json'), JSON.stringify({ paneId: process.env.HERDR_PANE_ID, socketPath: process.env.HERDR_SOCKET_PATH, at: Date.now() }))`],
       { env: { ...there, HERDR_PANE_ID: 'w1:p1', HERDR_SOCKET_PATH: herdr.socketPath }, encoding: 'utf8' });
     assert.equal(linked.status, 0, linked.stderr);
   }
@@ -2132,7 +3100,7 @@ test('herdr tab titles: the app\'s pass leaves alone a tab its session\'s own sy
   await new Promise(r => setTimeout(r, 20));
   const saved = { HERDR_PANE_ID: process.env.HERDR_PANE_ID, HERDR_SOCKET_PATH: process.env.HERDR_SOCKET_PATH };
   Object.assign(process.env, { HERDR_PANE_ID: 'w1:p1', HERDR_SOCKET_PATH: herdr.socketPath });
-  try { core.linkHerdrPane(S); } finally { for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } }
+  try { fs.mkdirSync(core.storeDir(S), { recursive: true }); fs.writeFileSync(path.join(core.storeDir(S), 'herdr.json'), JSON.stringify({ paneId: 'w1:p1', socketPath: herdr.socketPath, at: Date.now() })); } finally { for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } }
   await core.syncSessionTab({ session: S, title: 'New title', transport: core, herdrOptions: { timeoutMs: 4000 } });
   assert.deepEqual(labels(), ['Old title', 'New title']);
   // A herdr event: the app's pass, from the list it read before that sync, leaves the tab alone.
@@ -2156,7 +3124,7 @@ test('app: the session list the app reads itself tells the tab pass when it was 
     'app.ts hands the runtime the start of each read of this machine\'s session list');
 });
 
-// A probe run from a herdr pane made two btop tabs on the person's LIVE server (2026-09-26): the tidy
+// A probe run from a herdr pane made btop tabs on the LIVE herdr server it ran under: the tidy
 // pass sent its verbs through herdr-tabs' own import of the transport, bypassing the fake core the probe
 // injected, straight to HERDR_SOCKET_PATH. Here the environment's socket AND its herdr binary are
 // sentinels that record whatever reaches them, and the runtime gets its own scripted herdr. Every write —
@@ -2243,9 +3211,57 @@ else process.stdout.write('{"result":{"type":"ok"}}');
   assert.ok(server.requests.some(r => r.method === 'session.snapshot'), 'this machine\'s snapshot was read');
   assert.ok(argvs.some(a => a.join(' ') === '--machine far api snapshot'), `the saved machine's snapshot was read (argv: ${JSON.stringify(argvs)})`);
   // …and wrote to neither.
-  assert.deepEqual(server.requests.map(r => r.method).filter(m => m !== 'session.snapshot'), [], 'nothing but the snapshot on this machine\'s socket');
+  assert.deepEqual(server.requests.map(r => r.method).filter(m => !['session.snapshot', 'pane.process_info'].includes(m)), [], 'only snapshot and process reads on this machine\'s socket');
   const writes = argvs.filter(a => a[0] === '--machine' && a[2] !== 'api');
   assert.deepEqual(writes, [], 'nothing but the snapshot on the saved machine');
+});
+
+// A saved machine's pinned session cost one ssh call per edit preview (289 for one window of a 2,600-edit
+// session) and a whole-fleet `multitask` for its Workers and Tasks (5.2 MB on the Mac), then the `subagents`
+// fallback (94 MB) when the fleet did not list it. The frame now reads each of them once, and only that session.
+test('oak tui --once: a saved machine\'s pinned session reads its previews in one call and only its own workers (2026-11-05)', { skip: process.platform === 'win32' && 'POSIX fake ssh' }, async t => {
+  const { base } = isolated(t);
+  const repo = path.join(__dirname, '..', '..', '..'), cli = path.join(repo, 'packages', 'cli', 'dist', 'index.js');
+  const bin = path.join(base, 'bin'), remote = path.join(base, 'remote-home'), runs = path.join(base, 'remote-runs.log');
+  fs.mkdirSync(bin); fs.mkdirSync(path.join(remote, '.local', 'bin'), { recursive: true });
+  fs.copyFileSync(path.join(repo, 'test', 'fixtures', 'machine-exec-stub.sh'), path.join(bin, 'ssh')); fs.chmodSync(path.join(bin, 'ssh'), 0o755);
+  fs.writeFileSync(path.join(bin, 'herdr'), `#!${process.execPath}
+const argv = process.argv.slice(2);
+if (argv.join(' ') === 'machine list --json') process.stdout.write(${JSON.stringify(JSON.stringify([{ id: 'm1', label: 'build-box', target: 'builder@build-box.example', session: 'default', enabled: true, selected: false }]))});
+else if (argv[0] === '--machine') process.stdout.write('{"result":{"snapshot":{"version":"0.9.1","protocol":22,"panes":[],"agents":[],"workspaces":[],"tabs":[]}}}');
+`, { mode: 0o755 });
+  // The remote's oak: this build, and one line per run of what it was asked and how many bytes it answered.
+  fs.writeFileSync(path.join(remote, '.local', 'bin', 'oak'), `#!${process.execPath}
+const r = require('child_process').spawnSync(process.execPath, [${JSON.stringify(cli)}, ...process.argv.slice(2)], { stdio: ['inherit', 'pipe', 'inherit'] });
+process.stdout.write(r.stdout);
+require('fs').appendFileSync(${JSON.stringify(runs)}, JSON.stringify({ bytes: r.stdout.length, argv: process.argv.slice(2) }) + '\\n');
+process.exitCode = r.status ?? 1;
+`, { mode: 0o755 });
+  const session = 'saved-pinned', remoteEnv = { HOME: remote, PATH: '/usr/bin:/bin' };
+  const seeded = require('child_process').spawnSync(process.execPath, [path.join(repo, 'test', 'fixtures', 'saved-session.cjs'), repo, session, '12', '40'], { env: remoteEnv, encoding: 'utf8' });
+  assert.equal(seeded.status, 0, seeded.stderr);
+  const env = { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH}`, FAKE_REMOTE_HOME: remote, MACHINE_EXEC_LOG: path.join(base, 'machine-exec.log'),
+    XDG_CONFIG_HOME: path.join(base, 'config'), CLAUDE_OBSERVATORY_NO_UPDATE_CHECK: '1', OAK_NO_SERVER: '1', OAK_NO_BACKGROUND: '1' };
+  const run = await new Promise(resolve => require('child_process').execFile(process.execPath,
+    [cli, 'tui', '--once', '--no-mouse', '--tab', 'observatory', '--session', session, '--cols', '120', '--rows', '40', '--no-color'],
+    { cwd: base, env, timeout: 120_000 }, (error, stdout, stderr) => resolve({ code: error ? error.code : 0, stdout, stderr })));
+  assert.equal(run.code, 0, run.stderr);
+  const asked = fs.readFileSync(runs, 'utf8').trim().split('\n').map(l => JSON.parse(l)).filter(r => !r.argv[0].startsWith('__'));
+  const verbs = asked.map(r => r.argv[0]);
+  assert.ok(asked.some(r => r.argv[0] === 'sessions' && r.argv.includes('--workers')), 'the visible Observatory tree still receives its machine Workers');
+  // Control: the frame has the session's workers and tasks, and a preview (its text is only in the machine's store).
+  assert.match(run.stdout, /Workers · 0\/12 active/, run.stdout);
+  assert.match(run.stdout, /Tasks · 1\/2 open/);
+  assert.match(run.stdout, /\+new 63 0/);
+  assert.equal(verbs.filter(v => v === 'diff').length, 1, `one read for every preview (asked: ${verbs.join(' ')})`);
+  assert.ok(asked.some(r => r.argv[0] === 'diff' && r.argv[1] === '--ids' && r.argv[2].split(',').length > 10), 'the previews are batched');
+  assert.ok(!verbs.includes('subagents'), 'no subagents fallback');
+  const workers = asked.filter(r => r.argv[0] === 'multitask');
+  assert.equal(workers.length, 1);
+  assert.ok(workers[0].argv.includes('--only-session'), workers[0].argv.join(' '));
+  assert.ok(asked.length <= 5, `at most five remote reads (asked: ${verbs.join(' ')})`);
+  // 5.6 KB here; the whole fleet's was 18.8 KB.
+  assert.ok(workers[0].bytes < 10_000, `the workers read is ${workers[0].bytes} bytes`);
 });
 
 // Every tail replaced the events array, so the whole conversation was drawn again on the paint thread
@@ -2293,7 +3309,7 @@ test('Observatory conversation: a pinned conversation longer than a call\'s argu
 });
 
 // The master was built twice a frame — once to ask whether its pane was empty (it never is), at the full
-// width — and again for every animation frame, every 150 ms while any pane worked: 20 ms a frame with
+// width — and again for every animation frame, every 150 ms while any pane worked: tens of ms a frame with
 // Show archived and its folds open. It is built once for what it shows; a frame
 // only moves the live sessions' spinners.
 test('Observatory master: built once for what it shows; an animation frame moves only the spinners (2026-09-26)', () => {
@@ -2345,6 +3361,455 @@ test('Observatory review tokens: sent on change, and refreshed only before they 
   assert.equal(sent().length, first + 3, 'a change goes out at once');
 });
 
+for (const local of [true, false]) test(`Observatory closed pane: pending edits on ${local ? 'this machine' : 'a saved machine'} forget the pane until herdr lists it again`, { skip: !local && process.platform === 'win32' }, async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.parse('2026-11-04T10:00:00Z') });
+  const state = fixture(), m = state.observatory.machines[local ? 0 : 1];
+  const listed = m.snapshot, session = local ? 'claude-conversation' : 'remote-done';
+  let gone = true;
+  const attempts = [];
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-closed-pane-'));
+  t.after(() => (() => { try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }); } catch { /* a child's late write: never skip the stop hooks after this one */ } })());
+  const binary = path.join(dir, 'herdr');
+  fs.writeFileSync(binary, `#!${process.execPath}\nprocess.stderr.write(JSON.stringify({error:{code:'pane_not_found',message:'pane p1 not found'},id:'cli:request'})); process.exitCode = 1;\n`, { mode: 0o755 });
+  const fake = fakeRuntime(state, { ensureHerdrTabs: undefined,
+    herdrRequest: async (method, params) => {
+      if (local && method === 'pane.report_metadata' && params.pane_id === 'p1') {
+        attempts.push(params);
+        if (gone) throw new core.HerdrError('pane_not_found', 'pane p1 not found');
+      }
+      return { type: 'ok' };
+    },
+    herdrOnMachine: async (label, argv, options) => {
+      if (argv[0] === 'api') return { result: { type: 'session_snapshot', snapshot: listed } };
+      if (!local && argv[2] === 'p1') {
+        attempts.push(argv);
+        if (gone) return core.herdrOnMachine(label, argv, { ...options, binary });
+      }
+      return null;
+    } }, { watch: false });
+  t.after(() => fake.runtime.close());
+  await fake.runtime.publishStore();
+  assert.equal(attempts.length, 1);
+  assert.deepEqual(fake.statuses, [], 'closing a pane says nothing on the status row');
+  const row = () => tui.observatorySessions(state).find(s => s.session === session);
+  assert.equal(row().paneId, undefined, 'the pending session stays, without its stale pane');
+  assert.ok(row().meta.pending > 0);
+  assert.ok(!state.observatory.machines.find(x => x.id === m.id).snapshot.agents.some(a => a.pane_id === 'p1'));
+  assert.ok(state.observatory.machines[local ? 1 : 0].snapshot.panes.some(p => p.pane_id === 'p1'), 'pane ids are scoped to their machine');
+  for (const elapsed of [0, 15000, 30000, 120000, 600000]) {
+    t.mock.timers.tick(elapsed);
+    await fake.runtime.publishStore();
+  }
+  assert.equal(attempts.length, 1, 'no backoff loop or token refresh targets the closed pane');
+  gone = false;
+  if (local) await fake.runtime.refreshLocal(); else await fake.runtime.refreshRemotes();
+  await fake.runtime.publishStore();
+  assert.equal(attempts.length, 2, 'a fresh listing permits reporting to the pane again');
+  assert.equal(row().paneId, 'p1');
+  assert.deepEqual(fake.statuses, []);
+});
+
+test('Observatory closed pane: identity reports forget the stale capture link until a fresh listing', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.parse('2026-11-04T10:00:00Z') });
+  const state = fixture();
+  state.observatory.machines[0].snapshot.panes.push({ ...pane('p-link', 'linked', 'working'), agent_session: null });
+  state.views.sessions.sessions.push({ id: 'linked', agent: 'codex', pending: 2 });
+  let attempts = 0, gone = true;
+  const fake = fakeRuntime(state, { ensureHerdrTabs: undefined,
+    readHerdrPaneLink: session => session === 'linked' ? { paneId: 'p-link', socketPath: '/fake.sock', at: 3 } : null,
+    reportHerdrSession: async () => { attempts++; if (gone) throw new core.HerdrError('pane_not_found', 'pane p-link not found'); } }, { watch: false });
+  t.after(() => fake.runtime.close());
+  await fake.runtime.publishStore();
+  assert.deepEqual(fake.statuses, []);
+  for (const elapsed of [15000, 30000, 120000]) { t.mock.timers.tick(elapsed); await fake.runtime.publishStore(); }
+  assert.equal(attempts, 1, 'the durable capture link does not resurrect the pane');
+  gone = false;
+  await fake.runtime.refreshLocal(); await fake.runtime.publishStore();
+  assert.equal(attempts, 2);
+});
+
+test('Observatory closed pane: screen reads forget a pane until herdr lists it again', async t => {
+  const fx = await quietCodex(t);
+  if (!fx) return;
+  fx.screen.fail = new core.HerdrError('pane_not_found', 'pane p4 not found');
+  await fx.refresh();
+  assert.ok(!fx.state.observatory.machines[0].snapshot.panes.some(p => p.pane_id === 'p4'));
+  await fx.runtime.readScreens(); await fx.runtime.readScreens();
+  assert.equal(fx.reads().length, 1, 'no further screen reads without a listing');
+  assert.deepEqual(fx.statuses, []);
+  fx.screen.fail = false;
+  await fx.refresh();
+  assert.equal(fx.reads().length, 2);
+  assert.match(askingLine(fx.state), / working /);
+});
+
+// herdr 0.9.1's `pane report-metadata` exits 0 and prints nothing. The forwarded token was refused as
+// "herdr command did not return JSON", so the status line showed an error and the token went out
+// again, one ssh call each, on every pass.
+test('Observatory review tokens: a saved machine\'s silent report-metadata counts as sent', { skip: process.platform === 'win32' }, async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-silent-herdr-'));
+  t.after(() => (() => { try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }); } catch { /* a child's late write: never skip the stop hooks after this one */ } })());
+  const binary = path.join(dir, 'herdr');
+  fs.writeFileSync(binary, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  const state = fixture(), forwarded = [];
+  const fake = fakeRuntime(state, { ensureHerdrTabs: undefined,
+    herdrOnMachine: async (label, argv, o) => {
+      if (argv[0] === 'api') return { result: { type: 'session_snapshot', snapshot: state.observatory.machines[1].snapshot } };
+      forwarded.push(argv);
+      return core.herdrOnMachine(label, argv, { ...o, binary });
+    } }, { watch: false });
+  t.after(() => fake.runtime.close());
+  await fake.runtime.start(); await fake.runtime.publishStore();
+  assert.equal(forwarded.filter(a => a[1] === 'report-metadata').length, 1);
+  assert.deepEqual(fake.statuses.filter(s => s.includes('review tokens')), []);
+  await fake.runtime.publishStore();
+  assert.equal(forwarded.filter(a => a[1] === 'report-metadata').length, 1, 'a recorded token is not sent again on the next pass');
+});
+
+// A saved machine that stopped answering failed its review-token report on every pass, and each failure wrote
+// herdr's error over the status row, where it stood after the machine was back (2026-10-13). The Observatory
+// marks that machine itself; the report says nothing, and it and every other report to that machine wait,
+// longer each time, rather than spending a connection timeout per pane on every pass.
+test('Observatory review tokens: a saved machine that cannot be reached is not said on the status row, and its reports wait (2026-10-13)', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.parse('2026-10-13T10:00:00Z') });
+  const state = fixture();
+  // Two pending panes on the saved machine, so a pass that tried each would try twice.
+  state.observatory.machines[1].sessions.sessions[1].pending = 1;
+  let down = true;
+  const tries = [];
+  const fake = fakeRuntime(state, { ensureHerdrTabs: undefined,
+    herdrOnMachine: async (label, argv) => {
+      if (argv[0] === 'api') return { result: { type: 'session_snapshot', snapshot: state.observatory.machines[1].snapshot } };
+      tries.push(argv[2]);
+      if (down) throw new core.HerdrError('command_failed', "machine 'build-box' (session default): remote SSH connection failed: ssh: connect to host fixture.invalid port 22: Operation timed out");
+      return null;
+    } }, { watch: false });
+  t.after(() => fake.runtime.close());
+  const local = () => fake.calls.filter(c => c.method === 'pane.report_metadata').length;
+  await fake.runtime.start(); await fake.runtime.publishStore();
+  assert.equal(tries.length, 1, 'the first failure holds the machine\'s other report too');
+  assert.equal(local(), 1, 'this machine\'s token goes out as before');
+  await fake.runtime.publishStore(); await fake.runtime.publishStore();
+  assert.equal(tries.length, 1, 'a pass inside the wait does not try again');
+  t.mock.timers.tick(15000); await fake.runtime.publishStore();
+  assert.equal(tries.length, 2, 'tried again after the first wait');
+  t.mock.timers.tick(15000); await fake.runtime.publishStore();
+  assert.equal(tries.length, 2, 'the second wait is longer');
+  t.mock.timers.tick(15000); await fake.runtime.publishStore();
+  assert.equal(tries.length, 3);
+  assert.deepEqual(fake.statuses, [], 'nothing on the status row: the Observatory marks the machine');
+  down = false;
+  t.mock.timers.tick(60000); await fake.runtime.publishStore();
+  assert.deepEqual(tries.slice(3).sort(), ['p1', 'p2'], 'back, both panes\' tokens go out');
+  await fake.runtime.publishStore();
+  assert.equal(tries.length, 5, 'and are not sent again on the next pass');
+  // The next outage starts over from the first wait.
+  down = true;
+  state.observatory.machines[1].sessions.sessions[0].pending = 4;
+  await fake.runtime.publishStore();
+  assert.equal(tries.length, 6);
+  t.mock.timers.tick(15000); await fake.runtime.publishStore();
+  assert.equal(tries.length, 7, 'tried again after the first wait, not the last');
+  assert.deepEqual(fake.statuses, []);
+});
+
+const unreachableBuildBox = () => new core.HerdrError('command_failed', "machine 'build-box' (session default): remote SSH connection failed: ssh: connect to host fixture.invalid port 22: Operation timed out");
+
+// Each failure doubles the wait up to two minutes, where it stays: a machine down all afternoon is tried every two minutes.
+test('Observatory review tokens: a saved machine that stays down is tried after 15, 30 and 60 seconds, then every two minutes (2026-10-13)', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.parse('2026-10-13T10:00:00Z') });
+  const state = fixture();
+  const tries = [];
+  const fake = fakeRuntime(state, { ensureHerdrTabs: undefined,
+    herdrOnMachine: async (label, argv) => {
+      if (argv[0] === 'api') return { result: { type: 'session_snapshot', snapshot: state.observatory.machines[1].snapshot } };
+      tries.push(Date.now());
+      throw unreachableBuildBox();
+    } }, { watch: false });
+  t.after(() => fake.runtime.close());
+  await fake.runtime.start(); await fake.runtime.publishStore();
+  for (let s = 0; s < 600; s++) { t.mock.timers.tick(1000); await fake.runtime.publishStore(); }
+  assert.deepEqual(tries.slice(1).map((at, i) => (at - tries[i]) / 1000), [15, 30, 60, 120, 120, 120, 120]);
+});
+
+// A machine that leaves herdr's list (removed, or disabled) and comes back started from the longest wait it had reached.
+test('Observatory review tokens: a saved machine that leaves herdr\'s list and comes back starts again from the first wait (2026-10-13)', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.parse('2026-10-13T10:00:00Z') });
+  const state = fixture();
+  const remote = state.observatory.machines[1];
+  let listed = true;
+  const tries = [];
+  const fake = fakeRuntime(state, { ensureHerdrTabs: undefined,
+    herdrMachines: async () => listed ? [{ id: 'build', label: 'build-box', enabled: true }] : [],
+    herdrOnMachine: async (label, argv) => {
+      if (argv[0] === 'api') return { result: { type: 'session_snapshot', snapshot: remote.snapshot } };
+      tries.push(Date.now());
+      throw unreachableBuildBox();
+    } }, { watch: false, reader: { ...testReader(), sessions: async (_session, _root, label) => label ? remote.sessions : state.views.sessions } });
+  t.after(() => fake.runtime.close());
+  await fake.runtime.start(); await fake.runtime.publishStore();
+  t.mock.timers.tick(15000); await fake.runtime.publishStore();
+  t.mock.timers.tick(30000); await fake.runtime.publishStore();
+  assert.equal(tries.length, 3, 'the wait is a minute now');
+  listed = false; await fake.runtime.refreshRemotes();
+  assert.ok(!state.observatory.machines.some(m => m.id === 'build'), 'the machine left');
+  t.mock.timers.tick(1000);
+  listed = true; await fake.runtime.refreshRemotes(); await fake.runtime.publishStore();
+  assert.equal(tries.length, 4, 'back, its count goes out at once');
+  t.mock.timers.tick(15000); await fake.runtime.publishStore();
+  assert.equal(tries.length, 5, 'and after its failure waits 15 seconds, not a minute or two');
+});
+
+// Any other failure of a report is said once, not on every pass, and the report waits before it is tried again.
+test('Observatory review tokens and identity: another failure is said once, and the report waits (2026-10-13)', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.parse('2026-10-13T10:00:00Z') });
+  const state = fixture();
+  state.observatory.machines[0].snapshot.panes.push({ ...pane('p-link', 'linked', 'working'), agent_session: null });
+  state.views.sessions.sessions.push({ id: 'linked', agent: 'codex', pending: 0 });
+  const tries = [], identities = [];
+  let refused = true;
+  const fake = fakeRuntime(state, { ensureHerdrTabs: undefined,
+    readHerdrPaneLink: session => session === 'linked' ? { paneId: 'p-link', socketPath: '/fake.sock', at: 3 } : null,
+    reportHerdrSession: async () => { identities.push(1); throw new core.HerdrError('metadata_rejected', 'pane p-link metadata rejected'); },
+    herdrOnMachine: async (label, argv) => {
+      if (argv[0] === 'api') return { result: { type: 'session_snapshot', snapshot: state.observatory.machines[1].snapshot } };
+      tries.push(argv[2]);
+      if (refused) throw new core.HerdrError('metadata_rejected', 'pane p1 metadata rejected');
+      return null;
+    } }, { watch: false });
+  t.after(() => fake.runtime.close());
+  await fake.runtime.start(); await fake.runtime.publishStore();
+  await fake.runtime.publishStore(); await fake.runtime.publishStore();
+  assert.deepEqual(fake.statuses, ['herdr identity: pane p-link metadata rejected', 'herdr review tokens: pane p1 metadata rejected'], 'each said once');
+  assert.deepEqual([identities.length, tries.length], [1, 1], 'neither is tried again inside its wait');
+  t.mock.timers.tick(15000); await fake.runtime.publishStore();
+  assert.deepEqual([identities.length, tries.length], [2, 2], 'both are tried again after it');
+  assert.equal(fake.statuses.length, 2, 'the same failure is not said again');
+  // Once a count goes out, a later failure is a new one, and is said.
+  refused = false;
+  t.mock.timers.tick(30000); await fake.runtime.publishStore();
+  assert.equal(tries.length, 3);
+  refused = true;
+  state.observatory.machines[1].sessions.sessions[0].pending = 4;
+  await fake.runtime.publishStore();
+  assert.deepEqual(fake.statuses.slice(2), ['herdr review tokens: pane p1 metadata rejected']);
+});
+
+// A conversation pinned from a saved machine that is down failed its Workers read every ten seconds, each failure
+// written over the status row. It is said once; after a read that works, the next failure is said again.
+test('Observatory Workers: a saved machine\'s failing read is said once, not on every read (2026-10-13)', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.parse('2026-10-13T10:00:00Z') });
+  const state = pin(fixture(), 'remote-done', 'obs-detail', 'build');
+  let down = true, reads = 0;
+  const fake = fakeRuntime(state, { ensureHerdrTabs: undefined }, { watch: false, reader: { ...testReader(),
+    read: async () => ({ events: [], cursor: null, transcriptPath: '/remote/remote-done.jsonl', agent: 'codex' }),
+    fleet: async () => {
+      reads++;
+      if (down) throw new Error('oak: build-box is not reachable over ssh (fixture.invalid): Connection timed out');
+      return { subagents: [], todos: [] };
+    } } });
+  t.after(() => fake.runtime.close());
+  const workers = () => fake.statuses.filter(s => s.startsWith('Workers'));
+  await fake.runtime.load('obs-detail');
+  for (let i = 0; i < 4; i++) { t.mock.timers.tick(11000); await fake.runtime.refreshWorkers(); }
+  assert.ok(reads >= 4, `read on its own schedule, as before (${reads})`);
+  assert.deepEqual(workers(), ['Workers: oak: build-box is not reachable over ssh (fixture.invalid): Connection timed out']);
+  down = false; t.mock.timers.tick(11000); await fake.runtime.refreshWorkers();
+  down = true; t.mock.timers.tick(11000); await fake.runtime.refreshWorkers();
+  assert.equal(workers().length, 2, 'a failure after a read that worked is said');
+});
+
+// A pane that stopped showing the conversation, then showed it again (the pane's view picked away and back), read the
+// same failure and said nothing: what the closed detail had said was still kept for it.
+test('Observatory Workers: a detail closed and opened again on its pane says its read\'s failure again (2026-10-13)', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.parse('2026-10-13T10:00:00Z') });
+  const state = pin(fixture(), 'remote-done', 'obs-detail', 'build');
+  const fake = fakeRuntime(state, { ensureHerdrTabs: undefined }, { watch: false, reader: { ...testReader(),
+    read: async () => ({ events: [], cursor: null, transcriptPath: '/remote/remote-done.jsonl', agent: 'codex' }),
+    fleet: async () => { throw new Error('oak: build-box is not reachable over ssh (fixture.invalid): Connection timed out'); } } });
+  t.after(() => fake.runtime.close());
+  const workers = () => fake.statuses.filter(s => s.startsWith('Workers'));
+  await fake.runtime.load('obs-detail');
+  t.mock.timers.tick(11000); await fake.runtime.refreshWorkers();
+  assert.equal(workers().length, 1);
+  const { 'obs-detail': _closed, ...rest } = state.observatory.details;
+  state.observatory = { ...state.observatory, details: rest };
+  await fake.runtime.refreshWorkers();
+  state.observatory = pin(state, 'remote-done', 'obs-detail', 'build').observatory;
+  await fake.runtime.load('obs-detail');
+  t.mock.timers.tick(11000); await fake.runtime.refreshWorkers();
+  assert.equal(workers().length, 2, 'opened again, its failure is said again');
+});
+
+// A detail closed while its Workers failure stood on the status row left it there: no read of that detail would ever
+// work again to take it back, so the row said the machine could not be reached after it was back (2026-10-13). The
+// close takes it back, unless the row has said something else since.
+test('Observatory Workers: a detail closed while its failure is on the status row takes the failure with it (2026-10-13)', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.parse('2026-10-13T10:00:00Z') });
+  const state = pin(fixture(), 'remote-done', 'obs-detail', 'build');
+  let down = true;
+  const fake = fakeRuntime(state, { ensureHerdrTabs: undefined }, { watch: false, status: message => { state.status = message; }, reader: { ...testReader(),
+    read: async () => ({ events: [], cursor: null, transcriptPath: '/remote/remote-done.jsonl', agent: 'codex' }),
+    fleet: async () => { if (down) throw new Error('oak: build-box is not reachable over ssh (fixture.invalid): Connection timed out'); return { subagents: [], todos: [] }; } } });
+  t.after(() => fake.runtime.close());
+  const close = () => { const { 'obs-detail': _closed, ...rest } = state.observatory.details; state.observatory = { ...state.observatory, details: rest }; };
+  await fake.runtime.load('obs-detail');
+  t.mock.timers.tick(11000); await fake.runtime.refreshWorkers();
+  assert.equal(state.status, 'Workers: oak: build-box is not reachable over ssh (fixture.invalid): Connection timed out');
+  close(); await fake.runtime.refreshWorkers();
+  assert.equal(state.status, 'ready', 'closed, its failure leaves the row');
+  down = false;
+  for (let i = 0; i < 3; i++) { t.mock.timers.tick(11000); await fake.runtime.refreshWorkers(); }
+  assert.equal(state.status, 'ready', 'and the row stays clear once the machine is back');
+  // What the row said since stays.
+  down = true;
+  state.observatory = pin(state, 'remote-done', 'obs-detail', 'build').observatory;
+  await fake.runtime.load('obs-detail');
+  t.mock.timers.tick(11000); await fake.runtime.refreshWorkers();
+  assert.match(state.status, /^Workers: /, 'opened again, its failure is said again');
+  state.status = 'kept 1 edit';
+  close(); await fake.runtime.refreshWorkers();
+  assert.equal(state.status, 'kept 1 edit');
+});
+
+// Two conversations pinned from one saved machine fail their Workers reads in the same words: the one that works again
+// took them back, and the other, still failing, said them no more (2026-10-13). It says them at its next failure.
+test('Observatory Workers: a failure taken back for one detail is said again by another that still fails in the same words (2026-10-13)', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.parse('2026-10-13T10:00:00Z') });
+  let state = pin(fixture(), 'remote-done', 'obs-a', 'build');
+  state = pin(state, 'unknown', 'obs-b', 'build');
+  const down = new Set(['remote-done', 'unknown']);
+  const fake = fakeRuntime(state, { ensureHerdrTabs: undefined }, { watch: false, status: message => { state.status = message; }, reader: { ...testReader(),
+    read: async session => ({ events: [], cursor: null, transcriptPath: `/remote/${session}.jsonl`, agent: 'codex' }),
+    fleet: async session => { if (down.has(session)) throw new Error('oak: build-box is not reachable over ssh (fixture.invalid): Connection timed out'); return { subagents: [], todos: [] }; } } });
+  t.after(() => fake.runtime.close());
+  const said = 'Workers: oak: build-box is not reachable over ssh (fixture.invalid): Connection timed out';
+  await fake.runtime.load('obs-a'); await fake.runtime.load('obs-b');
+  t.mock.timers.tick(11000); await fake.runtime.refreshWorkers();
+  assert.equal(state.status, said);
+  down.delete('remote-done');
+  t.mock.timers.tick(11000); await fake.runtime.refreshWorkers();
+  assert.equal(state.status, said, 'obs-a works again and obs-b failed again: the row still says so');
+  down.delete('unknown');
+  t.mock.timers.tick(11000); await fake.runtime.refreshWorkers();
+  assert.equal(state.status, 'ready', 'both work: taken back');
+});
+
+// Said once, such a failure stood on the status row after what failed worked again: the machine was back, and the row
+// still said it could not be reached (2026-10-13). It is taken back then, unless the row has said something else since.
+test('Observatory: a failure said on the status row is taken back once what failed works again (2026-10-13)', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.parse('2026-10-13T10:00:00Z') });
+  const state = pin(fixture(), 'remote-done', 'obs-detail', 'build');
+  let down = true, refused = true;
+  const fake = fakeRuntime(state, { ensureHerdrTabs: undefined,
+    herdrOnMachine: async (label, argv) => {
+      if (argv[0] === 'api') return { result: { type: 'session_snapshot', snapshot: state.observatory.machines[1].snapshot } };
+      if (refused) throw new core.HerdrError('metadata_rejected', 'pane p1 metadata rejected');
+      return null;
+    } }, { watch: false, status: message => { state.status = message; }, reader: { ...testReader(),
+    read: async () => ({ events: [], cursor: null, transcriptPath: '/remote/remote-done.jsonl', agent: 'codex' }),
+    fleet: async () => {
+      if (down) throw new Error('oak: build-box is not reachable over ssh (fixture.invalid): Connection timed out');
+      return { subagents: [], todos: [] };
+    } } });
+  t.after(() => fake.runtime.close());
+  await fake.runtime.load('obs-detail');
+  t.mock.timers.tick(11000); await fake.runtime.refreshWorkers();
+  assert.equal(state.status, 'Workers: oak: build-box is not reachable over ssh (fixture.invalid): Connection timed out');
+  down = false; t.mock.timers.tick(11000); await fake.runtime.refreshWorkers();
+  assert.equal(state.status, 'ready', 'taken back once a read works');
+  down = true; t.mock.timers.tick(11000); await fake.runtime.refreshWorkers();
+  state.status = 'kept 1 edit';
+  down = false; t.mock.timers.tick(11000); await fake.runtime.refreshWorkers();
+  assert.equal(state.status, 'kept 1 edit', 'what the row said since stays');
+  await fake.runtime.publishStore();
+  assert.equal(state.status, 'herdr review tokens: pane p1 metadata rejected');
+  refused = false; t.mock.timers.tick(15000); await fake.runtime.publishStore();
+  assert.equal(state.status, 'ready', 'taken back once the count goes out');
+});
+
+test('Observatory identity: a failed report that tells herdr a pane\'s session is taken back once it goes out (2026-10-13)', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.parse('2026-10-13T10:00:00Z') });
+  const state = fixture();
+  state.observatory.machines[0].snapshot.panes.push({ ...pane('p-link', 'linked', 'working'), agent_session: null });
+  state.views.sessions.sessions.push({ id: 'linked', agent: 'codex', pending: 0 });
+  let refused = true;
+  const fake = fakeRuntime(state, { ensureHerdrTabs: undefined,
+    readHerdrPaneLink: session => session === 'linked' ? { paneId: 'p-link', socketPath: '/fake.sock', at: 3 } : null,
+    reportHerdrSession: async () => { if (refused) throw new core.HerdrError('metadata_rejected', 'pane p-link metadata rejected'); } },
+  { watch: false, status: message => { state.status = message; } });
+  t.after(() => fake.runtime.close());
+  await fake.runtime.start(); await fake.runtime.publishStore();
+  assert.equal(state.status, 'herdr identity: pane p-link metadata rejected');
+  refused = false; t.mock.timers.tick(15000); await fake.runtime.publishStore();
+  assert.equal(state.status, 'ready', 'taken back once the report goes out');
+});
+
+// Two reports failed in the same words (a local herdr too busy to answer names the request, not the pane): the one that
+// went out took them back, and the other, still failing, said them no more (2026-10-13). It says them at its next failure.
+test('Observatory review tokens: a failure taken back for one report is said again by another that still fails in the same words (2026-10-13)', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.parse('2026-10-13T10:00:00Z') });
+  const state = fixture();
+  state.views.sessions.sessions.find(s => s.id === 'working').pending = 1;
+  const failing = new Set(['p1', 'p2']);
+  const fake = fakeRuntime(state, { ensureHerdrTabs: undefined,
+    herdrRequest: async (method, params) => {
+      if (method === 'pane.report_metadata' && failing.has(params.pane_id)) throw new core.HerdrTimeoutError('pane.report_metadata', 4000);
+      return { type: 'ok' };
+    } }, { watch: false, status: message => { state.status = message; } });
+  t.after(() => fake.runtime.close());
+  await fake.runtime.start(); await fake.runtime.publishStore();
+  const said = 'herdr review tokens: herdr pane.report_metadata timed out after 4000 ms';
+  assert.equal(state.status, said);
+  failing.delete('p1');
+  t.mock.timers.tick(15000); await fake.runtime.publishStore();
+  assert.equal(state.status, said, 'p1 went out and p2 failed again: the row still says so');
+  failing.delete('p2');
+  t.mock.timers.tick(30000); await fake.runtime.publishStore();
+  assert.equal(state.status, 'ready', 'both went out: taken back');
+});
+
+// What goes out takes back its own words only: another report's failure of the same kind, said on the row since, stays.
+test('Observatory review tokens: a report that goes out leaves another report\'s failure of the same kind on the row (2026-10-13)', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.parse('2026-10-13T10:00:00Z') });
+  const state = fixture();
+  state.views.sessions.sessions.find(s => s.id === 'working').pending = 1;
+  const refused = new Set(['p1']);
+  const fake = fakeRuntime(state, { ensureHerdrTabs: undefined,
+    herdrOnMachine: async (label, argv) => argv[0] === 'api' ? { result: { type: 'session_snapshot', snapshot: state.observatory.machines[1].snapshot } } : null,
+    herdrRequest: async (method, params) => { if (method === 'pane.report_metadata' && refused.has(params.pane_id)) throw new core.HerdrError('metadata_rejected', `pane ${params.pane_id} metadata rejected`); return { type: 'ok' }; } },
+  { watch: false, status: message => { state.status = message; } });
+  t.after(() => fake.runtime.close());
+  await fake.runtime.start(); await fake.runtime.publishStore();
+  assert.equal(state.status, 'herdr review tokens: pane p1 metadata rejected');
+  // p1 fails again (its wait is now 30 s); p2's count changes and its report fails in its own words, said on the row.
+  state.views.sessions.sessions.find(s => s.id === 'working').pending = 4;
+  refused.add('p2');
+  t.mock.timers.tick(15000); await fake.runtime.publishStore();
+  assert.equal(state.status, 'herdr review tokens: pane p2 metadata rejected');
+  refused.delete('p1');
+  t.mock.timers.tick(30000); await fake.runtime.publishStore();
+  assert.equal(state.status, 'herdr review tokens: pane p2 metadata rejected', "p1 went out, and p2's failure, said after p1's, stays");
+});
+
+// A saved machine that stays listed and stays down keeps its growing wait across the discoveries that run on the same
+// 15-second timer as the reports.
+test('Observatory review tokens: a saved machine that stays listed keeps its growing wait across discoveries (2026-10-13)', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.parse('2026-10-13T10:00:00Z') });
+  const state = fixture();
+  const tries = [];
+  const fake = fakeRuntime(state, { ensureHerdrTabs: undefined,
+    herdrOnMachine: async (label, argv) => {
+      if (argv[0] === 'api') return { result: { type: 'session_snapshot', snapshot: state.observatory.machines[1].snapshot } };
+      tries.push(Date.now());
+      throw unreachableBuildBox();
+    } }, { watch: false });
+  t.after(() => fake.runtime.close());
+  await fake.runtime.start(); await fake.runtime.publishStore();
+  for (let s = 0; s < 240; s += 15) { t.mock.timers.tick(15000); await fake.runtime.refreshRemotes(); await fake.runtime.publishStore(); }
+  assert.deepEqual(tries.slice(1).map((at, i) => (at - tries[i]) / 1000).slice(0, 4), [15, 30, 60, 120]);
+});
+
 // A saved machine's failure read `build-box conversation unavailable: oak: build-box is not reachable…`,
 // the CLI's own prefix mid-sentence. The Review panes already drop it.
 test('Observatory detail: a remote read failure reads as one sentence, without the CLI\'s oak: prefix (2026-09-26)', async t => {
@@ -2366,5 +3831,280 @@ test('frame: every row fits a terminal narrower than the selected tab (2026-09-2
     const lines = tui.renderDashFrame(state, { cols, rows, color: 'none', glyphs: g });
     assert.ok(lines.length > 0);
     for (const line of lines) assert.ok(tui.displayWidth(line) <= cols, `${state.tabs[tab].id} at ${cols}x${rows}: ${JSON.stringify(line)}`);
+  }
+});
+
+// Codex's Auto-review runs each approval as a thread with a rollout of its own; the session list the master
+// is drawn from (core's listing, which the app reads through the CLI) leaves them out (2026-09-30).
+test('Observatory master: a Codex Auto-review thread is not listed beside the session it reviews', t => {
+  const { root } = isolated(t);
+  const dir = path.join(process.env.CODEX_HOME, 'sessions', '2026', '09', '30');
+  fs.mkdirSync(dir, { recursive: true });
+  const rollout = (id, prompt, meta) => fs.writeFileSync(path.join(dir, `rollout-2026-09-30T12-00-00-${id}.jsonl`), [
+    { type: 'session_meta', payload: { id, cwd: root, ...meta } },
+    { type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: prompt }] } },
+    { type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 100, cached_input_tokens: 0, output_tokens: 10 } } } },
+  ].map(r => JSON.stringify({ timestamp: '2026-09-30T12:00:00Z', ...r })).join('\n') + '\n');
+  const PARENT = '0199a000-0000-7000-8000-0000000000c1', REVIEW = '0199a000-0000-7000-8000-0000000000c2';
+  rollout(PARENT, 'Fix the observatory exporter', {});
+  rollout(REVIEW, 'The following is the Codex agent history whose request action you are assessing.', { thread_source: 'guardian_review', parent_thread_id: PARENT });
+  const drawn = listing => {
+    const state = fixture();
+    state.views.sessions = listing;
+    return lines(render({ ...state, allSessions: true, open: new Set(['earlier', 'archived']) }));
+  };
+  const all = drawn(core.sessionMeta(root, null, { includeReviews: true }));
+  assert.match(all, /Auto-review: Fix the observatory exporter/, 'control: a listed review thread is drawn');
+  const text = drawn(core.sessionMeta(root, null));
+  assert.match(text, /Fix the observatory exporter/);
+  assert.doesNotMatch(text, /Auto-review/);
+});
+
+// While Review reads a saved machine's session, only a store write lists this machine's sessions, and that machine's payload
+// carries the app's catalog of them. The listing went into the views alone, which a switch to another of that machine's
+// sessions clears, and a listing still being read then was dropped: a hand a waiting agent raised (its last write) left
+// Review's toast and inbox until the next write. Each listing is the app's catalog now; moved to a session on this
+// machine, whose own read lists the sessions, a listing still being read is dropped.
+test('the session listing: Review moved to another session while it was read (2026-10-08)', async t => {
+  isolated(t);
+  const listing = { sessions: [{ id: 'localone', attention: { kind: 'permission', message: 'Bash', ts: 1 } }] };
+  const run = async (move) => {
+    const state = { session: 'remoteone', reviewMachine: { label: 'build-box' }, views: { list: {}, sessions: { sessions: [] } },
+      observatory: { machines: [{ id: 'local', label: 'laptop', local: true }], details: {} } };
+    const kept = [];
+    let answer;
+    const fake = { ...core, herdrMachines: async () => [], herdrSubscribe: () => ({ close() {} }), observatoryRoots: () => [] };
+    const runtime = tui.createObservatory(fake, state, { cwd: '/workspace', changed() {}, status() {}, timers: false, watch: false,
+      catalogFresh: () => !state.reviewMachine && !!state.session, catalog: (sessions) => kept.push(sessions),
+      reader: { ...testReader(fake), sessions: () => new Promise((resolve) => { answer = resolve; }) } });
+    t.after(() => runtime.close());
+    const flight = runtime.refreshSessions();
+    move(state);
+    answer(listing);
+    await flight;
+    return { views: state.views, kept };
+  };
+  // The picker moves Review to another session on the same saved machine: its views are cleared for that machine's read.
+  const away = await run((state) => { state.session = 'remotetwo'; state.views = null; });
+  assert.deepEqual(away.kept, [listing], 'kept for the saved machine\'s read, whose payload carries this machine\'s sessions');
+  assert.equal(away.views, null, 'never a payload of sessions alone, which Review draws as "… has no data to draw"');
+  // Moved to a session on this machine: its own read lists the sessions, and this listing is dropped.
+  const here = await run((state) => { state.session = 'localone'; state.reviewMachine = undefined; state.views = null; });
+  assert.deepEqual([here.kept, here.views], [[], null]);
+  // Still on the saved machine's session, its views in: the listing lands beside them, and in the catalog a switch reads.
+  const stay = await run(() => {});
+  assert.deepEqual([stay.views.sessions, stay.kept], [listing, [listing]]);
+  // That machine's read failed, with nothing to draw: the listing lands in the views, as it did.
+  const failed = await run((state) => { state.session = 'remotetwo'; state.views = null; state.reviewMachine = { label: 'build-box', error: 'not reachable' }; });
+  assert.deepEqual([failed.views?.sessions, failed.kept], [listing, [listing]]);
+  // The app keeps what the runtime hands it as this machine's catalog, which a saved machine's payload carries.
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'app.ts'), 'utf8');
+  assert.match(src, /catalog: \(sessions\) => \{ localCatalog = sessions; \}/);
+  assert.match(src, /const catalog = state\.views\?\.sessions \?\? localCatalog;/);
+});
+
+// Agents OAK started from a brief (`oak agent start --brief`): listed with OAK's own state, when it began, the error a
+// turn stopped on and their workers; a row with a session pins it, and `t` opens the agent's own tab on its machine,
+// before its session has a row of its own.
+test('Observatory master: delegated agents with their states, since, error and workers; their tab opens on their machine', async () => {
+  const state = fixture();
+  const since = Date.UTC(2026, 8, 18, 13, 58, 7);
+  state.views = { ...state.views, multitask: { ...(state.views.multitask ?? {}), agents: [], delegated: [
+    { id: 'fix1', title: 'Fix the parser', kind: 'claude', model: 'Opus 5.5', effort: 'xhigh', machine: null, tab: 't1', pane: 'p9', session: 'sess-fix1', cwd: '/w/tree',
+      state: 'working', since, tokens: 125000, cost: 1.25, workers: [{ id: 'w1', title: 'map the lexer', state: 'working', model: 'Sonnet' }] },
+    { id: 'port2', remoteId: 'port2', title: 'Port the lexer', kind: 'codex', model: 'gpt-x', effort: 'high', machine: 'build-box', tab: 'rt1', pane: 'rp1', session: 'sess-port2',
+      state: 'errored', since, error: 'Selected model is at capacity. Please try a different model.', workers: [] },
+  ] } };
+  const rows = render(state, 120);
+  const text = lines(rows);
+  assert.match(text, /^agents · 2$/m);
+  assert.match(text, /^  fix1 · Fix the parser\n    \S+ working · since 13:58:07 · claude · Opus 5\.5 xhigh · tab fix1 · 125k tok · \$1\.25\n    └ map the lexer · working · Sonnet$/m);
+  assert.match(text, /^  port2 · Port the lexer\n    \S+ errored · since 13:58:07 · codex · gpt-x high · on build-box · tab port2\n    Selected model is at capacity\. Please try a different model\.$/m);
+  const row = rows.find(r => r.key === 'delegated:fix1');
+  assert.deepEqual([row.scope.session, row.scope.paneId, row.scope.machineId], ['sess-fix1', 'p9', 'local']);
+  assert.equal(rows.find(r => r.key === 'delegated:fix1:worker:w1').scope.agentId, 'w1');
+  state.views.multitask.delegated[0].worktree = { state: { files: 3, added: 120, removed: 8, merged: false } };
+  assert.match(lines(render({ ...state }, 180)), /3 files · \+120 −8 · not merged/);
+  // Its tab: by its pane, here and on its saved machine, though neither session is listed yet.
+  const { runtime, calls } = fakeRuntime(state);
+  try {
+    await runtime.start();
+    await runtime.focus(row.scope);
+    assert.ok(calls.some(c => c.method === 'pane.focus' && c.params.pane_id === 'p9'));
+    await runtime.focus(rows.find(r => r.key === 'delegated:port2').scope);
+    assert.ok(calls.some(c => c.label === 'build-box' && c.argv.join(' ') === 'agent focus rp1'));
+  } finally { runtime.close(); }
+  // None started: the master is as it was.
+  assert.equal(lines(render(fixture())), lines(render({ ...fixture(), views: { ...fixture().views, multitask: { agents: [], delegated: [] } } })));
+});
+
+test('Observatory findings count stays visible without delegated agents and updates on refresh', () => {
+  const state = fixture();
+  state.views = { ...state.views, multitask: { agents: [], findings: { count: 2, rows: [] } } };
+  assert.match(lines(render(state, 120)), /findings · 2 · oak finding list/);
+  state.views.multitask.findings = { count: 0, rows: [] };
+  assert.match(lines(render(state, 120)), /findings · 0 · oak finding list/);
+  state.views.multitask.findings = { count: null, rows: [] };
+  assert.match(lines(render(state, 120)), /findings · unavailable/);
+});
+
+test('workers: machine fleet state overrides a stale working transcript and names the pane by its tab', () => {
+  const { observatorySessions } = require('../dist/observatory');
+  const { observatoryMasterRows } = require('../dist/observatory-rows');
+  const { glyphs } = require('../dist/glyphs');
+  const state = { now: Date.now(), open: new Set(['archived']), allSessions: true, views: { sessions: { sessions: [] } },
+    observatory: { details: {}, machines: [{ id: 'local', label: 'test-box', local: true,
+      snapshot: { panes: [{ pane_id: 'p1', tab_id: 't1', agent: 'claude', agent_status: 'working', agent_session: { value: 'killed', agent: 'claude' } }], agents: [], tabs: [{ tab_id: 't1', label: 'Check amber widgets' }] },
+      sessions: { sessions: [], workers: [{ session: 'killed', title: 'Check amber widgets', state: 'gone', kind: 'claude', worktree: '/synthetic', tokens: 10, lastActiveMs: 1, subagents: [] }] } }] } };
+  assert.equal(observatorySessions(state)[0].label, 'Check amber widgets');
+  const text = observatoryMasterRows(state, 150, glyphs('ascii'), 'none').map(r => r.cells).join('\n');
+  assert.match(text, /gone/);
+  assert.doesNotMatch(text, /working/);
+});
+
+
+test('queued agents: Workers show dependency ids before a session exists', () => {
+  const state = fixture();
+  const machine = state.observatory.machines.find(m => m.local);
+  machine.sessions = { sessions: [], workers: [{ key: 'local:delegated:queue', title: 'Queued job', state: 'queued', session: '', after: ['dep-a', 'dep-b'] }] };
+  const text = lines(render(state, 120));
+  assert.match(text, /Queued job\n    queued · waiting on dep-a, dep-b/);
+});
+
+test('workspace window: groups offer only one unambiguous folder on their own machine', () => {
+  const state = fixture();
+  const rows = render(state);
+  const group = rows.find(r => r.key === 'workspace:local:herdr:w1');
+  assert.equal(group.workspaceWindow.root, '/workspace');
+  assert.equal(group.workspaceWindow.machineId, 'local');
+  assert.equal(group.buttons[0].action, 'workspace-window');
+  assert.equal(rows.find(r => r.key === 'machine:build').workspaceWindow.machineId, 'build');
+  assert.equal(rows.find(r => r.key === 'machine:local').workspaceWindow, undefined, 'another local session has no known folder');
+  state.observatory.machines[0].snapshot.panes[1].cwd = '/other-project';
+  assert.equal(render(state).find(r => r.key === 'workspace:local:herdr:w1').workspaceWindow, undefined, 'two folders sharing a group label must not choose one');
+});
+
+test('done sessions: per-machine folds retain workspaces, pins, selection, revival and search, and fold pending work with its count', () => {
+  const state = fixture();
+  state.views.sessions.sessions = [];
+  state.views.multitask = { agents: [] };
+  state.observatory.machines = ['local', 'build'].map((id, i) => ({ id, label: id, local: !i,
+    snapshot: snapshot([pane('p1', `${id}-one`, 'done', 'codex', 'w1'), pane('p2', `${id}-two`, 'done', 'claude', 'w2')],
+      { w1: `${id}-first`, w2: `${id}-second` }), sessions: { sessions: [] } }));
+  const folds = rows => rows.filter(r => r.openPath?.startsWith('done:'));
+  const shown = rows => rows.filter(r => r.key.startsWith('session:') && !r.cont).map(r => r.scope.session);
+  const closed = render(state);
+  assert.deepEqual(folds(closed).map(r => r.cells.trim()), ['> 2 done', '> 2 done']);
+  assert.deepEqual(shown(closed), []);
+  assert.ok(!closed.some(r => r.key.startsWith('workspace:')), 'done-only workspaces belong inside the fold');
+  assert.deepEqual(closed.filter(r => r.key.startsWith('machine:') || r.openPath).map(r => r.key),
+    ['machine:local', 'done:local', 'machine:build', 'done:build']);
+  state.open = new Set(['done:local', 'done:build']);
+  const opened = render(state);
+  assert.equal(shown(opened).length, 4);
+  for (const id of ['local', 'build']) {
+    assert.equal(workspaceOfRow(opened, `${id}-one`).trim(), `${id}-first`);
+    assert.equal(workspaceOfRow(opened, `${id}-two`).trim(), `${id}-second`);
+  }
+  const pinned = pin({ ...state, open: new Set() }, 'build-one', 'obs-detail', 'build');
+  pinned.scopeWorker = null;
+  assert.deepEqual(shown(render(pinned)), ['build-one'], 'a detail pin stays visible without the master selection');
+  state.open = new Set();
+  state.scopeWorker = tui.observatorySelection(state, 'local-two', 'local');
+  assert.deepEqual(shown(render(state)), ['local-two'], 'the selected session cannot be hidden');
+  // Selected inside its open fold, it stays there: pulled above the fold, it moved away from under the arrows that picked it.
+  const order = rows => rows.filter(r => (r.key.startsWith('session:') && !r.cont) || r.openPath?.startsWith('done:')).map(r => r.openPath ?? r.scope.session);
+  assert.deepEqual(order(render({ ...state, open: new Set(['done:local']) })), ['done:local', 'local-one', 'local-two', 'done:build']);
+  state.scopeWorker = null;
+  state.observatory.machines[0].sessions.sessions = [];
+  state.views.sessions.sessions = [{ id: 'local-two', pending: 2 }];
+  // The user: "alot of sessions that are marked done but not collapsed" (finished agents with edits left). Done folds
+  // all the same; the fold row says how much review work is inside it.
+  assert.deepEqual(shown(render(state)), [], 'a done session with pending edits folds');
+  assert.deepEqual(folds(render(state)).map(r => r.cells.trim()), ['> 2 done · 2 pending', '> 2 done'], 'the fold counts the pending edits inside it');
+  state.views.sessions.sessions = [];
+  // `current` is the watched session only on this machine: a saved machine's listing marks the newest session of its own
+  // launch folder, which must not hold a done session out of the fold here (2026-11-05).
+  state.observatory.machines[1].sessions.sessions = [{ id: 'build-one', current: true }];
+  assert.ok(!shown(render(state)).includes('build-one'), 'another machine\'s current session folds when done');
+  state.observatory.machines[1].sessions.sessions = [];
+  state.views.sessions.sessions = [{ id: 'local-one', current: true }];
+  assert.deepEqual(shown(render(state)), ['local-one'], 'this machine\'s watched session stays visible');
+  state.views.sessions.sessions = [];
+  state.observatory.machines[0].snapshot.panes[0].agent_status = 'working';
+  assert.deepEqual(shown(render(state)), ['local-one'], 'a new turn leaves its closed fold');
+  state.filter = 'build-two';
+  assert.deepEqual(shown(render(state)), ['build-two'], 'a search reveals the matching done session');
+  assert.equal(folds(render(state)).length, 0);
+  state.filter = '';
+  state.views.sessions.sessions = [{ id: 'pending-done', pending: 2 }];
+  state.views.multitask.agents = [{ session: 'pending-done', state: 'done', title: 'Pending finished work', worktree: '/fixture' }];
+  state.open = new Set(['earlier']);
+  assert.ok(!shown(render(state)).includes('pending-done'), 'finished work awaiting review is not under earlier');
+  state.open = new Set(['done:local']);
+  const inFold = shown(render(state));
+  assert.ok(inFold.includes('pending-done'), 'it is in its machine’s done fold');
+  assert.equal(inFold.filter(id => id === 'pending-done').length, 1, 'listed once');
+  // A filter that matches it shows it under its machine, and "earlier" neither lists nor counts it again (review 2026-11-05).
+  state.open = new Set(['earlier']);
+  state.filter = 'pending-done';
+  const filtered = render(state);
+  assert.equal(shown(filtered).filter(id => id === 'pending-done').length, 1, 'a filtered finished session is drawn once');
+  assert.ok(!filtered.some(r => r.key === 'earlier'), 'and not counted under earlier');
+  state.filter = '';
+  // With no herdr pane, a finished turn its hooks recorded (idle-done) folds as the editors fold it (review 2026-11-05).
+  state.views.multitask.agents = [];
+  // (With nothing pending such a session is archived here, behind Show archived, as before.)
+  state.views.sessions.sessions = [{ id: 'quiet-finished', pending: 1, attention: { kind: 'idle-done', ts: 1 } }];
+  state.open = new Set();
+  assert.ok(!shown(render(state)).includes('quiet-finished'), 'a paneless finished session folds');
+  state.open = new Set(['done:local']);
+  assert.ok(shown(render(state)).includes('quiet-finished'), 'inside its machine\'s done fold');
+});
+
+test('saved machine Workers follow pane visibility without delaying Sessions or changing the poll', async t => {
+  const state = fixture(), reads = [];
+  let visible = false;
+  const fake = fakeRuntime(state, {}, { watch: false, workersVisible: () => visible, reader: { ...testReader(),
+    sessions: async (_session, _root, machine, workers) => {
+      reads.push({ machine, workers });
+      return { sessions: [{ id: 'remote-done', title: 'Remote work' }], ...(workers ? { workers: [{ session: 'remote-done' }] } : {}) };
+    },
+  } });
+  t.after(() => fake.runtime.close());
+  await fake.runtime.refreshRemotes();
+  assert.ok(reads.length);
+  assert.ok(reads.every(r => r.workers === false), 'hidden Workers never enters the Workers reader');
+  const count = reads.length;
+  visible = true;
+  await fake.runtime.refreshRemotes();
+  assert.equal(reads.length, count * 2, 'opening Workers upgrades the recent Sessions-only answer immediately');
+  assert.ok(reads.slice(count).every(r => r.workers));
+  assert.ok(state.observatory.machines.find(m => !m.local).sessions.workers.length);
+  await fake.runtime.refreshRemotes();
+  assert.equal(reads.length, count * 2, 'regular cooldown still applies');
+});
+
+test('app Workers demand follows the visible pane, including the Observatory tree that renders fleet states', () => {
+  const ts = require('typescript'), vm = require('node:vm');
+  const source = fs.readFileSync(path.join(__dirname, '../src/app.ts'), 'utf8');
+  const ast = ts.createSourceFile('app.ts', source, ts.ScriptTarget.Latest, true);
+  const callbacks = [];
+  function visit(node) {
+    if (ts.isPropertyAssignment(node) && node.name.getText(ast) === 'workersVisible') callbacks.push(node.initializer.getText(ast));
+    ts.forEachChild(node, visit);
+  }
+  visit(ast);
+  assert.equal(callbacks.length, 2, 'live and one-shot app both declare the consumer');
+  for (const callback of callbacks) {
+    const context = { tabs: [{ root: {} }], active: 0, placements: [], leafPanes: () => context.placements,
+      treeGeom: () => ({ tl: { placements: context.placements } }) };
+    const visible = vm.runInNewContext(ts.transpile('(' + callback + ')'), context);
+    for (const [views, expected] of [[['workers'], true], [['sessions-nav'], true], [['session-detail'], false], [[], false]]) {
+      context.placements = views.map(view => ({ view }));
+      assert.equal(visible(), expected, views.join(',') || 'collapsed');
+    }
+    context.tabs = [{}];
+    assert.equal(visible(), false, 'another tab has no Workers consumer');
   }
 });

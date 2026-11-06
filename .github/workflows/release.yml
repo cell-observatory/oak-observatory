@@ -16,7 +16,7 @@ jobs:
   release:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:
           node-version: 22
@@ -31,6 +31,9 @@ jobs:
         # package.json — so gating the tag on root package.json transitively covers them all.
         run: |
           TAG="${GITHUB_REF_NAME}"; VER="${TAG#v}"
+          # X.Y.Z-dev.0 is the version every `dev` checkout carries, and OAK reads it as a local build (isLocalBuild):
+          # a release at it is never offered an update, so every install of it would stay there.
+          case "$VER" in *-dev.0) echo "::error::tag $TAG names a local build's version (-dev.0), which no release carries — stamp the release version first (node scripts/version.mjs X.Y.Z) and tag that"; exit 1 ;; esac
           PKG_VER="$(node -p "require('./package.json').version")"
           if [ "$VER" != "$PKG_VER" ]; then
             echo "::error::tag $TAG (=$VER) != committed version $PKG_VER — bump versions (npm run version:set) or fix the tag"
@@ -56,12 +59,14 @@ jobs:
       - run: npm ci
       - run: npm test
       - run: bash test/e2e.sh
-      - run: npm run release
-      - uses: actions/setup-java@v5
+      # release.sh builds the JetBrains plugin when JAVA_HOME has a JDK, so the JDK and Gradle's cache come
+      # first: after it, the wrapper downloaded Gradle uncached, with no retry, on the runner's default JDK.
+      - uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: 21
-      - uses: gradle/actions/setup-gradle@v4
+      - uses: gradle/actions/setup-gradle@v5
+      - run: npm run release
       - run: ./gradlew buildPlugin --console=plain
         working-directory: packages/jetbrains
       - name: Create GitHub Release with artifacts
@@ -90,6 +95,16 @@ jobs:
           # migration and upgrade callouts live there, and old installs link users to this page.
           # A tag with no section still releases, loudly, on generated notes.
           awk -v ver="$VER" '$0 ~ "^## \\[" ver "\\]" {on=1; next} on && /^## \[/ {exit} on {print}' CHANGELOG.md > release/notes.md
+          # GitHub refuses a release whose notes pass 125,000 characters ("body is too long"), and this step then
+          # creates no release, so the tag stands with no assets. Longer notes end before the first entry or heading
+          # that does not fit (counted in bytes, which are never fewer than characters), and say where the rest is.
+          if [ "$(wc -c < release/notes.md)" -gt 120000 ]; then
+            LC_ALL=C awk -v max=120000 '{ line[NR] = $0; size += length($0) + 1; if (/^(- |#+ )/) head[NR] = 1; if (size <= max) fit = NR }
+              END { for (cut = fit + 1; cut > 1 && !head[cut]; cut--); for (i = 1; i < cut; i++) print line[i] }' release/notes.md > release/notes.cut
+            printf "\nGitHub keeps a release's notes to 125,000 characters: the rest of these notes are in [CHANGELOG.md](https://github.com/%s/blob/%s/CHANGELOG.md).\n" \
+              "$GITHUB_REPOSITORY" "$TAG" >> release/notes.cut
+            mv release/notes.cut release/notes.md
+          fi
           if [ -s release/notes.md ]; then NOTES=(--notes-file release/notes.md); else
             echo "::warning::no CHANGELOG section for ${VER} — falling back to generated notes"
             NOTES=(--generate-notes)

@@ -82,6 +82,8 @@ const CSI_TILDE: Record<string, string> = {
   '11': 'f1', '12': 'f2', '13': 'f3', '14': 'f4', '15': 'f5', '17': 'f6', '18': 'f7',
   '19': 'f8', '20': 'f9', '21': 'f10', '23': 'f11', '24': 'f12',
 };
+/** F1 to F5 as the Linux console sends them: ESC [ [ then a letter (terminfo `linux`). */
+const CONSOLE_FKEY: Record<string, string> = { A: 'f1', B: 'f2', C: 'f3', D: 'f4', E: 'f5' };
 const CTRL_NAME: Record<string, string> = {
   '\r': 'enter', '\n': 'enter', '\t': 'tab', '\x7f': 'backspace', '\b': 'backspace',
 };
@@ -193,6 +195,16 @@ export function createDecoder(): Decoder {
       if (buf.startsWith(`${ESC}[O`)) {
         buf = buf.slice(3);
         return [{ t: 'focus', focused: false }];
+      }
+      // The console's F-keys. Read as a CSI whose final byte is `[`, they left their letter behind as a key: F1 was `A`,
+      // which keeps everything on Review.
+      if (buf.startsWith(`${ESC}[[`)) {
+        if (buf.length === 3) return null;
+        const name = CONSOLE_FKEY[buf[3]];
+        if (name) {
+          buf = buf.slice(4);
+          return [key(name)];
+        }
       }
 
       // Generic CSI: ESC [ params intermediates final. A final byte is 0x40-0x7e.

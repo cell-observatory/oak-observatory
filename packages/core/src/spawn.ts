@@ -26,6 +26,13 @@
  * POSIX is left completely alone: bare binary, args array, no shell, no new quoting — therefore no
  * new injection surface anywhere except the one platform that demands a shell.
  *
+ * Windows also gives a console program started by a process with no console of its own a console window
+ * of its own, for as long as it runs. VS Code's extension host has no console, nor does a detached
+ * refresh or the herdr server OAK starts, and each child of theirs (herdr, ssh, node, cmd.exe for a
+ * `.cmd` shim) flashed one on the desktop. So every launch here passes `windowsHide`, which Node ignores
+ * elsewhere, unless its caller names it. The flag also starts a GUI program's window hidden, so a launch
+ * of one (an editor, the file manager) passes `windowsHide: false`.
+ *
  * WHAT THIS DOES NOT HANDLE — pass `direct` when any of it applies to your arguments:
  *   • `%VAR%` still expands INSIDE double quotes. A path holding two `%` characters gets mangled.
  *     Windows account names may contain `%`, so this is reachable in principle, unfixable in shell
@@ -112,6 +119,14 @@ function split<T extends object>(options: T & LaunchOpts): [T, LaunchOpts] {
   return [rest as T, { platform, direct }];
 }
 
+/** OAK_NO_BACKGROUND=1 turns off every fire-and-forget child OAK starts on its own (the account pull, the
+ *  title, tab and month refreshes, the update check, the change-map warm-up and the terminal app's focus
+ *  server). Each outlives the process that started it, so under a test harness it kept writing into a
+ *  temporary HOME the harness was removing. The test bootstrap sets it; nothing else does. */
+export function noBackgroundChildren(): boolean {
+  return process.env.OAK_NO_BACKGROUND === '1';
+}
+
 // Mirrors Node's stdio-based narrowing: an all-`pipe` stdio guarantees the three streams, and callers
 // pipe stdin/stdout precisely so they can use them without a null check on every line.
 export function spawnTool(
@@ -136,7 +151,7 @@ export function spawnTool(
   // the user's project folder for as long as it ran. So on Windows, unless the caller names a cwd, it
   // starts at home. POSIX does not pin a cwd, and there a detached child keeps the caller's, as before.
   const home = o.detached && o.cwd === undefined && process.platform === 'win32' ? os.homedir() : undefined;
-  return cp.spawn(s.file, s.args, { ...o, ...(home && fs.existsSync(home) ? { cwd: home } : {}), shell: s.shell });
+  return cp.spawn(s.file, s.args, { windowsHide: true, ...o, ...(home && fs.existsSync(home) ? { cwd: home } : {}), shell: s.shell });
 }
 
 // Mirrors Node's own typings: an explicit string `encoding` narrows stdout/stderr to strings, so
@@ -158,18 +173,80 @@ export function spawnToolSync(
 ): cp.SpawnSyncReturns<string | Buffer> {
   const [o, l] = split(options);
   const s = launchSpec(file, args, l);
-  return cp.spawnSync(s.file, s.args, { ...o, shell: s.shell });
+  return cp.spawnSync(s.file, s.args, { windowsHide: true, ...o, shell: s.shell });
+}
+
+/** The detached children of execFileTool still running: each leads a process group of its own. */
+const detachedGroups = new Set<number>();
+
+/** Stop each detached child of execFileTool still running, with its whole process group (SIGTERM), except
+ *  one started with `keepOnExit`. Such a child runs apart from the terminal, so ctrl+c or a hangup reaches
+ *  only the process that started it, and a saved machine's herdr command ran on once that process had ended:
+ *  `oak prompt` delivered its prompt after ctrl+c. The CLI calls this before it ends by a signal, and the
+ *  terminal app on every way out, which leaves the reply it is sending (`keepOnExit`) to finish. Core never
+ *  calls it, at exit or otherwise: VS Code runs core inside its extension host, where closing a window must
+ *  not stop a prompt still being sent. */
+export function stopDetachedChildren(): void {
+  for (const pid of detachedGroups) {
+    try { process.kill(-pid, 'SIGTERM'); } catch { /* the group has ended */ }
+  }
 }
 
 /** String encoding only — the callback's `stdout`/`stderr` are declared as strings, so a caller must
- *  not be able to ask for buffers through the same door and get a lie. */
+ *  not be able to ask for buffers through the same door and get a lie.
+ *
+ *  `detached`, which execFile ignores, runs the child on POSIX in a session of its own, which no terminal
+ *  belongs to, read the way execFile reads it. At `timeout`, or once stdout or stderr passes `maxBuffer`
+ *  bytes, its output pipes are closed, as execFile closes them, and its whole process group is sent
+ *  killSignal (SIGTERM unless given), then SIGKILL half a second later: everything still in that group
+ *  ends by then, and the callback comes once the child itself has ended, even while a process that left
+ *  the group (a daemon it started) runs on. `keepOnExit` leaves it out of stopDetachedChildren. Windows keeps
+ *  execFile: there a detached child gets a console window of its own. */
 export function execFileTool(
   file: string,
   args: readonly string[],
-  options: Omit<cp.ExecFileOptionsWithStringEncoding, 'encoding'> & { encoding?: BufferEncoding } & LaunchOpts,
+  options: Omit<cp.ExecFileOptionsWithStringEncoding, 'encoding'> & { encoding?: BufferEncoding; detached?: boolean; keepOnExit?: boolean } & LaunchOpts,
   callback: (error: cp.ExecFileException | null, stdout: string, stderr: string) => void
 ): cp.ChildProcess {
-  const [o, l] = split(options);
+  const [{ detached, keepOnExit, ...o }, l] = split(options);
   const s = launchSpec(file, args, l);
-  return cp.execFile(s.file, s.args, { ...o, encoding: o.encoding ?? 'utf8', shell: s.shell }, callback);
+  if (!detached || (l.platform ?? process.platform) === 'win32') {
+    return cp.execFile(s.file, s.args, { windowsHide: true, ...o, encoding: o.encoding ?? 'utf8', shell: s.shell }, callback);
+  }
+  const { timeout, maxBuffer = 1024 * 1024, killSignal = 'SIGTERM', encoding = 'utf8', ...rest } = o;
+  const child = cp.spawn(s.file, s.args, { windowsHide: true, ...rest, shell: s.shell, detached: true });
+  const pid = child.pid;
+  if (pid && !keepOnExit) detachedGroups.add(pid);
+  let stdout = '', stderr = '', timedOut = false, overflow = '', ended = false;
+  const bytes = { stdout: 0, stderr: 0 };
+  const group = (signal: NodeJS.Signals | number): void => {
+    try { if (pid) process.kill(-pid, signal); } catch { /* the group has ended */ }
+  };
+  const stop = (): void => {
+    child.stdout?.destroy();
+    child.stderr?.destroy();
+    group(killSignal);
+    setTimeout(() => group('SIGKILL'), 500).unref();
+  };
+  const timer = timeout ? setTimeout(() => { timedOut = true; stop(); }, Math.min(2147483647, timeout)) : undefined;
+  const read = (stream: 'stdout' | 'stderr', text: string): void => {
+    if ((bytes[stream] += Buffer.byteLength(text, encoding)) > maxBuffer && !overflow) { overflow = stream; stop(); }
+  };
+  child.stdout?.setEncoding(encoding).on('data', (text: string) => { stdout += text; read('stdout', text); });
+  child.stderr?.setEncoding(encoding).on('data', (text: string) => { stderr += text; read('stderr', text); });
+  const end = (error: cp.ExecFileException | null): void => {
+    if (ended) return;
+    ended = true;
+    clearTimeout(timer);
+    callback(error, stdout, stderr);
+  };
+  child.on('error', end);
+  child.on('close', (code, signal) => {
+    if (pid) detachedGroups.delete(pid);
+    if (code === 0 && !overflow) return end(null);
+    const cmd = [s.file, ...s.args].join(' ');
+    end(overflow ? Object.assign(new RangeError(`${overflow} maxBuffer length exceeded`), { code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER', cmd })
+      : Object.assign(new Error(`Command failed: ${cmd}\n${stderr}`), { cmd, code: code ?? undefined, killed: timedOut, signal: signal ?? undefined }));
+  });
+  return child;
 }

@@ -3,7 +3,6 @@ package com.cellobservatory.observatory.platform
 import com.cellobservatory.observatory.core.ClaudePaths
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.util.Disposer
-import com.intellij.testFramework.fixtures.BasePlatformTestCase
 import java.nio.file.Files
 
 /**
@@ -17,7 +16,7 @@ import java.nio.file.Files
  * framework, so a construction-time "Cannot add null action" fails here even where the production
  * IDE would log-and-limp.
  */
-class PanelConstructionTest : BasePlatformTestCase() {
+class PanelConstructionTest : ObservatoryPlatformTestCase() {
 
     private lateinit var cfg: java.nio.file.Path
 

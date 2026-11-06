@@ -13,7 +13,6 @@ import com.intellij.openapi.actionSystem.ToggleAction
 import com.intellij.openapi.actionSystem.impl.ActionToolbarImpl
 import com.intellij.openapi.actionSystem.impl.SimpleDataContext
 import com.intellij.openapi.wm.ToolWindowManager
-import com.intellij.testFramework.fixtures.BasePlatformTestCase
 import java.awt.Component
 import java.awt.Container
 import javax.swing.JTabbedPane
@@ -26,7 +25,7 @@ import javax.swing.JTabbedPane
  * registers no tool windows at all — so "the reader cannot see the session selector" was a bug no test
  * could hold. Now the selector is a component of this panel, and these methods are what say so.
  */
-class TimelineWindowTest : BasePlatformTestCase() {
+class TimelineWindowTest : ObservatoryPlatformTestCase() {
 
     private var savedGrouped = false
     private var savedCollapsed: MutableList<String> = ArrayList()

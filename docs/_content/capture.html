@@ -1,4 +1,4 @@
-<p>Everything OAK shows is derived from two sources, and it writes to neither of them without your say-so. The <strong>transcript</strong> the agent already keeps, and the <strong>store</strong> the capture <strong>hook</strong> appends to. Both cost no tokens and are invisible to the agent.</p>
+<p>Everything OAK shows is derived from two sources: the <strong>transcript</strong> the agent already keeps, and the <strong>store</strong> the capture <strong>hook</strong> appends to. Capturing edits uses no model calls. An optional <a href="agents-across-machines.html#sharing-knowledge">edit-time heads-up</a> adds a short context note when recent evidence shows another agent’s pending edits to the same repository path.</p>
 
 <h2>Transcript</h2>
 <p>The <strong>transcript</strong> is the event log the agent itself writes for a session: prompts, tool calls, results, reasoning, and plan updates, one JSON record per line. The observatory reads it as evidence and never writes to it. Because the reading happens outside the model loop, it costs no tokens and is invisible to the agent.</p>
@@ -12,8 +12,10 @@
   <p>The store sits under your config directory, one folder per session. <code>oak store</code> prints its location; every session's edits, snapshots, and derived caches live there. It is git-independent, so nothing you review touches your working tree until you decide.</p></div>
 </div>
 
+<p>Each machine also keeps a <a href="database-and-sync.html">local database</a> of what OAK derives from its transcripts and its store, and <code>oak sync</code> carries what each machine’s database derives to your other machines. The database is a cache of these two sources: deleting it loses nothing they still hold.</p>
+
 <h2>Hook</h2>
-<p>A <strong>hook</strong> is the local capture point. <a href="claude-code.html">Claude Code</a> invokes it before and after each file-changing tool call, and after one that fails; the hook snapshots the file and appends an edit record to the store. It prints nothing and returns immediately, so the agent's behavior and context are unchanged.</p>
+<p>A <strong>hook</strong> is the local capture point. <a href="claude-code.html">Claude Code</a> invokes it before and after each file-changing tool call, and after one that fails; the hook snapshots the file and appends an edit record to the store. Its only context output is the optional heads-up. It never blocks an edit or makes a permission decision.</p>
 <p><code>oak init</code> installs Claude Code capture hooks, and native Codex hooks too when <code>codex</code> is on the PATH; <code>oak init --codex</code> installs the Codex hooks alone. herdr manages terminals while OAK reads the captured store and native transcripts.</p>
 
 <div class="callout warn">

@@ -14,7 +14,9 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { claudeConfigDir } from './paths';
 import { projectDir, commonDir, repoKeyForSession, firstCwdLine, isMirroredTranscript, isBridgePointer } from './session';
-import { readLog, isSafeSessionId, sidecarMemo } from './store';
+import { readLog, isSafeSessionId, sidecarMemo, storeDir } from './store';
+import { readManifest, manifestKey, syncDir, type SyncManifest } from './sync-state';
+import { machineHostTag } from './machine-usage';
 import { captureEventsPath } from './capture-events';
 import { cancelledMemberIds } from './units';
 import { parseTranscriptActions, agentPhaseDetail } from './actions';
@@ -208,6 +210,31 @@ function buildSibling(
   };
 }
 
+/** oak sync's manifest, read again only when its file changed (its stat), and only for a transcript with no store. */
+let manifestMemo: { stamp: string; manifest: SyncManifest } | null = null;
+
+/** A transcript oak sync copied here from another machine, as it landed (the manifest names that machine, with the size
+ *  and time it landed at), of a session with no store here: that machine's session, running there, which `oak sync fetch`
+ *  brought or a later run kept current (index ingest.ts copyOrigin takes it so). One resumed or captured here is this
+ *  machine's own. A copy whose recorded directory is another machine's isMirroredTranscript already tells; this tells one
+ *  whose directory is the same path on both machines. */
+function syncCopy(id: string, transcript: string): boolean {
+  try {
+    if (fs.existsSync(storeDir(id))) return false;
+    const file = path.join(syncDir(), 'manifest.jsonl');
+    const st = fs.statSync(file);
+    const stamp = `${st.size}:${st.mtimeMs}`;
+    if (manifestMemo?.stamp !== stamp) manifestMemo = { stamp, manifest: readManifest() };
+    const rel = path.relative(path.join(claudeConfigDir(), 'projects'), transcript).split(path.sep).join('/');
+    const e = manifestMemo.manifest.get(manifestKey('transcripts', rel));
+    if (!e?.origin || e.origin === machineHostTag() || !e.sha256 || e.changed) return false;
+    const now = fs.statSync(transcript);
+    return e.size === now.size && e.mtime === Math.floor(now.mtimeMs);
+  } catch {
+    return false; // no sync here, or the file went: a session of this machine's
+  }
+}
+
 /**
  * Every session in the current project (siblings + self), newest activity first. `activeSessionId`
  * marks which one is `self`. Zero token — store reads plus one transcript parse per sibling for risk.
@@ -226,9 +253,12 @@ export function listSiblings(cwd: string, activeSessionId?: string): SiblingSess
     if (!name.endsWith('.jsonl')) continue;
     const id = name.slice(0, -'.jsonl'.length);
     if (!isSafeSessionId(id)) continue;
+    // A copy of another machine's session that oak sync landed here is no sibling: it runs there (syncCopy).
+    const transcript = path.join(dir, name);
+    if (isMirroredTranscript(transcript).mirrored || isBridgePointer(transcript) || syncCopy(id, transcript)) continue;
     // Same project dir ⇒ every session here launched from `cwd`; the branch isn't resolved on this
     // cheap same-dir path (honest null, not a guess) — listRepoSiblings reads it from the transcript.
-    const s = buildSibling(id, path.join(dir, name), cwd, null, activeSessionId, now);
+    const s = buildSibling(id, transcript, cwd, null, activeSessionId, now);
     if (s) out.push(s);
   }
   return out.sort((a, b) => b.lastMs - a.lastMs);
@@ -268,7 +298,7 @@ export function listRepoSiblings(cwd: string, activeSessionId?: string): Sibling
       const id = name.slice(0, -'.jsonl'.length);
       if (!isSafeSessionId(id)) continue;
       const transcript = path.join(dir, name);
-      if (isMirroredTranscript(transcript).mirrored || isBridgePointer(transcript)) continue;
+      if (isMirroredTranscript(transcript).mirrored || isBridgePointer(transcript) || syncCopy(id, transcript)) continue;
       const first = firstCwdLine(transcript);
       if (!first) continue; // no cwd line ⇒ can't resolve its repo; skip (never guess membership)
       if (repoKeyForSession(id, first.cwd) !== key) continue; // different (or unresolvable) repo

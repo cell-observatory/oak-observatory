@@ -1,5 +1,5 @@
 /**
- * oak — standalone, git-free, per-edit Keep/Undo for Claude Code.
+ * oak — standalone, git-free, per-edit Keep/Undo for Claude Code and Codex.
  *
  * Commands:
  *   init                 install the capture + attention hooks into ~/.claude/settings.json
@@ -12,6 +12,7 @@
  *   inbox                every session waiting on you, most urgent first (--next = the one to jump to)
  *   notify               desktop notifications for raised hands (--message | --session … | --watch)
  *   search <words…>      every conversation on this machine, ranked (asks + answers)
+ *   query <name>         the local index in JSON (named queries, or one read-only SQL statement)
  *
  * Machine-readable surface (drives the JetBrains plugin): blob / locate / observe / usage, plus
  * --json on list / status / sessions / keep / undo / redo, and analyze / recap / suggest for the
@@ -20,7 +21,8 @@
  * `oak capture` never reaches this file: the dist/index.js launcher (launch.ts) sends it to the lean
  * capture bundle, so the hooks do not compile the whole CLI.
  */
-import type { EditRecord, InstallResult, StatMetrics, InstalledSurface, UpdatePlan, HandKind, Check, HerdrReport } from '@oak-observatory/core';
+import type { EditRecord, InstallResult, StatMetrics, InstalledSurface, UpdatePlan, UpdateAction, HandKind, Check, HerdrReport } from '@oak-observatory/core';
+import type { SyncCliDeps } from './sync';
 
 /** Version read from the package manifest at runtime — one source of truth, so it can never drift. */
 function version(): string {
@@ -61,14 +63,55 @@ const c = {
   cyan: (s: string) => (isTTY() ? `\x1b[36m${s}\x1b[0m` : s),
 };
 
+/** A command that records the reader's decisions runs whole outside any store move (core.outsideStoreMoves): its reads
+ *  and its writes. Read while a move had renamed the store, before the new location was recorded, a keep found no edit
+ *  to keep and an undo said there was none; only the writes waited for the move. */
+function deciding(run: () => void): void {
+  (require('@oak-observatory/core') as typeof import('@oak-observatory/core')).outsideStoreMoves(run);
+}
+
 function fail(msg: string): never {
   process.stderr.write(c.red('oak: ') + msg + '\n');
   process.exit(1);
 }
 
-/** Machine-readable output for non-Node front-ends (the JetBrains plugin drives these). */
+/** True while `emitJson` writes: JSON passes `guardHumanOutput` byte-exact, even from a verb that
+ *  answers in JSON without `--json` (`chat-context`). */
+let writingJson = false;
+
+/** Machine-readable output for non-Node front-ends (the JetBrains plugin drives these). A verb that
+ *  emits JSON and then sets an exit status sets `process.exitCode` and returns, never `process.exit()`:
+ *  exit drops whatever a pipe has not taken yet, which cut the JSON off at the pipe's buffer (8 KB on
+ *  macOS) whenever the reader was slower than the writer. */
 function emitJson(v: unknown): void {
-  process.stdout.write(JSON.stringify(v));
+  writingJson = true;
+  try {
+    process.stdout.write(JSON.stringify(v));
+  } finally {
+    writingJson = false;
+  }
+}
+
+/** Verbs whose stdout is data or a terminal app of its own, never filtered: the raw blob, the JSON
+ *  trace and view batches, the protocol probes, the tab-sync answer, the focus server and the terminal
+ *  app itself. `views` is filtered on a terminal, as `--json` is: its batches (and `views --serve`'s
+ *  answers) reach the editors and the terminal app through a pipe. */
+const RAW_OUTPUT_VERBS = new Set(['blob', 'export', 'views', 'tui', 'server', '__conversation-protocol', '__review-protocol', '__update-protocol', '__tab-sync', '__sync-inventory', '__sync-fetch', '__sync-key', '__query-sql', '__index-build']);
+
+/**
+ * Human output carries text an agent wrote: titles, prompts, replies, file names, messages. Printed
+ * raw, an escape sequence in any of them drives the reader's terminal (retitle the window, clear the
+ * screen, write the clipboard over OSC 52). Every string this process writes to stdout or stderr is
+ * therefore filtered as the terminal app filters its cells, keeping only colour, line breaks and tabs.
+ * One filter at the stream, rather than one call per print, covers every path, including new ones.
+ * Messages on stderr are always for a person; stdout is left exact for the machine formats.
+ */
+function guardHumanOutput(streams: NodeJS.WriteStream[]): void {
+  const { sanitizeText } = require('@oak-observatory/tui/dist/textwidth') as typeof import('@oak-observatory/tui/dist/textwidth');
+  for (const stream of streams) {
+    const write = stream.write.bind(stream) as (chunk: unknown, ...rest: unknown[]) => boolean;
+    stream.write = ((chunk: unknown, ...rest: unknown[]) => write(typeof chunk === 'string' && !writingJson ? sanitizeText(chunk) : chunk, ...rest)) as typeof stream.write;
+  }
 }
 
 // --- session resolution (shared shape with the VS Code front-end) ---
@@ -82,7 +125,9 @@ function emitJson(v: unknown): void {
  */
 function getTuiSessionId(args: string[]): string | { session: string; elsewhere: true } {
   const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
-  const pinned = args.includes('--session') || process.env.CLAUDE_OBSERVATORY_SESSION || process.env.CLAUDE_CHANGES_SESSION;
+  // `--root <dir>` names the workspace the app reviews, so it scopes every lookup here, not the launch cwd.
+  const root = flagValue(args, '--root') ?? process.cwd();
+  const pinned = args.some((a) => a === '--session' || a.startsWith('--session=')) || process.env.CLAUDE_OBSERVATORY_SESSION || process.env.CLAUDE_CHANGES_SESSION;
   if (pinned) {
     const id = getSessionId(args);
     // The dashboard is a whole-session view, so an EXPLICIT id it cannot open (a typo) must fail loudly
@@ -91,14 +136,14 @@ function getTuiSessionId(args: string[]): string | { session: string; elsewhere:
     // id with neither — `feed --feed-agent <subagent>` — never reach here (this is the tui path only).
     // With saved machines, the session may run on one of them: the dashboard finds its owner from
     // their catalogs, reviews it there, and fails just as loudly when none lists it.
-    if (id && !core.findTranscript(process.cwd(), id) && !require('fs').existsSync(core.storeDir(id))) {
+    if (id && !core.findTranscript(root, id) && !require('fs').existsSync(core.storeDir(id))) {
       if (savedMachineLabels().length) return { session: id, elsewhere: true };
       fail(`no session "${id}" on this machine — \`oak sessions\` lists the ones it has.`);
     }
     return id;
   }
   // `--root` means that workspace's own session, never the machine-wide newest the launch default reaches for.
-  const id = args.includes('--root') ? core.resolveSessionId(process.cwd()) : core.defaultTuiSession(process.cwd());
+  const id = core.defaultTuiSession(root, flagValue(args, '--root') !== undefined);
   if (id && core.isSafeSessionId(id)) return id;
   // No agent session on this machine yet — a first run. The TUI still opens (on the herdr tab, which
   // starts one) and adopts the first session that appears; exiting here would make "install oak, get
@@ -122,10 +167,11 @@ function savedMachineLabels(): string[] {
 
 function getSessionId(args: string[]): string {
   const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
-  const i = args.indexOf('--session');
+  // `--session=` names no id, as a bare `--session` does not: both fail, never fall back to the cwd's session.
+  const named = args.some((a) => a === '--session' || a.startsWith('--session='));
   const given = flagValue(args, '--session');
   let id: string | null = null;
-  if (i >= 0 && !given) fail('`--session` requires a session id');
+  if (named && !given) fail('`--session` requires a session id');
   if (given) id = given;
   else if (process.env.CLAUDE_OBSERVATORY_SESSION) id = process.env.CLAUDE_OBSERVATORY_SESSION;
   else if (process.env.CLAUDE_CHANGES_SESSION) id = process.env.CLAUDE_CHANGES_SESSION; // legacy name
@@ -371,6 +417,8 @@ function cmdUninstall(args: string[]): void {
   const project = args.includes('--project');
   const all = args.includes('--all');
   const target = project ? core.projectSettingsPath(process.cwd()) : core.settingsPath();
+  const setups = project ? (core.repoRoot(process.cwd()) ? [core.applyAgentSetup(core.agentSetupPlan({ project: process.cwd(), remove: true }))] : []) : core.refreshAgentSetup(process.cwd(), true);
+  for (const p of setups) for (const e of p.items) process.stdout.write(`${e.path}: ${e.state === 'edited' ? 'user-edited; left unchanged' : 'OAK delegation content removed or absent'}\n`);
   if (project) {
     // Explicitly scoped: exactly this repo's settings file, nothing else.
     let res: InstallResult;
@@ -415,43 +463,146 @@ function cmdUninstall(args: string[]): void {
     if (unwired) process.stdout.write(c.green('✓ ') + `removed the codex model lines oak init added (${unwired}) from ${core.codexConfigTomlPath()}\n`);
   }
   if (!all) {
+    // `--purge-store` acts only with `--all`: said, never skipped in silence, so a store meant to go is not left unnoticed.
+    if (args.includes('--purge-store'))
+      process.stdout.write(c.yellow('⚠ ') + '`--purge-store` takes effect with `--all`: nothing was purged. Run `oak uninstall --all --purge-store` to delete the stored edits.\n');
     process.stdout.write(
       c.dim('tip: `oak uninstall --all` also reverts the bundled status line + prints full teardown steps.\n')
     );
     return;
   }
-  // --all: revert the bundled status line too, but only if it's still ours (never a user's custom one).
-  try {
-    const sl = core.uninstallStatusline(target);
-    if (sl.changed || sl.scriptRemoved) {
-      process.stdout.write(c.green('✓ ') + `reverted the bundled status line${sl.changed ? ' (settings.json + script)' : ' (script)'}\n`);
-    } else if (sl.scriptKept) {
-      // Deliberately left, so say so: a settings entry still points at the script, and deleting it
-      // would leave Claude Code erroring on every render with nothing naming us.
-      process.stdout.write(
-        c.yellow('⚠ ') +
-          `left ${core.claudeConfigDir()}/statusline.sh in place — a statusLine in settings.json still points at it.\n` +
-          c.dim('  Remove that statusLine entry first, then re-run, or delete the script yourself.\n')
-      );
+  // --all: revert the bundled status line too, but only if it's still ours (never a user's custom one). Its
+  // installer sets it up for the user, so a project's uninstall leaves it: reverting it there edited Codex's
+  // config and deleted the script the user's own settings still ran.
+  if (project) {
+    process.stdout.write(c.dim('- a project\'s uninstall leaves the bundled status line, which is set up for your user: `oak uninstall --all` reverts it.\n'));
+  } else {
+    try {
+      const sl = core.uninstallStatusline(target);
+      if (sl.changed || sl.scriptRemoved) {
+        process.stdout.write(c.green('✓ ') + `reverted the bundled status line${sl.changed ? ' (settings.json + script)' : ' (script)'}\n`);
+      } else if (sl.scriptKept) {
+        // Deliberately left, so say so: a settings entry still points at the script, and deleting it
+        // would leave Claude Code erroring on every render with nothing naming us.
+        process.stdout.write(
+          c.yellow('⚠ ') +
+            `left ${core.claudeConfigDir()}/statusline.sh in place — a statusLine in settings.json still points at it.\n` +
+            c.dim('  Remove that statusLine entry first, then re-run, or delete the script yourself.\n')
+        );
+      }
+    } catch {
+      /* leave a custom/hand-edited statusLine alone */
     }
-  } catch {
-    /* leave a custom/hand-edited statusLine alone */
+    // …and the one it configured in Codex (the lines it marks `# oak-statusline` in config.toml).
+    try {
+      if (core.uninstallCodexStatusline()) process.stdout.write(c.green('✓ ') + `removed the bundled status line's lines from ${core.codexConfigTomlPath()}\n`);
+    } catch (e) {
+      process.stdout.write(c.yellow('⚠ ') + `could not remove the bundled status line's lines from ${core.codexConfigTomlPath()}: ${String((e as Error)?.message || e)}\n`);
+    }
   }
+  const syncState = core.syncDir();
   if (args.includes('--purge-store')) {
-    const sessions = core.listSessions();
-    for (const s of sessions) core.removeSession(s.id);
+    // Every session folder, one holding no edit log among them (a session that only asked and read, a Bash snapshot's
+    // stub, a demo of the simulator's): the store's own folders (oak sync's state, the record logs) are no session.
+    const sessions = core.allStoreSessionIds().map((id) => ({ id }));
+    for (const s of sessions) core.removeSession(s.id, { archive: false });
+    // Forgotten as a deliberate delete forgets them: their rows and full-text entries in the local index, and in this
+    // machine's record log, whose purge oak sync carries to the other machines. Wherever an index file or this machine's
+    // record log is left (the index may have been moved aside, as `oak doctor` advises for a damaged one); a machine that
+    // never built an index gets none made.
+    const fs = require('fs') as typeof import('fs');
+    const unopened = core.indexFiles().length || core.recordHosts().includes(core.machineHostTag()) ? core.indexForget(sessions.map((s) => s.id)) : null;
+    if (unopened) process.stdout.write(c.yellow('⚠ ') + `the local database could not be opened (${unopened}): the sessions purged are forgotten in this machine's record log, which a new database reads\n`);
+    // Each session removed is noted in sync/evicted.jsonl (store.ts), which so lists every id purged. Where it is all oak
+    // sync's state holds (a machine that never synced), it goes with the sessions; otherwise the line below names it.
+    try {
+      if (fs.readdirSync(syncState).every((n: string) => n === 'evicted.jsonl' || n === core.OLD_CLEAN_GUARD_DIR)) fs.rmSync(syncState, { recursive: true, force: true });
+    } catch {
+      /* no sync state */
+    }
     process.stdout.write(c.green('✓ ') + `purged the store (${sessions.length} session(s))\n`);
   }
-  // We can't remove the global CLI or the editor extensions from here — print the exact steps.
+  // We can't remove the global CLI or the editor extensions from here — print the exact steps. oak sync's state and the
+  // record logs are no session, so neither `oak clean --all` nor `--purge-store` removes them: name them where they are.
+  const indexFolder = core.indexDir();
+  const records = core.recordsRoot();
+  const recordHosts = core.recordHosts();
+  // A backup folder is outside the store, and may be shared with the user's other machines: named, never removed here.
+  const backup = core.syncSettings().backup;
+  // What the bundled status line keeps beside its cache between renders, which reverting it leaves: its calibration, and
+  // the claims and journal of the refreshes and pulls it starts. And Node's compile cache of OAK's code, which the `oak`
+  // launcher keeps in this user's cache folder.
+  const fsx = require('fs') as typeof import('fs');
+  const pathx = require('path') as typeof import('path');
+  const sideFiles = all && !project ? ['statusline-usage.json', 'statusline-last.json.month-refresh', 'statusline-last.json.pull-log', 'statusline-last.json.pulling']
+    .map((n) => pathx.join(core.claudeConfigDir(), n)).filter((f) => fsx.existsSync(f)) : [];
+  const xdgCache = process.env.XDG_CACHE_HOME;
+  let compileCache = '';
+  try {
+    compileCache = pathx.join(xdgCache && pathx.isAbsolute(xdgCache) ? xdgCache : pathx.join(require('os').homedir(), '.cache'), 'oak', 'compile-cache');
+  } catch {
+    /* no home: no cache the launcher could have kept */
+  }
+  const compileCacheHere = pathx.isAbsolute(compileCache) && fsx.existsSync(compileCache);
   process.stdout.write(
     '\n' + c.bold('To finish removing OAK:\n') +
+      // An agent session runs the hooks it started with until it ends, and they record (and rebuild the local index) until
+      // the CLI is gone.
+      c.dim('  • Agents:     ') + 'end the Claude Code and Codex sessions still running: each runs the hooks it started with until it ends\n' +
       c.dim('  • CLI:        ') + 'npm rm -g oak-observatory\n' +
       c.dim('  • VS Code:    ') + 'uninstall the “OAK” extension (Extensions view)\n' +
       c.dim('  • JetBrains:  ') + 'Settings → Plugins → OAK → Uninstall\n' +
       (args.includes('--purge-store')
         ? ''
-        : c.dim('  • Stored edits: ') + '`oak clean --all`  (or re-run with `--purge-store`)\n')
+        : c.dim('  • Stored edits: ') + '`oak clean --all`  (or re-run with `--purge-store`)\n') +
+      syncStateStep(syncState, (require('fs') as typeof import('fs')).existsSync(core.syncKeyPath())) +
+      ((require('fs') as typeof import('fs')).existsSync(indexFolder)
+        ? c.dim('  • Local database: ') + `delete ${indexFolder}  (OAK's searchable database of your sessions: it holds your prompts and the answers to them, and sessions kept after their files were removed)\n`
+        : '') +
+      (recordHosts.length
+        ? c.dim('  • Record logs: ') + `delete ${records}  (what the local database published of your sessions${recordHosts.some((h) => h !== core.machineHostTag()) ? ', and the copies oak sync keeps of other machines\'' : ''}: your prompts and the answers to them, which a new database reads back)\n`
+        : '') +
+      (backup?.kind === 'folder'
+        ? c.dim('  • Backup folder: ') + `${core.backupFolderPath(backup.path)}  (the encrypted backup of each of your machines that uses it: delete it once none does)\n`
+        : '') +
+      (sideFiles.length
+        ? c.dim('  • Status line files: ') + `delete ${sideFiles.join(', ')}  (what the bundled status line kept between renders: its calibration, and when it last refreshed and pulled the account's usage)\n`
+        : '') +
+      (compileCacheHere
+        ? c.dim('  • Compile cache: ') + `delete ${compileCache}  (what Node compiled of OAK's code, kept so that \`oak\` and the capture hooks start faster)\n`
+        : '')
   );
+}
+
+/** The teardown step for oak sync's state, as `oak uninstall` prints it. A store that never synced has at most the list of
+ *  the sessions removed there (store.ts writes it as one goes), which goes with it. Where oak sync ran, that list stays
+ *  (the purge keeps it): without it, the copies the other machines keep of the sessions removed here come back with this
+ *  machine's next run. Empty where there is no state. */
+function syncStateStep(syncState: string, keyHere: boolean): string {
+  const fs = require('fs') as typeof import('fs');
+  const path = require('path') as typeof import('path');
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
+  let names: string[];
+  try {
+    // The file that keeps OAK 0.10's `oak clean` off the folder (store.ts keepFromOldClean) is no state of its own.
+    names = fs.readdirSync(syncState).filter((n) => n !== core.OLD_CLEAN_GUARD_DIR);
+  } catch {
+    return '';
+  }
+  if (!names.length) return '';
+  // A machine that never synced may hold the list of the sessions removed here and oak sync's copy of the settings an
+  // older OAK drops from prefs.json (settings.json, which a machineUsage set there makes), and nothing else.
+  const others = names.some((n) => n !== 'evicted.jsonl' && n !== 'settings.json');
+  const listed = names.includes('evicted.jsonl');
+  const key = keyHere ? '; it holds the backup key: keep it first, `oak sync key --show`, if a backup folder must stay readable' : '';
+  if (!others) {
+    const held = [listed ? 'the list of the sessions removed here' : '', names.includes('settings.json') ? 'a copy of oak sync\'s settings and "machineUsage" from prefs.json' : ''];
+    return c.dim('  • Sync state: ') + `delete ${syncState}  (${held.filter(Boolean).join(', and ')})\n`;
+  }
+  const what = `oak sync's trash, conflict copies, merge bases and the copies of other machines' sessions${key}`;
+  if (!listed) return c.dim('  • Sync state: ') + `delete ${syncState}  (${what})\n`;
+  return c.dim('  • Sync state: ') + `delete everything in ${syncState} but evicted.jsonl  (${what})\n` +
+    c.dim('                ') + `keep ${path.join(syncState, 'evicted.jsonl')} while oak sync runs on another of your machines: it lists the sessions removed here, whose copies there would otherwise come back with this machine's next run\n`;
 }
 
 function cmdStatus(args: string[] = []): void {
@@ -574,6 +725,7 @@ function cmdStatus(args: string[] = []): void {
         : c.red(`${codexStatus.trust} — codex skips untrusted hooks SILENTLY; re-run \`oak init --codex\``);
     process.stdout.write(
       `codex hooks:     installed → ${codexStatus.hooksJsonPath}  ${trust}\n` +
+        (codexStatus.userDisabled.length ? c.dim(`                 turned off in Codex: ${codexStatus.userDisabled.join(', ')}\n`) : '') +
         (codexStatus.foreignGroups ? c.dim(`                 ${codexStatus.foreignGroups} foreign hook group(s) untouched\n`) : '')
     );
   } else {
@@ -801,6 +953,97 @@ function python3Check(report: HerdrReport | null): Check {
   };
 }
 
+/** On macOS, a notification OAK cannot hand to the terminal (an editor, a herdr pane) goes through
+ *  osascript when terminal-notifier is missing, and macOS files it under Script Editor, which a click
+ *  opens. Nothing fails for it, so the row is a warning, and only where it applies. The lookup is the
+ *  one the post makes (PATH, then Homebrew's directories), so the two cannot disagree. */
+function notifierCheck(): Check | null {
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
+  if (process.platform !== 'darwin' || core.terminalNotifierPath(process.env) !== null) return null;
+  return {
+    id: 'terminal-notifier', label: 'Desktop notifications (macOS)', level: 'warn',
+    detail: 'terminal-notifier is not installed: a notification posted through osascript opens Script Editor when clicked',
+    fix: 'brew install terminal-notifier',
+  };
+}
+
+/** The installation an `oak` command runs: its real path, through the launcher script `oak machine add`
+ *  writes, which execs $HOME/.local/lib/oak/index.js. */
+function oakEntry(cmd: string): string {
+  const fs = require('fs');
+  const path = require('path');
+  const real = fs.realpathSync(cmd);
+  try {
+    if (fs.statSync(real).size < 512 && /"\$HOME\/\.local\/lib\/oak\/index\.js"/.test(fs.readFileSync(real, 'utf8')))
+      return fs.realpathSync(path.join(process.env.HOME || require('os').homedir(), '.local', 'lib', 'oak', 'index.js'));
+  } catch {
+    /* not that launcher, or its bundle is gone: the file itself is the answer */
+  }
+  return real;
+}
+
+/** The version of the OAK installation whose entry point is `entry`, or null when it is not one. */
+function oakEntryVersion(entry: string): string | null {
+  const path = require('path');
+  for (const manifest of [path.join(path.dirname(entry), '..', 'package.json'), path.join(path.dirname(entry), 'package.json')]) {
+    try {
+      const p = JSON.parse(require('fs').readFileSync(manifest, 'utf8'));
+      if (p?.name === 'oak-observatory' || p?.name === 'claude-observatory') return String(p.version);
+    } catch {
+      /* try the other layout */
+    }
+  }
+  return null;
+}
+
+/**
+ * Inspect only: is the `oak` a login shell finds this installation? Codex runs each hook through the login
+ * shell (`$SHELL -lc`), whose PATH comes from the login startup files rather than from the shell `oak
+ * doctor` ran in: on macOS, path_helper puts /usr/local/bin and Homebrew's directories before
+ * ~/.local/bin. Another installation found first runs every such hook, and a release left beside a linked
+ * checkout runs old code with no error anywhere. One shell, started in the home folder as the hooks' is,
+ * with a deadline. POSIX only: on Windows the hooks run `oak` from the PATH every process inherits, which
+ * the `oak` on PATH row checks.
+ */
+function loginShellOakCheck(): Check {
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
+  const fs = require('fs');
+  const path = require('path');
+  const row = { id: 'login-shell-oak', label: '`oak` in a login shell' };
+  if (process.platform === 'win32')
+    return { ...row, level: 'ok', detail: 'not checked on Windows, where the hooks run `oak` from the PATH every process inherits (the `oak` on PATH row)' };
+  const shell = process.env.SHELL || '/bin/sh';
+  let ours = path.join(__dirname, 'index.js');
+  try {
+    ours = fs.realpathSync(ours);
+  } catch {
+    /* an install missing its entry point: nothing can match it */
+  }
+  const here = `${version()} at ${ours}`;
+  const fix = 'remove the other one (an npm install: `npm uninstall -g oak-observatory` with the npm that installed it), or put the directory of this one first on PATH in your login startup file (~/.zprofile for zsh, ~/.bash_profile or ~/.profile for bash). On macOS, path_helper puts /usr/local/bin and Homebrew\'s directories before ~/.local/bin in a login shell.';
+  const r = core.spawnToolSync(shell, ['-lc', 'command -v oak'], { cwd: process.env.HOME || require('os').homedir(), encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000 });
+  // A startup file can leave a job of its own holding the shell's output open: a shell that exited by itself
+  // answered, and only the wait for that output to close ran into the deadline. Its answer stands.
+  if (r.status === null)
+    return { ...row, level: 'warn', detail: `not inspected — \`${shell} -lc 'command -v oak'\` ${r.signal ? 'did not answer within 5 s' : `could not run: ${String(r.error?.message || r.error)}`}` };
+  // The last path it printed: a login startup file can print lines of its own.
+  const lines = String(r.stdout ?? '').split('\n').map((l) => l.trim()).filter(Boolean);
+  const found = lines.filter((l) => l.startsWith('/')).pop() ?? lines.pop();
+  if (r.status !== 0 || !found)
+    return { ...row, level: 'warn', detail: `a login shell (${shell} -lc) finds no \`oak\`, so the hooks Codex runs through one cannot capture anything; this installation is ${here}`, fix: 'put the directory of this `oak` on PATH in your login startup file (~/.zprofile for zsh, ~/.bash_profile or ~/.profile for bash)' };
+  let entry: string | null = null;
+  try {
+    entry = path.isAbsolute(found) ? oakEntry(found) : null;
+  } catch {
+    /* a dangling link: named as found below */
+  }
+  if (entry === ours) return { ...row, level: 'ok', detail: `${found} is this installation (${here})` };
+  const theirs = entry ? oakEntryVersion(entry) : null;
+  if (theirs === null)
+    return { ...row, level: 'warn', detail: `a login shell runs \`oak\` as ${found}, which OAK cannot follow to an installation (a version manager's shim, a wrapper script or an alias), so it cannot tell whether that is this one (${here})`, fix: `check that \`${shell} -lc 'oak --version'\` prints oak ${version()}; if not, ${fix}` };
+  return { ...row, level: 'warn', detail: `a login shell runs ${found}, which is ${theirs} at ${entry}, not this installation (${here}): the hooks Codex runs through a login shell run that one`, fix };
+}
+
 async function cmdDoctor(args: string[]): Promise<void> {
   const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
   const checks = core.diagnose({
@@ -808,17 +1051,32 @@ async function cmdDoctor(args: string[]): Promise<void> {
     binOnPath: onPath('oak'),
     jqPresent: onPath('jq'),
   });
+  checks.push(loginShellOakCheck());
+  checks.push(...await core.diagnoseHerdrPane());
   checks.push(core.diagnoseRemoteTitles());
   const codexQuota = core.diagnoseCodexQuota();
   if (codexQuota) checks.push(codexQuota);
   const herdr = await herdrCheck(args.includes('--fix'));
   checks.push(herdr.check);
   checks.push(python3Check(herdr.report));
+  const notifier = notifierCheck();
+  if (notifier) checks.push(notifier);
   if (herdr.check.level !== 'fail') checks.push(...herdrIdentityCheck(), herdrLoginScopeCheck());
   checks.push(await core.diagnoseFocusServer(args.includes('--fix')));
   const tui = require('@oak-observatory/tui') as typeof import('@oak-observatory/tui');
   checks.push(await tui.diagnoseNativeSpawn(args.includes('--fix'), { bundle: machineBundle() }));
-  if (herdr.check.level !== 'fail') checks.push(...await core.diagnoseHerdrForwarding({ binary: core.findHerdrBin() ?? undefined }));
+  if (herdr.check.level !== 'fail') {
+    stopDetachedOnSignals();
+    checks.push(...await core.diagnoseHerdrForwarding({ binary: core.findHerdrBin() ?? undefined }));
+  }
+  // How each saved machine answered the last read of its Claude usage, and why one gave no reading: from the cache.
+  checks.push(...core.diagnoseMachineUsage());
+  // Once oak sync has been used here: Claude Code's retention, which sync follows, and sync's last run and open
+  // conflicts, from the store alone. Before, with a machine saved here, a suggestion to set it up.
+  // herdr's machines, as the forwarding rows above listed them (one row each): no second read of its list.
+  const savedMachines = checks.filter((ch) => ch.id.startsWith('herdr-forwarding:')).length;
+  checks.push(...core.diagnoseSync(Date.now(), { savedMachines }));
+  checks.push(core.diagnoseIndex());
   if (args.includes('--json')) {
     emitJson({ version: version(), checks, herdr: herdr.report });
     return;
@@ -941,14 +1199,15 @@ function cmdStore(args: string[]): void {
     const parsed = toDefault ? { dir: target } : core.parseStorePath(target);
     if ('error' in parsed) fail(parsed.error);
     else {
+      // The move records the new location in prefs.json itself, while captures wait for it.
       const res = core.moveStore(parsed.dir);
       if ('error' in res) fail(res.error);
+      // The store is already there, and could not be put back: said as the bare refusal, it read as "not moved".
+      else if (res.unrecorded) fail(`the store moved to ${res.to}, but prefs.json could not record it, so OAK looks for it where it was: ${res.unrecorded} — once prefs.json parses, ${toDefault ? 'remove its "storeDir"' : `set its "storeDir" to ${parsed.dir}`}`);
       else {
-        const prefs = core.readPrefs();
-        if (toDefault) delete prefs.storeDir;
-        else prefs.storeDir = parsed.dir;
-        core.writePrefs(prefs);
         process.stdout.write(`${c.green('moved')} ${res.from}\n   →   ${res.to}\n`);
+        if (res.left) process.stderr.write(`${c.yellow('note:')} ${res.left}\n`);
+        if (res.missed) process.stderr.write(`${c.yellow('note:')} ${core.missedDuringMove(res.missed)}\n`);
       }
     }
     return;
@@ -964,23 +1223,96 @@ function cmdStore(args: string[]): void {
   process.stdout.write(c.dim('  move it with: oak store --move <dir>   (--default puts it back)\n'));
 }
 
-/** SSH options every remote step of `machine add` shares — the same set the session listing uses:
- *  never prompt (a password prompt in a script hangs forever), fail fast, trust a first-contact
- *  host key, and reject a changed known key. */
+/** SSH options every remote step of `machine add`, `--machine` and `update` shares: never prompt (a
+ *  password prompt in a script hangs forever), fail fast, trust a first-contact host key, and reject a
+ *  changed known key. Keepalives are the person's own ssh_config's to set: OAK's command deadlines,
+ *  and the signal cleanup that stops its ssh with it, end a run that hangs. */
 const SSH_OPTS = ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8', '-o', 'StrictHostKeyChecking=accept-new'];
 
+/** Per ssh target, what `sshMux` decided, asked once per process. */
+const sshMuxAsked = new Map<string, string[]>();
+/** `-o ControlMaster=no` when the person's ssh config would make OAK's ssh to `target` the master of a
+ *  shared connection that is not kept in the background, which stopping OAK's ssh would close under every
+ *  session sharing it (core's sshMuxOptions, which decides herdr's ssh for a saved machine the same way). */
+function sshMux(target: string): string[] {
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
+  let opts = sshMuxAsked.get(target);
+  if (opts) return opts;
+  opts = core.sshMuxOptions(core.spawnToolSync('ssh', ['-G', target], { encoding: 'utf8', timeout: 5000, direct: true, env: core.machineSshEnv() }));
+  sshMuxAsked.set(target, opts);
+  return opts;
+}
+
+/** Why ssh, or scp, which runs it, failed, in its own words: the last two lines of its stderr that can say
+ *  why, joined by ` — `. One line is not enough: a server that refuses a login says why before ssh's line
+ *  that it closed the connection (a PAM module's `System is booting up …`), where a banner comes too, and
+ *  OAK cannot tell the two apart; anything the remote printed before the connection dropped comes before
+ *  ssh's own line too. */
+function sshReason(stderr: string): string {
+  // Never why: a stale control socket is reported before ssh connects directly, accept-new announces a
+  // host key it just recorded before the login that then fails, LogLevel VERBOSE notes the closed
+  // identification exchange before ssh's line that the server closed the connection, and the login that
+  // succeeded before what went wrong after it, ssh notes that it allocates no terminal (RequestTTY in the
+  // person's ssh_config, with no terminal on stdin) before it tries to connect, and rows of `@` frame a
+  // changed host key's warning. A line said twice in a row (a jump host's banner, then its target's) is
+  // shown once.
+  const lines = stderr.split('\n').map((l) => l.trim())
+    .filter((l) => l && !/^(?:Control socket connect\(|Warning: Permanently added |kex_exchange_identification: Connection closed by remote host$|Authenticated to |Pseudo-terminal will not be allocated because stdin is not a terminal\.$|@.*@$)/.test(l))
+    .filter((l, i, kept) => l !== kept[i - 1]);
+  // Nor are the lines ssh ends with once another has said why: through a jump host or ProxyCommand, the
+  // jump's `stdio forwarding failed` and the close of the proxied connection, which ssh knows only as
+  // `UNKNOWN port 65535`; a server's disconnect, a handshake that timed out, and LogLevel VERBOSE's
+  // transfer totals; nor scp's after those (`lost connection` in its older protocol, `scp: Connection
+  // closed`, and `scp: failed to upload …` after the line that says why the file could not be written,
+  // each named by the path scp was run as). When nothing else was said, the last of them is the reason.
+  const after = /^(?:Connection (?:closed|reset) by UNKNOWN port \d+|Connection to \S+ port \d+ timed out|Disconnected from \S+ port \d+|Transferred: sent \d|Bytes per second: |stdio forwarding failed$|lost connection$|(?:\S*\/)?scp: (?:Connection closed$|failed to upload ))/;
+  const said = lines.filter((l) => !after.test(l));
+  return (said.length ? said.slice(-2) : lines.slice(-1)).join(' — ');
+}
+
+/** End this process as `sig` would have, once its handler has stopped what it started: the signal is
+ *  raised again with no handler left, so the parent sees it. A shell stops a loop at ctrl+c only for a
+ *  command the signal ended; an exit status of 128 + n reads as one that handled it, and the loop goes
+ *  on. Windows has no such signals: there it exits with the status a shell reports for one. */
+function endBySignal(sig: NodeJS.Signals, n: number): void {
+  if (process.platform === 'win32') process.exit(128 + n);
+  process.kill(process.pid, sig);
+}
+
+/** The signals that stop OAK's ssh to a saved machine before they end OAK: a deadline's SIGTERM (the terminal
+ *  app's, an editor's), and from a terminal ctrl+c (SIGINT), a hangup (SIGHUP) and ctrl+\ (SIGQUIT, which
+ *  Windows does not have). SIGKILL (`kill -9`) ends OAK with no handler run, and ssh then runs on until the
+ *  remote command ends. */
+const SSH_STOP_SIGNALS: readonly (readonly [NodeJS.Signals, number])[] =
+  [['SIGTERM', 15], ['SIGINT', 2], ['SIGHUP', 1], ...(process.platform === 'win32' ? [] : [['SIGQUIT', 3] as const])];
+
+/** For a verb that may run herdr's command for a saved machine (`herdr --machine`: `oak prompt`, and
+ *  `oak doctor`'s forwarding check), which runs apart from the terminal as the ssh above does: the same
+ *  signals stop it, with herdr's ssh, before they end OAK. Unstopped, it ran on after ctrl+c, and a prompt
+ *  was delivered seconds later. Installed once, however many such commands run. Windows runs that command
+ *  in this process's console (execFileTool), where ctrl+c reaches it as well, so there is nothing to stop. */
+let detachedStops = false;
+function stopDetachedOnSignals(): void {
+  if (detachedStops || process.platform === 'win32') return;
+  detachedStops = true;
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
+  for (const [sig, n] of SSH_STOP_SIGNALS) {
+    process.once(sig, () => {
+      core.stopDetachedChildren();
+      endBySignal(sig, n);
+    });
+  }
+}
+
 /** The verbs `--machine <label>` runs on a saved machine: everything Review and Observatory read or decide
- *  for a session whose store and files live there, and `__tab-sync`, with which the terminal app has a
+ *  for a session whose store and files live there, `search`, with which the terminal app's session picker
+ *  matches what was said in that machine's conversations, and `__tab-sync`, with which the terminal app has a
  *  saved machine name its own session's herdr tab. `prompt` and `agent start` are deliberately absent:
  *  their `--machine` is herdr's (deliver to, or start in, that machine's pane) and keeps that meaning. */
-const MACHINE_VERBS = new Set(['views', 'review', 'list', 'sessions', 'conversation', 'feed', 'multitask', 'subagents', 'diff', 'keep', 'undo', 'redo', 'resolve', 'comment', 'quote', 'ignore', '__tab-sync']);
+const MACHINE_VERBS = new Set(['processes', 'fleet', 'views', 'review', 'list', 'sessions', 'prompts', 'conversation', 'feed', 'multitask', 'subagents', 'diff', 'keep', 'undo', 'redo', 'resolve', 'clean', 'task-keep', 'task-undo', 'task-clear', 'chat-context', 'comment', 'quote', 'ignore', 'search', '__tab-sync', 'editor-review', 'locate', 'install-extensions']);
 /** End to end, for one command on a saved machine. A cold review read there takes seconds;
  *  connection setup allows 8 s; OAK_MACHINE_TIMEOUT_MS can extend this command deadline. */
 const MACHINE_TIMEOUT_MS = 120_000;
-/** Where a non-interactive ssh finds the remote's `oak` and the `node` it runs on. Such a shell sources
- *  no profile, so its PATH is the system's alone: `oak machine add` installs to ~/.local/bin, and npm or
- *  Homebrew globals land in /opt/homebrew/bin (Apple silicon) or /usr/local/bin. */
-const MACHINE_PATH = '$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH';
 
 /**
  * `oak <verb> … --machine <label>` — one session verb, run where the session's store and files are.
@@ -1020,13 +1352,15 @@ async function forwardToMachine(verb: string, args: string[]): Promise<void> {
   const argv = [verb, ...args.filter((_, i) => i !== at && (inline || i !== at + 1))];
   // A same-version dev tag cannot prove support. Check the requested features before an older
   // CLI can ignore a flag, expand only part of a review unit, or return plain text instead of JSON.
-  const needsProtocol = args.includes('--units') || (verb === 'diff' && args.includes('--json')) || (verb === 'comment' && (args[0] === 'mark-sent' || args.some(a => a.startsWith('--text='))));
+  // Level 2 adds `ignore --dry-run`: an older build ignores the flag and runs the sweep, which cannot be undone.
+  const reviewLevel = verb === 'ignore' && args.includes('--dry-run') ? 2
+    : args.includes('--units') || (verb === 'diff' && args.includes('--json')) || (verb === 'comment' && (args[0] === 'mark-sent' || args.some(a => a.startsWith('--text=')))) ? 1 : 0;
   const marker = 'OAK_EXIT_' + require('crypto').randomBytes(12).toString('hex') + ':';
   const conversationProtocol = verb === 'conversation';
   const check = conversationProtocol
     ? `if [ "$(oak __conversation-protocol 2>/dev/null)" != 1 ]; then printf '%s\n' ${quote('oak: update OAK on ' + m.label + ' — this build does not support the requested conversation protocol')} >&2; exit 78; fi; `
-    : needsProtocol
-    ? `if [ "$(oak __review-protocol 2>/dev/null)" != 1 ]; then printf '%s\n' ${quote('oak: update OAK on ' + m.label + ' — this build does not support the requested review protocol')} >&2; exit 78; fi; `
+    : reviewLevel
+    ? `level=$(oak __review-protocol --level 2>/dev/null); case "$level" in ''|*[!0-9]*) level=0 ;; esac; if [ "$level" -lt ${reviewLevel} ]; then printf '%s\n' ${quote('oak: update OAK on ' + m.label + ' — this build does not support the requested review protocol')} >&2; exit 78; fi; `
     : '';
   // The final, private stderr marker distinguishes the remote program's exit 255 from SSH's 255.
   // It is removed below; the program's stdout, stderr and exit status remain unchanged.
@@ -1036,13 +1370,8 @@ async function forwardToMachine(verb: string, args: string[]): Promise<void> {
   // (`enterSessionWorkspace`). OAK_FORWARDED_MACHINE: the label this side reaches it by, so a repair
   // command the remote prints ("not recorded … --record-only") runs from here. An older build there
   // ignores both.
-  const remote = `env PATH="${MACHINE_PATH}" CLAUDE_OBSERVATORY_NO_UPDATE_CHECK=1 OAK_FORWARDED=1 OAK_FORWARDED_MACHINE=${quote(label)} sh -c ${quote(script)} oak ${argv.map(quote).join(' ')}`;
-  const env = { ...process.env };
-  // An ssh_config SendEnv wildcard must not export this machine's store or agent identity.
-  for (const key of Object.keys(env)) {
-    if (key.startsWith('CLAUDE_CODE_') || ['CLAUDECODE', 'CLAUDE_CONFIG_DIR', 'CODEX_HOME',
-      'CLAUDE_OBSERVATORY_SESSION', 'HERDR_SOCKET_PATH', 'XDG_CONFIG_HOME'].includes(key)) delete env[key];
-  }
+  const remote = `env PATH="${core.MACHINE_PATH}" CLAUDE_OBSERVATORY_NO_UPDATE_CHECK=1 OAK_FORWARDED=1 OAK_FORWARDED_MACHINE=${quote(label)} sh -c ${quote(script)} oak ${argv.map(quote).join(' ')}`;
+  const env = core.machineSshEnv();
   const configured = Number(process.env.OAK_MACHINE_TIMEOUT_MS);
   const timeout = Number.isInteger(configured) && configured > 0 && configured <= 2147483647
     ? configured : MACHINE_TIMEOUT_MS;
@@ -1050,7 +1379,66 @@ async function forwardToMachine(verb: string, args: string[]): Promise<void> {
   // is forwarded only to a verb told to read it (`ignore --stdin`): unforwarded, the remote read no
   // paths, and ssh must not swallow the caller's otherwise. `direct`: ssh is a real executable, and the
   // Windows shell route would drop the command's double quotes.
-  const child = core.spawnTool('ssh', ['-T', ...SSH_OPTS, m.target, remote], { stdio: [args.includes('--stdin') ? 'inherit' : 'ignore', 'inherit', 'pipe'], direct: true, env });
+  // To a terminal, the remote's stdout passes through this side's output filter: the remote sees a pipe
+  // and leaves its machine formats unfiltered, and an older build there filters nothing.
+  // `detached` (POSIX; on Windows it would give ssh a console window of its own): ssh runs in a session of
+  // its own, so a terminal's ctrl+c or hangup reaches this process alone, whose handlers below stop ssh and
+  // end by the signal. Once its session is up, ssh catches both and exits 255: signalled too, it could
+  // close first, and the command then named the machine unreachable and exited 255, which a shell loop
+  // around it read as handled, and went on. Out of the terminal's jobs, ssh must not read the terminal
+  // either: ctrl+z stops this process and not ssh, which went on reading what was then typed to the
+  // shell. This process reads stdin and hands it on.
+  const readsStdin = verb === 'locate' || args.includes('--stdin');
+  // windowsHide: false — on Windows ssh shares this command's console: a terminal's, where a jump host's ssh asks its
+  // questions, or the unseen one an editor runs this command in, so it opens no window either way. Hidden, with every
+  // stdio a pipe, it got an unseen console of its own, where a jump host's question waited out the deadline.
+  const child = core.spawnTool('ssh', ['-T', ...SSH_OPTS, ...sshMux(m.target), m.target, remote], { stdio: [readsStdin ? 'pipe' : 'ignore', isTTY() ? 'pipe' : 'inherit', 'pipe'], direct: true, env, detached: process.platform !== 'win32', windowsHide: false });
+  if (readsStdin && child.stdin) {
+    child.stdin.on('error', () => { /* ssh closed first: its close below reports why */ });
+    process.stdin.pipe(child.stdin);
+  }
+  // Told to stop (the terminal app's deadline sends SIGTERM, ctrl+c sends SIGINT), ssh stops with it:
+  // otherwise it outlives this process, reparented, until the remote command ends. That command is not
+  // stopped: without a terminal, sshd does not signal it, so a search there may still finish there.
+  for (const [sig, n] of SSH_STOP_SIGNALS) {
+    process.once(sig, () => {
+      child.kill();
+      endBySignal(sig, n);
+    });
+  }
+  // So does any other exit (an uncaught exception), unless a handler above has stopped it already.
+  process.once('exit', () => { if (!child.killed) child.kill(); });
+  child.stdout?.setEncoding('utf8');
+  // Whole lines at a time: the filter reads a line on its own, and an escape sequence that one read of
+  // the pipe split in two it took for two broken ones, printing what was left of them (`[31m`).
+  // A line longer than 64 KB goes out without waiting for its end, less a trailing escape sequence
+  // still incomplete: held whole, one without a newline grew until the process ran out of memory.
+  const HOLD_MAX = 64 * 1024;
+  let partial: string[] = [];
+  let held = 0;
+  // A patch printed for a person shows a bidirectional control or zero-width character in the file as the mark that
+  // names it, as `oak diff` does here: the saved machine prints `--patch` into its pipe byte for byte, and the filter
+  // on this terminal would drop them.
+  const write = verb === 'diff' && args.includes('--patch') && isTTY() ? (text: string) => process.stdout.write(core.revealHidden(text, true)) : (text: string) => process.stdout.write(text);
+  child.stdout?.on('data', (d: string) => {
+    const cut = d.lastIndexOf('\n') + 1;
+    if (!cut) {
+      partial.push(d);
+      if ((held += d.length) <= HOLD_MAX) return;
+      const text = partial.join('');
+      // eslint-disable-next-line no-control-regex
+      const open = /\x1b(?:\[[0-9;:?<>!]*|\][^\x07\x1b]*|[PX^_][^\x1b]*|[()])?$/.exec(text);
+      const keep = open && open[0].length < HOLD_MAX ? open.index : text.length;
+      write(text.slice(0, keep));
+      partial = keep < text.length ? [text.slice(keep)] : [];
+      held = text.length - keep;
+      return;
+    }
+    write(partial.join('') + d.slice(0, cut));
+    partial = cut < d.length ? [d.slice(cut)] : [];
+    held = d.length - cut;
+  });
+  child.stdout?.on('end', () => { if (partial.length) write(partial.join('')); });
   const errChunks: Buffer[] = [];
   child.stderr?.on('data', (d: Buffer) => errChunks.push(d));
   let timedOut = false;
@@ -1073,7 +1461,7 @@ async function forwardToMachine(verb: string, args: string[]): Promise<void> {
     if (missing) err = err.slice(0, -(`\n${marker}missing\n`).length);
     const receipt = err.match(new RegExp('\\n' + marker + '(\\d+)\\n$'));
     if (receipt) err = err.slice(0, -receipt[0].length);
-    const reason = err.split('\n').map((l) => l.trim()).filter(Boolean)[0] ?? '';
+    const reason = sshReason(err);
     const refuse = (status: number, msg: string): never => {
       process.stderr.write(c.red('oak: ') + msg + '\n');
       process.exit(status);
@@ -1164,7 +1552,7 @@ async function cmdAttach(args: string[]): Promise<void> {
   // Inside herdr already? herdr refuses to nest, so don't hand off — the target is reachable in
   // herdr's own machine/workspace sidebar (its `oak` tab is now ready there). oak attach bootstraps
   // from a plain terminal outside herdr.
-  if (process.env.HERDR_PANE_ID) {
+  if ((await core.herdrPaneContext()).nested) {
     process.stdout.write(c.yellow('! ') + `you're already inside herdr — ${where}${target ? ` (${target})` : ''} is in herdr's machine sidebar; select it there (its \`oak\` tab is ready). Run \`oak attach\` from a plain terminal to open a fresh herdr.\n`);
     return;
   }
@@ -1179,7 +1567,9 @@ async function cmdAttach(args: string[]): Promise<void> {
   // herdr's client starts the server when none runs, and a server born from a Claude Code session's
   // shell (an agent running `oak attach`, a `!` command) would stamp every pane's agent as a child
   // session — the same strip the terminal's herdr tab applies.
-  const r = core.spawnToolSync(bin, attach, { stdio: 'inherit', env: core.stripSessionIdentity(process.env) });
+  const env = core.stripSessionIdentity(process.env);
+  for (const key of ['HERDR_PANE_ID', 'HERDR_TAB_ID', 'HERDR_WORKSPACE_ID', 'HERDR_ENV']) delete env[key];
+  const r = core.spawnToolSync(bin, attach, { stdio: 'inherit', env });
   process.exit(typeof r.status === 'number' ? r.status : 0);
 }
 async function cmdMachine(args: string[]): Promise<void> {
@@ -1202,10 +1592,14 @@ async function cmdMachine(args: string[]): Promise<void> {
   const target = positional[1];
   if (!label || !target) fail('usage: oak machine add <label> <ssh-target>');
   const lock = core.readHerdrLock();
+  // The environment of every ssh to a saved machine (machineSshEnv). This command keeps the terminal, where
+  // a jump host's ssh still asks its questions; run without one, it fails with the reason, never a dialog.
+  const env = core.machineSshEnv();
+  // windowsHide: false, as forwardToMachine's: on Windows too, ssh asks in this command's console.
   const ssh = (script: string) =>
-    core.spawnToolSync('ssh', [...SSH_OPTS, target, script], { encoding: 'utf8', timeout: 120000 });
+    core.spawnToolSync('ssh', [...SSH_OPTS, ...sshMux(target), target, script], { encoding: 'utf8', timeout: 120000, env, windowsHide: false });
   const why = (r: { stderr: string | Buffer; status: number | null }): string =>
-    String(r.stderr ?? '').split('\n').map((l) => l.trim()).filter(Boolean)[0] || `exit ${r.status ?? '?'}`;
+    sshReason(String(r.stderr ?? '')) || `exit ${r.status ?? '?'}`;
 
   process.stdout.write(c.dim(`probing ${target} …\n`));
   const un = ssh('uname -s; uname -m');
@@ -1235,9 +1629,11 @@ async function cmdMachine(args: string[]): Promise<void> {
       const mk = ssh('mkdir -p "$HOME/.local/bin"');
       if (mk.status !== 0) fail(`could not create ~/.local/bin on ${target}: ${why(mk)}`);
       process.stdout.write(c.dim(`copying herdr ${lock.version} to ${target}:~/.local/bin/herdr …\n`));
-      const cp = core.spawnToolSync('scp', [...SSH_OPTS, src, `${target}:.local/bin/herdr.oak-new`], {
+      const cp = core.spawnToolSync('scp', [...SSH_OPTS, ...sshMux(target), src, `${target}:.local/bin/herdr.oak-new`], {
         encoding: 'utf8',
         timeout: 600000,
+        env,
+        windowsHide: false,
       });
       if (cp.status !== 0) fail(`scp to ${target} failed: ${why(cp)}`);
       // Land it with a rename, never a write-in-place: overwriting a herdr that is currently running
@@ -1276,65 +1672,84 @@ async function cmdMachine(args: string[]): Promise<void> {
     process.stdout.write(c.green('✓ ') + `machine ${label} → ${target}\n`);
   }
   await installOakStack(target, __dirname);
+  // A machine is saved now: sync is offered, until it is set up here.
+  const st = core.syncStatus();
+  if (!st.setUp && !st.backup && !core.keptPrefs().sync?.setupAt) {
+    process.stdout.write(c.dim(`share memory, plans, skills and sessions with ${label}, and choose where sessions are backed up: \`oak sync setup\`\n`));
+  }
 }
 
 /**
  * Install the OAK stack on a remote machine so the tmux-attach model actually works there: the CLI
  * bundle (verified to run standalone — no node_modules), its sidecar assets, and the capture hooks.
- * herdr alone runs terminals but cannot render the observatory or capture edits. Node 20+ is OAK's
- * only extra remote runtime need; without it we WARN and leave herdr working rather than fail the add.
+ * herdr alone runs terminals but cannot render the observatory or capture edits. A Node that runs the local index
+ * (core INDEX_NODES) is OAK's only extra remote runtime need; without it we WARN and leave herdr working rather than
+ * fail the add.
  * `distDir` is this bundle's own directory (`__dirname`), which holds the index.js launcher, cli.js
  * (this CLI), capture.js + the sidecar assets.
  */
 async function installOakStack(target: string, distDir: string): Promise<void> {
   const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
   const path = require('path');
-  const ssh = (script: string) => core.spawnToolSync('ssh', [...SSH_OPTS, target, script], { encoding: 'utf8', timeout: 120000 });
-  const scp = (args: string[]) => core.spawnToolSync('scp', [...SSH_OPTS, ...args], { encoding: 'utf8', timeout: 600000 });
+  const env = core.machineSshEnv();
+  const ssh = (script: string) => core.spawnToolSync('ssh', [...SSH_OPTS, ...sshMux(target), target, script], { encoding: 'utf8', timeout: 120000, env, windowsHide: false });
+  const scp = (args: string[]) => core.spawnToolSync('scp', [...SSH_OPTS, ...sshMux(target), ...args], { encoding: 'utf8', timeout: 600000, env, windowsHide: false });
   const why = (r: { stderr?: string | Buffer; status: number | null }): string =>
-    String(r.stderr ?? '').split('\n').map((l) => l.trim()).filter(Boolean)[0] || `exit ${r.status ?? '?'}`;
+    sshReason(String(r.stderr ?? '')) || `exit ${r.status ?? '?'}`;
 
-  // Node 20+ is OAK's only extra remote runtime need. A stock host often has it user-local in
+  // A Node that runs the local index is OAK's only extra remote runtime need. A stock host often has it user-local in
   // ~/.local/bin, which a non-interactive ssh does NOT put on PATH — so check that path explicitly too.
   const nodeV = ssh('command -v node >/dev/null 2>&1 && node --version || { [ -x "$HOME/.local/bin/node" ] && "$HOME/.local/bin/node" --version; } || true');
-  const major = /v(\d+)/.exec(String(nodeV.stdout || ''));
-  if (!major || Number(major[1]) < 20) {
-    process.stdout.write(c.yellow('! ') + `oak not installed on ${target}: needs Node.js 20+ (found ${String(nodeV.stdout).trim() || 'none'}). herdr is set up; install Node 20+ there and re-run \`oak machine add <label> ${target}\` to enable review + capture.\n`);
+  if (!core.nodeRunsIndex(/v\d+\.\d+\.\d+/.exec(String(nodeV.stdout || ''))?.[0] ?? '')) {
+    process.stdout.write(c.yellow('! ') + `oak not installed on ${target}: needs ${core.INDEX_NODES} (found ${String(nodeV.stdout).trim() || 'none'}). herdr is set up; install that Node there and re-run \`oak machine add <label> ${target}\` to enable review + capture.\n`);
     return;
   }
   process.stdout.write(c.dim(`installing oak + capture hooks on ${target} …\n`));
-  const mk = ssh('mkdir -p "$HOME/.local/lib/oak/herdr-plugin" "$HOME/.local/bin"');
+  // An `oak` there that is not the launcher below (npm's, or npm's link to a checkout, which npm puts in
+  // ~/.local/bin when its prefix is ~/.local) is left as it is: writing the launcher went through such a link
+  // and replaced the checkout's build. Found as `--machine` finds it, on MACHINE_PATH.
+  const found = ssh(`PATH="${core.MACHINE_PATH}"; o=$(command -v oak 2>/dev/null) || exit 0; ` +
+    `[ "$o" = "$HOME/.local/bin/oak" ] && [ ! -L "$o" ] && grep -q '/.local/lib/oak/index.js' "$o" 2>/dev/null && exit 0; printf '%s\\n' "$o"`);
+  const other = found.status === 0 ? String(found.stdout ?? '').trim() : '';
+  const mk = ssh(other ? 'mkdir -p "$HOME/.local/bin"' : 'mkdir -p "$HOME/.local/lib/oak/herdr-plugin" "$HOME/.local/bin"');
   if (mk.status !== 0) fail(`could not create ~/.local on ${target}: ${why(mk)}`);
   // Put ~/.local/bin on PATH for login (.profile) and interactive (.bashrc) shells — a stock host does
   // not, so `oak` and the capture hooks would not resolve in the agent's pane. Idempotent; printf is
   // single-quoted so $HOME/$PATH land literally in the rc, evaluated when a shell starts.
   // …and .zprofile: zsh (the macOS default) reads neither of the other two.
   ssh('for rc in "$HOME/.profile" "$HOME/.bashrc" "$HOME/.zprofile"; do touch "$rc"; grep -q "oak: user-local bin on PATH" "$rc" || printf \'\\n# oak: user-local bin on PATH\\nexport PATH="$HOME/.local/bin:$PATH"\\n\' >> "$rc"; done');
-  // The index.js launcher is copied last, after the two bundles it loads, so a failed copy never
-  // leaves it pointing at a cli.js that is not there.
-  for (const f of ['cli.js', 'capture.js', 'THIRD_PARTY_NOTICES.md', 'index.js']) {
-    const cp = scp([path.join(distDir, f), `${target}:.local/lib/oak/${f}`]);
-    if (cp.status !== 0) fail(`could not copy oak/${f} to ${target}: ${why(cp)}`);
+  if (other) {
+    process.stdout.write(c.dim(`${target} already runs oak from ${other}, which \`oak machine add\` did not put there: left as it is\n`));
+  } else {
+    // The index.js launcher is copied last, after the two bundles it loads, so a failed copy never
+    // leaves it pointing at a cli.js that is not there.
+    for (const f of ['cli.js', 'capture.js', 'THIRD_PARTY_NOTICES.md', 'index.js']) {
+      const cp = scp([path.join(distDir, f), `${target}:.local/lib/oak/${f}`]);
+      if (cp.status !== 0) fail(`could not copy oak/${f} to ${target}: ${why(cp)}`);
+    }
+    // The manifest rides beside the bundle so `oak --version` there is the real version (without it
+    // `oak update` on the remote planned an update forever). It is found
+    // where version() looks: ../package.json in an npm install, beside index.js in a bundle that
+    // `oak machine add` itself pushed (a remote adding a machine of its own).
+    const manifest = [path.join(distDir, '..', 'package.json'), path.join(distDir, 'package.json')].find((p) => require('fs').existsSync(p));
+    const cpManifest = scp([manifest ?? path.join(distDir, 'package.json'), `${target}:.local/lib/oak/package.json`]);
+    if (cpManifest.status !== 0) fail(`could not copy package.json to ${target}: ${why(cpManifest)}`);
+    const cpPlugin = scp(['-r', path.join(distDir, 'herdr-plugin') + '/.', `${target}:.local/lib/oak/herdr-plugin/`]);
+    if (cpPlugin.status !== 0) fail(`could not copy the herdr plugin to ${target}: ${why(cpPlugin)}`);
+    // Launcher that resolves node at RUN time — system node if on PATH, else the user-local one — so it
+    // works even from a hook's non-interactive shell. $HOME/$@ stay literal (printf is single-quoted).
+    // Written beside its place and renamed over it: a write to the path itself went through a link there.
+    const launch = ssh('f="$HOME/.local/bin/oak"; rm -f "$f.oak-new" && printf \'#!/bin/sh\\nexec "$(command -v node 2>/dev/null || echo "$HOME/.local/bin/node")" "$HOME/.local/lib/oak/index.js" "$@"\\n\' > "$f.oak-new" && chmod 0755 "$f.oak-new" && mv -f "$f.oak-new" "$f"');
+    if (launch.status !== 0) fail(`could not install the oak launcher on ${target}: ${why(launch)}`);
   }
-  // The manifest rides beside the bundle so `oak --version` there is the real version (without it
-  // `oak update` on the remote planned an update forever). It is found
-  // where version() looks: ../package.json in an npm install, beside index.js in a bundle that
-  // `oak machine add` itself pushed (a remote adding a machine of its own).
-  const manifest = [path.join(distDir, '..', 'package.json'), path.join(distDir, 'package.json')].find((p) => require('fs').existsSync(p));
-  const cpManifest = scp([manifest ?? path.join(distDir, 'package.json'), `${target}:.local/lib/oak/package.json`]);
-  if (cpManifest.status !== 0) fail(`could not copy package.json to ${target}: ${why(cpManifest)}`);
-  const cpPlugin = scp(['-r', path.join(distDir, 'herdr-plugin') + '/.', `${target}:.local/lib/oak/herdr-plugin/`]);
-  if (cpPlugin.status !== 0) fail(`could not copy the herdr plugin to ${target}: ${why(cpPlugin)}`);
-  // Launcher that resolves node at RUN time — system node if on PATH, else the user-local one — so it
-  // works even from a hook's non-interactive shell. $HOME/$@ stay literal (printf is single-quoted).
-  const launch = ssh('printf \'#!/bin/sh\\nexec "$(command -v node 2>/dev/null || echo "$HOME/.local/bin/node")" "$HOME/.local/lib/oak/index.js" "$@"\\n\' > "$HOME/.local/bin/oak" && chmod 0755 "$HOME/.local/bin/oak"');
-  if (launch.status !== 0) fail(`could not install the oak launcher on ${target}: ${why(launch)}`);
   // Capture hooks (claude + codex), then verify oak actually runs. Hooks are best-effort; a dead oak
   // is a hard failure. `--no-codex` on the plain init: its codex step can also wire a local model, a
   // config change that must never happen where nobody sees it; `init --codex` installs the hooks.
-  const init = ssh('PATH="$HOME/.local/bin:$PATH"; oak init --no-codex >/dev/null 2>&1 || true; oak init --codex >/dev/null 2>&1 || true; oak --version 2>&1');
+  const init = ssh(`PATH="${core.MACHINE_PATH}"; oak init --no-codex >/dev/null 2>&1 || true; oak init --codex >/dev/null 2>&1 || true; oak --version 2>&1`);
   if (!/oak\s+\S+/.test(String(init.stdout || ''))) fail(`installed oak on ${target}, but it did not run: ${why(init)}`);
-  process.stdout.write(c.green('\u2713 ') + `oak installed on ${target} (${String(init.stdout).trim()}) + capture hooks; ~/.local/bin on PATH\n`);
+  process.stdout.write(c.green('\u2713 ') + (other
+    ? `oak on ${target} (${String(init.stdout).trim()}) + capture hooks\n`
+    : `oak installed on ${target} (${String(init.stdout).trim()}) + capture hooks; ~/.local/bin on PATH\n`));
 }
 
 
@@ -1347,21 +1762,35 @@ async function installOakStack(target: string, distDir: string): Promise<void> {
 function cmdInbox(args: string[]): void {
   const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
   const root = flagValue(args, '--root') ?? process.cwd();
-  const inbox = core.attentionInbox(root, { includeDone: !args.includes('--no-done') });
+  const includeDone = !args.includes('--no-done');
+  const here = fromIndex('inbox', () => core.attentionInbox(root, { includeDone }), (db) => core.indexedInbox(db, root, { includeDone }));
+  // Other machines' hands, which only the index holds, as their records brought them: listed whichever way this machine's
+  // own were read (from the files, while another process catches the index up), as `oak sessions --json` carries them.
+  const synced = core.readSyncedHands(Date.now(), includeDone);
+  const inbox = synced.length ? { ...here, hands: [...here.hands, ...synced].sort(core.byHand) } : here;
   if (args.includes('--next')) {
     const after = flagValue(args, '--after') ?? null;
-    const id = core.nextAttention(inbox.hands.map((h) => ({ id: h.id, attention: { kind: h.kind, ts: h.ts } })), after);
+    // A session of this machine's own: another machine's hand is answered on that machine.
+    const own = inbox.hands.filter((h) => h.origin !== 'synced');
+    const id = core.nextAttention(own.map((h) => ({ id: h.id, attention: { kind: h.kind, ts: h.ts } })), after);
+    // How many hands wait on other machines (`elsewhere`), which the jump never goes to: said when none waits here.
+    const elsewhere = inbox.hands.filter((h) => h.origin === 'synced' && h.kind !== 'idle-done').length;
     // The whole row rides along, so a caller that needs the label (JetBrains' balloon) makes ONE call.
-    if (args.includes('--json')) emitJson({ next: id, hand: inbox.hands.find((h) => h.id === id) ?? null });
-    else process.stdout.write(id ? `${id}\n` : c.dim('nobody is waiting on you\n'));
+    if (args.includes('--json')) emitJson({ next: id, hand: own.find((h) => h.id === id) ?? null, elsewhere });
+    else process.stdout.write(id ? `${id}\n` : c.dim(`${core.nobodyWaitingHere(elsewhere, '`oak inbox`')}\n`));
     return;
   }
   if (args.includes('--json')) {
     emitJson(inbox);
     return;
   }
+  for (const s of inbox.sync) {
+    // A diverged session is resolved by deleting the copy alone: sync never takes an edit to a transcript for a merge.
+    const resolve = s.reason === 'diverged' ? 'delete the copy to keep yours' : 'edit your file or delete the copy';
+    process.stdout.write(`${c.yellow('sync conflict')}  ${s.family} ${s.name} from ${s.from} — its copy is ${s.copy}; ${resolve} (\`oak sync resolve ${s.id}\` deletes it)\n`);
+  }
   if (!inbox.hands.length) {
-    process.stdout.write(c.dim('nobody is waiting on you\n'));
+    if (!inbox.sync.length) process.stdout.write(c.dim('nobody is waiting on you\n'));
     return;
   }
   for (const h of inbox.hands) {
@@ -1369,7 +1798,9 @@ function cmdInbox(args: string[]): void {
     const wait = h.kind === 'idle-done' ? '' : c.dim(`  ${core.compactDuration(h.waitingMs)} waiting`);
     const agent = h.agent && h.agent !== 'claude' ? c.yellow(`[${h.agent}] `) : '';
     const name = h.title ? `${c.bold(h.title)}  ${c.dim(h.id)}` : c.bold(h.id);
-    process.stdout.write(`${kind}  ${agent}${name}${h.message ? ` — ${h.message}` : ''}${wait}\n`);
+    // Another machine's hand: where it waits, and as of when its records came over.
+    const where = h.origin === 'synced' ? c.dim(`  on ${h.machine}${h.syncedAt ? `, as synced ${core.relTime(h.syncedAt)}` : ''}`) : '';
+    process.stdout.write(`${kind}  ${agent}${name}${h.message ? ` — ${h.message}` : ''}${wait}${where}\n`);
     if (h.question) {
       process.stdout.write(c.dim(`            ${h.question.header ? `${h.question.header}: ` : ''}${h.question.question}\n`));
       h.question.options.forEach((o, i) => process.stdout.write(c.dim(`              ${i + 1}. ${o.label}${o.description ? ` — ${o.description}` : ''}\n`)));
@@ -1384,11 +1815,23 @@ function cmdInbox(args: string[]): void {
  * the asks you typed and the prose that answered them, across sessions and workspaces. Every word
  * must appear; a hit in the ask outranks one in the answer. `--query <text>` is the same thing as one
  * argument (the terminal app's door — a value, never a leading dash); `--days N` narrows to sessions
- * active since; `--limit N` caps the rows (50).
+ * active since; `--limit N` caps the rows (50); `--per-session` keeps each session's best hit only, before
+ * the cap. `--machine <label>` searches a saved machine's conversations: from the local index when oak sync
+ * read that machine lately (the main dispatch reaches this with it then), else over SSH, there.
  */
 function cmdSearch(args: string[]): void {
   const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
   const root = flagValue(args, '--root') ?? process.cwd();
+  const { query, opts } = searchRequest(args);
+  const machine = flagValue(args, '--machine');
+  const res = machine ? core.indexedMachineSearch(machine, query, opts)
+    : fromIndex('search', () => core.searchConversations(root, query, opts), (db) => core.indexedSearch(db, root, query, opts));
+  if (!res) fail(`${machine}'s conversations are not in the local database as oak sync read them in the last ten minutes: search it there (\`oak search --machine ${machine}\`)`);
+  printSearch(res, args);
+}
+
+/** What `oak search` was asked: the words, and the limit, the days back and whether each session counts once. */
+function searchRequest(args: string[]): { query: string; opts: { limit?: number; sinceMs?: number; perSession: boolean } } {
   const flagged = flagValue(args, '--query');
   const words: string[] = [];
   for (let i = 0; i < args.length; i++) {
@@ -1403,16 +1846,28 @@ function cmdSearch(args: string[]): void {
   if (!query) fail('search needs some words: oak search <words…> (or --query <text>)');
   const days = Number(flagValue(args, '--days'));
   const limit = Number(flagValue(args, '--limit'));
-  const res = core.searchConversations(root, query, {
-    limit: Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : undefined,
-    sinceMs: Number.isFinite(days) && days > 0 ? Date.now() - days * 86_400_000 : undefined,
-  });
+  return {
+    query,
+    opts: {
+      limit: Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : undefined,
+      sinceMs: Number.isFinite(days) && days > 0 ? Date.now() - days * 86_400_000 : undefined,
+      perSession: args.includes('--per-session'),
+    },
+  };
+}
+
+function printSearch(res: import('@oak-observatory/core').SearchResult & { fromIndex?: true; syncedAt?: number }, args: string[]): void {
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
   if (args.includes('--json')) {
     emitJson(res);
     return;
   }
+  const query = res.query;
+  const count = (n: number, noun: string): string => `${n} ${noun}${n === 1 ? '' : 's'}`;
+  // Another machine's conversations from its records here: as of the oak sync run that brought them.
+  const from = res.fromIndex && res.syncedAt ? ` · from ${flagValue(args, '--machine')}'s records, synced ${core.relTime(res.syncedAt)}` : '';
   if (!res.hits.length) {
-    process.stdout.write(c.dim(`nothing matches “${query}” across ${res.sessions} session${res.sessions === 1 ? '' : 's'} (${res.asks} asks, ${res.ms} ms)\n`));
+    process.stdout.write(c.dim(`nothing matches “${query}” across ${count(res.sessions, 'session')} (${count(res.asks, 'ask')}, ${res.ms} ms)${from}\n`));
     return;
   }
   for (const h of res.hits) {
@@ -1421,7 +1876,250 @@ function cmdSearch(args: string[]): void {
     process.stdout.write(`${agent}${name}  ${c.dim(`${h.session.slice(0, 8)} · ${core.relTime(h.ts)}${h.workspace ? ` · ${h.workspace}` : ''}`)}\n`);
     process.stdout.write(`    ${c.dim(h.where === 'prompt' ? 'ask' : 'answer')}  ${h.snippet}\n`);
   }
-  process.stdout.write(c.dim(`\n${res.hits.length} of the asks matching “${query}” · ${res.sessions} sessions, ${res.asks} asks, ${res.ms} ms${res.indexed ? ` (indexed ${res.indexed} session${res.indexed === 1 ? '' : 's'} on the way)` : ''}\n`));
+  const matching = count(res.matched, args.includes('--per-session') ? 'session' : 'ask');
+  const shown = res.hits.length < res.matched ? `${res.hits.length} of the ${matching}` : matching;
+  process.stdout.write(c.dim(`\n${shown} matching “${query}” · ${count(res.sessions, 'session')}, ${count(res.asks, 'ask')}, ${res.ms} ms${res.indexed ? ` (prepared ${count(res.indexed, 'session')} for search)` : ''}${from}\n`));
+}
+
+/**
+ * The listings below are served from the local index when it is caught up with the files on disk, and listed the old
+ * way otherwise (core index/listing.ts): when the index is unavailable (a Node without FTS5), turned off
+ * (`OAK_INDEX=off`), busy (another process is catching it up) or building for the first time (a reader never waits for
+ * that: a detached `oak __index-build` is started instead). `OAK_INDEX=shadow` lists the old way and records where the
+ * index would have differed.
+ */
+function fromIndex<T>(kind: string, oldWay: () => T, indexWay: (db: import('node:sqlite').DatabaseSync) => T): T {
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
+  const mode = core.indexMode();
+  if (mode === 'off') return oldWay();
+  const ix = core.useIndex({ kick: true, workRefreshMs: core.LISTING_WORK_REFRESH_MS });
+  if (!ix.ok) return oldWay();
+  try {
+    if (!ix.catchUp.caughtUp) return oldWay();
+    const answer = indexWay(ix.db);
+    if (mode === 'shadow') {
+      const old = oldWay();
+      const strip = (v: unknown): unknown => JSON.parse(JSON.stringify(v, (k, x) => (k === 'ms' || k === 'indexed' || k === 'generatedAt' || k === 'waitingMs' || k === 'waitedTodayMs' ? undefined : x)));
+      const diff = core.listingDifference(strip(old), strip(answer));
+      if (diff) core.recordShadow(kind, diff);
+      return old;
+    }
+    return answer;
+  } catch {
+    return oldWay();
+  } finally {
+    ix.close();
+  }
+}
+
+/** Every other machine's sessions the local index holds from its records (core indexedMachineListings), read without
+ *  another catch-up: the caller's listing has just caught it up. Empty where there is no index. */
+function machinesFromIndex(core: Core): import('@oak-observatory/core').MachineListing[] {
+  if (core.indexMode() === 'off') return [];
+  const opened = core.openIndex();
+  if (!opened.ok) return [];
+  try {
+    return core.machineListings(opened.db);
+  } catch {
+    return [];
+  } finally {
+    opened.close();
+  }
+}
+
+/** The flags each named query takes, as `--<name> <value>`; `--archived` and `--all` stand alone. */
+function queryParamsFrom(core: Core, name: string, args: string[]): Record<string, unknown> {
+  const spec = core.NAMED_QUERIES[name]?.params ?? {};
+  const out: Record<string, unknown> = {};
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (!a.startsWith('--')) continue;
+    const [flag, inline] = a.includes('=') ? [a.slice(0, a.indexOf('=')), a.slice(a.indexOf('=') + 1)] : [a, undefined];
+    const key = flag.slice(2);
+    // `--status` is a parameter here (`oak query edits --status pending`): the index's status is `oak query --status`.
+    if (['json', 'arrays', 'table', 'serve', 'timeout', 'param', 'quiet'].includes(key)) {
+      if ((key === 'timeout' || key === 'param') && inline === undefined) i++;
+      continue;
+    }
+    if (!(key in spec)) {
+      out[key] = inline ?? true; // refused by name, with the list of what it takes
+      continue;
+    }
+    if (spec[key].type === 'bool') out[key] = inline ?? true;
+    else out[key] = inline ?? args[++i];
+  }
+  return out;
+}
+
+/** An answer for a person at a terminal: each row as one block, a line per column, every value whole. */
+function printQueryTable(answer: import('@oak-observatory/core').QueryAnswer): void {
+  const cols = answer.columns;
+  const width = Math.max(0, ...cols.map((name) => name.length));
+  const cell = (v: unknown): string => (v === null || v === undefined ? '' : typeof v === 'string' ? v : JSON.stringify(v));
+  answer.rows.forEach((r, n) => {
+    if (n) process.stdout.write('\n');
+    cols.forEach((name, i) => {
+      const v = Array.isArray(r) ? r[i] : (r as Record<string, unknown>)[name];
+      process.stdout.write(`${c.dim(name.padEnd(width))}  ${answer.query === 'findings' && typeof v === 'string' ? (require('@oak-observatory/core') as Core).quoteFinding(v) : cell(v)}\n`);
+    });
+  });
+  const f = answer.freshness;
+  process.stdout.write(c.dim(`\n${answer.rowCount} row${answer.rowCount === 1 ? '' : 's'}${answer.truncated ? ' (more left out by the limit)' : ''} · ${answer.elapsedMs} ms · ` +
+    (f.caughtUp ? 'the database is current' : `the database was last caught up ${f.indexedAt ? (require('@oak-observatory/core') as Core).relTime(f.indexedAt) : 'never'}`) + '\n'));
+  for (const p of answer.problems) process.stdout.write(c.yellow(`! ${p}\n`));
+}
+
+/**
+ * `oak query <name> [--<param> <value>…] [--archived|--all] [--arrays] [--table]` and `oak query sql "<SELECT…>"`:
+ * the local index's answers in the JSON contract (core index/query.ts). `--serve` answers NDJSON requests on stdin, one
+ * per line (`{"id":…,"query":"sessions","params":{…}}` or `{"id":…,"sql":"SELECT …"}`), for a front end that keeps one
+ * process. `--status` with no query named describes the index. Exit status: 2 for a query that cannot run, 3 when there
+ * is no index here, 124 when raw SQL ran past its deadline.
+ */
+function printFindingsBoard(board: import('@oak-observatory/core').FindingsBoard): void {
+  const core = require('@oak-observatory/core') as Core;
+  if (board.count === null) { process.stdout.write(`findings unavailable: ${core.quoteFinding(board.error)}\n`); return; }
+  process.stdout.write(`findings · ${board.count} · untrusted quoted data · oak finding list\n`);
+  for (const r of board.rows) process.stdout.write(`  ${core.quoteFinding(r.id)} · ${core.quoteFinding(r.machine_label)} · ${core.quoteFinding(r.text)}\n`);
+}
+
+function cmdFinding(args: string[]): void {
+  const core = require('@oak-observatory/core') as Core;
+  const verb = args[0];
+  if (verb === 'add') {
+    const text = args[1];
+    if (!text || text.startsWith('--')) return fail('finding add needs quoted text');
+    const paths: string[] = [];
+    for (let i = 2; i < args.length; i++) if (args[i] === '--path') {
+      const at = paths.length;
+      while (args[i + 1] && !args[i + 1].startsWith('--')) paths.push(args[++i]);
+      if (paths.length === at) return fail('--path needs a file');
+    }
+    const added = core.addFinding(text, { cwd: process.cwd(), paths, session: flagValue(args, '--session') });
+    if (args.includes('--json')) emitJson(added);
+    else process.stdout.write(`Finding ${added.id} posted as untrusted data.\n`);
+  } else if (verb === 'resolve') {
+    if (!args[1]) return fail('finding resolve needs an id');
+    core.resolveFinding(args[1], flagValue(args, '--session'));
+    if (args.includes('--json')) emitJson({ id: args[1], resolved: true });
+    else process.stdout.write(`Finding ${args[1]} resolved.\n`);
+  } else if (verb === 'list') {
+    const params = queryParamsFrom(core, 'findings', args.filter(a => a !== '--repo'));
+    // A bare --repo means this checkout; an explicit key is accepted by both reading commands.
+    const at = args.indexOf('--repo');
+    if (at >= 0) params.repo = args[at + 1] && !args[at + 1].startsWith('--') ? args[at + 1] : core.findingScope(process.cwd()).repo;
+    if (typeof params.path === 'string' && require('path').isAbsolute(params.path)) {
+      const scope = core.findingScope(process.cwd(), [params.path]);
+      params.repo = scope.repo; params.path = scope.paths[0];
+    }
+    const out = core.queryIndex('findings', params, { kick: true });
+    if ('error' in out) return fail(out.error.message);
+    if (args.includes('--json')) emitJson(out);
+    else printQueryTable(out);
+  } else fail('finding needs add, list or resolve');
+}
+
+function cmdQuery(args: string[]): void {
+  const core = require('@oak-observatory/core') as Core;
+  // The query's name: the first word that is not a flag's value.
+  const name = args.find((a, i) => !a.startsWith('-') && !(i > 0 && args[i - 1].startsWith('--') && !args[i - 1].includes('=') && !['--json', '--arrays', '--table', '--archived', '--all'].includes(args[i - 1])));
+  // After a query's name, `--status` is that query's parameter (`oak query edits --status pending`).
+  if (!name && args.includes('--status')) {
+    const st = core.indexStatus();
+    if (args.includes('--table') || (!args.includes('--json') && isTTY())) {
+      process.stdout.write(st.available ? `database: ${st.file}\n` : `database unavailable: ${st.reason}\n`);
+      if (st.available) process.stdout.write(c.dim(`${st.sessions ?? 0} session(s), ${st.archived ?? 0} archived · ${fmtBytes(st.bytes)} · ${st.indexedAt ? `caught up ${core.relTime(st.indexedAt)}` : 'not built yet'}${st.building ? ` · a build is running (pid ${st.building.pid})` : ''}\n`));
+      return;
+    }
+    emitJson(st);
+    return;
+  }
+  const arrays = args.includes('--arrays');
+  const table = args.includes('--table');
+  const answer = (out: import('@oak-observatory/core').QueryAnswer | import('@oak-observatory/core').QueryFailure, id?: unknown): void => {
+    if ('error' in out) {
+      if (table) process.stderr.write(c.red('oak query: ') + `${out.error.message} (${out.error.code})\n`);
+      else emitJson(id === undefined ? out : { id, ...out });
+      process.exitCode = core.failureExitCode(out);
+      return;
+    }
+    if (table) printQueryTable(out);
+    else emitJson(id === undefined ? out : { id, ...out });
+  };
+  const deadline = (): number | undefined => {
+    const t = flagValue(args, '--timeout');
+    if (t === undefined) return undefined;
+    const ms = Number(t);
+    if (!Number.isInteger(ms) || ms < 100 || ms > 600_000) fail('--timeout is milliseconds, from 100 to 600000');
+    return ms;
+  };
+  if (args.includes('--serve')) {
+    void serveQueries(core, deadline());
+    return;
+  }
+  if (!name) {
+    answer({ v: 1, error: { code: 'bad_query', message: `name a query (${[...Object.keys(core.NAMED_QUERIES), 'schema', 'sql'].join(', ')}): \`oak query sessions\`, or \`oak query sql "SELECT …"\`` } });
+    return;
+  }
+  if (name === 'sql') {
+    const at = args.indexOf('sql');
+    let sql = args[at + 1];
+    if (sql === '-' || sql === undefined) sql = sql === '-' ? require('fs').readFileSync(0, 'utf8') : '';
+    if (!sql || !sql.trim()) {
+      answer({ v: 1, error: { code: 'bad_query', message: 'sql needs one SELECT: `oak query sql "SELECT …"`, or `-` to read it from stdin' } });
+      return;
+    }
+    const params: (string | number | null)[] = [];
+    for (let i = 0; i < args.length; i++) if (args[i] === '--param') params.push(args[i + 1] ?? null);
+    const limit = flagValue(args, '--limit');
+    answer(core.querySql(sql, { params, limit: limit === undefined ? undefined : Number(limit), arrays, deadlineMs: deadline(), kick: true }));
+    return;
+  }
+  // The delegated agents' states as `oak agent list` derives them now, before the index reads their records.
+  if (name === 'delegated') core.refreshDelegated();
+  answer(core.queryIndex(name, queryParamsFrom(core, name, args), { arrays, kick: true }));
+}
+
+/** `oak query --serve`: one process answering a request per line until stdin closes, so a front end starts Node once.
+ *  Each answer catches the index up first, for at most half a second. */
+async function serveQueries(core: Core, deadlineMs: number | undefined): Promise<void> {
+  const rl = require('readline').createInterface({ input: process.stdin, crlfDelay: Infinity });
+  for await (const line of rl as AsyncIterable<string>) {
+    if (!line.trim()) continue;
+    let req: { id?: unknown; query?: unknown; params?: unknown; sql?: unknown; arrays?: unknown; limit?: unknown };
+    try {
+      req = JSON.parse(line);
+    } catch {
+      process.stdout.write(JSON.stringify({ v: 1, error: { code: 'bad_query', message: 'each line is one JSON request' } }) + '\n');
+      continue;
+    }
+    const arrays = req.arrays === true;
+    let out: import('@oak-observatory/core').QueryAnswer | import('@oak-observatory/core').QueryFailure;
+    if (typeof req.sql === 'string') {
+      out = core.querySql(req.sql, { arrays, limit: typeof req.limit === 'number' ? req.limit : undefined, deadlineMs, kick: true, budgetMs: 500 });
+    } else if (typeof req.query === 'string') {
+      const params = req.params && typeof req.params === 'object' && !Array.isArray(req.params) ? (req.params as Record<string, unknown>) : {};
+      out = core.queryIndex(req.query, params, { arrays, kick: true, budgetMs: 500 });
+    } else {
+      out = { v: 1, error: { code: 'bad_query', message: 'a request names a query ("query") or carries one SELECT ("sql")' } };
+    }
+    process.stdout.write(JSON.stringify(req.id === undefined ? out : { id: req.id, ...out }) + '\n');
+  }
+}
+
+/** `oak __query-sql`: the child that runs one guarded read for `oak query sql`, the request on stdin. */
+function cmdQuerySqlChild(): void {
+  const core = require('@oak-observatory/core') as Core;
+  let req: import('@oak-observatory/core').SqlRequest;
+  try {
+    req = JSON.parse(require('fs').readFileSync(0, 'utf8'));
+  } catch {
+    process.stdout.write(JSON.stringify({ ok: false, code: 'sql_error', message: 'no request on stdin' }));
+    return;
+  }
+  // Ends itself past the deadline even when the parent that would stop it is gone.
+  if (typeof req.deadlineMs === 'number' && req.deadlineMs > 0) core.sqlChildWatchdog(req.deadlineMs);
+  process.stdout.write(JSON.stringify(core.runGuardedSql(req)));
 }
 
 /**
@@ -1429,7 +2127,7 @@ function cmdSearch(args: string[]): void {
  *   --message <text> [--title <t>] [--sound]     pop one notification (the plumbing check)
  *   --session <id> --kind <k> --ts <ms> [...]    announce a row IF DUE — the once-per-machine claim
  *                                                 and cooldown every surface shares; JetBrains' door
- *   --watch [--interval <s>]                      headless: announce every hand this workspace raises,
+ *   --watch [--interval <s>]                      headless: announce every hand raised on this machine,
  *                                                 from a plain terminal with no editor open
  * Never answers anything: the notification says who is waiting; the answer stays in the agent's terminal.
  */
@@ -1444,8 +2142,14 @@ async function cmdNotify(args: string[]): Promise<void> {
     );
     const tick = (): void => {
       try {
-        for (const r of core.sessionMeta(root).sessions) {
-          if (core.announceAttention(r)) process.stdout.write(`${core.relTime(Date.now())}  ${r.title ?? r.id}  ${core.attentionLabel(r.attention!.kind)}${r.attention!.message ? ` — ${r.attention!.message}` : ''}\n`);
+        // The listing `oak sessions --json` gives, from the local index when it is current (every tick read every
+        // session's files before).
+        // Other machines' hands too, as their records brought them, each named with its machine.
+        const synced = core.readSyncedHands().map((h) => ({ id: h.id, title: h.title, agent: h.agent, attention: { kind: h.kind, message: h.message, ts: h.ts }, host: h.host, machine: h.machine }));
+        for (const r of [...fromIndex('sessions', () => core.sessionMeta(root), (db) => core.indexedSessionMeta(db, root)).sessions, ...synced]) {
+          const where = 'host' in r && r.host ? ` · on ${r.machine}` : '';
+          const line = (): void => { process.stdout.write(`${core.relTime(Date.now())}  ${r.title ?? r.id}  ${core.attentionLabel(r.attention!.kind)}${r.attention!.message ? ` — ${r.attention!.message}` : ''}${where}\n`); };
+          if (core.announceAttention(r, Date.now(), (sent) => { if (sent) line(); })) line();
         }
       } catch (e) {
         process.stderr.write(`notify: ${String((e as Error).message)}\n`);
@@ -1465,9 +2169,19 @@ async function cmdNotify(args: string[]): Promise<void> {
     const kind = flagValue(args, '--kind') as HandKind | undefined;
     const ts = Number(flagValue(args, '--ts'));
     if (!kind || !(core.HAND_KINDS as readonly string[]).includes(kind) || !Number.isFinite(ts)) fail('notify --session needs --kind <permission|question|input|idle-done> and --ts <ms>');
-    const sent = core.announceAttention({ id: session, title: flagValue(args, '--title') ?? null, agent: flagValue(args, '--agent') ?? '', attention: { kind, message: flagValue(args, '--message') ?? '', ts } });
-    if (args.includes('--json')) emitJson({ sent });
-    else process.stdout.write(sent ? 'notified\n' : c.dim('not due — already announced, inside the cooldown, or off in the options\n'));
+    const attention = { kind, message: flagValue(args, '--message') ?? '', ts };
+    // `--host <id> [--machine <label>]`: another machine's hand (a `syncedHands` row), announced at once and naming it.
+    const host = flagValue(args, '--host');
+    if (host !== undefined && !/^[0-9a-f]{12}$/.test(host)) fail(`notify: invalid machine id "${host}"`);
+    // A permission prompt waits out its wait here (JetBrains runs this off its UI thread), and is
+    // announced only if it still stands then; the process ends as soon as it is answered.
+    const sent = await core.announceWhenDue({ id: session, title: flagValue(args, '--title') ?? null, agent: flagValue(args, '--agent') ?? '', attention,
+      ...(host ? { host, machine: flagValue(args, '--machine') ?? host } : {}) });
+    // `stillUp`: the hand still stood when its wait ended, whether or not this run posted it (another
+    // surface may have). JetBrains pops a permission prompt up in its window only then. Another machine's hand stood as
+    // its records last said.
+    if (args.includes('--json')) emitJson({ sent, stillUp: host ? true : core.handStillUp(session, attention) });
+    else process.stdout.write(sent ? 'notified\n' : c.dim('not due — already announced, inside the cooldown, off in the options, or a permission prompt answered while it waited\n'));
     return;
   }
   const message = flagValue(args, '--message');
@@ -1544,9 +2258,16 @@ async function cmdServer(args: string[]): Promise<void> {
 }
 
 /** A failed or unavailable prompt keeps a clipboard draft and printable text. */
+/** The exit status of `oak prompt`, `oak comment send` and `oak quote --send` when nothing was sent and the text was kept as
+ *  a draft (sysexits' EX_TEMPFAIL: the agent could not take it now), in every output mode, so an agent driving another
+ *  agent can tell; 0 only when it was sent. */
+const DRAFT_KEPT_EXIT = 75;
+
 async function promptDraft(session: string, text: string, args: string[]): Promise<boolean> {
   const core = require('@oak-observatory/core') as Core;
   let result: { sent: boolean; reason?: string };
+  // With no live pane here, or with --machine, the prompt goes through a saved machine's herdr.
+  stopDetachedOnSignals();
   try { result = await core.promptSession(session, text, { machine: flagValue(args, '--machine') }); }
   catch (error) { result = { sent: false, reason: String((error as Error).message || error) }; }
   if (!result.sent) {
@@ -1556,6 +2277,7 @@ async function promptDraft(session: string, text: string, args: string[]): Promi
       if (!copied.error && copied.status === 0) break;
     }
   }
+  if (!result.sent) process.exitCode = DRAFT_KEPT_EXIT;
   if (args.includes('--json')) emitJson({ ...result, text });
   else if (result.sent) process.stdout.write('Sent to the agent.\n');
   else { process.stderr.write(`Draft retained: ${result.reason}\n`); process.stdout.write(text + '\n'); }
@@ -1567,17 +2289,38 @@ async function cmdPrompt(args: string[]): Promise<void> {
   if (!session || !text) return fail('prompt needs --session <id> --text <text>');
   if (await promptDraft(session, text, args)) {
     const ids = flagValue(args, '--comment-ids')?.split(',').filter(Boolean) ?? [];
-    if (ids.length) (require('@oak-observatory/core') as Core).markCommentsSent(session, ids);
+    if (ids.length) markSentAfterDelivery(session, ids);
   }
 }
 
+/** The ledger step after a delivered prompt. Its failure says the prompt was delivered: said bare ("could not be
+ *  saved"), JetBrains read the exit as an undelivered prompt and offered the draft to send again. */
+function markSentAfterDelivery(session: string, ids: string[]): void {
+  try {
+    (require('@oak-observatory/core') as Core).markCommentsSent(session, ids);
+  } catch (e) {
+    fail(`sent to the agent, but its review comments were not marked sent, so the next send drafts them again: ${String((e as Error)?.message || e)}`);
+  }
+}
+
+const AGENT_USAGE = 'agent: setup [--yes|--check] [--json] [--project] [--remove] | start --kind claude|codex [--brief <file>] … | tell <id…> <text> [--file <path>] | list [--all] | wait <id…> [--until done|blocked|any] | close <id…>';
+
 async function cmdAgent(args: string[]): Promise<void> {
   const core = require('@oak-observatory/core') as Core;
-  if (args[0] !== 'start') return fail('agent: start --kind claude|codex [--cwd <dir>] [--machine <label|ssh-target>]');
+  if (args[0] === 'setup') return (require('./agent-setup') as typeof import('./agent-setup')).cmdAgentSetup(args.slice(1));
+  if (args[0] === 'tell') return cmdAgentTell(args.slice(1));
+  if (args[0] === '__tell') return cmdAgentTellPayload();
+  if (args[0] === '__after') return cmdAgentAfter(args[1]);
+  if (args[0] === 'list') return cmdAgentList(args.slice(1));
+  if (args[0] === 'wait') return cmdAgentWait(args.slice(1));
+  if (args[0] === 'close') return cmdAgentClose(args.slice(1));
+  if (args[0] !== 'start') return fail(AGENT_USAGE);
   const kind = flagValue(args, '--kind');
   if (kind !== 'claude' && kind !== 'codex') return fail('agent start needs --kind claude|codex');
   const cwd = flagValue(args, '--cwd');
   const machineArg = flagValue(args, '--machine');
+  if (args.some(a => a === '--after' || a.startsWith('--after=')) || args.includes('--after-any')) return cmdAgentQueue(kind, args);
+  if (flagValue(args, '--brief') !== undefined) return machineArg ? cmdAgentStartRemote(machineArg, args) : cmdAgentStartBrief(kind, args);
   if (machineArg) {
     // Spin an agent up ON a remote machine from here, then drop into its OAK (the chosen flow).
     // Auto-provisions an unknown machine (installs herdr + saves it) so a brand-new remote works
@@ -1608,6 +2351,393 @@ async function cmdAgent(args: string[]): Promise<void> {
   if (args.includes('--json')) emitJson(result);
   else process.stdout.write(`Started ${kind} in herdr pane ${result.pane}.\n`);
 }
+/** Tell's text is data, including words that look like global CLI flags. Remote hops carry JSON on stdin. */
+async function cmdAgentTell(args: string[]): Promise<void> {
+  const core = require('@oak-observatory/core') as Core;
+  const fs = require('fs') as typeof import('fs');
+  const words: string[] = [];
+  let file: string | undefined, json = false, literal = false;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (!literal && a === '--') { literal = true; continue; }
+    if (!literal && a === '--json') { json = true; continue; }
+    if (!literal && (a === '--file' || a.startsWith('--file='))) {
+      file = a === '--file' ? args[++i] : a.slice(7);
+      if (!file) return fail('agent tell --file needs a path');
+      continue;
+    }
+    words.push(a);
+  }
+  const text = file ? fs.readFileSync(file, 'utf8') : words.pop() ?? '';
+  const ids = [...new Set(words)];
+  if (!ids.length) return fail('agent tell needs <id…> <text> or <id…> --file <path>');
+  core.validateDelegatedMessage(text);
+  const os = require('os') as typeof import('os');
+  const from = process.env.OAK_DELEGATED ?? process.env.CODEX_THREAD_ID ?? process.env.CLAUDE_OBSERVATORY_SESSION ?? `${os.userInfo().username}@${os.hostname()}`;
+  const groups = new Map<string, import('@oak-observatory/core').DelegatedAgent[]>();
+  for (const id of ids) {
+    const rec = core.readDelegated(id);
+    if (!rec) return fail(`no delegated agent "${id}" (oak agent list shows them)`);
+    if (rec.closedMs != null || core.isTerminalDelegated(rec.state) || rec.state === 'queued') return fail(`${id} is ${rec.closedMs != null ? 'closed' : rec.state}; cannot tell it`);
+    const key = rec.machine ?? '';
+    groups.set(key, [...(groups.get(key) ?? []), rec]);
+  }
+  const remote = async (machine: string, recs: import('@oak-observatory/core').DelegatedAgent[], check: boolean) => {
+    const r = await agentOnMachine(machine, ['__tell', '--stdin', '--json'], JSON.stringify({ ids: recs.map(r => r.remoteId ?? r.id), text, from, check }));
+    if (r.code !== 0) throw new Error(r.stderr.trim() || `agent tell on ${machine} failed (exit ${r.code})`);
+    const value = JSON.parse(r.stdout);
+    if (check ? value.checked !== true : !Array.isArray(value.sent)) throw new Error(`agent tell on ${machine} returned no confirmation; update OAK there`);
+    return value;
+  };
+  for (const [machine, recs] of groups) {
+    if (machine) await remote(machine, recs, true);
+    else await core.checkDelegatedTell(recs.map(r => r.id));
+  }
+  const sent: import('@oak-observatory/core').DelegatedAgent[] = [];
+  try {
+    for (const [machine, recs] of groups) {
+      if (machine) {
+        const result = await remote(machine, recs, false);
+        for (const rec of recs) {
+          const there = result.sent.find((r: { id: string }) => r.id === (rec.remoteId ?? rec.id));
+          if (!there) throw new Error(`${rec.id}: no delivery confirmation; check its herdr tab`);
+          sent.push(core.applyRemoteDelegated(rec, there, 'ssh'));
+        }
+      } else for (const rec of recs) sent.push(await core.tellDelegatedAgent(rec.id, text, from));
+    }
+  } catch (e) {
+    return fail(`${String((e as Error).message || e)}${sent.length ? `; already sent to ${sent.map(r => r.id).join(', ')}` : ''}`);
+  }
+  if (json) emitJson({ sent });
+  else process.stdout.write(`Sent to ${sent.map(r => r.id).join(', ')}.\n`);
+}
+
+async function cmdAgentTellPayload(): Promise<void> {
+  const core = require('@oak-observatory/core') as Core;
+  const value = JSON.parse((require('fs') as typeof import('fs')).readFileSync(0, 'utf8'));
+  if (!Array.isArray(value.ids) || !value.ids.length || !value.ids.every((id: unknown) => typeof id === 'string' && core.isDelegatedId(id)) || typeof value.text !== 'string' || typeof value.from !== 'string') return fail('invalid agent tell payload');
+  core.validateDelegatedMessage(value.text);
+  await core.checkDelegatedTell(value.ids);
+  if (value.check === true) return emitJson({ checked: true });
+  const sent = [];
+  for (const id of value.ids) sent.push(await core.tellDelegatedAgent(id, value.text, value.from));
+  emitJson({ sent });
+}
+
+async function cmdAgentQueue(kind: 'claude' | 'codex', args: string[]): Promise<void> {
+  const core = require('@oak-observatory/core') as Core;
+  const brief = flagValue(args, '--brief');
+  if (!brief) return fail('agent start --after needs --brief <file>');
+  const after: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i].startsWith('--after=')) after.push(...args[i].slice(8).split(',').filter(Boolean));
+    else if (args[i] === '--after') while (i + 1 < args.length && !args[i + 1].startsWith('--')) after.push(...args[++i].split(',').filter(Boolean));
+  }
+  const machine = flagValue(args, '--machine') ?? null;
+  const cwd = flagValue(args, '--cwd') ?? (machine ? '.' : process.cwd());
+  if (!machine && !(require('fs') as typeof import('fs')).statSync(cwd).isDirectory()) return fail(`agent start: no folder ${cwd} to work in`);
+  const d = machine ? {} : core.delegatedDefaults(kind);
+  const pick = (flag: string, fallback?: string): string | null => flagValue(args, flag) ?? fallback ?? null;
+  const rec = core.queueDelegatedAgent({
+    kind, brief, cwd, name: flagValue(args, '--name'), title: flagValue(args, '--title'), out: flagValue(args, '--out'), report: flagValue(args, '--report'),
+    agentType: pick('--agent', d.agentType), permissionMode: pick('--permission-mode', d.permissionMode), model: pick('--model', d.model),
+    effort: pick('--effort', d.effort), sandbox: pick('--sandbox', d.sandbox), args: d.args, workspace: flagValue(args, '--workspace'),
+    parent: flagValue(args, '--parent') ?? process.env.OAK_DELEGATED ?? process.env.CODEX_THREAD_ID ?? process.env.CLAUDE_OBSERVATORY_SESSION ?? null,
+  }, after, args.includes('--after-any'), machine);
+  try {
+    // The same detached CLI machinery as OAK's refresh jobs; this requested job exits after one launch or cancellation.
+    const entry = require('@oak-observatory/core/dist/cli-entry').oakCliEntry();
+    const child = core.spawnTool(process.execPath, [entry, 'agent', '__after', rec.id], { detached: true, stdio: 'ignore', windowsHide: true });
+    await new Promise<void>((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
+    child.unref();
+  } catch (e) {
+    core.writeDelegated({ ...rec, state: 'gone', endedMs: Date.now(), since: Date.now(), error: `Could not start queued job: ${String(e)}` });
+    throw e;
+  }
+  if (args.includes('--json')) emitJson(rec);
+  else process.stdout.write(`Queued ${rec.id}; waiting on ${after.join(', ')}.\n`);
+}
+
+/** One requested background job. It uses the existing record watcher and saved-machine refresh, then exits. */
+async function cmdAgentAfter(id: string): Promise<void> {
+  const core = require('@oak-observatory/core') as Core;
+  if (!core.isDelegatedId(id)) return fail('invalid queued agent id');
+  const fs = require('fs') as typeof import('fs'), path = require('path') as typeof import('path');
+  const lock = path.join(core.delegatedDir(), `${id}.queue-lock`);
+  let fd: number;
+  try { fd = fs.openSync(lock, 'wx', 0o600); } catch { return; }
+  try {
+    for (;;) {
+      const rec = core.readDelegated(id);
+      if (!rec || rec.state !== 'queued' || rec.closedMs != null || !rec.launch) return;
+      const rows = await delegatedNow(true);
+      const decision = core.delegatedDependencies(rec, rows);
+      if (core.readDelegated(id)?.closedMs != null) return;
+      if (decision.error) {
+        core.writeDelegated({ ...rec, state: 'gone', endedMs: Date.now(), since: Date.now(), error: decision.error });
+        return;
+      }
+      if (decision.ready) {
+        if (rec.machine) {
+          const o = rec.launch;
+          const argv = ['start', '--kind', rec.kind, '--brief', rec.brief, '--cwd', rec.cwd, '--name', rec.id, '--out', rec.out, '--report', rec.report, '--json'];
+          for (const [flag, value] of [['--title', o.title], ['--agent', o.agentType], ['--permission-mode', o.permissionMode], ['--model', o.model], ['--effort', o.effort], ['--sandbox', o.sandbox], ['--workspace', o.workspace], ['--parent', o.parent]]) {
+            if (value) argv.push(flag!, value);
+          }
+          const r = await agentOnMachine(rec.machine, argv);
+          if (r.code !== 0) throw new Error(r.stderr.trim() || `start on ${rec.machine} failed`);
+          const there = JSON.parse(r.stdout);
+          if (!core.isDelegatedId(there?.id)) throw new Error(`start on ${rec.machine} returned no agent`);
+          const latest = core.readDelegated(id);
+          if (latest?.closedMs != null) {
+            await agentOnMachine(rec.machine, ['close', there.id, '--json']);
+            return;
+          }
+          delete rec.launch;
+          rec.remoteId = there.id;
+          for (const key of ['brief', 'cwd', 'out', 'report'] as const) rec[key] = there[key];
+          rec.startedMs = there.startedMs;
+          core.applyRemoteDelegated(rec, there, 'ssh');
+        } else await core.startDelegatedAgent(rec.launch, rec);
+        return;
+      }
+      await new Promise<void>((resolve) => {
+        let watcher: ReturnType<typeof core.createWatcher> | undefined;
+        const done = () => { clearTimeout(timer); watcher?.close(); resolve(); };
+        const timer = setTimeout(done, Math.max(200, Number(process.env.OAK_AGENT_WAIT_MS) || 2000));
+        watcher = core.createWatcher({ roots: core.delegatedWatchRoots(rows.filter(r => r.id === id || rec.after?.includes(r.id))), onChange: done, onDegrade: () => {} });
+      });
+    }
+  } catch (e) {
+    const rec = core.readDelegated(id);
+    if (rec && rec.closedMs == null) core.writeDelegated({ ...rec, state: 'gone', endedMs: Date.now(), since: Date.now(), error: String((e as Error).message || e) });
+  } finally {
+    fs.closeSync(fd); fs.unlinkSync(lock);
+  }
+}
+
+/** `oak agent start --brief <file>`: a new herdr tab labelled from the brief's title, the agent started there and handed
+ *  the brief, and its row recorded (core delegated.ts). Codex's model, effort and sandbox, and Claude Code's agent type
+ *  and permission mode, come from prefs.json `agents`, each overridden by its flag. */
+async function cmdAgentStartBrief(kind: 'claude' | 'codex', args: string[]): Promise<void> {
+  const core = require('@oak-observatory/core') as Core;
+  const brief = flagValue(args, '--brief')!;
+  const fs = require('fs') as typeof import('fs');
+  if (!fs.existsSync(brief)) return fail(`agent start: no brief at ${brief}`);
+  const cwd = flagValue(args, '--cwd') ?? process.cwd();
+  if (!fs.existsSync(cwd)) return fail(`agent start: no folder ${cwd} to work in`);
+  const d = core.delegatedDefaults(kind, cwd);
+  const worktree = args.some(a => a === '--worktree' || a.startsWith('--worktree=')) ? flagValue(args, '--worktree') ?? true : undefined;
+  const writableRoots = [...(d.writableRoots ?? [])];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i].startsWith('--writable-root=')) writableRoots.push(args[i].slice('--writable-root='.length));
+    else if (args[i] === '--writable-root') {
+      if (!args[i + 1] || args[i + 1].startsWith('--')) return fail('--writable-root needs a directory');
+      writableRoots.push(args[++i]);
+    }
+  }
+  const pick = (flag: string, fallback?: string): string | null => flagValue(args, flag) ?? fallback ?? null;
+  // The agent or session this one is started from: a delegated agent's own shell names it, as Codex names its thread.
+  const parent = flagValue(args, '--parent') ?? process.env.OAK_DELEGATED ?? process.env.CODEX_THREAD_ID ?? process.env.CLAUDE_OBSERVATORY_SESSION ?? null;
+  stopDetachedOnSignals();
+  let rec: import('@oak-observatory/core').DelegatedAgent;
+  try {
+    rec = await core.startDelegatedAgent({
+      kind, brief, cwd, worktree, writableRoots, name: flagValue(args, '--name'), title: flagValue(args, '--title'), out: flagValue(args, '--out'), report: flagValue(args, '--report'),
+      agentType: pick('--agent', d.agentType), permissionMode: pick('--permission-mode', d.permissionMode), model: pick('--model', d.model),
+      effort: pick('--effort', d.effort), sandbox: pick('--sandbox', d.sandbox), args: d.args, workspace: flagValue(args, '--workspace'), parent,
+      log: (line) => process.stderr.write(c.dim(`${line}\n`)),
+    });
+  } catch (error) {
+    return fail(String((error as Error).message || error));
+  }
+  if (args.includes('--json')) emitJson(rec);
+  else process.stdout.write(`Started ${rec.id} (${kind}) in herdr tab "${rec.id}: ${rec.title}", pane ${rec.pane}. Its report: ${rec.report}\n`);
+}
+
+/** `oak agent <argv>` run on a saved machine, as `--machine` runs a session verb there (forwardToMachine, over ssh):
+ *  this CLI again, told to forward the verb, with its output captured. */
+function agentOnMachine(label: string, argv: string[], input?: string): Promise<{ code: number | null; stdout: string; stderr: string }> {
+  const core = require('@oak-observatory/core') as Core;
+  return new Promise((resolve) => {
+    const child = core.spawnTool(process.execPath, [process.argv[1], 'agent', ...argv, '--machine', label],
+      { stdio: [input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'], env: { ...process.env, OAK_AGENT_FORWARD: '1' } });
+    if (input !== undefined) { child.stdin?.on('error', () => {}); child.stdin?.end(input); }
+    const out: Buffer[] = [], err: Buffer[] = [];
+    child.stdout?.on('data', (d: Buffer) => out.push(d));
+    child.stderr?.on('data', (d: Buffer) => err.push(d));
+    child.on('error', (e: Error) => resolve({ code: null, stdout: '', stderr: e.message }));
+    child.on('close', (code: number | null) => resolve({ code, stdout: Buffer.concat(out).toString('utf8'), stderr: Buffer.concat(err).toString('utf8') }));
+  });
+}
+
+/** `oak agent start --brief … --machine <label>`: the saved machine's own OAK starts the agent there, in a herdr tab
+ *  there, with the paths (brief, tree, output folder) as that machine has them; this machine keeps a row naming the
+ *  machine, which list, wait and close read and act on there. */
+async function cmdAgentStartRemote(label: string, args: string[]): Promise<void> {
+  const core = require('@oak-observatory/core') as Core;
+  const parent = flagValue(args, '--parent') ?? process.env.OAK_DELEGATED ?? process.env.CODEX_THREAD_ID ?? process.env.CLAUDE_OBSERVATORY_SESSION ?? null;
+  const isMachine = (a: string, i: number) => a === '--machine' || a.startsWith('--machine=') || (i > 0 && args[i - 1] === '--machine');
+  const argv = args.filter((a, i) => !isMachine(a, i) && a !== '--json' && a !== '--parent' && !(i > 0 && args[i - 1] === '--parent'));
+  const r = await agentOnMachine(label, [...argv, ...(parent ? ['--parent', parent] : []), '--json']);
+  let there: import('@oak-observatory/core').DelegatedAgent;
+  try { there = JSON.parse(r.stdout); } catch { return fail(r.stderr.trim() || `agent start on ${label} answered nothing (exit ${r.code})`); }
+  if (r.code !== 0 || !core.isDelegatedId(there?.id)) return fail(r.stderr.trim() || `agent start on ${label} failed (exit ${r.code})`);
+  const rec: import('@oak-observatory/core').DelegatedAgent = { ...there, id: core.delegatedIdFor(there.id), remoteId: there.id, machine: label, pid: null, herdrName: null, parent: parent ?? there.parent };
+  core.writeDelegated(rec);
+  if (args.includes('--json')) emitJson(rec);
+  else process.stdout.write(`Started ${rec.id} (${rec.kind}) on ${label} in herdr tab "${there.id}: ${rec.title}", pane ${rec.pane}. Its report there: ${rec.report}\n`);
+}
+
+/** When this machine last read each saved machine's agents, so a wait's polls ask a machine at most every
+ *  REMOTE_READ_MS. */
+const remoteReads = new Map<string, number>();
+const REMOTE_READ_MS = 3000;
+
+/** Read the agents started from here on saved machines where they run: from this machine's index when oak sync keeps
+ *  that machine current (core indexedMachineDelegated), else from its `oak agent list --json` over ssh. A machine that
+ *  cannot be reached keeps the rows as last read, which say when. */
+async function refreshRemoteDelegated(records: import('@oak-observatory/core').DelegatedAgent[]): Promise<void> {
+  const core = require('@oak-observatory/core') as Core;
+  const now = Date.now();
+  const byMachine = new Map<string, import('@oak-observatory/core').DelegatedAgent[]>();
+  for (const r of records) if (r.machine && !r.launch && !core.isTerminalDelegated(r.state)) {
+    const group = byMachine.get(r.machine);
+    if (group) group.push(r);
+    else byMachine.set(r.machine, [r]);
+  }
+  const indexed = core.refreshRemoteFromIndex(records, now);
+  for (const [label, recs] of byMachine) {
+    if (indexed.has(label) || now - (remoteReads.get(label) ?? 0) < REMOTE_READ_MS) continue;
+    remoteReads.set(label, now);
+    let agents: import('@oak-observatory/core').DelegatedRow[] | null = null;
+    const r = await agentOnMachine(label, ['list', '--all', '--json']);
+    try { if (r.code === 0) agents = JSON.parse(r.stdout).agents; } catch { /* not an answer */ }
+    if (!Array.isArray(agents)) continue;
+    const byId = new Map<string, import('@oak-observatory/core').DelegatedRow>();
+    for (const agent of agents) {
+      const id = agent.id;
+      if (!byId.has(id)) byId.set(id, agent);
+    }
+    for (const rec of recs) {
+      const there = byId.get(rec.remoteId ?? rec.id);
+      if (there) core.applyRemoteDelegated(rec, there, 'ssh', now);
+    }
+  }
+}
+
+/** The ids a `wait` or `close` names: its words that are no flag and no flag's value. */
+function agentIds(args: string[]): string[] {
+  return args.filter((a, i) => !a.startsWith('--') && !(i > 0 && FLAGS_WITH_VALUES.has(args[i - 1])));
+}
+
+/** The delegated agents refreshed now, with what herdr's snapshots show of their panes. */
+async function delegatedNow(all: boolean): Promise<import('@oak-observatory/core').DelegatedRow[]> {
+  const core = require('@oak-observatory/core') as Core;
+  const records = core.listDelegatedRecords();
+  await refreshRemoteDelegated(records);
+  const herdr = await core.delegatedPanes(records);
+  return core.listDelegated({ herdr, all, records, refreshRemote: false });
+}
+
+function delegatedLine(r: import('@oak-observatory/core').DelegatedRow, now: number): string {
+  const core = require('@oak-observatory/core') as Core;
+  const tint = r.state === 'done' ? c.green : r.state === 'blocked' || r.state === 'gone' || r.state === 'errored' ? c.yellow : (s: string) => s;
+  const read = r.remote ? `read ${core.relTime(r.remote.readMs, now)} ${r.remote.via === 'index' ? 'from its synced records' : 'over ssh'}` : null;
+  const bits = [r.kind, [r.model, r.effort].filter(Boolean).join(' ') || null, r.machine ? `on ${r.machine}` : 'this machine', read, r.tab ? `tab ${r.remoteId ?? r.id}: ${r.title}` : null,
+    r.tokens ? `${core.compactTokens(r.tokens)} tok` : null, r.cost ? `$${r.cost.toFixed(2)}` : null, r.closedMs !== null ? 'closed' : null, r.state === 'queued' ? `waiting on ${(r.after ?? []).join(', ')}` : null, core.agentWorktreeSummary(r.worktree)].filter(Boolean);
+  const head = `${c.bold(r.id)}  ${tint(r.state)} since ${core.relTime(r.since, now)}  ${r.title}\n    ${bits.join(' · ')}${r.error ? `\n    ${c.yellow(r.error)}` : ''}\n`;
+  return head + r.workers.map((w) => `    └ worker ${w.title} · ${w.state}${w.model ? ` · ${w.model}` : ''} · ${core.compactTokens(w.tokens)} tok\n`).join('');
+}
+
+/** `oak agent list` — every delegated agent with its state and since, and its workers still at it. */
+async function cmdAgentList(args: string[]): Promise<void> {
+  const rows = await delegatedNow(args.includes('--all'));
+  const findings = (require('@oak-observatory/core') as Core).findingsBoard();
+  if (args.includes('--json')) return emitJson({ agents: rows, findings });
+  printFindingsBoard(findings);
+  if (!rows.length) return void process.stdout.write(c.dim('no delegated agents — `oak agent start --kind claude|codex --brief <file>` starts one\n'));
+  const now = Date.now();
+  for (const r of rows) process.stdout.write(delegatedLine(r, now));
+}
+
+/** `oak agent wait <id…> --until done|blocked|any` — returns once that is reached, for an orchestrator's background job:
+ *  `done` when every agent is done or gone (exit 1 when one is gone), `blocked` when one is blocked or stopped on an
+ *  error (or none can be any more), `any` when one has turned to waiting, blocked, errored, done or gone. 124 at
+ *  `--timeout <seconds>`. */
+async function cmdAgentWait(args: string[]): Promise<void> {
+  const core = require('@oak-observatory/core') as Core;
+  const until = flagValue(args, '--until') ?? 'done';
+  if (!['done', 'blocked', 'any'].includes(until)) return fail('agent wait --until done | blocked | any');
+  const ids = agentIds(args);
+  if (!ids.length) return fail('agent wait needs the ids of the agents to wait for (oak agent list shows them)');
+  for (const id of ids) if (!core.readDelegated(id)) return fail(`no delegated agent "${id}" (oak agent list shows them)`);
+  const timeout = flagValue(args, '--timeout') !== undefined ? Number(flagValue(args, '--timeout')) : Infinity;
+  if (!(timeout > 0)) return fail('agent wait --timeout takes a number of seconds');
+  // Each pass re-derives at once when a file it reads changes (the report, the transcript or rollout, a raised hand, a
+  // session linked), and at least every OAK_AGENT_WAIT_MS (2 s) where nothing is watched or a watch cannot be had.
+  const poll = Math.max(200, Number(process.env.OAK_AGENT_WAIT_MS) || 2000);
+  const deadline = Date.now() + timeout * 1000;
+  let wake: (() => void) | null = null;
+  let watcher: { close(): void } | null = null;
+  let watched = '';
+  const said = new Set<string>();
+  process.once('exit', () => watcher?.close());
+  for (;;) {
+    const rows = (await delegatedNow(true)).filter((r) => ids.includes(r.id));
+    const roots = core.delegatedWatchRoots(rows);
+    const key = roots.map((r) => `${r.kind}:${r.dir}`).sort().join('|');
+    if (key !== watched) {
+      watcher?.close();
+      watched = key;
+      watcher = core.createWatcher({
+        roots, onChange: () => { const w = wake; wake = null; w?.(); },
+        onDegrade: (dir, why) => { if (!said.has(dir)) { said.add(dir); process.stderr.write(c.dim(`watching ${dir} by polling (${why})\n`)); } },
+      });
+    }
+    const final = rows.every((r) => core.isTerminalDelegated(r.state));
+    const reached = until === 'done' ? final
+      : until === 'blocked' ? final || rows.some((r) => r.state === 'blocked' || r.state === 'errored')
+      : rows.some((r) => r.state !== 'queued' && r.state !== 'starting' && r.state !== 'working');
+    if (reached || Date.now() >= deadline) {
+      if (args.includes('--json')) emitJson({ until, reached, agents: rows });
+      else { const now = Date.now(); for (const r of rows) process.stdout.write(delegatedLine(r, now)); }
+      process.exitCode = !reached ? 124 : until === 'done' && rows.some((r) => r.state === 'gone') ? 1 : 0;
+      watcher?.close();
+      return;
+    }
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(() => { wake = null; resolve(); }, Math.min(poll, Math.max(0, deadline - Date.now())));
+      wake = () => { clearTimeout(timer); resolve(); };
+    });
+  }
+}
+
+/** `oak agent close <id…>` — close each agent's herdr tab; its row stays, marked closed. */
+async function cmdAgentClose(args: string[]): Promise<void> {
+  const core = require('@oak-observatory/core') as Core;
+  const ids = agentIds(args);
+  if (!ids.length) return fail('agent close needs the ids of the agents whose tabs to close');
+  const closed: import('@oak-observatory/core').DelegatedAgent[] = [];
+  for (const id of ids) {
+    const rec = core.readDelegated(id);
+    if (rec?.machine && !rec.launch) {
+      // Closed where it runs, by that machine's OAK; the row here follows what it says.
+      const r = await agentOnMachine(rec.machine, ['close', rec.remoteId ?? rec.id, '--json', ...(args.includes('--remove-worktree') ? ['--remove-worktree'] : [])]);
+      let there: import('@oak-observatory/core').DelegatedAgent | undefined;
+      try { there = JSON.parse(r.stdout).closed?.[0]; } catch { /* not an answer */ }
+      if (r.code !== 0 || !there) return fail(r.stderr.trim() || `agent close on ${rec.machine} failed (exit ${r.code})`);
+      rec.closedMs = there.closedMs ?? Date.now();
+      closed.push(core.applyRemoteDelegated(rec, there, 'ssh'));
+      continue;
+    }
+    try { closed.push(await core.closeDelegatedAgent(id, { removeWorktree: args.includes('--remove-worktree') })); }
+    catch (error) { return fail(String((error as Error).message || error)); }
+  }
+  if (args.includes('--json')) emitJson({ closed });
+  else for (const r of closed) process.stdout.write(`Closed ${r.id}'s tab; it stays listed under \`oak agent list --all\` (${r.state}).\n`);
+}
+
 /** `oak quote` — the agent's last reply as a `> ` block for the composer (#6/#7). */
 async function cmdQuote(args: string[]): Promise<void> {
   const core = require('@oak-observatory/core') as Core;
@@ -1671,7 +2801,7 @@ async function cmdComment(args: string[]): Promise<void> {
       return;
     }
     if (sub === 'send') {
-      if (await promptDraft(session, p.text, args)) core.markCommentsSent(session, p.ids);
+      if (await promptDraft(session, p.text, args)) markSentAfterDelivery(session, p.ids);
       return;
     }
     if (json) emitJson(p);
@@ -1715,11 +2845,12 @@ function cmdTitles(args: string[]): void {
   }
   if (args.includes('--off') || args.includes('--on')) {
     const prefs = core.readPrefs();
-    if (args.includes('--off')) {
-      prefs.remoteTitles = false;
-      fs.rmSync(core.remoteTitlesCachePath(), { force: true }); // no cached claude.ai title outlives the switch
-    } else delete prefs.remoteTitles;
+    if (args.includes('--off')) prefs.remoteTitles = false;
+    else delete prefs.remoteTitles;
     core.writePrefs(prefs);
+    // No cached claude.ai title outlives the switch. Once it is saved: removed before a save that was refused (prefs.json
+    // not parsing), the titles went while the setting stayed on, and the next poll fetched them again.
+    if (prefs.remoteTitles === false) fs.rmSync(core.remoteTitlesCachePath(), { force: true });
     process.stdout.write(prefs.remoteTitles === false
       ? 'Remote Control titles off: OAK no longer reads session titles from claude.ai, and names sessions from their transcripts.\n'
       : 'Remote Control titles on: the next poll reads session titles from claude.ai.\n');
@@ -1784,11 +2915,12 @@ function cmdSessions(args: string[] = []): void {
     const forced = args.includes('--force');
     const pending = forced || named !== undefined ? 0 : core.sessionCounts(del).pending;
     if (pending > 0)
-      fail(`${del} has ${pending} edit${pending === 1 ? '' : 's'} pending review; deleting the session purges ${pending === 1 ? 'that edit' : 'those edits'} for good. Review ${pending === 1 ? 'it' : 'them'} first, or pass --force.`);
+      fail(`${del} has ${pending} edit${pending === 1 ? '' : 's'} pending review; deleting the session purges ${pending === 1 ? 'that edit' : 'those edits'} ${core.deleteWords().purged}. Review ${pending === 1 ? 'it' : 'them'} first, or pass --force.`);
     try { core.deleteSession(del, { confirmedPending: forced ? Infinity : Number(named ?? 0), seenThrough: seen === undefined ? undefined : Number(seen) }); }
     catch (e) { fail(String((e as Error)?.message || e)); }
     if (args.includes('--json')) emitJson({ deleted: del });
-    else process.stdout.write(`removed session ${del} from Observatory and purged its captured edits (its transcript is untouched; \`oak sessions --undelete ${del}\` puts it back in the pickers, without those edits)\n`);
+    // oak sync's backup folder keeps its copy of a deleted session's store, which an undelete brings back (sync-store.ts).
+    else process.stdout.write(`removed session ${del} from Observatory and purged its captured edits (its transcript is untouched; \`oak sessions --undelete ${del}\` puts it back in the pickers, ${core.syncSettings().backup?.kind === 'folder' ? 'and the next `oak sync now` brings back what of its edits the backup folder holds' : 'without those edits'})\n`);
     return;
   }
   const undel = flagValue(args, '--undelete');
@@ -1809,30 +2941,56 @@ function cmdSessions(args: string[] = []): void {
   // transcripts, which live under the mangled launch cwd — so listed from outside the workspace the
   // rows fell back to bare session ids, which is what "the selector shows the id instead of the name"
   // was. The workspace is the session's, not the terminal's.
+  // `--machine <label>` reaches here only from a `views` batch (the main dispatch runs `sessions --machine` itself, on the
+  // machine or from the index): the terminal app's warm worker asks for a saved machine's sessions from the local index,
+  // which answers as `oak sessions --json --machine` does when it can, and asks that machine over ssh when it cannot.
+  const machine = flagValue(args, '--machine');
+  if (machine) {
+    const listed = core.indexedMachineSessions(machine, Date.now(), flagValue(args, '--session') ?? null);
+    if (!listed) fail(`${machine}'s sessions are not in the local database as oak sync read them lately, or one of them may be running: ask it over ssh`);
+    emitJson(listed);
+    return;
+  }
   const cwd = flagValue(args, '--root') ?? process.cwd();
-  const reviewing = args.includes('--session') ? getSessionId(args) : null;
-  const meta = core.sessionMeta(cwd, reviewing);
+  const reviewing = args.some(a => a === '--session' || a.startsWith('--session=')) ? getSessionId(args) : null;
+  // --all also lists Codex's Auto-review threads, which the listing leaves out.
+  const listOpts = { includeReviews: args.includes('--all') };
+  const meta = fromIndex('sessions', () => core.sessionMeta(cwd, reviewing, listOpts), (db) => core.indexedSessionMeta(db, cwd, reviewing, listOpts));
+  // `--synced`: every other machine's sessions this machine's index holds from its records, by label, with when oak
+  // sync last brought them (the index as the listing above left it; none where there is no index, or OAK_INDEX=off).
+  const machines = args.includes('--synced') ? machinesFromIndex(core) : null;
   if (args.includes('--json')) {
-    emitJson(meta);
+    // Other machines' raised hands as their records brought them, which every surface that polls this listing lists, and
+    // announces, labelled with their machine (core readSyncedHands).
+    const hands = core.readSyncedHands();
+    emitJson({ ...meta, ...(machines ? { machines } : {}), ...(hands.length ? { syncedHands: hands } : {}) });
     return;
   }
-  if (meta.sessions.length === 0) {
-    process.stdout.write(c.dim('no sessions on this machine yet.\n'));
+  if (meta.sessions.length === 0 && !machines?.some((m) => m.sessions.length)) {
+    process.stdout.write(c.dim(machines ? 'no sessions on this machine or in the records of another yet.\n' : 'no sessions on this machine yet.\n'));
     return;
   }
-  let workspace: string | undefined;
-  for (const s of meta.sessions) {
-    if (workspace !== s.workspace) {
-      workspace = s.workspace;
-      const count = meta.sessions.filter((r) => r.workspace === workspace).length;
-      process.stdout.write(`\n${c.bold(workspace || 'Unknown workspace')} · ${count} session${count === 1 ? '' : 's'}\n`);
+  const printRows = (rows: import('@oak-observatory/core').SessionMetaRow[], indent: string): void => {
+    let workspace: string | undefined;
+    for (const s of rows) {
+      if (workspace !== s.workspace) {
+        workspace = s.workspace;
+        const count = rows.filter((r) => r.workspace === workspace).length;
+        process.stdout.write(`\n${indent}${c.bold(workspace || 'Unknown workspace')} · ${count} session${count === 1 ? '' : 's'}\n`);
+      }
+      const mark = s.current ? c.green('● ') : '  ';
+      const agent = s.agent !== 'claude' ? `[${s.agent}] ` : '';
+      const stats = `${s.edits} edit${s.edits === 1 ? '' : 's'} · ${core.compactTokens(s.tokens)} tok · ${core.compactDuration(s.durationMs)} · ${s.model || 'model unknown'}`;
+      process.stdout.write(`${indent}${mark}${agent}${c.bold(s.title || s.id)}  ${c.dim(s.id)}  ${c.dim(stats + ' · ' + core.relTime(s.lastActiveMs))}\n`);
     }
-    const mark = s.current ? c.green('● ') : '  ';
-    const agent = s.agent !== 'claude' ? `[${s.agent}] ` : '';
-    const stats = `${s.edits} edit${s.edits === 1 ? '' : 's'} · ${core.compactTokens(s.tokens)} tok · ${core.compactDuration(s.durationMs)} · ${s.model || 'model unknown'}`;
-    process.stdout.write(`${mark}${agent}${c.bold(s.title || s.id)}  ${c.dim(s.id)}  ${c.dim(stats + ' · ' + core.relTime(s.lastActiveMs))}\n`);
+  };
+  printRows(meta.sessions, '');
+  for (const m of machines ?? []) {
+    const synced = m.syncedAt ? `synced ${core.relTime(m.syncedAt)}` : 'synced at a time not recorded';
+    process.stdout.write(`\n${c.bold(m.label)} ${c.dim(`· ${synced} · ${m.sessions.length} session${m.sessions.length === 1 ? '' : 's'} from its records`)}\n`);
+    printRows(m.sessions, '  ');
   }
-  process.stdout.write(c.dim('\n● = resolves for this workspace · sessions on this machine, grouped by workspace\nuse `--session <id>` to target another\n'));
+  process.stdout.write(c.dim(`\n● = resolves for this workspace · sessions on this machine${machines ? ', then each other machine\'s as oak sync last brought its records' : ''}, grouped by workspace\nuse \`--session <id>\` to target another\n`));
 
 }
 
@@ -2019,7 +3177,9 @@ function cmdReview(args: string[]): void {
   for (const u of rows) {
     const mem = u.members.length > 1 ? c.dim(` (${u.members.length} edits)`) : '';
     process.stdout.write(c.bold(`#${u.id} `) + `${u.rel}` + c.dim(` +${u.added}/−${u.removed}`) + mem + '\n');
-    if (u.patch) process.stdout.write(core.coloredDiff(session, byId.get(u.id) as EditRecord, isTTY()) + '\n');
+    // A bidirectional control or zero-width character in the file shows as the mark that names it (`⟨U+202E⟩`): the
+    // filter on this output drops them, and a line of code that hides one runs differently from how it reads.
+    if (u.patch) process.stdout.write(core.revealHidden(core.coloredDiff(session, byId.get(u.id) as EditRecord, isTTY()), isTTY()) + '\n');
   }
   // The footer: named, never a silent omission, and it carries the exact command that clears them.
   if (cancelled.length) {
@@ -2221,7 +3381,7 @@ function cmdActions(args: string[]): void {
     const tag = c.cyan(`[${a.category}]`.padEnd(9));
     const link = a.editId != null ? c.dim(` edit#${a.editId}`) : '';
     const detail = a.detail ? c.dim(`  (${a.detail})`) : '';
-    process.stdout.write(`${when} ${mark} ${tag} ${c.bold(a.tool.padEnd(10))} ${(a.target || '').slice(0, 80)}${link}${detail}\n`);
+    process.stdout.write(`${when} ${mark} ${tag} ${c.bold(a.tool.padEnd(10))} ${core.graphemeHead(a.target || '', 80)}${link}${detail}\n`);
   }
 }
 
@@ -2255,7 +3415,7 @@ function cmdRisk(args: string[]): void {
   process.stdout.write(c.bold('Risk') + c.dim(`  ${risky.length} flagged · ${high} high · session ${session}\n\n`));
   for (const r of risky) {
     const badge = r.level === 'high' ? c.red('● HIGH') : c.yellow('● MED ');
-    process.stdout.write(`${badge}  ${(r.target || '').slice(0, 74)}\n       ${c.dim(r.reasons.join(' · '))}\n`);
+    process.stdout.write(`${badge}  ${core.graphemeHead(r.target || '', 74)}\n       ${c.dim(r.reasons.join(' · '))}\n`);
   }
 
   // Writes that left the workspace. Risk otherwise only inspects commands, but "it edited files outside
@@ -2376,20 +3536,40 @@ function cmdProcesses(args: string[]): void {
   const viewRoot = flagValue(args, '--root') ?? process.cwd();
   const core = require('@oak-observatory/core') as Core;
   const session = getSessionId(args);
+  const follow = flagValue(args, '--follow');
+  if (args.includes('--follow') && !follow) fail('--follow requires a background shell id.');
+  if (follow) {
+    const output = processFollowOutput(args);
+    let stop = (): void => {};
+    const cancel = (): void => { stop(); process.removeListener('SIGINT', cancel); process.removeListener('SIGTERM', cancel); };
+    process.once('SIGINT', cancel); process.once('SIGTERM', cancel);
+    stop = core.followProcessOutput(viewRoot, session, follow, {
+      onSnapshot: snapshot => { output(snapshot); if (!snapshot.process.running) cancel(); },
+      onError: error => { process.stderr.write(`oak: ${error.message}\n`); process.exitCode = 1; cancel(); },
+    });
+    return;
+  }
   if (noTranscript(session, args.includes('--json'), flagValue(args, '--root') ?? undefined)) return;
+  const preview = flagValue(args, '--process-previews');
+  if (preview !== undefined) {
+    emitJson(core.processView(viewRoot, session, { previews: preview.split(','), selected: flagValue(args, '--process-selected') }));
+    return;
+  }
   const list = core.sessionProcesses(viewRoot, session);
   const sum = core.summarizeProcesses(list);
   // `--id <shell>` drills into ONE shell: the full command it is running, plus a tail of its output —
   // for a job that is still going, that tail is the only view of what it is actually doing.
   const want = flagValue(args, '--id');
   if (want) {
-    const p = list.find((x) => x.id === want);
+    const p = list.find((x) => core.processKey(x) === want);
     if (!p) fail(`no background shell "${want}" in session ${session}.`);
-    const tail = core.processOutputTail(p!.outputPath);
     if (args.includes('--json')) {
-      emitJson({ session, process: p, outputTail: tail });
+      const cursor = Number(flagValue(args, '--process-cursor'));
+      const source = flagValue(args, '--process-source');
+      emitJson(core.processSnapshot(viewRoot, session, want, source && Number.isSafeInteger(cursor) && cursor >= 0 ? { cursor, source } : undefined, list));
       return;
     }
+    const tail = p!.recordedOutput !== undefined ? core.plainProcessOutput(p!.recordedOutput) : core.processOutputTail(p!.outputPath);
     process.stdout.write(c.bold(p!.id) + c.dim(`  ${p!.running ? 'running' : p!.status}${p!.exitCode !== null ? ` (exit ${p!.exitCode})` : ''} · ${fmtDur(p!.runtimeMs)}\n\n`));
     if (p!.description) process.stdout.write(c.dim(`${p!.description}\n\n`));
     process.stdout.write(`${p!.command}\n`);
@@ -2417,8 +3597,8 @@ function cmdProcesses(args: string[]): void {
           ? c.dim('exit 0 ')
           : c.red(`exit ${p.exitCode}`);
     const out = p.outputBytes ? c.dim(` · ${human(p.outputBytes)}B out`) : '';
-    process.stdout.write(`${state}  ${c.cyan(p.id.padEnd(11))} ${fmtDur(p.runtimeMs).padStart(7)}${out}\n`);
-    process.stdout.write(c.dim(`             ${(p.description || p.command).replace(/\s+/g, ' ').slice(0, 84)}\n`));
+    process.stdout.write(`${state}  ${c.cyan(core.processKey(p).padEnd(11))} ${fmtDur(p.runtimeMs).padStart(7)}${out}\n`);
+    process.stdout.write(c.dim(`             ${core.graphemeHead((p.description || p.command).replace(/\s+/g, ' '), 84)}\n`));
   }
   process.stdout.write(c.dim('\nshell ids are the harness’s own — no OS pid is recorded in the transcript\n'));
 }
@@ -2450,7 +3630,25 @@ function cmdFeed(args: string[]): void {
   // never perturbs any other view that shares the batch's argv.
   const limitRaw = flagValue(args, '--feed-limit') ?? flagValue(args, '--limit');
   const limit = limitRaw ? Math.max(1, Number(limitRaw) || 0) : undefined;
-  const res = core.liveFeed(viewRoot, session, { kind, id }, limit ? { limit } : {});
+  if (args.includes('--follow')) {
+    if (kind !== 'agent') fail('--follow requires --kind agent --id <worker>.');
+    const output = workerFeedOutput(args);
+    let stop = (): void => {};
+    const cancel = (): void => { stop(); process.removeListener('SIGINT', cancel); process.removeListener('SIGTERM', cancel); };
+    process.once('SIGINT', cancel); process.once('SIGTERM', cancel);
+    stop = core.followWorkerFeed(viewRoot, session, id, {
+      limit,
+      onError: error => { process.stderr.write(`oak: ${error.message}\n`); process.exitCode = 1; cancel(); },
+      onFeed: feed => {
+        output(feed);
+        if (feed.endedTs) cancel();
+      },
+    });
+    return;
+  }
+  const sinceRaw = flagValue(args, '--feed-since-entry');
+  const sinceEntry = sinceRaw !== undefined && /^\d+$/.test(sinceRaw) ? Number(sinceRaw) : undefined;
+  const res = core.liveFeed(viewRoot, session, { kind, id }, { limit, sinceEntry });
   if (args.includes('--json')) {
     // The session RECAP rides the feed payload (0.10.0): the terminal's Agent screen shows it
     // directly above its prompt, and this is the view that surface already polls. `recapOf` is the
@@ -2468,14 +3666,103 @@ function cmdFeed(args: string[]): void {
     emitJson({ ...res, ...recap });
     return;
   }
+  printFeed(res, kind);
+}
+
+/** Follow output is append-only in a terminal; JSON callers receive one snapshot per line. */
+function workerFeedOutput(args: string[]): (feed: import('@oak-observatory/core').FeedResult) => void {
+  let first = true;
+  let previous = new Map<string, number>();
+  return feed => {
+    if (args.includes('--json')) { emitJson(feed); process.stdout.write('\n'); }
+    else {
+      const counts = new Map<string, number>();
+      const entries = feed.entries.filter(entry => {
+        const key = JSON.stringify(entry), n = (counts.get(key) ?? 0) + 1;
+        counts.set(key, n);
+        return n > (previous.get(key) ?? 0);
+      });
+      printFeed({ ...feed, entries }, 'agent', first);
+      previous = counts;
+    }
+    first = false;
+  };
+}
+
+function processFollowOutput(args: string[]): (snapshot: import('@oak-observatory/core').ProcessSnapshot) => void {
+  let note = '';
+  return snapshot => {
+    if (args.includes('--json')) { emitJson(snapshot); process.stdout.write('\n'); }
+    else {
+      if (snapshot.note && snapshot.note !== note) process.stderr.write(`oak: ${snapshot.note}\n`);
+      note = snapshot.note || '';
+      process.stdout.write((require('@oak-observatory/core') as Core).plainProcessOutput(snapshot.outputDelta));
+    }
+  };
+}
+
+/** Each remote read uses the existing --machine transport, including its timeout and SSH errors.
+ * No remote follower is left behind when this viewer closes. */
+function followMachineWorker(args: string[], processId?: string): void {
+  const core = require('@oak-observatory/core') as Core;
+  if (!processId && ((flagValue(args, '--kind') ?? '') !== 'agent' || !flagValue(args, '--id'))) fail('--follow requires --kind agent --id <worker>.');
+  const output = processId ? processFollowOutput(args) : workerFeedOutput(args);
+  let previous: import('@oak-observatory/core').ProcessSnapshot | undefined;
+  let child: ReturnType<typeof core.spawnTool> | undefined;
+  let timer: NodeJS.Timeout | undefined;
+  let closed = false, sinceEntry: number | undefined;
+  let session = flagValue(args, '--session');
+  const stop = (): void => {
+    closed = true; clearTimeout(timer); child?.kill();
+    process.removeListener('SIGINT', stop); process.removeListener('SIGTERM', stop);
+  };
+  process.once('SIGINT', stop); process.once('SIGTERM', stop);
+  const read = (): void => {
+    if (closed) return;
+    const argv = processId ? args.filter((a, i) => a !== '--json' && a !== '--follow' && args[i - 1] !== '--follow' && !a.startsWith('--follow='))
+      : args.filter(a => a !== '--follow' && a !== '--json');
+    if (processId) argv.push('--id', processId);
+    if (previous) argv.push('--process-cursor', String(previous.cursor), '--process-source', previous.source);
+    if (session && !flagValue(args, '--session')) argv.push('--session', session);
+    if (sinceEntry !== undefined) argv.push('--feed-since-entry', String(sinceEntry));
+    const run = core.spawnTool(process.execPath, [__filename, processId ? 'processes' : 'feed', ...argv, '--json'], { stdio: ['ignore', 'pipe', 'pipe'] });
+    child = run;
+    let out = '', err = '';
+    run.stdout?.on('data', d => { out += d; });
+    run.stderr?.on('data', d => { err += d; });
+    run.on('error', error => { if (!closed) { process.stderr.write(`oak: ${error.message}\n`); process.exitCode = 1; stop(); } });
+    run.on('close', code => {
+      child = undefined;
+      if (closed) return;
+      if (code !== 0) { process.stderr.write(err || `oak: remote worker log exited ${code}\n`); process.exitCode = code || 1; stop(); return; }
+      try {
+        const feed = JSON.parse(out) as import('@oak-observatory/core').ProcessSnapshot;
+        if (processId && (feed.processLogVersion !== 1 || !feed.process || typeof feed.outputTail !== 'string'))
+          throw new Error(`update OAK on ${flagValue(args, '--machine')} for live process output`);
+        if (!processId && (feed.workerLogVersion !== 1 || feed.ref?.kind !== 'agent' || !Array.isArray(feed.entries)))
+          throw new Error(`update OAK on ${flagValue(args, '--machine')} — this build does not support live worker logs`);
+        session ??= feed.session;
+        if (processId) previous = feed;
+        else sinceEntry = feed.truncated + feed.entries.length;
+        output(feed);
+        if (feed.endedTs || (processId && !feed.process.running)) { stop(); return; }
+        timer = setTimeout(read, 10000);
+      } catch (error) { process.stderr.write(`oak: ${String((error as Error).message || error)}\n`); process.exitCode = 1; stop(); }
+    });
+  };
+  read();
+}
+
+function printFeed(res: import('@oak-observatory/core').FeedResult, kind: string, heading = true): void {
+  const core = require('@oak-observatory/core') as Core;
   const age = res.lastTs ? core.relTime(res.lastTs) : 'no activity yet';
   // Print core's own mode, not a re-derived running/idle: live-vs-audit IS the feature, and both editors
   // and the docs present it in exactly these words.
   const mode = res.mode === 'live' ? c.green('● live') : c.dim('▣ audit log');
-  process.stdout.write(c.bold(res.title) + c.dim(`  `) + mode + c.dim(` · ${age} · ${kind}\n`));
-  if (res.note) process.stdout.write(c.dim(`${res.note}\n`));
-  process.stdout.write('\n');
-  if (res.truncated) process.stdout.write(c.dim(`… ${res.truncated} earlier entr${res.truncated === 1 ? 'y' : 'ies'} not shown\n`));
+  if (heading) process.stdout.write(c.bold(res.title) + c.dim(`  `) + mode + c.dim(` · ${age} · ${kind}\n`));
+  if (res.note && (heading || res.endedTs)) process.stdout.write(c.dim(`${res.note}\n`));
+  if (heading) process.stdout.write('\n');
+  if (heading && res.truncated) process.stdout.write(c.dim(`… ${res.truncated} earlier entr${res.truncated === 1 ? 'y' : 'ies'} not shown\n`));
   const { wrapVisible, stripSgr } = require('@oak-observatory/tui') as typeof import('@oak-observatory/tui');
   for (const e of res.entries) {
     if (e.kind === 'output') {
@@ -2491,7 +3778,7 @@ function cmdFeed(args: string[]): void {
     for (const source of line.split('\n')) for (const part of wrapVisible(source, process.stdout.columns || 100))
       process.stdout.write((e.reasoningKind === 'thinking' ? c.dim(stripSgr(part)) : part) + '\n');
   }
-  if (!res.entries.length) process.stdout.write(c.dim('nothing recorded yet\n'));
+  if (heading && !res.entries.length) process.stdout.write(c.dim('nothing recorded yet\n'));
 }
 
 /** `conversation` — the transcript as renderer-ready session updates. JSON is the pane contract. */
@@ -2542,8 +3829,12 @@ function cmdPrompts(args: string[]): void {
   const viewRoot = flagValue(args, '--root') ?? process.cwd();
   const core = require('@oak-observatory/core') as Core;
   const session = getSessionId(args);
-  if (noTranscript(session, args.includes('--json'), flagValue(args, '--root') ?? undefined)) return;
-  const reqs = core.sessionPrompts(viewRoot, session);
+  // A session whose transcript is gone (an audit-log session: its store stays) lists the asks and answers the local
+  // index kept of it. Only where the index holds none is there nothing to list, and the CLI says why.
+  const archived = core.findTranscript(flagValue(args, '--root') ?? process.cwd(), session) ? null : core.indexedSessionPrompts(session);
+  if (!archived && noTranscript(session, args.includes('--json'), flagValue(args, '--root') ?? undefined)) return;
+  const fromArchive = archived ? { fromIndex: true, note: 'the transcript is gone; these asks and answers are what the local database kept of it' } : {};
+  const reqs = archived ? archived.prompts : core.sessionPrompts(viewRoot, session);
   const want = flagValue(args, '--id');
   if (want) {
     const r = reqs.find((x) => x.id === want || String(x.index) === want);
@@ -2551,9 +3842,12 @@ function cmdPrompts(args: string[]): void {
     // `--response`: Claude's own prose in reply to this ask (its tool calls stripped) — the log a
     // reviewer expands to read. Fetched lazily because it can be large.
     if (args.includes('--response')) {
-      const resp = core.promptResponse(viewRoot, session, r!.id);
+      const kept = archived?.responses.get(r!.id);
+      const resp = archived
+        ? { promptId: r!.id, index: r!.index, text: kept ?? '', turns: kept ? 1 : 0, bytes: Buffer.byteLength(kept ?? ''), truncated: 0 }
+        : core.promptResponse(viewRoot, session, r!.id);
       if (args.includes('--json')) {
-        emitJson({ session, response: resp });
+        emitJson({ session, response: resp, ...fromArchive });
         return;
       }
       if (!resp || !resp.text) {
@@ -2566,7 +3860,7 @@ function cmdPrompts(args: string[]): void {
       return;
     }
     if (args.includes('--json')) {
-      emitJson({ session, prompt: r });
+      emitJson({ session, prompt: r, ...fromArchive });
       return;
     }
     process.stdout.write(c.bold(`#${r!.index}`) + c.dim(`  ${core.relTime(r!.ts)} · ${fmtDur(r!.durationMs)}\n\n`));
@@ -2597,6 +3891,7 @@ function cmdPrompts(args: string[]): void {
       summary: core.summarizePrompts(reqs),
       prompts: reqs,
       ...(assignErrors.length ? { assignErrors } : {}),
+      ...fromArchive,
     });
     return;
   }
@@ -2605,7 +3900,8 @@ function cmdPrompts(args: string[]): void {
     process.stdout.write(c.dim(`no user prompts recorded in session ${session}.\n`));
     return;
   }
-  process.stdout.write(c.bold('Prompts') + c.dim(`  ${sum.total} asked · ${sum.withEdits} produced edits · ${sum.edits} edit(s) total · session ${session}\n\n`));
+  process.stdout.write(c.bold('Prompts') + c.dim(`  ${sum.total} asked · ${sum.withEdits} produced edits · ${sum.edits} edit(s) total · session ${session}\n`));
+  process.stdout.write(archived ? c.dim(`  ${fromArchive.note}\n\n`) : '\n');
   for (const r of reqs) {
     const facts: string[] = [];
     if (r.edits) facts.push(c.cyan(`${r.edits}e`) + c.dim(` ${r.files}f ${r.folders}fo`));
@@ -2701,17 +3997,35 @@ function cmdSubagents(args: string[]): void {
       .filter(Boolean)
       .join(' · ');
     process.stdout.write(c.cyan('▸ ') + c.bold(title) + c.dim(`  ${meta}\n`));
-    if (s.description && s.agentType) process.stdout.write('   ' + c.dim(s.description.slice(0, 100)) + '\n');
+    if (s.description && s.agentType) process.stdout.write('   ' + c.dim(core.graphemeHead(s.description, 100)) + '\n');
     for (const a of s.actions.slice(0, limit)) {
       const mark = a.isError ? c.red('✗') : ' ';
-      process.stdout.write(`   ${mark} ${c.dim(`[${a.category}]`.padEnd(9))} ${c.bold(a.tool)} ${(a.target || '').slice(0, 56)}\n`);
+      process.stdout.write(`   ${mark} ${c.dim(`[${a.category}]`.padEnd(9))} ${c.bold(a.tool)} ${core.graphemeHead(a.target || '', 56)}\n`);
     }
     if (s.actions.length > limit) process.stdout.write(c.dim(`   … ${s.actions.length - limit} more (\`--all\` to expand)\n`));
     process.stdout.write('\n');
   }
 }
 
-/** `siblings` (alias `fleet`) — the other Claude Code sessions in THIS project: active/idle, pending
+async function workerFleetValue(args: string[]) {
+  const core = require('@oak-observatory/core') as Core;
+  const cwd = flagValue(args, '--root') ?? process.cwd();
+  const session = flagValue(args, '--session') ?? null;
+  const result = await core.readWorkerFleet(cwd, session, { allRecent: args.includes('--workers') });
+  const findings = core.findingsBoard();
+  return { ...result, findings };
+}
+
+async function cmdWorkerFleet(args: string[]): Promise<void> {
+  const core = require('@oak-observatory/core') as Core;
+  const result = await workerFleetValue(args);
+  const { findings } = result;
+  if (args.includes('--json')) return emitJson(result);
+  printFindingsBoard(findings);
+  for (const w of result.workers) process.stdout.write(`${w.title} · ${w.machine} · ${w.kind} · ${w.state} · ${core.compactTokens(w.tokens)} tok · ${core.relTime(w.lastActiveMs)}\n`);
+}
+
+/** `siblings` — the other Claude Code sessions in THIS project: active/idle, pending
  *  edits, files touched, risk flags. Agent-facing digest (call it mid-run to see what siblings touch);
  *  --json defaults to siblings only (excludes self), --all includes self. */
 function cmdSiblings(args: string[]): void {
@@ -2724,13 +4038,23 @@ function cmdSiblings(args: string[]): void {
     ? core.listRepoSiblings(process.cwd(), session)
     : core.listSiblings(process.cwd(), session);
   const sum = core.summarizeFleet(sessions);
+  // --repo: the other machines' sessions of this repository too, from the local index (their records), read-only here.
+  const elsewhere = args.includes('--repo') ? core.repoSessionsElsewhere(process.cwd()) : [];
   if (args.includes('--json')) {
     const list = args.includes('--all') ? sessions : sessions.filter((s) => !s.self);
-    emitJson({ session, summary: sum, siblings: list });
+    emitJson({ session, summary: sum, siblings: list, ...(args.includes('--repo') ? { machines: elsewhere } : {}) });
     return;
   }
+  const printElsewhere = (): void => {
+    for (const m of elsewhere) {
+      process.stdout.write(`\n${c.bold(m.machine)} ${c.dim(`· synced ${m.syncedAt ? core.relTime(m.syncedAt) : 'at a time not recorded'} · read-only here: its sessions are reviewed on ${m.machine}`)}\n`);
+      // The whole id: `--session <id> --machine <label>` takes it exactly, there.
+      for (const r of m.sessions) process.stdout.write(`${c.dim('○')} ${c.bold(r.id)}  ${r.title ?? ''}  ${c.dim(`${r.edits} edit(s) · ${r.pending} pending · ${core.relTime(r.lastMs)}`)}\n`);
+    }
+  };
   if (sessions.filter((s) => !s.self).length === 0) {
     process.stdout.write(c.dim(`no sibling sessions in this project (only ${session}).\n`));
+    printElsewhere();
     return;
   }
   process.stdout.write(
@@ -2749,6 +4073,7 @@ function cmdSiblings(args: string[]): void {
       process.stdout.write('   ' + c.dim(shown.join(', ') + (s.moreFiles ? ` +${s.moreFiles} more` : '')) + '\n');
     }
   }
+  printElsewhere();
 }
 
 
@@ -2756,11 +4081,56 @@ function cmdSiblings(args: string[]): void {
  *  worktree of this repo (live phase, sparkline, ±lines, risk), its nested subagents (phase + current
  *  task/todos + ±lines), and the cross-agent live file conflicts. One JSON payload; both editors render it
  *  thin, no client aggregation. Zero token, git-free, path-only. */
+/** One session's Workers rows: each subagent's digest with the ±lines its edits made (from its change map). */
+function subagentRows(core: Core, worktree: string, session: string, map: import('@oak-observatory/core').ChangeMap) {
+  const subRoll = new Map(map.rollupBySubagent.map((r) => [r.subagentId, r])); // per-subagent ±lines
+  // Digests, not full parses: a fleet row needs identity, plan and live phase — never the subagent's
+  // action list, which is what made this the slowest remaining part of a refresh.
+  return core.subagentDigests(worktree, session).map((s) => {
+    const roll = subRoll.get(s.agentId);
+    return {
+      agentId: s.agentId,
+      agentType: s.agentType ?? null,
+      description: s.description ?? null,
+      phase: s.phase,
+      phaseConfidence: s.phaseConfidence, // 'high' | 'heuristic' — renderers dim staleness-inferred phases
+      running: s.running, // the digest's own liveness — dropping it left consumers deriving it from prose
+      todos: s.todos,
+      currentTask: s.currentTask,
+      ts: s.ts ?? 0, // spawn time — so the detail pane can order most-recent-first and show its age
+      model: s.model ?? '', // the spawn's OWN model/effort, from its transcript
+      effort: s.effort ?? '',
+      edits: roll ? roll.edits : 0,
+      added: roll ? roll.added : 0,
+      removed: roll ? roll.removed : 0,
+      // What the subagent cost, so the Workers tab shows it the same metrics as its parent.
+      tokens: s.tokens ?? 0,
+      // The ↑in·↓out·↺cacheRead split the statusline shows.
+      tokensIn: s.tokensIn ?? 0,
+      tokensOut: s.tokensOut ?? 0,
+      tokensCacheRead: s.tokensCacheRead ?? 0,
+      durationMs: s.durationMs ?? 0,
+    };
+  });
+}
+
 function cmdMultitask(args: string[]): void {
   const core = require('@oak-observatory/core') as Core;
   const session = getSessionId(args);
   const ri = args.indexOf('--root'); // repo-scoped: honor --root like changemap/tree (editors point it at the workspace)
   const cwd = flagValue(args, '--root') ?? process.cwd();
+  // `--only-session`: the session's own row, as the full read carries it, and only what the terminal app's
+  // Workers and Tasks draw from it. The full read builds every sibling's row and the session's actions,
+  // and a saved machine sends all of it over ssh (5.2 MB, 6.7 s for a 300-worker session on the Mac).
+  // Its worktree is the transcript's own cwd, as listRepoSiblings gives it, so both reads share one cache slot. A
+  // transcript the root does not lead to gets the whole fleet, as before: the session may still be one of its rows.
+  const own = args.includes('--only-session') ? core.findTranscript(cwd, session) : null;
+  if (own) {
+    const worktree = core.firstCwdLine(own)?.cwd ?? cwd;
+    const view = core.siblingOverview(worktree, session, { root: worktree });
+    emitJson({ agents: [{ session, subagents: subagentRows(core, worktree, session, view.map), todos: view.todos }] });
+    return;
+  }
   const siblings = core.listRepoSiblings(cwd, session);
   const fleet = core.summarizeFleet(siblings);
   const collisions = core.fleetConflicts(siblings); // live conflicts: a file pending in 2+ both-active siblings
@@ -2831,35 +4201,7 @@ function cmdMultitask(args: string[]): void {
     // Per-sibling tokens + wall-clock (one light transcript pass) — so Fleet shows the same metric style
     // as Workflows already do. Cached on this slow tier alongside buildChangeMap.
     const usage = core.sessionUsage(sib.worktree, sib.id);
-    const subRoll = new Map(map.rollupBySubagent.map((r) => [r.subagentId, r])); // per-subagent ±lines
-    // Digests, not full parses: a fleet row needs identity, plan and live phase — never the subagent's
-    // action list, which is what made this the slowest remaining part of a refresh.
-    const subagents = core.subagentDigests(sib.worktree, sib.id).map((s) => {
-      const roll = subRoll.get(s.agentId);
-      return {
-        agentId: s.agentId,
-        agentType: s.agentType ?? null,
-        description: s.description ?? null,
-        phase: s.phase,
-        phaseConfidence: s.phaseConfidence, // 'high' | 'heuristic' — renderers dim staleness-inferred phases
-        running: s.running, // the digest's own liveness — dropping it left consumers deriving it from prose
-        todos: s.todos,
-        currentTask: s.currentTask,
-        ts: s.ts ?? 0, // spawn time — so the detail pane can order most-recent-first and show its age
-        model: s.model ?? '', // the spawn's OWN model/effort, from its transcript
-        effort: s.effort ?? '',
-        edits: roll ? roll.edits : 0,
-        added: roll ? roll.added : 0,
-        removed: roll ? roll.removed : 0,
-        // What the subagent cost, so the Workers tab shows it the same metrics as its parent.
-        tokens: s.tokens ?? 0,
-        // The ↑in·↓out·↺cacheRead split the statusline shows.
-        tokensIn: s.tokensIn ?? 0,
-        tokensOut: s.tokensOut ?? 0,
-        tokensCacheRead: s.tokensCacheRead ?? 0,
-        durationMs: s.durationMs ?? 0,
-      };
-    });
+    const subagents = subagentRows(core, sib.worktree, sib.id, map);
     return {
       session: sib.id,
       worktree: sib.worktree,
@@ -2925,6 +4267,10 @@ function cmdMultitask(args: string[]): void {
     agents,
     collisions,
     worktrees: [...wtBy.values()],
+    // The agents OAK started from a brief, with their state and their workers (core delegated.ts): every surface's Workers
+    // lists them beside the sessions above.
+    delegated: core.listDelegated(),
+    findings: core.findingsBoard(),
     // Workflow runs (one level above subagents) for the ACTIVE session — aggregated in core, rendered thin.
     workflows: core.parseWorkflows(cwd, session),
     // The ACTIVE session's task list for the Overview's Tasks tab, across BOTH task generations:
@@ -3105,15 +4451,153 @@ function refuseUnsupportedDryRun(args: string[], verb: string): void {
   if (previewable && args.includes(previewable)) return;
   fail(
     `\`${verb} --dry-run\` is not supported.\n` +
-      '  Only `undo --from-prompt <id> --dry-run` and `clean --completed --dry-run` can preview;\n' +
+      '  Only `undo --from-prompt <id> --dry-run`, `clean --completed --dry-run` and `ignore --dry-run` can preview;\n' +
       '  every other scope would perform the change it was asked to describe.\n' +
       `  Drop --dry-run to ${verb} for real.`
   );
 }
 
+/** Editor handoffs are written on the session's machine through the ordinary --machine route. */
+function cmdEditorReview(args: string[]): void {
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
+  const fs = require('fs'), path = require('path'), os = require('os');
+  const sub = args[0], editor = flagValue(args, '--editor') ?? 'vscode';
+  if (sub === 'consume') {
+    const workspace = flagValue(args, '--workspace');
+    if (!workspace) fail('editor-review consume needs --workspace');
+    return emitJson({ request: core.consumeEditorReviewRequest(editor, workspace) });
+  }
+  if (sub === 'connection') {
+    const target = flagValue(args, '--target');
+    if (!target || target.startsWith('-') || /[\s\0]/.test(target)) fail('Invalid SSH target');
+    const r = core.spawnToolSync('ssh', ['-G', target], { encoding: 'utf8', timeout: 5000, direct: true, env: core.machineSshEnv() });
+    if (r.status !== 0) fail('Could not resolve the saved SSH target');
+    const values = new Map(String(r.stdout).split('\n').map(l => { const i = l.indexOf(' '); return [l.slice(0, i), l.slice(i + 1).trim()]; }));
+    return emitJson({ host: values.get('hostname'), user: values.get('user'), port: Number(values.get('port')) });
+  }
+  if (sub === 'map') {
+    const remote = JSON.parse(flagValue(args, '--remote') ?? '{}');
+    const files = flagValue(args, '--files');
+    const paths: string[] = files ? JSON.parse(files) : [flagValue(args, '--file') ?? ''];
+    if (!Array.isArray(paths) || paths.length > 10 || paths.some(f => typeof f !== 'string')) fail('map accepts at most 10 file paths');
+    const mounts = core.readMountTable();
+    const roots = new Map<string, string>();
+    const mapped = [...new Set(paths)].map(file => {
+      const local = core.mapReviewPath(file, flagValue(args, '--target') ?? '', remote, mounts);
+      const mount = local && mounts.filter(m => local.startsWith(m.mount + '/')).sort((a, b) => b.mount.length - a.mount.length)[0];
+      try {
+        if (local && mount && fs.existsSync(local)) {
+          if (!roots.has(mount.mount)) roots.set(mount.mount, fs.realpathSync(mount.mount));
+          if (fs.realpathSync(local).startsWith(roots.get(mount.mount)! + path.sep)) return { remote: file, file: local };
+        }
+      } catch { /* missing or unreachable share: use the recorded contents */ }
+      return { remote: file, file: null };
+    });
+    return emitJson(files ? { files: mapped } : { file: mapped[0]?.file ?? null });
+  }
+  const session = getSessionId(args);
+  const workspace = core.sessionWorkspace(session);
+  if (!workspace || !path.isAbsolute(workspace)) fail('The session has no recorded workspace; open its project over SSH and select the session in OAK.');
+  if (sub === 'snapshot') {
+    const file = flagValue(args, '--file');
+    const text = (sha: string | null): string => sha ? core.readBlob(session, sha).toString('utf8') : '';
+    return emitJson({ records: core.readLog(session).filter(r => r.file === file).map(r => ({ ...r, before: text(r.beforeBlob), after: text(r.afterBlob) })) });
+  }
+  const home = os.homedir();
+  let idePath: string | null = null;
+  let ideDataDirectory: string | null = null;
+  const dist = path.join(home, '.cache', 'JetBrains', 'RemoteDev', 'dist');
+  const product = flagValue(args, '--product');
+  try {
+    for (const name of fs.readdirSync(dist).sort().reverse()) {
+      const dir = path.join(dist, name);
+      try {
+        const info = JSON.parse(fs.readFileSync(path.join(dir, 'product-info.json'), 'utf8'));
+        if ((!product || info.productCode === product) && fs.existsSync(path.join(dir, 'bin', 'remote-dev-server.sh'))) { idePath = dir; ideDataDirectory = info.dataDirectoryName ?? null; break; }
+      } catch { /* not an installed backend */ }
+    }
+  } catch { /* Gateway has not deployed an IDE yet */ }
+  const installed = editor === 'jetbrains'
+    ? jetbrainsPluginDirs(true).some(d => {
+      // Current backends use the product's data directory; legacy backends isolate plugins per project.
+      const legacy = d.includes('RemoteDev-') && path.basename(path.dirname(d)) === workspace.replace(/\//g, '_') &&
+        (!product || d.includes('RemoteDev-' + product));
+      const shared = ideDataDirectory && path.basename(d) === ideDataDirectory;
+      return (legacy || shared) && fs.existsSync(path.join(d, JB_PLUGIN_DIRNAME));
+    })
+    // A Remote-SSH window runs the extension from its server's own row (`cursor-server`, `code-server`, …).
+    : vscodeEditors().some(e => e.server && e.cliName.startsWith(editor === 'cursor' ? 'cursor-server' : 'code-server') && e.version !== null);
+  const selectedEdit = flagValue(args, '--edit');
+  const info = { workspace, home, hostname: os.hostname(), user: os.userInfo().username, shares: core.readMountTable(), installed, idePath,
+    file: selectedEdit ? core.findRecord(session, Number(selectedEdit))?.file ?? null : null };
+  if (sub === 'info') return emitJson(info);
+  if (sub !== 'prepare') fail('Use editor-review info, prepare, consume, snapshot, map or connection');
+  const action = flagValue(args, '--action') as import('@oak-observatory/core').EditorReviewRequest['action'];
+  const edit = flagValue(args, '--edit'), file = flagValue(args, '--file'), prompt = flagValue(args, '--prompt');
+  const records = core.reviewEdits(session);
+  if (action === 'edit' && (!edit || !records.some(r => r.id === Number(edit)) && !core.findRecord(session, Number(edit)))) fail('Requested edit is absent');
+  if (action === 'file' && (!file || !core.readLog(session).some(r => r.file === file))) fail('Requested file is absent');
+  const request = core.writeEditorReviewRequest({ editor: editor as 'vscode' | 'cursor' | 'jetbrains', workspace, session, action,
+    ...(edit ? { edit: Number(edit) } : {}), ...(file ? { file } : {}), ...(prompt ? { prompt } : {}) });
+  emitJson({ ...info, request });
+}
+
 function cmdDiff(args: string[]): void {
   const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
   const session = getSessionId(args);
+  const batch = flagValue(args, '--ids');
+  const pending = args.includes('--pending');
+  // `--ids … --patch`: each edit's patch exactly as `diff <id> --patch` prints it, keyed by id. The terminal app reads a
+  // saved machine's previews this way, all in one ssh call; it made one call per edit before, 289 for one window of a
+  // 2,600-edit session. There is no cap, since only that reader asks. An edit that cannot be read goes in `errors`
+  // and does not fail the rest.
+  if (batch !== undefined && !pending && args.includes('--patch')) {
+    const ids = batch.split(',').map(Number);
+    if (ids.some(id => !Number.isSafeInteger(id) || id < 1)) fail('diff --ids accepts positive edit ids');
+    const byId = new Map(core.reviewEdits(session).map(rec => [rec.id, rec]));
+    const patches: Record<number, string> = {}, errors: Record<number, string> = {};
+    for (const id of ids) {
+      try {
+        const rec = byId.get(id) ?? core.findRecord(session, id);
+        if (!rec) throw new Error(`no edit #${id} in session ${session}`);
+        patches[id] = core.coloredDiff(session, rec as EditRecord, false) + '\n';
+      } catch (error) { errors[id] = error instanceof Error ? error.message : String(error); }
+    }
+    return emitJson({ patches, errors });
+  }
+  if (batch !== undefined || pending) {
+    if (pending && batch !== undefined) fail('Use either --pending or --ids');
+    let ids = batch?.split(',').map(Number) ?? [];
+    if (!pending && (!ids.length || ids.length > 10 || ids.some(id => !Number.isSafeInteger(id) || id < 1))) fail('diff --ids accepts 1–10 positive edit ids');
+    const budget = Number(flagValue(args, '--preview-lines') ?? '50');
+    if (!Number.isSafeInteger(budget) || budget < 0) fail('--preview-lines must be a nonnegative integer');
+    const byId = new Map(core.reviewEdits(session).map(rec => [rec.id, rec]));
+    let prompt: { index: number } | undefined;
+    if (pending) {
+      const promptId = flagValue(args, '--prompt');
+      const ask = promptId ? core.promptWindows(core.sessionWorkspace(session) ?? process.cwd(), session).find(p => p.id === promptId) : undefined;
+      const cancelled = core.cancelledGroups(session);
+      ids = (ask ? ask.editIds : [...byId.keys()]).filter(id => byId.get(id)?.status === 'pending' && !cancelled.has(id));
+      if (ask) prompt = { index: ask.index };
+    }
+    const requestedOffset = Number(flagValue(args, '--offset') ?? '0');
+    if (!Number.isSafeInteger(requestedOffset) || requestedOffset < 0) fail('--offset must be a nonnegative integer');
+    const offset = pending ? Math.min(requestedOffset, Math.floor(Math.max(0, ids.length - 1) / 10) * 10) : 0;
+    const pageIds = pending ? ids.slice(offset, offset + 10) : ids;
+    const records = pageIds.map(id => {
+      const rec = byId.get(id) ?? core.findRecord(session, id);
+      if (!rec) fail(`no edit #${id} in session ${session}`);
+      const patch = core.coloredDiff(session, rec, false).split('\n');
+      const start = patch.findIndex(l => l.startsWith('@@'));
+      const lines = (start < 0 ? patch : patch.slice(start)).filter((l, i, a) => l.length > 0 || i < a.length - 1);
+      const omittedLines = budget > 0 ? Math.max(0, lines.length - budget * 2) : 0;
+      const text = (sha: string | null) => sha ? core.readBlob(session, sha).toString('utf8') : '';
+      return { rec, ...core.lineDelta(session, rec), patch: (omittedLines ? lines.slice(0, budget * 2) : lines).join('\n'),
+        ...(args.includes('--contents') ? budget > 0 ? core.previewPair(session, rec, budget) : { before: text(rec.beforeBlob), after: text(rec.afterBlob) } : {}), omittedLines };
+    });
+    const os = require('os');
+    return emitJson({ records, ...(pending ? { ids, prompt, offset } : {}), ...(args.includes('--contents') ? { paths: { home: os.homedir(), hostname: os.hostname(), user: os.userInfo().username, shares: core.readMountTable() } } : {}) });
+  }
   const id = requireId(args);
   // The DISPLAY record first: every list shows collapsed review units, and `diff <id>` on a unit's
   // row must render the unit's whole net change — not the raw last hop, which shows a slice of what
@@ -3121,8 +4605,16 @@ function cmdDiff(args: string[]): void {
   // hand-typed member id keeps meaning the single record it names.
   const rec = core.reviewEdits(session).find((r) => r.id === id) ?? core.findRecord(session, id);
   if (!rec) fail(`no edit #${id} in session ${session}`);
-  if (args.includes('--json')) return emitJson({ session, id, file: rec.file, patch: core.coloredDiff(session, rec as EditRecord, false) });
-  process.stdout.write(core.coloredDiff(session, rec as EditRecord, isTTY()) + '\n');
+  if (args.includes('--json')) {
+    const text = (sha: string | null): string => sha ? core.readBlob(session, sha).toString('utf8') : '';
+    return emitJson({ session, id, file: rec.file, patch: core.coloredDiff(session, rec as EditRecord, false),
+      ...(args.includes('--contents') ? { before: text(rec.beforeBlob), after: text(rec.afterBlob) } : {}) });
+  }
+  // A bidirectional control or zero-width character in the file shows as the mark that names it (`⟨U+202E⟩`) wherever
+  // this output is filtered for a person, which drops them: on a terminal, and in a pipe unless it is `--patch`, which a
+  // pipe gets byte for byte (the terminal app reads a saved machine's patch that way, and shows the marks itself).
+  const patch = core.coloredDiff(session, rec as EditRecord, isTTY());
+  process.stdout.write((!isTTY() && args.includes('--patch') ? patch : core.revealHidden(patch, isTTY())) + '\n');
   // `--patch` means "the patch and nothing else". The trailer below is a hint for a human at a
   // prompt; to anything that PARSES this output it is one more line of diff, and the dashboard
   // rendered it as a context row at the bottom of every edit it showed.
@@ -3391,7 +4883,8 @@ function cmdUndo(args: string[]): void {
       ...(res.dependents ? { dependents: res.dependents, closure: res.closure } : {}),
       ...(res.unrecorded ? { unrecorded: res.unrecorded } : {}),
     });
-    process.exit(res.status === 'conflict' ? 1 : res.ok ? 0 : 1);
+    process.exitCode = res.status === 'conflict' ? 1 : res.ok ? 0 : 1;
+    return;
   }
   if (res.status === 'conflict') {
     process.stdout.write(c.yellow('⚠ conflict: ') + res.message + '\n');
@@ -3567,7 +5060,8 @@ function cmdRedo(args: string[]): void {
   const res = force ? core.reapplyFile(session, id) : core.redoGroup(session, id);
   if (args.includes('--json')) {
     emitJson({ ok: res.ok, status: res.status, message: res.message, ...(res.unrecorded ? { unrecorded: res.unrecorded } : {}) });
-    process.exit(res.status === 'conflict' ? 1 : res.ok ? 0 : 1);
+    process.exitCode = res.status === 'conflict' ? 1 : res.ok ? 0 : 1;
+    return;
   }
   if (res.status === 'conflict') {
     process.stdout.write(c.yellow('⚠ conflict: ') + res.message + '\n');
@@ -3835,6 +5329,10 @@ function cmdClean(args: string[]): void {
   refuseUnsupportedDryRun(args, 'clean');
   const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
   const json = args.includes('--json'); // structured results for front-ends/scripts (sibling to keep/undo)
+  // The local index keeps what a cleanup removes: it records the sessions first, and says so when it could not.
+  const archiveFirst = (ids: string[], opts: { archive: boolean }): void => {
+    for (const p of core.indexBeforeCleanup(ids, opts)) process.stderr.write(c.yellow('! ') + p + '\n');
+  };
   // Drop resolved (kept/undone) edits in the active session, keep pending. --under <path> scopes it to
   // a file/folder (the editors' folder/file Clear action).
   if (args.includes('--resolved')) {
@@ -3853,6 +5351,8 @@ function cmdClean(args: string[]): void {
         .map((x) => parseInt(x.trim(), 10))
         .filter((n) => Number.isFinite(n));
       if (!ids.length) fail('`clean --resolved --ids <a,b,c>` got no valid integer ids');
+      // The local index keeps the records a cleanup drops: it catches up on them first.
+      archiveFirst([getSessionId(args)], { archive: false });
       const res = core.clearResolvedIds(getSessionId(args), ids);
       if (json) {
         emitJson({ cleared: res.cleared, ids: res.ids });
@@ -3861,6 +5361,7 @@ function cmdClean(args: string[]): void {
       process.stdout.write(c.green('✓ ') + `cleared ${res.cleared} resolved edit(s)\n`);
       return;
     }
+    archiveFirst([getSessionId(args)], { archive: false });
     const n = core.clearResolved(getSessionId(args), under);
     if (json) {
       emitJson({ cleared: n, under: under ?? null });
@@ -3875,6 +5376,9 @@ function cmdClean(args: string[]): void {
     const id = args[di + 1];
     if (!id) fail('`--drop <session-id>` requires a session id');
     if (!core.isSafeSessionId(id)) fail(`invalid session id "${id}" — refusing to delete.`);
+    if (core.isReservedStoreDir(id)) fail(`"${id}" is no session but a folder the store keeps for itself — refusing to delete.`);
+    // Dropped is not forgotten: the local index keeps the session, archived as cleaned (`oak sessions --delete` forgets).
+    archiveFirst([id], { archive: true });
     core.removeSession(id);
     if (json) {
       emitJson({ dropped: [id] });
@@ -3888,6 +5392,7 @@ function cmdClean(args: string[]): void {
   if (args.includes('--phantoms')) {
     const sess = flagValue(args, '--session') ?? core.resolveSessionId(process.cwd());
     if (!sess) fail('no session resolved — pass --session <id>');
+    archiveFirst([sess], { archive: false });
     const r = core.repairCasePhantoms(sess);
     if (json) {
       emitJson({ session: sess, pairs: r.pairs, ids: r.ids });
@@ -3921,6 +5426,7 @@ function cmdClean(args: string[]): void {
     // dialog always did by calling core in-process.
     const dry = args.includes('--dry-run');
     const doomed = core.reapableSessions(process.cwd(), Date.now(), staleMs ?? undefined);
+    if (!dry && doomed.length) archiveFirst(doomed.map((s) => s.id), { archive: true });
     if (!dry) for (const s of doomed) core.removeSession(s.id);
     if (json) {
       emitJson({ dropped: dry ? [] : doomed.map((s) => s.id), sessions: doomed, dryRun: dry });
@@ -3975,6 +5481,7 @@ function cmdClean(args: string[]): void {
       }
     })();
     const stale = core.listSessions().filter((s) => s.lastMs < Date.now() - ms && s.id !== live);
+    if (stale.length) archiveFirst(stale.map((s) => s.id), { archive: true });
     for (const s of stale) core.removeSession(s.id);
     if (json) {
       emitJson({ dropped: stale.map((s) => s.id), olderThan: spec });
@@ -3986,32 +5493,39 @@ function cmdClean(args: string[]): void {
   // Destructive: drop everything.
   if (args.includes('--all')) {
     const all = core.listSessions();
+    if (all.length) archiveFirst(all.map((s) => s.id), { archive: true });
     for (const s of all) core.removeSession(s.id);
     if (json) {
       emitJson({ dropped: all.map((s) => s.id) });
       return;
     }
     process.stdout.write(c.green('✓ ') + `dropped all ${all.length} session(s)\n`);
+    // Dropped is not forgotten: say so where a person wiping everything would otherwise think it gone.
+    if (all.length && core.indexFiles().some((f) => f.current))
+      process.stdout.write(c.dim(`  the local database keeps what it recorded of them (\`oak query edits --all\`), and so does this machine's record log (${core.recordsRoot()}), from which a new database reads it back: \`oak sessions --delete <id>\` forgets a session\n`));
     return;
   }
   // Safe default: garbage-collect orphaned blobs (optionally scoped to --session <id>), then
   // reclaim stub-session husks — dirs with no log that hold only Bash-walk snapshots. Iterates the
   // store root directly: listSessions skips log-less dirs, which made stubs unreclaimable.
-  const si = args.indexOf('--session');
-  const only = flagValue(args, '--session');
   // A missing value used to widen the scope from ONE session to the whole store — and this verb's sink
-  // is pruneEmptySession → removeSession → recursive rm. Scope-widening on a typo is not a default.
-  if (si >= 0 && !only) fail('`clean --session <id>` requires a session id');
-  if (only && !core.isSafeSessionId(only)) fail(`invalid session id: ${JSON.stringify(only)}`);
+  // is pruneEmptySession → removeSession → recursive rm. Scope-widening on a typo is not a default, so a
+  // bare `--session` and an empty `--session=` both fail (getSessionId), as does an unsafe id.
+  const only = args.some((a) => a === '--session' || a.startsWith('--session=')) ? getSessionId(args) : undefined;
   const targets = only ? [only] : core.allStoreSessionIds();
   let removed = 0;
   let bytes = 0;
   let pruned = 0;
   let maps = 0;
   let cursors = 0;
+  let indexFiles = 0;
   if (!only) {
     const normalized = core.pruneCodexDerivedCache();
     bytes += normalized.bytes;
+    // The Stats caches of an earlier version (`stats-cache.json` and the like), which nothing in this build reads.
+    const sc = core.pruneStaleStatsCaches();
+    maps += sc.removed;
+    bytes += sc.bytes;
     // Blind spots the store-id loop below cannot see (all three found live on a real store):
     // 1. Cache dirs for sessions with NO store dir — version-bump orphans survive there forever, since
     //    nothing else visits them. Superseded VERSIONS only: a live-version cache for a transcript-only
@@ -4019,15 +5533,26 @@ function cmdClean(args: string[]): void {
     const storeIds = new Set(targets);
     for (const id of core.cachedMapSessionIds()) {
       if (storeIds.has(id)) continue; // the main loop prunes these
-      const m = core.pruneStaleMaps(id);
+      const m = core.pruneSupersededCaches(id);
       maps += m.removed;
       bytes += m.bytes;
     }
-    // 2. Usage cursors whose transcript is gone (hash-keyed, unreachable from any session id).
+    // 2. Usage cursors whose transcript is gone (hash-keyed, unreachable from any session id), and those
+    //    of an earlier version, which are superseded cache files.
     const uc = core.reapUsageCursors();
     cursors = uc.removed;
+    maps += uc.superseded;
     bytes += uc.bytes;
-    // 3. blob-memo.json: written only by an uncommitted 0.8.6-era build — no released version ever read
+    // 3. Superseded local index files (a new format, or the store moved) whose archive the current file carried and
+    //    verified: the current file holds everything they did.
+    for (const f of core.reclaimableIndexFiles()) {
+      const size = core.indexFiles().find((x) => x.file === f)?.bytes ?? 0;
+      if (core.removeIndexFile(f)) {
+        indexFiles++;
+        bytes += size;
+      }
+    }
+    // 4. blob-memo.json: written only by an uncommitted 0.8.6-era build — no released version ever read
     //    it. 3.7MB of nothing with no owner; this is the only place that can know to drop it.
     try {
       const fs = require('fs') as typeof import('fs');
@@ -4043,15 +5568,19 @@ function cmdClean(args: string[]): void {
     const r = core.gcSession(id);
     removed += r.removed;
     bytes += r.bytes;
-    // Cached map payloads from an earlier cache version are unreachable but never overwritten, because
-    // the version is part of the filename. The GC is where they get collected.
-    const m = core.pruneStaleMaps(id);
+    // Cached map payloads, and the other derived caches, from an earlier cache version are unreachable but
+    // never overwritten, because the version is part of the filename. The GC is where they get collected.
+    const m = core.pruneSupersededCaches(id);
     maps += m.removed;
     bytes += m.bytes;
+    // …and so are the search indexes this build never reads (an earlier version's, or one in the session's own folder).
+    const si = core.pruneStaleSearchIndexes(id);
+    maps += si.removed;
+    bytes += si.bytes;
     if (core.pruneEmptySession(id)) pruned++;
   }
   if (json) {
-    emitJson({ removed, bytes, pruned, staleMaps: maps, cursors });
+    emitJson({ removed, bytes, pruned, staleMaps: maps, cursors, indexFiles });
     return;
   }
   process.stdout.write(
@@ -4059,6 +5588,7 @@ function cmdClean(args: string[]): void {
       `garbage-collected ${removed} orphaned blob(s), freed ${fmtBytes(bytes)}` +
       (maps ? `, dropped ${maps} superseded cache file(s)` : '') +
       (cursors ? `, reaped ${cursors} orphaned usage cursor(s)` : '') +
+      (indexFiles ? `, removed ${indexFiles} superseded database file(s)` : '') +
       (pruned ? `, pruned ${pruned} empty stub session(s)` : '') +
       '\n'
   );
@@ -4074,13 +5604,9 @@ function human(n: number): string {
 
 function cmdStats(args: string[]): void {
   const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
-  let sid: string | undefined;
-  const i = args.indexOf('--session');
-  if (i >= 0 && args[i + 1]) {
-    sid = args[i + 1];
-    // Guard a user-provided id like getSessionId does — computeStats derives a store path from it.
-    if (!core.isSafeSessionId(sid)) fail(`invalid session id "${sid}" (letters, digits, dot, dash, underscore only).`);
-  } else sid = core.resolveSessionId(process.cwd()) || undefined; // no session → global/default window
+  // `--session <id>` or `--session=<id>`, checked by getSessionId (computeStats derives a store path from it);
+  // with neither, this directory's session, and with none, the global/default window.
+  const sid = args.some((a) => a === '--session' || a.startsWith('--session=')) ? getSessionId(args) : core.resolveSessionId(process.cwd()) || undefined;
   const stats = core.computeStats(sid);
   if (args.includes('--json')) {
     process.stdout.write(JSON.stringify(stats));
@@ -4269,7 +5795,8 @@ function cmdIgnore(args: string[]): void {
         })),
         files: ctx.files,
       });
-      process.exit(anyIgnored ? 0 : 1);
+      process.exitCode = anyIgnored ? 0 : 1;
+      return;
     }
     if (quiet) process.exit(anyIgnored ? 0 : 1);
 
@@ -4289,7 +5816,8 @@ function cmdIgnore(args: string[]): void {
             : `${src}:${ln}:${pat}\t${r.given}\n`
         );
       }
-      process.exit(anyIgnored ? 0 : 1);
+      process.exitCode = anyIgnored ? 0 : 1; // not exit(): it would cut a long answer off in a pipe (see emitJson)
+      return;
     }
 
     // More than one path (or none, from an empty --stdin): one line each, like git's default. The
@@ -4300,7 +5828,8 @@ function cmdIgnore(args: string[]): void {
         const tag = r.d.ignored ? c.yellow('ignored') : c.green('shown  ');
         process.stdout.write(`${tag} ${r.given}\n`);
       }
-      process.exit(anyIgnored ? 0 : 1);
+      process.exitCode = anyIgnored ? 0 : 1;
+      return;
     }
 
     const r = rows[0];
@@ -4343,6 +5872,14 @@ function cmdIgnore(args: string[]): void {
   }
 
   const session = getSessionId(args);
+  // `--dry-run` counts what the sweep would drop and drops nothing: the terminal app's refresh asks it
+  // first, so the one irreversible thing a refresh can do is confirmed with its real count.
+  if (args.includes('--dry-run')) {
+    const would = core.countIgnored(session);
+    if (json) emitJson({ session, wouldDrop: would });
+    else process.stdout.write(`${would} recorded edit(s) are now ignored and would be dropped\n`);
+    return;
+  }
   const edits = core.reviewEdits(session);
   // Runs the sweep, rather than only reporting one. A rule normally takes effect at the next capture;
   // a reader who has just written one and made no further edits would otherwise be told what the file
@@ -4443,13 +5980,19 @@ function cmdLocate(args: string[]): void {
   }
   // readLog is chronological and .filter keeps that order — which is what lets locateEditsInCurrent
   // compose one-edit-wide hops instead of re-aligning the whole buffer once per edit.
-  const recs = core.readLog(session).filter((r) => r.status === 'pending' && r.file === abs);
+  const log = core.readLog(session).filter(r => r.file === abs);
+  const recs = log.filter(r => r.status === 'pending');
   const blob = (sha: string | null): string => (sha ? core.readBlob(session, sha).toString('utf8') : '');
   const placed = core.locateEditsInCurrent(
     recs.length,
     (i) => ({ before: blob(recs[i].beforeBlob), after: blob(recs[i].afterBlob) }),
     current
   );
+  // An undone edit is no longer part of the pending chain. Locate its inverse independently for Redo.
+  if (args.includes('--include-undone')) for (const rec of log.filter(r => r.status === 'undone')) {
+    recs.push(rec);
+    placed.push(core.locateEditsInCurrent(1, () => ({ before: blob(rec.afterBlob), after: blob(rec.beforeBlob) }), current)[0]);
+  }
   // `removed` rides along for free now that one pass computes both — JetBrains renders no deletion
   // ghost text today only because this payload never carried it.
   //
@@ -4502,7 +6045,7 @@ function cmdTree(args: string[]): void {
  * A view that fails is `null` rather than fatal: one unbuildable section must not cost the reader the
  * other seven, and `fail()`'s `process.exit` is caught for the same reason.
  */
-function cmdViews(args: string[]): void {
+async function cmdViews(args: string[]): Promise<void> {
   const vi = args.indexOf('--views');
   const DEFAULT = 'changemap,multitask,prompts,processes,sessions,observations,risk,egress';
   if (vi >= 0 && !flagValue(args, '--views')) fail('`views --views <a,b,c>` requires a comma-separated list');
@@ -4524,11 +6067,17 @@ function cmdViews(args: string[]): void {
   // describing the wrong session entirely.
   const rest = vi >= 0 ? args.filter((_, i) => i !== vi && i !== vi + 1) : args;
   const viewArgs = rest.includes('--json') ? rest : [...rest, '--json'];
-  emitJson(buildViews(names, viewArgs));
+  emitJson(await buildViews(names, viewArgs));
 }
 
 /** One batch of views as a value — the shared engine of `views` (one shot) and `views --serve`. */
-function buildViews(names: string[], viewArgs: string[]): Record<string, unknown> {
+async function buildViews(names: string[], viewArgs: string[]): Promise<Record<string, unknown>> {
+  // Fleet awaits herdr. Keep that wait outside stdout capture and the synchronous derived inventory.
+  let fleet: unknown, fleetError: string | undefined;
+  if (names.includes('fleet')) {
+    try { fleet = await workerFleetValue(viewArgs); }
+    catch (e) { fleetError = String((e as Error)?.message || e); }
+  }
   const core = require('@oak-observatory/core') as Core;
   return core.withDerivedInventory(() => {
     const out: Record<string, unknown> = {};
@@ -4537,6 +6086,11 @@ function buildViews(names: string[], viewArgs: string[]): Record<string, unknown
     const realWrite = process.stdout.write.bind(process.stdout);
     const realExit = process.exit.bind(process);
     for (const name of names) {
+      if (name === 'fleet') {
+        out[name] = fleet ?? null;
+        if (fleetError) problems[name] = fleetError;
+        continue;
+      }
       let buf = '';
       (process.stdout as unknown as { write: (s: string) => boolean }).write = (chunk: string) => {
         buf += chunk;
@@ -4580,23 +6134,26 @@ function buildViews(names: string[], viewArgs: string[]): Record<string, unknown
 function serveViews(): void {
   const realWrite = process.stdout.write.bind(process.stdout);
   const rl = require('readline').createInterface({ input: process.stdin, terminal: false });
+  let pending = Promise.resolve();
   rl.on('line', (line: string) => {
-    let payload: Record<string, unknown>;
-    try {
-      const req = JSON.parse(line) as { views?: unknown; args?: unknown };
-      const names = Array.isArray(req.views) ? req.views.map(String) : [];
-      const reqArgs = Array.isArray(req.args) ? req.args.map(String) : [];
-      if (!names.length) throw new Error('request carries no views');
-      payload = buildViews(names, reqArgs.includes('--json') ? reqArgs : [...reqArgs, '--json']);
-    } catch (e) {
-      payload = { __fatal: String((e as Error)?.message || e) };
-    }
-    // This worker's resident size leads every answer, where the dashboard reads it without parsing the
-    // payload, to retire a worker grown too big. Asking `ps` instead spawned one every 5 s per worker
-    // wherever /proc is absent (macOS), and Windows had no probe at all.
-    realWrite(JSON.stringify({ __rss: process.memoryUsage.rss(), ...payload }) + '\n');
+    pending = pending.then(async () => {
+      let payload: Record<string, unknown>;
+      try {
+        const req = JSON.parse(line) as { views?: unknown; args?: unknown };
+        const names = Array.isArray(req.views) ? req.views.map(String) : [];
+        const reqArgs = Array.isArray(req.args) ? req.args.map(String) : [];
+        if (!names.length) throw new Error('request carries no views');
+        payload = await buildViews(names, reqArgs.includes('--json') ? reqArgs : [...reqArgs, '--json']);
+      } catch (e) {
+        payload = { __fatal: String((e as Error)?.message || e) };
+      }
+      // This worker's resident size leads every answer, where the dashboard reads it without parsing the
+      // payload, to retire a worker grown too big. Asking `ps` instead spawned one every 5 s per worker
+      // wherever /proc is absent (macOS), and Windows had no probe at all.
+      realWrite(JSON.stringify({ __rss: process.memoryUsage.rss(), ...payload }) + '\n');
+    });
   });
-  rl.on('close', () => process.exit(0));
+  rl.on('close', () => { void pending.then(() => process.exit(0)); });
 }
 
 /** The views `views` may batch. An allow-list on purpose: nothing that MUTATES belongs in a poll.
@@ -4622,6 +6179,12 @@ function runView(name: string, args: string[]): void {
     // the patch `diff <id> --patch` prints) instead of a cold `oak diff` per edit.
     case 'diff':
       return cmdDiff(args);
+    case 'review':
+      return cmdReview(args);
+    case 'tree':
+      return cmdTree(args);
+    case 'timeline':
+      return cmdTimeline(args);
     case 'list':
       return cmdList(args);
     case 'multitask':
@@ -4640,6 +6203,10 @@ function runView(name: string, args: string[]): void {
       return cmdEgress(args);
     case 'stats':
       return cmdStats(args);
+    // Read-only: an editor reads a saved machine's session's Actions through here, since `views` runs on that machine
+    // with `--machine` and `actions` alone does not.
+    case 'actions':
+      return cmdActions(args);
     default:
       throw new Error(`unknown view ${name}`);
   }
@@ -4756,7 +6323,7 @@ function cmdInsights(args: string[]): void {
     process.stdout.write(
       `${c.bold('#' + e.id)}  ${statusLabel(e.status).padEnd(7)}  ${c.cyan(relFile(e.file))}  ${c.dim(e.summary)}\n`
     );
-    if (e.reasoning) process.stdout.write('     ' + c.dim(e.reasoning.split('\n')[0].slice(0, 140)) + '\n');
+    if (e.reasoning) process.stdout.write('     ' + c.dim(core.graphemeHead(e.reasoning.split('\n')[0], 140)) + '\n');
     for (const f of e.flags) {
       process.stdout.write('     ' + (f.level === 'warn' ? c.yellow('⚠ ') : c.dim('· ')) + f.message + '\n');
     }
@@ -4774,13 +6341,113 @@ function cmdInsights(args: string[]): void {
 function kickAccountPull(): void {
   try {
     const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
-    if (!core.dueAccountUsagePull()) return;
+    if (core.noBackgroundChildren() || !core.dueAccountUsagePull()) return;
     core.spawnTool(process.execPath, [process.argv[1], 'usage', '--pull-account', '--json'], { detached: true, stdio: 'ignore' }).unref();
   } catch {
     /* a failed kick only means the cache stays stale until the next poll */
   }
 }
 
+
+/** What the `sync` verbs (sync.ts) share with the rest of the CLI: its ssh options and wording, and its output. */
+function syncDeps(): SyncCliDeps {
+  return { sshOpts: SSH_OPTS, sshReason, stopSignals: SSH_STOP_SIGNALS, endBySignal, fail, emitJson, c };
+}
+
+/** The saved machines' ssh a `usage --pull-machines` has running (sshUsageBrief). */
+const usageSsh = new Set<ReturnType<typeof import('@oak-observatory/core').spawnTool>>();
+
+/** `usage --pull-machines`, hidden: the pollers start it detached (core kickMachineUsage) with `--if-due`,
+ *  which honours the throttle; without it, it runs now. It reads herdr's saved machines and each enabled
+ *  one's `oak __usage-brief`, in parallel, and exits at its deadline whatever an inherited handle is
+ *  doing. It prints nothing: `oak usage --json` shows what it read. */
+function pullMachineUsage(args: string[]): void {
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
+  // Ended early, at its deadline or by a signal, it stops the ssh it started: ssh has no timeout of its own once
+  // a server has sent its banner, and one left running ran on, reparented, for as long as that server stalled.
+  const stop = (): void => { for (const child of usageSsh) child.kill(); };
+  const deadline = setTimeout(() => { stop(); process.exit(1); }, core.machineUsageDeadlineMs());
+  deadline.unref();
+  for (const [sig, n] of SSH_STOP_SIGNALS) process.once(sig, () => { stop(); endBySignal(sig, n); });
+  const list = async (): Promise<import('@oak-observatory/core').UsageMachine[] | null> => {
+    const bin = core.findHerdrBin();
+    if (!bin) return []; // no herdr here, so no saved machines
+    try {
+      return await core.herdrMachines({ binary: bin, timeoutMs: 15000 });
+    } catch {
+      return null; // the list could not be read: every machine keeps its last reading
+    }
+  };
+  void core.refreshMachineUsage(list, sshUsageBrief, { force: !args.includes('--if-due') }).then(() => clearTimeout(deadline));
+}
+
+/** One saved machine's `oak __usage-brief --json` (what `oak usage --brief --json` prints), over OAK's own ssh as
+ *  forwardToMachine reaches it (herdr's target, MACHINE_PATH, never an interactive shell): its stdout, or why
+ *  there is none, for the cache and `oak doctor` to name (core MachineUsageAnswer): ssh's own reason when it
+ *  could not connect, no answer within MACHINE_USAGE_ASK_MS, no `oak` there, or an OAK from before the verb,
+ *  which refuses it. Such a build ignored `--brief` and ran its whole `oak usage`, which starts that machine's
+ *  account-usage and title reads. With `ControlMaster=no` it shares a connection already open and never becomes
+ *  one, so it asks no `ssh -G`, which runs the configuration's `Match exec` commands: asked in turn, before each
+ *  machine's own deadline started, slow ones held every later machine's ask past the refresh's deadline. It
+ *  keeps the last 16 KB of stderr, of which the cache keeps one sanitized line. */
+function sshUsageBrief(m: { target: string }, how: import('@oak-observatory/core').MachineUsageAsk = { verb: 'brief', since: null }): Promise<import('@oak-observatory/core').MachineUsageAnswer> {
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
+  const quote = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`;
+  const verb = how.verb === 'records' ? `__usage-records --json${how.since ? ` --since ${quote(how.since)}` : ''}` : '__usage-brief --json';
+  const remote = `env PATH="${core.MACHINE_PATH}" CLAUDE_OBSERVATORY_NO_UPDATE_CHECK=1 oak ${verb}`;
+  return new Promise((resolve) => {
+    let child: ReturnType<typeof core.spawnTool>;
+    try {
+      // windowsHide: the refresh runs detached, with no console, where on Windows an ssh started without it would open one.
+      child = core.spawnTool('ssh', ['-T', ...SSH_OPTS, '-o', 'ControlMaster=no', m.target, remote], { stdio: ['ignore', 'pipe', 'pipe'], direct: true, windowsHide: true, env: core.machineSshEnv() });
+    } catch (e) {
+      resolve({ status: 'unreachable', detail: `ssh could not start: ${String((e as Error)?.message || e)}` });
+      return;
+    }
+    usageSsh.add(child);
+    const out: Buffer[] = [];
+    let size = 0;
+    let err = Buffer.alloc(0);
+    // A brief is under 1 KB; a page of usage records at most a few MB.
+    const room = how.verb === 'records' ? 64 * 1024 * 1024 : 65536;
+    child.stdout?.on('data', (d: Buffer) => { if ((size += d.length) <= room) out.push(d); });
+    child.stderr?.on('data', (d: Buffer) => { err = Buffer.concat([err, d]); if (err.length > 16384) err = err.subarray(err.length - 16384); });
+    let settled = false;
+    let drain: NodeJS.Timeout | undefined;
+    const settle = (answer: import('@oak-observatory/core').MachineUsageAnswer): void => {
+      if (settled) return;
+      settled = true;
+      usageSsh.delete(child);
+      clearTimeout(timer);
+      clearTimeout(drain);
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+      resolve(answer);
+    };
+    // What ssh's exit status and stderr say: 255 is ssh's own failure, 127 an `oak` the remote shell could not
+    // find, and every release names a verb it does not know on stderr as it refuses it.
+    const judge = (code: number | null): import('@oak-observatory/core').MachineUsageAnswer => {
+      const stderr = err.toString('utf8');
+      if (code === 0) return Buffer.concat(out).toString('utf8');
+      if (code === 255) return { status: 'unreachable', detail: sshReason(stderr) };
+      if (code === 127) return { status: 'no-oak' };
+      if (stderr.includes('unknown command "__usage-brief"') || stderr.includes('unknown command "__usage-records"')) return { status: 'old-oak' };
+      return { status: 'failed', detail: core.failureLines(stderr)[0] || (code === null ? 'ended by a signal' : `exited ${code}`) };
+    };
+    // Settled by the deadline itself, as sshUpdate is: a remote process that outlives ssh holds its pipe open.
+    const timer = setTimeout(() => {
+      child.kill();
+      setTimeout(() => child.kill('SIGKILL'), 1000).unref();
+      settle({ status: 'timeout' });
+    }, core.MACHINE_USAGE_ASK_MS);
+    child.on('error', (e: Error) => settle({ status: 'unreachable', detail: `ssh could not start: ${e.message}` }));
+    // ssh has ended, but a process it left (a LocalCommand's) may hold its stdout open, so 'close' may not come
+    // before the deadline, which lost a whole answer: what ssh wrote is judged once its pipes have had a second
+    // to drain.
+    child.on('exit', (code: number | null) => { if (!settled) drain = setTimeout(() => settle(judge(code)), 1000); });
+    child.on('close', (code: number | null) => settle(judge(code)));
+  });
+}
 
 /** The UsageLine snapshot (ctx / 5h / week) + the session's input/output/cache token split + its
  *  model/effort/compaction vitals + the shared staleness threshold; always JSON. Both editors' Stats
@@ -4793,11 +6460,8 @@ function cmdUsage(args: string[]): void {
     // read by the statusline's month segment and the breakdown's month buckets. 0 clears.
     const v = Number(args[bi + 1]);
     if (!Number.isInteger(v) || v < 0 || v > 31) fail('--bill-day takes a day of month 1-31 (0 clears it).');
-    const prefs = core.readPrefs();
-    if (v === 0) delete prefs.billDay;
-    else prefs.billDay = v;
-    core.writePrefs(prefs);
-    console.log(v === 0 ? 'Claude bill day cleared — Claude month figures use calendar months.' : `Claude bill day set to the ${v}${v === 1 ? 'st' : v === 2 ? 'nd' : v === 3 ? 'rd' : 'th'} — Claude month figures now follow your bill cycle (set it on each machine).`);
+    core.setAccountBillDay('claude', v);
+    console.log(v === 0 ? 'Claude bill day cleared — Claude month figures use calendar months.' : `Claude bill day set to the ${v}${v === 1 ? 'st' : v === 2 ? 'nd' : v === 3 ? 'rd' : 'th'} — Claude month figures now follow your bill cycle (shared with saved machines through the database).`);
     return;
   }
   const gbi = args.indexOf('--gpt-bill-day');
@@ -4806,14 +6470,12 @@ function cmdUsage(args: string[]): void {
     // date. Read by the gpt month segment (gptUsagePanel). 0 clears (calendar months).
     const v = Number(args[gbi + 1]);
     if (!Number.isInteger(v) || v < 0 || v > 31) fail('--gpt-bill-day takes a day of month 1-31 (0 clears it).');
-    const prefs = core.readPrefs();
-    if (v === 0) delete prefs.gptBillDay;
-    else prefs.gptBillDay = v;
-    core.writePrefs(prefs);
-    console.log(v === 0 ? 'GPT bill day cleared — GPT month figures use calendar months.' : `GPT bill day set to the ${v}${v === 1 ? 'st' : v === 2 ? 'nd' : v === 3 ? 'rd' : 'th'} — GPT month figures now follow your bill cycle (set it on each machine).`);
+    core.setAccountBillDay('codex', v);
+    console.log(v === 0 ? 'GPT bill day cleared — GPT month figures use calendar months.' : `GPT bill day set to the ${v}${v === 1 ? 'st' : v === 2 ? 'nd' : v === 3 ? 'rd' : 'th'} — GPT month figures now follow your bill cycle (shared with saved machines through the database).`);
     return;
   }
   if (args.includes('--breakdown')) return cmdUsageBreakdown(args);
+  if (args.includes('--window') || args.some((a) => a.startsWith('--window=')) || args.includes('--by') || args.some((a) => a.startsWith('--by='))) return cmdUsageWindow(args);
   // The detached account pull: one process fetches the account's own usage (pcts + resets +
   // fable) and merges it into the statusline cache — the numbers stay live with NO claude
   // session open. Hidden verb; every poller kicks it via the claim below.
@@ -4822,16 +6484,21 @@ function cmdUsage(args: string[]): void {
       if (!args.includes('--json')) console.log(ok ? 'account usage pulled.' : 'nothing pulled (no credentials, or the account answered nothing).');
     });
   }
+  // The saved machines' readings of the Claude account (core machine-usage.ts): the detached refresh the
+  // pollers kick below, which reads each machine's `--brief` over ssh into the store's cache.
+  if (args.includes('--pull-machines')) return pullMachineUsage(args);
+  // What a saved machine's refresh reads from this one: this machine's own Claude shares, from its cache
+  // alone. It starts nothing here, so a read from another machine has no effects on this one.
+  if (args.includes('--brief')) return emitJson(core.machineUsageBrief(process.cwd()));
   kickAccountPull(); // …and the account pull that keeps 5h/wk live without a claude session
   core.kickRemoteTitles(); // …and the Remote Control titles, on the same pollers (throttled, detached)
+  core.kickMachineUsage(); // …and the saved machines' readings, for when this machine has none (throttled, detached)
   // …and the month scan, so the bill-cycle $ stays live in editor-only use. Skip it when the caller
   // IS the statusline (OAK_STATUSLINE) — the statusline reads `oak usage --session` for its token line,
   // and kicking there would have it spawn itself in a throttled loop.
   if (!process.env.OAK_STATUSLINE) core.kickMonthRefresh(process.cwd());
-  const si = args.indexOf('--session');
-  const provided = si >= 0 && args[si + 1] ? args[si + 1] : undefined;
-  // Guard a user-provided id like getSessionId does — usageLine derives a store path from it.
-  if (provided && !core.isSafeSessionId(provided)) fail(`invalid session id "${provided}" (letters, digits, dot, dash, underscore only).`);
+  // `--session <id>` or `--session=<id>`, checked by getSessionId: usageLine derives a store path from it.
+  const provided = args.some((a) => a === '--session' || a.startsWith('--session=')) ? getSessionId(args) : undefined;
   const sid = provided || core.resolveSessionId(process.cwd()) || '';
   // sessionTokens = the session's cumulative input/output/cache split (+ cache hit rate), which the
   // editors' stats panels render under the session title; ctx/5h/week above are point-in-time limits.
@@ -4865,10 +6532,26 @@ function cmdUsage(args: string[]): void {
     claudeFableLabel: acct.fableLabel,
     claudeMonthCost: acct.monthCost,
     claudeMonthCostTotal: acct.monthCostTotal,
-    claudeMonthPct: acct.monthTokens && acct.monthTokensTotal ? Math.min(100, (acct.monthTokens / acct.monthTokensTotal) * 100) : null,
+    // The month's dollar figure as the status bars show it (core.monthUsd): `~$13` estimated, `$13` charged.
+    claudeMonthUsd: core.monthUsd(acct),
+    claudeMonthPct: acct.monthTokens != null && acct.monthTokensTotal ? Math.min(100, (acct.monthTokens / acct.monthTokensTotal) * 100) : null,
     claudeMonthReset: acct.monthReset,
     claudeWeekTokens: acct.weekTokens,
     claudeWeekTotal: acct.weekTotal,
+    // The saved machine(s) the claude* figures came from, every window's; '' for this one.
+    claudeMachineNote: acct.machineNote,
+    // …and the same over the windows the JetBrains widget's bar shows (wk, mo), for the bar itself to name.
+    claudeMachineBarNote: acct.machineBarNote,
+    // …and over the windows its tooltip shows (wk, the per-model cap, mo), for the tooltip to name.
+    claudeMachineTipNote: acct.machineTipNote,
+    // …and true when this machine has no Claude Code login to match that machine's account against.
+    claudeMachineUnmatched: acct.machineUnmatched,
+    // …and when the oldest of those windows was measured there (epoch ms), every window's and the tooltip's.
+    claudeMachineAt: acct.machineAt,
+    claudeMachineTipAt: acct.machineTipAt,
+    // The saved machines whose own usage the estimates add to this machine's ('' for none), for the widget's tooltip.
+    claudeMeasuredMachines: acct.machineMeasured?.machines ?? '',
+    claudeUsageFreshness: acct.usageFreshness ?? '',
     gptFivePct: gpt?.fivePct ?? null,
     gptFiveReset: gpt?.fiveReset ?? null,
     gptWeekPct: gpt?.weekPct ?? null,
@@ -4885,10 +6568,90 @@ function cmdUsage(args: string[]): void {
     gptMonthReads: gpt?.monthReads ?? null,
     gptMonthCost: gpt?.monthCost ?? null,
     gptMonthCostTotal: gpt?.monthCostTotal ?? null,
+    gptMonthUsd: gpt ? core.monthUsd(gpt) : null,
+    gptMeasuredMachines: gpt?.measuredMachines ?? null,
+    gptUsageSource: gpt?.usageSource ?? null,
+    gptUsageFreshness: gpt?.usageFreshness ?? '',
     sessionTokens: core.sessionUsage(process.cwd(), sid),
+    // …its own turns only. With every agent it started (its workers' transcripts, `agents` of them), the figure the index's
+    // `oak query usage --by session` gives: each surface shows both, labelled, so the own figure never reads as the task's.
+    sessionTreeTokens: core.sessionTreeUsage(process.cwd(), sid),
     vitals: core.sessionVitals(process.cwd(), sid),
     staleMs: core.USAGE_STALE_MS,
+    // The account's 5-hour, weekly and bill-cycle windows from the local index, each message counted once across every
+    // machine whose usage it holds, placed by the resets claudeAccount shows; null where there is no index. The index is
+    // first brought up to date for this session and this machine's usage caches (a status line's render pays for no more),
+    // and only for a status line render that will use them (statuslineWantsTotals).
+    usageTotals: core.machineUsageEnabled() && (!process.env.OAK_STATUSLINE || statuslineWantsTotals())
+      ? core.indexedUsageTotals({ fiveReset: acct.fiveReset, weekReset: acct.weekReset, session: sid || null,
+        transcript: sid ? core.findTranscript(process.cwd(), sid) : null, rollout: sid ? core.findCodexRollout(sid) : null }) : null,
   });
+}
+
+/** The bundled status line's scan interval (install-statusline.sh THR). */
+const STATUSLINE_SCAN_MS = 600_000;
+
+/** Whether the status line rendering now uses `usageTotals`: its estimator takes them in place of the scan it runs once a
+ *  scan interval (no state yet, an interval since its last, or a file map from a scan still to drop). Between two, the
+ *  render draws the last figures, and `oak usage` opens no index for it. */
+function statuslineWantsTotals(now = Date.now()): boolean {
+  const fs = require('fs') as typeof import('fs');
+  const path = require('path') as typeof import('path');
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
+  try {
+    const file = path.join(core.claudeConfigDir(), 'statusline-usage.json');
+    if (fs.statSync(file).size > 16_384) return true; // the file map a scan kept
+    const s = JSON.parse(fs.readFileSync(file, 'utf8')) as { last_scan?: unknown; fc?: unknown };
+    return typeof s.last_scan !== 'number' || now - s.last_scan * 1000 >= STATUSLINE_SCAN_MS || (!!s.fc && typeof s.fc === 'object' && Object.keys(s.fc).length > 0);
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * `oak usage --window <5h|week|bill|month|day|all> [--by machine|model|session|day|agent|account] [--agent claude|codex]
+ * [--json]`: the account's usage in a window from the local index (`oak query usage`), each message once however many
+ * machines hold it: tokens (input + output + cache creation), cache reads apart, and list-price cost.
+ */
+function cmdUsageWindow(args: string[]): void {
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
+  const params: Record<string, unknown> = { window: flagValue(args, '--window') ?? 'week', by: flagValue(args, '--by') ?? 'machine' };
+  for (const k of ['agent', 'since', 'until', 'limit'] as const) {
+    const v = flagValue(args, `--${k}`);
+    if (v !== undefined) params[k] = v;
+  }
+  if (args.includes('--all-accounts')) params.account = 'all';
+  const answer = core.queryIndex('usage', params, { kick: true });
+  if ('error' in answer) {
+    if (args.includes('--json')) emitJson(answer);
+    else process.stderr.write(`oak usage: ${answer.error.message}\n`);
+    process.exit(core.failureExitCode(answer));
+  }
+  if (args.includes('--json')) return emitJson(answer);
+  const p = answer.params as { start: number; end: number; by: string; window: string; since?: unknown };
+  const human = (n: unknown): string => {
+    const v = Number(n) || 0;
+    return v >= 1e9 ? `${(v / 1e9).toFixed(1)}B` : v >= 1e6 ? `${(v / 1e6).toFixed(1)}M` : v >= 1e3 ? `${(v / 1e3).toFixed(1)}K` : String(Math.round(v));
+  };
+  // `--since` places the span itself, in place of the window.
+  process.stdout.write(c.bold(`usage · ${typeof p.since === 'number' ? 'since' : p.window} · by ${p.by}`) + c.dim(`  ${new Date(p.start).toISOString().slice(0, 16)}Z to ${new Date(Math.min(p.end, Date.now())).toISOString().slice(0, 16)}Z\n`));
+  process.stdout.write(c.dim('tokens are input + output + cache creation; cache reads are counted apart; ~$ is an estimate at today\'s API list prices, not a bill\n'));
+  if (p.by === 'session') process.stdout.write(c.dim('a session counts every agent it started; the line under it, `own`, is its own turns\n'));
+  process.stdout.write('\n');
+  const line = (tokens: unknown, read: unknown, cost: unknown, name: string): void => {
+    process.stdout.write(`${human(tokens).padStart(8)}  ${c.dim(`↺${human(read)}`.padEnd(9))} ${c.dim(`~$${Number(cost ?? 0).toFixed(2)}`.padEnd(10))} ${name}\n`);
+  };
+  for (const r of answer.rows as Record<string, unknown>[]) {
+    // A session deleted on purpose keeps its usage without its id (index/ingest.ts keepUsageOf).
+    const name = r.session === '' ? '(deleted sessions)' : String(r.title ?? r.label ?? r.key ?? '') || '(none)';
+    const n = Number(r.agents) || 0;
+    // A session that started agents: the figure with them, then its own, each labelled (its own unknown: the one line).
+    const split = n > 0 && r.own_tokens != null && r.session !== '';
+    line(r.tokens, r.cache_read, r.cost, split ? `${name} · with ${n} agent${n === 1 ? '' : 's'}` : name);
+    if (split) line(r.own_tokens, r.own_cache_read, r.own_cost, c.dim('  own'));
+  }
+  if (!answer.rows.length) process.stdout.write(c.dim('no usage in this window\n'));
+  if (!answer.freshness.caughtUp) process.stdout.write(c.dim('\nthe local database is catching up; these figures may grow\n'));
 }
 
 /**
@@ -4918,7 +6681,7 @@ function cmdUsageBreakdown(args: string[]): void {
   const rows: import('@oak-observatory/core').AgentBreakdown[] = [];
   const billDay = core.billDay();
   if (agent !== 'codex') rows.push(core.claudeBreakdown(by, sinceMs, anchorMs, undefined, billDay));
-  if (agent !== 'claude') rows.push(core.codexBreakdown(by, sinceMs, core.codexUsageLive().weekReset, undefined, null));
+  if (agent !== 'claude') rows.push(core.codexBreakdown(by, sinceMs, core.gptUsagePanel()?.weekReset ?? null, undefined, core.gptBillDay()));
   const promo = core.activePromo();
 
   if (args.includes('--json')) {
@@ -4928,8 +6691,8 @@ function cmdUsageBreakdown(args: string[]): void {
 
   const money = (v: number): string => (v >= 100 ? `$${Math.round(v)}` : v >= 10 ? `$${v.toFixed(0)}` : `$${v.toFixed(1)}`);
   const out: string[] = [];
-  out.push(`usage breakdown · by ${by} · last ${weeks} week${weeks > 1 ? 's' : ''} · this machine's records`);
-  out.push(`~$ are API list prices — an estimate of compute value, not a bill (subscriptions are flat-rate)`);
+  out.push(`usage breakdown · by ${by} · last ${weeks} week${weeks > 1 ? 's' : ''} · ${rows.every((r) => r.usageSource === 'database') ? 'account database across machines' : 'this machine alone'}`);
+  out.push(`~$ are estimates at today's API list prices, not a bill (subscriptions are flat-rate)`);
   out.push(`the oldest bucket may be partial — records before the ${weeks}-week cutoff are not counted`);
   if (promo) {
     const until = new Date(promo.endMs).toISOString().slice(0, 10);
@@ -4942,11 +6705,15 @@ function cmdUsageBreakdown(args: string[]): void {
       out.push('  (no records in range)');
       continue;
     }
-    const w = Math.max(...r.buckets.map((b) => b.label.length), 6);
+    // By session, one that started agents is its own row, labelled so, with the figure with them under it.
+    const labelOf = (b: import('@oak-observatory/core').BreakdownBucket): string => (b.tree ? `${b.label} · own` : b.label);
+    const withAgents = (n: number): string => `  with ${n} agent${n === 1 ? '' : 's'}`;
+    const w = Math.max(...r.buckets.map((b) => Math.max(labelOf(b).length, b.tree ? withAgents(b.tree.agents).length : 0)), 6);
+    const line = (label: string, x: Omit<import('@oak-observatory/core').BreakdownBucket, 'key' | 'label'>): string =>
+      `  ${label.padEnd(w)}  ${fmtTok(x.tokens).padStart(8)} tok  ${human(x.cacheRead).padStart(7)} reads  ${(x.usdKnown ? money(x.usd) : '—').padStart(7)}${x.usdApprox ? '*' : ' '}  ${String(x.messages).padStart(6)} msgs`;
     for (const b of r.buckets.slice(0, 40)) {
-      out.push(
-        `  ${b.label.padEnd(w)}  ${fmtTok(b.tokens).padStart(8)} tok  ${human(b.cacheRead).padStart(7)} reads  ${(b.usdKnown ? money(b.usd) : '—').padStart(7)}${b.usdApprox ? '*' : ' '}  ${String(b.messages).padStart(6)} msgs`
-      );
+      out.push(line(labelOf(b), b));
+      if (b.tree) out.push(line(withAgents(b.tree.agents), b.tree));
     }
     if (r.buckets.length > 40) out.push(`  … ${r.buckets.length - 40} more (use --json for all)`);
   }
@@ -5064,18 +6831,27 @@ const NPM_PKG_OLD = 'claude-observatory';
 // `where code` alone. (VS Code's layout is from its own docs; the other three are best-effort, which
 // costs nothing — these are existsSync candidates, so a wrong guess is skipped, a missing one is a
 // real editor we fail to find.)
-const VSCODE_EDITORS: { label: string; extDirs: string[]; cli: string; app: string; winApp: string }[] = [
-  { label: 'VS Code', extDirs: ['.vscode/extensions', '.vscode-server/extensions'], cli: 'code', app: 'Visual Studio Code', winApp: 'Microsoft VS Code' },
+const VSCODE_EDITORS: { label: string; extDirs: string[]; cli: string; app: string; winApp: string; server?: string }[] = [
+  { label: 'VS Code', extDirs: ['.vscode/extensions'], cli: 'code', app: 'Visual Studio Code', winApp: 'Microsoft VS Code' },
   // Insiders is a SEPARATE install with its own extensions dir and its own CLI name — omitting it
   // did not degrade anything gracefully, it made every Insiders user invisible to `update` and
   // `install-extensions`, which then reported "no editor detected" and did nothing, forever.
-  { label: 'VS Code Insiders', extDirs: ['.vscode-insiders/extensions', '.vscode-server-insiders/extensions'], cli: 'code-insiders', app: 'Visual Studio Code - Insiders', winApp: 'Microsoft VS Code Insiders' },
-  // The `-server` dirs are the Remote-SSH/remote-dev backends, same as `.vscode-server` above —
-  // without them a server-side install (e.g. `~/.cursor-server` on a GPU box) is invisible to
-  // `update`, which then silently skips the one install the user actually works in.
-  { label: 'Cursor', extDirs: ['.cursor/extensions', '.cursor-server/extensions'], cli: 'cursor', app: 'Cursor', winApp: 'cursor' },
-  { label: 'VSCodium', extDirs: ['.vscodium/extensions', '.vscodium-server/extensions'], cli: 'codium', app: 'VSCodium', winApp: 'VSCodium' },
-  { label: 'Windsurf', extDirs: ['.windsurf/extensions', '.windsurf-server/extensions'], cli: 'windsurf', app: 'Windsurf', winApp: 'Windsurf' },
+  { label: 'VS Code Insiders', extDirs: ['.vscode-insiders/extensions'], cli: 'code-insiders', app: 'Visual Studio Code - Insiders', winApp: 'Microsoft VS Code Insiders' },
+  { label: 'Cursor', extDirs: ['.cursor/extensions'], cli: 'cursor', app: 'Cursor', winApp: 'cursor' },
+  { label: 'VSCodium', extDirs: ['.vscodium/extensions'], cli: 'codium', app: 'VSCodium', winApp: 'VSCodium' },
+  { label: 'Windsurf', extDirs: ['.windsurf/extensions'], cli: 'windsurf', app: 'Windsurf', winApp: 'Windsurf' },
+  // The Remote-SSH backends. A remote window runs the extension from the SERVER's own extensions dir,
+  // which the desktop CLI above never writes: these used to share a row with their desktop editor, so
+  // `code --install-extension` updated ~/.vscode while the server kept running the old build, and a
+  // server-only machine (no desktop CLI at all) was reported as "install the shell command". Each server
+  // is its own row, driven by the server binary it ships (`server` names it; see serverCli). The
+  // VS Code and Cursor names are what those servers install; the other three are best-effort, which
+  // costs nothing, since a name that is not there is simply not found.
+  { label: 'VS Code server', extDirs: ['.vscode-server/extensions'], cli: 'code-server', app: '', winApp: '', server: '.vscode-server' },
+  { label: 'VS Code Insiders server', extDirs: ['.vscode-server-insiders/extensions'], cli: 'code-server-insiders', app: '', winApp: '', server: '.vscode-server-insiders' },
+  { label: 'Cursor server', extDirs: ['.cursor-server/extensions'], cli: 'cursor-server', app: '', winApp: '', server: '.cursor-server' },
+  { label: 'VSCodium server', extDirs: ['.vscodium-server/extensions'], cli: 'codium-server', app: '', winApp: '', server: '.vscodium-server' },
+  { label: 'Windsurf server', extDirs: ['.windsurf-server/extensions'], cli: 'windsurf-server', app: '', winApp: '', server: '.windsurf-server' },
 ];
 // The JetBrains plugin unzips to this dir inside each IDE's plugins/ folder; we drop a version
 // sentinel beside it so a later `update` can tell whether the installed plugin is already current.
@@ -5160,6 +6936,65 @@ async function downloadAsset(asset: ReleaseAsset): Promise<string> {
   return dest;
 }
 
+/** The source checkout a CLI package directory is part of: `<root>/packages/cli` in a git work tree (a
+ *  `.git` directory, or the `.git` file of a worktree). Null for an npm install and for the copy
+ *  `oak machine add` pushes. */
+function checkoutOf(pkgDir: string): string | null {
+  const fs = require('fs');
+  const path = require('path');
+  const root = path.dirname(path.dirname(pkgDir));
+  return path.basename(pkgDir) === 'cli' && path.basename(path.dirname(pkgDir)) === 'packages' && fs.existsSync(path.join(root, '.git')) ? root : null;
+}
+
+/** The checkout this CLI runs from, or null. Node resolves a linked `oak` to its real path, so an npm link
+ *  to a checkout lands here too. No process is started: the update nudge asks this on every command. */
+function runningCheckout(): string | null {
+  try {
+    return checkoutOf(require('fs').realpathSync(require('path').join(__dirname, '..')));
+  } catch {
+    return null;
+  }
+}
+
+/** Where `npm i -g` puts this package, or null when npm cannot say. Not `npm root -g`: npm 11 and later print
+ *  a UUID-shaped path segment as ***. A script npm runs is handed the real global prefix, whose
+ *  lib/node_modules (node_modules on Windows) holds the package. Without npm's own check for a newer npm,
+ *  which would ask the registry. */
+function npmGlobalPackageDir(): string | null {
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
+  const path = require('path');
+  const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+  try {
+    const prefix = String(core.spawnToolSync(npm, ['exec', '--no-update-notifier', '--silent', '-c', 'node -p process.env.npm_config_global_prefix'], { encoding: 'utf8', timeout: 30000 }).stdout ?? '').trim();
+    return path.isAbsolute(prefix) ? path.join(prefix, process.platform === 'win32' ? '' : 'lib', 'node_modules', 'oak-observatory') : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The source checkout the CLI that `oak update` would replace belongs to, or null. `npm i -g` of a release
+ * over an npm link (`npm link`, `npm i -g ./packages/cli`, ./install.sh) replaces the link with a copy of
+ * the release, and from then on every `oak`, the capture hooks' included, runs that copy while the checkout's
+ * builds change nothing. A CLI run from a checkout is left alone too: its version says nothing about the
+ * install npm would replace, and a release installed beside a checkout can shadow it on PATH.
+ */
+function linkedCli(): string | null {
+  const here = runningCheckout();
+  if (here) return here;
+  const fs = require('fs');
+  const global = npmGlobalPackageDir();
+  try {
+    if (global && fs.lstatSync(global).isSymbolicLink()) {
+      const target = fs.realpathSync(global);
+      return checkoutOf(target) ?? target;
+    }
+  } catch {
+    /* no global package, or a link to nothing: there is no checkout to keep */
+  }
+  return null;
+}
+
 /** Download the CLI tarball from the release and `npm i -g` it (integrity-checked first — the tarball
  *  runs install lifecycle scripts as the current user). */
 async function updateCliBinary(assets: ReleaseAsset[], latest: string, current: string): Promise<void> {
@@ -5196,49 +7031,70 @@ async function updateCliBinary(assets: ReleaseAsset[], latest: string, current: 
         `re-run \`oak update\`. Otherwise try: npm i -g ${dest} --allow-scripts=node-pty`
     );
   process.stdout.write(c.green('✓ ') + `updated the CLI ${current} → ${latest}\n`);
-  refreshInstalledStatusline();
 }
 
 /**
  * Finish an update in the CLI npm just installed. This process is still the OLD release: its
- * compiled-in herdr pin is the old one, and npm has just re-extracted node-pty, which resets the macOS
- * spawn-helper's mode. Found through npm's global root rather than `oak` on PATH, which can be
+ * compiled-in herdr pin is the old one, its idea of a complete hook install is the old one (an update
+ * that adds a hook event is exactly the case), and npm has just re-extracted node-pty, which resets the
+ * macOS spawn-helper's mode. Found through npm's global root rather than `oak` on PATH, which can be
  * another install (a linked checkout, a second Node).
+ *
+ * Returns whether that step ran and exited 0, and the new CLI's per-component results (it writes them
+ * to OAK_UPDATE_REPORT), null when it wrote none: it failed, or it is a release older than the report
+ * (a switch down to one).
  */
-function finishInInstalledCli(): void {
+function finishInInstalledCli(): { ok: boolean; rows: UpdateComponent[] | null } {
   const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
   const fs = require('fs');
+  const os = require('os');
   const path = require('path');
   let entry: string | null = null;
   try {
-    // Not `npm root -g`: npm 11 and later print a UUID-shaped path segment as ***. A script npm runs is
-    // handed the real global prefix, whose lib/node_modules (node_modules on Windows) holds the package.
-    const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
-    const prefix = String(core.spawnToolSync(npm, ['exec', '--silent', '-c', 'node -p process.env.npm_config_global_prefix'], { encoding: 'utf8' }).stdout ?? '').trim();
-    const pkg = path.join(prefix, process.platform === 'win32' ? '' : 'lib', 'node_modules', 'oak-observatory');
-    const bin = JSON.parse(fs.readFileSync(path.join(pkg, 'package.json'), 'utf8')).bin?.oak;
-    if (typeof bin === 'string') entry = path.join(pkg, bin);
+    const pkg = npmGlobalPackageDir();
+    const bin = pkg ? JSON.parse(fs.readFileSync(path.join(pkg, 'package.json'), 'utf8')).bin?.oak : null;
+    if (pkg && typeof bin === 'string') entry = path.join(pkg, bin);
   } catch {
     /* reported below */
   }
-  const r = entry ? core.spawnToolSync(process.execPath, [entry, '__after-update'], { stdio: 'inherit' }) : null;
-  if (r?.status !== 0)
-    process.stdout.write(c.yellow('⚠ ') + 'the updated CLI did not finish setting up herdr and its terminal — run `oak doctor --fix`\n');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-update-'));
+  const report = path.join(dir, 'components.json');
+  try {
+    const r = entry ? core.spawnToolSync(process.execPath, [entry, '__after-update'], { stdio: 'inherit', env: { ...process.env, OAK_UPDATE_REPORT: report } }) : null;
+    let rows: UpdateComponent[] | null = null;
+    try {
+      const parsed = JSON.parse(fs.readFileSync(report, 'utf8'));
+      if (Array.isArray(parsed)) rows = parsed as UpdateComponent[];
+    } catch {
+      /* no report: handled by the caller */
+    }
+    return { ok: r?.status === 0, rows };
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 /** `__after-update`: the half of `oak update` that belongs to the NEW release (see finishInInstalledCli). */
 async function afterUpdate(): Promise<void> {
-  await ensureHerdrPin();
+  const components = await applyComponents(await componentPlan());
   const tui = require('@oak-observatory/tui') as typeof import('@oak-observatory/tui');
   const pty = await tui.diagnoseNativeSpawn(true);
   if (pty.level !== 'ok') process.stdout.write(c.yellow('⚠ ') + `${pty.label}: ${pty.detail}\n` + (pty.fix ? c.dim(`  → ${pty.fix}\n`) : ''));
   else if (pty.detail.startsWith('repaired')) process.stdout.write(c.green('✓ ') + `${pty.detail}\n`);
+  // A supported Node whose database is still unavailable (built without node:sqlite, or OAK_INDEX=off): say once, in
+  // OAK's words, what that leaves out. An update onto an unsupported Node never gets here: the launcher refuses first.
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
+  if (!core.indexRuntime().ok) {
+    const ix = core.diagnoseIndex();
+    if (ix.level !== 'ok') process.stdout.write(c.yellow('⚠ ') + `${ix.label}: ${ix.detail}\n` + (ix.fix ? c.dim(`  → ${ix.fix}\n`) : ''));
+  }
+  const report = process.env.OAK_UPDATE_REPORT;
+  if (report) require('fs').writeFileSync(report, JSON.stringify(components));
 }
 
-/** The bundled status line updates WITH the CLI. Updating the observatory used to leave the installed
- *  ~/.claude/statusline.sh stale until the user re-ran `oak statusline` by hand — one
- *  update command now covers both. Runs the freshly-installed GLOBAL binary (not this process, whose
- *  bundled copy is the old version), and only when ours is actually installed. */
+/** The bundled status line, for an update whose installed CLI reports no components (a release older
+ *  than the report). Runs the freshly-installed GLOBAL binary (not this process, whose bundled copy is
+ *  the old version), and only when ours is actually installed. */
 function refreshInstalledStatusline(): void {
   const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
   if (!core.statuslineInstalled()) return; // some other status line (or none) — never touch it
@@ -5252,6 +7108,142 @@ function refreshInstalledStatusline(): void {
     process.stdout.write(
       c.dim(`status line refresh did not complete — run \`oak statusline\` yourself.\n`)
     );
+}
+
+/**
+ * OAK's own setup on a machine that an update keeps in step with the CLI. These are not release assets
+ * with a version: they are what the CLI writes (capture hooks, the status line, herdr and its
+ * integrations, the focus server), so each is judged by the CLI that is RUNNING. A stale CLI therefore
+ * plans them as `after-cli` and leaves them to the release it installs.
+ *
+ *   current    nothing to do        update    the plan will act on it   absent   not set up here, left alone
+ *   after-cli  judged by the new CLI   updated / failed   what the run did
+ *   manual     yours to do, never the update's (a project's own settings file): the detail names the command
+ */
+type ComponentState = 'current' | 'update' | 'absent' | 'after-cli' | 'updated' | 'failed' | 'manual';
+interface UpdateComponent {
+  id: 'hooks' | 'project-hooks' | 'codex-hooks' | 'statusline' | 'herdr' | 'focus-server' | 'setup' | 'agent-setup';
+  label: string;
+  state: ComponentState;
+  detail: string;
+}
+
+/** The status line script this build installs: the installer's heredoc, byte for byte as bash writes it. */
+function statuslineCurrent(): boolean {
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
+  const fs = require('fs');
+  const path = require('path');
+  try {
+    const installer = fs.readFileSync(statuslineInstallerPath(), 'utf8');
+    const open = "<<'STATUSLINE_EOF'\n";
+    const start = installer.indexOf(open);
+    const end = installer.indexOf('\nSTATUSLINE_EOF\n', start);
+    if (start < 0 || end < 0) return false;
+    const want = installer.slice(start + open.length, end + 1);
+    return fs.readFileSync(path.join(core.claudeConfigDir(), 'statusline.sh'), 'utf8') === want;
+  } catch {
+    return false;
+  }
+}
+
+/** What this CLI would change in OAK's own setup here. Reads only. */
+async function componentPlan(): Promise<UpdateComponent[]> {
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
+  const row = (id: UpdateComponent['id'], label: string) => (state: ComponentState, detail: string): UpdateComponent => ({ id, label, state, detail });
+  const out: UpdateComponent[] = [];
+  const setup = core.agentSetupStatus();
+  const setupItems = setup.flatMap(p => p.items);
+  if (setup.length) out.push(row('agent-setup', 'Agent delegation guidance')( setupItems.some(e => e.state === 'outdated' || e.state === 'missing') ? 'update' : setupItems.some(e => e.state === 'edited') ? 'manual' : 'current',
+    setupItems.length ? setupItems.map(e => `${e.path}: ${e.state}`).join('; ') : 'not set up — oak agent setup opts in'));
+  // The user's settings file, the one `oak init` writes. A file the user never installed into is not one
+  // an update adds hooks to. A project's own .claude/settings.json is committed and shared, so an update
+  // never writes there: each one that needs repair is a row naming the command to run in it.
+  const hooks = row('hooks', 'Claude Code capture hooks');
+  const installed = core.installStatus().filter((f) => f.exists && f.installed);
+  const files = installed.filter((f) => f.scope === 'user');
+  const short = files.filter((f) => f.entries !== core.HEALTHY_HOOK_ENTRIES);
+  out.push(!files.length ? hooks('absent', 'not installed — `oak init` adds them')
+    : short.length ? hooks('update', short.map((f) => `${f.path}: ${f.entries} of ${core.HEALTHY_HOOK_ENTRIES} events`).join('; '))
+    : hooks('current', `all ${core.HEALTHY_HOOK_ENTRIES} events`));
+  for (const f of installed.filter((f) => f.scope === 'project' && f.entries !== core.HEALTHY_HOOK_ENTRIES)) {
+    const missing = core.missingHookEvents(f.path);
+    const what = missing.length ? `is missing ${missing.join(', ')}` : `has ${f.entries} entries for its ${core.HEALTHY_HOOK_ENTRIES} events`;
+    out.push(row('project-hooks', 'Claude Code project hooks')('manual', `${f.path} ${what} — run \`oak init --repair\` there`));
+  }
+  const codex = row('codex-hooks', 'Codex capture hooks');
+  const cx = core.codexHooksStatus(core.isOurCommand);
+  // A hook the user turned off in Codex is theirs to turn back on: only a missing or changed hash is work.
+  out.push(!cx.installed ? codex('absent', 'not installed — `oak init --codex` adds them')
+    : cx.disabled ? codex('current', 'turned off in codex config.toml — left alone')
+    : cx.trust !== 'trusted' ? codex('update', `trust is ${cx.trust} — reinstall`)
+    : cx.userDisabled.length ? codex('current', `${cx.userDisabled.join(', ')} turned off in Codex — left alone`)
+    : codex('current', 'installed and trusted'));
+  // Only OUR status line, never a foreign one: the installer refuses those without --force, and an
+  // update never passes it.
+  const sl = row('statusline', 'status line');
+  out.push(!core.statuslineInstalled() ? sl('absent', 'not installed, or another tool’s — left alone')
+    : statuslineCurrent() ? sl('current', 'this build’s script') : sl('update', 'older than this build’s script'));
+  // herdr as `oak doctor --fix` keeps it: the pinned binary when it is missing or older (a newer one is
+  // the user's), plus its Claude and Codex integrations and OAK's plugin, which ensureHerdr checks first
+  // and installs only when not current. Where herdr ships no build (Windows on ARM, 32-bit ARM) there is
+  // nothing to install, so a missing herdr is not work.
+  const herdr = row('herdr', 'herdr');
+  const pin = core.readHerdrLock().version;
+  const h = core.probeHerdr();
+  out.push(!h.bin && !core.herdrPlatformKey() ? herdr('absent', 'herdr publishes no build for this platform')
+    : !h.bin ? herdr('update', `not installed — installs the pinned ${pin}, as \`oak doctor --fix\` does`)
+    : !h.current ? herdr('update', `${h.version} → ${pin}`)
+    : herdr('current', `${h.version}`));
+  const focus = await core.diagnoseFocusServer(false);
+  out.push(row('focus-server', 'focus server')(focus.level === 'ok' ? 'current' : 'update', focus.detail));
+  return out;
+}
+
+/** Bring each component the plan marked `update` up to this build, through the installer that owns it
+ *  (`oak init`'s hook upsert, the codex hook installer, the bundled status line installer, doctor's
+ *  herdr repair and focus-server stop). herdr is always passed through ensureHerdr, which leaves a
+ *  current install alone, because its integrations are only checked there; a platform herdr ships no
+ *  build for is left out. */
+async function applyComponents(plan: UpdateComponent[]): Promise<UpdateComponent[]> {
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
+  const out: UpdateComponent[] = [];
+  for (const p of plan) {
+    const set = (state: ComponentState, detail: string): UpdateComponent => ({ ...p, state, detail });
+    try {
+      if (p.id === 'herdr' && p.state !== 'absent') out.push({ ...p, ...(await ensureHerdrPin()) });
+      else if (p.state !== 'update') out.push(p);
+      else if (p.id === 'agent-setup') {
+        const plans = core.refreshAgentSetup();
+        const edited = plans.flatMap(p => p.items).filter(e => e.state === 'edited');
+        out.push(set(edited.length ? 'manual' : 'updated', edited.length ? edited.map(e => `${e.path}: user-edited; left unchanged`).join('; ') : 'managed delegation guidance refreshed'));
+      } else if (p.id === 'hooks') {
+        const bad: string[] = [];
+        for (const f of core.installStatus().filter((f) => f.scope === 'user' && f.exists && f.installed && f.entries !== core.HEALTHY_HOOK_ENTRIES)) {
+          try {
+            core.installHooks(captureCommand(false), f.path);
+          } catch (e) {
+            bad.push(`${f.path}: ${String((e as Error)?.message || e)}`);
+          }
+        }
+        out.push(bad.length ? set('failed', bad.join('; ')) : set('updated', `repaired to all ${core.HEALTHY_HOOK_ENTRIES} events`));
+      } else if (p.id === 'codex-hooks') {
+        core.installCodexHooks(`oak capture --agent codex #${core.HOOK_MARKER}`, core.isOurCommand);
+        const trust = core.codexHooksStatus(core.isOurCommand).trust;
+        out.push(trust === 'trusted' ? set('updated', 'reinstalled and trusted') : set('failed', `trust is ${trust} after a reinstall — run \`oak init --codex\``));
+      } else if (p.id === 'statusline') {
+        // `direct`: bash is a real executable (the same call cmdStatusline makes), never `--force`.
+        const r = core.spawnToolSync('bash', [statuslineInstallerPath()], { stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', direct: true });
+        const why = String(r.stderr ?? '').split('\n').find((l) => l.trim()) || r.error?.message || `the installer exited ${r.status ?? '?'}`;
+        out.push(r.status === 0 && statuslineCurrent() ? set('updated', 'refreshed to this build') : set('failed', `${why} — run \`oak statusline\``));
+      } else if (p.id === 'focus-server') {
+        const f = await core.diagnoseFocusServer(true);
+        out.push(set(f.level === 'ok' ? 'updated' : 'failed', f.detail));
+      } else out.push(p);
+    } catch (e) {
+      out.push(set('failed', String((e as Error)?.message || e)));
+    }
+  }
+  return out;
 }
 
 /** Editors in the VS Code family (code/cursor/…) on PATH that already have our extension, with the
@@ -5294,7 +7286,8 @@ function resolveEditorCli(cli: string, app: string, winApp: string): string | nu
 
 /**
  * What the editor itself says is installed in `dir`, from its own `extensions.json` registry:
- * `{ '<publisher>.<name>': '<version>' }`. Null when the file is absent or unreadable — then the
+ * `{ '<publisher>.<name>': { version, gallery } }`, where `gallery` says a marketplace installed it
+ * (`metadata.source`, the same field the VS Code extension's own updater reads). Null when the file is absent or unreadable — then the
  * caller falls back to scanning folders.
  *
  * This has to come first, because a folder scan answers a DIFFERENT question. An editor leaves the
@@ -5304,7 +7297,7 @@ function resolveEditorCli(cli: string, app: string, winApp: string): string | nu
  * user on a build the registry no longer even loads. The registry lists what is LOADED, one row per
  * extension — which is the thing an update has to reason about.
  */
-function registeredExtVersions(dir: string): Record<string, string> | null {
+function registeredExtVersions(dir: string): Record<string, { version: string; gallery: boolean }> | null {
   const fs = require('fs');
   const path = require('path');
   let raw: string;
@@ -5316,11 +7309,11 @@ function registeredExtVersions(dir: string): Record<string, string> | null {
   try {
     const list = JSON.parse(raw);
     if (!Array.isArray(list)) return null;
-    const out: Record<string, string> = {};
+    const out: Record<string, { version: string; gallery: boolean }> = {};
     for (const e of list) {
       const id = String(e?.identifier?.id ?? '').toLowerCase();
       const v = e?.version;
-      if (id && typeof v === 'string' && v) out[id] = v;
+      if (id && typeof v === 'string' && v) out[id] = { version: v, gallery: e?.metadata?.source === 'gallery' };
     }
     return out;
   } catch {
@@ -5357,6 +7350,10 @@ type EditorRow = {
   cliName: string;
   version: string | null;
   hasOld: boolean;
+  /** The editor's registry says a marketplace installed our extension (see registeredExtVersions). */
+  gallery: boolean;
+  /** A Remote-SSH server dir, driven by the server binary it holds rather than a desktop CLI. */
+  server: boolean;
 };
 
 function vscodeEditors(): EditorRow[] {
@@ -5369,6 +7366,7 @@ function vscodeEditors(): EditorRow[] {
   for (const ed of VSCODE_EDITORS) {
     let best: string | null = null; // newest version across this editor's extension dirs
     let hasOld = false;
+    let gallery = false;
     const extRoots: string[] = [];
     for (const rel of ed.extDirs) {
       const dir = path.join(home, rel);
@@ -5380,8 +7378,9 @@ function vscodeEditors(): EditorRow[] {
       const reg = registeredExtVersions(dir);
       if (reg) {
         if (reg[VSCODE_EXT_ID_OLD]) hasOld = true;
-        const v = reg[VSCODE_EXT_ID];
+        const v = reg[VSCODE_EXT_ID]?.version;
         if (v && (best === null || core.isNewer(v, best))) best = v;
+        if (reg[VSCODE_EXT_ID]?.gallery) gallery = true;
         continue;
       }
       for (const e of entries) {
@@ -5393,9 +7392,47 @@ function vscodeEditors(): EditorRow[] {
         if (v && (best === null || core.isNewer(v, best))) best = v;
       }
     }
-    out.push({ label: ed.label, extDirs: ed.extDirs, extRoots, cli: resolveEditorCli(ed.cli, ed.app, ed.winApp), cliName: ed.cli, version: best, hasOld });
+    const cli = ed.server ? serverCli(path.join(home, ed.server), ed.cli) : resolveEditorCli(ed.cli, ed.app, ed.winApp);
+    out.push({ label: ed.label, extDirs: ed.extDirs, extRoots, cli, cliName: ed.cli, version: best, hasOld, gallery, server: Boolean(ed.server) });
   }
   return out;
+}
+
+/**
+ * The newest `name` binary a Remote-SSH server dir holds, or null. Servers keep one build per editor
+ * release, in two layouts: `bin/<commit>/bin/<name>` (older VS Code; Cursor adds a platform level,
+ * `bin/linux-x64/<commit>/bin/<name>`) and `cli/servers/Stable-<commit>/server/bin/<name>` (current
+ * VS Code). The newest by modification time is the build the editor connects to now. Bounded depth,
+ * so a large server dir is never walked whole.
+ */
+function serverCli(serverDir: string, name: string): string | null {
+  const fs = require('fs');
+  const path = require('path');
+  let best: { p: string; t: number } | null = null;
+  const walk = (dir: string, depth: number): void => {
+    let entries: import('fs').Dirent[];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      const p = path.join(dir, e.name);
+      if (e.isDirectory()) { if (depth > 0 && e.name !== 'node_modules' && e.name !== 'extensions') walk(p, depth - 1); continue; }
+      if (e.name !== name || path.basename(dir) !== 'bin') continue;
+      try {
+        const t = fs.statSync(p).mtimeMs;
+        if (!best || t > best.t) best = { p, t };
+      } catch { /* vanished mid-walk */ }
+    }
+  };
+  walk(path.join(serverDir, 'bin'), 4);
+  walk(path.join(serverDir, 'cli', 'servers'), 4);
+  return (best as { p: string; t: number } | null)?.p ?? null;
+}
+
+/** What makes an editor row actionable when its CLI was not found. A Remote-SSH server has no shell
+ *  command to install: its binary arrives when the editor next connects. */
+function noCliFix(e: EditorRow | undefined): string {
+  if (e?.server) return `connect to this machine from ${e.label.slice(0, -' server'.length)} once, so it installs its server (${e.cliName})`;
+  const label = e?.label ?? 'VS Code';
+  return `in ${label}, ⇧⌘P → "Shell Command: Install '${e?.cliName || 'code'}' command in PATH"`;
 }
 
 /** Is this editor on the machine at all? An extensions dir means it has RUN; a resolvable CLI means it
@@ -5415,17 +7452,24 @@ function editorPresent(e: EditorRow): boolean {
 function installedSurfaces(): InstalledSurface[] {
   const fs = require('fs');
   const path = require('path');
-  const out: InstalledSurface[] = [{ surface: 'cli', label: 'CLI', version: version() }];
+  // The copy `oak machine add` pushed is updated by running that again, never by npm; a CLI linked to a
+  // checkout is updated in the checkout.
+  const bundle = machineBundle();
+  const linked = bundle ? null : linkedCli();
+  const out: InstalledSurface[] = [{ surface: 'cli', label: 'CLI', version: version(), ...(bundle ? { provisioned: true } : linked ? { linked } : {}) }];
   for (const e of vscodeEditors()) {
     if (!editorPresent(e)) continue;
     // An editor with no CLI is still reported — "installed but we cannot drive an update" has to be
     // said out loud, and the plan is what carries it to whoever prints.
-    out.push({ surface: 'vscode', label: e.label, version: e.version, actionable: e.cli !== null, ref: e });
+    out.push({ surface: 'vscode', label: e.label, version: e.version, actionable: e.cli !== null, marketplace: e.gallery, ref: e });
   }
-  for (const d of jetbrainsPluginDirs()) {
+  for (const d of jetbrainsPluginDirs(true)) {
     const pluginDir = path.join(d, JB_PLUGIN_DIRNAME);
     if (!fs.existsSync(pluginDir)) continue;
-    out.push({ surface: 'jetbrains', label: `JetBrains (${path.basename(path.dirname(d))})`, version: jbInstalledVersion(pluginDir), ref: d });
+    // The IDE's own folder: `<IDE>/plugins` on macOS, Windows and Remote Development, `<IDE>` itself
+    // on Linux, where two IDEs were otherwise both labelled "JetBrains (JetBrains)".
+    const ide = path.basename(d) === 'plugins' ? path.basename(path.dirname(d)) : path.basename(d);
+    out.push({ surface: 'jetbrains', label: `JetBrains (${ide})`, version: jbInstalledVersion(pluginDir), ref: d });
   }
   return out;
 }
@@ -5433,9 +7477,9 @@ function installedSurfaces(): InstalledSurface[] {
 /** Install `vsixPath` into each target with `--install-extension --force`, handle the 0.8.6 publisher
  *  cleanup, and report per editor. Returns how many succeeded. Shared by `update` (refresh what is
  *  there) and `install-extensions` (put it where it is missing) so the two cannot drift. */
-function applyVsix(targets: EditorRow[], vsixPath: string, version: string): number {
+function applyVsix(targets: EditorRow[], vsixPath: string, version: string): EditorRow[] {
   const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
-  let installed = 0;
+  const installed: EditorRow[] = [];
   for (const h of targets) {
     // `h.cli` is `code`/`cursor`/… — a bare name on PATH, or an explicit `…\bin\code.cmd` on
     // Windows. BOTH are unspawnable there without cmd.exe, which is why this never once worked
@@ -5443,7 +7487,7 @@ function applyVsix(targets: EditorRow[], vsixPath: string, version: string): num
     const r = core.spawnToolSync(h.cli as string, ['--install-extension', vsixPath, '--force'], { stdio: 'inherit' });
     if (r.status === 0) {
       process.stdout.write(c.green('✓ ') + `${h.label} extension ${h.version ?? '(new)'} → ${version}\n`);
-      installed++;
+      installed.push(h);
       // Publisher change (0.8.6): drop the old-id install, but only once the renamed extension is
       // confirmed on disk — a --force reinstall of a pre-rename .vsix must not uninstall itself.
       if (h.hasOld && hasExtFolder(h.extDirs, VSCODE_EXT_ID)) {
@@ -5455,7 +7499,7 @@ function applyVsix(targets: EditorRow[], vsixPath: string, version: string): num
       process.stdout.write(c.yellow(`  ⚠ ${h.label} --install-extension failed — install the .vsix manually from the release\n`));
     }
   }
-  if (installed) process.stdout.write(c.dim('  fully quit the editor (⌘Q) once so the activity-bar icon refreshes.\n'));
+  if (installed.length) process.stdout.write(c.dim('  fully quit the editor (⌘Q) once so the activity-bar icon refreshes.\n'));
   return installed;
 }
 
@@ -5472,51 +7516,46 @@ function hasExtFolder(extDirs: string[], id: string): boolean {
   return false;
 }
 
+/** What happened to one surface the plan said needed work. Rows the plan left alone have no entry. */
+type RowResult = { state: 'updated' | 'failed'; detail: string };
+
 /** Refresh the VS Code-family extension in every editor that already has it (never installs into an
  *  editor that lacks it — that is `install-extensions`' job). Downloads the .vsix once and
  *  `--install-extension --force`s it. The DECISION of what is stale came from `resolveUpdatePlan`;
- *  this only applies it. */
-async function refreshVscodeExtension(
-  assets: ReleaseAsset[],
-  plan: UpdatePlan
-): Promise<'updated' | 'current' | 'blocked' | 'absent'> {
+ *  this only applies it, and records each row's outcome in `results`. */
+async function refreshVscodeExtension(assets: ReleaseAsset[], plan: UpdatePlan, results: Map<UpdateAction, RowResult>): Promise<void> {
   const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
-  const here = plan.surfaces.filter((s) => s.surface === 'vscode');
-  const installs = here.filter((s) => s.reason !== 'missing');
-  if (installs.length === 0) return 'absent'; // genuinely not installed — the only OK silent case
-  const stale = installs.filter((s) => s.reason !== 'current');
-  if (stale.length === 0) {
-    process.stdout.write(c.green('✓ ') + `VS Code extension up to date (${installs[0].from})\n`);
-    return 'current';
-  }
+  const stale = plan.actions.filter((s) => s.surface === 'vscode' && s.reason !== 'missing');
+  if (!stale.length) return;
   // Installed but no CLI could be located: SURFACE it loudly with a fix — never skip in silence.
   for (const s of stale.filter((s) => !s.actionable)) {
-    const ed = s.ref as EditorRow;
     process.stdout.write(
       c.yellow('  ⚠ ') +
-        `${s.label} extension ${s.from} is installed, but its CLI wasn't found on PATH or in the usual app locations — can't auto-update it.\n` +
-        c.dim(`    Fix: in ${s.label}, ⇧⌘P → "Shell Command: Install '${ed?.cliName || 'code'}' command in PATH", then re-run \`oak update\`;\n`) +
+        `${s.label} extension ${s.from} is installed, but its CLI wasn't found — can't auto-update it.\n` +
+        c.dim(`    Fix: ${noCliFix(s.ref as EditorRow)}, then re-run \`oak update\`;\n`) +
         c.dim(`    or install oak-observatory-vscode-v${plan.target}.vsix from the release manually.\n`)
     );
+    results.set(s, { state: 'failed', detail: `no CLI found — ${noCliFix(s.ref as EditorRow)}` });
   }
   const actionable = stale.filter((s) => s.actionable);
-  let installed = 0;
-  if (actionable.length) {
-    const vsix = core.assetFor(assets, 'vscode');
-    if (!vsix) {
-      process.stdout.write(c.yellow(`  ⚠ release v${plan.target} has no .vsix asset — could not update the VS Code extension\n`));
-    } else {
-      const dest = await downloadAsset(vsix);
-      installed = applyVsix(actionable.map((s) => s.ref as EditorRow), dest, plan.target);
-    }
+  if (!actionable.length) return;
+  const vsix = core.assetFor(assets, 'vscode');
+  if (!vsix) {
+    process.stdout.write(c.yellow(`  ⚠ release v${plan.target} has no .vsix asset — could not update the VS Code extension\n`));
+    for (const s of actionable) results.set(s, { state: 'failed', detail: `release ${plan.target} has no .vsix asset` });
+    return;
   }
-  // 'blocked' when any stale install couldn't be applied (no CLI, no asset, or a failed install).
-  return installed === stale.length ? 'updated' : 'blocked';
+  const dest = await downloadAsset(vsix);
+  const done = applyVsix(actionable.map((s) => s.ref as EditorRow), dest, plan.target);
+  for (const s of actionable)
+    results.set(s, done.includes(s.ref as EditorRow)
+      ? { state: 'updated', detail: `${s.from} → ${plan.target}` }
+      : { state: 'failed', detail: '--install-extension failed — install the .vsix from the release by hand' });
 }
 
 /** JetBrains plugin dirs across platforms — ports the detection in scripts/install-jetbrains.sh so
  *  `update` also works on an SSH host serving JetBrains Remote Development. */
-function jetbrainsPluginDirs(): string[] {
+function jetbrainsPluginDirs(anyProduct = false): string[] {
   const fs = require('fs');
   const path = require('path');
   const os = require('os');
@@ -5530,7 +7569,10 @@ function jetbrainsPluginDirs(): string[] {
     let entries: string[] = [];
     try { entries = fs.readdirSync(parent); } catch { return; }
     for (const e of entries) {
-      if (!PRODUCTS.some((p) => e.startsWith(p))) continue;
+      // `update` looks in EVERY JetBrains product dir (it only acts where our plugin already is, so CLion
+      // or Rider with a hand-installed plugin is refreshed too); `install-extensions` keeps to the IDEs
+      // the installers name.
+      if (!anyProduct && !PRODUCTS.some((p) => e.startsWith(p))) continue;
       const target = sub ? path.join(parent, e, sub) : path.join(parent, e);
       if (isDir(target)) dirs.push(target);
     }
@@ -5615,28 +7657,24 @@ function jetbrainsAutoUpdateHint(): string {
 
 /** Refresh the JetBrains plugin in every IDE plugins dir that already has it, by unzipping the release
  *  zip in place (the plugin can't hot-swap — the IDE must fully restart). Idempotent via a version
- *  sentinel written beside the plugin. */
-async function refreshJetbrainsPlugin(
-  assets: ReleaseAsset[],
-  plan: UpdatePlan
-): Promise<'updated' | 'current' | 'blocked' | 'absent'> {
+ *  sentinel written beside the plugin. Records each row's outcome in `results`. */
+async function refreshJetbrainsPlugin(assets: ReleaseAsset[], plan: UpdatePlan, results: Map<UpdateAction, RowResult>): Promise<void> {
   const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
-  const holders = plan.surfaces.filter((s) => s.surface === 'jetbrains');
-  if (holders.length === 0) return 'absent';
-  const stale = holders.filter((s) => s.reason !== 'current');
-  if (stale.length === 0) {
-    process.stdout.write(c.green('✓ ') + `JetBrains plugin up to date (${plan.target})\n`);
-    return 'current';
-  }
-  if (!zipToolReady()) return 'blocked';
+  const stale = plan.actions.filter((s) => s.surface === 'jetbrains');
+  if (!stale.length) return;
+  const failAll = (detail: string) => { for (const s of stale) results.set(s, { state: 'failed', detail }); };
+  if (!zipToolReady()) return failAll('`unzip` was not found');
   const zip = core.assetFor(assets, 'jetbrains');
   if (!zip) {
     process.stdout.write(c.yellow(`  ⚠ release v${plan.target} has no JetBrains .zip asset — could not update the plugin\n`));
-    return 'blocked';
+    return failAll(`release ${plan.target} has no JetBrains .zip asset`);
   }
   const dest = await downloadAsset(zip);
-  const installed = applyJetbrainsZip(stale.map((s) => s.ref as string), dest, plan.target);
-  return installed === stale.length ? 'updated' : 'blocked'; // any dir that failed to extract → surface it
+  const done = applyJetbrainsZip(stale.map((s) => s.ref as string), dest, plan.target);
+  for (const s of stale)
+    results.set(s, done.includes(s.ref as string)
+      ? { state: 'updated', detail: `${s.from} → ${plan.target}; restart the IDE to load it` }
+      : { state: 'failed', detail: `could not unzip into ${s.ref as string}` });
 }
 
 /** The precondition for unzipping into a plugin dir. Windows uses PowerShell's Expand-Archive, so only
@@ -5649,10 +7687,10 @@ function zipToolReady(): boolean {
 
 /** Unzip `zipPath` into each IDE plugin dir, stamp the version sentinel, report per dir. Returns how
  *  many succeeded. Shared by `update` and `install-extensions`. */
-function applyJetbrainsZip(dirs: string[], zipPath: string, version: string): number {
+function applyJetbrainsZip(dirs: string[], zipPath: string, version: string): string[] {
   const fs = require('fs');
   const path = require('path');
-  let installed = 0;
+  const installed: string[] = [];
   for (const d of dirs) {
     const pluginDir = path.join(d, JB_PLUGIN_DIRNAME);
     try {
@@ -5661,25 +7699,18 @@ function applyJetbrainsZip(dirs: string[], zipPath: string, version: string): nu
       if (!extractZip(zipPath, d)) throw new Error('extract failed');
       fs.writeFileSync(path.join(pluginDir, JB_VERSION_SENTINEL), version);
       process.stdout.write(c.green('✓ ') + `JetBrains plugin → ${version} (${d})\n`);
-      installed++;
+      installed.push(d);
     } catch (e: any) {
       process.stdout.write(c.yellow(`  ⚠ could not install the JetBrains plugin into ${d}: ${e?.message || e}\n`));
     }
   }
-  if (installed) {
+  if (installed.length) {
     process.stdout.write(c.dim('  fully restart the IDE (⌘Q → reopen) — a running JVM can’t hot-swap plugin classes.\n'));
     process.stdout.write(jetbrainsAutoUpdateHint());
   }
   return installed;
 }
 
-/**
- * `update` — refresh the CLI AND the locally-installed editor extensions from the latest GitHub
- * Release (marketplace-free). The CLI self-updates via `npm i -g`; the VS Code extension via
- * `code --install-extension --force`; the JetBrains plugin by unzipping into the IDE plugin dirs.
- * `--check` reports only; `--cli-only` is the old CLI-only behavior; `--force` reinstalls even if
- * already current.
- */
 /** The releases LIST (newest first, drafts invisible anonymously) — ONE fetch answers both
  *  channels: the first regular release is what `releases/latest` serves, the first prerelease is
  *  the rolling dev build. Channel choice happens in core (`resolveReleaseFromList`), pure. */
@@ -5824,13 +7855,18 @@ async function cmdInstallExtensions(args: string[]): Promise<void> {
     const stale = (installed: string | null) =>
       force || vsixArg !== null || installed === null || core.compareVersions(installed, target) !== 0;
     const actionable = editors.filter((e) => e.cli && stale(e.version));
-    const noCli = editors.filter((e) => !e.cli);
+    // A Remote-SSH server dir whose server binary is gone (the editor removed an old build) holds
+    // nothing to drive and nothing a person can fix from here; the editor reinstalls its server on the
+    // next connection. Said, not counted as a failure, as when the dirs belonged to the desktop row.
+    for (const e of editors.filter((e) => !e.cli && e.server))
+      process.stdout.write(c.dim(`${e.label}: no server binary found — skipped; ${noCliFix(e)} to install into it.\n`));
+    const noCli = editors.filter((e) => !e.cli && !e.server);
     for (const e of noCli) {
       // Never a silent skip: the editor is here, we just cannot drive it.
       process.stdout.write(
         c.yellow('  ⚠ ') +
           `${e.label} is installed but its CLI wasn't found — can't install into it.\n` +
-          c.dim(`    Fix: in ${e.label}, ⇧⌘P → "Shell Command: Install '${e.cliName}' command in PATH", then re-run.\n`)
+          c.dim(`    Fix: ${noCliFix(e)}, then re-run.\n`)
       );
       blocked++;
     }
@@ -5847,7 +7883,7 @@ async function cmdInstallExtensions(args: string[]): Promise<void> {
         if (!vsix) fail(`release v${target} has no .vsix asset to install.`);
         src = await downloadAsset(vsix!);
       }
-      const n = applyVsix(actionable, src, target);
+      const n = applyVsix(actionable, src, target).length;
       did += n;
       blocked += actionable.length - n;
     }
@@ -5872,7 +7908,7 @@ async function cmdInstallExtensions(args: string[]): Promise<void> {
           if (!zip) fail(`release v${target} has no JetBrains .zip asset to install.`);
           src = await downloadAsset(zip!);
         }
-        const n = applyJetbrainsZip(targets, src, target);
+        const n = applyJetbrainsZip(targets, src, target).length;
         did += n;
         blocked += targets.length - n;
       }
@@ -5932,21 +7968,337 @@ function persistChannel(requested: 'stable' | 'dev' | null): void {
  *
  * Never fatal. The CLI update itself already succeeded; herdr's state is reported, not enforced.
  */
-async function ensureHerdrPin(): Promise<void> {
+async function ensureHerdrPin(): Promise<Pick<UpdateComponent, 'state' | 'detail'>> {
   const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
   try {
     const report = await core.ensureHerdr({ startServer: false });
-    if (report.upgraded) process.stdout.write(c.green('✓ ') + `herdr ${report.version} installed (pinned by herdr.lock)\n`);
-    if (report.sidebarConfigured) process.stdout.write(c.green('✓ ') + `herdr sidebar widths set in its config.toml (a backup sits beside it)\n`);
-    if (report.themeConfigured) process.stdout.write(c.green('✓ ') + `herdr theme: gruvbox (set)\n`);
+    const did: string[] = [];
+    if (report.upgraded) {
+      process.stdout.write(c.green('✓ ') + `herdr ${report.version} installed (pinned by herdr.lock)\n`);
+      did.push(`installed ${report.version}`);
+    }
+    if (report.sidebarConfigured) {
+      process.stdout.write(c.green('✓ ') + `herdr sidebar widths set in its config.toml (a backup sits beside it)\n`);
+      did.push('sidebar widths set');
+    }
+    if (report.themeConfigured) {
+      process.stdout.write(c.green('✓ ') + `herdr theme: gruvbox (set)\n`);
+      did.push('theme set');
+    }
     for (const w of report.warnings) process.stdout.write(c.yellow('⚠ ') + w + '\n');
+    const integrations = Object.entries(report.integrations ?? {});
+    const added = integrations.filter(([, v]) => v === 'installed').map(([k]) => k);
+    if (added.length) did.push(`${added.join(' and ')} integration installed`);
+    const failed = integrations.filter(([, v]) => v === 'failed').map(([k]) => k);
+    if (failed.length) return { state: 'failed', detail: `the ${failed.join(' and ')} integration did not install — run \`oak doctor --fix\`` };
+    return did.length ? { state: 'updated', detail: `${report.version}: ${did.join(', ')}` } : { state: 'current', detail: `${report.version}` };
   } catch (e) {
-    process.stderr.write(
-      c.yellow('⚠ ') + `could not verify herdr: ${String((e as Error)?.message || e)} — run \`oak doctor --fix\`\n`
-    );
+    const msg = String((e as Error)?.message || e);
+    process.stderr.write(c.yellow('⚠ ') + `could not verify herdr: ${msg} — run \`oak doctor --fix\`\n`);
+    return { state: 'failed', detail: `${msg} — run \`oak doctor --fix\`` };
   }
 }
 
+/** A saved machine's part of `oak update`: its own `oak update --here`, run over ssh.
+ *
+ *   current     nothing to do there            update      its plan has work (plan only)
+ *   updated     its update ran and succeeded   failed      it ran and failed, or its answer was unreadable
+ *   no-oak      OAK is not installed there     old-oak     its OAK predates `update --here`
+ *   unreachable ssh could not connect          timeout     no answer within the deadline
+ *   disabled    disabled in herdr, skipped
+ *   linked      its CLI is linked to a checkout, and its OAK predates leaving such a CLI alone: nothing ran
+ *   provisioned its OAK is the copy `oak machine add` pushed, older than leaving such a copy alone: nothing ran
+ */
+type MachineState = 'current' | 'update' | 'updated' | 'failed' | 'no-oak' | 'old-oak' | 'linked' | 'provisioned' | 'unreachable' | 'timeout' | 'disabled';
+interface MachineUpdate {
+  label: string;
+  target: string;
+  state: MachineState;
+  detail: string;
+  /** The machine's own `update --here --json`: its plan, or after an update its state afterwards. */
+  plan?: any;
+}
+/** The machine states an update counts as failed: something is installed there that it could not update. */
+const MACHINE_FAILED: ReadonlySet<MachineState> = new Set(['failed', 'old-oak', 'unreachable', 'timeout']);
+/** Reading a machine's plan is one ssh and one release-feed fetch; applying it can be an npm install
+ *  and an editor install. With herdr's machine list (15 s), both leave most of the fifteen minutes the
+ *  editors give a whole `oak update` to this machine's own installs (a gate test holds the sum).
+ *  OAK_MACHINE_TIMEOUT_MS overrides both, as it does for `--machine`. */
+const MACHINE_PLAN_TIMEOUT_MS = 45_000;
+const MACHINE_APPLY_TIMEOUT_MS = 180_000;
+
+/** The ssh children `oak update` has running on saved machines. Told to stop (an editor's deadline sends
+ *  SIGTERM), it stops them too, as forwardToMachine stops its one, and ends as the signal ends it:
+ *  otherwise each outlives this process, reparented, until its machine's update ends. While none is
+ *  running, a signal ends the update as it always has. */
+const updateSsh = new Set<ReturnType<typeof import('@oak-observatory/core').spawnTool>>();
+const updateSshStops = SSH_STOP_SIGNALS.map(([sig, n]) => [sig, () => {
+  for (const c of updateSsh) c.kill();
+  endBySignal(sig, n);
+}] as const);
+/** Any other exit (an uncaught exception) stops each one no handler above has stopped already. */
+const updateSshExit = (): void => { for (const c of updateSsh) if (!c.killed) c.kill(); };
+function stopWithUpdate(child: ReturnType<typeof import('@oak-observatory/core').spawnTool>): void {
+  if (!updateSsh.size) {
+    for (const [sig, stop] of updateSshStops) process.once(sig, stop);
+    process.once('exit', updateSshExit);
+  }
+  updateSsh.add(child);
+  child.on('close', () => {
+    updateSsh.delete(child);
+    if (!updateSsh.size) {
+      for (const [sig, stop] of updateSshStops) process.off(sig, stop);
+      process.off('exit', updateSshExit);
+    }
+  });
+}
+
+/** Run `oak <body>` on a saved machine, the way forwardToMachine reaches it: herdr's ssh target, the
+ *  shared MACHINE_PATH and ssh environment, never an interactive shell. Before the body runs, the
+ *  remote is asked whether OAK is there and whether it speaks `update --here`, and a private stderr
+ *  receipt separates its exit status from ssh's own 255. An OAK there from before level 2 installs the
+ *  release with npm whatever it runs from: beside the copy `oak machine add` pushed, where nothing runs it,
+ *  or over a CLI linked to a checkout. It is not run there at all. Never rejects. */
+function sshUpdate(m: import('@oak-observatory/core').HerdrMachine, body: string, timeoutMs: number):
+  Promise<{ state: 'ran' | 'no-oak' | 'old-oak' | 'linked' | 'provisioned' | 'unreachable' | 'timeout'; code: number | null; stdout: string; stderr: string; linked?: string }> {
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
+  const quote = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`;
+  const marker = 'OAK_EXIT_' + require('crypto').randomBytes(12).toString('hex') + ':';
+  const script =
+    `if ! command -v oak >/dev/null 2>&1; then printf '\\n${marker}missing\\n' >&2; exit 127; fi; ` +
+    `level=$(oak __update-protocol --level 2>/dev/null); case "$level" in ''|*[!0-9]*) level=0 ;; esac; ` +
+    // The launcher `oak machine add` writes is a script, where npm (a prefix of ~/.local) links its own.
+    `if [ "$level" -lt 2 ] && [ "$(command -v oak)" = "$HOME/.local/bin/oak" ] && [ ! -L "$HOME/.local/bin/oak" ] && [ -f "$HOME/.local/lib/oak/index.js" ]; then printf '\\n${marker}bundle\\n' >&2; exit 78; fi; ` +
+    `if [ "$level" -lt 1 ]; then printf '\\n${marker}old\\n' >&2; exit 78; fi; ` +
+    `if [ "$level" -lt 2 ]; then g="$(npm exec --no-update-notifier --silent -c 'node -p process.env.npm_config_global_prefix' 2>/dev/null)/lib/node_modules/oak-observatory"; ` +
+    `if [ -L "$g" ] && t=$(cd "$g" 2>/dev/null && pwd -P); then case "$t" in */packages/cli) [ -e "\${t%/packages/cli}/.git" ] && t="\${t%/packages/cli}" ;; esac; ` +
+    `printf '\\n${marker}linked %s\\n' "$t" >&2; exit 78; fi; fi; ` +
+    `${body}; oak_status=$?; printf '\\n${marker}%s\\n' "$oak_status" >&2; exit "$oak_status"`;
+  const remote = `env PATH="${core.MACHINE_PATH}" CLAUDE_OBSERVATORY_NO_UPDATE_CHECK=1 sh -c ${quote(script)} oak`;
+  return new Promise((resolve) => {
+    let child: ReturnType<typeof core.spawnTool>;
+    try {
+      // In a session of its own (POSIX), as forwardToMachine's: a terminal's ctrl+c or hangup reaches this
+      // process alone, whose handlers stop every ssh and end by the signal (stopWithUpdate).
+      child = core.spawnTool('ssh', ['-T', ...SSH_OPTS, ...sshMux(m.target), m.target, remote], { stdio: ['ignore', 'pipe', 'pipe'], direct: true, env: core.machineSshEnv(), detached: process.platform !== 'win32', windowsHide: false });
+    } catch (e) {
+      resolve({ state: 'unreachable', code: null, stdout: '', stderr: String((e as Error)?.message || e) });
+      return;
+    }
+    stopWithUpdate(child);
+    const out: Buffer[] = [];
+    const err: Buffer[] = [];
+    child.stdout?.on('data', (d: Buffer) => out.push(d));
+    child.stderr?.on('data', (d: Buffer) => err.push(d));
+    let timedOut = false;
+    // Settled by the deadline itself, not by 'close': a remote process that outlives the ssh client
+    // keeps its pipes open, and waiting for them is the hang the deadline exists to end.
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill();
+      setTimeout(() => child.kill('SIGKILL'), 1000).unref();
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+      done(null);
+    }, timeoutMs);
+    let settled = false;
+    const done = (code: number | null, error?: Error): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      const stdout = Buffer.concat(out).toString('utf8');
+      let stderr = Buffer.concat(err).toString('utf8');
+      if (error) return resolve({ state: 'unreachable', code, stdout, stderr: error.message });
+      if (timedOut) return resolve({ state: 'timeout', code, stdout, stderr });
+      const tail = stderr.match(new RegExp('\\n' + marker + '(missing|old|bundle|linked [^\\n]*|\\d+)\\n$'));
+      if (tail) stderr = stderr.slice(0, -tail[0].length);
+      if (tail?.[1] === 'missing') return resolve({ state: 'no-oak', code, stdout, stderr });
+      if (tail?.[1] === 'old') return resolve({ state: 'old-oak', code, stdout, stderr });
+      if (tail?.[1] === 'bundle') return resolve({ state: 'provisioned', code, stdout, stderr });
+      if (tail?.[1].startsWith('linked ')) return resolve({ state: 'linked', code, stdout, stderr, linked: tail[1].slice('linked '.length) });
+      // Without the receipt, 255 is ssh failing to connect, not the remote program's answer.
+      if (!tail && code === 255) return resolve({ state: 'unreachable', code, stdout, stderr });
+      resolve({ state: 'ran', code, stdout, stderr });
+    };
+    child.on('error', (e: Error) => done(null, e));
+    child.on('close', (code: number | null) => done(code));
+  });
+}
+
+/** One line naming what a machine's `update --here --json` plan would change. */
+function machinePlanSummary(plan: any): string {
+  const surfaces = (Array.isArray(plan?.surfaces) ? plan.surfaces : [])
+    .filter((s: any) => !['current', 'managed', 'missing', 'linked', 'provisioned', 'local'].includes(s?.reason))
+    .map((s: any) => `${s.label} ${s.from ?? '—'} → ${s.to}`);
+  const components = (Array.isArray(plan?.components) ? plan.components : [])
+    .filter((c: any) => c?.state === 'update' || c?.state === 'failed')
+    .map((c: any) => `${c.label}: ${c.detail}`);
+  return [...surfaces, ...components].join('; ');
+}
+
+/** Turn one ssh run into the machine's row. `applied` = the body ran an update, then printed the plan
+ *  that is left afterwards. */
+function machineRow(m: import('@oak-observatory/core').HerdrMachine, r: Awaited<ReturnType<typeof sshUpdate>>, applied: boolean, timeoutMs: number): MachineUpdate {
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
+  const row = (state: MachineState, detail: string, plan?: any): MachineUpdate => ({ label: m.label, target: m.target, state, detail, ...(plan ? { plan } : {}) });
+  const reason = sshReason(r.stderr);
+  switch (r.state) {
+    case 'no-oak': return row('no-oak', `OAK is not installed there — \`oak machine add ${m.label} ${m.target}\` installs it`);
+    case 'old-oak': return row('old-oak', `its OAK predates \`oak update --here\` — run \`oak update\` there once`);
+    case 'linked': return row('linked', `its CLI is ${linkedText(r.linked ?? '')}; its OAK there predates leaving such a CLI alone, so nothing ran there`);
+    case 'provisioned': return row('provisioned', `its OAK is a copy \`oak machine add\` pushed, from a release whose \`oak update\` installs a CLI that nothing there runs, so nothing ran there; \`oak machine add ${m.label} ${m.target}\` updates it`);
+    case 'unreachable': return row('unreachable', `not reachable over ssh (${m.target})${reason ? `: ${reason}` : ''}`);
+    case 'timeout': return row('timeout', `no answer within ${Math.round(timeoutMs / 1000)} s (OAK_MACHINE_TIMEOUT_MS)`);
+  }
+  let plan: any = null;
+  try {
+    plan = JSON.parse(r.stdout);
+  } catch {
+    /* judged below */
+  }
+  if (r.code !== 0) {
+    // After an update its stderr is the whole run's log, so the plan it is left with names what failed;
+    // without one, the log's own trouble lines do, or a crash's error line (core.failureLine).
+    const left = applied && plan ? machinePlanSummary(plan) : '';
+    if (left) return row('failed', `still to do: ${left}`, plan);
+    return row('failed', core.failureLine(r.stderr) || (applied ? '' : core.failureLine(r.stdout)) || `exited ${r.code ?? '?'}`, plan ?? undefined);
+  }
+  if (!plan || typeof plan !== 'object') return row('failed', 'its `oak update --here --json` answer was not a plan');
+  // What is left to the user there (a project's own settings, a CLI linked to a checkout or copied there by
+  // `oak machine add`, a local build), on its row as this machine's table says it.
+  const surfaces: any[] = Array.isArray(plan.surfaces) ? plan.surfaces : [];
+  const yours = (Array.isArray(plan.components) ? plan.components : []).filter((c: any) => c?.state === 'manual').map((c: any) => `; ${c.detail}`).join('') +
+    surfaces.filter((s) => s?.reason === 'linked').map((s) => `; ${s.label} ${linkedText(s.linked)}`).join('') +
+    surfaces.filter((s) => s?.reason === 'provisioned').map((s) => `; ${s.label} ${provisionedText(m)}`).join('') +
+    surfaces.filter((s) => s?.reason === 'local').map((s) => `; ${s.label} ${s.from} is ${LOCAL_BUILD_TEXT}`).join('');
+  // The CLI the read after an update finds is the `oak` there: still behind, the update installed one that
+  // `oak` does not run.
+  const cli = surfaces.find((s) => s?.surface === 'cli' && !['current', 'managed', 'missing', 'linked', 'provisioned', 'local'].includes(s?.reason));
+  if (applied && cli) return row('failed', `the update ran, but the CLI there still reports ${cli.from ?? '—'}; still to do: ${machinePlanSummary(plan)}${yours}`, plan);
+  if (applied) return row('updated', (machinePlanSummary(plan) ? `updated; still to do: ${machinePlanSummary(plan)}` : `updated to ${plan.target}`) + yours, plan);
+  return plan.upToDate ? row('current', `${plan.target}${yours}`, plan) : row('update', (machinePlanSummary(plan) || 'its plan has work') + yours, plan);
+}
+
+/** Every saved machine's plan, in parallel. Disabled machines are listed and skipped. A machine list
+ *  herdr could not produce is one failed row, never a silent "no machines". Machines saved with the
+ *  same ssh target (one per herdr session there) are one install: it is asked once, and its answer is
+ *  each of their rows. */
+async function planMachines(passArgs: string[]): Promise<{ machines: import('@oak-observatory/core').HerdrMachine[]; rows: MachineUpdate[] }> {
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
+  const bin = core.findHerdrBin();
+  if (!bin) return { machines: [], rows: [] }; // no herdr here, so no saved machines
+  let machines: import('@oak-observatory/core').HerdrMachine[];
+  try {
+    machines = await core.herdrMachines({ binary: bin, timeoutMs: 15000 });
+  } catch (e) {
+    return { machines: [], rows: [{ label: '(saved machines)', target: '', state: 'failed', detail: `could not read herdr's machine list: ${String((e as Error)?.message || e)}` }] };
+  }
+  const timeout = machineTimeout(MACHINE_PLAN_TIMEOUT_MS);
+  const quote = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`;
+  const body = `oak update --here --json ${passArgs.map(quote).join(' ')}`;
+  const asked = new Map<string, ReturnType<typeof sshUpdate>>();
+  const rows = await Promise.all(machines.map(async (m) => {
+    if (!m.enabled) return { label: m.label, target: m.target, state: 'disabled' as const, detail: 'disabled in herdr — skipped' };
+    if (!m.target || m.target.startsWith('-')) return { label: m.label, target: m.target, state: 'failed' as const, detail: 'invalid ssh target' };
+    if (!asked.has(m.target)) asked.set(m.target, sshUpdate(m, body, timeout));
+    return machineRow(m, await asked.get(m.target)!, false, timeout);
+  }));
+  return { machines, rows };
+}
+
+function machineTimeout(fallback: number): number {
+  const configured = Number(process.env.OAK_MACHINE_TIMEOUT_MS);
+  return Number.isInteger(configured) && configured > 0 && configured <= 2147483647 ? configured : fallback;
+}
+
+/** Run the update on each machine whose plan has work (every reachable one under `--force`), in
+ *  parallel, once per ssh target, as the plans were read. Its own output goes to its stderr, which is
+ *  kept for a failure's reason; its stdout is the plan it is left with, read by a second, freshly
+ *  started `oak` (the one the update installed). */
+async function applyMachines(machines: import('@oak-observatory/core').HerdrMachine[], planned: MachineUpdate[], passArgs: string[], force: boolean): Promise<MachineUpdate[]> {
+  const timeout = machineTimeout(MACHINE_APPLY_TIMEOUT_MS);
+  const quote = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`;
+  const a = passArgs.map(quote).join(' ');
+  // The read afterwards takes the channel alone: under `--force` every surface reads as work left.
+  const read = passArgs.filter((x) => x !== '--force').map(quote).join(' ');
+  const body = `oak update --here ${a} >&2; s=$?; oak update --here --json ${read}; (exit "$s")`;
+  const ran = new Map<string, ReturnType<typeof sshUpdate>>();
+  return Promise.all(planned.map(async (row) => {
+    const m = machines.find((x) => x.label === row.label && x.target === row.target);
+    if (!m || !(row.state === 'update' || (force && row.state === 'current'))) return row;
+    if (!ran.has(m.target)) ran.set(m.target, sshUpdate(m, body, timeout));
+    return machineRow(m, await ran.get(m.target)!, true, timeout);
+  }));
+}
+
+/** The one plan / one result table: a label column, then what is (or was) done. */
+function printUpdateTable(title: string, rows: { label: string; text: string; tone: 'ok' | 'work' | 'dim' | 'bad' }[]): void {
+  const w = Math.max(0, ...rows.map((r) => r.label.length));
+  const paint = { ok: c.green, work: c.yellow, dim: c.dim, bad: c.red };
+  process.stdout.write(c.bold(title) + '\n');
+  for (const r of rows) process.stdout.write(`  ${r.label.padEnd(w)}  ${paint[r.tone](r.text)}\n`);
+}
+
+/** What a CLI linked to a checkout is, and the one thing that updates it. */
+function linkedText(checkout: string | undefined): string {
+  return `linked to the checkout at ${checkout}; update it there (git pull, then npm run build)`;
+}
+
+/** What a local build is (core.isLocalBuild), and what replaces it. */
+const LOCAL_BUILD_TEXT = 'a local build, which no release carries: `oak update` leaves it alone, and `--force` or `--channel` replaces it';
+
+/** What the copy `oak machine add` pushed is, and the one thing that updates it: run on the machine that
+ *  added this one, which `m` names when this machine is the one asking. */
+function provisionedText(m?: { label: string; target: string }): string {
+  return m
+    ? `copied there by \`oak machine add\`, which updates it: \`oak machine add ${m.label} ${m.target}\``
+    : 'copied here by `oak machine add` from another machine; running it there again updates it';
+}
+
+/** A surface row of the plan, in words. `ahead` is its own sentence: reading "0.10.0 → 0.9.5" as an
+ *  update is confusing; reading it as nothing at all is what stranded people for weeks. */
+function surfacePlanText(s: UpdateAction, target: string): { text: string; tone: 'ok' | 'work' | 'dim' | 'bad' } {
+  if (s.reason === 'current') return { text: `current (${s.from})`, tone: 'ok' };
+  // `update` refreshes only what is ALREADY installed; a present-but-empty editor is not in its plan.
+  if (s.reason === 'missing' && s.surface === 'vscode') return { text: 'not installed — `oak install-extensions` adds it', tone: 'dim' };
+  if (s.reason === 'managed') return { text: `${s.from} · installed from a marketplace, which updates it (the editor's Extensions view)`, tone: 'dim' };
+  if (s.reason === 'linked') return { text: `${s.from} · ${linkedText(s.linked)}`, tone: 'dim' };
+  if (s.reason === 'provisioned') return { text: `${s.from} · ${provisionedText()}`, tone: 'dim' };
+  if (s.reason === 'local') return { text: `${s.from} · ${LOCAL_BUILD_TEXT}`, tone: 'dim' };
+  const how = s.reason === 'ahead' ? ' (not on this channel — will be replaced)' : '';
+  const blocked = s.actionable ? '' : ` (no CLI found — ${noCliFix(s.ref as EditorRow)})`;
+  return { text: `${s.from ?? '—'} → ${target}${how}${blocked}`, tone: s.actionable ? 'work' : 'bad' };
+}
+
+function componentText(cpt: UpdateComponent): { text: string; tone: 'ok' | 'work' | 'dim' | 'bad' } {
+  switch (cpt.state) {
+    case 'current': return { text: `current (${cpt.detail})`, tone: 'ok' };
+    case 'update': return { text: cpt.detail, tone: 'work' };
+    case 'absent': return { text: cpt.detail, tone: 'dim' };
+    case 'after-cli': return { text: cpt.detail, tone: 'dim' };
+    case 'updated': return { text: `updated — ${cpt.detail}`, tone: 'ok' };
+    case 'failed': return { text: `failed — ${cpt.detail}`, tone: 'bad' };
+    case 'manual': return { text: cpt.detail, tone: 'work' };
+  }
+}
+
+function machineText(m: MachineUpdate): { text: string; tone: 'ok' | 'work' | 'dim' | 'bad' } {
+  if (m.state === 'current') return { text: `current (${m.detail})`, tone: 'ok' };
+  if (m.state === 'updated') return { text: m.detail, tone: 'ok' };
+  if (m.state === 'update' || m.state === 'linked' || m.state === 'provisioned') return { text: m.detail, tone: 'work' };
+  if (m.state === 'no-oak' || m.state === 'disabled') return { text: m.detail, tone: 'dim' };
+  return { text: m.detail, tone: 'bad' };
+}
+
+/**
+ * `update` — bring everything OAK installed up to the followed release channel: on this machine the CLI,
+ * the editor extensions (every VS Code-family editor and Remote-SSH server, every JetBrains IDE), and
+ * OAK's own setup (capture hooks, status line, herdr, focus server); then the same on every enabled saved
+ * machine, each running its own `oak update --here` over ssh and downloading the release itself.
+ *
+ * `--here` stops at this machine; `--check` prints the plan; `--json` returns it, and changes nothing;
+ * `--cli-only` is the CLI and its setup on this machine; `--force` reinstalls even if already current.
+ */
 async function cmdUpdate(args: string[]): Promise<void> {
   const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
   const current = version();
@@ -5954,6 +8306,7 @@ async function cmdUpdate(args: string[]): Promise<void> {
   const checkOnly = args.includes('--check');
   const force = args.includes('--force');
   const json = args.includes('--json');
+  const here = cliOnly || args.includes('--here');
   // --channel <stable|dev>: SWITCH channels — persist the choice and install that channel's newest
   // in the same breath (a switch installs even when the target version isn't "newer": moving from a
   // dev build back to stable is a downgrade by semver and must still happen).
@@ -5964,6 +8317,8 @@ async function cmdUpdate(args: string[]): Promise<void> {
   if (chRaw && !requested) fail(`unknown channel "${chRaw}" — use stable or dev (pre-release)`);
   const switching = requested !== null && requested !== core.getUpdateChannel();
   const channel = requested ?? core.getUpdateChannel();
+  // What every saved machine is asked to do: the same channel and the same --force.
+  const passArgs = [...(requested ? ['--channel', requested] : []), ...(force ? ['--force'] : [])];
 
   const releases = await fetchReleases();
   // ONE decision for every surface, in core: a surface is acted on when its installed version
@@ -5971,16 +8326,27 @@ async function cmdUpdate(args: string[]): Promise<void> {
   // downgrade half of a channel switch, and it silently ignored anything sitting ABOVE the channel
   // line (a local build at 0.10.0 outranks every 0.10.0-dev.N the dev channel publishes).
   const surfaces = cliOnly ? installedSurfaces().filter((s) => s.surface === 'cli') : installedSurfaces();
-  const plan = core.resolveUpdatePlan(releases, channel, surfaces, { switching, force });
+  const plan = core.resolveUpdatePlan(releases, channel, surfaces, { switching, force, named: requested !== null });
   if (!plan.release) fail('no published release found for the repository.');
-  if (plan.degradedToStable)
-    process.stdout.write(c.dim(releases.some((r: any) => r?.prerelease === true && !r?.draft)
-      ? 'the stable release outranks the newest pre-release, so the pre-release channel serves it.\n'
-      : 'no pre-release published yet — the stable release is the newest there is.\n'));
   const latest = plan.target;
   const assets: ReleaseAsset[] = (plan.release as any).assets || [];
   const cliSurface = plan.surfaces.find((s) => s.surface === 'cli');
-  const cliStale = cliSurface !== undefined && cliSurface.reason !== 'current';
+  // A CLI linked to a checkout, copied here by `oak machine add`, or a local build left alone, is not replaced:
+  // it stays, and owns the setup below.
+  const cliStale = cliSurface !== undefined && !['current', 'linked', 'provisioned', 'local'].includes(cliSurface.reason);
+  // OAK's own setup is judged by the CLI that will own it: this one when it is current, otherwise the
+  // release it is about to install, which says what it did once it has run.
+  const components: UpdateComponent[] = cliStale
+    ? (await componentPlan()).map((cpt) => ({ ...cpt, state: 'after-cli', detail: 'checked by the new CLI once it is installed' }))
+    : await componentPlan();
+  const machinePlan = here ? null : await planMachines(passArgs);
+  const machines = machinePlan?.rows ?? [];
+  // A row left to the user (`manual`) is not work this command can do, so it never holds the plan open.
+  const settled = (cpt: UpdateComponent) => cpt.state === 'current' || cpt.state === 'absent' || cpt.state === 'manual';
+  // An editor without our extension is in the plan's actions (install-extensions acts on those), but
+  // `update` never installs into one, so it is not work left undone here.
+  const hereUpToDate = plan.actions.every((s) => s.surface === 'vscode' && s.reason === 'missing') && components.every(settled);
+  const machinesUpToDate = machines.every((m) => m.state === 'current' || m.state === 'no-oak' || m.state === 'disabled');
 
   if (json) {
     // The STRUCTURED hand-off, and deliberately READ-ONLY: `--json` reports the plan and changes
@@ -6002,45 +8368,45 @@ async function cmdUpdate(args: string[]): Promise<void> {
         to: s.to,
         reason: s.reason,
         actionable: s.actionable,
+        // Which IDE a JetBrains row is: its plugins folder, so an IDE marks only its own row.
+        ...(s.surface === 'jetbrains' && typeof s.ref === 'string' ? { pluginsDir: s.ref } : {}),
+        // Which editor a VS Code-family row is: its extensions folder, so a window tells its own row apart.
+        ...(s.surface === 'vscode' && s.ref ? { extensionsDir: require('path').join(require('os').homedir(), (s.ref as EditorRow).extDirs[0]) } : {}),
+        ...(s.linked ? { linked: s.linked } : {}),
       })),
-      upToDate: plan.actions.length === 0,
+      components,
+      // Absent under --here: this machine only, and the shape a saved machine answers with.
+      ...(here ? {} : { machines }),
+      upToDate: hereUpToDate && machinesUpToDate,
     });
     return;
   }
 
+  if (plan.degradedToStable)
+    process.stdout.write(c.dim(releases.some((r: any) => r?.prerelease === true && !r?.draft)
+      ? 'the stable release outranks the newest pre-release, so the pre-release channel serves it.\n'
+      : 'no pre-release published yet — the stable release is the newest there is.\n'));
+  // A PREVIEW is honest about being one: `--check --channel dev` shows what the switch WOULD do — it
+  // never persists, and the closing hint names the command that actually applies it.
+  process.stdout.write(
+    c.dim(
+      checkOnly && switching
+        ? `channel: ${CHANNEL_LABEL[channel]} → ${latest} (previewing — you follow ${CHANNEL_LABEL[core.getUpdateChannel()]}; nothing switched)\n`
+        : `channel: ${CHANNEL_LABEL[channel]} → ${latest}\n`
+    )
+  );
+  const planRows = [
+    ...plan.surfaces.map((s) => ({ label: s.label, ...surfacePlanText(s, latest) })),
+    ...components.map((cpt) => ({ label: cpt.label, ...componentText(cpt) })),
+    ...machines.map((m) => ({ label: `machine ${m.label}`, ...machineText(m) })),
+  ];
+  printUpdateTable('Plan', planRows);
+  if (!cliOnly) {
+    if (!plan.surfaces.some((s) => s.surface === 'vscode')) process.stdout.write(c.dim('  VS Code: extension not detected\n'));
+    if (!plan.surfaces.some((s) => s.surface === 'jetbrains')) process.stdout.write(c.dim('  JetBrains: plugin not detected\n'));
+  }
+
   if (checkOnly) {
-    // A PREVIEW is honest about being one: `--check --channel dev` shows what the switch WOULD do —
-    // it never persists, and the closing hint names the command that actually applies it.
-    process.stdout.write(
-      c.dim(
-        switching
-          ? `channel: ${CHANNEL_LABEL[channel]} (previewing — you follow ${CHANNEL_LABEL[core.getUpdateChannel()]}; nothing switched)\n`
-          : `channel: ${CHANNEL_LABEL[channel]}\n`
-      )
-    );
-    for (const s of plan.surfaces) {
-      if (s.reason === 'current') {
-        process.stdout.write(c.green(`${s.label}: up to date (${s.from})\n`));
-        continue;
-      }
-      // `update` refreshes only what is ALREADY installed; putting a present-but-empty editor in the
-      // action list would promise an install this command is about to skip on purpose.
-      if (s.reason === 'missing') {
-        process.stdout.write(c.dim(`${s.label}: not installed — \`oak install-extensions\` adds it\n`));
-        continue;
-      }
-      // 'ahead' is its own sentence. Reading "0.10.0 → 0.9.5" as an update is confusing; reading it
-      // as nothing at all is what stranded people for weeks.
-      const how = s.reason === 'ahead' ? ' (not on this channel — will be replaced)' : '';
-      process.stdout.write(
-        c.yellow(`${s.label}: ${s.from} → ${latest}${how}`) +
-          (s.actionable ? '\n' : c.yellow(`  (installed but no CLI found to update — install the shell \`${(s.ref as EditorRow)?.cliName || 'code'}\` command)\n`))
-      );
-    }
-    if (!cliOnly) {
-      if (!plan.surfaces.some((s) => s.surface === 'vscode')) process.stdout.write(c.dim('VS Code: extension not detected\n'));
-      if (!plan.surfaces.some((s) => s.surface === 'jetbrains')) process.stdout.write(c.dim('JetBrains: plugin not detected\n'));
-    }
     if (channel === 'stable') {
       // The pre-release channel's tip, one dim line — the list is already in hand, and this is the
       // only place a stable user learns the channel exists from the terminal.
@@ -6055,51 +8421,73 @@ async function cmdUpdate(args: string[]): Promise<void> {
     return;
   }
 
-  if (cliOnly) {
-    if (cliStale) await updateCliBinary(assets, latest, current);
-    else process.stdout.write(c.green('✓ ') + `oak CLI is up to date (${current})\n`);
-    persistChannel(requested);
-    if (cliStale) finishInInstalledCli();
-    else await ensureHerdrPin();
-    return;
+  const results = new Map<UpdateAction, RowResult>();
+  if (cliStale) await updateCliBinary(assets, latest, current);
+  if (!cliOnly) {
+    await refreshVscodeExtension(assets, plan, results);
+    await refreshJetbrainsPlugin(assets, plan, results);
   }
-
-  if (cliStale) await updateCliBinary(assets, latest, current); // refreshes the status line itself
-  else refreshInstalledStatusline(); // CLI already current — still heal a statusline.sh an older CLI wrote
-  const vscode = await refreshVscodeExtension(assets, plan);
-  const jetbrains = await refreshJetbrainsPlugin(assets, plan);
   // Persist the switch AFTER the installs, not before. Doing it first meant a blocked install left
   // the config naming one channel while the binaries came from the other — the split-brain the
   // channel file is supposed to make impossible — and the failure toast made it look like nothing
   // had happened at all.
   persistChannel(requested);
-  if (cliStale) finishInInstalledCli();
-  else await ensureHerdrPin();
-  if (vscode === 'blocked' || jetbrains === 'blocked') {
+  let componentResults: UpdateComponent[];
+  if (cliStale) {
+    const finished = finishInInstalledCli();
+    // A setup step that failed, or that could not be found to run, may have set up nothing.
+    if (!finished.ok)
+      componentResults = [...(finished.rows ?? []), { id: 'setup', label: 'OAK setup', state: 'failed', detail: 'the installed CLI’s setup step failed — run `oak doctor --fix`' }];
+    else if (finished.rows) componentResults = finished.rows;
+    else {
+      // A release older than the per-component report set itself up without saying how.
+      refreshInstalledStatusline();
+      componentResults = [{ id: 'setup', label: 'OAK setup', state: 'after-cli', detail: 'set up by the installed CLI, which reports no detail — `oak doctor` checks it' }];
+    }
+  } else componentResults = await applyComponents(components);
+  const machineResults = machinePlan ? await applyMachines(machinePlan.machines, machines, passArgs, force) : [];
+
+  const resultRows = [
+    ...plan.surfaces.map((s) => {
+      if (s.surface === 'cli' && cliStale) return { label: s.label, text: `updated — ${s.from} → ${latest}`, tone: 'ok' as const };
+      const r = results.get(s);
+      if (r) return { label: s.label, text: `${r.state} — ${r.detail}`, tone: r.state === 'updated' ? ('ok' as const) : ('bad' as const) };
+      return { label: s.label, ...surfacePlanText(s, latest) };
+    }),
+    ...componentResults.map((cpt) => ({ label: cpt.label, ...componentText(cpt) })),
+    ...machineResults.map((m) => ({ label: `machine ${m.label}`, ...machineText(m) })),
+  ];
+  printUpdateTable('Result', resultRows);
+
+  // Each with its reason: the editors show stderr alone, so a name with no reason left the person a
+  // table they never see.
+  const failed = [
+    ...plan.surfaces.filter((s) => results.get(s)?.state === 'failed').map((s) => `${s.label} (${results.get(s)?.detail})`),
+    ...componentResults.filter((cpt) => cpt.state === 'failed').map((cpt) => `${cpt.label} (${cpt.detail})`),
+    ...machineResults.filter((m) => MACHINE_FAILED.has(m.state)).map((m) => `machine ${m.label} (${m.detail})`),
+  ];
+  if (failed.length) {
     // Something is installed but couldn't be updated — never let this pass as success/silence.
     // On STDERR, not stdout: this is the failure reason, and an editor surfacing this run reads
     // stderr first. Reported as #45, where the only thing on stderr was a Node deprecation warning,
     // so the toast showed the warning and the person never saw this line at all.
-    const which = [vscode === 'blocked' ? 'the VS Code extension' : null, jetbrains === 'blocked' ? 'the JetBrains plugin' : null]
-      .filter(Boolean)
-      .join(' and ');
-    process.stderr.write(c.yellow('⚠ ') + `could not update ${which} — see the notes above.\n`);
+    process.stderr.write(c.yellow('⚠ ') + `could not update ${failed.join('; ')} — see the table above.\n`);
     process.exitCode = 1;
     return;
   }
-  if (!(cliStale || vscode === 'updated' || jetbrains === 'updated')) {
-    if (vscode === 'absent' && jetbrains === 'absent') {
-      process.stdout.write(
-        c.green('✓ ') +
-          `CLI is up to date (${latest}); no editor extensions detected locally.\n` +
-          c.dim('  install the VS Code / JetBrains extensions via scripts/bootstrap.sh or the release assets.\n')
-      );
-    } else {
-      process.stdout.write(
-        c.green('✓ ') + `everything is up to date (${latest}${channel === 'dev' ? ', pre-release channel' : ''})\n`
-      );
-    }
-  }
+  const changed = cliStale || results.size > 0 || componentResults.some((cpt) => cpt.state === 'updated') || machineResults.some((m) => m.state === 'updated');
+  // A repair left to the user, here or on a saved machine (whose row names it), is not "up to date", and
+  // neither is a CLI linked to a checkout or copied by `oak machine add`, which is updated elsewhere, or a
+  // local build, which no release carries.
+  const elsewhere = (reason: unknown) => reason === 'linked' || reason === 'provisioned' || reason === 'local';
+  const yours = componentResults.some((cpt) => cpt.state === 'manual') || plan.surfaces.some((s) => elsewhere(s.reason)) ||
+    machineResults.some((m) => elsewhere(m.state) ||
+      (Array.isArray(m.plan?.components) ? m.plan.components : []).some((cpt: any) => cpt?.state === 'manual') ||
+      (Array.isArray(m.plan?.surfaces) ? m.plan.surfaces : []).some((s: any) => elsewhere(s?.reason)));
+  if (!changed && !yours)
+    process.stdout.write(c.green('✓ ') + `everything is up to date (${latest}${channel === 'dev' ? ', pre-release channel' : ''})\n`);
+  if (!plan.surfaces.some((s) => s.surface !== 'cli') && !cliOnly)
+    process.stdout.write(c.dim('  install the VS Code / JetBrains extensions with `oak install-extensions`.\n'));
 }
 
 /** `version` — print the installed CLI version; with `--check` (or `--latest`), also fetch the newest
@@ -6113,7 +8501,11 @@ async function cmdVersion(args: string[]): Promise<void> {
     // Network-free forms. `--json` is what the editors' version chip renders BEFORE any fetch:
     // the installed version + the followed channel, instantly.
     if (json) {
-      emitJson({ current: cur, channel: core.getUpdateChannel() });
+      // `linked`: this CLI runs from a checkout; `provisioned`: it is the copy `oak machine add` pushed.
+      // `oak update` leaves both alone. Asked without npm, so the chip paints at once; `--check` also
+      // asks npm whether its global package is a link.
+      const checkout = machineBundle() ? null : runningCheckout();
+      emitJson({ current: cur, channel: core.getUpdateChannel(), ...(checkout ? { linked: checkout } : {}), ...(machineBundle() ? { provisioned: true } : {}) });
       return;
     }
     process.stdout.write(`oak ${cur}\n`);
@@ -6140,20 +8532,40 @@ async function cmdVersion(args: string[]): Promise<void> {
   // number. `stranded` is the difference that points the other way: an install sitting ABOVE the
   // channel (a local build, or a channel just switched downward), which the old isNewer check read
   // as "up to date" and left there permanently.
+  // A CLI linked to a checkout, or copied here by `oak machine add`, is not on any channel: a release is no
+  // update for it, since `oak update` leaves it alone and it is updated where it came from. Nor is a local
+  // build (a version no release carries), which `oak update` leaves alone unless asked by name.
+  const provisioned = machineBundle();
+  const linked = provisioned ? null : linkedCli();
   const cmp = core.compareVersions(latest, cur);
-  const differs = cmp !== 0;
-  const stranded = cmp < 0;
+  const local = cmp !== 0 && !linked && !provisioned && core.isLocalBuild(cur);
+  const differs = cmp !== 0 && !linked && !provisioned && !local;
+  const stranded = cmp < 0 && !linked && !provisioned && !local;
   if (json) {
     // The editors' version dropdown: one call answers the chip, the Update row, and both channel rows.
-    emitJson({ current: cur, channel, latest, updateAvailable: differs, stranded, stableLatest, devLatest });
+    // `--compare <version>` also places a build this CLI is not (JetBrains passes its own plugin's), in
+    // the same words VS Code's menu uses, so both editors compare every surface with core's one rule.
+    const other = flagValue(args, '--compare');
+    if (args.some((a) => a === '--compare' || a.startsWith('--compare=')) && !other) fail('`--compare` requires a version');
+    emitJson({
+      current: cur, channel, latest, updateAvailable: differs, stranded, stableLatest, devLatest,
+      ...(linked ? { linked } : {}),
+      ...(provisioned ? { provisioned } : {}),
+      ...(local ? { local } : {}),
+      ...(other ? { compared: { version: other, reason: core.channelReason(latest, other) } } : {}),
+    });
     return;
   }
   process.stdout.write(
     `installed   ${c.bold(cur)}   ${c.dim(`(${CHANNEL_LABEL[channel]} channel)`)}\n` +
-      `latest      ${c.bold(latest)}   ${differs ? c.yellow(stranded ? '← not on this channel' : '← update available') : c.green('✓ up to date')}\n` +
+      `latest      ${c.bold(latest)}${linked || provisioned || local ? '' : `   ${differs ? c.yellow(stranded ? '← not on this channel' : '← update available') : c.green('✓ up to date')}`}\n` +
       (channel === 'stable' && devLatest ? c.dim(`pre-release ${devLatest}   (switch: \`update --channel dev\`)\n`) : '')
   );
-  if (stranded) {
+  if (linked || provisioned) {
+    process.stdout.write(c.dim(`this CLI is ${linked ? linkedText(linked) : provisionedText()}; \`oak update\` leaves it alone.\n`));
+  } else if (local) {
+    process.stdout.write(c.dim(`this CLI is ${LOCAL_BUILD_TEXT}.\n`));
+  } else if (stranded) {
     process.stdout.write(
       c.dim(`the installed build is newer than anything the ${CHANNEL_LABEL[channel]} channel publishes — probably a local build.\n`) +
         c.dim('run `oak update` to move onto the channel, or switch channels with `update --channel dev`.\n')
@@ -6165,7 +8577,7 @@ async function cmdVersion(args: string[]): Promise<void> {
 
 function usage(): void {
   process.stdout.write(
-    `oak — per-edit Keep/Undo for Claude Code\n\n` +
+    `oak — per-edit Keep/Undo for Claude Code and Codex\n\n` +
       `  init [--project] [--with-statusline] [--force] [--repair] [--no-codex]\n` +
       `                       install capture hooks (--project = repo ./.claude/settings.json;\n` +
       `                       --with-statusline also installs the bundled status line; --repair\n` +
@@ -6179,17 +8591,20 @@ function usage(): void {
       `                       refuses to replace another tool's statusLine unless --force\n` +
       `  uninstall [--project] [--all] [--purge-store]\n` +
       `                       remove the capture hooks from every install-ledger location (--project =\n` +
-      `                       only this repo's file; --all also reverts the bundled status line +\n` +
-      `                       prints teardown steps; --purge-store also deletes the stored edits)\n` +
+      `                       only this repo's file; --all also reverts the bundled status line, a\n` +
+      `                       setup for the user that --project leaves, + prints teardown steps;\n` +
+      `                       --all --purge-store also deletes the stored edits and forgets their\n` +
+      `                       sessions in the local database and the record log)\n` +
       `  status               show hooks + hook-path health + session + edit counts\n` +
       `  integrity [--session <id>] [--json]  inspect capture gaps and unsafe history; read-only\n` +
       `  doctor [--json] [--fix]\n` +
-      `                       diagnose setup (hooks, PATH, config dir, session, status line, herdr,\n` +
-      `                       the herdr server's environment) with fixes; --markdown (--md) emits the\n` +
-      `                       report as Markdown; --fix installs the pinned herdr, its claude + codex\n` +
-      `                       integrations and OAK's plugin, sets missing sidebar widths and theme\n` +
-      `                       defaults (gruvbox), starts its server, repairs PTY helper permissions\n` +
-      `                       and stops outdated focus servers; reports slow SSH forwarding for saved machines\n` +
+      `                       diagnose setup (hooks, PATH, the \`oak\` a login shell runs, config dir,\n` +
+      `                       session, status line, herdr, the herdr server's environment) with fixes;\n` +
+      `                       --markdown (--md) emits the report as Markdown; --fix installs the pinned\n` +
+      `                       herdr, its claude + codex integrations and OAK's plugin, sets missing\n` +
+      `                       sidebar widths and theme defaults (gruvbox), starts its server, repairs\n` +
+      `                       PTY helper permissions and stops outdated focus servers; reports slow SSH\n` +
+      `                       forwarding for saved machines, and why one gave no Claude usage reading\n` +
       `  models [use <name>]\n` +
       `                       local models: list what ollama serves here and which one codex runs\n` +
       `                       (a fresh \`ollama pull\` appears with nothing to reinstall — capture is\n` +
@@ -6199,62 +8614,169 @@ function usage(): void {
       `                       install the editor extensions into whatever editors are on this machine\n` +
       `                       (VS Code family + JetBrains); --vsix/--jetbrains-zip use local build\n` +
       `                       outputs instead of the release; --check reports without installing\n` +
-      `  update [--check] [--json] [--cli-only] [--force] [--channel stable|dev]\n` +
-      `                       update the CLI AND refresh the locally-installed editor extensions from\n` +
-      `                       the followed release channel (VS Code via \`code --install-extension\`;\n` +
-      `                       JetBrains by unzip into plugin dirs), and refresh the bundled status\n` +
-      `                       line when ours is installed. A surface is updated whenever it DIFFERS\n` +
-      `                       from the channel's newest — including builds newer than it, which is\n` +
-      `                       what makes switching channels work in both directions. --check reports\n` +
-      `                       only; --json reports the plan as JSON and changes nothing; --cli-only\n` +
-      `                       skips the extensions; --force reinstalls even if already current;\n` +
-      `                       --channel switches between stable and the rolling pre-release (dev)\n` +
-      `                       and installs that channel's newest in the same run\n` +
-      `  sessions [--delete <id> [--force | --force-pending <n>] [--seen-through <edit>] | --undelete <id>]\n` +
+      `  update [--here] [--check] [--json] [--cli-only] [--force] [--channel stable|dev]\n` +
+      `                       update everything OAK installed from the followed release channel: the\n` +
+      `                       CLI; the extension in each VS Code-family editor and Remote-SSH server\n` +
+      `                       that has it; the plugin in each JetBrains IDE that has it; the capture\n` +
+      `                       hooks in your user settings (repaired as \`init --repair\` does; a project's\n` +
+      `                       own .claude/settings.json is never written, and gets a row naming the\n` +
+      `                       \`oak init --repair\` to run there); the bundled status line when it is\n` +
+      `                       ours; herdr, its integrations and plugin (as \`doctor --fix\` does); and\n` +
+      `                       an outdated focus server, which it stops. Then each enabled saved machine\n` +
+      `                       runs its own \`oak update --here\` over ssh, in parallel. One plan, one\n` +
+      `                       result table; what is current is left alone; exit 1 when anything,\n` +
+      `                       on any machine, could not be updated. A surface is updated whenever it\n` +
+      `                       DIFFERS from the channel's newest — including builds newer than it,\n` +
+      `                       which is what makes switching channels work in both directions. --here\n` +
+      `                       updates this machine only; --check reports only; --json reports the\n` +
+      `                       plan as JSON and changes nothing; --cli-only is the CLI and its setup\n` +
+      `                       here, without the extensions; --force reinstalls even if already\n` +
+      `                       current (never over a marketplace install). A CLI linked to a source\n` +
+      `                       checkout is never replaced: git pull and npm run build there update it;\n` +
+      `                       nor is the copy \`oak machine add\` pushed, which running that again updates.\n` +
+      `                       A local build (a version ending in -dev.0, which no release carries) is\n` +
+      `                       left alone unless --force or --channel asks for the channel's build.\n` +
+      `                       --channel switches between stable and the rolling pre-release (dev) and\n` +
+      `                       installs that channel's newest in the same run, on every machine\n` +
+      `  sessions [--all] [--synced] [--delete <id> [--force | --force-pending <n>] [--seen-through <edit>] | --undelete <id>]\n` +
       `                       this machine's sessions, grouped by workspace (● = this directory's), without\n` +
-      `                       those in which nothing happened (no edit, no tokens, no reply) unless still running;\n` +
-      `                       --json --machine <label|id> reads one machine's own captured sessions over SSH;\n` +
+      `                       those in which nothing happened (no edit, no tokens, no reply) unless still running,\n` +
+      `                       and without Codex's Auto-review threads unless --all or --session names one;\n` +
+      `                       --synced adds every other machine's sessions the local database holds from its\n` +
+      `                       records, by machine, with when oak sync last brought them (--json: machines[]);\n` +
+      `                       --json --machine <label|id> lists one machine's own captured sessions: from the\n` +
+      `                       local database when oak sync read that label in the last ten minutes and nothing there\n` +
+      `                       may be running (no session active in two hours, as its records and that run's view\n` +
+      `                       of its files say; no hand raised in the last day still up) (fromIndex, syncedAt,\n` +
+      `                       publishedAt), else over SSH;\n` +
       `                       delete hides a session and purges stored edits (pending ones only with --force,\n` +
       `                       or with --force-pending <n> while no more than n are pending); --seen-through\n` +
       `                       <edit> also refuses while an edit newer than that id is pending;\n` +
-      `                       undelete restores visibility, not the purged edits\n` +
+      `                       undelete restores visibility; a backup folder can restore its saved edits on the next sync\n` +
       `  prompt --session <id> --text "…" [--machine <label>] [--json]  explicitly submit to its live pane;\n` +
-      `                       without a live pane, retain the clipboard draft and print it\n` +
+      `                       without a live pane, retain the clipboard draft and print it, and exit 75\n` +
       `  comment add|list|rm|compose|send|mark-sent --session <id>  add --edit <n> [--line <n>] --text "…";\n` +
       `                       compose prints an unsent draft; send submits it and marks only acknowledged\n` +
-      `                       comments sent; mark-sent --ids <a,b> records a reply delivered another way.\n` +
+      `                       comments sent (a draft it could not send exits 75); mark-sent --ids <a,b> records\n` +
+      `                       a reply delivered another way.\n` +
       `                       --json reports the result; --text=--note preserves text beginning with dashes\n` +
       `  quote --session <id> [--text "note"] [--send] [--json]  quote the latest transcript reply;\n` +
-      `                       default is a draft; --send explicitly submits it through herdr\n` +
+      `                       default is a draft; --send explicitly submits it through herdr (75: kept as a draft)\n` +
       `  focus --session <id> --tab observatory|review|herdr  select a conversation in an attached OAK TUI\n` +
       `                       --pane <id> resolves a live herdr pane to its session\n` +
       `  server start|stop|status [--json]  local focus endpoint; herdr owns terminals and agents\n` +
       `  inbox [--json]       every session waiting on you, most urgent first — permission prompts, questions\n` +
       `                       (with their options), input waits, then finished turns; --next [--after <id>]\n` +
-      `                       names the one to jump to. Review tab: i opens the inbox, h jumps to the next session;\n` +
-      `                       on Observatory, i replies and h focuses herdr\n` +
+      `                       names the one to jump to. On both OAK tabs, i opens the inbox and h jumps to the\n` +
+      `                       next session waiting on you; the inbox lists oak sync's open conflicts too, on every surface,\n` +
+      `                       and the other machines' raised hands as their records brought them, each on its machine\n` +
+      `                       (--json adds its machine's id and label, syncedAt and publishedAt); --next skips them\n` +
       `  search <words…>      every conversation on this machine, ranked: the asks you typed and the prose that\n` +
       `                       answered them, across sessions and workspaces (every word must appear; a hit in\n` +
-      `                       the ask outranks one in the answer); --days <N>, --limit <N>, --json\n` +
+      `                       the ask outranks one in the answer); --days <N>, --limit <N>, --json;\n` +
+      `                       --per-session keeps each session's best hit, before the limit;\n` +
+      `                       --machine <label> searches a saved machine's conversations: in its records here\n` +
+      `                       when oak sync read it in the last ten minutes, there over SSH otherwise\n` +
+      `  query <name> [--<param> <value>…] [--archived|--all] [--arrays|--table]\n` +
+      `                       the local database in JSON: sessions, edits, files, prompts, search (asks and answers,\n` +
+      `                       ranked; an ask outranks its answer), workers, delegated, findings, sync, notes (plans,\n` +
+      `                       memories, skills), usage (tokens in a window by machine, model, session, day, agent or\n` +
+      `                       account, each message once), readings (the shares each machine read, and the account's\n` +
+      `                       answers on its five-hour limit) or schema; sessions lists every machine's the database holds;\n` +
+      `                       the rows of sessions, edits, prompts, search, workers and notes name their machine by\n` +
+      `                       id (machine, which a query's --machine takes, as it takes self and the label a saved\n` +
+      `                       machine has here; any other name is refused) and by this machine's\n` +
+      `                       name for it (machine_label: for a saved machine, the label the other verbs' --machine\n` +
+      `                       takes); files are one row per path within a repository, every clone together;\n` +
+      `                       edits --path takes that path (with --project), or an absolute path in this machine's clone;\n` +
+      `                       sessions whose files are gone are archived and listed only with --archived or --all;\n` +
+      `                       exit 2 = the query cannot run, 3 = no database here\n` +
+      `  query sql "<SELECT…>" [--param <v>…] [--limit <N>] [--timeout <ms>]\n` +
+      `                       one read-only statement, in a child process stopped at its deadline (exit 124);\n` +
+      `                       \`query --serve\` answers one JSON request per line; \`query --status\` describes the database\n` +
       `  notify               desktop notifications for raised hands: --message <text> [--title <t>] [--sound]\n` +
-      `                       pops one; --watch [--interval <s>] announces every hand this workspace raises\n` +
-      `                       (from a plain terminal with no editor open); the editors announce in-process\n` +
+      `                       pops one; --watch [--interval <s>] announces every hand raised on this machine\n` +
+      `                       (from a plain terminal with no editor open), and every hand the other machines'\n` +
+      `                       records bring, naming the machine; the editors announce in-process; each hand once\n` +
+      `                       per machine\n` +
+      `  agent setup [--yes|--check] [--json] [--project] [--remove]\n` +
       `  agent start --kind claude|codex [--cwd <dir>] [--machine <label>]  spin an agent up (add --machine to run it on a remote and attach)\n` +
+      `  agent start --kind claude|codex --brief <file> [--name <id>] [--cwd <tree>] [--out <dir>] [--report <file>]\n` +
+      `              [--agent <type>] [--permission-mode <mode>] [--model <m>] [--effort <e>] [--sandbox <s>] [--machine <label>] [--worktree [<base>]] [--writable-root <dir> …]\n` +
+      `                       start an agent from a brief in its own herdr tab, labelled from the brief's # Title, here or on a\n` +
+      `                       saved machine (its paths are that machine's); defaults from prefs.json "agents"; the report it is\n` +
+      `                       told to write is <out>/report.md (out: <id>-out beside the tree)\n` +
+      `  agent start … --after <id…> [--after-any]  record as queued; start after every dependency is done (after-any accepts gone)\n` +
+      `  agent tell <id…> <text> [--file <path>] [--json]  send follow-up scope to each running agent, on its machine\n` +
+      `  agent list [--all] [--json]  every agent started from a brief: OAK's own state (queued, starting, working, waiting, blocked,\n` +
+      `                       errored, done, gone) and since when, kind, model and effort, machine, tab, tokens and cost, workers\n` +
+      `  agent wait <id…> [--until done|blocked|any] [--timeout <s>] [--json]  return once reached (done: every agent done or\n` +
+      `                       gone, exit 1 if one is gone; blocked: one blocked or errored; any: one no longer working); 124 at the timeout\n` +
+      `  agent close <id…> [--remove-worktree] [--json]  close each agent's herdr tab, on its machine; its row stays (agent list --all)\n` +
+      `  finding add "<text>" [--path <file>…] [--repo] [--session <id>]  post an untrusted fact\n` +
+      `  finding list [--repo [<key>]] [--path <file>] [--session <id>] [--machine <id>] [--all] [--json]\n` +
+      `  finding resolve <id> [--session <id>]  retire a finding through the record log\n` +
       `  attach [machine]          attach this terminal to herdr here, or on a saved machine over SSH (tmux-style)\n` +
       `  machine add <label> <ssh-target> | machine list [--json]\n` +
       `                       the machines herdr runs agents on: add installs the version pinned in herdr.lock\n` +
       `                       over ssh (checksum-verified) and saves it non-interactively; a newer local herdr is left alone.\n` +
       `                       list is herdr's own machine list\n` +
+      `  sync now [--machine <label>]… [--json] [--quiet]\n` +
+      `                       pull from each enabled saved machine what this machine keeps: memory, plans, skills,\n` +
+      `                       agents and commands on every machine (merged three ways; changes to the same lines\n` +
+      `                       keep both copies as a conflict), OAK's edit log, comments and agent record of each\n` +
+      `                       session and each machine's record log (what its local database derives of its sessions) on\n` +
+      `                       every machine too, and Claude Code and Codex sessions and OAK's snapshots on the machine\n` +
+      `                       that made them and the backup (the others keep their inventories and fetch on demand).\n` +
+      `                       It writes only this machine, and its own files, encrypted, in a backup folder when one is\n` +
+      `                       set; a machine whose user name is not this machine's refuses and lists nothing. Once it\n` +
+      `                       has run with a saved machine to sync with, or a backup folder, the capture hooks and the\n` +
+      `                       pollers start it in the background at most every 5 minutes, and less often after a run that\n` +
+      `                       stopped with an error. Each machine asked catches its local database up first (up to 5 s;\n` +
+      `                       the rest in the background, for a later run), so its record log holds what it has done.\n` +
+      `                       Exits 1 when every machine it asked failed and nothing was pulled\n` +
+      `  sync plan [--machine <label>]… [--json]\n` +
+      `                       preview what \`sync now\` would do on this machine and on each saved machine;\n` +
+      `                       copies and changes nothing anywhere\n` +
+      `  sync status [--root <folder>] [--json]\n` +
+      `                       the last run per machine, open conflicts, the inventories of other machines' files and\n` +
+      `                       the on-demand copies, from this machine alone; --json also names the project in --root\n` +
+      `                       (this folder by default) as \`sync exclude\` keys it, and whether it is excluded here\n` +
+      `  sync fetch <session> [--json]\n` +
+      `                       bring one session here from the machine that made it, else the backup (an evictable copy)\n` +
+      `  sync resolve <conflict> [--json]\n` +
+      `                       keep this machine's file: delete the other machine's copy (to sync's trash) and close\n` +
+      `                       the conflict now; \`sync status --json\` and \`inbox --json\` list each conflict's id\n` +
+      `  sync include|exclude <machine|project>\n` +
+      `                       sync with a saved machine, or a project (an identity key or a folder here), again or no more\n` +
+      `  sync backup [<label> | --folder <path> | --none]\n` +
+      `                       where every machine's sessions are kept besides the machine that made them: a saved\n` +
+      `                       machine, or a folder (a share, a NAS, a disk; its path on this machine), encrypted on this\n` +
+      `                       machine with a key the folder never holds\n` +
+      `  sync setup [--none | --machine <label> | --folder <path>] [--key-from <machine> | --import-key] [--replace]\n` +
+      `             [--restore]\n` +
+      `                       choose the backup, make or bring the folder's key, and preview a first run; it asks on\n` +
+      `                       a terminal. --restore takes over the folder's record under this machine's name (this\n` +
+      `                       machine is a reinstall of the one that wrote it), and the next run restores from it\n` +
+      `  sync key [--show | --import | --from <machine>] [--replace]\n` +
+      `                       the backup folder's key here: its fingerprint; --show prints it, for a password\n` +
+      `                       manager; --import takes one from standard input, or asks for it on a terminal (never\n` +
+      `                       as an argument); --from copies one over ssh\n` +
+      `  sync family <family> <everywhere|backup|on-demand|off>\n` +
+      `                       where one family's files are kept on this machine\n` +
       `  <verb> … --machine <label>\n` +
-      `                       views, review, list, sessions, conversation, feed, multitask, subagents, diff,\n` +
-      `                       keep, undo, redo, resolve, comment, quote and ignore run on that saved machine over ssh.\n` +
+      `                       fleet, views, review, list, sessions, prompts, conversation, feed, processes, multitask, subagents, diff,\n` +
+      `                       keep, undo, redo, resolve, clean, task-keep, task-undo, task-clear, chat-context, comment, quote, ignore, search,\n` +
+      `                       editor-review, locate and install-extensions run on that saved\n` +
+      `                       machine over ssh.\n` +
       `                       Its own oak answers (from ~/.local/bin, /opt/homebrew/bin or\n` +
       `                       /usr/local/bin), in the session's own workspace there, with output and exit\n` +
-      `                       status passed back unchanged. Review (its session picker lists every saved\n` +
-      `                       machine's sessions; --session and --once too) and Observatory read sessions on\n` +
-      `                       their owning machine.\n` +
+      `                       status passed back unchanged (output is filtered when printed to a terminal).\n` +
+      `                       Review (its session picker lists every saved machine's sessions; --session\n` +
+      `                       and --once too) and Observatory read sessions on their owning machine.\n` +
       `                       OAK_MACHINE_TIMEOUT_MS overrides the 120-second command deadline; unit and\n` +
-      `                       mark-sent operations and conversations require a compatible remote build\n` +
+      `                       mark-sent operations, ignore --dry-run and conversations require a compatible\n` +
+      `                       remote build.\n` +
       `  list [filters]       list edits (grouped by file); filters: --pending|--kept|--undone, --file <substr>\n` +
       `  timeline [--json]    edits newest-first as a chronological feed (time · id · Δ · file)\n` +
       `  actions [--json]     the full action timeline: EVERY tool call Claude made (reads, greps, bash,\n` +
@@ -6267,6 +8789,7 @@ function usage(): void {
       `                       (with risk tiers), MCP servers, network, subagents — exercised, not approved\n` +
       `  processes [--json]   background shells this session left running (runtime · exit code · output);\n` +
       `                       --id <shell> shows one shell's full command + a tail of its output\n` +
+      `  processes --follow <id> [--session <id>] [--machine <label>] [--json]  live plain-text output (JSON snapshots).\n` +
       `  prompts [--json]     the session as the list of things YOU asked for, each with the edits,\n` +
       `                       files, folders, tokens, agents, workflows, tasks and shells it produced;\n` +
       `                       --id <n> drills into one; --id <n> --response prints Claude’s reply to it\n` +
@@ -6275,15 +8798,23 @@ function usage(): void {
       `                       one ask; --pending hides resolved units; --no-patch for metadata only\n` +
       `  feed [--json]        what ONE thing is doing now — a tail of its activity;\n` +
       `                       --kind session|agent|workflow|task|process --id <id> [--limit <n>]\n` +
+      `                       --kind agent --id <worker> [--session <id>] --follow watches its live log;\n` +
+      `                       --machine <label> reads it over ssh every 10 s; ends at recorded completion.\n` +
+      `                       --json --follow prints one snapshot per line, with endedTs in milliseconds.\n` +
       `  subagents [--json]   every subagent this session spawned, each with its own action timeline + metrics (alias: agents)\n` +
+      `  fleet [--json] [--machine LABEL]  named workers on this machine, including herdr and worktrees\n` +
       `  siblings [--json]    the other Claude Code sessions in THIS project (active/idle · pending · files · risk);\n` +
-      `                       agent-facing digest for cross-agent awareness (alias: fleet); --all includes self;\n` +
-      `                       --repo widens to every WORKTREE of the repo (adds worktree/branch/phase + conflicts)\n` +
+      `                       agent-facing digest for cross-agent awareness; --all includes self;\n` +
+      `                       --repo widens to every WORKTREE of the repo (adds worktree/branch/phase + conflicts),\n` +
+      `                       and lists the other machines' sessions of the repo from the local database, read-only\n` +
+      `                       (--json: machines)\n` +
       `  multitask                the multi-agent view: one row per running agent across every worktree (live phase,\n` +
       `                       sparkline, ±lines, risk) + nested subagents (phase/current task) + live file conflicts\n` +
       `  tasklog                    cross-agent task log: one row per stable taskId, unioned across worktrees + subagents\n` +
       `  metrics [--json]     session numbers: ±lines, action/error counts, subagent duration/tokens, tool latency\n` +
       `  diff <id> [--json]   show before/after; JSON carries session, id, file and patch\n` +
+      `  diff --ids <id,id,…> --json [--contents] [--preview-lines 50]  one page of at most ten edits; 0 shows full contents\n` +
+      `  diff --pending --json [--prompt <id>] [--offset N]  pending scope ids and one preview page\n` +
       `  keep <id>            keep the whole change (review unit) edit <id> belongs to;\n` +
       `                       bulk: --all | --file <substr> | --under <path> | --ids <a,b,c>\n` +
       `                       an id and a bulk flag are mutually exclusive (they mean different things)\n` +
@@ -6340,6 +8871,7 @@ function usage(): void {
       `                       actions, tasks, subagents, egress, outside writes, observations, usage\n` +
       `  insights [--json]    Observations view: recap + per-edit reasoning/flags/file-memory + next steps\n` +
       `  ignore [--json]      what .observatoryignore is hiding in this session, and which files set it\n` +
+      `  ignore --dry-run [--json]   how many recorded edits the ignore sweep would drop, dropping none\n` +
       `  ignore --check <p>... [-v] [-n] [-z] [-q] [--stdin] [--json]   why each path is shown / hidden /\n` +
       `                       refused — names the rule, its file and its line (and the excluded ancestor,\n` +
       `                       when that is what decided). Takes git check-ignore's flags and its exit\n` +
@@ -6348,13 +8880,17 @@ function usage(): void {
       `  tui [--session <id>] [--root <d>] [--tick <s>] [--once] [--no-color] [--no-mouse]\n` +
       `       [--cols N] [--rows N]\n` +
       `                       herdr · Observatory · Review; --tab herdr|observatory|review selects a tab\n` +
-      `                       Observatory: arrows preview (Review follows), Enter pins, i replies,\n` +
-      `                       h focuses herdr, r reviews, Shift+A includes archived sessions.\n` +
-      `                       Review: a keep, u undo.\n` +
-      `                       Leader (default ctrl+a) then o opens herdr's focused conversation.\n` +
-      `                       Herdr's tab bar starts agents; ctrl+a n/p or 1-3 switches OAK tabs.\n` +
-      `                       Ctrl+q twice quits OAK on every tab (repeat within two seconds).\n` +
-      `                       Ctrl+a q twice also quits OAK, including from the herdr tab.\n` +
+      `                       Observatory: arrows preview (Review follows), Enter pins, c replies,\n` +
+      `                       t focuses herdr, R resolves and X stops (both ask first), B includes\n` +
+      `                       archived sessions.\n` +
+      `                       Review: a keep, u undo, U redo, A keep all, D undo all.\n` +
+      `                       : opens the palette: every command, and find anything.\n` +
+      `                       Tab / shift+Tab switch OAK tabs. herdr's tab bar starts agents; on the\n` +
+      `                       herdr tab, herdr's prefix (ctrl+b unless its config sets another) then m\n` +
+      `                       returns to OAK and M pins herdr's focused session in the Observatory.\n` +
+      `                       Ctrl+q twice quits OAK on every tab (repeat within two seconds); when\n` +
+      `                       herdr's prefix is ctrl+q, the herdr tab passes it to herdr and OAK quits\n` +
+      `                       from its own tabs.\n` +
       `                       ? lists keys; Options rebinds them. --once prints one frame.\n\n` +
       `machine-readable (for front-ends/scripts; list/status/sessions/keep/undo/redo also take --json):\n` +
       `  blob <sha>           raw blob bytes to stdout\n` +
@@ -6370,7 +8906,8 @@ function usage(): void {
       `                       run several READ-ONLY views in ONE process and emit {name: payload} —\n` +
       `                       each is byte-identical to its own command. Default set: changemap,\n` +
       `                       multitask, prompts, processes, sessions, observations, risk, egress;\n` +
-      `                       stats is accepted by name too, though nothing batches it by default.\n` +
+      `                       stats and actions are accepted by name too, though nothing batches them by\n` +
+      `                       default.\n` +
       `                       A view that fails is null rather than fatal to the batch; a mutating\n` +
       `                       verb is refused. The JetBrains Overview polls its eight views through it.\n` +
       `  chat-context [--tool-use-id <id> | --edit <n> | --agent <id> | --task <id>]\n` +
@@ -6382,7 +8919,15 @@ function usage(): void {
       `  usage                ctx / 5h / week snapshot + session token split + model/effort/compaction\n` +
       `                       vitals, as JSON; --breakdown [--by week|month|model|session]\n` +
       `                       [--agent claude|codex|both] [--weeks N]; --bill-day N anchors Claude month\n` +
-      `                       figures to your bill cycle, --gpt-bill-day N does the same for GPT (0 clears)\n` +
+      `                       figures to your bill cycle, --gpt-bill-day N does the same for GPT (0 clears).\n` +
+      `                       A Claude window with no current share here shows a saved machine's reading\n` +
+      `                       of the same account, named (with no Claude Code login here, of the one account\n` +
+      `                       the saved machines name; "machineUsage": false in prefs.json turns that off);\n` +
+      `                       --window 5h|week|bill|month|day|all [--by machine|model|session|day|agent|account]\n` +
+      `                       [--agent claude|codex] [--json] breaks a window down from the local database, each\n` +
+      `                       message once across the machines whose usage it holds, as the token and dollar\n` +
+      `                       estimates count it; --brief prints the shares and the usage this machine measured\n` +
+      `                       itself, as an earlier pre-release reads them from a machine that saved this one\n` +
       `  titles [--json] [--refresh] [--off | --on]\n` +
       `                       Remote Control titles read from claude.ai, so sessions carry the names the\n` +
       `                       Claude app shows: the last refresh and what it cached; --refresh reads now;\n` +
@@ -6392,9 +8937,10 @@ function usage(): void {
       `  recap                one-line session recap   [--json --fresh --claude-bin <path>]\n` +
       `  suggest              next-steps + suggestions [--json --fresh --claude-bin <path>]\n\n` +
       `  --session <id>       target a specific session instead of the newest\n` +
-      `  version [--check] [--json]\n` +
+      `  version [--check] [--json] [--compare <version>]\n` +
       `                       print the installed version (--json adds the channel); --check (or --latest)\n` +
-      `                       also shows the newest release of BOTH channels (--json feeds the editors' chip)\n` +
+      `                       also shows the newest release of BOTH channels (--json feeds the editors' chip);\n` +
+      `                       --compare with --check --json also says how <version> stands against the channel\n` +
       `  --version            print the installed CLI version\n`
   );
 }
@@ -6482,9 +9028,15 @@ function shouldCheckUpdates(cmd: string | undefined, rest: string[]): boolean {
  *  and kick a detached refresh if the cached check is older than a day. Cheap and non-blocking. */
 function maybeCheckForUpdate(cmd: string | undefined, rest: string[]): void {
   if (!shouldCheckUpdates(cmd, rest)) return;
+  // A checkout's build never matches a release, and `oak update` leaves it alone, as it leaves the copy
+  // `oak machine add` pushed: a nudge to run it on every command is noise, and before the update left a
+  // link alone it was the prompt that replaced one.
+  if (runningCheckout() || machineBundle()) return;
   const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
-  const cache = readUpdateCache();
   const cur = version();
+  // Nor is a local build, which no release carries and `oak update` leaves alone unless asked by name.
+  if (core.isLocalBuild(cur)) return;
+  const cache = readUpdateCache();
   // The nudge follows the ACTIVE channel: a dev-channel install compares against the rolling
   // pre-release tag, never against stable (which is older than every dev build by construction).
   const channelTag = core.getUpdateChannel() === 'dev' ? cache?.latestDevTag ?? cache?.latestTag : cache?.latestTag;
@@ -6508,7 +9060,7 @@ function maybeCheckForUpdate(cmd: string | undefined, rest: string[]): void {
     });
   }
   const DAY = 24 * 60 * 60 * 1000;
-  if (!cache || Date.now() - cache.checkedMs > DAY) {
+  if ((!cache || Date.now() - cache.checkedMs > DAY) && !core.noBackgroundChildren()) {
     // The optimistic throttle must carry BOTH tags forward — dropping latestDevTag here silently
     // ate a dev-channel machine's known-update nudge until the next successful network refresh.
     writeUpdateCache({ checkedMs: Date.now(), latestTag: cache?.latestTag ?? null, latestDevTag: cache?.latestDevTag ?? null });
@@ -6524,23 +9076,48 @@ function maybeCheckForUpdate(cmd: string | undefined, rest: string[]): void {
   }
 }
 
+/** Say once, after the command's own output, that oak sync's settings were put back in prefs.json from its copy (core
+ *  keptPrefs, run by whichever process read them first): an OAK older than 0.11.0 rewrote the file. Only to a person at a
+ *  terminal: a hook, the status line or an editor's call would take the one telling where nobody reads it. `oak doctor`
+ *  says it on every surface, and the terminal app on its own status line. */
+function sayKeptPrefsAtExit(cmd: string): void {
+  if (!process.stderr.isTTY || cmd === 'capture' || cmd === 'tui' || cmd.startsWith('__') || ['version', '--version', '-v', 'help', '--help', '-h'].includes(cmd)) return;
+  process.on('exit', () => {
+    try {
+      const text = (require('@oak-observatory/core') as typeof import('@oak-observatory/core')).takeKeptPrefsNotice();
+      if (text) process.stderr.write(c.yellow('\n⚠ ') + text + '. Quit or update that OAK: `oak doctor` says where it may be running.\n');
+    } catch {
+      /* a notice never fails a command */
+    }
+  });
+}
+
 /** Every verb the dispatch below answers to, and the flags that take a VALUE — both used only
  *  to tell a swallowed command apart from a flag's argument at the front door. Derived from
  *  the same switch that runs them, so the two cannot drift. */
 const KNOWN_VERBS = new Set([
-  'actions', 'agent', 'agents', 'analyze', 'assign', 'attach', 'blob', 'capabilities', 'capture', 'changemap', 'chat-context', 'clean', 'comment', 'conversation', 'quote', 'demo', 'diff', 'doctor', 'egress', 'export', 'feed', 'fleet', 'footprint', 'focus', 'help', 'ignore', 'inbox', 'init', 'integrity', 'insights', 'install-extensions', 'keep', 'list', 'locate', 'machine', 'metrics', 'models', 'multitask', 'notify', 'observations', 'observe', 'oplog', 'processes', 'prompt', 'prompts', 'recap', 'review', 'store', 'redo', 'resolve', 'risk', 'search', 'server', 'sessions', 'siblings', 'stats', 'status', 'statusline', 'subagents', 'tui', 'suggest', 'summary', 'task-clear', 'task-keep', 'task-undo', 'tasklog', 'timeline', 'titles', 'trace', 'tree', 'undo', 'uninstall', 'update', 'usage', 'version', 'views', 'warm',
+  'actions', 'agent', 'agents', 'analyze', 'assign', 'attach', 'blob', 'capabilities', 'capture', 'changemap', 'chat-context', 'clean', 'comment', 'conversation', 'quote', 'demo', 'diff', 'doctor', 'editor-review', 'egress', 'export', 'feed', 'fleet', 'footprint', 'focus', 'help', 'ignore', 'inbox', 'init', 'integrity', 'insights', 'install-extensions', 'keep', 'list', 'locate', 'machine', 'metrics', 'models', 'multitask', 'notify', 'observations', 'observe', 'oplog', 'processes', 'prompt', 'prompts', 'query', 'recap', 'review', 'store', 'redo', 'resolve', 'risk', 'search', 'server', 'sessions', 'siblings', 'stats', 'status', 'statusline', 'subagents', 'sync', 'tui', 'suggest', 'summary', 'task-clear', 'task-keep', 'task-undo', 'tasklog', 'timeline', 'titles', 'trace', 'tree', 'undo', 'uninstall', 'update', 'usage', 'version', 'views', 'warm',
 ]);
 // NOTE: this is the SECOND list of value-taking flags in this file (see `VALUE_FLAGS` above). They
 // serve different parsers — that one strips flag/value pairs, this one decides whether a bare token
 // is a verb — and a flag missing from EITHER fails in its own way. `--tab review` needs both: the
 // first so the pair is consumed, this one so `review` is not mistaken for the review command.
-const FLAGS_WITH_VALUES = new Set(['--root', '--session', '--tick', '--cols', '--rows', '--out', '--under', '--ids', '--file', '--since', '--stale', '--drop', '--older-than', '--check', '--views', '--channel', '--prompt', '--agent', '--cwd', '--resume', '--tab', '--delete', '--undelete', '--after', '--kind', '--ts', '--title', '--message', '--interval', '--query', '--days', '--limit', '--text', '--edit', '--line', '--id', '--machine', '--comment-ids', '--pane']);
+const FLAGS_WITH_VALUES = new Set(['--offset', '--preview-lines', '--files', '--root', '--session', '--tick', '--cols', '--rows', '--out', '--under', '--ids', '--file', '--since', '--stale', '--drop', '--older-than', '--check', '--views', '--channel', '--prompt', '--agent', '--cwd', '--resume', '--tab', '--delete', '--undelete', '--after', '--kind', '--ts', '--title', '--message', '--interval', '--query', '--days', '--limit', '--text', '--edit', '--line', '--id', '--machine', '--comment-ids', '--pane', '--brief', '--name', '--report', '--model', '--effort', '--sandbox', '--permission-mode', '--until', '--timeout', '--workspace', '--parent', '--writable-root', '--worktree']);
+
+/** Set while the terminal app runs interactive: a write that fails on its closed terminal (EIO) ends it as a hangup. */
+let terminalApp = false;
+/** runTui's own test: the app is interactive on a terminal, without `--once`. A one-shot frame is a command's output. */
+const interactiveApp = (args: string[]): boolean => !args.includes('--once') && Boolean(process.stdin.isTTY && process.stdout.isTTY);
 
 function main(): void {
   // Exit cleanly when output is piped to a consumer that closes early (`| head`, `| grep -q`, …)
-  // instead of crashing with an unhandled EPIPE 'error' event.
+  // instead of crashing with an unhandled EPIPE 'error' event, and, in the terminal app, when the terminal it
+  // writes to has closed (EIO on a terminal, before or without its SIGHUP): the app restores and ends as on that
+  // SIGHUP. Any other command ends on EIO as on any other write error, so one cut off part way never reports a
+  // success. exit() without a status keeps one the verb has already set (a refused undo, `ignore --check` that
+  // finds nothing ignored).
   process.stdout.on('error', (err: NodeJS.ErrnoException) => {
-    if (err.code === 'EPIPE') process.exit(0);
+    if (err.code === 'EPIPE' || (err.code === 'EIO' && process.stdout.isTTY && terminalApp)) process.exit();
     throw err;
   });
 
@@ -6552,6 +9129,10 @@ function main(): void {
   const argv = process.argv.slice(2);
   const cmd = argv[0];
   const rest = argv.slice(1);
+  if (cmd === 'agent' && rest[0] === 'tell') {
+    void cmdAgentTell(rest.slice(1)).catch(e => fail(String(e?.message || e)));
+    return;
+  }
   // Post-rename nudge: the product is now `oak` (package `oak-observatory`). The old
   // `claude-observatory` command still works as a deprecated alias, but say so once — interactively
   // only (a human at a TTY), and NEVER for the `capture` hook, which runs on every tool call and whose
@@ -6582,6 +9163,9 @@ function main(): void {
   // it would otherwise read as a command name. Named verbs still dispatch below, and `--help` and
   // `--version` keep answering for themselves — those are questions, not a request to open anything.
   const HELP_OR_VERSION = new Set(['-h', '--help', '-v', '--version']);
+  // An empty `--root=` named no workspace: read as named, the verbs scoped to "" and `export` wrote
+  // `"root": ""`, while the app read it as absent. Every verb and the app refuse it alike.
+  if (argv.includes('--root=')) fail('`--root` requires a path');
   if (cmd === undefined || (cmd.startsWith('-') && !HELP_OR_VERSION.has(cmd))) {
     // A VERB typed after a flag is not a request to open the dashboard. `oak --root x
     // status` used to open the app and silently drop `status`, which reads as the flag being wrong.
@@ -6591,27 +9175,81 @@ function main(): void {
     if (verb) {
       fail(`\`${verb}\` is a command, so it goes first: \`oak ${verb} ${argv.filter((a) => a !== verb).join(' ')}\``);
     }
+    terminalApp = interactiveApp(argv);
     require('@oak-observatory/tui').runTui(require('@oak-observatory/core'), argv, getTuiSessionId);
+    return;
+  }
+  if (!RAW_OUTPUT_VERBS.has(cmd) || (cmd === 'views' && isTTY())) {
+    // `--json`, a patch and git's NUL-separated check-ignore format are for programs, byte for byte —
+    // but printed to a terminal they are read by a person, and filtered like any other output.
+    const exact = !isTTY() && (rest.includes('--json') || (cmd === 'diff' && rest.includes('--patch')) || (cmd === 'ignore' && rest.includes('-z')));
+    guardHumanOutput(exact ? [process.stderr] : [process.stdout, process.stderr]);
+  }
+  // `oak agent` aimed at a saved machine by this CLI itself (agentOnMachine): the delegated agent's verb runs there.
+  if (cmd === 'agent' && process.env.OAK_AGENT_FORWARD === '1' && rest.some(a => a === '--machine' || a.startsWith('--machine='))) {
+    void forwardToMachine(cmd, rest).catch((e) => fail(String(e?.message || e)));
     return;
   }
   // A session verb aimed at a saved machine runs THERE, where the session's store and files are.
   if (MACHINE_VERBS.has(cmd) && rest.some(a => a === '--machine' || a.startsWith('--machine='))) {
+    // A machine oak sync keeps current here lists its sessions from the local index, saying how fresh they are; any
+    // other, and one with a session that may be running, is asked over ssh. A read that names a root or a session is
+    // asked there; the terminal app asks its warm worker for the index's answer first (cmdSessions).
+    if (cmd === 'sessions' && rest.includes('--json') && !rest.some((a) => /^--(delete|undelete|all|session|root|workers)(=|$)/.test(a))) {
+      const at = rest.findIndex((a) => a === '--machine' || a.startsWith('--machine='));
+      const label = rest[at].startsWith('--machine=') ? rest[at].slice('--machine='.length) : rest[at + 1];
+      const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
+      const listed = label ? core.indexedMachineSessions(label) : null;
+      if (listed) {
+        emitJson(listed);
+        return;
+      }
+    }
+    // Its conversations too: searched from its records here when oak sync read it lately, else over ssh.
+    if (cmd === 'search') {
+      const at = rest.findIndex((a) => a === '--machine' || a.startsWith('--machine='));
+      const label = rest[at].startsWith('--machine=') ? rest[at].slice('--machine='.length) : rest[at + 1];
+      const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
+      const { query, opts } = searchRequest(rest);
+      const found = label ? core.indexedMachineSearch(label, query, opts) : null;
+      if (found) {
+        printSearch(found, rest);
+        return;
+      }
+    }
+    if (cmd === 'processes' && flagValue(rest, '--follow')) { followMachineWorker(rest, flagValue(rest, '--follow')); return; }
+    if (cmd === 'feed' && rest.includes('--follow')) { followMachineWorker(rest); return; }
     void forwardToMachine(cmd, rest).catch((e) => fail(String(e?.message || e)));
     return;
   }
   // …and arriving there, it runs where its session ran.
   if (process.env.OAK_FORWARDED === '1' && MACHINE_VERBS.has(cmd)) enterSessionWorkspace(rest);
   maybeCheckForUpdate(cmd, rest); // register a once-a-day "update available" nudge (never blocks)
+  sayKeptPrefsAtExit(cmd);
   // A throw from a SYNC command should surface as `oak: <msg>`, not a raw Node stack.
   // process.exit() throws nothing, so a command's own exit is never caught here; async commands keep
   // their own .catch(fail) below.
   try {
   switch (cmd) {
+    case 'editor-review':
+      cmdEditorReview(rest);
+      break;
     case '__conversation-protocol':
       process.stdout.write('1\n'); // bounded initial reads, remote byte cursors and replacement resets
       break;
+    case '__update-protocol':
+      // 1: `update --here` (this machine only) and `update --json`'s components. `oak update` on another
+      // machine asks this first, so an older build there, which would ignore `--here` and plan nothing it
+      // reports, is told to update rather than misread. 2: a CLI linked to a checkout is planned `linked`
+      // and never replaced. Only `--level` is told 2, as `__review-protocol` does: a 0.10 caller checks for
+      // exactly 1, and an older build asked with `--level` still answers 1.
+      process.stdout.write(rest.includes('--level') ? '2\n' : '1\n');
+      break;
     case '__review-protocol':
-      process.stdout.write('1\n'); // units, sent-comment ledger, equals text values, and JSON diffs
+      // 1: units, sent-comment ledger, equals text values and JSON diffs. 2: `ignore --dry-run` counts and
+      // drops nothing. Only `--level` is told 2: a 0.10 caller checks for exactly 1, and an older build
+      // asked with `--level` still answers 1, so a caller that needs 2 refuses it.
+      process.stdout.write(rest.includes('--level') ? '2\n' : '1\n');
       break;
     case 'init':
       if (rest.includes('--codex')) {
@@ -6636,7 +9274,8 @@ function main(): void {
       cmdDoctor(rest).catch((e) => fail(String(e?.message || e)));
       break;
     case 'sessions':
-      cmdSessions(rest);
+      if (rest.includes('--workers')) cmdWorkerFleet(rest).catch((e) => fail(String(e.message || e)));
+      else cmdSessions(rest);
       break;
     case 'attach':
       cmdAttach(rest).catch((e) => fail(String(e?.message || e)));
@@ -6650,6 +9289,49 @@ function main(): void {
     case 'search':
       cmdSearch(rest);
       break;
+    case 'query':
+      cmdQuery(rest);
+      break;
+    case 'finding':
+      try { cmdFinding(rest); } catch (e) { fail(String((e as Error).message)); }
+      break;
+    case '__query-sql':
+      // Internal, hidden: the child that runs one guarded read for `oak query sql` (core index/sql.ts).
+      cmdQuerySqlChild();
+      break;
+    case '__index-build':
+      // Internal, hidden: started detached (by a reader whose catch-up was left undone, a capture hook, or a machine asked
+      // to publish) to build or catch up the local index without waiting for it. A build that cannot open the index holds
+      // the next off (core backOffIndexBuild). Another pass follows while a kick claimed a build since this pass began (a
+      // hook that moved a hand, whose own build found this one holding the lease), and once a permission prompt it left
+      // unpublished in its wait (5 s, or Codex Auto-review's 90) is due; four more passes at most. The wait ends, and the
+      // build with it, once every such prompt is down (answered, or the reviewer's verdict came): the hook that lowered
+      // it started a build of its own. One build a prompt slept out the whole wait, and they piled up (a Codex session
+      // under Auto-review, a tool call every 2 s: 30 asleep at once, 2 GB).
+      void (async () => {
+        const core = require('@oak-observatory/core') as Core;
+        let began = Date.now();
+        let res = core.buildIndex();
+        for (let pass = 0; pass < 4; pass++) {
+          if ('ok' in res) {
+            core.backOffIndexBuild();
+            return;
+          }
+          const due = res.handsDueAt;
+          if (!core.claimTouchedSince(began)) {
+            if (due === undefined) return;
+            const until = Date.now() + Math.min(Math.max(0, due - Date.now()) + 250, 95_000);
+            const waited = res.handsDue ?? [];
+            for (let left = until - Date.now(); left > 0; left = until - Date.now()) {
+              await new Promise((done) => setTimeout(done, Math.min(left, 1000)));
+              if (waited.length && !waited.some((h) => core.handStillUp(h.id, { kind: 'permission', ts: h.ts }))) return;
+            }
+          }
+          began = Date.now();
+          res = core.buildIndex();
+        }
+      })();
+      break;
     case 'notify':
       // Like `drive`: an async command in the sync dispatcher — `--watch` keeps its own interval alive;
       // the one-shot forms finish on their own.
@@ -6660,7 +9342,7 @@ function main(): void {
       break;
     // Deliberately NOT a `views` member: it WRITES caches, and that batch is read-only by contract.
     case 'resolve':
-      cmdResolve(rest);
+      deciding(() => cmdResolve(rest));
       break;
     case 'warm':
       cmdWarm(rest);
@@ -6711,8 +9393,10 @@ function main(): void {
       cmdSubagents(rest);
       break;
     case 'siblings':
-    case 'fleet':
       cmdSiblings(rest);
+      break;
+    case 'fleet':
+      cmdWorkerFleet(rest).catch((e) => fail(String(e.message || e)));
       break;
     case 'multitask':
       cmdMultitask(rest);
@@ -6752,34 +9436,34 @@ function main(): void {
       cmdDiff(rest);
       break;
     case 'keep':
-      cmdKeep(rest);
+      deciding(() => cmdKeep(rest));
       break;
     case 'undo':
-      cmdUndo(rest);
+      deciding(() => cmdUndo(rest));
       break;
     case 'oplog':
-      cmdOplog(rest);
+      deciding(() => cmdOplog(rest));
       break;
     case 'assign':
-      cmdAssign(rest);
+      deciding(() => cmdAssign(rest));
       break;
     case 'redo':
-      cmdRedo(rest);
+      deciding(() => cmdRedo(rest));
       break;
     case 'task-keep':
-      cmdTaskKeep(rest);
+      deciding(() => cmdTaskKeep(rest));
       break;
     case 'task-undo':
-      cmdTaskUndo(rest);
+      deciding(() => cmdTaskUndo(rest));
       break;
     case 'task-clear':
-      cmdTaskClear(rest);
+      deciding(() => cmdTaskClear(rest));
       break;
     case 'demo':
       void cmdDemo(rest);
       break;
     case 'clean':
-      cmdClean(rest);
+      deciding(() => cmdClean(rest));
       break;
     case 'stats':
       cmdStats(rest);
@@ -6794,7 +9478,7 @@ function main(): void {
       cmdBlob(rest);
       break;
     case 'ignore':
-      cmdIgnore(rest);
+      deciding(() => cmdIgnore(rest));
       break;
     case 'locate':
       cmdLocate(rest);
@@ -6803,9 +9487,10 @@ function main(): void {
       cmdTree(rest);
       break;
     case 'views':
-      cmdViews(rest);
+      cmdViews(rest).catch(e => fail(String(e?.message || e)));
       break;
     case 'tui':
+      terminalApp = interactiveApp(rest);
       require('@oak-observatory/tui').runTui(require('@oak-observatory/core'), rest, getTuiSessionId);
       break;
     case 'changemap':
@@ -6825,6 +9510,31 @@ function main(): void {
       break;
     case 'usage':
       cmdUsage(rest);
+      break;
+    case '__usage-brief':
+      // Internal, hidden: what an older OAK's `usage --pull-machines` reads from this one (sshUsageBrief): its readings.
+      cmdUsage(['--brief', '--json']);
+      break;
+    case '__usage-records': {
+      // Internal, hidden: what a saved machine's `usage --pull-machines` reads from this one: its own usage since a cursor.
+      const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
+      emitJson(core.indexUsageRecords(flagValue(rest, '--since') ?? null));
+      break;
+    }
+    case 'sync':
+      void (require('./sync') as typeof import('./sync')).cmdSync(rest, syncDeps()).catch((e) => fail(String(e?.message || e)));
+      break;
+    case '__sync-inventory':
+      // Internal, hidden: what another machine's `oak sync` reads from this one.
+      (require('./sync') as typeof import('./sync')).cmdSyncInventory(rest, syncDeps());
+      break;
+    case '__sync-fetch':
+      // Internal, hidden: the files another machine's `oak sync` pulls from this one, the request on stdin.
+      void (require('./sync') as typeof import('./sync')).cmdSyncFetch(rest, syncDeps()).catch((e) => fail(String(e?.message || e)));
+      break;
+    case '__sync-key':
+      // Internal, hidden: this machine's backup key, for `oak sync key --from` on another of the user's machines.
+      (require('./sync') as typeof import('./sync')).cmdSyncKey(rest, syncDeps());
       break;
     case 'titles':
       cmdTitles(rest);

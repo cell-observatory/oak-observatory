@@ -7,17 +7,22 @@
  * (the human presses send). A comment is "sent" once it has been batched into a delivered prompt, so
  * the same note never rides two prompts. Human comments only; nothing here calls a model.
  *
- * Store: `changemap-cache/<session>/comments.json`, written directly (tmp+rename), NOT through the
- * `persisted()` recompute cache — a comment is authored, not derived. It is per-session review-state:
- * dropped with the session (a dropped session has no pending edits to comment on), and the same
- * dropped-session guard the derived caches use keeps a read from resurrecting a cleaned store.
+ * Store: `<store>/<session>/comments.json`, beside the session's log, written directly (tmp+rename), NOT
+ * through the `persisted()` recompute cache — a comment is authored, not derived, so it lives with the
+ * session's own data rather than among the caches, and goes wherever the session goes (a store move).
+ * Until 0.11.0 it lived in `changemap-cache/<session>/comments.json`, where an older build still running beside
+ * this one (an editor not yet reloaded) goes on writing: the comments there are read with the session's own, and a
+ * change carries them into it and removes that file. It is per-session
+ * review-state: dropped with the session (a dropped session has no pending edits to comment on), and a
+ * write never makes the folder of a session whose log is gone.
  */
 import * as fs from 'fs';
 import * as path from 'path';
-import { isSafeSessionId, logPath, rootDir, findRecord, blobText, type EditRecord } from './store';
+import { isSafeSessionId, logPath, rootDir, storeDir, findRecord, blobText, outsideStoreMoves, withSessionLock, type EditRecord } from './store';
 import { reviewEdits } from './groups';
 import { pairKeyOf } from './derived';
 import { relPath } from './format';
+import { graphemeHead } from './graphemes';
 
 const COMMENTS_VERSION = 1;
 
@@ -51,34 +56,107 @@ const DEFAULT_TEMPLATE = 'Please address these {count} review comment(s) on {fil
 
 function commentsPath(session: string): string | null {
   if (!isSafeSessionId(session)) return null;
+  return path.join(storeDir(session), 'comments.json');
+}
+
+/** Where a session's comments were kept until 0.11.0, among the derived caches. */
+function legacyCommentsPath(session: string): string {
   return path.join(rootDir(), 'changemap-cache', session, 'comments.json');
 }
 
-export function readComments(session: string): ReviewComment[] {
-  const file = commentsPath(session);
-  if (!file) return [];
+/** The comments the file `at` holds: null when it is absent, none when it is truncated or another version's. */
+function commentFile(at: string): ReviewComment[] | null {
+  let text: string;
   try {
-    const j = JSON.parse(fs.readFileSync(file, 'utf8')) as CommentStore;
+    text = fs.readFileSync(at, 'utf8');
+  } catch {
+    return null;
+  }
+  try {
+    const j = JSON.parse(text) as CommentStore;
     if (j && j.version === COMMENTS_VERSION && Array.isArray(j.comments)) return j.comments;
   } catch {
-    /* absent, truncated, or from another version — no comments */
+    /* truncated, or from another version — no comments */
   }
   return [];
 }
 
+/** The session's comments: its own file's, then those of the file kept until 0.11.0 that its own lacks. An older build
+ *  still running beside this one adds there after the comments moved, and each was never shown again. */
+export function readComments(session: string): ReviewComment[] {
+  const file = commentsPath(session);
+  if (!file) return [];
+  const own = commentFile(file);
+  const older = commentFile(legacyCommentsPath(session));
+  if (!own) return older ?? [];
+  if (!older?.length) return own;
+  const ids = new Set(own.map((c) => c.id));
+  return [...own, ...older.filter((c) => !ids.has(c.id))];
+}
+
+/** Write the session's comments whole. A failure throws: written "best effort", a comment that could not be saved was
+ *  reported as added (`oak comment add` printed its id) and was gone at the next read. */
 function writeComments(session: string, comments: ReviewComment[]): void {
   const file = commentsPath(session);
   // A DROPPED SESSION IS NEVER RESURRECTED (mirrors derived.ts): `clean --drop` removes the store and
   // its caches together; a write that followed would recreate the directory behind it.
-  if (!file || !fs.existsSync(logPath(session))) return;
+  if (!file || !fs.existsSync(logPath(session))) throw new Error(`session ${session} has no store, so its review comments were not saved`);
+  const tmp = `${file}.${process.pid}.tmp`;
   try {
-    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-    const tmp = `${file}.${process.pid}.tmp`;
     fs.writeFileSync(tmp, JSON.stringify({ version: COMMENTS_VERSION, comments } satisfies CommentStore), { mode: 0o600 });
     fs.renameSync(tmp, file);
-  } catch {
-    /* best effort — a session whose comments cannot be written simply keeps what it had */
+  } catch (e) {
+    try {
+      fs.rmSync(tmp, { force: true });
+    } catch {
+      /* the error below says what failed */
+    }
+    throw new Error(`the review comments of session ${session} could not be saved: ${String((e as Error)?.message || e)}`);
   }
+  written++;
+}
+
+/** The writes writeComments has made: changeComments learns from it whether a change wrote the comments it read. */
+let written = 0;
+
+/** The file at `p` as a stamp that a write over it changes (a new inode, as every writer's rename makes), or null. */
+function fileStamp(p: string): string | null {
+  try {
+    const st = fs.statSync(p);
+    return `${st.dev}:${st.ino}:${st.size}:${st.mtimeMs}`;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Change the session's comments: read them, let `change` work on them (it writes them when it changes them), all under
+ * the session's lock, so two writers cannot both read the same comments and the second write drop what the first added.
+ * Outside any store move as well, the look for the log too: read where the store had been, the comments came back
+ * empty, and the write dropped every other comment. A session with no log has no comments, and none are written for it.
+ *
+ * The comments of the file kept until 0.11.0 are read with the session's own, so a change written carries them over,
+ * and that file then goes. Not when an older build wrote it during the change (it takes no lock): what it wrote stays
+ * there, for the next change to carry.
+ */
+function changeComments<T>(session: string, none: T, change: (all: ReviewComment[]) => T): T {
+  return outsideStoreMoves(() => {
+    if (!isSafeSessionId(session) || !fs.existsSync(logPath(session))) return none;
+    return withSessionLock(session, () => {
+      const older = legacyCommentsPath(session);
+      const read = fileStamp(older);
+      const writes = written;
+      const out = change(readComments(session));
+      if (read !== null && written !== writes && fileStamp(older) === read) {
+        try {
+          fs.rmSync(older, { force: true });
+        } catch {
+          /* left behind, it is read again: a comment it held that this change removed comes back */
+        }
+      }
+      return out;
+    });
+  });
 }
 
 /** The unit record a comment attaches to: the collapsed REVIEW unit (its synthetic net pair), or the
@@ -90,6 +168,13 @@ function unitRec(session: string, unit: number): EditRecord | null {
 /** Add a line comment on a pending edit. `line` 0 (or absent) is a whole-edit note. Returns null if
  *  the text is empty or the unit is unknown. */
 export function addComment(session: string, opts: { unit: number; line?: number; text: string }): ReviewComment | null {
+  return outsideStoreMoves(() => addCommentUnguarded(session, opts));
+}
+
+/** Every comment write reads the session's comments and writes them back whole, so both happen outside any store move
+ *  (outsideStoreMoves): read where the store had been, they came back empty, and the write dropped every other comment.
+ *  The unit is looked up there too, and the comment added under the session's lock (changeComments). */
+function addCommentUnguarded(session: string, opts: { unit: number; line?: number; text: string }): ReviewComment | null {
   const text = opts.text.trim();
   if (!text) return null;
   const rec = unitRec(session, opts.unit);
@@ -103,9 +188,13 @@ export function addComment(session: string, opts: { unit: number; line?: number;
     text,
     createdAt: Date.now(),
   };
-  const all = readComments(session);
-  all.push(c);
-  writeComments(session, all);
+  // A unit found means a log: a session whose log went since saves nothing, and says so rather than return the comment.
+  const saved = changeComments(session, false, (all) => {
+    all.push(c);
+    writeComments(session, all);
+    return true;
+  });
+  if (!saved) throw new Error(`session ${session} has no store, so the comment was not saved`);
   return c;
 }
 
@@ -124,32 +213,35 @@ export function pendingCommentCount(session: string): number {
 }
 
 export function removeComment(session: string, id: string): boolean {
-  const all = readComments(session);
-  const next = all.filter((c) => c.id !== id);
-  if (next.length === all.length) return false;
-  writeComments(session, next);
-  return true;
+  return changeComments(session, false, (all) => {
+    const next = all.filter((c) => c.id !== id);
+    if (next.length === all.length) return false;
+    writeComments(session, next);
+    return true;
+  });
 }
 
 /** Clear all comments, or (with `sentOnly`) just the ones already delivered. Returns how many went. */
 export function clearComments(session: string, opts: { sentOnly?: boolean } = {}): number {
-  const all = readComments(session);
-  const next = opts.sentOnly ? all.filter((c) => !c.sentAt) : [];
-  writeComments(session, next);
-  return all.length - next.length;
+  return changeComments(session, 0, (all) => {
+    const next = opts.sentOnly ? all.filter((c) => !c.sentAt) : [];
+    writeComments(session, next);
+    return all.length - next.length;
+  });
 }
 
 /** THE LEDGER WRITE: mark comments delivered so a later compose never re-sends them. */
 export function markCommentsSent(session: string, ids: string[], at = Date.now()): void {
-  const set = new Set(ids);
-  const all = readComments(session);
-  let changed = false;
-  for (const c of all)
-    if (set.has(c.id) && !c.sentAt) {
-      c.sentAt = at;
-      changed = true;
-    }
-  if (changed) writeComments(session, all);
+  changeComments(session, undefined, (all) => {
+    const set = new Set(ids);
+    let changed = false;
+    for (const c of all)
+      if (set.has(c.id) && !c.sentAt) {
+        c.sentAt = at;
+        changed = true;
+      }
+    if (changed) writeComments(session, all);
+  });
 }
 
 /** Render a set of comments into one prompt body via the template. File-grouped; each comment names
@@ -172,7 +264,7 @@ export function renderCommentBatch(session: string, comments: ReviewComment[], c
       afterLines.set(c.unit, lines);
     }
     const t = lines[c.line - 1];
-    return t !== undefined ? t.trim().slice(0, 160) : '';
+    return t !== undefined ? graphemeHead(t.trim(), 160) : '';
   };
   const blocks: string[] = [];
   for (const [file, cs] of byFile) {

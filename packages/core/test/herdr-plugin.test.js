@@ -5,7 +5,8 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { spawn, spawnSync } = require('node:child_process');
-const { parse } = require('smol-toml');
+// smol-toml 1.9 returns objects with a null prototype; these assertions compare content, so read plain objects.
+const parse = (text) => JSON.parse(JSON.stringify(require('smol-toml').parse(text)));
 const { fakeHerdr, processInfo, scripted } = require('./fake-herdr');
 // Only the startup-hook tests compare with OAK's reconciler, so only they need the built core.
 const reconciler = () => require('../dist/herdr-tabs');

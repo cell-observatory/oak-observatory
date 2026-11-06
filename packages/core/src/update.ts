@@ -21,7 +21,7 @@
  * testable without standing up a release server.
  */
 import { ReleaseInfo, UpdateChannel, resolveReleaseFromList, versionOfRelease } from './channel';
-import { compareVersions } from './semver';
+import { compareVersions, isLocalBuild } from './semver';
 
 /** The three things a release installs. One row each — an editor family counts as one `vscode`
  *  surface per editor, distinguished by `label` (VS Code, Cursor, …). */
@@ -37,9 +37,23 @@ export type UpdateSurface = 'cli' | 'vscode' | 'jetbrains';
  *             channel the config now names
  *   missing   not installed at all (only `install-extensions` asks for these)
  *   forced    `--force`: reinstall regardless
+ *   managed   a marketplace installed it and serves this channel (stable), so the editor's own
+ *             Extensions view updates it; acting on it too would make two updaters fight over one
+ *             install. Not acted on, even with `--force`.
+ *   linked    the CLI belongs to a source checkout (an npm link to one, or a CLI run from one). Installing
+ *             the release would replace the link with a copy of the release, which every `oak` and hook
+ *             then runs instead of the checkout. Its owner updates the checkout. Not acted on, even
+ *             with `--force`.
+ *   provisioned
+ *             the CLI is the copy `oak machine add` pushed from another machine, which updates it by
+ *             running `oak machine add` again. Installing the release would put a second CLI beside it
+ *             that nothing runs. Not acted on, even with `--force`.
+ *   local     a local build (isLocalBuild: `X.Y.Z-dev.0`, a version no release carries), whoever built
+ *             it. Installing the channel's newest would replace it with an older or a different build
+ *             unasked. Acted on only under `--force`, or when the channel is named (`--channel`).
  *   current   nothing to do
  */
-export type UpdateReason = 'behind' | 'ahead' | 'switching' | 'missing' | 'forced' | 'current';
+export type UpdateReason = 'behind' | 'ahead' | 'switching' | 'missing' | 'forced' | 'managed' | 'linked' | 'provisioned' | 'local' | 'current';
 
 /** One installed surface, as the caller found it on disk. `version: null` = not installed. */
 export interface InstalledSurface {
@@ -51,6 +65,13 @@ export interface InstalledSurface {
    *  found, an unwritable plugin dir). Kept in the plan so the caller can say so out loud instead of
    *  skipping in silence. */
   actionable?: boolean;
+  /** Installed from a marketplace (the editor's registry says `source: gallery`). Marketplaces serve
+   *  stable builds only, so on the stable channel the editor owns this install's updates. */
+  marketplace?: boolean;
+  /** The source checkout this install belongs to (see `linked` above), for the caller to name. */
+  linked?: string;
+  /** The copy `oak machine add` pushed (see `provisioned` above). */
+  provisioned?: boolean;
   /** Free-form passthrough for the caller's own bookkeeping (extension dirs, the editor CLI path).
    *  Never read here — this module stays pure. */
   ref?: unknown;
@@ -64,6 +85,8 @@ export interface UpdateAction {
   to: string;
   reason: UpdateReason;
   actionable: boolean;
+  /** The checkout of a `linked` surface. */
+  linked?: string;
   ref?: unknown;
 }
 
@@ -78,23 +101,34 @@ export interface UpdatePlan {
   /** Every surface the caller declared, each with its verdict — `current` ones included, because a
    *  chip that only lists what is stale cannot tell "up to date" from "not checked". */
   surfaces: UpdateAction[];
-  /** The subset needing work: everything whose reason is not `current`. */
+  /** The subset needing work: everything whose reason is not `current`, `managed`, `linked`, `provisioned` or
+   *  `local`. */
   actions: UpdateAction[];
 }
 
+/** `switching`: the channel changes (a reinstall even at an equal version). `force`: `--force`. `named`: the
+ *  channel was named (`--channel`), which replaces a local build too. */
+export interface UpdatePlanOptions {
+  switching?: boolean;
+  force?: boolean;
+  named?: boolean;
+}
+
 /** The verdict for one surface. Split out so the ordering rule lives in exactly one place. */
-function reasonFor(
-  installed: InstalledSurface,
-  target: string,
-  opts: { switching?: boolean; force?: boolean }
-): UpdateReason {
+function reasonFor(installed: InstalledSurface, target: string, channel: UpdateChannel, opts: UpdatePlanOptions): UpdateReason {
   if (installed.version === null) return 'missing';
+  if (installed.linked) return 'linked';
+  if (installed.provisioned) return 'provisioned';
+  if (installed.marketplace && channel === 'stable') return 'managed';
   if (opts.force) return 'forced';
   const cmp = compareVersions(installed.version, target);
   // Equal version, but the channel just changed: reinstall so the bits provably come from the
   // channel the config now names. Without this a stable→dev switch at the same version number
   // leaves an install nobody can attribute to either channel.
   if (cmp === 0) return opts.switching ? 'switching' : 'current';
+  // A local build differs from every release, and the channel's newest is no update to it: a dev
+  // checkout's build was replaced by an older pre-release this way.
+  if (isLocalBuild(installed.version) && !opts.named && !opts.switching) return 'local';
   return cmp < 0 ? 'behind' : 'ahead';
 }
 
@@ -110,7 +144,7 @@ export function resolveUpdatePlan(
   releases: ReleaseInfo[],
   channel: UpdateChannel,
   installed: InstalledSurface[],
-  opts: { switching?: boolean; force?: boolean } = {}
+  opts: UpdatePlanOptions = {}
 ): UpdatePlan {
   const release = resolveReleaseFromList(releases ?? [], channel);
   const target = versionOfRelease(release) ?? '';
@@ -133,8 +167,9 @@ export function resolveUpdatePlan(
     label: s.label,
     from: s.version,
     to: target,
-    reason: reasonFor(s, target, opts),
+    reason: reasonFor(s, target, channel, opts),
     actionable: s.actionable !== false,
+    ...(s.linked ? { linked: s.linked } : {}),
     ref: s.ref,
   }));
   return {
@@ -143,7 +178,7 @@ export function resolveUpdatePlan(
     target,
     degradedToStable,
     surfaces,
-    actions: surfaces.filter((a) => a.reason !== 'current'),
+    actions: surfaces.filter((a) => !['current', 'managed', 'linked', 'provisioned', 'local'].includes(a.reason)),
   };
 }
 

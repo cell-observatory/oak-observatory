@@ -45,7 +45,7 @@ const MAX_INLINE_LINES = 20000; // skip the overlay on very large files (perf)
 type FolderNode = { kind: 'folder'; label: string; path: string; folders: core.TreeFolder[]; files: core.TreeFile[] };
 type FileNode = { kind: 'file'; file: string; edits: core.TreeEdit[]; classes: core.TreeClass[]; loose: core.TreeEdit[] };
 type ClassNode = { kind: 'class'; file: string; name: string; edits: core.TreeEdit[] };
-type EditNode = { kind: 'edit'; rec: core.EditRecord; feed?: boolean }; // feed = top-level Timeline row (show file + time)
+type EditNode = { kind: 'edit'; rec: core.EditRecord; machine?: string; session?: string; feed?: boolean }; // feed = top-level Timeline row (show file + time)
 type TlRunNode = { kind: 'tlrun'; file: string; edits: core.EditRecord[] }; // Timeline run: adjacent same-file edits
 type Node = FolderNode | FileNode | ClassNode | EditNode | TlRunNode;
 
@@ -64,6 +64,11 @@ function currentSort(): core.SortKey {
   } catch {
     return 'time';
   }
+}
+/** The order is read back from prefs.json, so one that could not be saved there (a file that does not parse, one
+ *  that cannot be written) is not applied either, and the status bar says so. */
+function sortNotSaved(e: unknown): void {
+  vscode.window.setStatusBarMessage(`OAK: sort order not saved — ${String((e as Error)?.message || e)}`, 5000);
 }
 const filterSpecMsg = () => ({ exts: filterExts, categories: filterCats as string[] });
 
@@ -93,11 +98,26 @@ function activeEditorFile(): string | undefined {
 // assistant records), so this is only the guard against a real session starting mid-tour.
 let demoSession: string | undefined;
 
+/** A saved machine's session under review, picked from that machine's group: every read and verb that runs through the
+ *  CLI names the machine (`--machine`), as the terminal app reviews it. Kept for this window only; settings.json pins
+ *  a session of this machine's, and pinning one ends it. */
+let remotePin: { session: string; machine: string } | null = null;
+/** The saved machine the session under review is on; none for this machine's. */
+function currentMachine(): string | undefined {
+  return demoSession ? undefined : remotePin?.machine;
+}
+/** `--machine <label>` for a CLI read or verb of the session under review; nothing for this machine's. */
+function onMachine(): string[] {
+  const m = currentMachine();
+  return m ? ['--machine', m] : [];
+}
+
 /** The session the observatory shows: demo mode while it is on, else a pinned
  *  `claudeObservatory.session` override, else the newest Claude Code session for this workspace
  *  (mangled-path resolution lives in core). */
 function currentSession(): string | undefined {
   if (demoSession) return demoSession;
+  if (remotePin) return remotePin.session;
   const pinned = vscode.workspace.getConfiguration('claudeObservatory').get<string>('session', '').trim();
   if (pinned) return pinned;
   const root = workspaceRoot();
@@ -484,7 +504,14 @@ class ReviewComments implements vscode.Disposable {
       return;
     }
     const line = (reply.thread.range?.start.line ?? 0) + 1; // core lines are 1-based; 0 = file-level
-    const c = core.addComment(session, { unit: id, line, text: reply.text });
+    let c: ReturnType<typeof core.addComment>;
+    try {
+      c = core.addComment(session, { unit: id, line, text: reply.text });
+    } catch (e) {
+      // Not saved: said, and not drawn in the thread as if it were (the CLI and the terminal app fail the same way).
+      void vscode.window.showErrorMessage(`OAK: the comment was not saved — ${e instanceof Error ? e.message : String(e)}`);
+      return;
+    }
     if (!c) {
       vscode.window.showWarningMessage(`OAK: edit #${id} is no longer pending.`);
       return;
@@ -511,11 +538,19 @@ const DIFF_SPAN: Record<string, string> = {
   '-': 'color:var(--vscode-gitDecoration-deletedResourceForeground);background-color:var(--vscode-diffEditor-removedTextBackground);',
   '@': 'color:var(--vscode-descriptionForeground);',
 };
+/** A hidden character's mark, in the muted foreground the hunk headers take. */
+const HIDDEN_SPAN = 'color:var(--vscode-descriptionForeground);';
 
 /** A unified patch as sanitizer-safe HTML with git's diff colors: green/red text on the diff editor's
- *  translucent line fills. Lines are nbsp-padded to a common width so the fills read as full rows. */
+ *  translucent line fills. Lines are nbsp-padded to a common width so the fills read as full rows. A
+ *  bidirectional control or zero-width character in the file shows as the mark that names it (`⟨U+202E⟩`), and
+ *  so does a joiner inside an identifier: drawn as it is, it shows as nothing and reorders or hides what is
+ *  around it, so the line reads differently from how it runs. The bubble is Markdown with HTML on, and a line of
+ *  the file is shown as written, never read as Markdown: one `<div>` that starts a line and holds no line break is
+ *  an HTML block, whose text CommonMark leaves alone. Read as Markdown, a README's `![badge](https://…)` loaded its
+ *  image when the bubble opened, a `[link](…)` could be clicked, and `**bold**` or a `` `span` `` lost its marks. */
 function diffHtml(patch: string): string {
-  const all = patch.split('\n');
+  const all = core.revealHidden(patch).split('\n');
   const start = all.findIndex((l) => l.startsWith('@@'));
   const lines = (start >= 0 ? all.slice(start) : all).join('\n').trimEnd().split('\n');
   const width = Math.min(100, Math.max(...lines.map((l) => l.length), 0) + 2);
@@ -526,9 +561,10 @@ function diffHtml(patch: string): string {
       .replace(/>/g, '&gt;')
       .replace(/ /g, ' '); // HTML collapses runs of plain spaces — keep indentation + row padding
     const style = DIFF_SPAN[line[0] ?? ''];
-    return style ? `<span style="${style}">${text}</span>` : text;
+    const marked = text.replace(new RegExp(core.HIDDEN_MARK_SOURCE, 'g'), (mark) => `<span style="${HIDDEN_SPAN}">${mark}</span>`);
+    return style ? `<span style="${style}">${marked}</span>` : marked;
   });
-  return `<code>${html.join('<br>')}</code>`;
+  return `<div><code>${html.join('<br>')}</code></div>`;
 }
 
 /** The two review surfaces `EditPeek` renders, both as one comment thread on one controller.
@@ -1032,7 +1068,7 @@ async function openDiff(node: EditNode): Promise<void> {
   const cwd = workspaceRoot();
   const why = cwd ? cachedTranscript(cwd, session).reasoning.get(rec.id)?.trim() : undefined;
   const head = why ? firstLine(why) : '';
-  const short = head.length > 80 ? head.slice(0, 79) + '…' : head;
+  const short = head.length > 80 ? core.graphemeHead(head, 79) + '…' : head;
   const title = short ? `#${rec.id} · ${short}` : `${path.basename(rec.file)} · edit #${rec.id}`;
   // preview:false → the diff always gets its OWN tab instead of taking over the file's preview tab.
   await vscode.commands.executeCommand('vscode.diff', left, right, title, { preview: false });
@@ -1235,9 +1271,10 @@ async function redoOne(session: string, id: number): Promise<void> {
 /** Keep the draft on the clipboard; only the explicit Send choice submits through herdr. "Edit first…"
  *  opens the draft as a document to change before sending, as JetBrains' dialog and the TUI's
  *  composer allow; Send then submits what the document says. */
-async function deliverChatPrompt(prompt: string, what: string, session = currentSession()): Promise<boolean> {
+async function deliverChatPrompt(prompt: string, what: string, session = currentSession(), machine = session && session === currentSession() ? currentMachine() : undefined): Promise<boolean> {
+  // Capture the destination before the draft or a background read yields.
   await vscode.env.clipboard.writeText(prompt);
-  const pick = await vscode.window.showInformationMessage(`${what} is on the clipboard. Send it to this session’s live agent?`, { modal: true, detail: prompt }, 'Send to agent', 'Edit first…');
+  const pick = await vscode.window.showInformationMessage(`${what} is on the clipboard. Send it to this session’s live agent${machine ? ` on ${machine}` : ''}?`, { modal: true, detail: prompt }, 'Send to agent', 'Edit first…');
   if (pick === 'Edit first…') {
     const doc = await vscode.workspace.openTextDocument({ content: prompt, language: 'markdown' });
     await vscode.window.showTextDocument(doc, { preview: false });
@@ -1246,10 +1283,11 @@ async function deliverChatPrompt(prompt: string, what: string, session = current
     await vscode.env.clipboard.writeText(prompt);
   } else if (pick !== 'Send to agent' || !session) return false;
   try {
-    const result = await core.promptSession(session, prompt);
+    const result = await core.promptSession(session, prompt, machine ? { machine } : {});
     if (result.sent) { void vscode.window.showInformationMessage(`${what} sent to the agent.`); return true; }
     void vscode.window.showInformationMessage(`${result.reason}. Draft kept on the clipboard.`);
-  } catch (error) { void vscode.window.showErrorMessage(`Prompt failed: ${String(error)}. Draft kept on the clipboard.`); }
+    // A send herdr refused (a pane blocked on a dialog, or gone) is a draft kept, as `oak prompt` keeps it, never an error.
+  } catch (error) { void vscode.window.showInformationMessage(`${error instanceof Error ? error.message : String(error)}. Draft kept on the clipboard.`); }
   return false;
 }
 
@@ -1299,9 +1337,17 @@ async function chatAction(ref: core.ChatContextRef): Promise<void> {
   const session = currentSession();
   const cwd = workspaceRoot();
   if (!session || !cwd) return;
+  const machine = currentMachine();
   let prompt = '';
   try {
-    prompt = core.assembleChatContext(cwd, session, ref);
+    if (machine) {
+      const args = ['chat-context', '--json', '--session', session];
+      if (ref.editId != null) args.push('--edit', String(ref.editId));
+      if (ref.agentId) args.push('--agent', ref.agentId);
+      if (ref.taskId) args.push('--task', ref.taskId);
+      if (ref.toolUseId) args.push('--tool-use-id', ref.toolUseId);
+      prompt = String((await oakOn(machine, args)).json?.prompt ?? '');
+    } else prompt = core.assembleChatContext(cwd, session, ref);
   } catch {
     prompt = '';
   }
@@ -1309,7 +1355,7 @@ async function chatAction(ref: core.ChatContextRef): Promise<void> {
     vscode.window.showWarningMessage('OAK: no chat context for that item.');
     return;
   }
-  await deliverChatPrompt(prompt, 'Prompt', session);
+  await deliverChatPrompt(prompt, 'Prompt', session, machine);
 }
 
 /** Keep every pending edit in one file (shared by keepFile and keepOpenFile). Reads the RAW log so it
@@ -1432,9 +1478,14 @@ async function undoEditsInFolder(session: string, folder: string): Promise<void>
 function bulkSession(fromView: unknown): string | null {
   if (typeof fromView !== 'string' || !fromView) return currentSession() ?? null;
   if (!core.isSafeSessionId(fromView)) return null;
+  if (currentMachine()) return fromView === currentSession() ? fromView : null;
   const cwd = workspaceRoot();
   if (!cwd) return null;
-  if (core.sessionMeta(cwd).sessions.some((r) => r.id === fromView)) return fromView;
+  // This machine's listing as the local index composes it (read-only, as the last catch-up left it). A session it does not
+  // list (begun since that catch-up, or no index readable here) is asked of the files, as core sessionMeta lists them, on
+  // this host's thread, before the id is refused.
+  const listed = (meta: core.SessionMeta | null): boolean => !!meta?.sessions.some((r) => r.id === fromView);
+  if (listed(core.readIndexedListing(cwd)) || listed(core.sessionMeta(cwd))) return fromView;
   // The FLEET rows are sibling worktrees, and sessionMeta cannot see them: its provenance rail walks UP
   // from cwd, and a sibling worktree is never an ancestor. Validating against sessionMeta alone refused
   // every Fleet row's own Accept/Revert button while leaving it enabled — a control that can only fail.
@@ -1466,7 +1517,38 @@ async function withBulkScope(sess: unknown, run: (session: string) => void | Pro
   forceRefreshAll?.();
 }
 
-function keepAllSession(session: string): void {
+async function remoteDecision(machine: string, session: string, verb: string, scope: string[]): Promise<void> {
+  const target = scope.includes('--ids') ? `${scope[scope.indexOf('--ids') + 1].split(',').length} selected edit(s)`
+    : verb.startsWith('task-') ? (scope.includes('--completed') ? 'completed tasks' : `task ${scope[0]}`)
+    : scope.includes('--from-prompt') ? `prompt ${scope[scope.indexOf('--from-prompt') + 1]} and everything after it` : 'this session';
+  const label = `${verb} ${target} on ${machine}`;
+  if (verb !== 'keep' && verb !== 'task-keep' && await vscode.window.showWarningMessage(`OAK: ${label}?`, { modal: true,
+    detail: verb === 'resolve' || verb === 'clean' || verb === 'task-clear' ? 'Clearing review records cannot be undone.' : 'This rewrites files on that machine.' }, 'Continue') !== 'Continue') return;
+  let result = await oakOn(machine, [verb === 'resolve' && scope.length ? 'keep' : verb, ...scope, '--session', session, '--json']);
+  if (verb === 'resolve' && scope.length && result.json && !Number(result.json.errors))
+    result = await oakOn(machine, ['clean', '--resolved', ...scope, '--session', session, '--json']);
+  if (!result.json) void vscode.window.showErrorMessage(`OAK: ${label} — ${result.why}`);
+  else {
+    const r = result.json;
+    const detail = ['kept', 'undone', 'redone', 'accepted', 'cleared', 'conflicts', 'errors'].filter(k => typeof r[k] === 'number').map(k => `${r[k]} ${k}`).join(', ');
+    const problem = r.firstError || r.firstConflict || (r.unrecorded as { message?: string } | undefined)?.message;
+    if (problem || Number(r.errors) || Number(r.conflicts)) void vscode.window.showWarningMessage(`OAK: ${label} — ${detail}${problem ? ': ' + problem : ''}`);
+    else vscode.window.setStatusBarMessage(`OAK: ${label} — ${detail}`, 5000);
+  }
+  await refreshMountedReview(machine, session);
+  forceRefreshAll?.();
+}
+async function remotePromptDecision(machine: string, session: string, prompt: string, verb: string): Promise<void> {
+  const result = await oakOn(machine, ['review', '--prompt', prompt, '--no-patch', '--json', '--session', session]);
+  const review = result.json as RemoteReview | null;
+  if (!review || !Array.isArray(review.units)) { void vscode.window.showErrorMessage(`OAK: could not read prompt on ${machine} — ${result.why}`); return; }
+  const ids = review.units.filter(u => verb === 'clean' ? u.status !== 'pending' : u.status === 'pending').flatMap(u => u.members);
+  if (ids.length) await remoteDecision(machine, session, verb, [...(verb === 'clean' ? ['--resolved'] : []), '--ids', ids.join(',')]);
+}
+
+async function keepAllSession(session: string): Promise<void> {
+  const machine = currentMachine();
+  if (machine) { await remoteDecision(machine, session, 'keep', ['--all']); return; }
   // The one that mattered: 26,000 pending edits took eight minutes as a per-edit loop.
   const n = core.setStatusMany(
     session,
@@ -1481,6 +1563,8 @@ function keepAllSession(session: string): void {
  *  A function rather than command-body code because the Overview toolbar now calls it with the session
  *  it is LABELLED with, which is not always the session `withSession` would resolve. */
 async function clearResolvedSession(session: string): Promise<void> {
+  const machine = currentMachine();
+  if (machine) { await remoteDecision(machine, session, 'clean', ['--resolved']); return; }
   const resolved = core.readLog(session).filter((r) => r.status !== 'pending').length;
   if (resolved === 0) {
     vscode.window.showInformationMessage('No resolved (kept/reverted) edits to clear.');
@@ -1516,6 +1600,8 @@ async function clearResolvedSession(session: string): Promise<void> {
 }
 
 async function undoAllSession(session: string): Promise<void> {
+  const machine = currentMachine();
+  if (machine) { await remoteDecision(machine, session, 'undo', ['--all']); return; }
   const targets = core.readLog(session).filter((r) => r.status === 'pending').sort((a, b) => b.id - a.id);
   if (targets.length === 0) {
     vscode.window.showInformationMessage('Nothing to revert.');
@@ -1551,6 +1637,8 @@ async function undoAllSession(session: string): Promise<void> {
 
 /** Re-apply every UNDONE edit in the session (the forward mirror of undoAllSession). */
 async function redoAllSession(session: string): Promise<void> {
+  const machine = currentMachine();
+  if (machine) { await remoteDecision(machine, session, 'redo', ['--all']); return; }
   const targets = core.readLog(session).filter((r) => r.status === 'undone').sort((a, b) => a.id - b.id);
   if (targets.length === 0) {
     vscode.window.showInformationMessage('Nothing to redo.');
@@ -1589,7 +1677,9 @@ async function redoAllSession(session: string): Promise<void> {
 // never swept into a task's destructive scope.
 
 /** Accept — keep every PENDING edit in a task's strict in_progress span (task-keep). */
-function keepTaskScope(session: string, taskId: string): void {
+async function keepTaskScope(session: string, taskId: string): Promise<void> {
+  const machine = currentMachine();
+  if (machine) { await remoteDecision(machine, session, 'task-keep', [taskId]); return; }
   const cwd = workspaceRoot();
   if (!cwd) return;
   const res = core.keepTask(cwd, session, taskId);
@@ -1601,6 +1691,8 @@ function keepTaskScope(session: string, taskId: string): void {
 /** Reject — revert every PENDING edit in a task's strict span, after a confirm + dirty-buffer
  *  guard (task-undo). Accepted edits are left on disk — revert individually. */
 async function undoTaskScope(session: string, taskId: string): Promise<void> {
+  const machine = currentMachine();
+  if (machine) { await remoteDecision(machine, session, 'task-undo', [taskId]); return; }
   const cwd = workspaceRoot();
   if (!cwd) return;
   const ids = new Set(core.taskEditIds(cwd, session, taskId));
@@ -1636,7 +1728,9 @@ async function undoTaskScope(session: string, taskId: string): Promise<void> {
 }
 
 /** Clear — drop the RESOLVED (kept/undone) edits of a task's strict span (task-clear). */
-function clearTaskScope(session: string, taskId: string): void {
+async function clearTaskScope(session: string, taskId: string): Promise<void> {
+  const machine = currentMachine();
+  if (machine) { await remoteDecision(machine, session, 'task-clear', [taskId]); return; }
   const cwd = workspaceRoot();
   if (!cwd) return;
   const res = core.clearResolvedIds(session, core.taskEditIds(cwd, session, taskId));
@@ -1660,7 +1754,9 @@ function clearTaskScope(session: string, taskId: string): void {
  * terminal already guards it (`tui/src/backend.ts`). Every id is expanded through `groupMembers` here
  * for the same reason.
  */
-function keepPrompt(session: string, promptId: string): void {
+async function keepPrompt(session: string, promptId: string): Promise<void> {
+  const machine = currentMachine();
+  if (machine) { await remotePromptDecision(machine, session, promptId, 'keep'); return; }
   const cwd = workspaceRoot();
   if (!cwd) return;
   const ids = new Set(core.promptEditIds(cwd, session, promptId).flatMap((id) => core.groupMembers(session, id)));
@@ -1678,6 +1774,8 @@ function keepPrompt(session: string, promptId: string): void {
  *  Group-expanded for the same reason as `keepPrompt`: reverting a unit's representative alone leaves
  *  its earlier members applied, so the file keeps content the reader just rejected. */
 async function undoPrompt(session: string, promptId: string): Promise<void> {
+  const machine = currentMachine();
+  if (machine) { await remotePromptDecision(machine, session, promptId, 'undo'); return; }
   const cwd = workspaceRoot();
   if (!cwd) return;
   const ids = new Set(core.promptEditIds(cwd, session, promptId).flatMap((id) => core.groupMembers(session, id)));
@@ -1726,6 +1824,8 @@ async function undoPrompt(session: string, promptId: string): Promise<void> {
  * disagree with the row the reader clicked.
  */
 async function rewindFromPrompt(session: string, promptId: string): Promise<void> {
+  const machine = currentMachine();
+  if (machine) { await remoteDecision(machine, session, 'undo', ['--from-prompt', promptId]); return; }
   const cwd = workspaceRoot();
   if (!cwd) return;
   const scope = core.checkpointScope(cwd, session, promptId);
@@ -1781,7 +1881,9 @@ async function rewindFromPrompt(session: string, promptId: string): Promise<void
 }
 
 /** Clear — drop the RESOLVED (kept/undone) edits one prompt produced. */
-function clearPrompt(session: string, promptId: string): void {
+async function clearPrompt(session: string, promptId: string): Promise<void> {
+  const machine = currentMachine();
+  if (machine) { await remotePromptDecision(machine, session, promptId, 'clean'); return; }
   const cwd = workspaceRoot();
   if (!cwd) return;
   const res = core.clearResolvedIds(session, core.promptEditIds(cwd, session, promptId));
@@ -1792,7 +1894,9 @@ function clearPrompt(session: string, promptId: string): void {
 
 /** Clear the resolved edits of EVERY settled task (edits present, none pending, none undone) — the
  *  Tasks tab's "clear completed" affordance (task-clear --completed). */
-function clearCompletedTasks(session: string): void {
+async function clearCompletedTasks(session: string): Promise<void> {
+  const machine = currentMachine();
+  if (machine) { await remoteDecision(machine, session, 'task-clear', ['--completed']); return; }
   const cwd = workspaceRoot();
   if (!cwd) return;
   // SPAWNED, not read in-process. A cached read is only cheap when the cache HITS, and this map's stamp
@@ -1826,7 +1930,7 @@ function clearCompletedTasks(session: string): void {
               ? `Cleared ${cleared} resolved edit(s) across ${settled.length} completed task(s).`
               : 'No resolved edits to clear.'
           );
-          void vscode.commands.executeCommand('claudeObservatory.refresh');
+          void vscode.commands.executeCommand('claudeObservatory.refresh', NO_SWEEP);
           resolve();
         });
       })
@@ -1862,7 +1966,7 @@ function installHooksFromExtension(): void {
       return;
     }
     // The welcome views key on claudeObservatory.hooksInstalled — recompute without waiting for a reload.
-    void vscode.commands.executeCommand('claudeObservatory.refresh');
+    void vscode.commands.executeCommand('claudeObservatory.refresh', NO_SWEEP);
     vscode.window
       .showInformationMessage(
         `OAK: capture hooks installed.${codex ? ` ${codex}` : ''} Reload the window so Claude Code picks them up.`,
@@ -1969,6 +2073,7 @@ function docContentKey(doc: vscode.TextDocument): string {
 /** Wall-clock of the last real locate per file — feeds the adaptive keystroke debounce below. */
 const placementCostMs = new Map<string, number>();
 function cachedPlacements(session: string, doc: vscode.TextDocument): Placement[] {
+  if (currentMachine()) return mountedPlacements(session, doc);
   const file = canonFsPath(doc.uri); // #43: pendingByFile is keyed by canonical record paths
   // Keyed on the buffer content + THIS FILE's pending chain (ids + blob shas + count), NOT the whole
   // session log: with the log stamp in the key, a keep click in any file re-diffed every open file —
@@ -2036,10 +2141,12 @@ function pendingEditsInFolder(session: string, folder: string): core.EditRecord[
 }
 
 /** A one-line red-ghost preview of removed lines: first non-blank line (trimmed, truncated), with a
- *  "…(+N)" tail when the hunk removed more than one line — VS Code can't render multi-line ghost text. */
+ *  "…(+N)" tail when the hunk removed more than one line — VS Code can't render multi-line ghost text. A
+ *  bidirectional control or zero-width character in it shows as the mark that names it (`⟨U+202E⟩`), after the
+ *  cut, so no mark is cut: the JetBrains ghostLabel's rule. */
 function ghostText(lines: string[]): string {
   const head = (lines.find((l) => l.trim()) ?? '').trim();
-  const shown = head.length > 60 ? head.slice(0, 59) + '…' : head;
+  const shown = core.revealHidden(head.length > 60 ? core.graphemeHead(head, 59) + '…' : head);
   const more = lines.length - 1;
   return more > 0 ? `− ${shown} …(+${more})` : `− ${shown}`;
 }
@@ -2161,6 +2268,7 @@ class InlineLensProvider implements vscode.CodeLensProvider {
     if (!inlineEnabled()) return [];
     const session = currentSession();
     if (!session || doc.lineCount > MAX_INLINE_LINES) return [];
+    if (currentMachine()) return mountedLenses(session, doc);
     // Only the LATEST edit per anchor line gets an inline lens: several edits often land on one line
     // (a hunk edited twice), and stacking a menu per edit is noisy + ambiguous. Undoing the latest
     // surgically reveals the previous state (its lens then takes over); the full per-edit sequence for
@@ -2189,7 +2297,7 @@ class InlineLensProvider implements vscode.CodeLensProvider {
       const where = editIdx >= 0 ? ` — edit ${editIdx + 1} of ${filePending.length} pending in this file` : '';
       // The header opens the floating review BAR (the default review surface); "⋯ Details" opens the
       // bubble, where the reasoning and the git-coloured diff live. Per-edit keep/undo is also on
-      // ⌥⌘Y / ⌥⌘U and the Edits tree.
+      // ⌥⌘X A / ⌥⌘X U and the Edits tree.
       lenses.push(new vscode.CodeLens(range, { title: `🔬 #${id}  +${g.added} −${g.removed}${editPos}`, command: 'claudeObservatory.showReviewBar', arguments: [id], tooltip: `Agent edit #${id}: +${g.added} −${g.removed}${where}. Show the review bar here.` }));
       lenses.push(new vscode.CodeLens(range, { title: `✓ Keep`, command: 'claudeObservatory.inlineKeep', arguments: [id], tooltip: `Keep edit #${id} and move on to the next one awaiting review` }));
       lenses.push(new vscode.CodeLens(range, { title: `✗ Undo`, command: 'claudeObservatory.inlineUndo', arguments: [id], tooltip: `Revert edit #${id} on disk and move on to the next one awaiting review` }));
@@ -2604,7 +2712,7 @@ class ActionsProvider {
       const c = node.c;
       const item = new vscode.TreeItem(path.basename(c.file), vscode.TreeItemCollapsibleState.None);
       item.description = `${c.agents.length} agents${c.anyPending ? ' · pending' : ''}`;
-      item.tooltip = `${c.file}\ntouched by ${c.agents.map((a) => a.slice(0, 8)).join(', ')} — click to open`;
+      item.tooltip = `${c.file}\ntouched by ${c.agents.map((id) => id.slice(0, 8)).join(', ')} — click to open`;
       item.iconPath = new vscode.ThemeIcon('files', new vscode.ThemeColor('charts.orange'));
       item.command = { command: 'vscode.open', title: 'Open', arguments: [vscode.Uri.file(c.file), { preview: true }] };
       return item;
@@ -2741,11 +2849,27 @@ function resolveObservatoryBin(): string {
   return 'oak'; // neither resolved — let PATH decide
 }
 
+/** The script an npm `.cmd` shim runs with node (`"%dp0%\node_modules\…\index.js"`, or `%~dp0` in an
+ *  older npm's shim), beside the shim; null when the file is no such shim. */
+export function shimScript(shim: string): string | null {
+  try {
+    const m = /"%(?:~dp0|dp0%)\\([^"%]+\.[cm]?js)"/i.exec(fs.readFileSync(shim, 'utf8'));
+    const js = m ? path.join(path.dirname(shim), ...m[1].split('\\')) : null;
+    return js && fs.existsSync(js) ? js : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Detached CLI spawn that survives a Dock-launched editor. `oak` is a `#!/usr/bin/env node`
  *  script, and a GUI editor's PATH often carries no node — the child died AT THE SHEBANG with
  *  stdio ignored, which read as "refresh does nothing" (measured on the Mac, 2026-09-09:
  *  `env: node: No such file or directory`). A script that shebangs node runs on the editor's
- *  OWN runtime instead (ELECTRON_RUN_AS_NODE); anything else spawns as before. */
+ *  OWN runtime instead (ELECTRON_RUN_AS_NODE), and so does the script behind Windows' `oak.cmd`,
+ *  which, run through cmd.exe, would start node in a console window of its own for as long as the
+ *  refresh runs, and the bundle behind the launcher `oak machine add` writes (a sh script that execs
+ *  ~/.local/lib/oak/index.js), as the CLI sees through it. Anything else spawns as before. Every
+ *  spawn here asks Windows for no window. */
 function spawnOakDetached(args: string[]): void {
   try {
     const bin = resolveObservatoryBin();
@@ -2756,17 +2880,27 @@ function spawnOakDetached(args: string[]): void {
       /* keep the unresolved path */
     }
     let viaNode = target.endsWith('.js');
+    if (!viaNode && /\.cmd$/i.test(target)) {
+      const js = shimScript(target);
+      if (js) [target, viaNode] = [js, true];
+    }
     if (!viaNode) {
       try {
-        const head = fs.readFileSync(target).subarray(0, 64).toString('utf8');
-        viaNode = head.startsWith('#!') && head.includes('node');
+        const file = fs.readFileSync(target);
+        const head = file.subarray(0, 512).toString('utf8');
+        if (file.length < 512 && /"\$HOME\/\.local\/lib\/oak\/index\.js"/.test(head)) {
+          [target, viaNode] = [fs.realpathSync(path.join(process.env.HOME || os.homedir(), '.local', 'lib', 'oak', 'index.js')), true];
+        } else {
+          // Only the shebang line says what runs a script: the launcher above names node further on, for sh to find.
+          viaNode = /^#![^\n]*node/.test(head);
+        }
       } catch {
-        /* unreadable — spawn as-is */
+        /* unreadable, or the launcher's bundle is gone — spawn as-is */
       }
     }
     const child = viaNode
-      ? core.spawnTool(process.execPath, [target, ...args], { detached: true, stdio: 'ignore', env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' } })
-      : core.spawnTool(bin, args, { detached: true, stdio: 'ignore' });
+      ? core.spawnTool(process.execPath, [target, ...args], { detached: true, stdio: 'ignore', windowsHide: true, env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' } })
+      : core.spawnTool(bin, args, { detached: true, stdio: 'ignore', windowsHide: true });
     child.on('error', () => { /* a later refresh can retry when the CLI is available */ });
     child.unref();
   } catch {
@@ -2890,12 +3024,12 @@ function combinedShell(): string {
     '5h': '5-hour rolling plan usage — % of your 5-hour limit used · reset countdown · ~tokens used / estimated total for 100%',
     wk: 'Weekly plan usage — % of your weekly limit used · reset countdown · ~tokens used / estimated total for 100%',
     mo: 'Your bill cycle — tokens against four weekly cycles of budget, plus cache reads',
-    '$': 'The cycle’s spend against its projected budget — Claude Code’s own figures, estimates',
+    '$': 'The cycle’s cost against its projected budget, estimated from its tokens at today’s API list prices — not a bill',
     fable: 'Per-model weekly cap on the top-tier model, as the account reports it — share and reset only (no per-model token measurement exists)',
   };
   const usageHtml =
     `<div class="usagesec ssec" id="usage-sec">` +
-    `<div class="uhead shead" data-sec="usage" title="Plan usage: the context window (live from the transcript) plus your 5-hour and weekly limits (from your account)"><span class="scar">▾</span>Usage<span id="ulast" class="ulast" title="When the usage cache was last refreshed — by your claude session, the once-a-minute account pull, or the ↻"></span><span class="utabs" id="utabs" style="display:none"><span class="utab" data-ut="claude">claude</span><span class="utab" data-ut="gpt">gpt</span></span><span id="uref" class="uref codicon codicon-refresh" title="Refresh now — pull your account usage"></span></div>` +
+    `<div class="uhead shead" data-sec="usage" title="Plan usage: the context window (live from the transcript) plus your 5-hour and weekly limits (from your account)"><span class="scar">▾</span>Account usage · local context<span id="ulast" class="ulast" title="When the usage cache was last refreshed — by your claude session, the once-a-minute account pull, or the ↻"></span><span class="utabs" id="utabs" style="display:none"><span class="utab" data-ut="claude">claude</span><span class="utab" data-ut="gpt">gpt</span></span><span id="uref" class="uref codicon codicon-refresh" title="Refresh now — pull your account usage"></span></div>` +
     `<div class="sbody" id="ug">` +
     `<div class="row"><span class="lbl"></span><span></span><span></span><span class="ucol uch">used</span><span class="ucol uch">total</span><span class="ucol uch">cached</span></div>` +
     ['ctx', '5h', 'fable', 'wk', 'mo', '$']
@@ -2952,6 +3086,13 @@ function combinedShell(): string {
       if(d.getFullYear()===n.getFullYear() && d.getMonth()===n.getMonth() && d.getDate()===n.getDate()) return p2(d.getHours())+':'+p2(d.getMinutes());
       if(d.getFullYear()===n.getFullYear()) return MN[d.getMonth()]+' '+d.getDate()+' '+p2(d.getHours())+':'+p2(d.getMinutes());
       return d.getFullYear()+'-'+p2(d.getMonth()+1)+'-'+p2(d.getDate()); }
+    // The cache's last refresh, and the saved machine a reading came from when this machine had none current, with
+    // when that machine measured it (its label with no control, bidirectional, zero-width or other hidden characters,
+    // the class core.plainLabel drops, which needs the u flag: it is herdr's, whatever was typed), and the saved
+    // machines whose own usage the estimates add to this machine's (core machineMeasured).
+    function plainLabel(s){ return String(s).replace(/${core.PLAIN_LABEL_SOURCE}/gu,''); }
+    function usageStamp(u){ return [u.cachedAtMs? 'updated '+atTime(u.cachedAtMs) : '', u.machineNote? 'measured on '+plainLabel(u.machineNote)+(u.machineAt? ' at '+atTime(u.machineAt) : '') : '',
+      u.machineMeasured && u.machineMeasured.machines ? 'estimates include usage measured on '+plainLabel(u.machineMeasured.machines) : '', u.usageFreshness || ''].filter(Boolean).join(' \u00b7 '); }
     function renderUsage(u){ LASTU=u; var hint=document.getElementById('uhint');
       if(!u){ setRow('ctx',null); setRow('5h',null); setRow('wk',null); setRow('mo',null); setRow('$',null); var fb0=rowOf('fable'); if(fb0) fb0.style.display='none'; if(hint) hint.style.display='none'; return; }
       // One tab per subscription: gpt appears only when codex reports windows.
@@ -2963,24 +3104,26 @@ function combinedShell(): string {
       for(var tj=0;tj<tEls.length;tj++) tEls[tj].classList.toggle('on', tEls[tj].getAttribute('data-ut')===UTAB);
       if(UTAB==='gpt' && hasGpt){
         // Same grammar throughout: ctx from codex's own last-turn context vs
-        // its model window; wk with reported quota and measured local tokens; mo/$
-        // cycle-summed and list-priced from the rollouts. 5h appears only when codex still
+        // its model window; wk with reported quota and database tokens; mo/$
+        // cycle-summed and list-priced from the database. 5h appears only when codex still
         // reports one (current builds persist the weekly window alone — verified live). A row
         // codex gives no data for stays hidden rather than fabricated.
         var fbg=rowOf('fable'); if(fbg) fbg.style.display='none';
         var rcg=rowOf('ctx'); if(rcg) rcg.style.display = u.gptCtxPct!=null ? '' : 'none';
         if(u.gptCtxPct!=null) setRow('ctx', u.gptCtxPct, u.gptCtxTokens? human(u.gptCtxTokens):'', u.gptCtxSize? human(u.gptCtxSize):'', '');
         var s5g=rowOf('5h'); if(s5g) s5g.style.display = u.gptFivePct!=null ? '' : 'none';
-        if(u.gptFivePct!=null) setRow('5h', u.gptFivePct, '', '', '', until(u.gptFiveReset||null));
+        if(u.gptFivePct!=null) setRow('5h', u.gptFivePct, spent(null,u.gptFivePct,null), '', '', until(u.gptFiveReset||null));
         var s7g=rowOf('wk'); if(s7g) s7g.style.display='';
-        setRow('wk', u.gptWeekPct, u.gptWeekTok? '~'+humanTok(u.gptWeekTok):'', u.gptWeekTotal? humanTok(u.gptWeekTotal):'', '', until(u.gptWeekReset||null));
-        var gmp=(u.gptMonthTok&&u.gptMonthTokTotal)? Math.min(100, (u.gptMonthTok/u.gptMonthTokTotal)*100) : null;
-        var rmg=rowOf('mo'); if(rmg) rmg.style.display = u.gptMonthTok? '' : 'none';
-        if(u.gptMonthTok) setRow('mo', gmp, '~'+humanTok(u.gptMonthTok), u.gptMonthTokTotal? humanTok(u.gptMonthTokTotal):'', u.gptMonthReads? '+'+humanTok(u.gptMonthReads)+'\u21ba':'', until(u.gptMonthReset||null));
+        setRow('wk', u.gptWeekPct, spent(u.gptWeekTok,u.gptWeekPct,u.gptWeekTotal), u.gptWeekTotal? humanTok(u.gptWeekTotal):'', '', until(u.gptWeekReset||null));
+        // A month measured at 0 (a new cycle) reads 0%, as on the status bar; only an unmeasured one hides.
+        var gmp=(u.gptMonthTok!=null&&u.gptMonthTokTotal)? Math.min(100, (u.gptMonthTok/u.gptMonthTokTotal)*100) : null;
+        var rmg=rowOf('mo'); if(rmg) rmg.style.display = u.gptMonthTok!=null? '' : 'none';
+        if(u.gptMonthTok!=null) setRow('mo', gmp, spent(u.gptMonthTok,gmp,u.gptMonthTokTotal), u.gptMonthTokTotal? humanTok(u.gptMonthTokTotal):'', u.gptMonthReads? '+'+humanTok(u.gptMonthReads)+'\u21ba':'', until(u.gptMonthReset||null));
         var rdg=rowOf('$'); if(rdg) rdg.style.display = u.gptMonthCost? '' : 'none';
         if(u.gptMonthCost) setRow('$', gmp, '~'+usd(u.gptMonthCost), u.gptMonthCostTotal? '~'+usd(u.gptMonthCostTotal):'', '');
         var prg=document.getElementById('upromo'); if(prg) prg.style.display='none';
         if(hint) hint.style.display='none';
+        var ulg=document.getElementById('ulast'); if(ulg) ulg.textContent = usageStamp({ cachedAtMs: u.cachedAtMs, machineMeasured: { machines: u.gptMeasuredMachines }, usageFreshness: u.gptUsageFreshness });
         return;
       }
       var showC=['ctx','mo','$'];
@@ -3010,11 +3153,14 @@ function combinedShell(): string {
         // derived form survives only as the fallback when the cache has no estimate yet. And no
         // scope text on the rows, ever. Returned split, for the spent/total columns.
         var used = (tok && total) ? tok : (measured || tok);
-        if(!used) return ['',''];
+        if(!used) return pct===0 ? ['~0', total? humanTok(total) : ''] : ['',''];
         var budget = (tok && total) ? total
           : (used && pct>=1 ? Math.round(used/pct*100) : 0);
         return ['~'+humanTok(used), budget? humanTok(budget) : ''];
       }
+      // The spent column: a window at 0% reads ~0, against its budget where it has one, as the status line and the
+      // terminal app read ~0/<budget>, and ~0 alone where it has none; it was left empty.
+      function spent(tok,pct,total){ return tok? '~'+humanTok(tok) : pct===0? '~0' : ''; }
       // Money and credit, drawn wherever they apply — a plan with no rolling quota is billed in
       // dollars, and an account that reports a balance has one whether or not it has a quota.
       function creditText(u){ return u.creditsUnlimited ? 'credits unlimited' : (u.creditBalance!=null ? 'credits '+usd(u.creditBalance) : ''); }
@@ -3024,8 +3170,8 @@ function combinedShell(): string {
       // Claude Code sends rate_limits.* only for Claude.ai subscription plans. On Enterprise or an API
       // key these two bars can never fill, and an empty bar reads as "none of your quota used" rather
       // than "this plan has no rolling quota". Show what this machine CAN measure instead. No percentage
-      // is drawn, deliberately: there is no denominator, and inventing one would be a confident guess.
-      var moPct = (u.monthTokens && u.monthTokensTotal) ? Math.min(100,(u.monthTokens/u.monthTokensTotal)*100) : null;
+      // is drawn without a denominator (the month's budget): inventing one would be a confident guess.
+      var moPct = (u.monthTokens!=null && u.monthTokensTotal) ? Math.min(100,(u.monthTokens/u.monthTokensTotal)*100) : null;
       // The $ bar SHARES the month bar's percentage — one account, one share.
       var dPct = (u.monthCost && moPct!=null) ? moPct : null;
       if(u.rollingLimits===false){
@@ -3036,15 +3182,18 @@ function combinedShell(): string {
         if(hw) hw.style.display='none';
         if(hf) hf.style.display = u.fablePct!=null ? '' : 'none';
         if(u.fablePct!=null) setRow('fable', u.fablePct, '', '', '', until(u.fableReset||null));
-        setRow('mo', null, '~'+human(u.monthTokens||0), '', '');
-        var rmo=rowOf('mo'); if(rmo) rmo.title='tokens this bill cycle, measured from this machine';
-        if(u.monthCost!=null){ setRow('$', null, '~'+usd(u.monthCost), '', ''); var rd=rowOf('$'); if(rd) rd.title='spent this cycle, as the client reports it'; }
+        // The month keeps its share wherever the statusline gave it a budget, as JetBrains' panel draws it (a
+        // month measured at 0 reads 0%), and a month never measured shows no figure rather than ~0.
+        setRow('mo', moPct, spent(u.monthTokens,moPct,u.monthTokensTotal), u.monthTokensTotal? humanTok(u.monthTokensTotal):'', u.monthReads? '+'+humanTok(u.monthReads)+'\u21ba':'');
+        var rmo=rowOf('mo'); if(rmo) rmo.title='tokens this bill cycle, measured on this machine'+(u.machineMeasured && u.machineMeasured.month ? ' and on '+plainLabel(u.machineMeasured.machines) : '');
+        if(u.monthCost!=null){ setRow('$', dPct, '~'+usd(u.monthCost), u.monthCostTotal? '~'+usd(u.monthCostTotal):'', ''); var rd=rowOf('$'); if(rd) rd.title='this cycle’s cost, estimated from its tokens at today’s API list prices — not a bill'; }
+        else { var rd0=rowOf('$'); if(rd0) rd0.style.display='none'; } // no spend: no row, rather than the last post's figures
         showCredits(u);
         if(hint) hint.style.display='none';   // nothing to install: the status line is not the gap here
         // ↻ and the "updated …" stamp must clear on THIS path too: pressing refresh on a quota-less
         // account still has to stop the spinner and land the timestamp (there is no cached percentage
         // bar to go stale here, so that is the only bookkeeping left to reset before the early return).
-        var ulE=document.getElementById('ulast'); if(ulE) ulE.textContent = u.cachedAtMs? ('updated '+atTime(u.cachedAtMs)) : '';
+        var ulE=document.getElementById('ulast'); if(ulE) ulE.textContent = usageStamp(u);
         var urE=document.getElementById('uref'); if(urE) urE.classList.remove('busy');
         var ugE=document.getElementById('ug'); if(ugE) ugE.classList.remove('busy');
         return;
@@ -3052,8 +3201,9 @@ function combinedShell(): string {
       // Restore the quota labels: an account can start reporting limits between refreshes.
       var l5=document.getElementById('ul-5h'), lw2=document.getElementById('ul-wk');
       if(l5) l5.textContent='5h'; if(lw2) lw2.textContent='wk';
+      // An account with no five-hour limit (core fiveNoneAt: its newest usage answer carries no 5h window) has no 5h row.
       var h5b=rowOf('5h'), hwb=rowOf('wk');
-      if(h5b) h5b.style.display='';
+      if(h5b) h5b.style.display = u.fiveNoneAt!=null ? 'none' : '';
       if(hwb) hwb.style.display='';
       var p5=estPair(u.fiveMeasuredAll,u.fiveTotal,u.fiveTokens,u.fiveHourPct);
       var p7=estPair(u.weekMeasuredAll,u.weekTotal,u.weekTokens,u.weekPct);
@@ -3066,12 +3216,12 @@ function combinedShell(): string {
         if(fbr) fbr.style.display='';
         var fl=document.getElementById('ul-fable'); if(fl) fl.textContent=(u.fableLabel? String(u.fableLabel):'fable').toLowerCase();
         setRow('fable', u.fablePct,
-          u.fableTokens? '~'+humanTok(u.fableTokens):'',
+          spent(u.fableTokens,u.fablePct,u.fableTotal),
           u.fableTotal? humanTok(u.fableTotal):'',
           u.fableReads? '+'+humanTok(u.fableReads)+'\u21ba':'',
           until(u.fableReset||null));
       } else if(fbr) fbr.style.display='none';
-      setRow('mo', moPct, u.monthTokens? '~'+humanTok(u.monthTokens):'', u.monthTokensTotal? humanTok(u.monthTokensTotal):'', u.monthReads? '+'+humanTok(u.monthReads)+'\u21ba':'', until(u.monthReset||null));
+      setRow('mo', moPct, spent(u.monthTokens,moPct,u.monthTokensTotal), u.monthTokensTotal? humanTok(u.monthTokensTotal):'', u.monthReads? '+'+humanTok(u.monthReads)+'\u21ba':'', until(u.monthReset||null));
       // The month's $ total is projected like its spent figure (list prices over an estimated month): both carry ~.
       setRow('$', dPct, u.monthCost? '~'+usd(u.monthCost):'', u.monthCostTotal? '~'+usd(u.monthCostTotal):'', '');
       // Only nudge when the statusline cache is truly absent — not on a fresh session whose rate_limits
@@ -3084,7 +3234,7 @@ function combinedShell(): string {
       // The freshness story lives on the SECTION TOOLTIP, not a banner: when
       // it was last refreshed, what refreshes it, and the no-credentials fallback.
       var ul=document.getElementById('ulast');
-      if(ul) ul.textContent = u.cachedAtMs? ('updated '+atTime(u.cachedAtMs)) : '';
+      if(ul) ul.textContent = usageStamp(u);
       var ur2=document.getElementById('uref'); if(ur2) ur2.classList.remove('busy');
       var ug2=document.getElementById('ug'); if(ug2) ug2.classList.remove('busy');
       var sh=document.querySelector('#usage-sec .shead');
@@ -3095,6 +3245,14 @@ function combinedShell(): string {
       }
     }
     setInterval(function(){ if(LASTU) renderUsage(LASTU); }, 60000); // the "Xm ago" stamp ticks between posts
+    // A saved machine's session: what its listing says awaits review there. Its kept/undone split is not read here.
+    function renderRemoteCounts(r){
+      document.getElementById('rv-pending').textContent = r.pending==null ? '—' : r.pending;
+      document.getElementById('rv-kept').textContent='—'; document.getElementById('rv-undone').textContent='—';
+      document.getElementById('rv-fill').style.width='0%';
+      document.getElementById('rv-progress').textContent = 'on '+r.machine+(r.edits==null ? '' : ' — '+r.pending+' of '+r.edits+' edits await review there')+'; Keep and Undo run there, from the Overview and the Timeline';
+      document.getElementById('rv-rate').textContent='';
+    }
     function renderCounts(c){ if(!c) return;
       document.getElementById('rv-pending').textContent=c.pending;
       document.getElementById('rv-kept').textContent=c.kept;
@@ -3105,9 +3263,17 @@ function combinedShell(): string {
       document.getElementById('rv-progress').textContent = total ? (reviewed+' of '+total+' reviewed ('+pct+'%)') : 'no edits yet';
       document.getElementById('rv-rate').textContent = reviewed ? (Math.round(c.kept/reviewed*100)+'% accepted') : '';
     }
-    function renderTokens(t){
+    // tt: the session with every agent it started (the CLI's sessionTreeTokens). When it started any, its own cells are
+    // labelled "own" and a second row, labelled, shows the figure with them: its own never reads as the task's.
+    function renderTokens(t, tt){
       var i=document.getElementById('tk-in'), o=document.getElementById('tk-out'), c=document.getElementById('tk-cached'), l=document.getElementById('tk-cached-lbl');
       if(!i) return;
+      var n=(tt&&tt.agents)||0, tr=document.getElementById('tk-tree');
+      document.getElementById('tk-own-cap').style.display = n>0 ? '' : 'none'; tr.style.display = n>0 ? '' : 'none';
+      if(n>0){ document.getElementById('tk-tree-cap').textContent='with '+n+' agent'+(n===1?'':'s');
+        document.getElementById('tk-tin').textContent=human(tt.input); document.getElementById('tk-tout').textContent=human(tt.output);
+        document.getElementById('tk-tcached').textContent=human(tt.cacheRead);
+        document.getElementById('tk-tcached-lbl').textContent = tt.hitPct==null ? 'cached' : 'cached · '+Math.round(tt.hitPct)+'% hit'; }
       if(!t || t.available===false){ i.textContent='—'; o.textContent='—'; c.textContent='—'; l.textContent='cached'; return; }
       i.textContent=human(t.input); o.textContent=human(t.output); c.textContent=human(t.cacheRead);
       l.textContent = t.hitPct==null ? 'cached' : 'cached · '+Math.round(t.hitPct)+'% hit';
@@ -3162,13 +3328,13 @@ function combinedShell(): string {
     window.addEventListener('message', function(e){ var m=e.data||{};
       if(m.type==='tour'){ applyTour(m.anchor||null); return; }
       if(m.type==='usage'){ renderUsage(m.u); }
-      else if(m.type==='counts'){ renderCounts(m.c); renderTokens(m.t); renderVitals(m.v); renderCompactions(m.v);
+      else if(m.type==='counts'){ document.getElementById('tk-scope').textContent=m.usageNote||'Session usage on this machine'; if(m.remote) renderRemoteCounts(m.remote); else renderCounts(m.c); renderTokens(m.t, m.tt); renderVitals(m.v); renderCompactions(m.v);
         // Show the human-readable session NAME (title / first prompt); the raw id stays in the tooltip.
         var se=document.getElementById('nb-session'); if(se && m.session!==undefined){ var nm=(m.sessionTitle||'').trim();
-          se.textContent = nm || (m.session ? String(m.session).slice(0,8) : '—');
-          se.title = m.session ? ((nm? nm+' — ' : '')+'session '+m.session) : 'No active Claude Code session'; }
+          se.textContent = (nm || (m.session ? String(m.session).slice(0,8) : '—')) + (m.remote ? ' · on '+m.remote.machine : '');
+          se.title = m.session ? ((nm? nm+' — ' : '')+'session '+m.session+(m.remote ? ' on '+m.remote.machine : '')) : 'No active Claude Code session'; }
       }
-      else if(m.type==='stats'){ STATS=m.data; drawStats(); }
+      else if(m.type==='stats'){ STATS=m.data; var scope=document.getElementById('history-scope'); if(scope) scope.textContent=STATS.usageSource==='database'?'Account history':'Account history · this machine alone'; drawStats(); }
       else if(m.type==='statsError' && !STATS){ var g=document.getElementById('gathering'); if(g) g.innerHTML='⚠ stats need the <b>oak</b> CLI, which was not found.<br><span class="dim">install it with <b>./install.sh</b> (or <b>npm i -g ./packages/cli</b> from the repo), then reload.</span>'; }
     });
     (function(){ var segs=document.querySelectorAll('.seg'); for(var i=0;i<segs.length;i++){ segs[i].addEventListener('click',function(){ range=this.getAttribute('data-r'); saveSt(); drawStats(); }); }
@@ -3185,12 +3351,22 @@ function combinedShell(): string {
   // machine-wide day/hour series, the plan bars at the bottom are point-in-time limits.
   const tokensHtml =
     `<div class="toksec ssec" id="tk-sec">` +
-    `<div class="uhead shead" data-sec="tk" title="This session’s cumulative tokens, split the way the API bills them. hit rate = cache reads ÷ all context sent (input + cache reads + cache writes)."><span class="scar">▾</span>Session tokens</div>` +
+    `<div class="uhead shead" data-sec="tk" title="This session’s cumulative tokens, split the way the API bills them. hit rate = cache reads ÷ all context sent (input + cache reads + cache writes). A session that started agents shows its own figure and, below it, the figure with every agent it started."><span class="scar">▾</span>Session tokens</div>` +
+    `<div class="rvmeta" id="tk-scope">Session usage on this machine</div>` +
     `<div class="sbody">` +
+    `<span class="rvl" id="tk-own-cap" style="display:none;margin:0 0 3px">own</span>` +
     `<div class="rvcounts">` +
     `<div class="rvc" title="Uncached input tokens sent this session"><span class="rvn" id="tk-in" style="color:var(--c-input)">—</span><span class="rvl">input</span></div>` +
     `<div class="rvc" title="Output tokens generated this session"><span class="rvn" id="tk-out" style="color:var(--acc)">—</span><span class="rvl">output</span></div>` +
     `<div class="rvc" id="tk-cached-cell" title="Input tokens served from the prompt cache; hit rate = reads ÷ all context sent"><span class="rvn" id="tk-cached" style="color:var(--c-cached)">—</span><span class="rvl" id="tk-cached-lbl">cached</span></div>` +
+    `</div>` +
+    `<div id="tk-tree" style="display:none">` +
+    `<span class="rvl" id="tk-tree-cap" style="margin:0 0 3px"></span>` +
+    `<div class="rvcounts">` +
+    `<div class="rvc" title="Uncached input tokens sent by this session and every agent it started"><span class="rvn" id="tk-tin" style="color:var(--c-input)">—</span><span class="rvl">input</span></div>` +
+    `<div class="rvc" title="Output tokens generated by this session and every agent it started"><span class="rvn" id="tk-tout" style="color:var(--acc)">—</span><span class="rvl">output</span></div>` +
+    `<div class="rvc" title="Input tokens this session and its agents read from the prompt cache"><span class="rvn" id="tk-tcached" style="color:var(--c-cached)">—</span><span class="rvl" id="tk-tcached-lbl">cached</span></div>` +
+    `</div>` +
     `</div>` +
     `</div>` +
     `</div>`;
@@ -3225,7 +3401,7 @@ function combinedShell(): string {
     reviewHtml +
     `<div class="divider"></div>` +
     `<div class="ssec" id="ch-sec">` +
-    `<div class="uhead shead" data-sec="ch" title="Machine-wide token series over the selected range"><span class="scar">▾</span>Tokens${legendHtml}</div>` +
+    `<div class="uhead shead" data-sec="ch" title="Account token series across the machines in the database"><span class="scar">▾</span><span id="history-scope">Account history</span>${legendHtml}</div>` +
     `<div class="sbody">` +
     `<div class="ranges"><button class="seg" data-r="today">Today</button><button class="seg" data-r="week">7 days</button><button class="seg" data-r="month">30 days</button></div>` +
     `<div id="gathering" class="empty">Gathering stats… <span class="dim">(first scan of your transcripts; cached after)</span></div>` +
@@ -3586,8 +3762,14 @@ function changeMapShell(): string {
   .mt-trow .mt-tdep { flex:none; color: var(--mt-attn); font-size:10px; }
   .mt-none { padding:10px 2px; color: var(--vscode-descriptionForeground); font-size:11px; }
   /* folded group (0.9.0): week-old conversations, collapsed and not rebuilt */
+  .mt-done-subs { cursor:pointer; padding:4px 12px; opacity:.75 }
   .mt-foldhdr { cursor:pointer; user-select:none; margin:6px 0 3px; padding:3px 4px; border-top:1px solid var(--vscode-panel-border); font-family: var(--cm-mono); font-size:9.5px; color: var(--vscode-descriptionForeground); }
   .mt-foldhdr:hover { color: var(--vscode-foreground); }
+  /* A session's workers still at it, grouped under its row in the Sessions tab: a summary, then a group per state */
+  .mt-foldhdr.mt-wkgrp { margin:0 0 2px 14px; border-top:0; padding:1px 4px; }
+  .mt-wkhdr { margin:2px 0 1px 26px; font-size:10px; color: var(--vscode-descriptionForeground); }
+  .mt-trow.mt-wkrow { margin-left:38px; cursor:pointer; }
+  .mt-trow.mt-wkrow:hover { background: var(--vscode-list-hoverBackground, rgba(127,127,127,0.10)); }
   .mt-agent.folded { opacity:.72; }
   .mt-unloaded { font-family: var(--cm-mono); font-size:9px; color: var(--vscode-descriptionForeground); font-style:italic; margin-left:6px; }
   /* Processes tab — one row per background shell (run_in_background). No pid column: the transcript
@@ -3830,7 +4012,7 @@ function changeMapShell(): string {
     // showing its members as side-by-side columns the reader can resize and fold.
     `<div class="ov-navtabrow">` +
     `<div class="ov-navtabs" id="ov-navtabs"></div>` +
-    `<button class="ov-tb ov-toggle" id="ov-groupnav" aria-pressed="false" title="Show every tab side by side in one group (Sessions · Workers · Workflows · Tasks · Processes)"><i class="codicon codicon-split-horizontal"></i> Group tabs</button>` +
+    `<button class="ov-tb ov-toggle" id="ov-groupnav" aria-pressed="false" title="Show every tab side by side in one group (Sessions · Workers · Processes · Tasks · Workflows)"><i class="codicon codicon-split-horizontal"></i> Group tabs</button>` +
     `</div>` +
     `<div class="ov-ctl">` +
     `<label class="mt-toggle" title="Show only active agents / running workflows"><input type="checkbox" id="mt-active"> Active only</label>` +
@@ -3851,7 +4033,7 @@ function changeMapShell(): string {
     // Background shells the agent launched with run_in_background and left running. The tab is always here
     // (JetBrains parity); the pane itself says which state it is in when the CLI could not answer.
     `<div class="ov-pane" id="ov-pane-processes" style="display:none"><div class="ov-desc">Background shells this session launched (<code>run_in_background</code>) — state, runtime and output volume. Select one to follow its output.</div><div class="ov-list" id="ov-processes"></div></div>` +
-    `<div class="ov-pane" id="ov-pane-sessions"><div class="ov-desc">Sessions on this machine, grouped by workspace. This workspace is first; select a session to review its conversation and edits.</div><div class="ov-list" id="ov-sessions"></div></div>` +
+    `<div class="ov-pane" id="ov-pane-sessions"><div class="ov-desc">Sessions from every machine, newest activity first. Search, Active and Sort cover the whole list; select a session to review it.</div><div class="ov-list" id="ov-sessions"></div></div>` +
     // Grouped mode's two panes. Their COLUMNS are composed by the script (one per member, each carrying
     // that member's own list node), so every list still has exactly one renderer whichever mode is on.
     `<div class="ov-pane ov-group" id="ov-group-all" style="display:none"></div>` +
@@ -3882,6 +4064,47 @@ function changeMapShell(): string {
   return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${csp}">${style}</head><body>${body}</body></html>`;
 }
 
+type RemoteReviewUnit = { id: number; members: number[]; file: string; rel: string; tool: string; status: core.EditRecord['status']; ts: number; added: number; removed: number; partial?: boolean; capture?: string };
+type RemoteReview = { units: RemoteReviewUnit[]; ids: number[]; cancelledIds: number[]; cancelled: unknown[]; errors: string[]; prompt?: { index: number; title: string } };
+type RemoteReviewRead = { data: RemoteReview | null; history: RemoteReviewUnit[]; error: string | null; lastSuccess: number; at: number; reading: boolean; again?: boolean };
+const remoteReviewReads = new Map<string, RemoteReviewRead>();
+const remoteReviewListeners = new Set<() => void>();
+let remoteReviewFile: { machine: string; session: string; file: string } | undefined;
+
+/** Shared by Review and File History; every caller gets a snapshot without waiting on SSH. */
+function readRemoteReview(machine: string, session: string, prompt: string | null): RemoteReviewRead {
+  const key = JSON.stringify([resolveObservatoryBin(), machine, session, prompt]);
+  let r = remoteReviewReads.get(key);
+  if (!r) {
+    r = { data: null, history: [], error: null, lastSuccess: 0, at: 0, reading: false };
+    remoteReviewReads.set(key, r);
+    if (remoteReviewReads.size > 16) remoteReviewReads.delete(remoteReviewReads.keys().next().value!);
+  }
+  if (r.reading || Date.now() - r.at < SAVED_READ_MS) return r;
+  const entry = r;
+  entry.reading = true;
+  void oakOn(machine, ['views', '--views', 'review,timeline', '--json', '--no-patch', '--session', session, ...(prompt ? ['--prompt', prompt] : [])]).then(res => {
+    if (remoteReviewReads.get(key) !== entry) return;
+    const data = res.json?.review as RemoteReview | undefined;
+    const history = res.json?.timeline as { edits?: RemoteReviewUnit[] } | undefined;
+    entry.reading = false;
+    entry.at = entry.again ? 0 : Date.now();
+    entry.again = false;
+    if (data && Array.isArray(data.units) && Array.isArray(data.ids) && Array.isArray(history?.edits)) {
+      entry.data = data; entry.history = history.edits; entry.lastSuccess = Date.now(); entry.error = null;
+    } else {
+      entry.data = null; entry.history = [];
+      entry.error = Object.values((res.json?.__problems ?? {}) as Record<string, string>).join('; ') || res.why || 'Invalid review answer; update OAK on ' + machine;
+    }
+    remoteReviewListeners.forEach(f => f());
+  });
+  return r;
+}
+function selectRemoteReviewFile(machine: string, session: string, file: string): void {
+  remoteReviewFile = { machine, session, file };
+  remoteReviewListeners.forEach(f => f());
+}
+
 /** File History: the ACTIVE editor's agent edits, oldest→newest (id · time · status · reasoning).
  *  A flat chronological list — a different data model from the folder/class Edits tree — that follows
  *  the active editor. Reuses EditNode so every existing edit command works on its rows unchanged. */
@@ -3889,11 +4112,12 @@ class FileHistoryProvider implements vscode.TreeDataProvider<EditNode> {
   private readonly _changed = new vscode.EventEmitter<void>();
   readonly onDidChangeTreeData = this._changed.event;
   view?: vscode.TreeView<EditNode>;
+  constructor() { remoteReviewListeners.add(() => this.refresh()); }
 
   refresh(): void {
     this._changed.fire();
     if (this.view) {
-      const f = activeEditorFile();
+      const f = currentMachine() ? remoteReviewFile && remoteReviewFile.machine === currentMachine() && remoteReviewFile.session === currentSession() ? remoteReviewFile.file : undefined : activeEditorFile();
       this.view.description = f ? path.basename(f) : undefined; // name the file being followed
     }
   }
@@ -3901,6 +4125,15 @@ class FileHistoryProvider implements vscode.TreeDataProvider<EditNode> {
   getChildren(node?: EditNode): EditNode[] {
     if (node) return []; // flat list
     const session = currentSession();
+    const machine = currentMachine();
+    if (machine && session) {
+      const active = activeEditorFile();
+      const mounted = active ? mountedReviews.get(active) : undefined;
+      const picked = mounted?.machine === machine && mounted.session === session ? mounted : remoteReviewFile;
+      if (!picked || picked.machine !== machine || picked.session !== session) return [];
+      return readRemoteReview(machine, session, null).history.filter(r => r.file === picked.file).sort((a, b) => a.ts - b.ts || a.id - b.id)
+        .map(rec => ({ kind: 'edit', machine, session, rec: { ...rec, beforeBlob: null, afterBlob: null } } as EditNode));
+    }
     const file = activeEditorFile();
     if (!session || !file) return [];
     // The store read-primitive: a file's edits = readLog filtered by absolute-path equality.
@@ -3912,7 +4145,14 @@ class FileHistoryProvider implements vscode.TreeDataProvider<EditNode> {
 
   getTreeItem(node: EditNode): vscode.TreeItem {
     const rec = node.rec;
-    const session = currentSession();
+    const session = node.session ?? currentSession();
+    const machine = node.machine;
+    if (machine && session) {
+      const item = new vscode.TreeItem(`#${rec.id} · ${rec.status} · ${new Date(rec.ts).toLocaleTimeString()}`);
+      item.description = `on ${machine}`;
+      item.command = { command: 'claudeObservatory.remoteOpen', title: `Open on ${machine}`, arguments: [machine, session, rec.id, rec.file] };
+      return item;
+    }
     const cwd = workspaceRoot();
     const d = new Date(rec.ts);
     const hhmm = [d.getHours(), d.getMinutes()].map((x) => String(x).padStart(2, '0')).join(':');
@@ -3945,21 +4185,24 @@ const CLI_SPAWN_TIMEOUT_MS = 120_000;
 /** The setup check's deadline, the same in both editors (JetBrains' HEAVY_TIMEOUT_MS): doctor waits up
  *  to 30 s on each saved herdr machine in turn. */
 const DOCTOR_TIMEOUT_MS = 180_000;
-function spawnCliJson(args: string[], cwd: string, cb: (data: unknown | null) => void): void {
+function spawnCliJson(args: string[], cwd: string, cb: (data: unknown | null, stderr?: string) => void): void {
   let child: cp.ChildProcess;
   let fired = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let err = '';
+  // A failure hands its caller what the CLI printed on stderr, for a panel that says why.
   const once = (data: unknown | null) => {
     if (fired) return;
     fired = true;
     if (timer) clearTimeout(timer);
-    cb(data);
+    cb(data, data === null ? err : undefined);
   };
   try {
     // `--root <cwd>` carries a workspace path. The old shape passed an args ARRAY with shell:true,
     // which concatenates them UNQUOTED — so every panel here returned nothing on Windows for anyone
     // whose workspace sat under a spaced path (C:\Users\First Last\…). core/spawn quotes it.
-    child = core.spawnTool(resolveObservatoryBin(), args, { cwd, stdio: ['ignore', 'pipe', 'ignore'] });
+    child = core.spawnTool(resolveObservatoryBin(), args, { cwd, stdio: ['ignore', 'pipe', 'pipe'],
+      ...(args.includes('--machine') ? { env: { ...process.env, OAK_MACHINE_TIMEOUT_MS: String(SAVED_DEADLINE_MS) } } : {}) });
   } catch {
     once(null);
     return;
@@ -3971,9 +4214,10 @@ function spawnCliJson(args: string[], cwd: string, cb: (data: unknown | null) =>
       /* already gone */
     }
     once(null); // callers treat null as "this refresh failed" and clear their gates
-  }, CLI_SPAWN_TIMEOUT_MS);
+  }, args.includes('--machine') ? SAVED_DEADLINE_MS + 5000 : CLI_SPAWN_TIMEOUT_MS);
   let out = '';
   child.stdout?.on('data', (d) => (out += d));
+  child.stderr?.on('data', (d) => { if (err.length < 8192) err += d; });
   child.on('error', () => once(null));
   child.on('close', () => {
     try {
@@ -3982,6 +4226,49 @@ function spawnCliJson(args: string[], cwd: string, cb: (data: unknown | null) =>
       once(null);
     }
   });
+}
+
+/** Why a saved machine's Processes are missing, as the terminal app says it: '' when they arrived, or on this machine.
+ *  Never "update the CLI on PATH": that CLI answered (review 2026-11-05). */
+function machineProcessesFailure(machine: string | null | undefined, all: { __problems?: Record<string, string> } | null, pr: unknown, stderr?: string): string {
+  if (pr || !machine) return '';
+  return all ? all.__problems?.processes ?? `${machine} did not return its background shells` : core.cliFailureMessage('', stderr, `${machine} did not answer`);
+}
+
+/** The `claudeObservatory.refresh` argument for a refresh that follows a mutation: re-read only, no sweep. */
+const NO_SWEEP = 'noSweep';
+
+/**
+ * A user Refresh applies a newly-added `.observatoryignore`: it counts first (core's `countIgnored`,
+ * in-process like the terminal app's local refresh) and, when the sweep would drop anything, asks before
+ * dropping, as the terminal app does. The sweep cannot be undone. It runs in-process rather than through
+ * the CLI because an older CLI ignores `ignore --dry-run` and sweeps. A count that cannot be read is an
+ * error, never 0, so nothing is dropped then. Resolves once the store is settled.
+ */
+async function sweepIgnoredAsking(session: string): Promise<void> {
+  let would: number;
+  try {
+    would = core.countIgnored(session);
+  } catch (e) {
+    void vscode.window.showErrorMessage(
+      `OAK: could not count what .observatoryignore covers in ${session.slice(0, 8)}, so nothing was dropped: ${(e as Error)?.message ?? e}`
+    );
+    return;
+  }
+  if (would === 0) return;
+  const DROP = 'Drop';
+  const pick = await vscode.window.showWarningMessage(
+    `Drop the ${would} recorded edit${would === 1 ? '' : 's'} in ${session.slice(0, 8)} that .observatoryignore covers?`,
+    { modal: true, detail: 'This cannot be undone. Cancel keeps them.' },
+    DROP
+  );
+  if (pick !== DROP) return;
+  try {
+    const { dropped } = core.dropIgnored(session);
+    vscode.window.setStatusBarMessage(`OAK: dropped ${dropped} now-ignored edit(s)`, 3000);
+  } catch (e) {
+    void vscode.window.showErrorMessage(`OAK: could not apply .observatoryignore: ${(e as Error)?.message ?? e}`);
+  }
 }
 
 /**
@@ -4353,6 +4640,11 @@ const TL_ROW_ACTS: Record<string, TlAct[]> = {
     { v: 'redoFile', g: '↻', t: 'Re-apply every undone edit in this file', tone: 'done' },
     { v: 'openFile', g: '⧉', t: 'Open the file', tone: 'accent' },
   ],
+  // An edit in a saved machine's session: both verbs run there (`--machine`); its file is not on this machine to open.
+  remoteEdit: [
+    { v: 'remoteKeep', g: '✓', t: 'Keep this edit — on the machine the session is on', tone: 'done' },
+    { v: 'remoteUndo', g: '✗', t: 'Undo this edit — on the machine the session is on', tone: 'warn' },
+  ],
 };
 
 /**
@@ -4399,6 +4691,81 @@ function tlMoreRow(key: string, shown: number, total: number): TlRow {
     act: false,
     acts: [],
   };
+}
+
+/** A saved machine's session in Actions or Observations — the CLI's own `actions --json` / `observations --json`, read on
+ *  that machine with `--machine`, because the two providers above read only this machine's store. */
+type RemoteTl = { machine: string; session: string; data: Record<string, unknown> | null; err: string | null; at: number; reading: boolean };
+type RNode = { kind: string; label: string; desc?: string; tip?: string; icon?: vscode.ThemeIcon; kids?: RNode[]; id?: number; machine?: string; session?: string; rel?: string; n?: number };
+const remoteTl = new Map<'observations' | 'actions', RemoteTl>();
+
+/** The rows of one remote read, as tree nodes the Timeline serializes like any other. An edit row offers Keep and Undo —
+ *  run on that machine — and opens its patch as the CLI prints it there (the file itself is not on this machine). */
+function remoteTlProvider(tab: 'observations' | 'actions', r: RemoteTl): TlTreeProvider {
+  const d = r.data ?? {};
+  const time = (ts: unknown): string => (typeof ts === 'number' && ts ? new Date(ts).toLocaleTimeString() : '');
+  const edit = (e: Record<string, unknown>, rel: string, label: string): RNode => ({
+    kind: 'redit', label, desc: `+${e.added ?? 0} −${e.removed ?? 0} · ${String(e.status ?? '')} · ${time(e.ts)}`,
+    tip: `Edit #${e.id} on ${r.machine}${e.reasoning ? `\n\n${String(e.reasoning)}` : ''}`,
+    icon: statusIcon(String(e.status ?? '')), id: Number(e.id), machine: r.machine, session: r.session, rel, n: 1,
+  });
+  let roots: RNode[];
+  if (tab === 'observations') {
+    roots = [{ kind: 'rrecap', label: String(d.recap || 'No recap yet'), desc: String(d.recapSource ?? ''), icon: new vscode.ThemeIcon('compass') }];
+    for (const run of (d.runs as Record<string, unknown>[] | undefined) ?? []) {
+      const edits = (run.edits as Record<string, unknown>[] | undefined) ?? [];
+      const rel = String(run.rel ?? '');
+      if (edits.length === 1) roots.push(edit(edits[0], rel, rel));
+      else roots.push({ kind: 'rrun', label: `${rel} ×${run.count ?? edits.length}`, desc: `+${run.added ?? 0} −${run.removed ?? 0} · ${String(run.status ?? '')}`,
+        icon: statusIcon(String(run.status ?? '')), n: edits.length, kids: edits.map((e) => edit(e, rel, `${rel} #${e.id}`)) });
+    }
+    const next = (d.nextSteps as string[] | undefined) ?? [];
+    if (next.length) roots.push({ kind: 'rhead', label: 'Next steps', icon: new vscode.ThemeIcon('checklist'),
+      kids: next.map((s) => ({ kind: 'rnext', label: s, icon: new vscode.ThemeIcon('arrow-small-right') })) });
+  } else {
+    roots = ((d.groups as Record<string, unknown>[] | undefined) ?? []).filter((g) => g.category !== 'agent').map((g): RNode => {
+      const acts = (g.actions as Record<string, unknown>[] | undefined) ?? [];
+      return { kind: 'rgroup', label: String(g.label ?? ''), n: Number(g.count) || 0, icon: new vscode.ThemeIcon(ACTION_ICON[String(g.category)] ?? 'circle-small'),
+        desc: `${acts.length < Number(g.count) ? `${acts.length} of ${g.count}` : g.count}${g.errors ? ` · ${g.errors} err` : ''}`,
+        kids: acts.slice().reverse().map((a): RNode => ({ kind: 'ract', label: `${String(a.tool ?? '')} ${String(a.target ?? '')}`.trim(),
+          desc: `${a.isError ? 'error · ' : ''}${time(a.ts)}`, tip: String(a.detail ?? a.cmd ?? ''),
+          icon: a.isError ? new vscode.ThemeIcon('error', new vscode.ThemeColor('charts.red')) : new vscode.ThemeIcon('circle-small') })) };
+    });
+  }
+  if (tab === 'actions') {
+    const risk = d.risk as { risky?: { target: string; level: string; reasons: string[] }[]; outsideWrites?: { file: string; count: number }[] } | undefined;
+    const egress = d.egress as { channels?: { target: string; kind: string; scope: string; count: number }[] } | undefined;
+    const mt = d.multitask as { collisions?: { file: string; agents: string[]; anyPending: boolean }[] } | undefined;
+    const group = (label: string, kids: RNode[]) => { if (kids.length) roots.push({ kind: 'rhead', label, kids, desc: String(kids.length) }); };
+    group('Risk', (risk?.risky ?? []).map(x => ({ kind: 'raudit', label: x.target, desc: x.level, tip: x.reasons.join(' · ') })));
+    group('Outside the workspace', (risk?.outsideWrites ?? []).map(x => ({ kind: 'raudit', label: x.file, desc: `${x.count} edits on ${r.machine}` })));
+    group('Egress', (egress?.channels ?? []).map(x => ({ kind: 'raudit', label: x.target, desc: `${x.kind} · ${x.scope} · ${x.count}` })));
+    group('Live conflicts', (mt?.collisions ?? []).map(x => ({ kind: 'raudit', label: x.file, desc: `${x.agents.length} agents${x.anyPending ? ' · pending' : ''}`, tip: x.agents.join(', ') })));
+    for (const [name, why] of Object.entries((d.problems ?? {}) as Record<string, string>)) roots.push({ kind: 'rerror', label: `Could not read ${name} on ${r.machine}`, desc: why });
+  }
+  return {
+    getChildren: (node?: unknown) => (node ? (node as RNode).kids ?? [] : roots),
+    getTreeItem: (node: unknown) => {
+      const n = node as RNode;
+      const item = new vscode.TreeItem(n.label, n.kids ? (n.kind === 'rhead' ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.Collapsed) : vscode.TreeItemCollapsibleState.None);
+      item.description = n.desc;
+      item.tooltip = n.tip;
+      item.iconPath = n.icon;
+      if (n.kind === 'redit') {
+        item.contextValue = 'remoteEdit';
+        item.command = { command: 'claudeObservatory.remoteOpen', title: `Open on ${n.machine}`, arguments: [n.machine, n.session, n.id, n.rel] };
+      }
+      return item;
+    },
+  };
+}
+
+/** One view out of a `views` batch read on a saved machine (`views` runs there with `--machine`; most views' own verbs do
+ *  not): the view, or — when it failed there — its reason as `error`, or null when the batch itself did not answer. */
+function viewOf(data: unknown, name: string): unknown {
+  const all = data as ({ __problems?: Record<string, string> } & Record<string, unknown>) | null;
+  if (!all || typeof all !== 'object') return null;
+  return all[name] ?? (all.__problems?.[name] ? { error: all.__problems[name] } : null);
 }
 
 /** One `vscode.TreeItem` as a row. Nothing here re-derives a label, a description or a tooltip. */
@@ -4510,6 +4877,10 @@ function timelineShell(): string {
   .rq-sdel { flex:none; font-size:11px; line-height:1; padding:0 2px; cursor:pointer; opacity:0; }
   .rq-srow:hover .rq-sdel, .rq-srow.on .rq-sdel { opacity:.6; }
   .rq-sdel:hover { opacity:1; }
+  /* An oak sync conflict's row: its two ways out are links, always shown (they are the row's only actions). */
+  .rq-sync { cursor:default; }
+  .rq-sact { flex:none; font-size:10.5px; color: var(--vscode-textLink-foreground); cursor:pointer; text-decoration:underline; }
+  .rq-sact:hover { color: var(--vscode-textLink-activeForeground); }
   /* Workspace labels wrap in full. */
   .rq-sws { flex:none; max-width:100%; overflow-wrap:anywhere;
     font-family: var(--cm-mono); font-size:9px; opacity:.7; color: var(--vscode-descriptionForeground); }
@@ -4633,7 +5004,9 @@ function timelineShell(): string {
   .tl-row.act { cursor:pointer; }
   .tl-tw { flex:none; width:13px; background:transparent; border:0; color: var(--vscode-descriptionForeground); font:inherit; font-size:9px; line-height:1.5; padding:0; cursor:pointer; text-align:left; }
   .tl-gl { flex:none; width:13px; text-align:center; font-size:10px; color: var(--vscode-descriptionForeground); }
-  .tl-lb { flex:0 1 auto; min-width:0; font-size:11px; line-height:1.45; overflow-wrap:anywhere; }
+  /* A label wraps between words and keeps each word whole ("Context", never "Conte" / "xt"): its floor is its
+     longest word, capped at the row so one long path still wraps instead of overflowing it. */
+  .tl-lb { flex:0 1 auto; max-width:100%; font-size:11px; line-height:1.45; overflow-wrap:break-word; }
   .tl-de { flex:1 1 auto; min-width:0; font-size:9.5px; line-height:1.45; color: var(--vscode-descriptionForeground); overflow-wrap:anywhere; }
   .tl-ops { flex:none; display:inline-flex; gap:2px; opacity:0; transition:opacity .1s; }
   .tl-row:hover .tl-ops { opacity:1; }
@@ -4653,6 +5026,10 @@ function timelineShell(): string {
   /* The entry list is the tab's scroller — renderFeedTab restores its scrollTop and tails it, and
      the ↓ newest pill is measured against it, none of which a content-sized div can do. */
   .tlf-body { flex:1; min-height:0; overflow-y:auto; }
+  /* Nothing sits over the list: a row cut at the top is scrolled past the box's edge (the feed follows its newest
+     end). VS Code's scroll shadow marks that edge once the list is scrolled, so the cut reads as scrolled, not hidden. */
+  .tlf-body.scrolled::before { content:''; display:block; position:sticky; top:0; height:6px; margin-bottom:-6px; z-index:4; pointer-events:none;
+    box-shadow: var(--vscode-scrollbar-shadow, rgba(0,0,0,0.4)) 0 6px 6px -6px inset; }
   .tl-body { --tl-fs: var(--vscode-font-size, 13px); }
   /* Each entry is a bordered block with real air between blocks — the TUI's boxed blobs.
      The left edge stays the 2px status accent; the box is the quiet 1px border. */
@@ -4695,6 +5072,8 @@ function timelineShell(): string {
   .tlf-dl.rem { background: var(--vscode-diffEditor-removedTextBackground, rgba(248,81,73,0.18)); }
   .tlf-dl.hunk { color: var(--cm-accent); opacity:.8; }
   .tlf-dl.ctx { color: var(--vscode-descriptionForeground); }
+  /* a bidirectional control or zero-width character in the file, shown as the mark that names it */
+  .tlf-hid { opacity:.65; }
   .tlf-file { cursor:pointer; }
   .tlf-file:hover { text-decoration:underline; color: var(--cm-accent); opacity:1; }
   /* the way back to the tail once the reader scrolls up — floats over the body's bottom-right */
@@ -4728,7 +5107,7 @@ function timelineShell(): string {
     // The selector leads the WINDOW, above the tabs: which session these belong to precedes every
     // question any of the three tabs answers.
     `<div class="rq-sess" id="rq-sess" style="display:flex;align-items:center;flex-wrap:wrap;">` +
-    `<button class="rq-schip" id="rq-schip" title="The session the observatory is reviewing — click to switch session"><span class="rq-sdot" id="rq-sdot">○</span><span class="rq-sname" id="rq-sname">session —</span><span class="rq-swait" id="rq-swait" style="display:none" title="Sessions waiting on you — click to jump to the most urgent one"></span><span class="rq-scar">▾</span></button>` +
+    `<button class="rq-schip" id="rq-schip" title="The session the observatory is reviewing — click to switch session"><span class="rq-sdot" id="rq-sdot">○</span><span class="rq-sname" id="rq-sname">session —</span><span class="rq-swait" id="rq-swait" style="display:none" title="Sessions waiting on you, other machines’ included — click to jump to the most urgent one on this machine"></span><span class="rq-scar">▾</span></button>` +
     `<span class="rq-drop-anchor rq-newanchor"><button class="rq-nb" id="rq-newsess" title="Start a NEW agent session — its CLI opens in the terminal, the observatory picks it up">＋</button><div class="rq-filterdrop" id="rq-newdrop" hidden></div></span>` +
     `<div class="rq-slist" id="rq-slist" hidden></div>` +
     `</div>` +
@@ -4752,7 +5131,7 @@ const TIMELINE_SCRIPT = `
 (function(){
   "use strict";
   var vscode=acquireVsCodeApi();
-  var RQ=null, SEL=null, SEEN=false;
+  var RQ=null, SEL=null, SEEN=false, RQWHY=null; // RQWHY: the CLI's own reason when it listed nothing
   // --- this window's own layout ---------------------------------------------------------------------
   // Which tab is forward, whether the four sit side by side, which tree rows are expanded, and the
   // grouped columns' widths + folded set. Every one of these is a LAYOUT choice belonging to this panel,
@@ -4913,10 +5292,10 @@ const TIMELINE_SCRIPT = `
     else if(!st.seen) body='<div class="rq-empty">Reading this session’s '+tab+'…</div>';
     else if(!(st.rows['']||[]).length) body=emptyHtml(tab);
     else body=rowsHtml(tab,'',0);
+    // No head of its own: the tab, or the column head, already names this pane and counts it (badgeOf).
     host.innerHTML=
-      '<div class="rq-head"><span class="rq-title">'+(tab==='actions'?'Actions':'Observations')+'</span>'+
-      '<span class="rq-sum">'+((st.seen&&!st.err)? esc(sumText(tab)) : '')+'</span></div>'+
       '<div class="rq-desc">'+esc(TAB_DESC[tab])+'</div>'+
+      (st.note? '<div class="rq-desc tl-remote">'+esc(st.note)+'</div>' : '')+
       '<div class="tl-list">'+body+'</div>';
     var rows=host.querySelectorAll('.tl-row');
     for(var i=0;i<rows.length;i++) rows[i].addEventListener('click', function(ev){
@@ -5055,7 +5434,9 @@ const TIMELINE_SCRIPT = `
             if(shown>=14) continue;
             shown++;
             var cls2 = pl.indexOf('@@')===0?'hunk':(pl.charAt(0)==='+'?'add':(pl.charAt(0)==='-'?'rem':'ctx'));
-            dh+='<div class="tlf-dl '+cls2+'">'+esc(pl)+'</div>';
+            // The host sends a bidirectional control or zero-width character as the mark that names it (core's revealHidden),
+            // a tag character's with five digits.
+            dh+='<div class="tlf-dl '+cls2+'">'+esc(pl).replace(/⟨U\\+[0-9A-F]{4,5}⟩/g, '<span class="tlf-hid">$&</span>')+'</div>';
           }
           if(dh){
             h+='<div class="tlf-diff">'+dh+
@@ -5145,6 +5526,7 @@ const TIMELINE_SCRIPT = `
      the last line. (TUI: the hint only on a scrolled session-detail; JetBrains: FeedPanel's link.) */
   function syncJump(body,jump){
     if(!body||!jump) return;
+    var up=body.scrollTop>0; if(body.classList.contains('scrolled')!==up) body.classList.toggle('scrolled',up);
     var want=(body.scrollTop+body.clientHeight<body.scrollHeight-6)?'':'none';
     if(jump.style.display!==want) jump.style.display=want; // this runs per scroll event — no needless invalidation
   }
@@ -5202,10 +5584,11 @@ const TIMELINE_SCRIPT = `
   // wrap rendered both tabs blank until the next data change, and the abandoned wrap kept duplicate
   // element ids alive. Reset them wherever the layout is invalidated.
   function resetLayoutCaches(){ FEEDFP=''; }
+  /** The count a tab or column head carries, with its unit — the one place a pane is counted. */
   function badgeOf(k){
-    if(k==='prompts') return (RQ&&RQ.summary)? String(RQ.summary.total) : '';
-    if(k==='feed') return AGFEED&&AGFEED.entries?String(AGFEED.entries.length):'';
-    var st=TREE[k]; return (st.seen&&!st.err)? String(st.count) : ''; }
+    if(k==='prompts'){ var t=(RQ&&RQ.summary)? RQ.summary.total : null; return t==null? '' : t+' ask'+(t===1?'':'s'); }
+    if(k==='feed'){ var e=AGFEED&&AGFEED.entries? AGFEED.entries.length : null; return e==null? '' : e+' entr'+(e===1?'y':'ies'); }
+    var st=TREE[k]; return (st.seen&&!st.err)? sumText(k) : ''; }
   function renderTabs(){
     var host=document.getElementById('tl-tabs'); if(!host) return;
     var h='';
@@ -5355,12 +5738,12 @@ const TIMELINE_SCRIPT = `
     // Three states kept apart, as everywhere else in this product: nothing read yet · the CLI answered
     // nothing · this session genuinely has no recorded ask. Only the last is an observation.
     if(!RQ){
-      body='<div class="rq-empty">'+(SEEN
-        ? 'No answer for <b>prompts</b> — the <b>oak</b> CLI on PATH didn’t return them (a CLI older than 0.8.8 has no <code>prompts</code> command).'
-        : 'Reading this session’s prompts…')+'</div>';
+      body='<div class="rq-empty">'+(!SEEN ? 'Reading this session’s prompts…'
+        : RQWHY ? 'No prompts to list — the <b>oak</b> CLI answered: <b>'+esc(RQWHY)+'</b>'
+        : 'No answer for <b>prompts</b> — the <b>oak</b> CLI on PATH didn’t return them (a CLI older than 0.8.8 has no <code>prompts</code> command).')+'</div>';
     } else {
       var rs=RQ.prompts||[], s=RQ.summary||{total:rs.length,withEdits:0,edits:0};
-      sum = s.total+' ask'+(s.total===1?'':'s')+' · '+s.withEdits+' with edits · '+s.edits+' edit'+(s.edits===1?'':'s');
+      sum = s.withEdits+' with edits · '+s.edits+' edit'+(s.edits===1?'':'s'); // the asks are counted in the tab
       if(!rs.length) body='<div class="rq-empty">No prompts recorded yet — this fills in with every prompt you send in this session.</div>';
       else {
         // Newest ask FIRST: it is the one you are still thinking about. Each row keeps its own #index, so
@@ -5384,10 +5767,11 @@ const TIMELINE_SCRIPT = `
       }
     }
     host.innerHTML=
-      '<div class="rq-head"><span class="rq-title">Prompts</span><span class="rq-sum" id="rq-sum">'+esc(sum)+'</span>'+
+      ((sum||SEL)? '<div class="rq-head"><span class="rq-sum" id="rq-sum">'+esc(sum)+'</span>'+
       (SEL? '<button class="rq-clear" id="rq-clear" title="Clear the prompt scope — the Overview goes back to the whole session">clear scope</button>' : '')+
-      '</div>'+
+      '</div>' : '')+
       '<div class="rq-desc">'+esc(TAB_DESC.prompts)+'</div>'+
+      (RQ&&RQ.fromIndex&&RQ.note? '<div class="rq-desc">'+esc(RQ.note)+'</div>' : '')+
       '<div class="rq-list" id="rq-list">'+body+'</div>';
     var list=host.querySelector('.rq-list');
     var rows=list? list.querySelectorAll('.rq-row') : [];
@@ -5417,6 +5801,17 @@ const TIMELINE_SCRIPT = `
   // window's scope, which is why it goes through a command rather than a local filter.
   // (No backticks in this region: it is inside the TS template literal, which they would close.)
   var SESSROWS=[], SESSCUR='', SESSOPEN=false, SESSSEEN=false;
+  // oak sync's open conflicts, as the host posts them: each its own row under the raised hands, with its two ways out.
+  var SYNCROWS=[];
+  // Other machines' raised hands, as their records brought them: in the needs-you group, each on its machine.
+  var SYNCHANDS=[];
+  // Every other machine's sessions, from its records in the local index: asked for when the list opens, null until the
+  // host answers. Each {label, host, syncedAt, sessions}.
+  var MACHROWS=null;
+  // Each saved machine's sessions as the host's last read of it gave them ({label, listing, readAt, error, reading}), read
+  // again behind them; SAVEDERR, why the saved machines themselves could not be read. SESSMACH: the saved machine the
+  // session under review is on ('' for this machine's).
+  var SAVED=[], SAVEDERR='', SESSMACH='';
   var SESSQ='', SESSSORT='new', SESSACT=false;
   // Conversation search: {q, hits|null} — null hits = the host is still searching.
   var SEARCHRES=null;
@@ -5427,7 +5822,9 @@ const TIMELINE_SCRIPT = `
     return d.getFullYear()+'-'+p2(d.getMonth()+1)+'-'+p2(d.getDate()); }
   function sessName(r){ return (r&&r.title)? r.title : ('session '+String((r&&r.id)||'').slice(0,8)); }
   function sessWhere(r){ return r.workspace||'Unknown workspace'; }
-  function sessCurRow(){ for(var i=0;i<SESSROWS.length;i++) if(String(SESSROWS[i].id)===String(SESSCUR)) return SESSROWS[i]; return null; }
+  function sessCurRow(){ var rows=SESSROWS;
+    if(SESSMACH){ rows=[]; for(var k=0;k<SAVED.length;k++) if(SAVED[k].label===SESSMACH&&SAVED[k].listing) rows=SAVED[k].listing.sessions||[]; }
+    for(var i=0;i<rows.length;i++) if(String(rows[i].id)===String(SESSCUR)) return rows[i]; return null; }
   function renderSess(){
     var dot=document.getElementById('rq-sdot'), nm=document.getElementById('rq-sname'),
         chip=document.getElementById('rq-schip'), list=document.getElementById('rq-slist');
@@ -5437,15 +5834,15 @@ const TIMELINE_SCRIPT = `
     dot.textContent=live?'●':'○';
     // With no row for it (no listing yet, or a session pinned from another workspace) the chip still names
     // the id it is reviewing — an unnamed selector over a session that IS being reviewed says nothing.
-    nm.textContent = SESSCUR? sessName(r||{id:SESSCUR}) : (SESSSEEN? 'no session selected' : 'session —');
+    nm.textContent = SESSCUR? sessName(r||{id:SESSCUR})+(SESSMACH?' · on '+SESSMACH:'') : (SESSSEEN? 'no session selected' : 'session —');
     // Raised hands ride the chip: how many sessions are waiting on the reader.
-    var waitN=0;
+    var waitN=SYNCHANDS.length;
     for(var wi=0;wi<SESSROWS.length;wi++){ var wa=SESSROWS[wi].attention;
       if(wa&&wa.kind!=='idle-done') waitN++; }
     var wEl=document.getElementById('rq-swait');
     if(wEl){ wEl.textContent=waitN?('⚠ '+waitN):''; wEl.style.display=waitN?'':'none'; }
     // The supplied title, full id and conversation recency.
-    chip.title=(r&&r.title? r.title+' — ':'')+'session '+(SESSCUR||'—')+
+    chip.title=(r&&r.title? r.title+' — ':'')+(SESSMACH? SESSMACH+'’s ':'')+'session '+(SESSCUR||'—')+
       (r? ' · '+(live?'active · ':'')+ago(r.lastActiveMs):'')+' · click to switch session';
     if(!SESSOPEN){ list.hidden=true; list.innerHTML=''; return; }
     // ONE string per paint, bar + rows + footer — except while the reader is TYPING in the
@@ -5471,7 +5868,7 @@ const TIMELINE_SCRIPT = `
           '</div></span>'+
       '</div>'+
       '<div id="rq-srows">'+sessRowsHtml()+'</div>'+
-      '<button class="rq-srow" data-sall="1" title="Every session on this machine, from every workspace — the Overview’s Sessions tab is the full browser">'+
+      '<button class="rq-srow" data-sall="1" title="Every session, from every machine and workspace — the Overview’s Sessions tab is the full browser">'+
         '<span class="rq-sdot">☰</span><span class="rq-sname">All sessions…</span></button>';
     list.hidden=false;
     if(!list.addEventListener) return; // a stubbed DOM (tests) renders the string and stops here
@@ -5484,8 +5881,19 @@ const TIMELINE_SCRIPT = `
         // deleted one drops out in place.
         var del=(t&&t.closest)? t.closest('[data-sdel]') : null;
         if(del){ ev.stopPropagation(); vscode.postMessage({type:'deleteSession', id:del.getAttribute('data-sdel')}); return; }
+        var sy=(t&&t.closest)? t.closest('[data-sync]') : null;
+        if(sy){ ev.stopPropagation(); vscode.postMessage({type:'syncConflict', id:sy.getAttribute('data-sync'), act:sy.getAttribute('data-act')}); return; }
         var ss=(t&&t.closest)? t.closest('[data-ssearch]') : null;
         if(ss){ var sq=ss.getAttribute('data-ssearch')||''; SEARCHRES={q:sq,hits:null}; renderSessRowsOnly(); vscode.postMessage({type:'searchConversations', q:sq}); return; }
+        var sh=(t&&t.closest)? t.closest('[data-search-id]') : null;
+        if(sh){ SESSOPEN=false; renderSess(); vscode.postMessage({type:'pickSearchHit', id:sh.getAttribute('data-search-id'), machine:sh.getAttribute('data-search-machine')||''}); return; }
+        var ww=(t&&t.closest)? t.closest('[data-workspace-window]') : null;
+        if(ww){ ev.stopPropagation(); vscode.postMessage({type:'openWorkspaceWindow',id:ww.getAttribute('data-workspace-window'),machine:ww.getAttribute('data-machine')||''}); return; }
+        var rb=(t&&t.closest)? t.closest('[data-rsid]') : null;
+        if(rb){ SESSOPEN=false; renderSess(); vscode.postMessage({type:'pickRemote', id:rb.getAttribute('data-rsid'), machine:rb.getAttribute('data-rmach')}); return; }
+        var mb=(t&&t.closest)? t.closest('[data-msid]') : null;
+        if(mb){ SESSOPEN=false; renderSess(); var pk={type:'pickSynced', id:mb.getAttribute('data-msid'), host:mb.getAttribute('data-mhost')};
+          if(mb.getAttribute('data-mhand')) pk.hand=true; vscode.postMessage(pk); return; }
         var b=(t&&t.closest)? t.closest('[data-sid]') : null;
         if(b){ SESSOPEN=false; renderSess(); vscode.postMessage({type:'pickSession', id:b.getAttribute('data-sid')}); return; }
         if((t&&t.closest)? t.closest('[data-sall]') : null){ SESSOPEN=false; renderSess(); vscode.postMessage({type:'allSessions'}); return; }
@@ -5504,40 +5912,70 @@ const TIMELINE_SCRIPT = `
       });
       list.addEventListener('keydown', function(ev){
         var t=ev.target; if(!t||t.id!=='rq-sq') return;
-        // Enter opens the first matching session; with none, it runs the conversation search instead.
-        if(ev.key==='Enter'){ var f=list.querySelector('#rq-srows [data-sid]')||list.querySelector('#rq-srows [data-ssearch]'); if(f&&f.click) f.click(); ev.preventDefault(); }
+        // Enter opens the first matching row in display order, including saved and indexed machines.
+        if(ev.key==='Enter'){ var f=list.querySelector('#rq-srows [data-sid], #rq-srows [data-rsid], #rq-srows [data-msid]')||list.querySelector('#rq-srows [data-ssearch]'); if(f&&f.click) f.click(); ev.preventDefault(); }
         if(ev.key==='Escape'){ SESSOPEN=false; renderSess(); ev.preventDefault(); }
       });
     }
   }
-  /** The dropdown's rows as ONE html string — search/sort/filter applied, current always kept. */
+  var SESSION_ORDER_CACHE=null;
+  function sessionWaiting(r){ return r.attention&&r.attention.kind!=='idle-done'; }
+  function sessionMatches(r,q){ return !q||((r.title||'')+' '+r.id+' '+(r.workspace||'')+' '+(r.model||'')+' '+(r.agent||'')+' '+(r._machine||'')).toLowerCase().indexOf(q.toLowerCase())>=0; }
+  function sessionVisible(r,q,active,pin,machine){
+    var current=(r._machine||'')===(machine||'')&&String(r.id)===String(pin);
+    var live=(!r._synced&&(r.active||Date.now()-Math.max(r.liveMs||0,r.lastActiveMs||0)<=60000))||(r.activeWorkers||[]).some(function(w){return w.phase==='working'||w.phase==='awaiting-input'||w.phase==='awaiting-permission';});
+    return sessionMatches(r,q)&&(!active||current||live||r.pending||sessionWaiting(r));
+  }
+  // Flatten in linear time. A saved listing supersedes the same machine's indexed records.
+  function machineRows(local,saved,machines){
+    var rows=local.slice(), listed=new Set();
+    (saved||[]).forEach(function(m){ if(!m.listing) return; listed.add(m.label);
+      (m.listing.sessions||[]).forEach(function(r){ rows.push(Object.assign({},r,{_row:r,_machine:m.label})); }); });
+    (machines||[]).forEach(function(m){ if(listed.has(m.label)) return;
+      (m.sessions||[]).forEach(function(r){ rows.push(Object.assign({},r,{_row:r,_machine:m.label,_host:m.host,_synced:true})); }); });
+    return rows;
+  }
+  // Sort only when the source rows change; search, filter and repeated paints walk the cached orders once.
+  function orderedSessionRows(rows,sort){
+    var c=SESSION_ORDER_CACHE;
+    if(!c||c.rows.length!==rows.length||rows.some(function(r,i){ var a=c.rows[i]; return (r._row||r)!==(a._row||a)||r._machine!==a._machine||r._host!==a._host; })){
+      c={rows:rows,orders:{}}; SESSION_ORDER_CACHE=c;
+      ['new','old','az','za'].forEach(function(k){ c.orders[k]=rows.slice().sort(function(a,b){
+        var aw=sessionWaiting(a), bw=sessionWaiting(b);
+        if(!!aw!==!!bw) return aw?-1:1;
+        if(aw&&bw){ var ranks={permission:0,question:1,input:2}; return ((ranks[a.attention.kind]||0)-(ranks[b.attention.kind]||0))||((a.attention.ts||0)-(b.attention.ts||0)); }
+        if(k==='new'||k==='old') return ((a.lastActiveMs||0)-(b.lastActiveMs||0))*(k==='new'?-1:1);
+        var an=String(a.title||a.id).toLowerCase(),bn=String(b.title||b.id).toLowerCase(); return (an<bn?-1:an>bn?1:0)*(k==='za'?-1:1);
+      }); });
+    }
+    return c.orders[sort]||c.orders.new;
+  }
+  function machineStatusHtml(saved,machines,error,cls){
+    var h='',seen=new Set();
+    function line(text){ h+='<div class="'+cls+'">'+esc(text)+'</div>'; }
+    if(error) line('could not read the saved machines — '+error);
+    (saved||[]).forEach(function(m){ seen.add(m.label); var ls=m.listing, state;
+      if(m.error) state='could not list sessions — '+m.error+' · '+(m.readAt?'last read '+ago(m.readAt):'never read');
+      else if(!ls) state='has not answered yet';
+      else state=(ls.fromIndex?'from its records, synced '+ago(ls.syncedAt||m.readAt):'read '+ago(m.readAt))+' ('+(ls.sessions||[]).length+')'+(!(ls.sessions||[]).length?' · no sessions':'');
+      line(m.label+' · '+state+(m.reading?' · reading again…':'')); });
+    (machines||[]).forEach(function(m){ if(!seen.has(m.label)) line(m.label+' · synced '+(m.syncedAt?ago(m.syncedAt):'at a time not recorded')+' ('+(m.sessions||[]).length+')'); });
+    return h;
+  }
+  /** One order across machines; machine state stays above the rows even under a search. */
   function sessRowsHtml(){
     var q=(SESSQ||'').toLowerCase();
-    var out=[];
-    for(var i=0;i<SESSROWS.length;i++){ var s=SESSROWS[i];
-      var isCur=(String(s.id)===String(SESSCUR));
-      if(SESSACT&&!s.active&&!isCur) continue;
-      if(q&&!isCur){
-        var hay=((s.title||'')+' '+s.id+' '+(s.workspace||'')+' '+(s.model||'')+' '+(s.agent||'')).toLowerCase();
-        if(hay.indexOf(q)<0) continue;
-      }
-      out.push(s);
-    }
-    if(SESSSORT!=='new') out.sort(function(a,b){
-      if(String(a.id)===String(SESSCUR)) return -1;
-      if(String(b.id)===String(SESSCUR)) return 1;
-      if(SESSSORT==='old') return (a.lastActiveMs||0)-(b.lastActiveMs||0);
-      var an=String(a.title||a.id).toLowerCase(), bn=String(b.title||b.id).toLowerCase();
-      var c=an<bn?-1:an>bn?1:0;
-      return SESSSORT==='za'?-c:c;
-    });
-    var h='';
+    var all=machineRows(SESSROWS,SAVED,MACHROWS);
+    var out=orderedSessionRows(all,SESSSORT).filter(function(r){ return sessionVisible(r,q,SESSACT,SESSCUR,SESSMACH); });
+    var h=machineStatusHtml(SAVED,MACHROWS,SAVEDERR,'rq-sgrp');
     function waitOf(s){ var a=s.attention; return (a&&a.kind&&a.kind!=='idle-done')? a : null; }
-    function srow(s){ var on=(String(s.id)===String(SESSCUR)), wa=waitOf(s);
-      return '<button class="rq-srow'+(on?' on':'')+(wa?' hand':'')+'" data-sid="'+esc(s.id)+'" title="'+
+    function srow(s){ var on=(s._machine||'')===SESSMACH&&String(s.id)===String(SESSCUR), wa=waitOf(s);
+      var attrs=s._synced?'data-msid="'+esc(s.id)+'" data-mhost="'+esc(s._host)+'"':s._machine?'data-rsid="'+esc(s.id)+'" data-rmach="'+esc(s._machine)+'"':'data-sid="'+esc(s.id)+'"';
+      return '<button class="rq-srow'+(on?' on':'')+(wa?' hand':'')+'" '+attrs+' title="'+
         esc(sessName(s)+' — session '+s.id+' · '+sessWhere(s)+' · '+(s.active?'active · ':'')+ago(s.lastActiveMs))+'">'+
         '<span class="rq-sdot'+(wa?' wait':(s.active?' live':''))+'">'+(wa?'⚠':(s.active?'●':'○'))+'</span>'+
         '<span class="rq-sname">'+esc(sessName(s))+'</span>'+
+        (s._machine?'<span class="rq-agentbadge">'+esc(s._machine)+'</span>':'')+
         // The raised hand said in full (2026-09-15): what kind of wait, on what, for how long.
         (wa?'<span class="rq-shand" title="What this session is waiting on, and for how long">'+esc(wa.kind+(wa.message?' · '+wa.message:'')+(wa.ts?' · '+fmtDur(Date.now()-wa.ts):''))+'</span>':'')+
         ((s.agent&&s.agent!=='claude')?'<span class="rq-agentbadge" title="The agent that ran this session">'+esc(s.agent)+'</span>':'')+
@@ -5545,37 +5983,66 @@ const TIMELINE_SCRIPT = `
         '<span class="rq-sago">'+(s.edits||0)+(s.edits===1?' edit · ':' edits · ')+fmtTok(s.tokens||0)+' tok · '+fmtDur(s.durationMs||0)+'</span>'+ 
         '<span class="rq-sws">'+esc(s.workspace||'')+'</span>'+
         '<span class="rq-sago">'+esc(ago(s.lastActiveMs))+(on?' · reviewing':'')+'</span>'+
+        '<span class="rq-sdel" data-workspace-window="'+esc(s.id)+'" data-machine="'+esc(s._machine||'')+'" title="Open workspace window">↗ window</span>'+
         // Delete straight from the selector. A SPAN, not a nested button (invalid
         // inside this row's button); the list listener catches [data-sdel] before the row's [data-sid]
         // so the click deletes rather than switches. 🗑 emoji, not a webview codicon — the trash glyph is
         // outside the whitelisted subset and would render a silent blank in a webview.
-        '<span class="rq-sdel" data-sdel="'+esc(s.id)+'" title="Delete this session from OAK — removes it from every picker and purges its captured edits for good. The transcript itself is not deleted; oak sessions --undelete '+esc(s.id)+' lists it again, without its edits">🗑</span></button>';
+        (s._machine?'':'<span class="rq-sdel" data-sdel="'+esc(s.id)+'" title="Delete this session from OAK — removes it from every picker and purges its captured edits; the transcript itself is not deleted. The confirmation says what oak sessions --undelete '+esc(s.id)+' brings back">🗑</span>')+'</button>';
     }
     // NEEDS YOU: the raised hands lead the list under their own header,
     // ordered by the rank the host stamped on each row (core.HAND_RANK: permission, question, input;
     // oldest first) — the same order as the inbox and the terminal app. The rest keep the reader's sort.
     var hands=[], rest=[];
     for(var r2=0;r2<out.length;r2++){ (waitOf(out[r2])?hands:rest).push(out[r2]); }
-    hands.sort(function(a,b){ var d=(a.handRank||9)-(b.handRank||9); return d||((a.attention.ts||0)-(b.attention.ts||0)); });
-    if(hands.length){ h+='<div class="rq-sgrp">needs you ('+hands.length+')</div>'; for(var hi=0;hi<hands.length;hi++) h+=srow(hands[hi]); if(rest.length) h+='<div class="rq-sgrp">sessions</div>'; }
+    // Another machine's hand waits there: its row says where, and a click says what is known of it (read-only, with a fetch).
+    var handKeys=new Set(out.filter(sessionWaiting).map(function(r){return (r._machine||'')+'\u0000'+r.id;}));
+    for(var y=0;y<SYNCHANDS.length;y++){ var sy=SYNCHANDS[y];
+      if(handKeys.has(sy.machine+'\u0000'+sy.id)) continue;
+      if(q&&((sy.title||'')+' '+sy.id+' '+(sy.workspace||'')+' '+(sy.agent||'')+' '+sy.machine).toLowerCase().indexOf(q)<0) continue;
+      hands.push({synced:true, id:sy.id, host:sy.host, machine:sy.machine, title:sy.title, agent:sy.agent, workspace:sy.workspace, handRank:sy.handRank,
+        attention:{kind:sy.kind, message:sy.message, ts:sy.ts}, syncedAt:sy.syncedAt}); }
+    // A permission prompt's rank is 0, which an || would read as no rank at all.
+    function rankOf(x){ var ranks={permission:0,question:1,input:2}; return typeof x.handRank==='number'? x.handRank : (ranks[(x.attention||{}).kind]===undefined?9:ranks[x.attention.kind]); }
+    hands.sort(function(a,b){ var d=rankOf(a)-rankOf(b); return d||((a.attention.ts||0)-(b.attention.ts||0)); });
+    function synrow(s){ var wa=s.attention;
+      return '<button class="rq-srow hand" data-msid="'+esc(s.id)+'" data-mhost="'+esc(s.host)+'" data-mhand="1" title="'+
+        esc(sessName(s)+' — '+s.machine+'’s session '+s.id+' · '+sessWhere(s)+' · as its records said'+(s.syncedAt?' when oak sync brought them at '+ago(s.syncedAt):'')+': a click says what is known of it and offers to fetch it here')+'">'+
+        '<span class="rq-sdot wait">⚠</span>'+
+        '<span class="rq-sname">'+esc(sessName(s))+'</span>'+
+        '<span class="rq-shand" title="What this session is waiting on, and for how long">'+esc(wa.kind+(wa.message?' · '+wa.message:'')+(wa.ts?' · '+fmtDur(Date.now()-wa.ts):''))+'</span>'+
+        '<span class="rq-agentbadge" title="The machine this session waits on">'+esc(s.machine)+'</span>'+
+        ((s.agent&&s.agent!=='claude')?'<span class="rq-agentbadge" title="The agent that ran this session">'+esc(s.agent)+'</span>':'')+
+        '<span class="rq-sws">'+esc(s.workspace||'')+'</span></button>';
+    }
+    if(hands.length){ h+='<div class="rq-sgrp">needs you ('+hands.length+')</div>'; for(var hi=0;hi<hands.length;hi++) h+=(hands[hi].synced?synrow(hands[hi]):srow(hands[hi])); }
+    // oak sync's conflicts, after the hands (a hand is an agent waiting now): both copies open side by side, or the copy goes.
+    if(SYNCROWS.length){ h+='<div class="rq-sgrp">sync conflicts ('+SYNCROWS.length+')</div>';
+      for(var ci=0;ci<SYNCROWS.length;ci++){ var cf=SYNCROWS[ci];
+        h+='<div class="rq-srow rq-sync" title="'+esc(cf.family+' '+cf.name+' from '+cf.from+' — yours: '+(cf.file||'not where sync reaches it here')+' · '+cf.from+'\u2019s copy: '+cf.copy)+'">'+
+          '<span class="rq-sdot wait">\u21c4</span><span class="rq-sname">'+esc(cf.family+' '+cf.name)+'</span>'+
+          '<span class="rq-shand">from '+esc(cf.from)+' — '+esc(cf.resolution)+'</span>'+
+          '<span class="rq-sact" data-sync="'+esc(cf.id)+'" data-act="open" title="Open both copies side by side: '+esc(cf.from)+'\u2019s on the left, yours on the right, to edit into the merge">open both</span>'+
+          '<span class="rq-sact" data-sync="'+esc(cf.id)+'" data-act="delete" title="Delete '+esc(cf.from)+'\u2019s copy (it goes to sync\u2019s trash), so yours stands">delete the copy</span></div>'; } }
+    if((hands.length||SYNCROWS.length)&&rest.length) h+='<div class="rq-sgrp">sessions</div>';
     for(var ri=0;ri<rest.length;ri++) h+=srow(rest[ri]);
-    if(!out.length) h='<div class="rq-snone">no session matches'+(q?' “'+esc(SESSQ)+'”':'')+(SESSACT?' (a filter is on)':'')+'</div>';
-    else if(out.length<SESSROWS.length) h+='<div class="rq-snone">'+(SESSROWS.length-out.length)+' hidden by the search/filter</div>';
+    if(!out.length) h+='<div class="rq-snone">no session matches'+(q?' “'+esc(SESSQ)+'”':'')+(SESSACT?' (a filter is on)':'')+'</div>';
+    else if(out.length<all.length) h+='<div class="rq-snone">'+(all.length-out.length)+' hidden by the search/filter</div>';
     // SEARCH THE CONVERSATIONS: with words typed, one more row asks the host to search
     // every session's asks and answers; the hits land beneath as rows that pick the session.
     if(q.length>=2){
-      h+='<button class="rq-srow rq-ssearch" data-ssearch="'+esc(SESSQ)+'" title="Search the asks you typed and the answers you got, in every session on this machine"><span class="rq-sdot">⌕</span><span class="rq-sname">search conversations for “'+esc(SESSQ)+'”</span><span class="rq-sago">asks and answers, every session</span></button>';
+      h+='<button class="rq-srow rq-ssearch" data-ssearch="'+esc(SESSQ)+'" title="Search the asks you typed and the answers you got, in sessions on this machine and saved machines"><span class="rq-sdot">⌕</span><span class="rq-sname">search conversations for “'+esc(SESSQ)+'”</span><span class="rq-sago">asks and answers, every session</span></button>';
       if(SEARCHRES&&SEARCHRES.q===SESSQ){
         var hits=SEARCHRES.hits;
-        if(hits===null) h+='<div class="rq-snone">searching… (the first search builds the index)</div>';
-        else if(SEARCHRES.error) h+='<div class="rq-snone">could not search the conversations — '+esc(SEARCHRES.error)+'</div>';
-        else if(!hits.length) h+='<div class="rq-snone">nothing matches “'+esc(SESSQ)+'” in any conversation</div>';
-        else {
+        if(hits===null) h+='<div class="rq-snone">searching… (the first search prepares the search cache)</div>';
+        if(SEARCHRES.error) h+='<div class="rq-snone">could not search the conversations — '+esc(SEARCHRES.error)+'</div>';
+        if(hits && !hits.length && !SEARCHRES.error) h+='<div class="rq-snone">nothing matches “'+esc(SESSQ)+'” in any conversation</div>';
+        if(hits && hits.length) {
           h+='<div class="rq-sgrp">in conversations ('+hits.length+')</div>';
           for(var si=0;si<hits.length;si++){ var ht=hits[si];
-            h+='<button class="rq-srow" data-sid="'+esc(ht.session)+'" title="'+esc((ht.title||ht.session)+' — '+ago(ht.ts)+' · click to review this session')+'">'+
+            h+='<button class="rq-srow" data-search-id="'+esc(ht.session)+'" data-search-machine="'+esc(ht.machine||'')+'" title="'+esc((ht.title||ht.session)+' — '+ago(ht.ts)+' · click to review this session')+'">'+
               '<span class="rq-sdot">'+(ht.where==='prompt'?'?':'≡')+'</span>'+
-              '<span class="rq-sname">'+esc(ht.title||('session '+String(ht.session).slice(0,8)))+'</span>'+
+              '<span class="rq-sname">'+esc(ht.title||('session '+String(ht.session).slice(0,8)))+' · '+esc(ht.machine||'This machine')+'</span>'+
               ((ht.agent&&ht.agent!=='claude')?'<span class="rq-agentbadge">'+esc(ht.agent)+'</span>':'')+
               '<span class="rq-sago">'+esc(ago(ht.ts))+' · '+(ht.where==='prompt'?'ask':'answer')+'</span>'+
               '<span class="rq-shit">'+esc(ht.snippet)+'</span></button>';
@@ -5592,7 +6059,7 @@ const TIMELINE_SCRIPT = `
   var schip=document.getElementById('rq-schip');
   // The ⚠ count on the chip is a door of its own: a click on it jumps to the next raised hand instead
   // of opening the list (the host applies core's ranking).
-  if(schip) schip.addEventListener('click', function(ev){ var t=ev.target; if(t&&t.closest&&t.closest('#rq-swait')){ ev.stopPropagation(); vscode.postMessage({type:'nextAttention'}); return; } SESSOPEN=!SESSOPEN; renderSess(); });
+  if(schip) schip.addEventListener('click', function(ev){ var t=ev.target; if(t&&t.closest&&t.closest('#rq-swait')){ ev.stopPropagation(); vscode.postMessage({type:'nextAttention'}); return; } SESSOPEN=!SESSOPEN; if(SESSOPEN) vscode.postMessage({type:'wantMachines'}); renderSess(); });
   // The + NEW SESSION menu: the installed agent CLIs; picking one opens that
   // CLI in a herdr terminal; the Feed shows its captured conversation.
   var NEWCLIS=null;
@@ -5646,7 +6113,10 @@ const TIMELINE_SCRIPT = `
   window.addEventListener('message', function(ev){ var m=ev.data||{};
     if(m.type==='tour'){ applyTour(m.anchor||null); return; }
     if(m.type==='newSessionAgents'){ NEWCLIS=m.items||[]; renderNewDrop(); return; }
-    if(m.type==='sessions'){ SESSROWS=m.rows||[]; SESSCUR=m.current||''; SESSSEEN=true; renderSess(); return; }
+    if(m.type==='sessions'){ SESSROWS=m.rows||[]; SESSCUR=m.current||''; SESSMACH=m.machine||''; SYNCHANDS=m.syncedHands||[]; SESSSEEN=true; renderSess(); return; }
+    if(m.type==='saved'){ SAVED=m.machines||[]; SAVEDERR=m.error||''; renderSess(); return; }
+    if(m.type==='syncConflicts'){ SYNCROWS=m.rows||[]; renderSess(); return; }
+    if(m.type==='machines'){ MACHROWS=m.machines||[]; renderSess(); return; }
     if(m.type==='searchResults'){ SEARCHRES={q:String(m.q||''), hits:Array.isArray(m.hits)?m.hits:[], error:String(m.error||'')}; renderSessRowsOnly(); return; }
     // A tour step (or a command) naming a tab brings it forward. Grouped, everything it could name is
     // already on screen — except a column the reader folded, which is brought back rather than left
@@ -5667,11 +6137,11 @@ const TIMELINE_SCRIPT = `
         // What the re-fetch storm cost is paid for instead by the host's tree throttle, which bounds
         // this whole exchange to once per 3s while the agent works.
         st.rows={}; st.req={}; st.rows['']=m.rows||[];
-        st.count=m.count||0; st.err=m.err||null; st.seen=true;
+        st.count=m.count||0; st.err=m.err||null; st.seen=!m.wait; st.note=m.note||null;
         if(typeof m.hooks==='boolean') st.hooks=m.hooks;
       } else { st.rows[m.parent]=m.rows||[]; delete st.req[m.parent]; }
       renderTabs(); paintColBadges(); renderTree(m.tab); return; }
-    if(m.type==='prompts'){ RQ=m.rq||null; SEEN=true; if(m.selected!==undefined) SEL=m.selected; renderPrompts(); renderTabs(); paintColBadges(); }
+    if(m.type==='prompts'){ RQ=m.rq||null; RQWHY=m.why||null; SEEN=true; if(m.selected!==undefined) SEL=m.selected; renderPrompts(); renderTabs(); paintColBadges(); }
     else if(m.type==='response'){ RESP[m.id]=m.response||{text:'',turns:0,truncated:0}; renderPrompts(); }
     // The tab's feed head. A payload for a connection the reader already left is dropped.
     else if(m.type==='agentFeed'){
@@ -5684,8 +6154,9 @@ const TIMELINE_SCRIPT = `
       AGSCROLLTS=(typeof m.scrollTs==='number'&&m.scrollTs>0)?m.scrollTs:0;
       AGSCROLLMODE=(m.scrollMode==='end')?'end':'start';
       if(shows('feed')) renderFeedTab();
+      renderTabs(); paintColBadges(); // the Feed's count rides its tab and column head
     }
-    else if(m.type==='error'){ RQ=null; SEEN=true; renderPrompts(); renderTabs(); }
+    else if(m.type==='error'){ RQ=null; RQWHY=m.why||null; SEEN=true; renderPrompts(); renderTabs(); paintColBadges(); }
   });
   renderTabs();
   applyPanes();
@@ -5722,6 +6193,457 @@ function readSessionListing(cwd: string, session?: string | null): Promise<core.
     (data) => { const listing = data as core.SessionMeta | null; resolve(Array.isArray(listing?.sessions) ? listing : null); }));
 }
 
+/**
+ * Every other machine's sessions the local index holds from its records, by label, with when oak sync last brought them
+ * (`oak sessions --json --synced`): read in-process and read-only where this host's Node runs the index, else from the
+ * CLI. Empty where there is no index, or oak sync never brought another machine's records here (then nothing is asked).
+ */
+async function readMachineListings(cwd: string): Promise<core.MachineListing[]> {
+  const here = core.readMachineListings();
+  if (here) return here;
+  if (core.indexMode() === 'off' || !core.recordHosts().some((h) => h !== core.machineHostTag())) return [];
+  return new Promise((resolve) => spawnCliJson(['sessions', '--json', '--synced', '--root', cwd], cwd, (data) => {
+    const machines = (data as { machines?: unknown } | null)?.machines;
+    resolve(Array.isArray(machines) ? (machines as core.MachineListing[]) : []);
+  }));
+}
+
+/**
+ * Every saved machine's sessions, as the terminal app lists them: herdr's enabled saved machines (`oak machine list
+ * --json`), each asked `oak sessions --json --machine <label>`, which answers from this machine's index when oak sync read
+ * that machine lately and nothing may be running there (`fromIndex`, `syncedAt`), else over ssh. Read in the background,
+ * every machine at once, each with the terminal app's deadline: what the last read gave shows at once with when it was
+ * read, and is read again behind it, no machine more often than every ten seconds. A read that fails says why and when
+ * the machine was last read, and its rows go: a failed refresh never shows the last answer as current.
+ */
+type SavedListing = { workers?: core.WorkerRow[]; workerError?: string; sessions: core.SessionMetaRow[]; fromIndex?: boolean; syncedAt?: number; publishedAt?: number | null };
+type SavedMachine = { label: string; listing: SavedListing | null; readAt: number | null; error: string | null; reading: boolean };
+const SAVED_READ_MS = 10_000;
+const SAVED_DEADLINE_MS = 45_000;
+const saved = { source: "", labels: null as string[] | null, error: null as string | null, labelsAt: 0, labelsReading: false,
+  machines: new Map<string, SavedMachine & { nextAt: number; workersRead?: boolean }>(), reviews: new Map<string, string>() };
+/** Told each time a saved machine's read lands. */
+const savedListeners = new Set<() => void>();
+const savedWorkerViews = new Set<() => boolean>();
+
+/** What the saved machines' last reads gave, in herdr's order; never waited for. */
+function savedMachineSnapshot(): { error: string | null; machines: SavedMachine[] } {
+  return { error: saved.error, machines: (saved.labels ?? []).map((label) => {
+    const m = saved.machines.get(label);
+    return { label, listing: m?.listing ?? null, readAt: m?.readAt ?? null, error: m?.error ?? null, reading: m?.reading ?? true };
+  }) };
+}
+
+/** Read the saved machines, and each one's sessions, again behind what is shown. No herdr here: none is saved, and
+ *  nothing is asked. */
+function refreshSavedMachines(machine?: string | null, session?: string | null): void {
+  const source = resolveObservatoryBin() + '\u0000' + (process.env.CLAUDE_CONFIG_DIR ?? '');
+  if (saved.source !== source) {
+    saved.source = source; saved.labels = null; saved.error = null; saved.labelsAt = 0; saved.labelsReading = false; saved.machines.clear(); saved.reviews.clear();
+  }
+  if (machine && session) saved.reviews.set(machine, session);
+  if (!core.findHerdrBin()) {
+    if (saved.labels?.length || saved.error) { saved.labels = []; saved.error = null; for (const f of savedListeners) f(); }
+    return;
+  }
+  const readAll = () => { for (const label of saved.labels ?? []) readSavedMachine(label); };
+  if (saved.labelsReading) return;
+  if (saved.labels && Date.now() - saved.labelsAt < SAVED_READ_MS * 3) return readAll();
+  saved.labelsReading = true;
+  void runOak(['machine', 'list', '--json'], { timeoutMs: 30_000 }).then((r) => {
+    if (saved.source !== source) return;
+    let list: unknown;
+    try { list = JSON.parse(r.stdout); } catch { list = null; }
+    if (Array.isArray(list)) {
+      saved.labels = list.filter((m) => m?.enabled !== false && typeof m?.label === 'string').map((m) => core.plainLabel(m.label)).filter(Boolean);
+      saved.error = null;
+    } else saved.error = core.cliFailureMessage(r.stdout, r.stderr, 'oak machine list did not answer').replace(/^oak: /, '');
+    saved.labelsAt = Date.now();
+    saved.labelsReading = false;
+    for (const f of savedListeners) f();
+    readAll();
+  });
+}
+
+/** One saved machine's sessions, read again unless a read of it runs, or ran within the last ten seconds (or as long as
+ *  that read took, when longer). */
+function readSavedMachine(label: string): void {
+  const m = saved.machines.get(label) ?? { label, listing: null, readAt: null, error: null, reading: false, nextAt: 0 };
+  saved.machines.set(label, m);
+  const workers = [...savedWorkerViews].some(visible => visible());
+  if (m.reading || (Date.now() < m.nextAt && (!workers || m.workersRead))) return;
+  m.reading = true;
+  m.workersRead = workers;
+  const started = Date.now();
+  const source = saved.source;
+  const deadline = SAVED_DEADLINE_MS + 5_000; // the CLI's own deadline first, so the reason is its own
+  void runOak(['sessions', '--json', ...(workers ? ['--workers'] : []), ...(saved.reviews.get(label) ? ['--session', saved.reviews.get(label)!] : []), '--machine', label], { timeoutMs: deadline, env: { OAK_MACHINE_TIMEOUT_MS: String(SAVED_DEADLINE_MS) } }).then((r) => {
+    if (saved.source !== source) return;
+    let listing: SavedListing | null = null;
+    try { listing = JSON.parse(r.stdout); } catch { listing = null; }
+    if (r.code === 0 && Array.isArray(listing?.sessions)) Object.assign(m, { listing, readAt: started, error: null });
+    else Object.assign(m, { listing: null, error: core.cliFailureMessage(r.stdout, r.stderr, r.code === null ? `no answer within ${deadline / 1000} s` : `oak sessions --machine ${label} did not answer`).replace(/^oak: /, '') });
+    m.reading = false;
+    m.nextAt = Date.now() + Math.max(SAVED_READ_MS, Date.now() - started);
+    for (const f of savedListeners) f();
+    if (!workers && [...savedWorkerViews].some(visible => visible())) readSavedMachine(label);
+  });
+}
+
+/** Workers consume the same saved-machine answers as the session selectors. A failed saved read also
+ *  removes its older synced worker rows, so those cannot masquerade as a current answer. */
+function workerMachineListings(synced: core.MachineListing[]): core.MachineListing[] {
+  const snapshot = savedMachineSnapshot();
+  const labels = new Set(snapshot.machines.map((m) => m.label));
+  return [...synced.filter((m) => !labels.has(m.label)), ...snapshot.machines.flatMap((m) => m.listing ? [{
+    label: m.label, host: synced.find((s) => s.label === m.label)?.host ?? m.label,
+    syncedAt: m.listing.syncedAt ?? m.readAt, publishedAt: m.listing.publishedAt ?? null, sessions: m.listing.sessions,
+  }] : [])];
+}
+
+/** A CLI verb run on a saved machine (`--machine`), with the deadline its listing has: its JSON answer, or why none came. */
+/** Search each saved machine concurrently, with the same deadline as the other remote editor reads. */
+async function searchConversationMachines(q: string, cancel?: vscode.CancellationToken): Promise<{ hits: (core.SearchHit & { machine: string })[]; error: string }> {
+  const opts = { timeoutMs: SAVED_DEADLINE_MS + 5_000, cancel, env: { OAK_MACHINE_TIMEOUT_MS: String(SAVED_DEADLINE_MS) } };
+  const hits: (core.SearchHit & { machine: string })[] = [], errors: string[] = [];
+  const search = async (machine: string) => {
+    const r = await runOak(['search', '--json', '--query=' + q, '--per-session', '--limit', '200', ...(machine ? ['--machine', machine] : [])], opts);
+    try {
+      const data = JSON.parse(r.stdout);
+      if (r.code !== 0 || !Array.isArray(data.hits)) throw new Error('invalid search answer');
+      hits.push(...data.hits.filter((h: core.SearchHit) => typeof h.session === 'string').map((h: core.SearchHit) => ({ ...h, machine })));
+    } catch { errors.push(`${machine || 'This machine'}: ${core.cliFailureMessage(r.stdout, r.stderr, 'search did not answer')}`); }
+  };
+  const local = search('');
+  const listing = await runOak(['machine', 'list', '--json'], opts);
+  let labels: string[] = [];
+  try {
+    const machines = JSON.parse(listing.stdout);
+    if (listing.code !== 0 || !Array.isArray(machines)) throw new Error('invalid machine list');
+    labels = [...new Set<string>(machines.filter(m => m.enabled !== false && typeof m.label === 'string' && m.label).map(m => m.label))];
+  } catch { errors.push(`Saved machines: ${core.cliFailureMessage(listing.stdout, listing.stderr, 'machine list did not answer')}`); }
+  if (!cancel?.isCancellationRequested) await Promise.all([local, ...labels.map(search)]);
+  else await local;
+  return { hits, error: errors.join('; ') };
+}
+async function openConversationHit(hit: { session: string; machine: string }): Promise<void> {
+  if (hit.machine) await vscode.commands.executeCommand('claudeObservatory.pinRemoteSession', hit.machine, hit.session);
+  else await vscode.commands.executeCommand('claudeObservatory.pinSession', hit.session);
+}
+
+let openingWorkspaceWindow = false;
+async function openWorkspaceWindow(session: string, machine?: string): Promise<void> {
+  if (openingWorkspaceWindow) return;
+  openingWorkspaceWindow = true;
+  try {
+    if (!session) throw new Error('this row has no workspace');
+    // --session: a bare listing of a machine oak sync keeps is answered from the local index (`~/…` paths, no
+    // workspaceExists); asked for one session, the machine itself answers.
+    const listing = machine ? (await oakOn(machine, ['sessions', '--json', '--session', session])).json
+      : await readSessionListing(workspaceRoot() ?? process.cwd(), currentSession());
+    const row = (listing?.sessions as core.SessionMetaRow[] | undefined)?.find(r => r.id === session);
+    const folder = row?.workspacePath;
+    if (!folder || (!path.isAbsolute(folder) && !path.posix.isAbsolute(folder))) throw new Error('this session has no workspace');
+    const exists = machine ? row.workspaceExists : core.workspaceDirectoryExists(folder);
+    if (exists === false) throw new Error(`workspace folder is missing or unavailable${machine ? ` on ${machine}` : ''}: ${folder}`);
+    if (exists !== true) throw new Error(`could not verify the workspace folder on ${machine}; update OAK there`);
+    let uri = vscode.Uri.file(folder);
+    if (machine) {
+      const result = await runOak(['machine', 'list', '--json'], { timeoutMs: 15000 });
+      const matches = JSON.parse(result.stdout).filter((m: { label: string; id: string; enabled: boolean }) => m.label === machine || m.id === machine);
+      if (result.code !== 0 || matches.length !== 1 || matches[0].enabled === false || !matches[0].target) throw new Error('Saved machine has no unique enabled SSH target');
+      uri = vscode.Uri.from({ scheme: 'vscode-remote', authority: 'ssh-remote+' + matches[0].target, path: folder });
+    } else {
+      // In a Remote-SSH extension host, "local" means that host, not the desktop's filesystem.
+      const host = vscode.workspace.workspaceFolders?.[0]?.uri;
+      if (host?.scheme === 'vscode-remote') uri = vscode.Uri.from({ scheme: host.scheme, authority: host.authority, path: folder });
+    }
+    if (machine) {
+      const prepared = await oakOn(machine, ['editor-review', 'prepare', '--session', session, '--editor', editorReviewKind(), '--action', 'workspace', '--json']);
+      if (!prepared.json?.request || prepared.json.workspace !== folder) throw new Error(prepared.why || 'The workspace handoff was not written for this folder');
+    } else core.writeEditorReviewRequest({ editor: editorReviewKind(), session, workspace: folder, action: 'workspace' });
+    await vscode.commands.executeCommand('vscode.openFolder', uri, { forceNewWindow: true });
+  } catch (e) { void vscode.window.showErrorMessage(`OAK: ${String((e as Error).message || e)}`); }
+  finally { openingWorkspaceWindow = false; }
+}
+
+function editorReviewKind(): 'cursor' | 'vscode' { return /cursor/i.test(vscode.env.appName) ? 'cursor' : 'vscode'; }
+
+async function openRemoteReview(machine: string, session: string, edit?: number, file?: string, all = false, prompt: string | null = null): Promise<void> {
+  if (!machine || !core.isSafeSessionId(session)) {
+    void vscode.window.showErrorMessage('OAK: this row names no machine and session to open; refresh Review and try again.');
+    return;
+  }
+  if (all) {
+    const result = await oakOn(machine, ['review', '--no-patch', '--json', '--session', session, ...(prompt ? ['--prompt', prompt] : [])]);
+    const review = result.json as RemoteReview | null;
+    if (!review?.units) { void vscode.window.showErrorMessage(`OAK: ${result.why}`); return; }
+    new ReviewViewProvider(() => prompt, false).openRemoteStacked(machine, session, review, prompt);
+    return;
+  }
+  // The steps ask the machine over SSH and can take seconds: say so at once, so a click never looks ignored.
+  return vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: `OAK: opening on ${machine}…` },
+    () => openRemoteReviewSteps(machine, session, edit, file, all, prompt));
+}
+
+async function openRemoteReviewSteps(machine: string, session: string, edit?: number, file?: string, all = false, prompt: string | null = null): Promise<void> {
+  if (edit !== undefined) file = undefined; // older tree commands also pass a display label
+  try {
+    const listing = await runOak(['machine', 'list', '--json'], { timeoutMs: 15000 });
+    const matches = JSON.parse(listing.stdout).filter((m: { label: string; id: string; enabled: boolean }) => (m.label === machine || m.id === machine) && m.enabled !== false);
+    if (listing.code !== 0 || matches.length !== 1 || !matches[0].target) throw new Error('Saved machine has no unique SSH target');
+    const target = matches[0].target;
+    const args = ['--session', session, '--editor', editorReviewKind(), '--action', all ? 'all' : file ? 'file' : 'edit',
+      ...(edit !== undefined ? ['--edit', String(edit)] : []), ...(file ? ['--file', file] : []), ...(prompt ? ['--prompt', prompt] : []), '--json'];
+    let result = await oakOn(machine, ['editor-review', 'info', ...args]);
+    if (!result.json) throw new Error(result.why || 'Update OAK on the saved machine to support editor handoffs');
+    if (await tryMountedReview(machine, session, target, result.json, edit, file, false, prompt)) return;
+    if (!result.json.installed) {
+      const choice = await vscode.window.showWarningMessage(`OAK is missing on the ${editorReviewKind()} server on ${machine}. Connect over Remote-SSH once if its server is not installed, then install OAK there.`, 'Install OAK there');
+      if (choice !== 'Install OAK there') return;
+      const installed = await runOak(['install-extensions', '--vscode-only', '--machine', machine], { timeoutMs: 185000, env: { OAK_MACHINE_TIMEOUT_MS: '180000' } });
+      if (installed.code !== 0) throw new Error(installed.stderr || installed.stdout || 'Remote extension installation failed');
+      result = await oakOn(machine, ['editor-review', 'info', ...args]);
+      if (!result.json?.installed) throw new Error('OAK is still missing on the remote editor server; connect over Remote-SSH and run oak install-extensions there');
+    }
+    const prepared = await oakOn(machine, ['editor-review', 'prepare', ...args]);
+    if (!prepared.json?.workspace) throw new Error(prepared.why || 'The remote handoff was not written');
+    const uri = vscode.Uri.from({ scheme: 'vscode-remote', authority: 'ssh-remote+' + target, path: String(prepared.json.workspace) });
+    await vscode.commands.executeCommand('vscode.openFolder', uri, { forceNewWindow: true });
+  } catch (e) {
+    void vscode.window.showErrorMessage(`OAK: could not open on ${machine} — ${String((e as Error).message || e)}. Use Remote-SSH: Connect to Host, open the session's workspace and select its session in OAK. Diff is available here.`);
+  }
+}
+
+async function consumeRemoteEditorReview(review: { openRequestedAll(session: string, prompt: string | null): void | Promise<void> }, overview: ChangeMapViewProvider): Promise<void> {
+  const workspace = workspaceRoot();
+  if (!workspace) return;
+  for (;;) {
+    const request = core.consumeEditorReviewRequest(editorReviewKind(), workspace);
+    if (!request) return;
+    await vscode.commands.executeCommand('claudeObservatory.pinSession', request.session);
+    if (request.action === 'workspace') {
+      await review.openRequestedAll(request.session, null);
+      await vscode.commands.executeCommand('claudeObservatory.fileHistory.focus');
+      await vscode.commands.executeCommand('claudeObservatory.reviewList.focus');
+      let terminal = vscode.window.terminals.find(t => t.name === 'OAK');
+      if (!terminal) {
+        terminal = vscode.window.createTerminal({ name: 'OAK', cwd: workspace });
+        terminal.sendText('oak');
+      }
+      terminal.show();
+      await vscode.commands.executeCommand('claudeObservatory.timeline.focus');
+      await overview.showWorkspaceDashboards();
+    } else if (request.action === 'all') await review.openRequestedAll(request.session, request.prompt ?? null);
+    else if (request.action === 'file' && request.file) await vscode.window.showTextDocument(vscode.Uri.file(request.file));
+    else if (request.action === 'edit') {
+      const rec = core.reviewEdits(request.session).find(r => r.id === request.edit) ?? core.findRecord(request.session, request.edit!);
+      if (rec) await openFileAtEdit({ kind: 'edit', rec });
+    }
+  }
+}
+
+function watchEditorReview(context: vscode.ExtensionContext, review: ReviewViewProvider, overview: ChangeMapViewProvider): void {
+  let running = false, again = false, disposed = false;
+  const check = async () => {
+    if (disposed) return;
+    if (running) { again = true; return; }
+    running = true;
+    try {
+      do { again = false; await consumeRemoteEditorReview(review, overview); } while (again && !disposed);
+    } catch (e) { void vscode.window.showErrorMessage(`OAK: could not open the requested review — ${(e as Error).message}`); }
+    finally { running = false; }
+  };
+  let watcher: fs.FSWatcher | undefined;
+  try {
+    const dir = path.join(core.claudeConfigDir(), 'editor-review');
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    watcher = fs.watch(dir, (_event, name) => { if (!name || name.toString().endsWith('.json')) void check(); });
+    watcher.unref();
+    watcher.on('error', () => { watcher?.close(); watcher = undefined; });
+  } catch { /* focus still checks when the filesystem cannot be watched */ }
+  context.subscriptions.push({ dispose() { disposed = true; watcher?.close(); } },
+    vscode.window.onDidChangeWindowState(s => { if (s.focused) void check(); }));
+  void check();
+}
+
+async function showRemoteDiff(machine: string, session: string, id: number): Promise<void> {
+  const result = await oakOn(machine, ['diff', String(id), '--contents', '--json', '--session', session]);
+  const d = result.json;
+  if (!d) { void vscode.window.showErrorMessage(`OAK: could not read Diff on ${machine} — ${result.why}`); return; }
+  if (typeof d.before === 'string' && typeof d.after === 'string') {
+    const before = await vscode.workspace.openTextDocument({ content: d.before });
+    const after = await vscode.workspace.openTextDocument({ content: d.after });
+    await vscode.commands.executeCommand('vscode.diff', before.uri, after.uri, `${d.file || '#' + id} · on ${machine}`);
+  } else await vscode.window.showTextDocument(await vscode.workspace.openTextDocument({ language: 'diff', content: String(d.patch ?? '') }), { preview: true });
+}
+
+type MountedReview = { machine: string; session: string; file: string; records: (core.EditRecord & { before: string; after: string })[] };
+const mountedReviews = new Map<string, MountedReview>();
+async function tryMountedReview(machine: string, session: string, target: string, info: Record<string, unknown>, edit?: number, file?: string, all = false, prompt: string | null = null): Promise<boolean> {
+  if (all) return false; // Open all is the paged stacked tab; mounts serve file editing.
+  const response = await oakOn(machine, ['views', '--views', 'review,timeline', '--no-patch', '--json', '--session', session, ...(prompt ? ['--prompt', prompt] : [])]);
+  const review = response.json?.review as RemoteReview | undefined;
+  const history = (response.json?.timeline as { edits?: RemoteReviewUnit[] } | undefined)?.edits ?? [];
+  if (!review) return false;
+  const units = file ? history.filter(u => u.file === file) : history.filter(u => u.id === edit);
+  if (!units.length) return false;
+  const mounts = core.readMountTable();
+  const mapped = new Map<string, string>();
+  const roots = new Map<string, string>();
+  for (const u of units) {
+    if (mapped.has(u.file)) continue;
+    const local = core.mapReviewPath(u.file, target, info as unknown as core.ReviewMachinePaths, mounts);
+    if (!local || !fs.existsSync(local)) return false;
+    // A symlink escaping a mounted share is not evidence that its target is the remote file.
+    const mount = mounts.filter(m => local.startsWith(m.mount + '/')).sort((a, b) => b.mount.length - a.mount.length)[0];
+    if (!mount) return false;
+    if (!roots.has(mount.mount)) roots.set(mount.mount, fs.realpathSync(mount.mount));
+    if (!fs.realpathSync(local).startsWith(roots.get(mount.mount)! + path.sep)) return false;
+    mapped.set(u.file, local);
+  }
+  for (const [remote, local] of mapped) {
+    const snapshot = await oakOn(machine, ['editor-review', 'snapshot', '--session', session, '--file', remote, '--json']);
+    const records = snapshot.json?.records as MountedReview['records'] | undefined;
+    if (!Array.isArray(records)) return false;
+    mountedReviews.set(local, { machine, session, file: remote, records });
+  }
+  await vscode.commands.executeCommand('claudeObservatory.pinRemoteSession', machine, session);
+  {
+    const remote = file ?? units[0].file;
+    selectRemoteReviewFile(machine, session, remote);
+    const editor = await vscode.window.showTextDocument(vscode.Uri.file(mapped.get(remote)!));
+    const placement = mountedPlacements(session, editor.document).find(p => p.rec.id === edit);
+    const line = placement && anchorLines(placement)[0];
+    if (line !== undefined) { editor.selection = new vscode.Selection(line, 0, line, 0); editor.revealRange(new vscode.Range(line, 0, line, 0)); }
+  }
+  refreshInline();
+  return true;
+}
+function mountedPlacements(session: string, doc: vscode.TextDocument, includeUndone = false): Placement[] {
+  const m = mountedReviews.get(canonFsPath(doc.uri));
+  if (!m || m.machine !== currentMachine() || m.session !== session) return [];
+  const records = m.records.filter(r => r.status === 'pending');
+  const placed = core.locateEditsInCurrent(records.length, i => records[i], doc.getText());
+  const result = records.map((rec, i) => ({ rec, ...placed[i] }));
+  if (includeUndone) for (const rec of m.records.filter(r => r.status === 'undone')) {
+    const reversed = core.locateEditsInCurrent(1, () => ({ before: rec.after, after: rec.before }), doc.getText())[0];
+    result.push({ rec, ...reversed });
+  }
+  return result;
+}
+function mountedLenses(session: string, doc: vscode.TextDocument): vscode.CodeLens[] {
+  const m = mountedReviews.get(canonFsPath(doc.uri));
+  if (!m || m.machine !== currentMachine() || m.session !== session) return [];
+  return mountedPlacements(session, doc, true).flatMap(p => {
+    const line = anchorLines(p)[0];
+    if (line === undefined) return [];
+    const range = new vscode.Range(line, 0, line, 0);
+    return (p.rec.status === 'undone' ? ['redo', 'resolve'] : ['keep', 'undo', 'resolve']).map(verb => new vscode.CodeLens(range, {
+      title: `${verb[0].toUpperCase() + verb.slice(1)} #${p.rec.id} on ${m.machine}`, command: 'claudeObservatory.mountedDecision', arguments: [m.machine, session, verb, p.rec.id],
+    }));
+  });
+}
+async function refreshMountedReview(machine: string, session: string): Promise<void> {
+  for (const [local, m] of mountedReviews) {
+    if (m.machine !== machine || m.session !== session) continue;
+    const snapshot = await oakOn(machine, ['editor-review', 'snapshot', '--session', session, '--file', m.file, '--json']);
+    m.records = (snapshot.json?.records as MountedReview['records']) ?? [];
+    // Revert only a clean buffer, to force the file service to reread a lagging network mount.
+    const doc = vscode.workspace.textDocuments.find(d => canonFsPath(d.uri) === local);
+    if (doc && !doc.isDirty) await vscode.commands.executeCommand('workbench.action.files.revertResource', doc.uri);
+  }
+  refreshInline();
+}
+
+let remoteReviewCursor: { machine: string; session: string; prompt: string | null; id: number; file: string } | undefined;
+let remoteReviewPrompt: () => string | null = () => null;
+/** Keyboard axes walk the same remote units as Review; only the selected patch is fetched. */
+async function navigateRemoteReview(dir: 1 | -1, axis: 'edit' | 'diff' | 'file' | 'advance' | 'first' = 'edit', fromId?: number): Promise<void> {
+  const machine = currentMachine(), session = currentSession(), prompt = remoteReviewPrompt();
+  if (!machine || !session) return;
+  if (axis === 'advance' && !vscode.workspace.getConfiguration('claudeObservatory').get<boolean>('revealNextOnResolve', true)) return;
+  const r = await oakOn(machine, ['review', '--no-patch', '--json', '--session', session, ...(prompt ? ['--prompt', prompt] : [])]);
+  if (machine !== currentMachine() || session !== currentSession() || prompt !== remoteReviewPrompt()) return;
+  const data = r.json as RemoteReview | null;
+  if (!data || !Array.isArray(data.units)) { void vscode.window.showErrorMessage(`OAK: could not navigate Review on ${machine} — ${r.why}`); return; }
+  if (axis === 'advance' && data.units.some(u => u.members.includes(fromId!) && u.status === 'pending')) return;
+  let pending = data.units.filter(u => u.status === 'pending' && core.matchesFileFilter(u.rel, core.fileExt(u.rel), core.fileCategory(u.rel), { query: editFilter, exts: filterExts, categories: filterCats })).sort((a,b) => a.id-b.id);
+  if (!pending.length) { vscode.window.setStatusBarMessage(`OAK: no pending edits in this scope on ${machine}`, 3000); return; }
+  const cursor = remoteReviewCursor?.machine === machine && remoteReviewCursor.session === session && remoteReviewCursor.prompt === prompt ? remoteReviewCursor : undefined;
+  let target;
+  if (axis === 'file') {
+    const files = [...new Set(pending.map(u => u.file))].sort();
+    const at = cursor ? files.indexOf(cursor.file) : -1;
+    const file = files[((at < 0 ? (dir > 0 ? -1 : 0) : at) + dir + files.length) % files.length];
+    target = pending.find(u => u.file === file)!;
+  } else {
+    if (axis === 'diff' && cursor && pending.some(u => u.file === cursor.file)) pending = pending.filter(u => u.file === cursor.file);
+    const id = axis === 'first' ? undefined : fromId ?? cursor?.id;
+    const at = pending.findIndex(u => u.id === id);
+    target = at >= 0 ? pending[(at + dir + pending.length) % pending.length]
+      : id === undefined ? (dir > 0 ? pending[0] : pending[pending.length-1])
+      : dir > 0 ? pending.find(u => u.id > id) ?? pending[0] : [...pending].reverse().find(u => u.id < id) ?? pending[pending.length-1];
+  }
+  remoteReviewCursor = { machine, session, prompt, id: target.id, file: target.file };
+  selectRemoteReviewFile(machine, session, target.file);
+  await vscode.commands.executeCommand('claudeObservatory.remoteOpen', machine, session, target.id);
+}
+
+
+
+async function oakOn(machine: string, args: string[]): Promise<{ json: Record<string, unknown> | null; why: string }> {
+  const deadline = SAVED_DEADLINE_MS + 5_000;
+  const r = await runOak([...args, '--machine', machine], { timeoutMs: deadline, env: { OAK_MACHINE_TIMEOUT_MS: String(SAVED_DEADLINE_MS) } });
+  let json: Record<string, unknown> | null = null;
+  try { json = r.code === 0 ? JSON.parse(r.stdout) : null; } catch { json = null; }
+  return { json, why: json ? '' : core.cliFailureMessage(r.stdout, r.stderr, r.code === null ? `no answer within ${deadline / 1000} s` : `oak ${args[0]} --machine ${machine} did not answer`).replace(/^oak: /, '') };
+}
+
+/** The sessions `oak sync fetch` is bringing here: one fetch each. */
+const fetching = new Set<string>();
+
+/**
+ * Another machine's session, picked from a list of every machine's: its facts as its records hold them, read-only (its
+ * conversation and edits are on that machine), with `oak sync fetch`, which brings a copy here from that machine or the
+ * backup; the copy then opens as any session here does.
+ */
+async function openSyncedSession(m: core.MachineListing, r: core.SessionMetaRow): Promise<void> {
+  const name = r.title || `session ${r.id.slice(0, 8)}`;
+  const FETCH = 'Fetch it here';
+  const detail = [
+    `${m.label} · ${r.workspace} · ${r.agent}${r.model ? ` · ${r.model}` : ''}`,
+    `last active ${core.relTime(r.lastActiveMs)} · ${r.edits} edit${r.edits === 1 ? '' : 's'} (${r.pending} pending) · ${core.compactTokens(r.tokens)} tok`,
+    `Read from ${m.label}’s records${m.syncedAt ? `, which oak sync brought at ${core.relTime(m.syncedAt)}` : ''}. Its conversation and edits are on ${m.label}: fetching brings a copy here (oak sync fetch ${r.id}).`,
+  ].join('\n');
+  const act = await vscode.window.showInformationMessage(`OAK: “${name}” is ${m.label}’s session`, { modal: true, detail }, FETCH);
+  if (act !== FETCH) return;
+  if (fetching.has(r.id)) return void vscode.window.showInformationMessage(`OAK: “${name}” is being fetched already`);
+  fetching.add(r.id);
+  let res: Awaited<ReturnType<typeof runOak>>;
+  let stopped = false;
+  try {
+    res = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: `OAK: fetching “${name}” from ${m.label}…`, cancellable: true },
+      (_progress, token) => runOak(['sync', 'fetch', r.id, '--json'], { timeoutMs: 600_000, cancel: token }).finally(() => { stopped = token.isCancellationRequested; }));
+  } finally {
+    fetching.delete(r.id);
+  }
+  if (stopped) return void vscode.window.showInformationMessage(`OAK: stopped fetching “${name}”`);
+  let out: { path?: string | null; from?: string | null; tried?: { label: string; status: string; detail?: string }[] } | null = null;
+  try {
+    out = JSON.parse(res.stdout);
+  } catch {
+    out = null;
+  }
+  if (!out?.path) {
+    const why = (out?.tried ?? []).filter((t) => t.status !== 'ok').map((t) => `${t.label}: ${t.detail ?? t.status}`).join('; ') || res.stderr.trim().replace(/^oak: /, '') || 'no answer';
+    void vscode.window.showErrorMessage(`OAK: could not fetch “${name}” — ${why}`);
+    return;
+  }
+  await vscode.commands.executeCommand('claudeObservatory.pinSession', r.id);
+  void vscode.window.showInformationMessage(out.from ? `OAK: fetched “${name}” from ${out.from}` : `OAK: “${name}” is here already`);
+}
+
 function allSessionRows(rows: core.SessionMetaRow[], current: string | null | undefined): core.SessionMetaRow[] {
   return [...rows.filter((r) => r.id === current), ...rows.filter((r) => r.id !== current)];
 }
@@ -5737,6 +6659,7 @@ function activeSessionRows(rows: core.SessionMetaRow[], current: string | null |
 /** The folder-reveal button a session picker row carries — a QuickPick row cannot link
  *  its store-size TEXT, so this opens the store folder instead (see revealStoreFolder). Shared by both
  *  selectors, so they can never disagree about the affordance. */
+const workspaceWindowBtn: vscode.QuickInputButton = { iconPath: new vscode.ThemeIcon('window'), tooltip: 'Open workspace window' };
 const revealStoreBtn: vscode.QuickInputButton = { iconPath: new vscode.ThemeIcon('folder-opened'), tooltip: 'Reveal this session’s store folder on disk' };
 /**
  * Open a session's store folder — the ONE body behind every store affordance: the Overview's Store
@@ -5783,9 +6706,10 @@ const deleteSessionBtn: vscode.QuickInputButton = { iconPath: new vscode.ThemeIc
  * QuickPick), so the confirm text and the pinned-fallback can never drift between them. It matches the
  * session delete's wording verbatim.
  *
- * `core.deleteSession` HIDES the session from every picker AND purges its captured edits for good; the agent's
- * own transcript/rollout is left untouched, and `oak sessions --undelete <id>` lists the session again, without
- * its edits. The confirm names the edits still pending review — the purge drops their before-snapshots, so
+ * `core.deleteSession` HIDES the session from every picker AND purges its captured edits (for good, or with a backup
+ * folder set, here only: core.deleteWords); the agent's own transcript/rollout is left untouched, and `oak sessions
+ * --undelete <id>` lists the session again, with what of its edits a backup folder holds once the next `oak sync now`
+ * runs, else without them. The confirm names the edits still pending review — the purge drops their before-snapshots, so
  * those changes can no longer be undone — and the delete then purges no more than it named. Deleting the
  * PINNED session would leave the pin pointing at a purged/hidden id, so the pin is moved forward to the
  * newest that remains (or Auto when none); otherwise a forced refresh re-resolves — which core already
@@ -5808,16 +6732,18 @@ async function confirmAndDeleteSession(id: string): Promise<string | null> {
   const pending = Math.max(0, Number(meta?.pending) || 0);
   const seenThrough = typeof meta?.lastEdit === 'number' ? meta.lastEdit : undefined;
   const verb = pending ? `Delete and purge ${pending} pending edit${pending === 1 ? '' : 's'}` : 'Delete';
+  // For good, or with a backup folder set, here only: its copy comes back after an undelete (as the CLI says it).
+  const said = core.deleteWords();
   const ok = await vscode.window.showWarningMessage(
     `Delete “${name}” from OAK?`,
     {
       modal: true,
       detail:
         'The conversation transcript itself is NOT deleted — this removes the session from ' +
-        'Observatory’s session pickers and views and purges its captured edits for good.' +
+        `Observatory’s session pickers and views and purges its captured edits ${said.purged}.` +
         (pending ? `\n\n${pending === 1 ? '1 of those edits is' : `${pending} of those edits are`} still pending review: the purge drops ` +
-          `${pending === 1 ? 'its before-snapshot' : 'their before-snapshots'}, so OAK can no longer undo ${pending === 1 ? 'that change' : 'those changes'}.` : '') +
-        `\n\noak sessions --undelete ${id} lists the session again, without its edits.`,
+          `${pending === 1 ? 'its before-snapshot' : 'their before-snapshots'}, so OAK can no longer undo ${pending === 1 ? 'that change' : 'those changes'}${said.folder ? ' here, unless the backup folder brings them back' : ''}.` : '') +
+        `\n\noak sessions --undelete ${id} lists the session again, ${said.after}.`,
     },
     verb
   );
@@ -5835,9 +6761,9 @@ async function confirmAndDeleteSession(id: string): Promise<string | null> {
     const next = (await readSessionListing(root))?.sessions[0]?.id ?? '';
     await vscode.commands.executeCommand('claudeObservatory.pinSession', next);
   } else {
-    await vscode.commands.executeCommand('claudeObservatory.refresh');
+    await vscode.commands.executeCommand('claudeObservatory.refresh', NO_SWEEP);
   }
-  vscode.window.setStatusBarMessage(`OAK: deleted “${name}” and purged its edits — oak sessions --undelete ${id} lists it again, without them`, 5000);
+  vscode.window.setStatusBarMessage(`OAK: deleted “${name}” and purged its edits — oak sessions --undelete ${id} lists it again, ${said.folder ? said.after : 'without them'}`, 5000);
   return name;
 }
 
@@ -5848,6 +6774,440 @@ function sessionBadgePrefix(r: core.SessionMetaRow): string {
   return [r.agent !== 'claude' ? r.agent : '', r.model || 'model unknown', r.workspace || 'Unknown workspace',
     `${r.edits} edit${r.edits === 1 ? '' : 's'}`, `${core.compactTokens(r.tokens)} tok`, core.compactDuration(r.durationMs),
     r.storeBytes ? core.compactBytes(r.storeBytes) : ''].filter(Boolean).join(' · ') + ' · ';
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// oak sync: its last run in the status bar, its conflicts in the Timeline's inbox, and its actions and settings in the
+// OAK: Sync picker. All through the CLI, which keeps sync's settings in prefs.json: nothing here keeps a copy of them.
+// ---------------------------------------------------------------------------------------------------------------
+
+/** One machine's line of the last run, with `text`, the words `oak sync status` prints after its label. */
+type SyncLine = NonNullable<core.SyncStatusResult['last']>['machines'][number] & { text?: string };
+/** `oak sync status --json`. */
+type SyncView = Omit<core.SyncStatusResult, 'last'> & { last: (Omit<NonNullable<core.SyncStatusResult['last']>, 'machines'> & { machines: SyncLine[] }) | null };
+
+/** The last `oak sync status --json` read (readSyncStatus); null until one answers. */
+let syncView: SyncView | null = null;
+/** Told whenever it is read again: the status bar item and the Timeline's inbox. */
+const syncListeners: (() => void)[] = [];
+/** Sync is in use here: a run set it up, a backup is chosen, or a conflict is open. A machine that never chose to sync
+ *  is shown nothing of it. */
+const syncInUse = (v: SyncView | null): v is SyncView => !!v && (v.setUp || !!v.backup || v.conflicts.length > 0);
+/** A machine's line that failed: one left out on purpose (disabled, excluded, the same as another, another account's)
+ *  did not. */
+const syncLineFailed = (m: SyncLine): boolean => m.errors.length > 0 || !['ok', 'disabled', 'excluded', 'duplicate', 'shared'].includes(m.status);
+/** The backup folder's own line of the last run (`backup (<path>)`), while that folder is the backup: the line a run left
+ *  for a folder no longer chosen says nothing of the backup now, nor which record to take over. */
+function syncBackupLine(v: SyncView): SyncLine | undefined {
+  const b = v.backup;
+  return b?.kind === 'folder' ? v.last?.machines.find((m) => m.label === `backup (${core.backupFolderPath(b.path)})`) : undefined;
+}
+/** How an open conflict is resolved, as `oak inbox` says it: a diverged session only by deleting the copy. */
+const conflictResolution = (reason: string): string => (reason === 'diverged' ? 'delete the copy to keep yours' : 'edit your file or delete the copy');
+
+/** The CLI once, keeping its exit status: sync's verbs answer in JSON on a failure too (`sync now` when every machine
+ *  failed, `sync setup` when a folder needs its key). `input` goes to its standard input (a pasted key), and `cancel`
+ *  stops it, and with it the ssh it started. */
+function runOak(args: string[], opts: { timeoutMs: number; input?: string; cancel?: vscode.CancellationToken; env?: Record<string, string> }): Promise<{ code: number | null; stdout: string; stderr: string }> {
+  return new Promise((resolve) => {
+    let child: cp.ChildProcess;
+    try {
+      child = core.execFileTool(resolveObservatoryBin(), args, { cwd: workspaceRoot(), timeout: opts.timeoutMs, maxBuffer: 64 * 1024 * 1024, ...(opts.env ? { env: { ...process.env, ...opts.env } } : {}) }, (err, stdout, stderr) => {
+        const code = !err ? 0 : typeof err.code === 'number' ? err.code : null;
+        resolve({ code, stdout: String(stdout || ''), stderr: String(stderr || '') || (code === null && err ? err.message : '') });
+      });
+    } catch (e) {
+      resolve({ code: null, stdout: '', stderr: String((e as Error)?.message || e) });
+      return;
+    }
+    child.stdin?.on('error', () => { /* it exited first: its exit says why */ });
+    child.stdin?.end(opts.input ?? '');
+    // A Windows `.cmd` shim runs node under cmd.exe, which alone would go: the whole tree goes. Elsewhere the CLI's own
+    // SIGTERM handler stops the ssh it started.
+    opts.cancel?.onCancellationRequested(() => {
+      if (process.platform !== 'win32' || !child.pid) return void child.kill();
+      try {
+        core.spawnTool('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true }).on('error', () => child.kill());
+      } catch {
+        child.kill();
+      }
+    });
+  });
+}
+
+/** A single background follower per selected shell. Only startup has a deadline; a quiet shell can stay open. */
+function followProcessCli(session: string, id: string, cwd: string, machine: string | undefined,
+  onSnapshot: (snapshot: core.ProcessSnapshot) => void, onError: (message: string) => void): () => void {
+  let closed = false, pending = '', error = '', received = false;
+  const child = core.spawnTool(resolveObservatoryBin(), ['processes', '--follow', id, '--session', session, '--json',
+    ...(machine ? ['--machine', machine] : ['--root', cwd])], {
+    cwd, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, OAK_MACHINE_TIMEOUT_MS: String(SAVED_DEADLINE_MS) },
+  });
+  const stop = () => { if (closed) return; closed = true; clearTimeout(timer); child.kill(); };
+  const fail = (message: string) => { if (!closed) { onError(message); stop(); } };
+  const timer = setTimeout(() => fail('Process output did not answer before the shared deadline.'), SAVED_DEADLINE_MS + 5000);
+  child.stdout?.setEncoding('utf8');
+  child.stdout?.on('data', (chunk: string) => {
+    if (closed) return;
+    pending += chunk;
+    if (pending.length > 512 * 1024) { fail('Process output returned an oversized snapshot.'); return; }
+    let end: number;
+    while ((end = pending.indexOf('\n')) >= 0) {
+      const line = pending.slice(0, end); pending = pending.slice(end + 1);
+      if (!line.trim()) continue;
+      try {
+        const snapshot = JSON.parse(line) as core.ProcessSnapshot;
+        if (snapshot.processLogVersion !== 1 || snapshot.ref?.kind !== 'process' || snapshot.ref.id !== id || !snapshot.process || !Array.isArray(snapshot.entries))
+          throw new Error('Update OAK on the session’s machine for live process output.');
+        received = true; clearTimeout(timer);
+        snapshot.entries = snapshot.entries.map(e => ({ ...e, label: core.plainProcessOutput(e.label) }));
+        onSnapshot(snapshot);
+      } catch (e) { fail(String((e as Error).message || e)); return; }
+    }
+  });
+  child.stderr?.on('data', d => { error = core.graphemeTail(error + d, 8192); });
+  child.on('error', e => fail(e.message));
+  child.on('close', code => { if (!closed && (code !== 0 || !received)) fail(error || 'Process output stopped without a snapshot.'); else stop(); });
+  return stop;
+}
+
+let syncReading: Promise<void> | null = null;
+let syncAgain = false;
+/** Read `oak sync status --json` again, and tell the listeners. A read that fails (an older CLI, none at all) keeps what
+ *  was read before. Asked while one runs, it runs once more after it, and the caller waits for that one too: a picker
+ *  built after it is built from what is true now. */
+function readSyncStatus(): Promise<void> {
+  if (syncReading) {
+    syncAgain = true;
+    return syncReading;
+  }
+  syncReading = (async () => {
+    try {
+      do {
+        syncAgain = false;
+        const r = await runOak(['sync', 'status', '--json'], { timeoutMs: 30_000 });
+        try {
+          const v = JSON.parse(r.stdout) as SyncView;
+          if (v?.syncStatus === 1) {
+            syncView = v;
+            for (const f of syncListeners) f();
+          }
+        } catch {
+          /* not an answer: what was read before stands */
+        }
+      } while (syncAgain);
+    } finally {
+      syncReading = null;
+    }
+  })();
+  return syncReading;
+}
+
+/** The backup and its state, in a phrase. */
+function syncBackupText(v: SyncView): string {
+  const b = v.backup;
+  if (!b) return 'none: each session stays on the machine that made it';
+  if (b.kind === 'machine') return `the saved machine ${b.label}`;
+  return `the encrypted folder ${b.path}, ${v.key.present ? `key ${v.key.fingerprint}` : `no key here${v.key.error ? ` (${v.key.error})` : ''}`}`;
+}
+
+/** The status bar item: the last run, or the one running now, and what needs the reader (a conflict, a failure);
+ *  hidden while sync is not in use. Its tooltip is the last run a machine a line, in the CLI's words. */
+function showSyncItem(item: vscode.StatusBarItem): void {
+  const v = syncView;
+  if (!syncInUse(v)) return item.hide();
+  const failed = !!v.last?.error || (v.last?.machines ?? []).some(syncLineFailed);
+  const n = v.conflicts.length;
+  item.text = `$(sync${v.running ? '~spin' : ''}) OAK sync${v.running ? '' : n ? `: ${n} conflict${n === 1 ? '' : 's'}` : failed && v.last ? `: failed ${core.relTime(v.last.at)}` : v.last ? ` ${core.relTime(v.last.at)}` : ''}`;
+  item.backgroundColor = !v.running && (n || failed) ? new vscode.ThemeColor('statusBarItem.warningBackground') : undefined;
+  const md = new vscode.MarkdownString();
+  md.appendMarkdown('**OAK sync** · ');
+  md.appendText(`${v.running ? 'running now' : v.last ? `last run ${core.relTime(v.last.at)} (${v.last.status})` : 'no run yet'} · background ${v.auto ? 'on' : 'off'}`);
+  for (const line of [...(v.last?.error ? [`the run stopped: ${v.last.error}`] : []), ...(v.last?.machines ?? []).map((m) => `${m.label}: ${m.text ?? m.detail ?? m.status}`),
+    `backup: ${syncBackupText(v)}`, ...(n ? [`${n} open conflict${n === 1 ? '' : 's'}: the Timeline's session list has ${n === 1 ? 'it' : 'them'}`] : []),
+    ...(v.last?.warnings ?? []).map((w) => `warning: ${w}`), 'Click for its actions and settings.']) {
+    md.appendMarkdown('\n\n');
+    md.appendText(line);
+  }
+  item.tooltip = md;
+  item.show();
+}
+
+/** What a run did, in a sentence: what it pulled, the conflicts it left, each machine that failed in the CLI's words, and the
+ *  run's warnings, as `oak sync now` prints them. */
+function syncNowWords(j: core.SyncNowResult): { text: string; failed: boolean } {
+  if (j.status === 'busy') return { text: 'another oak sync is running on this machine; it pulls the same', failed: false };
+  const pulled = j.done.filter((d) => d.action !== 'conflict' && d.action !== 'skipped');
+  const conflicts = j.done.filter((d) => d.action === 'conflict').length;
+  const bad = j.machines.filter(syncLineFailed);
+  const got = pulled.length ? `pulled ${pulled.length} file${pulled.length === 1 ? '' : 's'}, ${core.compactBytes(pulled.reduce((s, d) => s + d.bytes, 0))}` : j.status === 'ok' ? 'nothing to pull' : 'nothing pulled';
+  return {
+    text: [got, ...(conflicts ? [`${conflicts} conflict${conflicts === 1 ? '' : 's'}, in the Timeline's session list`] : []),
+      ...bad.map((m) => `${m.label}: ${m.errors[0] ?? m.detail ?? m.status}`), ...(j.warnings ?? []).map((w) => `warning: ${w}`)].join('; '),
+    failed: bad.length > 0,
+  };
+}
+
+/** `oak sync status`'s own text, in a tab: every machine's line whole, the conflicts and the warnings. */
+async function showSyncStatus(): Promise<void> {
+  const r = await runOak(['sync', 'status'], { timeoutMs: 30_000 });
+  if (r.code !== 0) {
+    void vscode.window.showErrorMessage(`OAK: could not read sync's status — ${core.cliFailureMessage(r.stdout, r.stderr, 'oak sync status did not answer')}`);
+    return;
+  }
+  await vscode.window.showTextDocument(await vscode.workspace.openTextDocument({ content: r.stdout, language: 'plaintext' }));
+}
+
+let syncNowRunning = false;
+/** `oak sync now`, with a cancellable progress notification, then its result; the status is read again after. */
+async function syncNowCommand(): Promise<void> {
+  if (syncNowRunning) {
+    void vscode.window.showInformationMessage('OAK: a sync is already running from this window — its result shows here when it ends.');
+    return;
+  }
+  syncNowRunning = true;
+  try {
+    const r = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: 'OAK: syncing with the saved machines…', cancellable: true },
+      (_progress, token) => runOak(['sync', 'now', '--json'], { timeoutMs: 60 * 60_000, cancel: token }));
+    let j: core.SyncNowResult | null = null;
+    try {
+      j = JSON.parse(r.stdout);
+    } catch {
+      /* no answer: said below */
+    }
+    if (!j?.syncNow) {
+      void vscode.window.showErrorMessage(`OAK: sync did not run — ${core.cliFailureMessage(r.stdout, r.stderr, r.code === null ? 'it was stopped' : 'oak sync now did not answer')}`);
+      return;
+    }
+    const said = syncNowWords(j);
+    const SHOW = 'Show the last run';
+    void (said.failed ? vscode.window.showWarningMessage(`OAK sync: ${said.text}`, SHOW) : vscode.window.showInformationMessage(`OAK sync: ${said.text}`, SHOW))
+      .then((a) => { if (a === SHOW) void showSyncStatus(); });
+  } finally {
+    syncNowRunning = false;
+    void readSyncStatus();
+  }
+}
+
+/** The saved machines' labels, from herdr's list (`oak machine list --json`); none when herdr is not here. */
+async function savedMachines(): Promise<string[]> {
+  const r = await runOak(['machine', 'list', '--json'], { timeoutMs: 30_000 });
+  try {
+    const list = JSON.parse(r.stdout) as { label?: unknown }[];
+    return Array.isArray(list) ? list.map((m) => (typeof m?.label === 'string' ? core.plainLabel(m.label) : '')).filter(Boolean) : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * `oak sync setup`, asking what it asks on a terminal: where sessions are backed up (nowhere else, a saved machine, or a
+ * folder), then, for a folder that holds a backup this machine's key does not open, where the key comes from (copied
+ * from a saved machine, or pasted), and, for a folder whose record under this machine's name this machine has not
+ * written, whether this machine is a reinstall of the one that wrote it. Also how the backup is changed later.
+ */
+async function syncSetupCommand(): Promise<void> {
+  const saved = await savedMachines();
+  type Where = vscode.QuickPickItem & { where: 'none' | 'machine' | 'folder' };
+  const where = await vscode.window.showQuickPick<Where>([
+    { label: 'Nowhere else', detail: 'each session stays on the machine that made it', where: 'none' },
+    { label: 'A saved machine…', detail: saved.length ? `it keeps every machine's sessions: ${saved.join(', ')}` : 'none is saved here yet: oak machine add <label> <ssh-target> saves one', where: 'machine' },
+    { label: 'A folder…', detail: 'a network share, a NAS or a disk, encrypted with a key only your machines hold', where: 'folder' },
+  ], { title: 'OAK — where the agents’ sessions are backed up', placeHolder: 'Memory, plans, skills, agents and commands go to every saved machine either way' });
+  if (!where) return;
+  if (where.where === 'none') return runSyncSetup(['--none'], saved);
+  if (where.where === 'machine') {
+    if (!saved.length) {
+      void vscode.window.showErrorMessage('OAK: no machine is saved here — oak machine add <label> <ssh-target> saves one.');
+      return;
+    }
+    const m = await vscode.window.showQuickPick(saved, { title: 'OAK — the machine that keeps every machine’s sessions' });
+    if (m) await runSyncSetup(['--machine', m], saved);
+    return;
+  }
+  const dir = await vscode.window.showOpenDialog({ canSelectFolders: true, canSelectFiles: false, canSelectMany: false, openLabel: 'Back up here', title: 'OAK — the backup folder, as this machine reaches it' });
+  if (dir?.length) await runSyncSetup(['--folder', dir[0].fsPath], saved);
+}
+
+async function runSyncSetup(args: string[], saved: string[], key?: string): Promise<void> {
+  const r = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: 'OAK: setting sync up, and previewing a first run…' },
+    () => runOak(['sync', 'setup', ...args, '--json'], { timeoutMs: 10 * 60_000, input: key }));
+  let j: { syncSetup?: number; needsKey?: boolean; error?: string; keyHere?: string | null; backup?: core.SyncBackupSetting | null; key?: { fingerprint: string; made: boolean; imported: boolean } | null;
+    record?: { state: string; lastWrite?: string; claimed?: boolean }; plan?: core.SyncPlan | null; planError?: string } | null = null;
+  try {
+    j = JSON.parse(r.stdout);
+  } catch {
+    /* no answer: said below */
+  }
+  const base = args.filter((a, i) => a !== '--import-key' && a !== '--key-from' && a !== '--replace' && args[i - 1] !== '--key-from');
+  if (j?.needsKey) {
+    // Where the folder's key comes from, as setup asks on a terminal; brought over this machine's own key (made for
+    // another folder), it replaces it, and the old one is kept beside it (`--replace`).
+    const COPY = 'Copy it from a saved machine…';
+    const PASTE = 'Paste it…';
+    const over = j.keyHere ? `\n\nThis machine keeps another backup key (${j.keyHere}): the folder's replaces it here, and the old one is kept beside it.` : '';
+    const replace = j.keyHere ? ['--replace'] : [];
+    const how = await vscode.window.showWarningMessage('OAK: this folder holds a backup sealed with a key this machine does not have', { modal: true, detail: `${j.error ?? ''}${over}` }, ...(saved.length ? [COPY] : []), PASTE);
+    if (how === COPY) {
+      const m = await vscode.window.showQuickPick(saved, { title: 'OAK — copy the backup key from' });
+      if (m) await runSyncSetup([...base, '--key-from', m, ...replace], saved);
+    } else if (how === PASTE) {
+      const pasted = await vscode.window.showInputBox({ title: 'OAK — the backup key', prompt: 'The key from `oak sync key --show` on a machine that has it (oak-sync-1:…); it is not shown as you paste it', password: true, ignoreFocusOut: true });
+      if (pasted) await runSyncSetup([...base, '--import-key', ...replace], saved, pasted);
+    }
+    return;
+  }
+  if (r.code !== 0 || j?.syncSetup !== 1) {
+    void vscode.window.showErrorMessage(`OAK: sync was not set up — ${core.cliFailureMessage(r.stdout, r.stderr, 'oak sync setup did not answer')}`);
+    return;
+  }
+  if (j.record && (j.record.state === 'unclaimed' || j.record.state === 'other') && !j.record.claimed) {
+    // A record under this machine's name in the folder that this machine has not written: a reinstall, or another machine.
+    const RESTORE = 'This machine is a reinstall: restore from it';
+    const ans = await vscode.window.showWarningMessage('OAK: the backup folder holds a record under this machine’s name (its host name and home folder) that this machine has not written', { modal: true,
+      detail: `${j.record.lastWrite ?? ''}.\n\nIf this machine is a reinstall of that one, its sessions are restored here, and it writes that record from now on. If it is another machine, give it another host name: until then nothing is restored from the folder or written to it.` }, RESTORE);
+    if (ans === RESTORE) return runSyncSetup([...base, '--restore'], saved);
+  }
+  const b = j.backup;
+  const what = !b ? 'no backup: each session stays on the machine that made it' : b.kind === 'machine' ? `the backup is ${b.label}` : `the backup is the encrypted folder ${b.path}${j.key?.fingerprint ? ` (key ${j.key.fingerprint})` : ''}`;
+  const me = j.plan?.machines[0];
+  const pulls = me?.pulls ?? [];
+  const refused = !!j.record && (j.record.state === 'unclaimed' || j.record.state === 'other') && !j.record.claimed;
+  const notes = [
+    j.key?.made ? 'A new backup key was made here. Keep a copy where you keep passwords (oak sync key --show, in a terminal): without it the backup cannot be read. On each of your other machines, run oak sync setup --folder <the folder’s path there> --key-from <the label that machine saved this one under> --replace (a key that machine kept for another folder is kept beside this one), or set sync up there.' : '',
+    j.key?.imported ? `The backup key ${j.key.fingerprint} is kept here now.` : '',
+    j.record?.claimed ? 'This machine took the folder’s record over: the next run restores its sessions from it.' : '',
+    refused
+      ? `The folder holds a record under this machine’s name that this machine has not written (${j.record!.lastWrite ?? 'by another machine'}): until this machine takes it over (oak sync setup --restore), nothing is restored from the folder or written to it.` : '',
+    // A plan made without the backup folder says why, unless the note above said all of it (a record this machine never
+    // wrote; another machine's writer, or a copy of this one's, is said here); only no plan at all was not made.
+    !me ? (j.planError ? `The first plan could not be made: ${j.planError}` : '')
+      : `A first run here would pull ${pulls.length ? `${pulls.length} file${pulls.length === 1 ? '' : 's'}, ${core.compactBytes(pulls.reduce((s, p) => s + p.bytes, 0))}` : 'nothing'}.` +
+        (j.planError && !(refused && j.record!.state === 'unclaimed') ? ` The backup folder cannot be used: ${j.planError.replace(/\.$/, '')}.` : ''),
+  ].filter(Boolean);
+  const NOW = 'Sync now';
+  // A new key's advice is a modal message, whose detail shows; a notification shows its message alone, so the notes
+  // (a key kept, a record taken over or not, the first run's preview) go in it.
+  void (j.key?.made ? vscode.window.showInformationMessage(`OAK sync is set up: ${what}`, { modal: true, detail: notes.join('\n\n') }, NOW)
+    : vscode.window.showInformationMessage([`OAK sync is set up: ${what}.`, ...notes].join(' '), NOW)).then((a) => { if (a === NOW) void syncNowCommand(); });
+  void readSyncStatus();
+}
+
+/** This workspace's project, by the identity key `oak sync exclude <folder>` gives it. */
+function syncProjectHere(): { key: string; folder: string } | null {
+  const root = workspaceRoot();
+  if (!root) return null;
+  try {
+    return { key: core.identityKey(root, { home: os.homedir(), shares: core.readMountTable() }).key, folder: root };
+  } catch {
+    return null;
+  }
+}
+
+/** Which saved machines and projects this machine syncs with: the ticked ones; an unticked one is `oak sync exclude`d,
+ *  one ticked again `oak sync include`d. */
+async function syncSelectCommand(): Promise<void> {
+  await readSyncStatus();
+  const offM = new Set(syncView?.exclude.machines ?? []);
+  const offP = new Set(syncView?.exclude.projects ?? []);
+  const here = syncProjectHere();
+  type It = vscode.QuickPickItem & { what: string; was: boolean };
+  const items: It[] = [
+    ...[...new Set([...(await savedMachines()), ...offM])].map((m) => ({ label: m, description: 'saved machine', what: m, was: !offM.has(m), picked: !offM.has(m) })),
+    ...(here ? [{ label: 'this project', description: here.key, detail: here.folder, what: here.folder, was: !offP.has(here.key), picked: !offP.has(here.key) }] : []),
+    ...[...offP].filter((k) => k !== here?.key).map((k) => ({ label: k, description: 'project', what: k, was: false, picked: false })),
+  ];
+  if (!items.length) {
+    void vscode.window.showInformationMessage('OAK: no saved machine or project to choose — oak machine add <label> <ssh-target> saves a machine.');
+    return;
+  }
+  const chosen = await vscode.window.showQuickPick(items, { canPickMany: true, title: 'OAK — sync with these machines and projects (an unticked one is excluded here)' });
+  if (!chosen) return;
+  const said: string[] = [];
+  for (const it of items) {
+    const on = chosen.includes(it);
+    if (on === it.was) continue;
+    const r = await runOak(['sync', on ? 'include' : 'exclude', it.what, '--json'], { timeoutMs: 60_000 });
+    said.push(r.code === 0 ? `${on ? 'syncing' : 'not syncing'} ${it.label}` : `could not ${on ? 'include' : 'exclude'} ${it.label}: ${core.cliFailureMessage(r.stdout, r.stderr, 'no answer')}`);
+  }
+  if (said.length) void vscode.window.showInformationMessage(`OAK sync: ${said.join('; ')}`);
+  void readSyncStatus();
+}
+
+/** A conflict's two ways out, as `oak inbox` names them: both copies side by side (the other machine's on the left,
+ *  this machine's on the right, to edit into the merge), or the other machine's copy deleted (`oak sync resolve`). */
+async function syncConflictAction(id: string, act: 'open' | 'delete'): Promise<void> {
+  const c = syncView?.conflicts.find((x) => x.id === id);
+  if (!c) {
+    void vscode.window.showInformationMessage('OAK: that sync conflict is resolved.');
+    return;
+  }
+  if (act === 'open') {
+    // The copy deleted by hand since the last run is a conflict resolved, which the next run closes.
+    if (!fs.existsSync(c.copy)) {
+      void vscode.window.showInformationMessage(`OAK sync: ${c.from}'s copy of ${c.name} is gone: the conflict is resolved.`);
+      void readSyncStatus();
+      return;
+    }
+    if (!c.file) {
+      void vscode.window.showWarningMessage(`OAK: this machine's ${c.family} ${c.name} is not where sync reaches it, so only ${c.from}'s copy opens.`);
+      await vscode.window.showTextDocument(vscode.Uri.file(c.copy));
+      return;
+    }
+    await vscode.commands.executeCommand('vscode.diff', vscode.Uri.file(c.copy), vscode.Uri.file(c.file), `${c.name}: ${c.from}'s copy ↔ yours`);
+    return;
+  }
+  const verb = `Delete ${c.from}'s copy`;
+  const ok = await vscode.window.showWarningMessage(`Delete ${c.from}'s copy of ${c.family} ${c.name}?`, { modal: true,
+    detail: `It goes to sync's trash, and this machine's file stands: ${c.file ?? 'not where sync reaches it here'}.${c.reason === 'diverged' ? ' That copy of the session is not fetched again until the other machine’s copy changes.' : ''}` }, verb);
+  if (ok !== verb) return;
+  const r = await runOak(['sync', 'resolve', id, '--json'], { timeoutMs: 60_000 });
+  let j: { syncResolve?: number; trash?: string | null } | null = null;
+  try {
+    j = JSON.parse(r.stdout);
+  } catch {
+    /* no answer: said below */
+  }
+  if (j?.syncResolve === 1) void vscode.window.showInformationMessage(`OAK sync: ${c.from}'s copy of ${c.name} ${j.trash ? 'is in sync’s trash' : 'was gone already'}, and yours stands.`);
+  else void vscode.window.showErrorMessage(`OAK: the conflict was not resolved — ${core.cliFailureMessage(r.stdout, r.stderr, 'oak sync resolve did not answer')}`);
+  void readSyncStatus();
+}
+
+/** Take the backup folder's record under this machine's name over (`oak sync setup --folder <path> --restore`), after
+ *  saying why the run refused it and what taking it over does. */
+async function syncRestoreCommand(): Promise<void> {
+  const v = syncView;
+  const line = v && syncBackupLine(v);
+  if (!line?.record || v?.backup?.kind !== 'folder') return;
+  const TAKE = 'Take the record over';
+  const ans = await vscode.window.showWarningMessage('OAK: the backup folder refused its record under this machine’s name', { modal: true,
+    detail: `${line.text ?? line.detail ?? ''}\n\nTaking it over says this machine is a reinstall of the one that wrote it (or its own sync state was put back from an older copy): the next run restores this machine's sessions from it, and this machine writes that record from now on.` }, TAKE);
+  if (ans === TAKE) await runSyncSetup(['--folder', v.backup.path, '--restore'], await savedMachines());
+}
+
+/** OAK: Sync — what the status bar item opens, and sync's settings page: run now, each open conflict, taking the
+ *  backup folder's record over when a run refused it, the backup (set up, or change it), the machines and projects
+ *  synced, and the last run whole. */
+async function syncCommand(): Promise<void> {
+  await readSyncStatus();
+  const v = syncView;
+  type It = vscode.QuickPickItem & { run?: () => unknown };
+  const line = v && syncBackupLine(v);
+  const items: It[] = [
+    { label: '$(sync) Sync now', detail: v?.running ? 'a run is going on now' : v?.last ? `last run ${core.relTime(v.last.at)} (${v.last.status})` : 'no run yet', run: syncNowCommand },
+    ...(v?.conflicts ?? []).map((c): It => ({ label: `$(warning) ${c.family} ${c.name} from ${c.from}`, detail: conflictResolution(c.reason),
+      run: async () => {
+        const OPEN = 'Open both copies', DELETE = `Delete ${c.from}'s copy`;
+        const a = await vscode.window.showQuickPick([OPEN, DELETE], { title: `OAK — ${c.family} ${c.name}: ${conflictResolution(c.reason)}` });
+        if (a) await syncConflictAction(c.id, a === OPEN ? 'open' : 'delete');
+      } })),
+    ...(line?.record ? [{ label: '$(history) This machine is a reinstall…', detail: 'the backup folder refused its record under this machine’s name', run: syncRestoreCommand }] : []),
+    { label: v && syncInUse(v) ? '$(gear) Change the backup…' : '$(gear) Set up sync…', detail: v ? `backup: ${syncBackupText(v)}` : undefined, run: syncSetupCommand },
+    { label: '$(list-selection) Machines and projects…', detail: 'which saved machines and projects this machine syncs with', run: syncSelectCommand },
+    ...(v?.last ? [{ label: '$(output) The last run', detail: 'every machine’s line, the conflicts and the warnings, as oak sync status prints them', run: showSyncStatus }] : []),
+  ];
+  const pick = await vscode.window.showQuickPick(items, { title: 'OAK sync — across the saved machines' });
+  await pick?.run?.();
 }
 
 /**
@@ -5868,8 +7228,13 @@ class TimelineViewProvider implements vscode.WebviewViewProvider {
   ) {}
   private view?: vscode.WebviewView;
   private connectedSession: string | null = null;
+  private searchCancel?: vscode.CancellationTokenSource;
+  private searchHits: (core.SearchHit & { machine: string })[] = [];
   private reviewedSession: string | null | undefined;
   conversationSelection(): string | null { return this.connectedSession ?? currentSession() ?? this.sessionShown; }
+  /** Whether the Timeline shows [id] other than as the session under review: connected from the Overview, or the newest
+   *  row where this workspace resolves no session. Cheap: no resolution. */
+  showsSession(id: string): boolean { return id === this.connectedSession || id === this.sessionShown; }
   connectSession(session: string | null): void { this.connectedSession = session; this.reviewedSession = currentSession() ?? this.sessionShown; this.followHead(null); }
   /** Guided tour: ring the control a step names, if this panel is the one that owns it. */
   setTour(anchor: string | null): void {
@@ -5936,7 +7301,9 @@ class TimelineViewProvider implements vscode.WebviewViewProvider {
       try {
         const rec = core.findRecord(session, id);
         if (!rec) continue;
-        patches[id] = core.coloredDiff(session, rec, false).split('\n').slice(0, 80).join('\n');
+        // A bidirectional control or zero-width character in the file goes as the mark that names it (`⟨U+202E⟩`),
+        // which the webview dims: drawn as it is, it shows as nothing and reorders the line around it.
+        patches[id] = core.revealHidden(core.coloredDiff(session, rec, false).split('\n').slice(0, 80).join('\n'));
         took++;
       } catch {
         /* a torn blob shows no preview — the diff door still opens the real thing */
@@ -5946,7 +7313,14 @@ class TimelineViewProvider implements vscode.WebviewViewProvider {
   }
   /** The Feed's poll state — shared by the session and Overview selections.
    *  Settles on an audit answer; forced by connect/subject/turn events. */
+  private processFollowKey = '';
+  private stopProcessFollow?: () => void;
+  private closeProcessFollow(): void { this.stopProcessFollow?.(); this.stopProcessFollow = undefined; this.processFollowKey = ''; }
   private agentFeedKey = '';
+  private agentFeedStamp = '';
+  private agentFeedPaths?: string[];
+  private agentFeedRequest = 0;
+  private agentFeedNextAt = 0;
   private agentFeedSettled = false;
   /** When the head settled: the feed's own newest stamp (re-armed by fresh transcript activity)
    *  and the wall clock (a 30s heartbeat for sessions the listing does not carry). */
@@ -5970,21 +7344,47 @@ class TimelineViewProvider implements vscode.WebviewViewProvider {
   }
   /** A NON-SESSION Overview pick (a workflow run, a task, a shell) the head follows — the old
    *  Feed tab's job. Null = the connected session's own feed. */
-  headRef: { kind: string; id: string; label: string } | null = null;
-  followHead(ref: { kind: string; id: string; label?: string } | null): void {
-    this.headRef = ref ? { kind: ref.kind, id: ref.id, label: ref.label ?? '' } : null;
+  headRef: { kind: string; id: string; label: string; session?: string; machine?: string; cwd?: string } | null = null;
+  followHead(ref: { kind: string; id: string; label?: string; session?: string; machine?: string; cwd?: string } | null): void {
+    this.closeProcessFollow();
+    this.headRef = ref ? { kind: ref.kind, id: ref.id, label: ref.label ?? '', ...(ref.session ? { session: ref.session } : {}), ...(ref.machine ? { machine: ref.machine } : {}), ...(ref.cwd ? { cwd: ref.cwd } : {}) } : null;
     this.agentFeedLimit = 60;
     this.pendingScrollTs = null;
     this.agentFeedSettled = false;
     this.fetchAgentFeed(true);
   }
   fetchAgentFeed(force = false): void {
-    if (!this.view?.visible || !this.showing.feed) return;
-    const cwd = workspaceRoot();
-    const session = this.conversationSelection() ?? currentSession();
-    if (!cwd || !session) return;
+    if (!this.view?.visible || !this.showing.feed) { this.closeProcessFollow(); return; }
     const ref = this.headRef;
-    const key = ref ? `${ref.kind}\u0000${ref.id}\u0000${session}` : session;
+    const cwd = (ref?.machine ? undefined : ref?.cwd) ?? workspaceRoot();
+    const session = ref?.session ?? this.conversationSelection() ?? currentSession();
+    if (!cwd || !session) return;
+    const key = ref ? `${ref.kind}\u0000${ref.id}\u0000${session}\u0000${ref.machine ?? ''}\u0000${ref.cwd ?? ''}` : session;
+    if (ref?.kind === 'process') {
+      const machine = ref.machine ?? (ref.cwd ? undefined : currentMachine() ?? undefined);
+      const processKey = `${key}\u0000${machine ?? ''}`;
+      if (this.processFollowKey === processKey) return;
+      this.closeProcessFollow();
+      this.processFollowKey = processKey;
+      this.agentFeedKey = key;
+      ++this.agentFeedRequest;
+      this.stopProcessFollow = followProcessCli(session, ref.id, cwd, machine, snapshot => {
+        if (this.processFollowKey !== processKey) return;
+        this.view?.webview.postMessage({ type: 'agentFeed', session: key, feed: snapshot, patches: {}, followed: [ref.label, machine].filter(Boolean).join(' · ') });
+      }, message => {
+        if (this.processFollowKey !== processKey) return;
+        this.view?.webview.postMessage({ type: 'agentFeed', session: key, feed: { ref, entries: [], mode: 'audit', note: message }, patches: {}, followed: ref.label });
+      });
+      return;
+    }
+    this.closeProcessFollow();
+    if (ref?.machine && !force && this.agentFeedKey === key && Date.now() < this.agentFeedNextAt) return;
+    let workerStamp: string | undefined;
+    if (ref?.kind === 'agent' && !ref.machine) {
+      if (this.agentFeedKey !== key || !this.agentFeedPaths) this.agentFeedPaths = core.workerFeedPaths(cwd, session, ref.id);
+      workerStamp = core.workerFeedStamp(this.agentFeedPaths);
+      if (!force && this.agentFeedKey === key && this.agentFeedStamp === workerStamp) return;
+    }
     if (!force && this.agentFeedKey === key && this.agentFeedSettled) {
       // An audit reading is a MOMENT, not a terminal state, for a session head: the worker the
       // reader clicked settles between its turns, then starts the next one — and the permanent
@@ -5992,28 +7392,34 @@ class TimelineViewProvider implements vscode.WebviewViewProvider {
       // activity since the settled snapshot means the subject is speaking again — with a slow
       // heartbeat for a session the listing does not carry. Non-session subjects (a workflow
       // run, a task) stay settled: their records do not resume.
-      if (ref && ref.kind !== 'session') return;
+      if (ref && ref.kind !== 'session' && ref.kind !== 'agent') return;
       const row = this.sessRowsCache.find((r) => r.id === session);
       const rearm = row ? (row.liveMs || row.lastActiveMs) > this.settledFeedTs : Date.now() - this.settledAt > 30_000;
-      if (!rearm) return;
+      if (!rearm && ref?.kind !== 'agent') return;
       this.agentFeedSettled = false;
     }
     if (this.agentFeedKey !== key) this.agentFeedSettled = false;
     this.agentFeedKey = key;
-    const args = ['feed', '--json', '--root', cwd, '--session', session, '--kind', ref?.kind ?? 'session',
+    // A worker row names its own machine; a saved machine's session is read there, in its own workspace (no root of this
+    // machine's).
+    const args = ['feed', '--json', ...(ref?.machine ? ['--machine', ref.machine] : currentMachine() && !ref?.cwd ? onMachine() : ['--root', cwd]), '--session', session, '--kind', ref?.kind ?? 'session',
       '--feed-limit', String(this.agentFeedLimit), '--limit', String(this.agentFeedLimit)];
     if (ref && ref.kind !== 'session' && ref.id) args.push('--id', ref.id);
-    const followed = ref?.label ?? '';
+    const followed = [ref?.label, ref?.machine].filter(Boolean).join(' · ');
+    if (ref?.machine) this.agentFeedNextAt = Infinity;
+    const request = ++this.agentFeedRequest;
     spawnCliJson(args, cwd, (data) => {
-      if (this.agentFeedKey !== key) return; // the connection moved while the spawn ran
-      const d = data as { entries?: unknown[]; mode?: string; lastTs?: number } | null;
-      const ok = !!(d && Array.isArray(d.entries) && (d.mode === 'live' || d.mode === 'audit'));
+      if (this.agentFeedKey !== key || this.agentFeedRequest !== request) return; // a newer selection or read owns this pane
+      if (ref?.machine) this.agentFeedNextAt = Date.now() + 10000;
+      const d = data as { entries?: unknown[]; mode?: string; lastTs?: number; workerLogVersion?: number } | null;
+      const ok = !!(d && Array.isArray(d.entries) && (d.mode === 'live' || d.mode === 'audit') && (!ref?.machine || d.workerLogVersion === 1));
       this.agentFeedSettled = ok && d!.mode === 'audit';
+      if (ok && workerStamp !== undefined) this.agentFeedStamp = workerStamp;
       if (this.agentFeedSettled) {
         this.settledFeedTs = Number(d!.lastTs ?? 0);
         this.settledAt = Date.now();
       }
-      const patches = ok ? this.buildFeedPatches(session, d!.entries as { editId?: number; previewId?: number }[]) : {};
+      const patches = ok && !ref?.machine ? this.buildFeedPatches(session, d!.entries as { editId?: number; previewId?: number }[]) : {};
       if (ok) {
         const ents = d!.entries as { ts?: number }[];
         this.lastHeadOldestTs = ents.find((e2) => Number(e2.ts ?? 0) > 0)?.ts ?? 0;
@@ -6022,8 +7428,29 @@ class TimelineViewProvider implements vscode.WebviewViewProvider {
       const scrollMode = this.pendingScrollMode;
       this.pendingScrollTs = null;
       this.pendingScrollMode = 'start';
-      this.view?.webview.postMessage({ type: 'agentFeed', session: key, feed: ok ? d : null, patches, followed, scrollTs, scrollMode });
+      this.view?.webview.postMessage({ type: 'agentFeed', session: key, feed: ok ? d : ref?.machine ? { ref, entries: [], mode: 'live', note: `Worker log unavailable on ${ref.machine}. Check the SSH connection and update OAK there.` } : null, patches, followed, scrollTs, scrollMode });
     });
+  }
+  /** One tab's read of a saved machine's session: started at most every 10 s after the last one landed, never twice at
+   *  once, and each landing posts the tab again. A failed read drops the rows and keeps the reason, as the TUI does. */
+  private readRemoteTl(tab: 'observations' | 'actions', machine: string, session: string): RemoteTl {
+    let r = remoteTl.get(tab);
+    if (!r || r.machine !== machine || r.session !== session) remoteTl.set(tab, (r = { machine, session, data: null, err: null, at: 0, reading: false }));
+    if (r.reading || Date.now() - r.at < SAVED_READ_MS) return r;
+    const entry = r;
+    const deadline = SAVED_DEADLINE_MS + 5_000;
+    entry.reading = true;
+    // Through `views`, as the terminal app reads a session there: `views` runs on that machine with `--machine`.
+    void runOak(['views', '--views', tab === 'actions' ? 'actions,risk,egress,multitask' : tab, '--json', '--session', session, '--machine', machine], { timeoutMs: deadline, env: { OAK_MACHINE_TIMEOUT_MS: String(SAVED_DEADLINE_MS) } }).then((res) => {
+      let all: { __problems?: Record<string, string> } & Record<string, unknown> = {};
+      try { all = res.code === 0 ? JSON.parse(res.stdout) ?? {} : {}; } catch { /* the reason below */ }
+      const d = all[tab];
+      Object.assign(entry, { reading: false, at: Date.now() }, d && typeof d === 'object'
+        ? { data: tab === 'actions' ? { ...d, risk: all.risk, egress: all.egress, multitask: all.multitask, problems: all.__problems } : d, err: null }
+        : { data: null, err: all.__problems?.[tab] ?? core.cliFailureMessage(res.stdout, res.stderr, res.code === null ? `no answer within ${deadline / 1000} s` : `oak views --machine ${machine} did not answer`).replace(/^oak: /, '') });
+      if (remoteTl.get(tab) === entry) this.postTree(tab, '');
+    });
+    return r;
   }
   /**
    * Serialize ONE level of a tree provider and hand it to the webview.
@@ -6044,12 +7471,27 @@ class TimelineViewProvider implements vscode.WebviewViewProvider {
   private postTree(tab: 'observations' | 'actions', parentKey: string): void {
     const view = this.view;
     if (!view) return;
-    const prov = (tab === 'actions' ? this.actions : this.observations) as unknown as TlTreeProvider;
+    let prov = (tab === 'actions' ? this.actions : this.observations) as unknown as TlTreeProvider;
+    // A saved machine's session: the list is the CLI's, read there in the background — the tab says it is reading until
+    // the first answer, a failed read says why, and every list says which machine it came from.
+    const machine = currentMachine();
+    const session = currentSession();
+    let note: string | null = null;
+    let remote: RemoteTl | undefined;
+    if (machine && session) {
+      remote = this.readRemoteTl(tab, machine, session);
+      if (!remote.data && !remote.err) {
+        if (!parentKey) void view.webview.postMessage({ type: 'rows', tab, parent: '', rows: [], count: 0, err: null, wait: true });
+        return;
+      }
+      if (remote.data) prov = remoteTlProvider(tab, remote);
+      note = `On ${machine} — read there with oak ${tab} --machine ${machine} at ${new Date(remote.at).toLocaleTimeString()}. Its files are not on this machine: an edit opens its patch, and Keep and Undo run on ${machine}.`;
+    }
     if (!parentKey) for (const k of [...this.nodes.keys()]) if (k.startsWith(tab + '/')) this.nodes.delete(k);
     let rows: TlRow[] = [];
-    let err: string | null = null;
+    let err: string | null = remote && !remote.data ? remote.err : null;
     let count = 0;
-    try {
+    if (!err) try {
       const parent = parentKey ? this.nodes.get(tab + '/' + parentKey)?.node : undefined;
       if (parentKey && parent === undefined) return; // the row went away with the last refresh
       const kids = prov.getChildren(parent) ?? [];
@@ -6086,8 +7528,9 @@ class TimelineViewProvider implements vscode.WebviewViewProvider {
       // `kids`, not `rows`: the cap above changes how much is DRAWN, never what the session did.
       if (!parentKey)
         for (const k of kids) {
-          const n = k as { kind?: string; count?: number; edits?: unknown[] };
-          if (tab === 'actions') count += n.kind === 'agroup' ? n.count ?? 0 : 0;
+          const n = k as { kind?: string; count?: number; edits?: unknown[]; n?: number };
+          if (remote) count += n.n ?? 0;
+          else if (tab === 'actions') count += n.kind === 'agroup' ? n.count ?? 0 : 0;
           else count += n.kind === 'edit' ? 1 : n.kind === 'tlrun' ? (n.edits ?? []).length : 0;
         }
     } catch (e) {
@@ -6097,7 +7540,7 @@ class TimelineViewProvider implements vscode.WebviewViewProvider {
       err = String((e as Error)?.message || e) || 'unreadable';
     }
     void view.webview.postMessage({
-      type: 'rows', tab, parent: parentKey, rows, count, err,
+      type: 'rows', tab, parent: parentKey, rows, count, err, note,
       // Which empty state Observations shows — the two `viewsWelcome` variants the removed view carried.
       hooks: core.hooksInstalled(),
     });
@@ -6111,7 +7554,6 @@ class TimelineViewProvider implements vscode.WebviewViewProvider {
       ...r, active: core.isFleetActive(r.liveMs || r.lastActiveMs),
     }));
     this.sessRowsCache = rows;
-    this.sessListingOk = listing !== null;
     // ATTENTION: toast once per raised hand — keyed by the
     // attention ts, so a session asks ONCE, not every tick — with Open pinning it and bringing
     // the Feed tab forward. idle-done stays quiet (shown, never toasted).
@@ -6119,7 +7561,10 @@ class TimelineViewProvider implements vscode.WebviewViewProvider {
     // machine whichever surface sees the hand first, filtered by the reader's notification prefs
     // (which is why idle-done goes through too — the pref decides, not this loop).
     for (const r of rows) core.announceAttention(r as core.SessionMetaRow);
-    this.onHandsChanged?.(rows.filter((r) => { const a = (r as core.SessionMetaRow).attention; return !!a && a.kind !== 'idle-done'; }).length);
+    // Other machines' hands, as the listing carries them from their records: announced once each, naming the machine.
+    const synced = listing?.syncedHands ?? [];
+    for (const h of synced) core.announceAttention({ id: h.id, title: h.title, agent: h.agent, attention: { kind: h.kind, message: h.message, ts: h.ts }, host: h.host, machine: h.machine });
+    this.onHandsChanged?.(rows.filter((r) => { const a = (r as core.SessionMetaRow).attention; return !!a && a.kind !== 'idle-done'; }).length + synced.filter((h) => h.kind !== 'idle-done').length);
     for (const r of rows) {
       const a = (r as core.SessionMetaRow).attention;
       if (!a || a.kind === 'idle-done') continue;
@@ -6127,7 +7572,9 @@ class TimelineViewProvider implements vscode.WebviewViewProvider {
       this.attnToasted.set(r.id, a.ts);
       const label = a.kind === 'question' ? 'has a question for you' : a.kind === 'permission' ? 'needs your permission' : 'is waiting for your input';
       const name = (r as core.SessionMetaRow).title || `session ${r.id.slice(0, 8)}`;
-      void vscode.window.showWarningMessage(`OAK: “${name}” ${label}${a.message ? ` — ${a.message}` : ''}`, 'Open').then((act) => {
+      // A permission prompt pops only once it has stood for the desktop's wait, as in the terminal app and
+      // JetBrains; the hand shows in the lists at once.
+      core.whenHandDue(r.id, a, () => void vscode.window.showWarningMessage(`OAK: “${name}” ${label}${a.message ? ` — ${a.message}` : ''}`, 'Open').then((act) => {
         if (act !== 'Open') return;
         void (async () => {
           await vscode.commands.executeCommand('claudeObservatory.pinSession', r.id);
@@ -6135,7 +7582,18 @@ class TimelineViewProvider implements vscode.WebviewViewProvider {
           this.followHead(null);
           this.setTab('feed');
         })();
-      });
+      }));
+    }
+    // Another machine's hand toasts at once (whenHandDue), naming the machine; Open says what is known of the session there.
+    for (const h of synced) {
+      if (h.kind === 'idle-done' || !h.host) continue;
+      const key = `${h.id}@${h.host}`;
+      if ((this.attnToasted.get(key) ?? 0) >= h.ts) continue;
+      this.attnToasted.set(key, h.ts);
+      const name = h.title || `session ${h.id.slice(0, 8)}`;
+      core.whenHandDue(h.id, h, () => void vscode.window.showWarningMessage(`OAK: “${name}” on ${h.machine} ${core.attentionLabel(h.kind)}${h.message ? ` — ${h.message}` : ''}`, 'Open').then((act) => {
+        if (act === 'Open') void this.openSyncedHand(h.host!, h.id, { name, machine: h.machine });
+      }), Date.now(), h.host);
     }
     // DEFAULT TO THE LATEST SESSION: with nothing pinned and nothing resolved
     // for this workspace, the selector — and everything keyed on "current" — points at the
@@ -6148,27 +7606,66 @@ class TimelineViewProvider implements vscode.WebviewViewProvider {
     // Rows carry core's hand RANK so the webview's "needs you" group orders by the same rule as the
     // inbox and the terminal app, without a copy of it in the webview.
     const posted = rows.map((r) => ({ ...r, handRank: (r as core.SessionMetaRow).attention ? core.HAND_RANK[(r as core.SessionMetaRow).attention!.kind] : 9 }));
-    this.view?.webview.postMessage({ type: 'sessions', rows: posted, current: shown ?? '' });
-
+    // Other machines' hands join the "needs you" group, each on its machine, ranked by the same rule.
+    const hands = synced.filter((h) => h.kind !== 'idle-done').map((h) => ({ ...h, handRank: core.HAND_RANK[h.kind] }));
+    this.handsShown = hands;
+    this.view?.webview.postMessage({ type: 'sessions', rows: posted, current: shown ?? '', machine: currentMachine() ?? '', syncedHands: hands });
+    this.onSessionsPosted?.();
+  }
+  /** After each listing the webview gets, the rest of its inbox: activate posts oak sync's conflicts with it. */
+  onSessionsPosted?: () => void;
+  /** oak sync's open conflicts, for the inbox's own group under the raised hands, each with its two ways out
+   *  (syncConflictAction); none while sync is not in use. */
+  postSyncConflicts(): void {
+    const rows = syncInUse(syncView) ? syncView.conflicts.map((c) => ({ id: c.id, family: c.family, name: c.name, from: c.from, file: c.file, copy: c.copy, resolution: conflictResolution(c.reason) })) : [];
+    void this.view?.webview.postMessage({ type: 'syncConflicts', rows });
   }
   /** The + menu's CLI list, host-detected — the launch validates against exactly this. */
   private newSessionClis: { id: string; name: string; command: string }[] | null = null;
-  /** One toast per raised hand: session id → the attention ts already announced. */
+  /** One toast per raised hand: session id (another machine's with its id) → the attention ts already announced. */
   private attnToasted = new Map<string, number>();
+  /** Another machine's session, picked from the list or from its raised hand: what its records hold of it, read-only, with
+   *  a fetch. One the machines' sessions the list last read do not hold (its machine, or the session, came after that
+   *  read) is read again then. `hand` (a raised hand's name and machine): said when even that read lists no such session
+   *  (one oak sync pulled here is listed with this machine's), as JetBrains says it; a pick from the list names one it
+   *  showed, and says nothing. */
+  async openSyncedHand(host: string, id: string, hand?: { name: string; machine: string }): Promise<void> {
+    const find = (): { machine?: core.MachineListing; row?: core.MachineListing['sessions'][number] } => {
+      const machine = this.machinesShown.find((x) => x.host === host);
+      return { machine, row: machine?.sessions.find((r) => r.id === id) };
+    };
+    let found = find();
+    if (!found.row) {
+      this.machinesShown = await readMachineListings(workspaceRoot() ?? process.cwd());
+      found = find();
+    }
+    if (found.machine && found.row) await openSyncedSession(found.machine, found.row);
+    else if (hand) void vscode.window.showInformationMessage(`OAK: “${hand.name}” waits on ${hand.machine}, whose records here do not list the session yet.`);
+  }
+  /** The other machines' raised hands the list last showed, which a pick of one names by host and id. */
+  private handsShown: core.InboxRow[] = [];
+  /** Every other machine's sessions the list last showed (wantMachines), which a pick names by host and id. */
+  private machinesShown: core.MachineListing[] = [];
+  /** Whether a landed read of a saved machine re-posts the list's saved groups. */
+  private savedHooked = false;
   /** How many sessions are waiting on the reader, after every sessions read — the status-bar chip. */
   onHandsChanged?: (n: number) => void;
   /** Jump to the next session waiting on you: core's ranking — permission,
    *  then question, then input, oldest first — cycling from the session shown; pin it and bring the
    *  Feed tab forward, the same landing the raised-hand toast's Open uses. */
-  jumpToNextHand(): void {
-    const id = core.nextAttention(this.sessRowsCache, this.sessionShown);
+  async jumpToNextHand(): Promise<void> {
+    // A fresh listing, as JetBrains asks `oak inbox --next`: the Timeline's cache fills only while it is
+    // visible, so with it hidden the key acted on an old listing, or on none at all.
+    const listing = await readSessionListing(workspaceRoot() ?? process.cwd(), currentSession());
+    const rows = listing?.sessions ?? [];
+    const id = core.nextAttention(rows, this.sessionShown);
     if (!id) {
-      // An empty cache after a listing that failed says nothing about who is waiting.
-      if (!this.sessListingOk) void vscode.window.showWarningMessage('OAK: could not read which sessions are waiting — the session list did not load');
-      else void vscode.window.showInformationMessage('OAK: nobody is waiting on you');
+      // A listing that failed says nothing about who is waiting.
+      if (!listing) void vscode.window.showWarningMessage('OAK: could not read which sessions are waiting — the session list did not load');
+      else void vscode.window.showInformationMessage(`OAK: ${core.nobodyWaitingHere((listing.syncedHands ?? []).filter((h) => h.kind !== 'idle-done').length, 'the session selector')}`);
       return;
     }
-    const row = this.sessRowsCache.find((r) => r.id === id);
+    const row = rows.find((r) => r.id === id);
     void (async () => {
       await vscode.commands.executeCommand('claudeObservatory.pinSession', id);
       await vscode.commands.executeCommand('claudeObservatory.timeline.focus');
@@ -6181,15 +7678,15 @@ class TimelineViewProvider implements vscode.WebviewViewProvider {
   private sessionShown: string | null = null;
   /** The last sessions listing, host-side — the settle re-arm consults its lastActiveMs. */
   private sessRowsCache: Array<core.SessionMetaRow & { active: boolean }> = [];
-  /** Whether that listing loaded: an empty cache from a failed read is not "nobody waiting". */
-  private sessListingOk = false;
   /** Fetch the agent's prose reply to one ask and post it back to the row that asked to expand. */
   private fetchResponse(id: string): void {
     const cwd = workspaceRoot() ?? process.cwd();
     const session = currentSession();
     if (!session) return;
-    spawnCliJson(['prompts', '--id', id, '--response', '--json', '--session', session], cwd, (data) => {
-      const d = data as { response?: unknown } | null;
+    const machine = currentMachine();
+    spawnCliJson(machine ? ['views', '--views', 'prompts', '--json', '--session', session, '--id', id, '--response', '--machine', machine]
+      : ['prompts', '--id', id, '--response', '--json', '--session', session], cwd, (data) => {
+      const d = (machine ? viewOf(data, 'prompts') : data) as { response?: unknown } | null;
       this.view?.webview.postMessage({ type: 'response', id, response: d && d.response ? d.response : { text: '', turns: 0, truncated: 0 } });
     });
   }
@@ -6197,7 +7694,7 @@ class TimelineViewProvider implements vscode.WebviewViewProvider {
     this.view = view;
     view.webview.options = { enableScripts: true };
     view.webview.html = timelineShell();
-    view.webview.onDidReceiveMessage((m: { type?: string; id?: string | null; tab?: string; key?: string; verb?: string; shows?: Record<string, boolean>; q?: string }) => {
+    view.webview.onDidReceiveMessage((m: { type?: string; id?: string | null; tab?: string; key?: string; verb?: string; shows?: Record<string, boolean>; q?: string; act?: string; host?: string; hand?: boolean; machine?: string }) => {
       if (!m) return;
       const treeTab = m.tab === 'actions' || m.tab === 'observations' ? m.tab : null;
       // Pick the ask that scopes the Overview; lazily fetch the agent's reply when a row is expanded (the
@@ -6261,11 +7758,15 @@ class TimelineViewProvider implements vscode.WebviewViewProvider {
         const feedOn = !!m.shows.feed;
         if (feedOn && !this.showing.feed) { this.showing.feed = true; this.fetchAgentFeed(true); }
         this.showing.feed = feedOn;
+        if (!feedOn) this.closeProcessFollow();
       }
       else if (m.type === 'agentFeedMore') {
         this.agentFeedLimit += 200;
         this.fetchAgentFeed(true);
       }
+      // A saved machine's session: its files and records are there, so an edit opens the patch read there.
+      else if ((m.type === 'agentOpenEditFile' || m.type === 'agentOpenEdit') && typeof (m as { id?: unknown }).id === 'number' && currentMachine() && (this.conversationSelection() ?? currentSession()) === currentSession())
+        void vscode.commands.executeCommand('claudeObservatory.remoteOpen', currentMachine(), currentSession(), (m as unknown as { id: number }).id);
       else if (m.type === 'agentOpenEditFile' && typeof (m as { id?: unknown }).id === 'number') {
         const cs = this.conversationSelection() ?? currentSession();
         if (cs) this.onOpenEditFile?.(cs, (m as unknown as { id: number }).id);
@@ -6303,7 +7804,36 @@ class TimelineViewProvider implements vscode.WebviewViewProvider {
       } else if (m.type === 'startDemo') void vscode.commands.executeCommand('claudeObservatory.startDemo');
       // The selector switches the WHOLE observatory (the user's call), so it goes through pinSession —
       // which is also what keeps a switch made mid-demo out of the user's settings.json.
-      else if (m.type === 'nextAttention') this.jumpToNextHand();
+      else if (m.type === 'nextAttention') void this.jumpToNextHand();
+      // The list opened: every other machine's sessions, from the index (core.readMachineListings), for its groups; and
+      // each saved machine's as its last read gave them, at once, read again behind them (each landing re-posts them).
+      else if (m.type === 'wantMachines') void (async () => {
+        if (!this.savedHooked) {
+          this.savedHooked = true;
+          savedListeners.add(() => void this.view?.webview.postMessage({ type: 'saved', ...savedMachineSnapshot() }));
+        }
+        void this.view?.webview.postMessage({ type: 'saved', ...savedMachineSnapshot() });
+        setTimeout(refreshSavedMachines, 0); // after this machine's list is posted: starting the reads costs a spawn
+        const machines = await readMachineListings(workspaceRoot() ?? process.cwd());
+        this.machinesShown = machines;
+        void this.view?.webview.postMessage({ type: 'machines', machines });
+      })();
+      // A saved machine's session, picked: reviewed there (every read and verb with `--machine`).
+      else if (m.type === 'pickRemote' && typeof m.id === 'string' && typeof m.machine === 'string') {
+        const id = m.id, machine = m.machine;
+        if (!savedMachineSnapshot().machines.some((x) => x.label === machine && x.listing?.sessions.some((r) => r.id === id))) return;
+        void (async () => {
+          await vscode.commands.executeCommand('claudeObservatory.pinRemoteSession', machine, id);
+          this.postSessions(workspaceRoot() ?? process.cwd(), currentSession());
+          this.fetchAgentFeed(true);
+        })();
+      }
+      // One of them picked, or another machine's raised hand: read-only, what is known of it, with a fetch to bring it here.
+      else if (m.type === 'pickSynced' && typeof m.id === 'string' && typeof m.host === 'string') {
+        const h = m.hand === true ? this.handsShown.find((x) => x.host === m.host && x.id === m.id) : undefined;
+        void this.openSyncedHand(m.host, m.id, h && { name: h.title || `session ${h.id.slice(0, 8)}`, machine: h.machine });
+      }
+      else if (m.type === 'openWorkspaceWindow') void openWorkspaceWindow(String(m.id || ''), m.machine || undefined);
       else if (m.type === 'pickSession' && typeof m.id === 'string') {
         // AWAITED: the pin is an async config write, and firing the re-reads before it landed
         // fetched the OLD session's feed — with the tick stamp-gated on store changes, nothing
@@ -6323,19 +7853,21 @@ class TimelineViewProvider implements vscode.WebviewViewProvider {
       // follow the fallback the way a selector pick does. Deleting another row leaves the current
       // selection intact, so `wasShown` is read before the delete re-resolves `currentSession()`.
       else if (m.type === 'searchConversations' && typeof m.q === 'string' && m.q.trim()) {
-        // Every conversation's asks and answers — in-host over the persisted index
-        // core keeps per session, so a search costs a few hundred ms, not a transcript scan.
         const q = m.q.trim();
-        let hits: core.SearchHit[] = [];
-        let error = '';
-        try {
-          hits = core.searchConversations(workspaceRoot() ?? process.cwd(), q, { limit: 30 }).hits;
-        } catch (e) {
-          // A search that threw learned nothing about any conversation: "nothing matches" would claim it had.
-          error = String((e as Error)?.message || e) || 'the search could not run';
-        }
-        void this.view?.webview.postMessage({ type: 'searchResults', q, error, hits: hits.map((h) => ({ session: h.session, title: h.title, agent: h.agent, ts: h.ts, snippet: h.snippet, where: h.where })) });
+        this.searchCancel?.cancel(); this.searchCancel?.dispose();
+        const request = this.searchCancel = new vscode.CancellationTokenSource();
+        this.searchHits = [];
+        void searchConversationMachines(q, request.token).then(({ hits, error }) => {
+          if (request !== this.searchCancel || request.token.isCancellationRequested) return;
+          this.searchHits = hits;
+          void this.view?.webview.postMessage({ type: 'searchResults', q, error, hits });
+        });
+      } else if (m.type === 'pickSearchHit' && typeof m.id === 'string' && typeof m.machine === 'string') {
+        const hit = this.searchHits.find(h => h.session === m.id && h.machine === m.machine);
+        if (hit) void openConversationHit(hit);
       }
+      // An oak sync conflict's row in the inbox: open both copies, or delete the other machine's copy.
+      else if (m.type === 'syncConflict' && typeof m.id === 'string' && m.id) void syncConflictAction(m.id, m.act === 'delete' ? 'delete' : 'open');
       else if (m.type === 'deleteSession' && typeof m.id === 'string' && m.id) {
         const id = m.id;
         const wasShown = id === (this.conversationSelection() ?? this.sessionShown ?? currentSession());
@@ -6371,7 +7903,9 @@ class TimelineViewProvider implements vscode.WebviewViewProvider {
     });
     view.onDidChangeVisibility(() => {
       if (view.visible) this.refresh(true);
+      else this.closeProcessFollow();
     });
+    view.onDidDispose?.(() => this.closeProcessFollow());
   }
   refresh(force = false): void {
     if (force) listingFloor = Date.now();
@@ -6413,14 +7947,18 @@ class TimelineViewProvider implements vscode.WebviewViewProvider {
       return;
     }
     this.running = true;
-    spawnCliJson(['prompts', '--json', '--session', session], cwd, (data) => {
+    const machine = currentMachine();
+    spawnCliJson(machine ? ['views', '--views', 'prompts', '--json', '--session', session, '--machine', machine]
+      : ['prompts', '--json', '--session', session], cwd, (raw) => {
+      const data = machine ? viewOf(raw, 'prompts') : raw;
       this.running = false;
       if (this.rerun) {
         this.rerun = false;
         setTimeout(() => this.refresh(true), 0);
       }
-      const d = data as { prompts?: unknown[]; summary?: unknown } | null;
+      const d = data as { prompts?: unknown[]; summary?: unknown; error?: unknown } | null;
       const rq = d && Array.isArray(d.prompts) && d.summary ? d : null;
+      const why = d && typeof d.error === 'string' ? d.error : null; // the CLI's own reason, shown as it gave it
       if (rq) {
         this.everLoaded = true;
         this.last = rq;
@@ -6435,8 +7973,8 @@ class TimelineViewProvider implements vscode.WebviewViewProvider {
           this.onSelect?.(null);
         }
       }
-      if (!rq && !this.everLoaded) this.view?.webview.postMessage({ type: 'error' });
-      else this.view?.webview.postMessage({ type: 'prompts', rq, selected: this.selected });
+      if (!rq && !this.everLoaded) this.view?.webview.postMessage({ type: 'error', why });
+      else this.view?.webview.postMessage({ type: 'prompts', rq, selected: this.selected, why });
     });
   }
 }
@@ -6450,6 +7988,9 @@ class StatsUsageViewProvider implements vscode.WebviewViewProvider {
   private statsRun = 0;
   private statsRunning = false;
   private statsEverLoaded = false; // gates the "CLI missing" hint: only before the first good payload
+  private remoteUsage?: { key: string; at: number; running: boolean; data: {
+    sessionTokens?: core.SessionTokens; sessionTreeTokens?: core.SessionTokens & { agents: number }; vitals?: core.SessionVitals;
+  } | null };
   resolveWebviewView(view: vscode.WebviewView): void {
     this.view = view;
     view.webview.options = { enableScripts: true };
@@ -6481,6 +8022,31 @@ class StatsUsageViewProvider implements vscode.WebviewViewProvider {
   private postCounts(): void {
     if (!this.view) return;
     const session = currentSession();
+    // The listing supplies the remote review counts; usage supplies that session's own and with-agents totals.
+    const machine = currentMachine();
+    if (session && machine) {
+      const r = savedMachineSnapshot().machines.find((x) => x.label === machine)?.listing?.sessions.find((x) => x.id === session);
+      const key = JSON.stringify([machine, session]);
+      if (this.remoteUsage?.key !== key) this.remoteUsage = { key, at: 0, running: false, data: null };
+      const request = this.remoteUsage;
+      this.view.webview.postMessage({ type: 'counts', c: null, remote: { machine, edits: r?.edits ?? null, pending: r?.pending ?? null }, session,
+        sessionTitle: (r?.title ?? '').replace(/\s+/g, ' ').trim(), t: request.data?.sessionTokens ?? null,
+        tt: request.data?.sessionTreeTokens ?? null, v: request.data?.vitals ?? null,
+        usageNote: `Session usage on ${machine}${request.data ? '' : request.running || !request.at ? ' · reading…' : ' · unavailable'}` });
+      if (!request.running && Date.now() - request.at >= 20_000) {
+        request.running = true;
+        request.at = Date.now();
+        spawnCliJson(['usage', '--session', session, '--machine', machine], workspaceRoot() ?? '', (data) => {
+          if (this.remoteUsage !== request || currentSession() !== session || currentMachine() !== machine) return;
+          request.running = false;
+          request.at = Date.now();
+          request.data = data && typeof data === 'object' && 'sessionTokens' in data ? data as NonNullable<typeof request.data> : null;
+          this.postCounts();
+        });
+      }
+      return;
+    }
+    this.remoteUsage = undefined;
     // DISPLAY units, like every other surface. This read raw records while the Sessions rows, the
     // Overview summary and sessionMetrics all collapsed same-code chains, so one window showed 2,800
     // pending in the Stats panel and 1,855 for the same session two panels away. reviewEdits is ~120ms
@@ -6502,6 +8068,8 @@ class StatsUsageViewProvider implements vscode.WebviewViewProvider {
     // re-reads nothing — but it stays its own try below, since a throw here must not take the token
     // cells down with it.
     let v: core.SessionVitals | null = null;
+    // …and with every agent it started (`oak usage`'s sessionTreeTokens): its own cursor again, plus one per worker file.
+    let tt: (core.SessionTokens & { agents: number }) | null = null;
     const cwd = workspaceRoot();
     if (session && cwd) {
       try {
@@ -6511,10 +8079,13 @@ class StatsUsageViewProvider implements vscode.WebviewViewProvider {
         t = core.sessionUsage(cwd, session);
       } catch { /* unreadable transcript — the cells stay "—" */ }
       try {
+        tt = core.sessionTreeUsage(cwd, session);
+      } catch { /* unreadable — no second row */ }
+      try {
         v = core.sessionVitals(cwd, session);
       } catch { /* unknown — the model/effort chip stays hidden */ }
     }
-    this.view.webview.postMessage({ type: 'counts', c, session: session ?? '', sessionTitle, t, v });
+    this.view.webview.postMessage({ type: 'counts', c, session: session ?? '', sessionTitle, t, tt, v });
   }
   /** Cheap + sync: post the current usage snapshot for the bars. */
   private postUsage(): void {
@@ -6526,14 +8097,14 @@ class StatsUsageViewProvider implements vscode.WebviewViewProvider {
     let u: unknown = u0;
     if (u0) {
       try {
-        const g = core.gptUsagePanel(session && core.describeSession(session).runtime.includes('codex') ? session : undefined);
+        const g = core.gptUsagePanel(session && !currentMachine() && core.describeSession(session).runtime.includes('codex') ? session : undefined);
         u = g
           ? { ...u0, gptFivePct: g.fivePct, gptFiveReset: g.fiveReset, gptWeekPct: g.weekPct, gptWeekReset: g.weekReset,
               gptCtxPct: g.ctxPct, gptCtxTokens: g.ctxTokens, gptCtxSize: g.ctxSize,
               gptWeekTok: g.weekTok, gptWeekTotal: g.weekTotal,
               gptMonthStart: g.monthStart, gptMonthReset: g.monthReset,
               gptMonthTok: g.monthTok, gptMonthTokTotal: g.monthTokTotal, gptMonthReads: g.monthReads,
-              gptMonthCost: g.monthCost, gptMonthCostTotal: g.monthCostTotal }
+              gptMonthCost: g.monthCost, gptMonthCostTotal: g.monthCostTotal, gptMeasuredMachines: g.measuredMachines, gptUsageSource: g.usageSource, gptUsageFreshness: g.usageFreshness }
           : u0;
       } catch { u = u0; }
     }
@@ -6548,7 +8119,7 @@ class StatsUsageViewProvider implements vscode.WebviewViewProvider {
     this.statsRun = now;
     const args = ['stats', '--json'];
     const session = currentSession();
-    if (session) args.push('--session', session);
+    if (session && !currentMachine()) args.push('--session', session);
     let child: cp.ChildProcess;
     try {
       // Windows: npm installs the CLI as a .cmd shim, which needs cmd.exe — see core/spawn.
@@ -6928,7 +8499,9 @@ function tmLineHtml(
 }
 
 class ReviewViewProvider implements vscode.WebviewViewProvider {
-  constructor(private readonly getPrompt: () => string | null) {}
+  constructor(private readonly getPrompt: () => string | null, listen = true) {
+    if (listen) { remoteReviewListeners.add(() => this.refresh()); remoteReviewPrompt = getPrompt; }
+  }
   private view?: vscode.WebviewView;
   /** Fires after a webview-initiated mutation, wired to `refreshAll` in activate — the same "one
    *  refresh, every surface" rule every other mutation path follows. */
@@ -6945,10 +8518,16 @@ class ReviewViewProvider implements vscode.WebviewViewProvider {
       tmOnThemeChanged();
       if (this.stackedPanel && this.stackedSession) void this.renderStacked(this.stackedSession);
     });
-    view.webview.onDidReceiveMessage((m: { type?: string; id?: number; file?: string; ids?: unknown }) => {
+    view.webview.onDidReceiveMessage((m: { type?: string; id?: number; file?: string; ids?: unknown; machine?: string; session?: string; prompt?: string | null }) => {
+      if (m.type === 'reviewNext' || m.type === 'reviewPrev' || m.type === 'navFileNext' || m.type === 'navFilePrev') {
+        void vscode.commands.executeCommand('claudeObservatory.' + m.type); return;
+      }
       if (!m) return;
+      if (m.machine && (m.machine !== currentMachine() || m.session !== currentSession())) return;
       if (m.type === 'ready') this.refresh();
-      else if (m.type === 'open' && typeof m.id === 'number') {
+      else if (currentMachine() && !['setQuery', 'setFilterSpec', 'setSort', 'cycleSort'].includes(m.type ?? '')) {
+        void this.remoteAction(m);
+      } else if (m.type === 'open' && typeof m.id === 'number') {
         const s = currentSession();
         if (!s) return;
         const rec = core.reviewEdits(s).find((r) => r.id === m.id) ?? core.findRecord(s, m.id);
@@ -7076,6 +8655,67 @@ class ReviewViewProvider implements vscode.WebviewViewProvider {
       if (view.visible) this.refresh();
     });
   }
+  openRemoteStacked(machine: string, session: string, review: RemoteReview, prompt: string | null): void {
+    const recs = review.units.filter(u => u.status === 'pending' && !review.cancelledIds?.includes(u.id))
+      .map(u => ({ ...u, beforeBlob: null, afterBlob: null, partial: u.partial ? true as const : undefined }));
+    this.openStacked(session, recs, `${review.prompt ? `prompt #${review.prompt.index}` : 'session'} — ${recs.length} change(s) · stacked · on ${machine}`, prompt, machine);
+  }
+  private async remoteAction(m: { type?: string; id?: number; file?: string; ids?: unknown; machine?: string; session?: string; prompt?: string | null }): Promise<void> {
+    const machine = currentMachine(), session = currentSession();
+    if (!machine || !session || m.machine !== machine || m.session !== session || m.prompt !== this.getPrompt()) return;
+    const r = readRemoteReview(machine, session, this.getPrompt());
+    if (!r.data || r.error) return;
+    const unit = r.data.units.find(u => u.id === m.id);
+    const file = m.file ?? unit?.file;
+    if (file) selectRemoteReviewFile(machine, session, file);
+    if (m.type === 'openAllStacked') { this.openRemoteStacked(machine, session, r.data, this.getPrompt()); return; }
+    if (m.type === 'diff' && unit) { await showRemoteDiff(machine, session, unit.id); return; }
+    if (m.type === 'open' && unit || m.type === 'openFile' && file) {
+      const u = unit ?? r.data.units.find(u => u.file === file);
+      if (u) {
+        remoteReviewCursor = { machine, session, prompt: this.getPrompt(), id: u.id, file: u.file };
+        await vscode.commands.executeCommand('claudeObservatory.remoteOpen', machine, session, m.type === 'open' ? u.id : undefined, m.type === 'openFile' ? file : undefined);
+      }
+      return;
+    }
+    if (m.type === 'comment' && unit) {
+      const line = await vscode.window.showInputBox({ prompt: `Line in edit #${unit.id} on ${machine}`, value: '1' });
+      if (!line || !/^\d+$/.test(line) || Number(line) < 1) return;
+      const text = await vscode.window.showInputBox({ prompt: `Review comment on ${machine}` });
+      if (!text?.trim()) return;
+      const result = await oakOn(machine, ['comment', 'add', '--edit', String(unit.id), '--line', line, '--text=' + text, '--session', session, '--json']);
+      if (!result.json) void vscode.window.showErrorMessage(`OAK: comment on ${machine} — ${result.why}`);
+      return;
+    }
+    const verb = m.type?.startsWith('keep') || m.type === 'dismissCancelled' ? 'keep'
+      : m.type?.startsWith('undo') ? 'undo' : m.type?.startsWith('redo') ? 'redo' : m.type?.startsWith('resolve') ? 'resolve' : m.type === 'clearResolved' ? 'clean' : null;
+    if (!verb) return;
+    const rows = r.data.units.filter(u => (!m.type?.endsWith('File') || u.file === file) &&
+      (m.type?.endsWith('All') || m.type?.endsWith('File') || u.id === m.id) && (verb === 'redo' ? u.status === 'undone' : verb === 'keep' || verb === 'undo' && (m.type?.endsWith('All') || m.type?.endsWith('File')) ? u.status === 'pending' : true));
+    const ids = m.type === 'dismissCancelled' ? r.data.cancelledIds : rows.flatMap(u => u.members);
+    const whole = m.type === 'resolveAll' || verb === 'clean';
+    if (!whole && !ids.length) return;
+    await remoteDecision(machine, session, verb, verb === 'clean' ? ['--resolved'] : whole ? [] : ['--ids', [...new Set(ids)].join(',')]);
+    this.onMutate?.();
+    if (unit && (m.type === 'keep' || m.type === 'undo') && currentMachine() === machine && currentSession() === session && this.getPrompt() === m.prompt) await navigateRemoteReview(1, 'advance', unit.id);
+  }
+
+  private refreshRemote(machine: string, session: string): void {
+    const r = readRemoteReview(machine, session, this.getPrompt());
+    const units = (r.data?.units ?? []).map(u => ({ ...u, members: u.members.length, ext: core.fileExt(u.rel), category: core.fileCategory(u.rel) }));
+    const listed = units.filter(u => core.matchesFileFilter(u.rel, u.ext, u.category, { query: editFilter, exts: filterExts, categories: filterCats }));
+    const pending = listed.filter(u => u.status === 'pending').length;
+    this.view!.badge = pending ? { value: pending, tooltip: `${pending} pending edit(s) on ${machine}` } : undefined;
+    void vscode.commands.executeCommand('setContext', 'claudeObservatory.reviewScoped', true);
+    if (!this.view!.visible) return;
+    const note = r.error ? `Could not read Review on ${machine}: ${r.error}. Last successful read: ${r.lastSuccess ? new Date(r.lastSuccess).toLocaleString() : 'never'}.`
+      : r.data ? `Read on ${machine} at ${new Date(r.lastSuccess).toLocaleTimeString()}${r.reading ? ' · refreshing…' : ''}` : `Reading Review on ${machine}…`;
+    this.view!.webview.postMessage({ type: 'review', machine, data: { session, prompt: this.getPrompt(), scoped: !!r.data?.prompt, index: r.data?.prompt?.index, title: r.data?.prompt?.title,
+      units: listed, pending, filter: editFilter, filtered: !!editFilter || !!filterExts.length || !!filterCats.length, sort: currentSort(), filterSpec: filterSpecMsg(),
+      presentCats: core.FILE_CATEGORIES.filter(c => units.some(u => u.category === c)), presentExts: [...new Set(units.map(u => u.ext))].sort(),
+      cancelled: r.data?.cancelled?.length ?? 0, cancelledIds: r.data?.cancelledIds ?? [], errors: r.data?.errors ?? [], note } });
+  }
+
   /**
    * The whole scope in ONE editor view — the selected ask's units, or every unit in the session when
    * no prompt is picked: the native multi-diff editor (`vscode.changes`) fed each unit's net blob
@@ -7083,24 +8723,23 @@ class ReviewViewProvider implements vscode.WebviewViewProvider {
    * changeset. Falls back to a single `.diff` document when the command is missing (an older fork),
    * so the gesture never dies silently.
    */
-  /** The rows an "open all" acts on: the picked ask's units or the whole session — pending only,
+  /** Read the rows an "open all" acts on off the host thread: the picked ask's units or the whole session — pending only,
    *  never a cancelled-out chain (the panel hides those; a view that disagreed with the panel's own
    *  count taught the reader to distrust both). One derivation for BOTH open-all views. */
-  private pendingScope(session: string, promptId: string | null): { r: core.SessionPrompt | null; recs: core.EditRecord[] } {
-    const root = workspaceRoot() ?? process.cwd();
-    const r = promptId ? (core.sessionPrompts(root, session).find((x) => x.id === promptId) ?? null) : null;
-    const byId = new Map(core.reviewEdits(session).map((rec) => [rec.id, rec]));
-    const cancelled = core.cancelledGroups(session);
-    const recs = (r ? r.editIds : [...byId.keys()])
-      .map((id) => byId.get(id))
-      .filter((x): x is core.EditRecord => !!x && x.status === 'pending' && !cancelled.has(x.id));
-    return { r, recs };
+  private async loadStackedScope(session: string, promptId: string | null, offset = 0): Promise<Awaited<ReturnType<ReviewViewProvider['loadStackedPage']>> & { ids: number[]; prompt?: { index: number } }> {
+    const budget = Math.max(0, vscode.workspace.getConfiguration('claudeObservatory').get<number>('openAllPreviewLines', 50));
+    const args = ['diff', '--pending', '--offset', String(offset), '--preview-lines', String(budget), '--session', session, '--json', ...(promptId ? ['--prompt', promptId] : [])];
+    const r = await runOak(args, { timeoutMs: 15000 });
+    if (r.code !== 0) throw new Error(r.stderr || r.stdout || 'Could not read pending changes');
+    return JSON.parse(r.stdout);
   }
+  openRequestedAll(session: string, prompt: string | null): Promise<void> { return this.openAllStackedInEditor(session, prompt); }
   private async openAllInEditor(session: string, promptId: string | null): Promise<void> {
     // Exactly the rows the panel lists: pending, and never a cancelled-out chain — opening "all"
     // over units the list hides would put empty-vs-empty diffs in the tab and make its "N change(s)"
     // title disagree with the panel beside it.
-    const { r, recs } = this.pendingScope(session, promptId);
+    const details = await this.loadStackedScope(session, promptId, this.stackedOffset);
+    const r = details.prompt, recs = details.records.map(d => d.rec);
     if (!recs.length) {
       vscode.window.setStatusBarMessage(`OAK: nothing pending ${r ? 'from this ask' : 'in this session'}`, 3000);
       return;
@@ -7113,16 +8752,15 @@ class ReviewViewProvider implements vscode.WebviewViewProvider {
     // row and on its bar — because the multi-diff editor caps nothing per row and one wholesale
     // rewrite otherwise buries every other change in the ask.
     const budget = Math.max(0, vscode.workspace.getConfiguration('claudeObservatory').get<number>('openAllPreviewLines', 50));
-    const resources = recs.map((rec) => {
-      const d = core.lineDelta(session, rec);
+    const page = recs;
+    const resources = page.map(rec => {
+      const d = details.records.find(r => r.rec.id === rec.id)!;
       const pv = budget > 0 && d.added + d.removed > budget ? budget : undefined;
-      return [
-        vscode.Uri.file(rec.file),
+      return [vscode.Uri.file(rec.file),
         blobUri(session, rec.beforeBlob, rec.file, 'before', rec.id, undefined, pv),
-        blobUri(session, rec.afterBlob, rec.file, 'after', rec.id, rec.beforeBlob, pv),
-      ];
+        blobUri(session, rec.afterBlob, rec.file, 'after', rec.id, rec.beforeBlob, pv)];
     });
-    const title = `${r ? `prompt #${r.index}` : 'session'} — ${recs.length} change(s)`;
+    const title = `${r ? `prompt #${r.index}` : 'session'} — ${details.ids.length} change(s) · ${page.length} shown, ${details.ids.length - page.length} remaining — use the stacked tab's page controls`;
     try {
       await vscode.commands.executeCommand('vscode.changes', title, resources);
       // Rows stay EXPANDED and lean on the diff editor's own hidden-unchanged folds ("N hidden
@@ -7130,7 +8768,7 @@ class ReviewViewProvider implements vscode.WebviewViewProvider {
       // every row was tried and hid the changes behind a second click; the folds bound the height
       // where there IS unchanged text, and a wholesale rewrite is honestly tall.
     } catch {
-      const patch = recs.map((rec) => core.coloredDiff(session, rec, false)).join('\n');
+      const patch = `# ${title}\n` + details.records.map(r => r.patch).join('\n');
       const doc = await vscode.workspace.openTextDocument({ content: patch, language: 'diff' });
       await vscode.window.showTextDocument(doc, { preview: false });
     }
@@ -7150,15 +8788,61 @@ class ReviewViewProvider implements vscode.WebviewViewProvider {
    */
   private stackedPanel?: vscode.WebviewPanel;
   private stackedIds: number[] = [];
+  private stackedOffset = 0;
+  private stackedMachine?: string;
+  private stackedRender = 0;
+  private stackedOpen = 0;
+  private stackedBusy = false;
+  private stackedFirstPage?: Awaited<ReturnType<ReviewViewProvider['loadStackedPage']>>;
+  private async loadStackedPage(session: string, ids: number[], contents = false): Promise<{ records: { rec: core.EditRecord; added: number; removed: number; patch: string; omittedLines: number; before?: string; after?: string }[]; paths?: core.ReviewMachinePaths }> {
+    const budget = Math.max(0, vscode.workspace.getConfiguration('claudeObservatory').get<number>('openAllPreviewLines', 50));
+    const args = ['diff', '--ids', ids.join(','), '--preview-lines', String(budget), '--session', session, '--json', ...(contents ? ['--contents'] : [])];
+    if (this.stackedMachine) {
+      const r = await oakOn(this.stackedMachine, args);
+      if (!Array.isArray(r.json?.records)) throw new Error(r.why || 'Update OAK on the saved machine to read review pages');
+      return r.json as unknown as Awaited<ReturnType<ReviewViewProvider['loadStackedPage']>>;
+    }
+    // Diff work belongs in the CLI process, including a single unusually expensive block.
+    const r = await runOak(args, { timeoutMs: 15000 });
+    if (r.code !== 0) throw new Error(r.stderr || r.stdout || 'Could not read review page');
+    return JSON.parse(r.stdout);
+  }
+  private async openStackedSide(session: string, promptId: string | null): Promise<void> {
+    const machine = this.stackedMachine;
+    if (!machine) return this.openAllInEditor(session, promptId);
+    const ids = this.stackedIds.slice(this.stackedOffset, this.stackedOffset + 10);
+    const page = await this.loadStackedPage(session, ids, true);
+    const listing = await runOak(['machine', 'list', '--json'], { timeoutMs: 15000 });
+    const matches = JSON.parse(listing.stdout).filter((m: { label: string; id: string; enabled: boolean }) => (m.label === machine || m.id === machine) && m.enabled !== false);
+    let mapped: { remote: string; file: string | null }[] = [];
+    if (listing.code === 0 && matches.length === 1 && page.paths) {
+      // Mapping and share I/O run off the extension host. The CLI checks each distinct file once.
+      const r = await runOak(['editor-review', 'map', '--files', JSON.stringify([...new Set(page.records.map(r => r.rec.file))]),
+        '--target', matches[0].target, '--remote', JSON.stringify(page.paths), '--json'], { timeoutMs: 15000 });
+      if (r.code === 0) mapped = JSON.parse(r.stdout).files;
+    }
+    const resources: vscode.Uri[][] = [];
+    for (const r of page.records) {
+      const before = await vscode.workspace.openTextDocument({ content: r.before ?? '' });
+      const after = await vscode.workspace.openTextDocument({ content: r.after ?? '' });
+      const local = mapped.find(m => m.remote === r.rec.file)?.file;
+      resources.push([local ? vscode.Uri.file(local) : after.uri, before.uri, after.uri]);
+    }
+    await vscode.commands.executeCommand('vscode.changes', `${this.stackedIds.length} change(s) on ${machine} · ${ids.length} shown, ${this.stackedIds.length - ids.length} remaining — use the stacked tab's page controls`, resources);
+  }
   /** The snapshot's session, held for re-renders the panel itself does not initiate (theme switch). */
   private stackedSession?: string;
-  private openAllStackedInEditor(session: string, promptId: string | null): void {
-    const { r, recs } = this.pendingScope(session, promptId);
-    if (!recs.length) {
-      vscode.window.setStatusBarMessage(`OAK: nothing pending ${r ? 'from this ask' : 'in this session'}`, 3000);
-      return;
-    }
-    this.openStacked(session, recs, `${r ? `prompt #${r.index}` : 'session'} — ${recs.length} change(s) · stacked`, promptId);
+  private async openAllStackedInEditor(session: string, promptId: string | null): Promise<void> {
+    const request = ++this.stackedOpen;
+    try {
+      const page = await this.loadStackedScope(session, promptId);
+      if (request !== this.stackedOpen) return;
+      if (!page.ids.length) {
+        vscode.window.setStatusBarMessage(`OAK: nothing pending ${page.prompt ? 'from this ask' : 'in this session'}`, 3000);
+        return;
+      }
+      this.openStacked(session, page.records.map(r => r.rec), `${page.prompt ? `prompt #${page.prompt.index}` : 'session'} — ${page.ids.length} change(s) · stacked`, promptId, undefined, page.ids, page);
+    } catch (e) { void vscode.window.showErrorMessage(`OAK: ${String(e)}`); }
   }
   /** The feed's edit-item opener: a file's edits open as the STACKED layout,
    *  scoped to that file — every non-cancelled unit, decided ones included, since the blocks carry
@@ -7177,11 +8861,15 @@ class ReviewViewProvider implements vscode.WebviewViewProvider {
     }
     this.openStacked(session, recs, `${path.basename(rec0.file)} — ${recs.length} change(s) · stacked`, null);
   }
-  private openStacked(session: string, recs: core.EditRecord[], title: string, promptId: string | null): void {
+  private openStacked(session: string, recs: core.EditRecord[], title: string, promptId: string | null, machine?: string, ids?: number[], firstPage?: Awaited<ReturnType<ReviewViewProvider['loadStackedPage']>>): void {
     // A snapshot, like the side-by-side view: the blocks are decided-from, not live-tracked. Ids are
     // pinned so a keep/undo re-render shows the SAME blocks with fresh verdicts.
-    this.stackedIds = recs.map((x) => x.id);
+    this.stackedOpen++;
+    this.stackedIds = ids ?? recs.map((x) => x.id);
+    this.stackedFirstPage = firstPage;
     this.stackedSession = session;
+    this.stackedMachine = machine;
+    this.stackedOffset = 0;
     this.stackedPanel?.dispose();
     const panel = vscode.window.createWebviewPanel(
       'claudeObservatory.reviewAllStacked',
@@ -7190,11 +8878,29 @@ class ReviewViewProvider implements vscode.WebviewViewProvider {
       { enableScripts: true, retainContextWhenHidden: true }
     );
     this.stackedPanel = panel;
+    panel.webview.html = '<!DOCTYPE html><html><body>Loading changes…</body></html>';
     panel.onDidDispose(() => {
       if (this.stackedPanel === panel) this.stackedPanel = undefined;
     });
-    panel.webview.onDidReceiveMessage((m: { type?: string; id?: number }) => {
-      if (!m) return;
+    panel.webview.onDidReceiveMessage(async (m: { type?: string; id?: number }) => {
+      if (!m || this.stackedPanel !== panel) return;
+      if (m.type === 'nextPage' || m.type === 'previousPage') {
+        if (this.stackedBusy) return;
+        this.stackedOffset = Math.max(0, Math.min(Math.floor((this.stackedIds.length - 1) / 10) * 10, this.stackedOffset + (m.type === 'nextPage' ? 10 : -10)));
+        await this.renderStacked(session);
+        return;
+      }
+      if (m.type === 'sideBySide') {
+        try { await this.openStackedSide(session, promptId); }
+        catch (e) { void vscode.window.showErrorMessage(`OAK: ${String(e)}`); }
+        return;
+      }
+      if (typeof m.id !== 'number' || !this.stackedIds.slice(this.stackedOffset, this.stackedOffset + 10).includes(m.id)) return;
+      if (machine && (m.type === 'keep' || m.type === 'undo' || m.type === 'redo')) {
+        await remoteDecision(machine, session, m.type, [String(m.id), '--units']);
+        if (this.stackedPanel === panel) await this.patchStacked(session, m.id);
+        return;
+      }
       if (m.type === 'keep' && typeof m.id === 'number') {
         core.keepGroup(session, m.id);
         this.onMutate?.();
@@ -7213,7 +8919,7 @@ class ReviewViewProvider implements vscode.WebviewViewProvider {
           this.onMutate?.();
           this.patchStacked(session, id);
         });
-      } else if (m.type === 'sideBySide') void this.openAllInEditor(session, promptId);
+      }
     });
     this.renderStacked(session);
   }
@@ -7237,10 +8943,13 @@ class ReviewViewProvider implements vscode.WebviewViewProvider {
    *  click at a real session's 378 blocks, and it also reset scroll and Spotlight, which the
    *  save-restore only papered over. The block's DIFF never changes on keep/undo/redo (it renders
    *  the edit's own before→after, not the file), so the action row is the whole delta. */
-  private patchStacked(session: string, id: number): void {
+  private async patchStacked(session: string, id: number): Promise<void> {
     const panel = this.stackedPanel;
     if (!panel) return;
-    const rec = core.reviewEdits(session).find((r) => r.id === id) ?? core.findRecord(session, id);
+    let rec: core.EditRecord | undefined;
+    try { rec = this.stackedMachine ? (await this.loadStackedPage(session, [id])).records[0]?.rec : core.reviewEdits(session).find(r => r.id === id) ?? core.findRecord(session, id) ?? undefined; }
+    catch (e) { void vscode.window.showErrorMessage(`OAK: ${String(e)}`); return; }
+    if (this.stackedPanel !== panel) return;
     if (!rec) return; // cleared mid-flight — the block keeps its last verbs, and a click on them fails loud
     void panel.webview.postMessage({ type: 'acts', id, done: rec.status !== 'pending', html: this.stackedActs(rec) });
   }
@@ -7248,20 +8957,35 @@ class ReviewViewProvider implements vscode.WebviewViewProvider {
     const panel = this.stackedPanel;
     if (!panel) return;
     const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-    const byId = new Map(core.reviewEdits(session).map((rec) => [rec.id, rec]));
-    // The same per-block bound the side-by-side view budgets with — a patch mixes both sides, so the
-    // allowance is doubled — and what is cut is named in the block, never silently.
+    const generation = ++this.stackedRender;
+    this.stackedBusy = true;
+    const ids = this.stackedIds.slice(this.stackedOffset, this.stackedOffset + 10);
+    let page: Awaited<ReturnType<ReviewViewProvider['loadStackedPage']>>;
+    try {
+      const first = this.stackedFirstPage;
+      this.stackedFirstPage = undefined;
+      page = first ?? (ids.length ? await this.loadStackedPage(session, ids) : { records: [] });
+    }
+    catch (e) {
+      if (this.stackedPanel === panel && generation === this.stackedRender) {
+        this.stackedBusy = false;
+        void vscode.window.showErrorMessage(`OAK: ${String(e)}`);
+      }
+      return;
+    }
+    if (this.stackedPanel !== panel || generation !== this.stackedRender) return;
     const budget = Math.max(0, vscode.workspace.getConfiguration('claudeObservatory').get<number>('openAllPreviewLines', 50)) * 2;
     const blocks: string[] = [];
-    for (const id of this.stackedIds) {
-      const rec = byId.get(id);
-      if (!rec) continue;
-      const d = core.lineDelta(session, rec);
-      const patch = core.coloredDiff(session, rec, false);
+    for (const item of page.records) {
+      // A resolved grammar promise is a microtask, not a yield to host events.
+      await new Promise<void>(resolve => setImmediate(resolve));
+      if (this.stackedPanel !== panel || generation !== this.stackedRender) return;
+      const { rec, patch } = item;
+      const d = item;
       const all = patch.split('\n');
       const start = all.findIndex((l) => l.startsWith('@@'));
       let lines = (start >= 0 ? all.slice(start) : all).filter((l, i, a) => l.length > 0 || i < a.length - 1);
-      let more = '';
+      let more = item.omittedLines > 0 ? `+${item.omittedLines} more diff line${item.omittedLines === 1 ? '' : 's'} — this block is previewed; open its full diff from the Review panel` : '';
       if (budget > 0 && lines.length > budget) {
         const n = lines.length - budget;
         more = `+${n} more diff line${n === 1 ? '' : 's'} — this block is previewed; open its full diff from the Review panel`;
@@ -7286,6 +9010,10 @@ class ReviewViewProvider implements vscode.WebviewViewProvider {
           } else {
             html = esc(line[0] ?? ' ') + hlLine(line.slice(1), ext);
           }
+          // A bidirectional control or zero-width character shows as the mark that names it (`⟨U+202E⟩`), dimmed, and so
+          // does a joiner inside an identifier (`is⟨U+200D⟩admin`): drawn as it is, it shows as nothing and reorders or hides
+          // what is around it. The tokens' tags stand between a run and the identifier around it.
+          html = core.revealHiddenHtml(html, (mark) => `<span class="hid">${mark}</span>`);
           return `<div class="ln ${k}">${html || '&nbsp;'}</div>`;
         })
         .join('');
@@ -7306,7 +9034,8 @@ class ReviewViewProvider implements vscode.WebviewViewProvider {
     }
     // The grammar awaits yield the loop — a panel disposed or replaced mid-render must not be
     // written to (a disposed webview throws; a replaced one would show the wrong scope).
-    if (this.stackedPanel !== panel) return;
+    if (this.stackedPanel !== panel || generation !== this.stackedRender) return;
+    this.stackedBusy = false;
     const nonce = getNonce();
     panel.webview.html =
       `<!DOCTYPE html><html><head><meta charset="utf-8">` +
@@ -7346,6 +9075,7 @@ class ReviewViewProvider implements vscode.WebviewViewProvider {
       `.ln{padding:0 10px 0 calc(10px + 1ch);text-indent:-1ch;white-space:pre-wrap;overflow-wrap:anywhere}` +
       // The bands carry add/del (no foreground override any more — the tokens below keep their
       // syntax colors inside the green/red, which was the ask).
+      `.ln .hid{opacity:.65}` +
       `.ln.add{background:var(--vscode-diffEditor-insertedLineBackground,rgba(60,180,90,.15))}` +
       `.ln.del{background:var(--vscode-diffEditor-removedLineBackground,rgba(220,80,80,.15))}` +
       `.ln.hunk{opacity:.65;color:var(--vscode-charts-blue)}` +
@@ -7362,6 +9092,9 @@ class ReviewViewProvider implements vscode.WebviewViewProvider {
       // the saved state below only ever turns it OFF (st.spot === false is the reader's own choice).
       `<button class="bt" id="spot" aria-pressed="true" title="Dim the unmodified context lines">Spotlight</button>` +
       `<button class="bt" id="sbs" title="The same changes in the native side-by-side multi-diff">Side by side</button></div>` +
+      `<div class="bar"><button class="bt" id="previous" ${this.stackedOffset === 0 ? 'disabled' : ''}>Previous 10</button>` +
+      `<span>${this.stackedOffset + 1}–${this.stackedOffset + ids.length} of ${this.stackedIds.length} changes · ${Math.max(0, this.stackedIds.length - this.stackedOffset - ids.length)} remaining</span>` +
+      `<button class="bt" id="next" ${this.stackedOffset + ids.length >= this.stackedIds.length ? 'disabled' : ''}>Show ${Math.min(10, this.stackedIds.length - this.stackedOffset - ids.length)} more</button></div>` +
       blocks.join('') +
       `<script nonce="${nonce}">` +
       `const vscode=acquireVsCodeApi();` +
@@ -7372,6 +9105,7 @@ class ReviewViewProvider implements vscode.WebviewViewProvider {
       `if(st.y)window.scrollTo(0,st.y);` +
       `window.addEventListener('scroll',function(){const s=vscode.getState()||{};s.y=window.scrollY;vscode.setState(s)});` +
       `document.getElementById('spot').onclick=function(){const on=document.body.classList.toggle('spot');this.setAttribute('aria-pressed',String(on));const s=vscode.getState()||{};s.spot=on;vscode.setState(s)};` +
+      `document.getElementById('next').onclick=function(){vscode.postMessage({type:'nextPage'})};document.getElementById('previous').onclick=function(){vscode.postMessage({type:'previousPage'})};` +
       `document.getElementById('sbs').onclick=function(){vscode.postMessage({type:'sideBySide'})};` +
       `document.body.addEventListener('click',function(e){const t=e.target.closest?e.target.closest('[data-keep],[data-undo],[data-redo]'):null;if(!t)return;` +
       `if(t.dataset.keep)vscode.postMessage({type:'keep',id:Number(t.dataset.keep)});` +
@@ -7408,6 +9142,8 @@ class ReviewViewProvider implements vscode.WebviewViewProvider {
   refresh(): void {
     if (!this.view) return;
     const session = currentSession();
+    const machine = currentMachine();
+    if (machine && session) { this.refreshRemote(machine, session); return; }
     // The badge's whole job is signaling while you are NOT looking at the view — set it BEFORE the
     // visibility gate (cheap: reviewEdits is memoized), or an Accept All with the container closed
     // freezes the count until the next reveal. (A webview view resolves lazily, so before its first
@@ -7521,28 +9257,35 @@ class ReviewViewProvider implements vscode.WebviewViewProvider {
 const REVIEW_SCRIPT = `
 (function(){
   var vscode = acquireVsCodeApi();
-  var DATA = null;
+  var DATA = null, RV_MACHINE = '';
+  function send(m){ m.machine=RV_MACHINE||''; m.session=DATA&&DATA.session; m.prompt=DATA&&DATA.prompt; vscode.postMessage(m); }
   function esc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
   function glyph(st){ return st==='kept' ? '✓' : st==='undone' ? '✗' : '●'; }
   function render(){
     var host = document.getElementById('rv');
+    if(!DATA && RV_MACHINE){
+      host.innerHTML = '<div class="rv-empty">Reading Review on '+esc(RV_MACHINE)+'…</div>';
+      return;
+    }
     if(!DATA){
       host.innerHTML = '<div class="rv-empty">No session is under observation yet. Once an agent works in this workspace, this panel lists the session’s changes — repeated edits to the same code read as ONE change. Click a row for its net diff, or open the whole list as one editor view; picking a prompt (the review button on its <b>Prompts</b> row, or the nav bar’s Prompt axis) scopes the list to that ask.</div>';
       return;
     }
+    var on = RV_MACHINE ? ' on '+esc(RV_MACHINE) : '';
     var scope = DATA.scoped ? 'this ask produced' : 'in this session';
-    var h = (DATA.scoped
+    var h = (RV_MACHINE ? '<div class="rv-hint">Open uses a matching mount first, then an SSH window. Open all and Diff stay here; review actions run on the saved machine.</div><div class="rv-filter">'+esc(DATA.note)+'</div>' : '') + (DATA.scoped
         ? '<div class="rv-head"><span class="rv-ix">#'+esc(DATA.index)+'</span><span class="rv-title">'+esc(DATA.title)+'</span></div>'
         : '<div class="rv-head"><span class="rv-title">Changes this session</span><span class="rv-hint">pick a prompt to scope</span></div>')+
-      (DATA.units.length && !DATA.filter?
+      (DATA.units.length && !DATA.filter && !DATA.filtered?
         '<div class="rv-acts">'+
         // ONE opener: stacked is the default view, and the stacked tab itself
         // carries the side-by-side switch next to Spotlight — two buttons here made one decision
         // (read the changes) look like two.
-        '<button class="rv-btn" data-act="openAllStacked" title="Every pending change '+scope+' in one editor tab — stacked (removed/added lines inline) with a Spotlight toggle; the bar up top switches to the side-by-side view">Open all in editor</button>'+
+        ('<button class="rv-btn" data-act="openAllStacked" title="Every pending change '+scope+' in one editor tab — stacked (removed/added lines inline) with a Spotlight toggle; the bar up top switches to the side-by-side view">Open all in editor'+on+'</button>')+
         (DATA.pending?
           '<button class="rv-btn" data-act="keepAll" title="Keep every pending edit '+scope+'">Keep all ('+DATA.pending+')</button>'+
           '<button class="rv-btn" data-act="undoAll" title="Revert every pending edit '+scope+'">Undo all</button>' : '')+
+        (RV_MACHINE ? '<button class="rv-btn" data-act="redoAll" title="Re-apply reverted edits in this scope">Redo all</button><button class="rv-btn" data-act="resolveAll" title="Accept and clear this session">Resolve session</button>' : '')+
         (DATA.units.some(function(u){return u.status!=='pending';})?
           '<button class="rv-btn" data-act="clearResolved" title="Drop the kept/reverted records and keep the pending ones — shortens a long session">Clear resolved</button>' : '')+
         '</div>'
@@ -7565,13 +9308,14 @@ const REVIEW_SCRIPT = `
     for(var i=0;i<DATA.units.length;i++){ var u0=DATA.units[i]; if(!groups[u0.rel]){ groups[u0.rel]=[]; order.push(u0.rel); } groups[u0.rel].push(u0); }
     // Per-file freshest edit time — the "N min ago" value and the time-sort key.
     var gTs=Object.create(null); for(var gi=0;gi<order.length;gi++){ var mx=0; var gu=groups[order[gi]]; for(var gj=0;gj<gu.length;gj++){ if((gu[gj].ts||0)>mx) mx=gu[gj].ts||0; } gTs[order[gi]]=mx; }
-    if((DATA.sort||'time')==='name') order.sort(function(a,b){ return a.localeCompare(b); });
+    if((DATA.sort||'time').indexOf('name')===0) order.sort(function(a,b){ return a.localeCompare(b)*(DATA.sort==='name-desc'?-1:1); });
+    else if(DATA.sort==='time-asc') order.sort(function(a,b){return (gTs[a]||0)-(gTs[b]||0)||a.localeCompare(b);});
     else order.sort(function(a,b){ return (gTs[b]||0)-(gTs[a]||0) || a.localeCompare(b); }); // 'time' (default)
     for(var g=0;g<order.length;g++){
       var rel = order[g]; var us = groups[rel];
       var pend = 0, undone = 0;
       for(var p=0;p<us.length;p++){ if(us[p].status==='pending') pend++; else if(us[p].status==='undone') undone++; }
-      h += '<div class="rv-file"><span class="rv-age" title="last edited '+relAge(gTs[rel])+'">'+relAge(gTs[rel])+'</span><span class="rv-frel" data-openfile="'+esc(us[0].file)+'" title="Open this file in the editor">'+esc(rel)+'</span><span class="rv-fmeta">'+(pend?pend+' pending':'resolved')+'</span>'+
+      h += '<div class="rv-file"><span class="rv-age" title="last edited '+relAge(gTs[rel])+'">'+relAge(gTs[rel])+'</span><span class="rv-frel" data-openfile="'+esc(us[0].file)+'" title="'+(RV_MACHINE?'Open on '+esc(RV_MACHINE):'Open this file in the editor')+'">'+esc(rel)+'</span><span class="rv-fmeta">'+(pend?pend+' pending':'resolved')+'</span>'+
         (pend? '<span class="rv-ubtns">'+
           '<button class="rv-btn" data-keepfile="'+esc(us[0].file)+'" title="Keep every pending edit in this file">✓ file</button>'+
           '<button class="rv-btn" data-undofile="'+esc(us[0].file)+'" title="Revert every pending edit in this file">✗ file</button></span>' : '')+
@@ -7580,11 +9324,12 @@ const REVIEW_SCRIPT = `
         // per-edit row both offer redo, and the file scope silently did not.
         (!pend && undone? '<span class="rv-ubtns">'+
           '<button class="rv-btn" data-redofile="'+esc(us[0].file)+'" title="Re-apply every undone edit in this file">↻ file</button></span>' : '')+
-        '</div>';
+        (RV_MACHINE ? '<button class="rv-btn" data-resolvefile="'+esc(us[0].file)+'" title="Accept and clear the listed edits in this file">Resolve file</button>' : '') + '</div>';
       for(var k=0;k<us.length;k++){
         var u = us[k];
         var mem = (u.status==='pending' && u.members>1) ? '<span class="rv-mem" title="'+u.members+' edits to the same code, combined — its diff is their net change">'+u.members+' edits</span>' : '';
-        var evidence = u.capture ? '<span class="rv-part" title="'+esc(u.capture)+'">'+esc(u.capture)+'</span>' : '';
+        // How the edit was captured (tool and turn ids) is detail for the hover, never row text.
+        var evidence = '';
         var part = u.partial ? '<span class="rv-part" title="Review-only: the before-state of this edit is uncertain (an overlapping hook capture), so its diff shows the new text against nothing and undo refuses (keep works).">review-only</span>' : '';
         var acts = u.status==='pending'
           ? '<span class="rv-ubtns"><button class="rv-btn" data-keep="'+u.id+'" title="Keep this change">✓</button>'+
@@ -7595,10 +9340,10 @@ const REVIEW_SCRIPT = `
             // back", and the reject glyph read as a second reject. ↺ reverts / ↻ re-applies.
             : '<span class="rv-ubtns"><button class="rv-btn" data-undo="'+u.id+'" title="Revert this kept edit">↺</button></span>';
         h += '<div class="rv-unit'+(u.status==='pending'?'':' rv-res')+'">'+
-          '<div class="rv-uhead" data-open="'+u.id+'" title="Open this change’s diff in the editor">'+
+          '<div class="rv-uhead" data-open="'+u.id+'" title="'+(RV_MACHINE?'Open on '+esc(RV_MACHINE):'Open this change’s diff in the editor')+'">'+
             '<span class="rv-st rv-'+esc(u.status)+'">'+glyph(u.status)+'</span>'+
-            '<span class="rv-id">#'+u.id+'</span>'+
-            '<span class="rv-delta"><span class="rv-add">+'+u.added+'</span> <span class="rv-del">−'+u.removed+'</span></span>'+mem+part+evidence+acts+
+            '<span class="rv-id"'+(u.capture?' title="'+esc(u.capture)+'"':'')+'>#'+u.id+'</span>'+
+            '<span class="rv-delta"><span class="rv-add">+'+u.added+'</span> <span class="rv-del">−'+u.removed+'</span></span>'+mem+part+evidence+acts+(RV_MACHINE?'<button class="rv-btn" data-diff="'+u.id+'">Diff</button><button class="rv-btn" data-comment="'+u.id+'" title="Comment on this edit">Comment</button><button class="rv-btn" data-resolve="'+u.id+'" title="Accept and clear this edit">Resolve</button>':'')+
           '</div>'+
           '</div>';
       }
@@ -7610,32 +9355,37 @@ const REVIEW_SCRIPT = `
         ' <span class="rv-fmeta">created then deleted, or put back — nothing to review</span>'+
         '<button class="rv-btn" data-act="dismissCancelled" title="Mark these kept — they were never a decision">Dismiss</button></div>';
     }
+    if(RV_MACHINE) h = h.replace(/title="([^"]*)"/g, function(_, t){return 'title="'+t+(t.endsWith(on)?'':on)+'"';});
     host.innerHTML = h;
   }
   document.addEventListener('click', function(ev){
-    var t = ev.target && ev.target.closest ? ev.target.closest('[data-act],[data-keep],[data-undo],[data-redo],[data-keepfile],[data-undofile],[data-redofile],[data-openfile],[data-open]') : null;
+    var t = ev.target && ev.target.closest ? ev.target.closest('[data-resolve],[data-resolvefile],[data-comment],[data-act],[data-keep],[data-undo],[data-redo],[data-keepfile],[data-undofile],[data-redofile],[data-openfile],[data-open],[data-diff]') : null;
     if(!t) return;
     // The FILENAME opens the file itself — the row heads beneath it open diffs; two different asks.
     var of = t.getAttribute('data-openfile');
-    if(of!=null){ ev.stopPropagation(); vscode.postMessage({type:'openFile', file:of}); return; }
+    if(of!=null){ ev.stopPropagation(); send({type:'openFile', file:of}); return; }
+    var resolve = t.getAttribute('data-resolve'); if(resolve!=null){ ev.stopPropagation(); send({type:'resolve', id:+resolve}); return; }
+    var resolveFile = t.getAttribute('data-resolvefile'); if(resolveFile!=null){ ev.stopPropagation(); send({type:'resolveFile', file:resolveFile}); return; }
+    var diff = t.getAttribute('data-diff'); if(diff!=null){ ev.stopPropagation(); send({type:'diff', id:+diff}); return; }
+    var comment = t.getAttribute('data-comment'); if(comment!=null){ ev.stopPropagation(); send({type:'comment', id:+comment}); return; }
     // Buttons FIRST: they sit inside the header, and the header click means "open the diff".
     var keep = t.getAttribute('data-keep');
-    if(keep!=null){ ev.stopPropagation(); vscode.postMessage({type:'keep', id:+keep}); return; }
+    if(keep!=null){ ev.stopPropagation(); send({type:'keep', id:+keep}); return; }
     var undo = t.getAttribute('data-undo');
-    if(undo!=null){ ev.stopPropagation(); vscode.postMessage({type:'undo', id:+undo}); return; }
+    if(undo!=null){ ev.stopPropagation(); send({type:'undo', id:+undo}); return; }
     var redo = t.getAttribute('data-redo');
-    if(redo!=null){ ev.stopPropagation(); vscode.postMessage({type:'redo', id:+redo}); return; }
+    if(redo!=null){ ev.stopPropagation(); send({type:'redo', id:+redo}); return; }
     var kf = t.getAttribute('data-keepfile');
-    if(kf!=null){ ev.stopPropagation(); vscode.postMessage({type:'keepFile', file:kf}); return; }
+    if(kf!=null){ ev.stopPropagation(); send({type:'keepFile', file:kf}); return; }
     var uf = t.getAttribute('data-undofile');
-    if(uf!=null){ ev.stopPropagation(); vscode.postMessage({type:'undoFile', file:uf}); return; }
+    if(uf!=null){ ev.stopPropagation(); send({type:'undoFile', file:uf}); return; }
     var rf = t.getAttribute('data-redofile');
-    if(rf!=null){ ev.stopPropagation(); vscode.postMessage({type:'redoFile', file:rf}); return; }
+    if(rf!=null){ ev.stopPropagation(); send({type:'redoFile', file:rf}); return; }
     var act = t.getAttribute('data-act');
-    if(act === 'dismissCancelled'){ vscode.postMessage({type:act, ids:(DATA&&DATA.cancelledIds)||[]}); return; }
-    if(act){ vscode.postMessage({type:act}); return; }
+    if(act === 'dismissCancelled'){ send({type:act, ids:(DATA&&DATA.cancelledIds)||[]}); return; }
+    if(act){ send({type:act}); return; }
     var open = t.getAttribute('data-open');
-    if(open!=null) vscode.postMessage({type:'open', id:+open});
+    if(open!=null) send({type:'open', id:+open});
   });
   // ---- the inline filter/sort toolbar (static, outside #rv, so typing survives a re-render) --------
   var RVCATLBL={ code:'Code', tests:'Tests', config:'Config', docs:'Docs', styles:'Styles', other:'Other' };
@@ -7669,30 +9419,30 @@ const REVIEW_SCRIPT = `
   function rvCloseSort(){ RV_SORT_OPEN=false; var d=document.getElementById('rv-sort-drop'); if(d) d.hidden=true; var b=document.getElementById('rv-sort-btn'); if(b) b.setAttribute('aria-expanded','false'); }
   (function wireRvToolbar(){
     var si=document.getElementById('rv-search-input');
-    if(si){ si.addEventListener('input', function(){ if(RV_ST) clearTimeout(RV_ST); RV_ST=setTimeout(function(){ vscode.postMessage({type:'setQuery', q:si.value}); }, 200); });
-      si.addEventListener('keydown', function(ev){ if(ev.key==='Escape'){ si.value=''; vscode.postMessage({type:'setQuery', q:''}); } }); }
+    if(si){ si.addEventListener('input', function(){ if(RV_ST) clearTimeout(RV_ST); RV_ST=setTimeout(function(){ send({type:'setQuery', q:si.value}); }, 200); });
+      si.addEventListener('keydown', function(ev){ if(ev.key==='Escape'){ si.value=''; send({type:'setQuery', q:''}); } }); }
     var fb=document.getElementById('rv-filter-btn');
     if(fb){ fb.addEventListener('click', function(ev){ ev.stopPropagation(); var d=document.getElementById('rv-filter-drop'); if(!d) return; rvCloseSort(); RV_DROP_OPEN=!RV_DROP_OPEN; if(RV_DROP_OPEN){ renderRvDrop(); d.hidden=false; fb.setAttribute('aria-expanded','true'); } else rvCloseDrop(); }); }
     var d=document.getElementById('rv-filter-drop');
-    if(d){ d.addEventListener('click', function(ev){ ev.stopPropagation(); if(ev.target&&ev.target.id==='rv-fd-clear') vscode.postMessage({type:'setFilterSpec', exts:[], categories:[]}); });
+    if(d){ d.addEventListener('click', function(ev){ ev.stopPropagation(); if(ev.target&&ev.target.id==='rv-fd-clear') send({type:'setFilterSpec', exts:[], categories:[]}); });
       d.addEventListener('change', function(ev){ var t=ev.target; if(!t||!DATA) return; var fs=DATA.filterSpec||{},cats=(fs.categories||[]).slice(),exts=(fs.exts||[]).slice();
         var cat=t.getAttribute&&t.getAttribute('data-cat'),ext=t.getAttribute&&t.getAttribute('data-ext');
         if(cat){ var ci=cats.indexOf(cat); if(t.checked&&ci<0) cats.push(cat); else if(!t.checked&&ci>=0) cats.splice(ci,1); }
         else if(ext){ var ei=exts.indexOf(ext); if(t.checked&&ei<0) exts.push(ext); else if(!t.checked&&ei>=0) exts.splice(ei,1); }
-        vscode.postMessage({type:'setFilterSpec', exts:exts, categories:cats}); }); }
+        send({type:'setFilterSpec', exts:exts, categories:cats}); }); }
     // Sort — the same anchored dropdown, its four rows the orders (a check on the one in force).
     var sb=document.getElementById('rv-sort-btn');
     if(sb){ sb.addEventListener('click', function(ev){ ev.stopPropagation(); var sd=document.getElementById('rv-sort-drop'); if(!sd) return; rvCloseDrop(); RV_SORT_OPEN=!RV_SORT_OPEN; if(RV_SORT_OPEN){ renderRvSortDrop(); sd.hidden=false; sb.setAttribute('aria-expanded','true'); } else rvCloseSort(); }); }
     var sd=document.getElementById('rv-sort-drop');
-    if(sd){ sd.addEventListener('click', function(ev){ ev.stopPropagation(); var r=ev.target; while(r && r!==sd && !(r.getAttribute&&r.getAttribute('data-sort'))) r=r.parentNode; if(r&&r.getAttribute){ var k=r.getAttribute('data-sort'); if(k){ vscode.postMessage({type:'setSort', sort:k}); rvCloseSort(); } } }); }
+    if(sd){ sd.addEventListener('click', function(ev){ ev.stopPropagation(); var r=ev.target; while(r && r!==sd && !(r.getAttribute&&r.getAttribute('data-sort'))) r=r.parentNode; if(r&&r.getAttribute){ var k=r.getAttribute('data-sort'); if(k){ send({type:'setSort', sort:k}); rvCloseSort(); } } }); }
     document.addEventListener('click', function(){ if(RV_DROP_OPEN) rvCloseDrop(); if(RV_SORT_OPEN) rvCloseSort(); });
   })();
   window.addEventListener('message', function(ev){
     var m = ev.data || {};
-    if(m.type==='review'){ DATA = m.data; render(); syncRvToolbar(); if(RV_DROP_OPEN) renderRvDrop(); if(RV_SORT_OPEN) renderRvSortDrop(); }
+    if(m.type==='review'){ DATA = m.data; RV_MACHINE = m.machine||''; render(); syncRvToolbar(); if(RV_DROP_OPEN) renderRvDrop(); if(RV_SORT_OPEN) renderRvSortDrop(); }
   });
   render();
-  vscode.postMessage({type:'ready'});
+  send({type:'ready'});
 })();
 `;
 
@@ -7701,6 +9451,9 @@ function reviewShell(): string {
   const csp = `default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';`;
   const style = `<style>
   body { margin:0; padding:8px 10px 12px; font-family: var(--vscode-font-family); font-size:11.5px; color: var(--vscode-foreground); }
+  body { height:100vh; box-sizing:border-box; display:flex; flex-direction:column; }
+  #rv { flex:1; min-height:0; overflow:auto; }
+  .rv-composer { flex:none; padding-top:6px; border-top:1px solid var(--vscode-widget-border, rgba(127,127,127,0.25)); }
   .rv-filter { padding:4px 2px 10px; color: var(--vscode-descriptionForeground); font-size:11px; }
   .rv-empty { padding:10px 2px; color: var(--vscode-descriptionForeground); line-height:1.55; }
   .rv-head { display:flex; align-items:baseline; gap:7px; margin-bottom:6px; }
@@ -7712,7 +9465,7 @@ function reviewShell(): string {
   .rv-acts { display:flex; flex-wrap:wrap; gap:6px; align-items:center; margin-bottom:10px; }
   .rv-btn { background: var(--vscode-button-secondaryBackground, rgba(127,127,127,0.15)); color: var(--vscode-button-secondaryForeground, var(--vscode-foreground)); border:1px solid var(--vscode-widget-border, rgba(127,127,127,0.25)); border-radius:4px; padding:2px 8px; font-size:10.5px; font-family:inherit; cursor:pointer; white-space:nowrap; }
   .rv-btn:hover { background: var(--vscode-button-secondaryHoverBackground, rgba(127,127,127,0.25)); }
-  .rv-unit { margin-bottom:5px; }
+  .rv-unit { margin-bottom:5px; content-visibility:auto; contain-intrinsic-size:auto 28px; }
   .rv-uhead { display:flex; align-items:center; gap:6px; padding:3px 4px; border:1px solid var(--vscode-widget-border, rgba(127,127,127,0.25)); border-radius:5px; background: var(--vscode-editorWidget-background, rgba(127,127,127,0.07)); cursor:pointer; }
   .rv-uhead:hover { background: var(--vscode-list-hoverBackground, rgba(127,127,127,0.12)); }
   .rv-st.rv-pending { color: var(--vscode-charts-yellow, #d9a441); }
@@ -7760,7 +9513,7 @@ function reviewShell(): string {
     `<span class="rv-swrap"><span class="rv-sicon">⌕</span><input id="rv-search-input" class="rv-sinp" type="text" placeholder="Search" title="Filter edits by path — a regex when it carries regex syntax, a substring otherwise"></span>` +
     `<span class="rv-cb"><button class="rv-tbb" id="rv-filter-btn" aria-expanded="false" title="Filter by file type and extension"><span id="rv-filter-lbl">Filter</span> ▾</button><div class="rv-drop" id="rv-filter-drop" hidden></div></span>` +
     `<span class="rv-cb"><button class="rv-tbb" id="rv-sort-btn" aria-expanded="false" title="Sort order — newest / oldest / name A→Z / name Z→A"><span id="rv-sort-lbl">Sort: Newest</span> ▾</button><div class="rv-drop" id="rv-sort-drop" hidden></div></span>` +
-  `</div><div id="rv"></div><script nonce="${nonce}">${REVIEW_SCRIPT}</script></body></html>`;
+  `</div><div id="rv"></div><div class="rv-composer"><div class="rv-acts"><button class="rv-btn" data-act="reviewPrev">Previous edit</button><button class="rv-btn" data-act="reviewNext">Next edit</button><button class="rv-btn" data-act="navFilePrev">Previous file</button><button class="rv-btn" data-act="navFileNext">Next file</button></div></div><script nonce="${nonce}">${REVIEW_SCRIPT}</script></body></html>`;
 }
 
 /** The combined Overview panel (0.8.0 round 3): shells out to BOTH `multitask --json` (the left-nav
@@ -7771,7 +9524,8 @@ function reviewShell(): string {
 interface NavPos {
   diff: { i: number; n: number; time: string } | null;
   file: { i: number; n: number; name: string; edits: number } | null;
-  folder: { i: number; n: number; name: string; files: number; edits: number } | null;
+  /** `shown`: the name as the bar's counter shows it, its last 23 characters after `…` when it is longer than 24. */
+  folder: { i: number; n: number; name: string; shown: string; files: number; edits: number } | null;
   // The user's own turn that produced the current edit. Every other axis slices the work the way the
   // AGENT saw it (a file, a folder); this one slices it the way the person asked for it.
   prompt: { i: number; n: number; id: string; index: number; title: string; files: number; edits: number } | null;
@@ -7792,6 +9546,7 @@ class ChangeMapViewProvider implements vscode.WebviewViewProvider {
   private run = 0;
   private running = false;
   private everLoaded = false;
+  private savedHooked = false;
   // The live Diff/File step-through position, mirrored into the title-bar nav-bar counters. Set by the
   // status bar's updateStatusItem (single source of truth); rides the next overview message + a live push.
   private navPos: NavPos | null = null;
@@ -7800,7 +9555,7 @@ class ChangeMapViewProvider implements vscode.WebviewViewProvider {
   /** A feed subject was picked in this panel's webview (a fleet/workflow/task/process row) — or
    *  cleared. The Timeline provider is the listener: it owns the feed fetch and the Feed tab
    *  (0.10.0 — the feed moved there from under the change map). */
-  onFeedSelect?: (ref: { kind: string; id: string; label: string } | null) => void;
+  onFeedSelect?: (ref: { kind: string; id: string; label: string; session?: string; machine?: string; cwd?: string } | null) => void;
   /** Wired in activate(): a ledger row's ⧉ opens that file's changes as the STACKED layout —
    *  through the Review provider that owns the stacked panel (the feed's opener, same rule). */
   onOpenFileStacked?: (session: string, editId: number) => void;
@@ -7833,11 +9588,26 @@ class ChangeMapViewProvider implements vscode.WebviewViewProvider {
   setShowAll(on: boolean): void {
     this.view?.webview.postMessage({ type: 'showall', on });
   }
+  private workspaceDashboards = false;
+  private readyHosts = new WeakSet<OverviewHost>();
+  async showWorkspaceDashboards(): Promise<void> {
+    this.workspaceDashboards = true;
+    await vscode.commands.executeCommand('claudeObservatory.changemap.focus');
+    if (this.panelView) { this.view = this.panelView; this.refresh(true); }
+    this.sendWorkspaceDashboards();
+  }
+  private sendWorkspaceDashboards(): void {
+    if (this.workspaceDashboards && this.panelView && this.readyHosts.has(this.panelView)) {
+      this.panelView.webview.postMessage({ type: 'workspaceDashboards' });
+      this.workspaceDashboards = false;
+    }
+  }
   resolveWebviewView(view: vscode.WebviewView): void {
     this.panelView = view;
     if (!this.editorPanel) this.view = view; // an open editor tab keeps the wheel
     this.wire(view);
     view.onDidChangeVisibility(() => {
+      if (!view.visible) this.readyHosts.delete(view);
       if (view.visible && this.view === view) this.refresh(true);
     });
   }
@@ -7851,9 +9621,11 @@ class ChangeMapViewProvider implements vscode.WebviewViewProvider {
     // forever with no explanation. Say where the Overview went instead of looking broken.
     if (this.editorPanel && host !== this.editorPanel)
       setTimeout(() => host.webview.postMessage({ type: 'elsewhere', where: 'editor' }), 0);
-    host.webview.onDidReceiveMessage((m: { type?: string; id?: number | string; kind?: string; taskId?: string; promptId?: string; folder?: string; ref?: core.ChatContextRef; session?: string; name?: string; pending?: string | number; channel?: string; act?: string; rel?: string }) => {
+    host.webview.onDidReceiveMessage((m: { visible?: boolean; host?: string; type?: string; id?: number | string; kind?: string; taskId?: string; promptId?: string; folder?: string; ref?: core.ChatContextRef; session?: string; machine?: string; cwd?: string; name?: string; pending?: string | number; channel?: string; act?: string; rel?: string; file?: string }) => {
       if (!m) return;
       if (m.type === 'ready') {
+        this.readyHosts.add(host);
+        this.sendWorkspaceDashboards();
         this.refresh(true);
         void versionChipInfo().then((v) => host.webview.postMessage({ type: 'version', v }));
       }
@@ -7880,9 +9652,12 @@ class ChangeMapViewProvider implements vscode.WebviewViewProvider {
       else if (m.type === 'feed')
         this.onFeedSelect?.(
           typeof m.kind === 'string' && m.kind
-            ? { kind: m.kind, id: typeof m.id === 'string' ? m.id : '', label: typeof (m as { label?: unknown }).label === 'string' ? (m as { label: string }).label : '' }
+            ? { kind: m.kind, id: typeof m.id === 'string' ? m.id : '', label: typeof (m as { label?: unknown }).label === 'string' ? (m as { label: string }).label : '', ...(typeof m.session === 'string' ? { session: m.session } : {}), ...(typeof m.machine === 'string' && m.machine ? { machine: m.machine } : {}), ...(typeof m.cwd === 'string' && m.cwd ? { cwd: m.cwd } : {}) }
             : null
         );
+      // A saved machine's session: the file is there, so its row opens the patch read there (the stacked layout too).
+      else if ((m.type === 'openEdit' || (m.type === 'mapScope' && m.act === 'stack')) && typeof m.id === 'number' && currentMachine())
+        void vscode.commands.executeCommand('claudeObservatory.remoteOpen', currentMachine(), currentSession(), m.id, typeof m.file === 'string' ? m.file : undefined);
       else if (m.type === 'openEdit' && typeof m.id === 'number')
         void vscode.commands.executeCommand('claudeObservatory.viewChanges', m.id);
       // A ledger row's ⧉: that file's changes as the STACKED layout — the same
@@ -7902,20 +9677,21 @@ class ChangeMapViewProvider implements vscode.WebviewViewProvider {
         void (async () => {
           const cwd = workspaceRoot();
           const session = currentSession();
+          const machine = currentMachine();
           if (!cwd || !session) return;
           // Undo REWRITES FILES ON DISK, so it asks first with the real number. Keep records a verdict
           // and changes nothing, so it does not — the same asymmetry every other surface here uses.
           if (act === 'undo') {
             const ok = await vscode.window.showWarningMessage(
-              `Undo ${pending} pending edit(s) in ${name}?`,
-              { modal: true, detail: 'This reverts them on disk. Keeping instead records a verdict and changes no file.' },
+              `Undo ${pending} pending edit(s) in ${name}${machine ? ` on ${machine}` : ''}?`,
+              { modal: true, detail: `This reverts them on disk${machine ? ` on ${machine}` : ''}. Keeping instead records a verdict and changes no file.` },
               'Undo'
             );
             if (ok !== 'Undo') return;
           }
           // Spawned, like every other bulk verb here: `--under` can resolve to hundreds of records on a
           // folder, and doing that in-process froze the host the last time a bulk path took that route.
-          spawnCliJson([act, '--under', rel, '--session', session, '--json'], cwd, (data) => {
+          spawnCliJson([act, '--under', rel, '--session', session, '--json', ...onMachine()], cwd, (data) => {
             const r = (data ?? {}) as Record<string, unknown>;
             const n = Number(r[act === 'keep' ? 'kept' : 'undone'] ?? 0);
             // CONFLICTS and REFUSALS are separate numbers and both have to be said. The CLI exits 0
@@ -7941,11 +9717,12 @@ class ChangeMapViewProvider implements vscode.WebviewViewProvider {
               );
             } else {
               vscode.window.setStatusBarMessage(
-                `OAK: ${act === 'keep' ? 'kept' : 'undid'} ${n} edit(s) in ${name}`,
+                `OAK: ${act === 'keep' ? 'kept' : 'undid'} ${n} edit(s) in ${name}${machine ? ` on ${machine}` : ''}`,
                 3000
               );
             }
-            void vscode.commands.executeCommand('claudeObservatory.refresh');
+            remoteTl.clear(); // a saved machine's Timeline lists read again, with the verdict
+            void vscode.commands.executeCommand('claudeObservatory.refresh', NO_SWEEP);
           });
         })();
       }
@@ -7959,6 +9736,8 @@ class ChangeMapViewProvider implements vscode.WebviewViewProvider {
       // because clearing the records is not undoable — the accept itself changes no file on disk.
       else if (m.type === 'resolveSession' && typeof m.session === 'string') {
         const sess = m.session;
+        // A saved machine's row: resolved there, and only an id that machine's listing holds.
+        const machine = typeof m.machine === 'string' && m.machine ? m.machine : '';
         const nm = typeof m.name === 'string' && m.name ? m.name : sess.slice(0, 8);
         const pend = Number(m.pending) || 0;
         void (async () => {
@@ -7977,9 +9756,11 @@ class ChangeMapViewProvider implements vscode.WebviewViewProvider {
           // Validated like every other bulk verb. resolveSession is the MOST destructive of them — it
           // accepts everything then drops the records — so it gets the same rails, not fewer, even
           // though the only sender today is this workspace's own Sessions list.
-          const target = bulkSession(sess);
+          const target = machine
+            ? (savedMachineSnapshot().machines.some((x) => x.label === machine && x.listing?.sessions.some((r) => r.id === sess)) ? sess : null)
+            : bulkSession(sess);
           if (!target || target !== sess) {
-            vscode.window.showWarningMessage('That session is not one of this workspace’s — nothing was changed.');
+            vscode.window.showWarningMessage(machine ? `That session is not one ${machine} listed — nothing was changed.` : 'That session is not one of this workspace’s — nothing was changed.');
             return;
           }
           // Spawned: resolveSession = accept-everything + rewrite-the-log, measured ~0.8s at 8k
@@ -7989,12 +9770,12 @@ class ChangeMapViewProvider implements vscode.WebviewViewProvider {
             { location: vscode.ProgressLocation.Notification, title: `Resolving ${nm}…` },
             () =>
               new Promise<void>((fin) => {
-                spawnCliJson(['resolve', '--session', target, '--json'], workspaceRoot() ?? process.cwd(), (data) => {
+                spawnCliJson(['resolve', '--session', target, '--json', ...(machine ? ['--machine', machine] : [])], workspaceRoot() ?? process.cwd(), (data) => {
                   const r = data as { accepted?: number; cleared?: number } | null;
                   if (r && typeof r.accepted === 'number')
-                    vscode.window.showInformationMessage(`Resolved ${nm} — accepted ${r.accepted} edit(s), cleared ${r.cleared ?? 0} record(s).`);
+                    vscode.window.showInformationMessage(`Resolved ${nm}${machine ? ` on ${machine}` : ''} — accepted ${r.accepted} edit(s), cleared ${r.cleared ?? 0} record(s).`);
                   else vscode.window.showErrorMessage(`Could not resolve ${nm} — is the oak CLI installed?`);
-                  void vscode.commands.executeCommand('claudeObservatory.refresh');
+                  void vscode.commands.executeCommand('claudeObservatory.refresh', NO_SWEEP);
                   fin();
                 });
               })
@@ -8002,11 +9783,11 @@ class ChangeMapViewProvider implements vscode.WebviewViewProvider {
         })();
       }
       // Task review actions from the Tasks tab's per-row chips (strict edit sets).
-      else if (m.type === 'taskKeep' && typeof m.taskId === 'string')
+      else if (m.type === 'taskKeep' && m.machine === (currentMachine() ?? '') && m.session === currentSession() && typeof m.taskId === 'string')
         void vscode.commands.executeCommand('claudeObservatory.taskKeep', m.taskId);
-      else if (m.type === 'taskUndo' && typeof m.taskId === 'string')
+      else if (m.type === 'taskUndo' && m.machine === (currentMachine() ?? '') && m.session === currentSession() && typeof m.taskId === 'string')
         void vscode.commands.executeCommand('claudeObservatory.taskUndo', m.taskId);
-      else if (m.type === 'taskClear' && typeof m.taskId === 'string')
+      else if (m.type === 'taskClear' && m.machine === (currentMachine() ?? '') && m.session === currentSession() && typeof m.taskId === 'string')
         void vscode.commands.executeCommand('claudeObservatory.taskClear', m.taskId);
       // Prompt (user-turn) review actions — the Prompts window's selected row retargets the bulk
       // buttons; core resolves the id to that ask's edit set.
@@ -8022,7 +9803,7 @@ class ChangeMapViewProvider implements vscode.WebviewViewProvider {
         void vscode.commands.executeCommand('claudeObservatory.reviewPrompt', m.promptId);
       else if (m.type === 'revealFolder' && typeof m.folder === 'string')
         void vscode.commands.executeCommand('claudeObservatory.revealFolder', m.folder);
-      else if (m.type === 'clearCompletedTasks')
+      else if (m.type === 'clearCompletedTasks' && m.machine === (currentMachine() ?? '') && m.session === currentSession())
         void vscode.commands.executeCommand('claudeObservatory.clearCompletedTasks');
       // Top-navbar review actions — the session selector + the same bulk actions the Observations toolbar has.
       else if (m.type === 'switchSession')
@@ -8031,6 +9812,31 @@ class ChangeMapViewProvider implements vscode.WebviewViewProvider {
       // other tab, which only re-slices the detail).
       else if (m.type === 'switchToSession' && typeof m.id === 'string')
         void vscode.commands.executeCommand('claudeObservatory.pinSession', m.id);
+      // The Sessions tab is on screen: each saved machine's sessions as the last read gave them, read again behind them.
+      else if (m.type === 'workersVisible') {
+        this.workerVisibility.set(host, m.visible === true);
+        if (host === this.view && host.visible) this.postWorkerMachines(this.workerSynced);
+      }
+      else if (m.type === 'wantSaved') {
+        if (!this.savedHooked) {
+          this.savedHooked = true;
+          savedListeners.add(() => void this.view?.webview.postMessage({ type: 'saved', ...savedMachineSnapshot() }));
+        }
+        void host.webview.postMessage({ type: 'saved', ...savedMachineSnapshot() });
+        refreshSavedMachines();
+      }
+      // …and one of them picked: only an id that machine's listing holds.
+      else if (m.type === 'pickSynced' && typeof m.id === 'string' && typeof m.host === 'string') {
+        void readMachineListings(workspaceRoot() ?? process.cwd()).then((machines) => {
+          const machine = machines.find((x) => x.host === m.host), row = machine?.sessions.find((x) => x.id === m.id);
+          if (machine && row) void openSyncedSession(machine, row);
+        });
+      }
+      else if (m.type === 'pickRemote' && typeof m.id === 'string' && typeof m.machine === 'string') {
+        const id = m.id, machine = m.machine;
+        if (savedMachineSnapshot().machines.some((x) => x.label === machine && x.listing?.sessions.some((r) => r.id === id)))
+          void vscode.commands.executeCommand('claudeObservatory.pinRemoteSession', machine, id);
+      }
       // The 🗑 on a Sessions-tab row: confirm, then core.deleteSession (hide + purge captured edits;
       // transcript untouched) and re-pin to the newest remaining if the deleted one was pinned. The
       // shared body's forced refresh re-posts this tab's session list (as `resolveSession` above relies
@@ -8048,8 +9854,8 @@ class ChangeMapViewProvider implements vscode.WebviewViewProvider {
         void vscode.commands.executeCommand('claudeObservatory.clearResolved', m.session);
       else if (m.type === 'refresh')
         // The sweep for a newly-added `.observatoryignore` lives in the `claudeObservatory.refresh`
-        // command handler now, so EVERY user refresh route gets it (this button, the palette, the
-        // post-mutation refreshes) — not just this one message.
+        // command handler now, so every user Refresh route gets it (this button, the palette, the view
+        // toolbars) — not just this one message.
         void vscode.commands.executeCommand('claudeObservatory.refresh');
       // Step-through review nav bar (mirrors the status-bar nav bar) — passthrough to the existing commands.
       else if (m.type === 'navFilePrev') void vscode.commands.executeCommand('claudeObservatory.navFilePrev');
@@ -8076,6 +9882,7 @@ class ChangeMapViewProvider implements vscode.WebviewViewProvider {
       else if (m.type === 'undoOpenFile') void vscode.commands.executeCommand('claudeObservatory.undoOpenFile');
       else if (m.type === 'exportSummary') void vscode.commands.executeCommand('claudeObservatory.exportSummary');
       else if (m.type === 'exportMenu') void vscode.commands.executeCommand('claudeObservatory.exportMenu');
+      else if (m.type === 'openWorkspaceWindow') void openWorkspaceWindow(String(m.id || ''), m.machine || undefined);
       else if (m.type === 'openStore') revealStoreFolder(String(m.id || currentSession() || ''));
       // A session row opens its conversation in the Feed tab.
       else if (m.type === 'openConversation' && typeof m.id === 'string' && m.id)
@@ -8148,7 +9955,7 @@ class ChangeMapViewProvider implements vscode.WebviewViewProvider {
    */
   private warmRecent(cwd: string): void {
     const now = Date.now();
-    if (now - this.warmedAt < 10 * 60_000) return; // at most once every ten minutes
+    if (now - this.warmedAt < 10 * 60_000 || core.noBackgroundChildren()) return; // at most once every ten minutes
     this.warmedAt = now;
     try {
       // Also `--root <cwd>`: same unquoted-concatenation defect as spawnCliJson above.
@@ -8166,13 +9973,55 @@ class ChangeMapViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private spawnJson(args: string[], cwd: string, cb: (data: unknown | null) => void): void {
+  private spawnJson(args: string[], cwd: string, cb: (data: unknown | null, stderr?: string) => void): void {
     spawnCliJson(args, cwd, cb);
+  }
+  private localWorkers: core.WorkerRow[] = [];
+  private workerFindings: core.FindingsBoard | null = null;
+  private workersReading = false;
+  private workersAt = 0;
+  private workersError = '';
+  private postWorkers(): void {
+    const saved = savedMachineSnapshot();
+    const workers = core.workersByMachine(this.localWorkers, saved.machines.map(m => ({ label: m.label, workers: m.listing?.workers })), currentMachine(), currentSession());
+    const notes = [this.workersError, saved.error, ...saved.machines.map(m => m.error ? `${m.label}: ${m.error}` : !m.listing?.workers ? `${m.label}: reading workers…` : m.listing.workerError ? `${m.label}: ${m.listing.workerError}` : '')].filter(Boolean);
+    if (this.view?.visible) this.view.webview.postMessage({ type: 'workers', workers, notes, findings: this.workerFindings });
+  }
+  private refreshWorkers(cwd: string): void {
+    this.postWorkerMachines(this.workerSynced);
+    if (this.workersReading || Date.now() - this.workersAt < 3000) return;
+    this.workersReading = true;
+    const session = currentMachine() ? null : currentSession();
+    void runOak(['fleet', '--json', '--root', cwd, ...(session ? ['--session', session] : [])], { timeoutMs: 15_000 }).then(r => {
+      let data: { workers?: core.WorkerRow[]; workerError?: string; findings?: core.FindingsBoard } | null = null;
+      try { data = r.code === 0 ? JSON.parse(r.stdout) : null; } catch { /* failed read */ }
+      this.localWorkers = data?.workers ?? [];
+      this.workerFindings = data?.findings ?? null;
+      this.workersError = data?.workerError ?? (data ? '' : core.cliFailureMessage(r.stdout, r.stderr, 'could not read workers'));
+      this.workersReading = false; this.workersAt = Date.now(); this.postWorkers();
+    });
+  }
+  private workerSynced: core.MachineListing[] = [];
+  private workerHooked = false;
+  private workerVisibility = new WeakMap<object, boolean>();
+  private postWorkerMachines(machines: core.MachineListing[]): void {
+    this.workerSynced = machines;
+    const post = () => {
+      if (this.view?.visible) this.view.webview.postMessage({ type: 'workerMachines', machines: workerMachineListings(this.workerSynced) });
+      this.postWorkers();
+    };
+    if (!this.workerHooked) {
+      this.workerHooked = true; savedListeners.add(post);
+      savedWorkerViews.add(() => !!this.view?.visible && this.workerVisibility.get(this.view) === true);
+    }
+    post();
+    refreshSavedMachines(currentMachine(), currentSession());
   }
   /** `force` bypasses the coalescing throttle (used on first-open / became-visible). */
   refresh(force = false): void {
     if (force) listingFloor = Date.now();
     if (!this.view?.visible) return;
+    this.refreshWorkers(workspaceRoot() ?? process.cwd());
     const now = Date.now();
     // A forced refresh that lands mid-spawn cannot simply be dropped: the in-flight payload was
     // gathered before whatever forced it (a clear, an accept), so letting it win leaves the panel
@@ -8188,6 +10037,10 @@ class ChangeMapViewProvider implements vscode.WebviewViewProvider {
     if (!session) {
       this.run = now;
       void readSessionListing(cwd).then((sessions) => { if (!currentSession()) this.view?.webview.postMessage({ type: 'sessions', sessions }); });
+      void readMachineListings(cwd).then(machines => {
+        if (!currentSession() && this.run === now && this.view?.visible)
+          this.postWorkerMachines(machines);
+      });
       return;
     }
     this.running = true;
@@ -8195,6 +10048,8 @@ class ChangeMapViewProvider implements vscode.WebviewViewProvider {
     let cm: unknown = undefined;
     let mt: unknown = undefined;
     let pr: unknown = undefined;
+    // Why a saved machine's Processes are missing, as the terminal app says it ('' when they arrived, or locally).
+    let prErr = '';
     let sessions: core.SessionMeta | null = null;
     const done = () => {
       if (cm === undefined || mt === undefined || pr === undefined) return; // wait for every spawn
@@ -8215,7 +10070,9 @@ class ChangeMapViewProvider implements vscode.WebviewViewProvider {
         setTimeout(() => this.refresh(true), 0);
       }
       if (cm === null && mt === null) {
-        this.postError();
+        // A saved machine that did not answer: say why, never "install the CLI" (review 2026-11-05).
+        if (prErr) this.view?.webview.postMessage({ type: 'error', sessions, failure: prErr, machine: currentMachine() ?? '' });
+        else this.postError();
         return;
       }
       this.everLoaded = true;
@@ -8230,13 +10087,21 @@ class ChangeMapViewProvider implements vscode.WebviewViewProvider {
       const pinned = vscode.workspace.getConfiguration('claudeObservatory').get<string>('session') || '';
       // The bar names the session under review; the listing already carries every session's title, so
       // this costs a lookup rather than another transcript scan.
-      const sessionTitle = sessions?.sessions.find((r) => r.id === session)?.title ?? undefined;
+      const machine = currentMachine();
+      const sessionTitle = (machine
+        ? savedMachineSnapshot().machines.find((x) => x.label === machine)?.listing?.sessions.find((r) => r.id === session)?.title
+        : sessions?.sessions.find((r) => r.id === session)?.title) ?? undefined;
       // Send everything EXCEPT the per-edit array. It is 0.72 MB of a 2.45 MB payload — 30% — and this
       // webview never reads it: every `.edits` in the Overview script is a scalar rollup count, and
       // `CM.edits` appears nowhere. It still leaves the CLI, because tools and the other front-ends do
       // read it; it just stops crossing postMessage to a renderer that throws it away.
       const cmLean = cm ? { ...cm, edits: [] } : cm;
-      this.view?.webview.postMessage({ type: 'overview', cm: cmLean, mt, pr, sessions, session, sessionTitle, pinned, prompt: this.promptId, navPos: this.navPos, filter: editFilter, filterSpec: filterSpecMsg(), sort: currentSort() });
+      this.view?.webview.postMessage({ type: 'overview', cm: cmLean, mt, pr, prErr, sessions, session, sessionTitle, machine: machine ?? '', pinned, prompt: this.promptId, navPos: this.navPos, filter: editFilter, filterSpec: filterSpecMsg(), sort: currentSort() });
+      const listedAt = this.run;
+      void readMachineListings(cwd).then(machines => {
+        if (currentSession() === session && this.run === listedAt && this.view?.visible)
+          this.postWorkerMachines(machines);
+      });
     };
     // ONE spawn for the three heavy views, and it stays a SPAWN on purpose.
     //
@@ -8255,10 +10120,15 @@ class ChangeMapViewProvider implements vscode.WebviewViewProvider {
     // identical to asking for them separately (pinned by §E2E 23).
     const startedAt = Date.now();
     const stamp = storeStamp;
+    // A saved machine's session is read there, as the terminal app reads it: no `--root` (the path is this machine's), and
+    // no `sessions` — the Sessions tab keeps this machine's list, and that machine's sits in its own group.
+    const machine = currentMachine();
     this.spawnJson(
-      ['views', '--views', 'changemap,multitask,processes,sessions', '--json', '--root', cwd, '--session', session],
+      machine
+        ? ['views', '--views', 'changemap,multitask,processes', '--json', '--session', session, '--machine', machine]
+        : ['views', '--views', 'changemap,multitask,processes,sessions', '--json', '--root', cwd, '--session', session],
       cwd,
-      (data) => {
+      (data, stderr) => {
         const all = data as { sessions?: core.SessionMeta; changemap?: unknown; multitask?: unknown; processes?: unknown; __problems?: Record<string, string>; __ignoreProblems?: string[] } | null;
         // A view the CLI could not build arrives as `null`, which renders as an empty panel — the same
         // frame a session that did nothing produces. `views` now says which views failed and why, and
@@ -8271,16 +10141,16 @@ class ChangeMapViewProvider implements vscode.WebviewViewProvider {
           );
         }
         for (const why of all?.__ignoreProblems ?? []) void vscode.window.showWarningMessage(`OAK: ${why}`);
-        sessions = all?.sessions && Array.isArray(all.sessions.sessions) ? all.sessions : null;
-        if (sessions) sharedListing = { key: listingKey(cwd, session), startedAt, landedAt: Date.now(), stamp, listing: sessions };
+        sessions = all?.sessions && Array.isArray(all.sessions.sessions) ? all.sessions : machine ? sharedListing?.listing ?? null : null;
+        if (sessions && !machine) sharedListing = { key: listingKey(cwd, session), startedAt, landedAt: Date.now(), stamp, listing: sessions };
         const d = (all?.changemap ?? null) as (core.ChangeMap & { agents?: unknown[] }) | null;
         cm = d && d.summary && Array.isArray(d.edits) && Array.isArray(d.files) && Array.isArray(d.modules) && Array.isArray(d.agents) ? d : null;
         const m = (all?.multitask ?? null) as { agents?: unknown[]; collisions?: unknown[] } | null;
         mt = m && Array.isArray(m.agents) && Array.isArray(m.collisions) ? m : null;
-        // An older CLI has no `processes`; that lands here as null, which HIDES the tab rather than
-        // breaking the panel.
+        // An older CLI has no `processes`; null keeps the tab visible with its unavailable message.
         const q = (all?.processes ?? null) as { processes?: unknown[]; summary?: unknown } | null;
         pr = q && Array.isArray(q.processes) && q.summary ? q : null;
+        prErr = machineProcessesFailure(machine, all, pr, stderr);
         // ONE call. The old code had three callbacks each setting one variable, so only the last
         // got past `done`'s guard; this one sets all three first, so three calls each ran the whole
         // body — three `sessionMeta` reads and three ~1.7 MB postMessages per tick, inside the very
@@ -8329,7 +10199,7 @@ export interface MultitaskFilterState {
 export const multitaskFilter = (
   data:
     | {
-        agents?: Array<{ session?: string; phase?: string | null; subagents?: Array<{ phase?: string | null }> }>;
+        agents?: Array<{ key?: string; session?: string; state?: string; phase?: string | null; subagents?: Array<{ state?: string; phase?: string | null }> }>;
         workflows?: Array<{ id?: string; running?: boolean }>;
       }
     | null
@@ -8342,7 +10212,8 @@ export const multitaskFilter = (
   const dWf = st.dismissedWorkflows || {};
   const isActive = (p: string | null | undefined) =>
     p === "working" || p === "awaiting-input" || p === "awaiting-permission";
-  const agentActive = (a: { phase?: string | null; subagents?: Array<{ phase?: string | null }> }) => {
+  const agentActive = (a: { state?: string; phase?: string | null; subagents?: Array<{ state?: string; phase?: string | null }> }) => {
+    if (a.state) return a.state === 'queued' || a.state === 'working' || a.state === 'waiting' || a.state === 'blocked';
     if (isActive(a && a.phase)) return true;
     const subs = (a && a.subagents) || [];
     for (let i = 0; i < subs.length; i++) if (isActive(subs[i] && subs[i].phase)) return true;
@@ -8357,13 +10228,13 @@ export const multitaskFilter = (
     const a = allAg[i];
     const act = agentActive(a);
     if (act) activeAgents++;
-    else completedAgents.push(String(a && a.session));
+    else completedAgents.push(String(a && (a.key || a.session)));
     if (activeOnly && !act) continue; // active-only hides the inactive outright
-    if (!act && dAg[String(a && a.session)]) {
+    if (!act && dAg[String(a && (a.key || a.session))]) {
       hiddenAgents++;
       continue;
     } // dismissed — but only while still inactive (reappears when it goes active)
-    agents.push(a);
+    agents.push(activeOnly ? { ...a, subagents: (a.subagents || []).filter(s => s.state ? ['working','waiting','blocked'].includes(s.state) : isActive(s.phase)) } : a);
   }
   const allWf = (data && data.workflows) || [];
   const workflows: typeof allWf = [];
@@ -8415,7 +10286,7 @@ const OVERVIEW_SCRIPT = `
   // answer it (a missing command must never break the panel). OV_SEEN records whether ANY overview
   // payload has arrived yet, so "nothing read yet" and "the CLI answered nothing" stay two different
   // sentences.
-  var PR=null, OV_SEEN=false;
+  var PR=null, PR_ERR='', OV_FAIL='', OV_SEEN=false;
   // PR_ID = the picked prompt (Prompts window) — scopes the whole panel to one ask.
   // REQ_ID = the request picked in the REQUESTS WINDOW beside this panel (0.8.7). It is a different kind
   // An ask narrows the WHOLE panel — fleet, runs, shells and the change map all show only what that
@@ -8435,8 +10306,9 @@ const OVERVIEW_SCRIPT = `
   // Week-old conversations start collapsed (0.9.0). Not persisted: "expanded" is a look-at-this-now
   // intent, and restoring it across reloads would quietly re-enter the state the fold exists to avoid.
   var SHOW_FOLDED=false;
-  // Older sessions in the Sessions tab, same rule as the fleet fold: collapsed by default, not persisted.
-  var SHOW_OLDSESS=false;
+  // Each session's group of workers in the Sessions tab, by session id: closed until a click opens it, and
+  // remembered while the panel lives, not persisted (the same rule as the folds above).
+  var WK_OPEN={}, DONE_SESSIONS_OPEN=new Set();
   // The reader's own Active-only value, parked while the guided tour runs. null = no tour is holding it.
   var TOUR_FILTER=null;
   /** The nav tab the reader was on before the tour moved them. null = no tour is holding it. */
@@ -8790,7 +10662,7 @@ const OVERVIEW_SCRIPT = `
     }
     var os=host.querySelectorAll('.cm-open');
     for(var o=0;o<os.length;o++){
-      os[o].addEventListener('click', function(){ var f=ROWS[+this.getAttribute('data-idx')]; if(f&&f.maxId>=0){ vscode.postMessage({type:'openEdit', id:f.maxId}); document.getElementById('cm-readout').innerHTML='→ <b>open diff</b> · '+esc(f.file)+' (edit #'+f.maxId+')'; } });
+      os[o].addEventListener('click', function(){ var f=ROWS[+this.getAttribute('data-idx')]; if(f&&f.maxId>=0){ vscode.postMessage({type:'openEdit', id:f.maxId, file:f.file}); document.getElementById('cm-readout').innerHTML='→ <b>open diff</b> · '+esc(f.file)+' (edit #'+f.maxId+')'; } });
     }
     // Keep / Undo, scoped to the FILE the row names. The host resolves the edit set through the CLI's
     // own --under scope, so the ledger, the terminal's change map and the folder actions in the trees
@@ -8804,7 +10676,7 @@ const OVERVIEW_SCRIPT = `
         var f=ROWS[+this.getAttribute('data-idx')]; if(!f) return;
         var act=this.getAttribute('data-act');
         // The stacked opener works on DECIDED files too (the blocks carry verdicts) — no pending gate.
-        if(act==='stack'){ if(f.maxId>=0) vscode.postMessage({type:'mapScope', act:'stack', id:f.maxId}); return; }
+        if(act==='stack'){ if(f.maxId>=0) vscode.postMessage({type:'mapScope', act:'stack', id:f.maxId, file:f.file}); return; }
         if(!f.pending) return;
         vscode.postMessage({type:'mapScope', act:act, rel:f.rel, pending:f.pending, name:f.file});
       });
@@ -8875,7 +10747,7 @@ const OVERVIEW_SCRIPT = `
       && donePs.every(function(p){return DISMISS_PR[p.id];});
   }
   function clearCompleted(){
-    var F=MTFILTER(MT, fstate());
+    var F=MTFILTER(workerData(), fstate());
     for(var i=0;i<F.completedAgents.length;i++) DISMISS_AG[F.completedAgents[i]]=1;
     for(var j=0;j<F.completedWorkflows.length;j++) DISMISS_WF[F.completedWorkflows[j]]=1;
     // A shell that has exited is finished work exactly like a done agent or run, so it folds away with
@@ -8908,9 +10780,43 @@ const OVERVIEW_SCRIPT = `
     return '<span class="mt-cap"'+((rd||wr)?' data-attn="1"':'')+' title="'+esc(tips.join(' · ')+EXERCISED_NOTE)+'">'+esc(parts.join(' · '))+'</span>';
   }
   // --- Fleet: running agents (worktree-siblings) + nested subagents; click selects the DETAIL ---------
+  // The agents OAK started from a brief (multitask's delegated, core delegated.ts): OAK's own state and when it began,
+  // the error a turn stopped on, the machine and tab, and the workers still at it, above the sessions.
+  var DELEGATED_PHASE={ queued:'idle', starting:'idle', working:'working', waiting:'idle', blocked:'awaiting-input', errored:'errored', done:'done', gone:'idle' };
+  function delegatedBlock(){ var ds=(MT&&MT.delegated)||[]; if(!ds.length) return '';
+    var h='<div class="mt-scope">Agents started from a brief · '+ds.length+'</div>';
+    for(var i=0;i<ds.length;i++){ var d=ds[i];
+      h+='<div class="mt-sub mt-dlg" title="'+esc('Brief '+(d.brief||'')+' · report '+(d.report||''))+'">';
+      h+='<span class="mt-badge sm" style="background:'+phaseColor(DELEGATED_PHASE[d.state]||'idle')+'">'+esc(d.state)+'</span>';
+      h+='<span class="mt-st">'+esc(d.id)+'<span class="mt-sd">'+esc(d.title||'')+'</span></span>';
+      var bits=['since '+relAge(d.since), esc(d.kind)];
+      if(d.state==='queued') bits.push('waiting on '+esc((d.after||[]).join(', ')));
+      if(d.model||d.effort) bits.push(esc([d.model,d.effort].filter(Boolean).join(' ')));
+      bits.push(d.machine?'on '+esc(d.machine):'this machine');
+      if(d.tab) bits.push('tab '+esc(d.remoteId||d.id));
+      if(d.tokens) bits.push(fmtTok(d.tokens)+' tok');
+      if(d.cost) bits.push('$'+Number(d.cost).toFixed(2));
+      var gs=d.worktree&&d.worktree.state;
+      if(d.worktree) bits.push(d.worktree.removedMs?'worktree removed':gs?(gs.error?'worktree state unavailable':esc(gs.files+' files · +'+gs.added+' −'+gs.removed+' · '+(gs.merged?'merged':'not merged'))):'worktree not read yet');
+      h+='<span class="mt-meta sm">'+bits.join(' · ')+'</span>';
+      if(d.error) h+='<span class="mt-cur" title="'+esc(d.error)+'">'+esc(d.error)+'</span>';
+      h+='</div>';
+      var ws=d.workers||[];
+      for(var k=0;k<ws.length;k++){ var w=ws[k];
+        var fsel=FEED&&FEED.kind==='agent'&&FEED.id===String(w.id)&&FEED.session===d.session&&(FEED.machine||'')===(d.machine||'');
+        h+='<div class="mt-sub mt-dlg'+(fsel?' sel':'')+'"'+(d.session&&w.id?' data-agent="'+esc(w.id)+'" data-session="'+esc(d.session)+'" data-machine="'+esc(d.machine||'')+'" data-cwd="'+esc(d.cwd||'')+'" data-label="'+esc(w.title||'')+'" title="Follow what this worker is doing"':'')+'><span class="mt-badge xs" style="background:'+phaseColor(w.state==='working'?'working':'awaiting-input')+'"></span><span class="mt-st">└ '+esc(w.title)+'</span><span class="mt-meta sm">'+esc(w.state)+(w.model?' · '+esc(w.model):'')+'</span></div>';
+      }
+    }
+    return h; }
+  var WORKERS=null, WORKER_NOTES=[], WORKER_FINDINGS=null, DONE_SUBS={};
+  function findingsBlock(){ var b=WORKERS===null?(MT&&MT.findings):WORKER_FINDINGS; if(!b) return '';
+    if(b.count===null) return '<div class="mt-scope">Findings unavailable · '+esc(b.error||'')+'</div>';
+    return '<div class="mt-scope" title="Unresolved findings in the local database, including synced records. Read quoted text with oak finding list; freshness with oak query findings.">Findings · '+Number(b.count)+' · oak finding list</div>'; }
+  function workerData(){ return WORKERS===null ? MT : Object.assign({},MT||{}, { agents:WORKERS, delegated:[] }); }
   function renderFleet(){ var host=paneHost('fleet'); if(!host) return;
-    var F=MTFILTER(MT, fstate()); var vis=F.agents; syncControls(F);
-    var h=filterBar('fleet', F);
+    var F=MTFILTER(workerData(), fstate()); var vis=F.agents; syncControls(F);
+    var h=filterBar('fleet', F)+findingsBlock()+(WORKERS===null?delegatedBlock():'');
+    for(var ni=0;ni<WORKER_NOTES.length;ni++) h+='<div class="mt-scope">'+esc(WORKER_NOTES[ni])+'</div>';
     // Under an ask scope: only THIS window's session can own your request (a sibling worktree's session
     // answers to nobody who typed here), and its subagent rows narrow to the ones that ask spawned.
     var rqf=prSlice(), fleetHidden=0, subsHidden=0;
@@ -8921,9 +10827,7 @@ const OVERVIEW_SCRIPT = `
         for(var si=0;si<subs0.length;si++) if(has(rqf.agentIds, subs0[si].agentId)) kept.push(subs0[si]);
         subsHidden+=subs0.length-kept.length;
         // A shallow copy: the payload is shared with the other panes and must not be mutated.
-        keep.push({ session:ag.session, worktree:ag.worktree, gitBranch:ag.gitBranch, self:ag.self, phase:ag.phase,
-          phaseConfidence:ag.phaseConfidence, sparkline:ag.sparkline, diff:ag.diff, tokens:ag.tokens, durationMs:ag.durationMs,
-          risk:ag.risk, outside:ag.outside, compactions:ag.compactions, subagents:kept });
+        keep.push(Object.assign({},ag,{subagents:kept}));
       }
       vis=keep;
       if(fleetHidden||subsHidden){ var bits=[];
@@ -8946,10 +10850,12 @@ const OVERVIEW_SCRIPT = `
         if(!SHOW_FOLDED) break;
       }
       var col=agentCollisions(a); var sel=(a.session===selAgentSess());
-      h+='<div class="mt-agent'+(sel?' sel':'')+(a.folded?' folded':'')+'" data-sess="'+esc(a.session)+'" data-wt="'+esc(a.worktree||'')+'">';
+      h+='<div class="mt-agent'+(sel?' sel':'')+(a.folded?' folded':'')+'" data-sess="'+esc(a.session)+'" data-wt="'+esc(a.worktree||'')+'" data-machine="'+esc(a.remote||'')+'" data-label="'+esc(a.title||'')+'">';
       h+='<div class="mt-arow">';
-      h+='<span class="mt-badge" style="background:'+phaseColor(a.phase)+'"'+(a.phaseConfidence==='heuristic'?' title="inferred from inactivity — no structural marker for this state">~':'>')+esc(phaseLabel(a.phase))+'</span>';
-      h+='<span class="mt-wt">'+esc(base(a.worktree))+(a.self?'<span class="mt-self">self</span>':'')+(a.gitBranch?'<span class="mt-br">⑂'+esc(a.gitBranch)+'</span>':'')+'</span>';
+      h+='<span class="mt-wt">'+esc(a.title||base(a.worktree))+(a.self?'<span class="mt-self">self</span>':'')+'</span>';
+      h+='<span class="mt-badge" style="background:'+phaseColor(a.phase)+'">'+esc(a.state||phaseLabel(a.phase))+'</span>';
+      h+='<span class="mt-meta">'+esc(a.machine||'this machine')+' · '+esc(a.kind||'claude')+' · '+relAge(a.lastActiveMs)+'</span>';
+      if(a.state==='queued') h+='<span class="mt-meta">waiting on '+esc((a.after||[]).join(', '))+'</span>';
       if(a.loaded===false){
         // Never draw +0/−0/0 tok for a map nobody built — that reads as "this session did nothing".
         // No apostrophe in this title: the TS template literal would unescape it and break the JS string.
@@ -8963,13 +10869,20 @@ const OVERVIEW_SCRIPT = `
       h+=outsideSuffix(a);
       }
       h+='</div>';
-      var subs=a.subagents||[];
+      var allSubs=a.subagents||[], subs=[], doneSubs=[];
+      for(var sk=0;sk<allSubs.length;sk++) ((allSubs[sk].phase==='done'||allSubs[sk].phase==='gone')?doneSubs:subs).push(allSubs[sk]);
+      var doneKey=a.key||a.session;
+      if(!ACTIVE_ONLY && doneSubs.length){
+        h+='<div class="mt-done-subs" data-done="'+esc(doneKey)+'">'+(DONE_SUBS[doneKey]?'▾ ':'▸ ')+doneSubs.length+' done</div>';
+        if(DONE_SUBS[doneKey]) subs=subs.concat(doneSubs);
+      }
       for(var k=0;k<subs.length;k++){ var su=subs[k];
         // A subagent row is feed-selectable: its own transcript is what "what is it doing" means for it.
         var fsel=(FEED&&FEED.kind==='agent'&&su.agentId&&FEED.id===String(su.agentId));
-        h+=su.agentId? ('<div class="mt-sub'+(fsel?' sel':'')+'" data-agent="'+esc(su.agentId)+'" data-label="'+esc(su.description||su.agentType||'')+'" title="Follow what this subagent is doing">') : '<div class="mt-sub">';
-        h+='<span class="mt-badge sm" style="background:'+phaseColor(su.phase)+'"'+(su.phaseConfidence==='heuristic'?' title="inferred — no completion notice or structural marker for this state yet">~':'>')+esc(phaseLabel(su.phase))+'</span>';
-        h+='<span class="mt-st">'+esc(su.agentType||'subagent')+(su.description?'<span class="mt-sd">'+esc(su.description)+'</span>':'')+'</span>';
+        h+=su.agentId? ('<div class="mt-sub'+(fsel?' sel':'')+'" data-agent="'+esc(su.agentId)+'" data-session="'+esc(a.session)+'" data-machine="'+esc(a.remote||'')+'" data-cwd="'+esc(a.worktree||'')+'" data-label="'+esc(su.description||su.agentType||'')+'" title="Follow what this subagent is doing">') : '<div class="mt-sub">';
+        h+='<span class="mt-st">'+esc(su.description||su.agentType||'subagent')+'</span>';
+        h+='<span class="mt-badge sm" style="background:'+phaseColor(su.phase)+'">'+esc(su.state||phaseLabel(su.phase))+'</span>';
+        h+='<span class="mt-meta sm">'+esc(a.machine||'this machine')+' · '+esc(su.kind||a.kind||'claude')+' · '+fmtTok(su.tokens||0)+' tok · '+relAge(su.lastActiveMs||su.ts)+'</span>';
         if(su.currentTask) h+='<span class="mt-cur" title="'+esc(su.currentTask)+'">▶ '+esc(su.currentTask)+'</span>';
         var td=su.todos||[]; if(td.length) h+='<span class="mt-todo">'+td.length+' todo'+(td.length===1?'':'s')+'</span>';
         h+='<span class="mt-diff sm"><span class="mt-add">+'+(su.added||0)+'</span> <span class="mt-rem">−'+(su.removed||0)+'</span></span>';
@@ -8987,15 +10900,17 @@ const OVERVIEW_SCRIPT = `
     }
     if(!vis.length) h+='<div class="mt-none">'+(rqf?('Prompt #'+rqf.index+' started no agent of its own — clear the scope to see the fleet.'):(ACTIVE_ONLY?'No active agents.':'No agents to show.'))+'</div>';
     host.innerHTML=h; wireFilterBar(host);
+    var dh=host.querySelectorAll('[data-done]');
+    for(var di=0;di<dh.length;di++) dh[di].addEventListener('click',function(ev){ev.stopPropagation();var key=this.getAttribute('data-done');DONE_SUBS[key]=!DONE_SUBS[key];renderFleet();});
     var fh=host.querySelector('.mt-foldhdr');
     if(fh) fh.addEventListener('click', function(){ SHOW_FOLDED=!SHOW_FOLDED; renderFleet(); });
     // Live conflicts moved to the Actions panel (0.8.3) — the audit surface owns them now.
     var rows=host.querySelectorAll('.mt-agent');
     // Selecting a fleet row picks its change-map slice AND follows what that session is doing. A sibling
     // agent is a whole SESSION, so its feed is the session kind (a subagent row below is the agent kind).
-    for(var r=0;r<rows.length;r++) rows[r].addEventListener('click', function(ev){ if(ev.target && String(ev.target.className||'').indexOf('mt-chat')>=0) return; var s=this.getAttribute('data-sess'); SEL={kind:'agent', session:s}; setFeed('session', s, base(this.getAttribute('data-wt')||'')); paint(); });
+    for(var r=0;r<rows.length;r++) rows[r].addEventListener('click', function(ev){ if(ev.target && String(ev.target.className||'').indexOf('mt-chat')>=0) return; var s=this.getAttribute('data-sess'); if(!s)return; var machine=this.getAttribute('data-machine')||''; if(machine){vscode.postMessage({type:'pickRemote',machine:machine,id:s});return;} SEL={kind:'agent', session:s}; setFeed('session', s, this.getAttribute('data-label')||base(this.getAttribute('data-wt')||'')); paint(); });
     var subs2=host.querySelectorAll('.mt-sub[data-agent]');
-    for(var s3=0;s3<subs2.length;s3++) subs2[s3].addEventListener('click', function(ev){ ev.stopPropagation(); setFeed('agent', this.getAttribute('data-agent'), this.getAttribute('data-label')||''); renderFleet(); });
+    for(var s3=0;s3<subs2.length;s3++) subs2[s3].addEventListener('click', function(ev){ ev.stopPropagation(); setFeed('agent', this.getAttribute('data-agent'), this.getAttribute('data-label')||'', this.getAttribute('data-session'), this.getAttribute('data-machine'), this.getAttribute('data-cwd')); renderFleet(); });
     var bs=host.querySelectorAll('.mt-chat');
     for(var b=0;b<bs.length;b++) bs[b].addEventListener('click', function(ev){ ev.stopPropagation(); var id=this.getAttribute('data-agent'); vscode.postMessage({type:'chatAction', ref:{agentId:id}}); });
   }
@@ -9021,7 +10936,7 @@ const OVERVIEW_SCRIPT = `
   function renderWorkflows(){ var host=paneHost('workflows'); if(!host) return;
     var all=(MT&&MT.workflows)||[];
     if(!all.length){ host.innerHTML='<div class="mt-none">No workflow runs in this session yet.</div>'; return; }
-    var F=MTFILTER(MT, fstate()), wf=F.workflows;
+    var F=MTFILTER(workerData(), fstate()), wf=F.workflows;
     var h=filterBar('workflows', F);
     var wfF=reqFilter(wf, 'workflowIds', function(w){ return w.id; }); wf=wfF.rows; h+=reqNote(wfF, 'workflow run', 'workflow runs');
     if(!wf.length){ host.innerHTML=h+'<div class="mt-none">'+(wfF.scoped?('Prompt #'+prSlice().index+' started no workflow run.'):(ACTIVE_ONLY?'No running workflows.':'No workflow runs to show.'))+'</div>'; wireFilterBar(host); return; }
@@ -9141,7 +11056,7 @@ const OVERVIEW_SCRIPT = `
     var tog=host.querySelector('.mt-ttog');
     if(tog) tog.addEventListener('click', function(){ TASKS_OPEN=!TASKS_OPEN; renderTasks(); });
     var tclr=host.querySelector('.mt-tclrall');
-    if(tclr) tclr.addEventListener('click', function(){ vscode.postMessage({type:'clearCompletedTasks'}); });
+    if(tclr) tclr.addEventListener('click', function(){ vscode.postMessage({type:'clearCompletedTasks', machine:OVMACH, session:SELF_KEY}); });
     var trs=host.querySelectorAll('.mt-trow[data-feed]');
     for(var r2=0;r2<trs.length;r2++) trs[r2].addEventListener('click', function(){ setFeed('task', this.getAttribute('data-feed'), this.querySelector('.mt-ts').textContent); renderTasks(); });
     // The chips act on the task, not on the row: stop the click before it re-points the feed.
@@ -9149,7 +11064,7 @@ const OVERVIEW_SCRIPT = `
     for(var o=0;o<tops.length;o++){ (function(attr,msg){
       var bs=host.querySelectorAll('['+attr+']');
       for(var b=0;b<bs.length;b++) bs[b].addEventListener('click', function(ev){
-        ev.stopPropagation(); vscode.postMessage({type:msg, taskId:this.getAttribute(attr)}); });
+        ev.stopPropagation(); vscode.postMessage({type:msg, taskId:this.getAttribute(attr), machine:OVMACH, session:SELF_KEY}); });
     })(tops[o][0],tops[o][1]); }
   }
 
@@ -9171,7 +11086,7 @@ const OVERVIEW_SCRIPT = `
     if(p.exitCode==null) return {txt:p.status||'ended', col:PAL.idle};
     return p.exitCode===0 ? {txt:'exit 0', col:PAL.idle} : {txt:'exit '+p.exitCode, col:PAL.warn}; }
   // --- Sessions: this workspace's sessions, newest conversation first — clicking SWITCHES the review --
-  var SESS=null;
+  var SESS=null, WORKER_MACHINES=null, OVMACH='', OVSAVED=[], OVSAVEDERR='', OVSAVED_ASKED=0;
   // Switching sessions costs a round trip through the host and several CLI builds. Until the new payload
   // lands, everything on this panel belongs to the session you just LEFT, so it is cleared rather than
   // left standing: showing one session's edits under another session's name is worse than showing none.
@@ -9214,7 +11129,7 @@ const OVERVIEW_SCRIPT = `
     // as broken. Clicking while current is a safe no-op — the host shows the up-to-date toast with
     // no reload offer — and doubles as a manual re-check. "up to date" is only claimed when the
     // release feed was actually consulted; with no data (offline, first paint) the slot shows '—'.
-    h+='<button class="vm-row" data-va="update"><i class="codicon codicon-cloud-download"></i> Update now<span class="vm-ver">'+(v.updateAvailable&&chLatest?'v'+esc(chLatest):(chLatest?'up to date':'—'))+'</span></button><div class="vm-sec"></div>';
+    h+='<button class="vm-row" data-va="update"><i class="codicon codicon-cloud-download"></i> Update now<span class="vm-ver">'+(v.updateAvailable&&chLatest?'v'+esc(chLatest):(chLatest?(v.local?'local build':'up to date'):'—'))+'</span></button><div class="vm-sec"></div>';
     h+='<button class="vm-row" data-va="stable"'+(v.channel!=='dev'?' disabled':'')+'><i class="codicon codicon-check" style="visibility:'+(v.channel!=='dev'?'visible':'hidden')+'"></i> Stable<span class="vm-ver">'+(v.stableLatest?'v'+esc(v.stableLatest):'—')+'</span></button>';
     h+='<button class="vm-row" data-va="dev"'+(v.channel==='dev'?' disabled':'')+'><i class="codicon codicon-check" style="visibility:'+(v.channel==='dev'?'visible':'hidden')+'"></i> Pre-release<span class="vm-ver">'+(v.devLatest?'v'+esc(v.devLatest):'none yet')+'</span></button>';
     if(v.offline) h+='<div class="vm-note">release info unavailable — offline?</div>';
@@ -9224,52 +11139,119 @@ const OVERVIEW_SCRIPT = `
       if(a==='update') vscode.postMessage({type:'versionUpdate'});
       else vscode.postMessage({type:'switchChannel', channel:a}); }); }
   }
-  function setSessLabel(s, title){ var el=document.getElementById('ov-sess-label'); if(!el) return;
+  function setSessLabel(s, title, machine){ var el=document.getElementById('ov-sess-label'); if(!el) return;
     var nm=(title||'').trim();
-    el.textContent='🔬 '+(nm || ('session '+(s? String(s).slice(0,8) : '—')));
-    el.title=(nm? nm+' — ' : '')+'session '+(s||'—')+' · switch in the Sessions tab'; }
+    el.textContent='🔬 '+(nm || ('session '+(s? String(s).slice(0,8) : '—')))+(machine? ' · on '+machine : '');
+    el.title=(nm? nm+' — ' : '')+'session '+(s||'—')+(machine? ' on '+machine+', read there' : '')+' · switch in the Sessions tab'; }
 
+  var SESSION_ORDER_CACHE=null;
+  function sessionWaiting(r){ return r.attention&&r.attention.kind!=='idle-done'; }
+  function sessionMatches(r,q){ return !q||((r.title||'')+' '+r.id+' '+(r.workspace||'')+' '+(r.model||'')+' '+(r.agent||'')+' '+(r._machine||'')).toLowerCase().indexOf(q.toLowerCase())>=0; }
+  function sessionVisible(r,q,active,pin,machine){
+    var current=(r._machine||'')===(machine||'')&&String(r.id)===String(pin);
+    var live=(!r._synced&&(r.active||Date.now()-Math.max(r.liveMs||0,r.lastActiveMs||0)<=60000))||(r.activeWorkers||[]).some(function(w){return w.phase==='working'||w.phase==='awaiting-input'||w.phase==='awaiting-permission';});
+    return sessionMatches(r,q)&&(!active||current||live||r.pending||sessionWaiting(r));
+  }
+  // Flatten in linear time. A saved listing supersedes the same machine's indexed records.
+  function machineRows(local,saved,machines){
+    var rows=local.slice(), listed=new Set();
+    (saved||[]).forEach(function(m){ if(!m.listing) return; listed.add(m.label);
+      (m.listing.sessions||[]).forEach(function(r){ rows.push(Object.assign({},r,{_row:r,_machine:m.label})); }); });
+    (machines||[]).forEach(function(m){ if(listed.has(m.label)) return;
+      (m.sessions||[]).forEach(function(r){ rows.push(Object.assign({},r,{_row:r,_machine:m.label,_host:m.host,_synced:true})); }); });
+    return rows;
+  }
+  // Sort only when the source rows change; search, filter and repeated paints walk the cached orders once.
+  function orderedSessionRows(rows,sort){
+    var c=SESSION_ORDER_CACHE;
+    if(!c||c.rows.length!==rows.length||rows.some(function(r,i){ var a=c.rows[i]; return (r._row||r)!==(a._row||a)||r._machine!==a._machine||r._host!==a._host; })){
+      c={rows:rows,orders:{}}; SESSION_ORDER_CACHE=c;
+      ['new','old','az','za'].forEach(function(k){ c.orders[k]=rows.slice().sort(function(a,b){
+        var aw=sessionWaiting(a), bw=sessionWaiting(b);
+        if(!!aw!==!!bw) return aw?-1:1;
+        if(aw&&bw){ var ranks={permission:0,question:1,input:2}; return ((ranks[a.attention.kind]||0)-(ranks[b.attention.kind]||0))||((a.attention.ts||0)-(b.attention.ts||0)); }
+        if(k==='new'||k==='old') return ((a.lastActiveMs||0)-(b.lastActiveMs||0))*(k==='new'?-1:1);
+        var an=String(a.title||a.id).toLowerCase(),bn=String(b.title||b.id).toLowerCase(); return (an<bn?-1:an>bn?1:0)*(k==='za'?-1:1);
+      }); });
+    }
+    return c.orders[sort]||c.orders.new;
+  }
+  function machineStatusHtml(saved,machines,error,cls){
+    var h='',seen=new Set();
+    function line(text){ h+='<div class="'+cls+'">'+esc(text)+'</div>'; }
+    if(error) line('could not read the saved machines — '+error);
+    (saved||[]).forEach(function(m){ seen.add(m.label); var ls=m.listing, state;
+      if(m.error) state='could not list sessions — '+m.error+' · '+(m.readAt?'last read '+ago(m.readAt):'never read');
+      else if(!ls) state='has not answered yet';
+      else state=(ls.fromIndex?'from its records, synced '+ago(ls.syncedAt||m.readAt):'read '+ago(m.readAt))+' ('+(ls.sessions||[]).length+')'+(!(ls.sessions||[]).length?' · no sessions':'');
+      line(m.label+' · '+state+(m.reading?' · reading again…':'')); });
+    (machines||[]).forEach(function(m){ if(!seen.has(m.label)) line(m.label+' · synced '+(m.syncedAt?ago(m.syncedAt):'at a time not recorded')+' ('+(m.sessions||[]).length+')'); });
+    return h;
+  }
+  function savedSessionHtml(r,under){
+    var L=r._machine, name=r.title||('session '+String(r.id).slice(0,8)), mine=OVMACH===L&&String(r.id)===String(under);
+    return '<div class="mt-trow'+(mine?' sel':'')+'" '+(r._synced?'data-msid="'+esc(r.id)+'" data-mhost="'+esc(r._host)+'"':'data-rsid="'+esc(r.id)+'" data-rmach="'+esc(L)+'"')+' title="'+esc(name+' — session '+r.id+' on '+L+(mine?' · the session you are reviewing':''))+'">'+
+      '<span class="mt-tg">'+(sessionWaiting(r)?'⚠':r.active?'●':'○')+'</span><span class="mt-ts">'+esc(name)+'</span>'+
+      '<span class="mt-agentbadge">on '+esc(L)+'</span><span class="mt-agentbadge">'+esc(r.model||'model unknown')+'</span>'+
+      '<span class="mt-tct">'+esc(r.workspace||'')+' · '+esc(ago(r.lastActiveMs))+(mine?' · reviewing':'')+'</span>'+
+      (r.pending?'<span class="mt-pend">'+r.pending+' pending</span>':'')+
+      '<button class="mt-resolve" data-workspace-window="'+esc(r.id)+'" data-machine="'+esc(L)+'">Open workspace window</button>'+
+      (!r._synced&&r.pending?'<button class="mt-resolve" data-rresolve="'+esc(r.id)+'" data-rmach="'+esc(L)+'" data-name="'+esc(name)+'" data-pending="'+r.pending+'">resolve</button>':'')+'</div>';
+  }
+  // A saved machine's row reviews that session there; its resolve runs there.
+  function bindSaved(host){
+    var rs=host.querySelectorAll('[data-rsid]');
+    for(var i=0;i<rs.length;i++) rs[i].addEventListener('click', function(){ vscode.postMessage({type:'pickRemote', id:this.getAttribute('data-rsid'), machine:this.getAttribute('data-rmach')}); });
+    var rr=host.querySelectorAll('[data-rresolve]');
+    for(var j=0;j<rr.length;j++) rr[j].addEventListener('click', function(ev){ ev.stopPropagation();
+      vscode.postMessage({type:'resolveSession', session:this.getAttribute('data-rresolve'), machine:this.getAttribute('data-rmach'), name:this.getAttribute('data-name'), pending:this.getAttribute('data-pending')}); });
+  }
   function renderSessions(){ var host=paneHost('sessions'); if(!host) return;
+    // The saved machines are read only while this list is on screen (the host holds each machine to one read per 10 s).
+    if(Date.now()-OVSAVED_ASKED>10000){ OVSAVED_ASKED=Date.now(); vscode.postMessage({type:'wantSaved'}); }
     var rows=(SESS&&SESS.sessions)||[];
-    var under=SELF_KEY||'', seen=false;
+    var under=SELF_KEY||'', seen=false, machines=WORKER_MACHINES||((SESS&&SESS.machines)||[]);
+    var all=machineRows(rows,OVSAVED,machines);
+    var sv=machineStatusHtml(OVSAVED,machines,OVSAVEDERR,'mt-scope');
     // The one thing a list of sessions cannot say by itself: follow whichever session is newest, rather
     // than any particular one. Without it, pinning would be a one-way door.
-    var auto='<div class="mt-trow'+(PINNED?'':' sel')+'" data-sess-auto="1" title="Follow this workspace’s newest session automatically, instead of staying on one you picked">'+
-      '<span class="mt-tg">'+(PINNED?'○':'●')+'</span><span class="mt-ts">Auto — newest session in this workspace</span>'+
-      '<span class="mt-tct">'+(PINNED?'':'following')+'</span></div>';
+    var pinned=PINNED||OVMACH;
+    var auto='<div class="mt-trow'+(pinned?'':' sel')+'" data-sess-auto="1" title="Follow this workspace’s newest session automatically, instead of staying on one you picked">'+
+      '<span class="mt-tg">'+(pinned?'○':'●')+'</span><span class="mt-ts">Auto — newest session in this workspace</span>'+
+      '<span class="mt-tct">'+(pinned?'':'following')+'</span></div>';
     // Pinned to a session the listing has no row for. The listing spans every workspace on this
     // machine, so that means deleted, empty, or a mirrored copy. Said BEFORE the early return: an empty
     // listing under a pinned session is exactly when the reader most needs to know what the panels are
     // showing them.
     var elsewhere=(under&&SESS)?'<div class="mt-scope" title="The session under review is not in this machine’s session list — the panels are showing it anyway. Pick a row to review a listed session instead.">reviewing '+esc(String(under).slice(0,8))+' — not in this machine’s session list (deleted, empty, or a copy mirrored from another machine)</div>':'';
-    if(!rows.length){ host.__sessHtml=null; host.innerHTML=(SESS?elsewhere+auto:'')+'<div class="mt-none">'+(SESS?'No sessions on this machine yet.':'Reading sessions…')+'</div>'; return; }
-    var h=auto, now=Date.now(), WEEK=7*86400000;
-    var groups=[];
-    rows.forEach(function(r){ var label=r.workspace||'Unknown workspace';
-      var group=groups.find(function(g){return g.label===label;});
-      if(!group){group={label:label,rows:[]};groups.push(group);} group.rows.push(r); });
-    for(var gi=0;gi<groups.length;gi++){
-      var group=groups[gi];
-      h+='<div class="mt-foldhdr mt-workspace" style="cursor:default">'+esc(group.label)+' · '+group.rows.length+(group.rows.length===1?' session':' sessions')+'</div>';
-      var recent=[], older=[], hidden=0;
-      for(var q=0;q<group.rows.length;q++){var rw=group.rows[q];
-        var kept=String(rw.id)===String(under)||rw.current||rw.pending||(rw.attention&&rw.attention.kind!=='idle-done');
-        if(ACTIVE_ONLY&&!kept&&now-(rw.liveMs||rw.lastActiveMs)>60000){hidden++;continue;}
-        if(String(rw.id)===String(under)||rw.current||(rw.attention&&rw.attention.kind!=='idle-done')||now-rw.lastActiveMs<=WEEK) recent.push(rw);
-        else older.push(rw);
-      }
-      var rows0=recent.concat(older);
+    var h=sv+auto, now=Date.now(), hidden=0;
+    var order={time:'new','time-asc':'old',name:'az','name-desc':'za'};
+    var rows0=orderedSessionRows(all,order[SORT]||'new').filter(function(r){ return sessionVisible(r,FILTER,ACTIVE_ONLY,under,OVMACH); });
+    hidden=all.length-rows0.length;
+    var done=new Map();
+    rows0=rows0.filter(function(r){
+      var mine=(r._machine||'')===(OVMACH||'')&&String(r.id)===String(under);
+      // Only this machine's current session is the watched one; a saved machine's listing marks its own launch folder's newest.
+      if(FILTER||mine||(r.current&&!r._machine)||activeWorkersOf(r).length||r.active||!r.attention||r.attention.kind!=='idle-done') return true;
+      var machine=r._machine||''; if(!done.has(machine)) done.set(machine,[]); done.get(machine).push(r); return false;
+    });
+    done.forEach(function(group,machine){
+      rows0.push({doneSessions:machine,count:group.length,pending:group.reduce(function(n,r){ return n+(r.pending||0); },0)});
+      if(!DONE_SESSIONS_OPEN.has(machine)) return;
+      var workspaces=new Map();
+      group.forEach(function(r){ var w=r.workspace||'Unknown workspace'; if(!workspaces.has(w)) workspaces.set(w,[]); workspaces.get(w).push(r); });
+      workspaces.forEach(function(list,w){ rows0.push({doneWorkspace:w}); rows0.push.apply(rows0,list); });
+    });
+    if(!rows0.length) h+='<div class="mt-none">'+(all.length?'No sessions match the search/filter.':SESS?'No sessions listed yet.':'Reading sessions…')+'</div>';
     // Two different facts, two different marks: the DOT says which session is live (the one still being
     // written), the HIGHLIGHT says which one you are reviewing. They are usually the same row and
     // sometimes not — conflating them told you the wrong thing exactly when it mattered.
     for(var i=0;i<rows0.length;i++){ var r=rows0[i];
-      if(older.length && i===recent.length){
-        h+='<div class="mt-foldhdr" data-oldsess="1" title="Sessions last active more than a week ago.">'+
-          (SHOW_OLDSESS?'▾ ':'▸ ')+older.length+' older sessions</div>';
-        if(!SHOW_OLDSESS) break;
-      }
+      if(r.doneSessions!==undefined){ h+='<div class="mt-scope">'+esc(r.doneSessions||'This machine')+'</div><button class="mt-done-subs" data-done-sessions="'+esc(r.doneSessions)+'" aria-expanded="'+DONE_SESSIONS_OPEN.has(r.doneSessions)+'">'+(DONE_SESSIONS_OPEN.has(r.doneSessions)?'▾':'▸')+' '+r.count+' done'+(r.pending?' · '+r.pending+' pending':'')+'</button>'; continue; }
+      if(r.doneWorkspace!==undefined){ h+='<div class="mt-scope">'+esc(r.doneWorkspace)+'</div>'; continue; }
+      if(r._machine){ h+=savedSessionHtml(r,under); h+=workerGroup(Object.assign({},r,{machine:r._machine})); continue; }
       var name=r.title||('session '+String(r.id).slice(0,8));
-      var mine=(String(r.id)===String(under)); if(mine) seen=true;
+      var mine=!OVMACH&&String(r.id)===String(under); if(mine) seen=true;
       // The same badge set a FLEET row carries (0.9.0), in the same order and the same classes: what it
       // changed, what it cost, and what it ran on. A session that changed nothing shows no diff rather
       // than +0 −0 — but still shows its tokens, because asking and reading is work the row should own.
@@ -9300,6 +11282,7 @@ const OVERVIEW_SCRIPT = `
         (r.attention&&r.attention.kind!=='idle-done'?'<span class="mt-pend">'+esc(r.attention.kind+(r.attention.message?' · '+r.attention.message:''))+'</span>':'')+
         diff+meta+chip+
         '<span class="mt-tct">'+esc(ago(r.lastActiveMs))+(mine?' · reviewing':'')+'</span>'+
+        '<button class="mt-resolve" data-workspace-window="'+esc(r.id)+'">Open workspace window</button>'+
         '<button class="mt-resolve" data-conversation="'+esc(r.id)+'" title="Read this conversation">conversation</button>'+ 
         // Resolve: accept what is left and stop carrying the history. Only offered where there IS
         // something to resolve, so the row never advertises a no-op.
@@ -9307,20 +11290,20 @@ const OVERVIEW_SCRIPT = `
         // Delete: drop a cluttering session straight from the list — offered on every
         // row (like the row-switch), the id validated host-side. The 🗑 emoji, not a webview codicon: the
         // trash glyph is outside the whitelisted subset and would render a silent blank in a webview.
-        '<button class="mt-resolve mt-del" data-sess-del="'+esc(r.id)+'" title="Delete this conversation from OAK — removes it from every session picker and purges its captured edits for good. The transcript itself is not deleted; oak sessions --undelete '+esc(r.id)+' lists it again, without its edits">🗑</button>'+
-        '</div>'; }
-      if(hidden) h+='<div class="mt-scope">'+hidden+' hidden by Active only</div>';
-    }
-    // Pinned to a session the listing has no row for: say so rather than leaving every row
-    // unhighlighted with no explanation.
-    if(under && !seen) h=elsewhere+h;
+        '<button class="mt-resolve mt-del" data-sess-del="'+esc(r.id)+'" title="Delete this conversation from OAK — removes it from every session picker and purges its captured edits; the transcript itself is not deleted. The confirmation says what oak sessions --undelete '+esc(r.id)+' brings back">🗑</button>'+
+        '</div>';
+      h+=workerGroup(r); }
+    if(hidden) h+='<div class="mt-scope">'+hidden+' hidden by the search/filter</div>';
+    if(under && !seen && !OVMACH) h=elsewhere+h;
     // Every overview payload re-renders this list, once per refresh tick. Unchanged markup is left in
     // place: rebuilding it between a click's press and its release swallowed the click.
     if(host.__sessHtml===h) return;
     host.__sessHtml=h;
     host.innerHTML=h;
     var bs=host.querySelectorAll('[data-sess-switch]');
-    for(var b=0;b<bs.length;b++) bs[b].addEventListener('click', function(){ switchTo(this.getAttribute('data-sess-switch')); });
+    for(var b=0;b<bs.length;b++) bs[b].addEventListener('click', function(){ var agent=this.getAttribute('data-agent-row'); if(agent) setFeed('agent', agent, this.getAttribute('data-worker-title')||'', this.getAttribute('data-sess-switch'), this.getAttribute('data-machine')); else switchTo(this.getAttribute('data-sess-switch')); });
+    var ww=host.querySelectorAll('[data-workspace-window]');
+    for(var w=0;w<ww.length;w++) ww[w].addEventListener('click', function(ev){ ev.stopPropagation(); vscode.postMessage({type:'openWorkspaceWindow',id:this.getAttribute('data-workspace-window'),machine:this.getAttribute('data-machine')||''}); });
     var sst=host.querySelectorAll('[data-store]');
     for(var s2=0;s2<sst.length;s2++) sst[s2].addEventListener('click', function(ev){ ev.stopPropagation(); vscode.postMessage({type:'openStore', id:this.getAttribute('data-store')}); });
     var db=host.querySelectorAll('[data-conversation]');
@@ -9337,19 +11320,59 @@ const OVERVIEW_SCRIPT = `
     var sd=host.querySelectorAll('[data-sess-del]');
     for(var sq=0;sq<sd.length;sq++) sd[sq].addEventListener('click', function(ev){ ev.stopPropagation();
       vscode.postMessage({type:'deleteSession', id:this.getAttribute('data-sess-del')}); });
-    var oh=host.querySelectorAll('[data-oldsess]');
-    for(var oi=0;oi<oh.length;oi++) oh[oi].addEventListener('click', function(){ SHOW_OLDSESS=!SHOW_OLDSESS; renderSessions(); renderNavTabs(); });
+    bindSaved(host);
+    var ms=host.querySelectorAll('[data-msid]');
+    for(var mi=0;mi<ms.length;mi++) ms[mi].addEventListener('click',function(){vscode.postMessage({type:'pickSynced',id:this.getAttribute('data-msid'),host:this.getAttribute('data-mhost')});});
+    var ds=host.querySelectorAll('[data-done-sessions]');
+    for(var di=0;di<ds.length;di++) ds[di].addEventListener('click', function(){ var k=this.getAttribute('data-done-sessions'); if(DONE_SESSIONS_OPEN.has(k)) DONE_SESSIONS_OPEN.delete(k); else DONE_SESSIONS_OPEN.add(k); renderSessions(); });
+    var wg=host.querySelectorAll('[data-wk]');
+    for(var wi=0;wi<wg.length;wi++) wg[wi].addEventListener('click', function(){ var k=this.getAttribute('data-wk'); WK_OPEN[k]=!WK_OPEN[k]; renderSessions(); });
+  }
+
+  // A session's workers still at it (its listing row's activeWorkers: working, or waiting on a person), grouped under
+  // its row as the terminal app's Observatory groups them: a summary counting them by state, closed until a click
+  // opens it, then a group per state, those waiting on a person first, each worker its title and stats in its
+  // session row's terms. A click on a worker opens its own log. A finished worker is never listed.
+  var WK_STATES=[['blocked','awaiting-permission'],['working','working']];
+  function wkState(w){ var p=w&&w.phase; return p==='working'?'working':(p==='awaiting-input'||p==='awaiting-permission')?'blocked':''; }
+  function activeWorkersOf(r){ var out=[], ws=(r&&r.activeWorkers)||[]; for(var i=0;i<ws.length;i++) if(wkState(ws[i])) out.push(ws[i]); return out; }
+  // An inferred phase wears the Workers tab's ~ and its explanation.
+  function wkBadge(phase, text, guess){ return '<span class="mt-badge sm" style="background:'+phaseColor(phase)+'"'+(guess?' title="inferred — no completion notice or structural marker for this state yet">~':'>')+esc(text)+'</span>'; }
+  function workerGroup(r){ var ws=activeWorkersOf(r); if(!ws.length) return '';
+    var id=String(r.id), groupKey=r.machine?r.machine+':'+id:id, open=!!WK_OPEN[groupKey], by={ blocked:[], working:[] }, counts=[];
+    for(var i=0;i<ws.length;i++) by[wkState(ws[i])].push(ws[i]);
+    if(by.working.length) counts.push(wkBadge('working', by.working.length+' working'));
+    if(by.blocked.length) counts.push(wkBadge('awaiting-permission', by.blocked.length+' blocked'));
+    var h='<div class="mt-foldhdr mt-wkgrp" data-wk="'+esc(groupKey)+'" title="The workers of this session still at it — click to '+(open?'hide':'show')+' them">'+
+      (open?'▾ ':'▸ ')+ws.length+' worker'+(ws.length===1?'':'s')+' · '+counts.join(' ')+'</div>';
+    if(!open) return h;
+    for(var s=0;s<WK_STATES.length;s++){ var list=by[WK_STATES[s][0]]; if(!list.length) continue;
+      h+='<div class="mt-wkhdr">'+wkBadge(WK_STATES[s][1], WK_STATES[s][0])+' ('+list.length+')</div>';
+      for(var k=0;k<list.length;k++){ var w=list[k], bits=[];
+        if(w.pending) bits.push('<span class="mt-pend">'+w.pending+' pending</span>');
+        bits.push((w.edits||0)+(w.edits===1?' edit':' edits'));
+        bits.push(fmtTok(w.tokens||0)+' tok');
+        h+='<div class="mt-trow mt-wkrow" data-sess-switch="'+esc(id)+'" data-agent-row="'+esc(w.agentId)+'" data-worker-title="'+esc(w.title||w.agentId)+'" data-machine="'+esc(r.machine||'')+'" title="'+esc((w.title||w.agentId)+' — a worker of '+(r.title||r.id)+' · click to open its live log')+'">'+
+          '<span class="mt-tg">'+wkBadge(WK_STATES[s][1], WK_STATES[s][0], w.phaseConfidence==='heuristic')+'</span>'+
+          '<span class="mt-ts">'+esc(w.title||w.agentId)+'</span>'+
+          '<span class="mt-agentbadge">'+esc(w.model||'model unknown')+'</span>'+
+          ((w.added||w.removed)?'<span class="mt-diff"><span class="mt-add">+'+(w.added||0)+'</span> <span class="mt-rem">−'+(w.removed||0)+'</span></span>':'')+
+          '<span class="mt-meta">'+bits.join(' · ')+'</span>'+
+          '<span class="mt-tct">'+esc(ago(w.lastActiveMs))+'</span></div>';
+      }
+    }
+    return h;
   }
 
   function renderProcesses(){ var host=paneHost('processes'); if(!host) return;
     // Three genuinely different states, which must not share one sentence: nothing has been read yet ·
     // the CLI answered nothing · this session truly started no background shell. Only the last one is an
     // observation about the session; saying it in the other two would assert something never observed.
-    if(!PR){ host.innerHTML=scopeNote('Background shells')+'<div class="mt-none">'+(OV_SEEN
+    if(!PR){ host.innerHTML=scopeNote('Background shells')+'<div class="mt-none">'+(PR_ERR ? 'Processes unavailable: '+esc(PR_ERR) : OV_SEEN
         ? 'No answer for background shells — the <b>oak</b> CLI on PATH didn’t return them (a CLI older than 0.8.7 has no <code>processes</code> command). Nothing else on this panel is affected.'
         : 'Reading this session’s background shells…')+'</div>'; return; }
     var all=PR.processes||[], sum=PR.summary||{total:all.length,running:0,failed:0};
-    if(!all.length){ host.innerHTML=scopeNote('Background shells')+'<div class="mt-none">No background shells — Claude starts one only when it runs a command with <code>run_in_background</code>.</div>'; return; }
+    if(!all.length){ host.innerHTML=scopeNote('Background shells')+'<div class="mt-none">No shells in this session</div>'; return; }
     // Under an ask scope: the shells that ask launched. A shell it started but which is still running now
     // stays its own — attribution is by START, so a long-lived shell doesn't migrate to a later ask.
     var pF=reqFilter(all, 'processIds', function(p){ return p.id; });
@@ -9367,9 +11390,9 @@ const OVERVIEW_SCRIPT = `
     for(var f=0;f<all.length;f++){ if(DISMISS_PR[all[f].id]) folded++; else ps.push(all[f]); }
     var h=scopeNote('Background shells')+pNote+'<div class="mt-chead">'+(pF.scoped?(all.length+' from this ask'):(sum.running+' running · '+sum.total+' total'+(sum.failed?' · '+sum.failed+' failed':'')))+(folded?' · <span class="mt-folded" title="Cleared from this list — click the Processes tab header to bring them back">'+folded+' cleared</span>':'')+'</div>';
     if(!ps.length){ host.innerHTML=h+'<div class="mt-none">Every shell has been cleared from this list — click the <b>Processes</b> tab header to bring them back.</div>'; return; }
-    for(var i=0;i<ps.length;i++){ var p=ps[i], st=procState(p);
-      var sel=(FEED&&FEED.kind==='process'&&FEED.id===p.id);
-      h+='<div class="mt-proc'+(sel?' sel':'')+'" data-proc="'+esc(p.id)+'" title="'+esc(p.command)+'">'+
+    for(var i=0;i<ps.length;i++){ var p=ps[i], st=procState(p), pid=p.workerId ? p.workerId+':'+p.id : p.id;
+      var sel=(FEED&&FEED.kind==='process'&&FEED.id===pid);
+      h+='<div class="mt-proc'+(sel?' sel':'')+'" data-proc="'+esc(pid)+'" title="'+esc(p.command)+'">'+
         '<div class="mt-arow">'+
         '<span class="mt-badge sm" style="background:'+st.col+'">'+esc(st.txt)+'</span>'+
         '<span class="mt-pid">'+esc(p.id)+'</span>'+
@@ -9388,10 +11411,14 @@ const OVERVIEW_SCRIPT = `
   // panel only NAMES the subject: FEED keeps the picked ref so the row highlights below still work,
   // and the post hands it to the host, whose activate() wiring re-points and reveals the Feed tab.
   var FEED=null;
-  function setFeed(kind, id, label){
-    if(FEED && FEED.kind===kind && FEED.id===id) return;
-    FEED={kind:kind, id:String(id==null?'':id), label:label||''};
-    vscode.postMessage({type:'feed', kind:FEED.kind, id:FEED.id, label:FEED.label});
+  function setFeed(kind, id, label, session, machine, cwd){
+    if(FEED && FEED.kind===kind && FEED.id===id && FEED.session===session && FEED.machine===machine && FEED.cwd===cwd) return;
+    FEED={kind:kind, id:String(id==null?'':id), label:label||'', session:session, machine:machine, cwd:cwd};
+    var message={type:'feed', kind:FEED.kind, id:FEED.id, label:FEED.label};
+    if(session) message.session=session;
+    if(machine) message.machine=machine;
+    if(cwd) message.cwd=cwd;
+    vscode.postMessage(message);
   }
   function ago(ts){ if(!ts) return '—'; var d=new Date(ts), n=new Date(); function p2(x){ return (x<10?'0':'')+x; }
     var MN=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
@@ -9408,12 +11435,8 @@ const OVERVIEW_SCRIPT = `
   // Shown/total, because this pane deliberately hides rows: the last day plus whatever the reader
   // expanded. "34" over a list of 3 is the same lie the Fleet badge told.
   function sessionsBadge(){
-    var rows=(SESS&&SESS.sessions)||[], now=Date.now(), under=SELF_KEY||'', shown=0;
-    for(var i=0;i<rows.length;i++){ var r=rows[i];
-      var kept=String(r.id)===String(under)||r.current||r.pending||(r.attention&&r.attention.kind!=='idle-done');
-      if(ACTIVE_ONLY&&!kept&&now-(r.liveMs||r.lastActiveMs)>60000) continue;
-      if(String(r.id)===String(under)||r.current||(r.attention&&r.attention.kind!=='idle-done')||now-r.lastActiveMs<=7*86400000||SHOW_OLDSESS) shown++;
-    }
+    var rows=machineRows((SESS&&SESS.sessions)||[],OVSAVED,WORKER_MACHINES||((SESS&&SESS.machines)||[]));
+    var shown=rows.filter(function(r){return sessionVisible(r,FILTER,ACTIVE_ONLY,SELF_KEY,OVMACH);}).length;
     return shown===rows.length? String(rows.length) : (shown+'/'+rows.length);
   }
 
@@ -9433,7 +11456,7 @@ const OVERVIEW_SCRIPT = `
     // fold. The fold is applied in the renderer rather than in multitaskFilter (which both editors
     // share and which has no folded clause), so the badge has to subtract it the same way. (No backticks
     // in this region: it is inside the webview template literal, which they would close.)
-    var visRows=(MTFILTER&&MT)? (MTFILTER(MT, fstate()).agents||[]) : ag;
+    var visRows=(MTFILTER&&(MT||WORKERS!==null))? (MTFILTER(workerData(), fstate()).agents||[]) : ag;
     var visN=0;
     for(var vi=0;vi<visRows.length;vi++) if(!visRows[vi].folded || SHOW_FOLDED) visN++;
     var fleetLabel=String(visN);
@@ -9459,7 +11482,7 @@ const OVERVIEW_SCRIPT = `
   var GROUP_BUILT=null; // 'on' once the grouped columns exist in the DOM; null while solo tabs are shown
   // ONE group (group ALL the tabs together, never two groups) — every
   // member side by side; folding columns is how a reader narrows it.
-  var NAV_GROUPS=[['all','Sessions · Workers · Workflows · Tasks · Processes',['sessions','fleet','workflows','tasks','processes']]];
+  var NAV_GROUPS=[['all','Sessions · Workers · Processes · Tasks · Workflows',['sessions','fleet','processes','tasks','workflows']]];
   function groupOf(member){ for(var i=0;i<NAV_GROUPS.length;i++) if(NAV_GROUPS[i][2].indexOf(member)>=0) return NAV_GROUPS[i]; return null; }
   function groupById(id){ for(var i=0;i<NAV_GROUPS.length;i++) if(NAV_GROUPS[i][0]===id) return NAV_GROUPS[i]; return null; }
   // --- the grouped columns: widths the reader drags, and columns they can fold ----------------------
@@ -9484,7 +11507,7 @@ const OVERVIEW_SCRIPT = `
     var gr=groupOf(k); if(!gr) return;
     if(colOpen(k) && openCols(gr)<=1) return;
     if(colOpen(k)) COLC[k]=1; else delete COLC[k];
-    GROUP_BUILT=null; saveState(); paint(); // the rail and the column are different markup, so rebuild
+    GROUP_BUILT=null; applyPanes(); saveState(); paint(); // the rail and the column are different markup, so rebuild
   }
   /** Write each expanded column's share as its flex-grow weight. A rail is sized by CSS and exempt from
    *  both this and the minimum width — it is not showing content to clip. */
@@ -9540,7 +11563,10 @@ const OVERVIEW_SCRIPT = `
   }
   /** The tab key that is actually clickable for a member right now — itself, or the group holding it. */
   function resolveTab(key){ if(!GROUPNAV) return key; var g=groupOf(key); return 'g:'+(g? g[0] : NAV_GROUPS[0][0]); }
-  function applyPanes(){ var ids=['sessions','fleet','workflows','tasks','processes'];
+  var WORKERS_VISIBLE;
+  function applyPanes(){ var ids=['sessions','fleet','processes','tasks','workflows'];
+    var workersVisible=GROUPNAV?!COLC.fleet:NAV==='fleet';
+    if(WORKERS_VISIBLE!==workersVisible){ WORKERS_VISIBLE=workersVisible; vscode.postMessage({type:'workersVisible',visible:workersVisible}); }
     var cur=resolveTab(NAV);
     for(var i=0;i<ids.length;i++){ var el=document.getElementById('ov-pane-'+ids[i]); if(el) el.style.display=(!GROUPNAV && NAV===ids[i])?'flex':'none'; }
     for(var g=0;g<NAV_GROUPS.length;g++){ var ge=document.getElementById('ov-group-'+NAV_GROUPS[g][0]);
@@ -9564,9 +11590,8 @@ const OVERVIEW_SCRIPT = `
     var defs=[
       // Sessions leads: which session you are reviewing is the question that precedes every other one.
       ['sessions','Sessions', SESS&&SESS.sessions? sessionsBadge() : '',
-        'Sessions on this machine, grouped by workspace. Selecting one switches the whole review to it.', false],
+        'Sessions from every machine, newest activity first. Search, Active and Sort cover the whole list.', false],
       ['fleet','Workers',String(c.fleet),'Workers — the sessions this pane is showing; pick one to map just its edits. A WORKER is a session doing work, not a live process, and the badge counts the rows this pane draws under the current filter — so it never implies that every session ever recorded here is running.',false],
-      ['workflows','Workflows',String(c.workflows),'Workflows — multi-agent runs (orchestrator + subagents) with their phases and attributed edits',false],
       ['tasks','Tasks',String(c.tasks),'Tasks — the REVIEWED session’s numbered task list (the agent’s TaskCreate/TaskUpdate plan), with live statuses. A sibling agent’s tasks are not in this payload, so while one is selected this pane still shows the reviewed session and the badge shows no count rather than another session’s.',false]];
     // The Processes tab is always present: a tab that silently vanishes when the CLI can't answer hides
     // the failure instead of reporting it (the pane itself says which of the three states it is in). The
@@ -9581,11 +11606,12 @@ const OVERVIEW_SCRIPT = `
     // another agent selected the honest badge is NO badge: showing the reviewed session's count beside a
     // pane the reader believes is scoped to their selection is the one thing worse than showing nothing.
     var otherAgent=otherAgentSelected(); // one definition of "a sibling is selected", shared with navCounts
-    defs.push(['processes','Processes', otherAgent? '' : (psum? (psum.running+'/'+psum.total) : ''),
+    defs.splice(2, 0, ['processes','Processes', otherAgent? '' : (psum? (psum.running+'/'+psum.total) : ''),
       otherAgent
         ? 'Processes — background shells are read for the session under review, never for a selected sibling agent, so no count is shown while one is selected. Open that session from the Sessions tab to see its shells.'
-        : 'Processes — background shells the ACTIVE session launched with run_in_background: state, runtime and output volume (shell ids are the harness’s own; a transcript records no OS pid).',
+        : 'Processes — shells recorded for the reviewed session and its workers, including Codex exec sessions: state, runtime and output volume (shell ids are the harness’s own; a transcript records no OS pid).',
       !otherAgent && !!(psum && psum.running>0)]);
+    defs.push(['workflows','Workflows',String(c.workflows),'Workflows — multi-agent runs (orchestrator + subagents) with their phases and attributed edits',false]);
     var cur=resolveTab(NAV);
     var h='';
     if(GROUPNAV){
@@ -9667,10 +11693,10 @@ const OVERVIEW_SCRIPT = `
 
   function paint(){
     var empty=document.getElementById('ov-empty');
-    if(MT && MT.agents){ empty.style.display='none'; renderNavTabs(); applyPanes(); renderFleet(); renderWorkflows(); renderTasks(); }
+    if((MT && MT.agents) || WORKERS!==null){ empty.style.display='none'; renderNavTabs(); applyPanes(); renderFleet(); renderWorkflows(); renderTasks(); }
     else {
       renderNavTabs(); applyPanes();
-      if(CLI_ERR){ empty.style.display='block'; empty.innerHTML=CLI_ERR_HTML; }
+      if(CLI_ERR){ empty.style.display='block'; empty.innerHTML=OV_FAIL||CLI_ERR_HTML; }
       else if(!CM){ empty.style.display='block'; empty.innerHTML='No agents yet. <span style="opacity:.75">This fills in as the agent works across your worktrees.</span>';
         clearNavLists(['fleet','workflows','tasks']); }
       else empty.style.display='none';
@@ -9690,7 +11716,7 @@ const OVERVIEW_SCRIPT = `
   function renderNavPos(){ var p=NAVPOS||{};
     var d=document.getElementById('ov-diffcount'); if(d) d.textContent='Diff '+(p.diff? (p.diff.i+'/'+p.diff.n+(p.diff.time?' · '+p.diff.time:'')) : '–/–');
     var f=document.getElementById('ov-filecount'); if(f){ var fe=(p.file&&p.file.edits>0)?' · '+p.file.edits+' edit'+(p.file.edits===1?'':'s'):''; f.textContent='File '+(p.file? ((p.file.i||'–')+'/'+p.file.n+(p.file.name?' · '+p.file.name:'')+fe) : '–/–'); }
-    var fo=document.getElementById('ov-foldercount'); if(fo){ if(p.folder){ var fon=p.folder.name||''; if(fon.length>24) fon='…'+fon.slice(-23);
+    var fo=document.getElementById('ov-foldercount'); if(fo){ if(p.folder){ var fon=p.folder.shown||'';
         var ft=[]; if(p.folder.files>0) ft.push(p.folder.files+' file'+(p.folder.files===1?'':'s')); if(p.folder.edits>0) ft.push(p.folder.edits+' edit'+(p.folder.edits===1?'':'s'));
         var fts=(ft.length?' · '+ft.join(' · '):''); fo.textContent='Folder '+(p.folder.i||'–')+'/'+p.folder.n+(fon?' · '+fon:'')+fts; fo.title=p.folder.name||''; } else { fo.textContent='Folder –/–'; fo.title='the current file’s folder'; } }
     // Prompt axis: i/n is its place among the asks that still have something to review; #k is the ask's
@@ -9722,8 +11748,11 @@ const OVERVIEW_SCRIPT = `
       return;
     }
     if(m.type==='version'){ VERINFO=m.v||null; renderVersion(); return; }
+    if(m.type==='workers'){ WORKERS=m.workers||[]; WORKER_NOTES=m.notes||[]; WORKER_FINDINGS=m.findings||null; renderFleet(); renderNavTabs(); return; }
+    if(m.type==='workerMachines'){ WORKER_MACHINES=m.machines||[]; renderSessions(); return; }
     if(m.type==='sessions'){ SESS=m.sessions||null; renderNavTabs(); renderSessions(); return; }
-    if(m.type==='overview'){ var oe=document.getElementById('ov-elsewhere'); if(oe&&oe.parentNode) oe.parentNode.removeChild(oe); CLI_ERR=false; PINNED=m.pinned||''; setSessLabel(m.session, m.sessionTitle); CM=m.cm||null; MT=m.mt||null; PR=m.pr||null; SESS=m.sessions||SESS; OV_SEEN=true; NAVPOS=m.navPos||null; FILTER=m.filter||''; if(m.filterSpec) FSPEC=m.filterSpec; if(m.sort) SORT=m.sort;
+    if(m.type==='saved'){ OVSAVED=m.machines||[]; OVSAVEDERR=m.error||''; renderSessions(); return; }
+    if(m.type==='overview'){ var oe=document.getElementById('ov-elsewhere'); if(oe&&oe.parentNode) oe.parentNode.removeChild(oe); CLI_ERR=false; OV_FAIL=''; PINNED=m.pinned||''; OVMACH=m.machine||''; setSessLabel(m.session, m.sessionTitle, OVMACH); CM=m.cm||null; MT=m.mt||null; PR=m.pr||null; PR_ERR=m.prErr||''; SESS=m.sessions||SESS; OV_SEEN=true; NAVPOS=m.navPos||null; FILTER=m.filter||''; if(m.filterSpec) FSPEC=m.filterSpec; if(m.sort) SORT=m.sort;
       // Reset dismissals only when the actual session changes — key on the stable host-provided session id,
       // NOT selfSession() (which falls back to agents[0].session and flips whenever the fleet re-sorts,
       // wiping the user's "clear completed" on every refresh).
@@ -9763,6 +11792,10 @@ const OVERVIEW_SCRIPT = `
     // Guided tour (0.8.9): select the tab the step is about, show its tip beside the panel it is
     // describing, and ring the named control. An anchor this build does not know simply does not ring —
     // the step still reads, which is what lets core add a step an older editor has never heard of.
+    else if(m.type==='workspaceDashboards'){
+      GROUPNAV=true; NAV='sessions'; COLC={}; GROUP_BUILT=null;
+      saveState(); applySplit(); paint();
+    }
     else if(m.type==='tour'){ applyTour(m.tab||null, m.anchor||null); }
     // The guided tour asks for every row to be visible while it runs, then hands the filter back exactly
     // as it found it (TOUR_FILTER remembers the reader's own value, not a default).
@@ -9773,10 +11806,10 @@ const OVERVIEW_SCRIPT = `
         if(TOUR_FILTER!==null){ ACTIVE_ONLY=TOUR_FILTER; TOUR_FILTER=null; saveState(); paint(); }
       }
     }
-    else if(m.type==='error'){ CLI_ERR=true; CM=null; MT=null; PR=null; OV_SEEN=true; FEED=null; SESS=m.sessions||null; renderNavTabs(); applyPanes(); renderProcesses(); renderSessions();
+    else if(m.type==='error'){ CLI_ERR=true; OV_FAIL=m.failure ? 'Could not read this session on <b>'+esc(m.machine)+'</b>: '+esc(m.failure) : ''; CM=null; MT=null; PR=null; PR_ERR=m.failure||''; OV_SEEN=true; FEED=null; SESS=m.sessions||null; renderNavTabs(); applyPanes(); renderProcesses(); renderSessions();
       var em=document.getElementById('ov-empty'); em.style.display='block';
-      em.innerHTML=CLI_ERR_HTML;
-      clearNavLists(['fleet','workflows']);
+      em.innerHTML=OV_FAIL||CLI_ERR_HTML;
+      clearNavLists(['workflows']); renderFleet();
       document.getElementById('cm-strip').innerHTML=''; document.getElementById('cm-ledger').innerHTML=''; document.getElementById('cm-detail-empty').style.display='none'; document.getElementById('cm-readout').innerHTML='';
       document.getElementById('cm-cap-folders').style.display='none'; document.getElementById('cm-cap-files').style.display='none'; document.getElementById('cm-summary').innerHTML=''; }
   });
@@ -9841,6 +11874,7 @@ const OVERVIEW_SCRIPT = `
   // rendered OFF while the filter was ON, and a click in that window silently persisted the opposite
   // of what the reader asked for.
   syncToggles();
+  applyPanes();
   vscode.postMessage({type:'ready'});
 })();
 `;
@@ -9929,9 +11963,14 @@ async function fetchLatestRelease(channel?: core.UpdateChannel): Promise<any> {
   return release;
 }
 
+/** How long `oak update` may run. On top of this machine's downloads and installs, it reads herdr's
+ *  machine list (15 s), each saved machine's plan (45 s) and then runs its update (180 s), and a run
+ *  stopped at its deadline stops the ssh it started on them. JetBrains gives it the same. */
+const UPDATE_TIMEOUT_MS = 15 * 60_000;
+
 /** Run the CLI once, resolving to its stdout — or to an Error. Windows: the CLI is an npm `.cmd`
  *  shim, which needs cmd.exe; core/spawn handles that, and the quoting, for every CLI spawn here. */
-function runCli(args: string[], timeoutMs = 300000): Promise<string> {
+function runCli(args: string[], timeoutMs: number): Promise<string> {
   return new Promise((resolve, reject) => {
     core.execFileTool(resolveObservatoryBin(), args, { timeout: timeoutMs }, (err, stdout, stderr) => {
       // core.cliFailureMessage, not `stderr || stdout`: that ordering is what put a Node deprecation
@@ -9945,45 +11984,110 @@ function runCli(args: string[], timeoutMs = 300000): Promise<string> {
 /** The CLI's own view of the world, network-free: its version and the channel it follows. Null when
  *  the CLI cannot be found or run — which is a normal state (the extension installs fine on its own)
  *  and must be reported as "not found", never as a failed update. */
-async function cliVersionInfo(): Promise<{ current: string; channel: core.UpdateChannel } | null> {
+async function cliVersionInfo(): Promise<{ current: string; channel: core.UpdateChannel; linked: string | null; provisioned: boolean } | null> {
   try {
     // Seconds, not the install timeout: this runs while a webview waits to paint, and it does no
     // network at all — anything slower than this is a wedged process, not a slow answer.
     const out = await runCli(['version', '--json'], 10000);
     const j = JSON.parse(out);
-    return { current: String(j?.current ?? ''), channel: j?.channel === 'dev' ? 'dev' : 'stable' };
+    return { current: String(j?.current ?? ''), channel: j?.channel === 'dev' ? 'dev' : 'stable', linked: typeof j?.linked === 'string' ? j.linked : null, provisioned: j?.provisioned === true };
   } catch {
     return null;
   }
 }
 
-/** Ask the CLI for the whole update plan as data. `--json` never installs anything, so this is safe
- *  to call from a chip render. Null = the CLI is absent or the release feed was unreachable. */
+/** Ask the CLI for this machine's update plan as data. `--json` never installs anything, so this is
+ *  safe to call from a chip render; `--here` leaves the saved machines to the `oak update` that follows,
+ *  so they are asked once per click, not twice. Null = the CLI is absent or the release feed was
+ *  unreachable. */
 async function fetchUpdatePlan(channel?: core.UpdateChannel): Promise<any | null> {
   try {
-    // One release-feed fetch, so a minute is generous; the 5-minute install budget is not for a read.
-    return JSON.parse(await runCli(channel ? ['update', '--json', '--channel', channel] : ['update', '--json'], 60000));
+    // One release-feed fetch, so a minute is generous; the install budget is not for a read.
+    return JSON.parse(await runCli(channel ? ['update', '--json', '--here', '--channel', channel] : ['update', '--json', '--here'], 60000));
   } catch {
     return null;
   }
+}
+
+/** Whether `update --json --here` names work the CLI does here: a surface it acts on (an editor without
+ *  our extension, one its marketplace updates, a CLI linked to a checkout or copied by `oak machine add`, or
+ *  a local build is not one) or a part of OAK's setup (one left to the user is not). A CLI older than the
+ *  components reports only surfaces, and is read the same way. */
+export function updatePending(plan: any): boolean {
+  return pendingRows(plan).length > 0;
+}
+
+/** The rows of an `update --json --here` plan that updatePending counts as work, each as `kind:key` and the
+ *  label the CLI gives it. A component the CLI checks only once it is itself updated (`after-cli`) is work. */
+function pendingRows(plan: any): { key: string; label: string }[] {
+  return [
+    ...(plan?.surfaces || [])
+      .filter((s: any) => !['current', 'managed', 'linked', 'provisioned', 'local'].includes(s.reason) && !(s.surface === 'vscode' && s.reason === 'missing'))
+      .map((s: any) => ({ key: `surface:${s.surface}:${s.label}`, label: String(s.label) })),
+    ...(plan?.components || [])
+      .filter((c: any) => c.state !== 'current' && c.state !== 'absent' && c.state !== 'manual')
+      .map((c: any) => ({ key: `component:${c.id}`, label: String(c.label ?? c.id) })),
+  ];
+}
+
+/** What the toast says `oak update` did on this machine, from the plans read before and after it: the rows
+ *  that were work before and are not after, by the CLI's label (its own row as "itself"), then any still
+ *  to do. Left out: this window's extension (the row whose `extensionsDir` is `ownDir`, the folder its
+ *  install sits in), which the extension installs itself, and a component the plan before left to the CLI
+ *  it was about to install (`after-cli`), of which neither plan says whether it changed. Without both
+ *  plans, nothing is named. `leftToYou`: the update left a repair to the user, so nothing is "current". */
+export function cliUpdateNote(before: any, after: any, ownDir: string, leftToYou: boolean): string {
+  if (!before || !after) return 'the CLI ran the update for the rest of this machine';
+  const real = (p: string): string => { try { return fs.realpathSync(p); } catch { return path.resolve(p); } };
+  const own = new Set([...(before.surfaces || []), ...(after.surfaces || [])]
+    .filter((s: any) => s.surface === 'vscode' && typeof s.extensionsDir === 'string' && !!ownDir && real(s.extensionsDir) === real(ownDir))
+    .map((s: any) => `surface:${s.surface}:${s.label}`));
+  const unknown = new Set((before.components || []).filter((c: any) => c.state === 'after-cli').map((c: any) => `component:${c.id}`));
+  const left = pendingRows(after).filter((r) => !own.has(r.key));
+  const still = new Set(left.map((r) => r.key));
+  const updated = pendingRows(before)
+    .filter((r) => !own.has(r.key) && !unknown.has(r.key) && !still.has(r.key))
+    .map((r) => (r.key.startsWith('surface:cli:') ? 'itself' : r.label));
+  const todo = left.length ? `still to do: ${left.map((r) => r.label).join(', ')}` : '';
+  if (updated.length) return `the CLI updated ${updated.join(', ')}${todo ? `; ${todo}` : ''}`;
+  if (todo) return `the CLI ran the update; ${todo}`;
+  return leftToYou ? 'the CLI had nothing else to update on this machine' : 'everything else on this machine already current';
 }
 
 /**
- * Apply an update, or switch channels — the ONE path behind both buttons.
+ * Apply an update, or switch channels — the ONE path behind every button: the version chip's Update now
+ * and channel switch, and the update notification's Update now.
  *
  * The .vsix is installed BY THIS EXTENSION, through VS Code's own extension service, and never by
- * shelling `code --install-extension`. That distinction is the whole bug: the notifier's installer
- * needs nothing on PATH (see installVsixUpdate), while the CLI's needs the editor's shell command,
+ * shelling `code --install-extension`. That distinction is the whole bug: our installer needs nothing on
+ * PATH (see installVsix), while the CLI's needs the editor's shell command,
  * which a Dock-launched editor frequently does not have — so the button people actually press was
  * the one that failed.
  *
- * The CLI is still asked to refresh ITSELF and the JetBrains plugin. Its absence is a PARTIAL
+ * The CLI is still asked to refresh everything else `oak update` covers: itself, the other editors, the
+ * JetBrains plugin, OAK's setup and the saved machines. Its absence is a PARTIAL
  * result, reported as such, not a failure: an extension-only install is a supported way to run this.
  *
  * Success is never inferred from the CLI's prose. We install what we install, and read the plan back
  * to see what actually moved.
+ *
+ * One at a time in this window: an update can run for minutes, and a second click started a second
+ * `oak update` over the same installs. It says so instead.
  */
+let updateRunning = false;
 async function applyUpdate(target: core.UpdateChannel | null): Promise<void> {
+  if (updateRunning) {
+    void vscode.window.showInformationMessage('OAK: an update is already running in this window — its result shows here when it finishes.');
+    return;
+  }
+  updateRunning = true;
+  try {
+    await runUpdate(target);
+  } finally {
+    updateRunning = false;
+  }
+}
+async function runUpdate(target: core.UpdateChannel | null): Promise<void> {
   const switching = target !== null && target !== core.getUpdateChannel();
   const label = target === 'dev' ? 'Pre-release' : 'Stable';
   const title = switching
@@ -9992,6 +12096,7 @@ async function applyUpdate(target: core.UpdateChannel | null): Promise<void> {
   const done: string[] = [];
   const skipped: string[] = []; // could not be done, and the user may be able to fix it
   const notes: string[] = []; // deliberately not done — a supported setup, not a failure
+  let yours: string[] = []; // left to the user by the update itself: each names the command to run
   let extensionMoved = false;
 
   await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title }, async () => {
@@ -10001,6 +12106,10 @@ async function applyUpdate(target: core.UpdateChannel | null): Promise<void> {
     //    ping-pong versions. The CLI + JetBrains legs below run either way.
     if (marketplaceManaged(target ?? undefined)) {
       notes.push('extension is marketplace-managed — your editor updates it in the Extensions view');
+    } else if (target === null && core.isLocalBuild(extensionVersion)) {
+      // A local build, which no release carries: Update now leaves it alone, as `oak update` does. Switching
+      // channels, or `oak update --force`, replaces it.
+      notes.push(`extension ${extensionVersion} is a local build, left alone`);
     } else {
       // The plan tells us the target; if the CLI could not produce one we fall back to our own
       // release lookup, so a missing CLI never blocks our own update.
@@ -10040,8 +12149,9 @@ async function applyUpdate(target: core.UpdateChannel | null): Promise<void> {
       }
     }
 
-    // 3. The CLI and the JetBrains plugin, via the CLI. `--force` is unnecessary: the CLI now acts on
-    //    any DIFFERENCE from the channel, in either direction.
+    // 3. Everything else, via the CLI: itself, the other editors and Remote-SSH servers, the JetBrains
+    //    plugin, OAK's setup (hooks, status line, herdr) and the saved machines. `--force` is
+    //    unnecessary: the CLI acts on any DIFFERENCE from the channel, in either direction.
     //
     //    A machine with no CLI is a SUPPORTED setup, not a failed update — the extension installs and
     //    updates itself. So "not installed" is a note; only a CLI that exists and then FAILED is a
@@ -10050,20 +12160,31 @@ async function applyUpdate(target: core.UpdateChannel | null): Promise<void> {
     //    Whether the CLI EXISTS is asked network-free (`version --json`), never inferred from the
     //    plan: `update --json` also fails when the release feed is unreachable, so keying off it
     //    reported "CLI not found" to people whose CLI was installed and whose network was not.
+    //
+    //    It runs on every click, as JetBrains runs it: the plan read above is this machine's alone, and
+    //    `oak update` is the one call that reaches the saved machines. A plan the CLI could not give
+    //    (null) is run anyway, so the CLI reports its own reason rather than a guess skipping it. The
+    //    message speaks for this machine only: the saved machines' rows are in the CLI's own table, and
+    //    a machine it could not update fails the run.
     const cli = await cliVersionInfo();
     if (!cli) {
       notes.push('CLI not found — the extension updated on its own');
-    } else if (plan === null || (plan.surfaces || []).some((s: any) => s.surface !== 'vscode' && s.reason !== 'current')) {
-      // plan === null: the CLI is there but could not tell us the plan. Run it anyway and let it
-      // report its own reason, rather than skipping on a guess.
+    } else {
+      let ran = false;
       try {
-        await runCli(target ? ['update', '--channel', target] : ['update']);
-        done.push('CLI and JetBrains plugin refreshed');
+        await runCli(target ? ['update', '--channel', target] : ['update'], UPDATE_TIMEOUT_MS);
+        ran = true;
       } catch (e) {
         skipped.push(`CLI: ${String((e as Error)?.message || e)}`);
       }
-    } else {
-      done.push('CLI and JetBrains plugin already current');
+      // Read back what the update leaves to the user (a project's own settings file, which it never
+      // writes): each is named, and this machine is never called current while one stands. The plan read
+      // before stands in when this read fails.
+      const read = await fetchUpdatePlan(target ?? undefined);
+      const after = read ?? plan;
+      yours = (Array.isArray(after?.components) ? after.components : []).filter((c: any) => c?.state === 'manual').map((c: any) => String(c.detail));
+      // What the CLI did, as the two plans show it: this window's extension is ours to name, above.
+      if (ran) done.push(cliUpdateNote(plan, read, EXTENSIONS_DIR, yours.length > 0));
     }
     versionInfoCache = null; // the chip must re-learn the world after an install
   });
@@ -10071,12 +12192,15 @@ async function applyUpdate(target: core.UpdateChannel | null): Promise<void> {
   // What MOVED, per surface — never one verdict for three things. A reload is offered exactly when
   // this extension's own bits changed, which is the only case a reload is what fixes.
   const headline = switching ? `Switched to the ${label} channel.` : 'OAK update:';
-  const detail = [done.join('; '), notes.join('; '), skipped.length ? `not done — ${skipped.join('; ')}` : '']
+  const detail = [done.join('; '), notes.join('; '), yours.length ? `left to you: ${yours.join('; ')}` : '', skipped.length ? `not done — ${skipped.join('; ')}` : '']
     .filter(Boolean)
     .join(' · ');
   if (extensionMoved) {
-    const pick = await vscode.window.showInformationMessage(`${headline} ${detail}`, 'Reload Window');
-    if (pick === 'Reload Window') void vscode.commands.executeCommand('workbench.action.reloadWindow');
+    // Not awaited: VS Code settles it only on a click or a dismissal, and until then applyUpdate would
+    // refuse every later click as an update still running.
+    void vscode.window.showInformationMessage(`${headline} ${detail}`, 'Reload Window').then((pick) => {
+      if (pick === 'Reload Window') void vscode.commands.executeCommand('workbench.action.reloadWindow');
+    });
   } else if (skipped.length) {
     vscode.window.showWarningMessage(`${headline} ${detail}`);
   } else {
@@ -10088,6 +12212,9 @@ async function applyUpdate(target: core.UpdateChannel | null): Promise<void> {
  *  channels' newest tags (1h in-memory cache — the chip renders instantly, the menu stays honest). */
 let versionInfoCache: { at: number; stableLatest: string | null; devLatest: string | null } | null = null;
 let extensionVersion = ''; // set once in activate() from the extension's own manifest
+/** The folder this extension's install sits in (`<editor>/extensions`), set in activate(): `update --json`
+ *  names each VS Code-family editor's, so this window's own row can be told from the others. */
+let EXTENSIONS_DIR = '';
 /**
  * A newer build is ON DISK but this extension host is still running the old one.
  *
@@ -10108,6 +12235,8 @@ async function versionChipInfo(): Promise<{
   stableLatest: string | null;
   devLatest: string | null;
   updateAvailable: boolean;
+  /** A surface is a local build, which Update now leaves alone: the Update row says so, not "up to date". */
+  local?: boolean;
   offline?: boolean;
   pendingReload?: string | null;
   surfaces?: { label: string; version: string | null; reason: string }[];
@@ -10150,25 +12279,11 @@ async function versionChipInfo(): Promise<{
         ? 'pending reload'
         : marketplaceManaged(channel)
           ? 'marketplace-managed' // the gallery updates it — excluded from updateAvailable below
-          : latest && core.compareVersions(latest, current) !== 0
-            ? core.isNewer(latest, current)
-              ? 'update available'
-              : 'not on this channel'
-            : 'current',
+          : core.channelReason(latest, current),
     },
   ];
   const cli = await cliVersionInfo();
-  surfaces.push({
-    label: 'CLI',
-    version: cli?.current ?? null,
-    reason: !cli
-      ? 'not found'
-      : latest && core.compareVersions(latest, cli.current) !== 0
-        ? core.isNewer(latest, cli.current)
-          ? 'update available'
-          : 'not on this channel'
-        : 'current',
-  });
+  surfaces.push({ label: 'CLI', version: cli?.current ?? null, reason: cliChipReason(cli, latest) });
   return {
     current,
     channel,
@@ -10177,9 +12292,19 @@ async function versionChipInfo(): Promise<{
     // Any DIFFERENCE from the channel, in either direction — an install sitting ABOVE the channel is
     // the case that silently stranded people, and it is precisely the one isNewer called "current".
     updateAvailable: surfaces.some((s) => s.reason === 'update available' || s.reason === 'not on this channel'),
+    local: surfaces.some((s) => s.reason === 'local build'),
     pendingReload: pendingReloadVersion,
     surfaces,
   };
+}
+
+/** The chip's CLI row. A CLI linked to a checkout, or copied by `oak machine add`, is on no channel:
+ *  `oak update` leaves it alone and it is updated where it came from, so a release is never offered to it.
+ *  Nor is one to a local build (`local build`, from channelReason). */
+export function cliChipReason(cli: { current: string; linked?: string | null; provisioned?: boolean } | null, latest: string | null): string {
+  if (!cli) return 'not found';
+  if (cli.linked) return 'linked to a checkout';
+  return cli.provisioned ? 'copied by oak machine add' : core.channelReason(latest, cli.current);
 }
 
 /** Download `url` (following redirects) to `dest`. Rejects on any non-200 / network error. */
@@ -10238,37 +12363,25 @@ async function installVsix(url: string, latest: string, digest?: string): Promis
   versionInfoCache = null;
 }
 
-/** The notifier's install: `installVsix` wrapped in its own progress + reload prompt. Falls back to
- *  opening the download in a browser if anything fails. */
-async function installVsixUpdate(url: string, latest: string, digest?: string): Promise<void> {
-  try {
-    await vscode.window.withProgress(
-      { location: vscode.ProgressLocation.Notification, title: `Installing OAK ${latest}…` },
-      () => installVsix(url, latest, digest)
-    );
-    const reload = await vscode.window.showInformationMessage(
-      `OAK ${latest} installed. Reload the window to activate it.`,
-      'Reload Window'
-    );
-    if (reload === 'Reload Window') void vscode.commands.executeCommand('workbench.action.reloadWindow');
-  } catch (e) {
-    const pick = await vscode.window.showWarningMessage(
-      `Couldn't auto-install the update (${String((e as Error)?.message || e)}). Download the .vsix instead?`,
-      'Download .vsix'
-    );
-    if (pick === 'Download .vsix') void vscode.env.openExternal(vscode.Uri.parse(url));
-  }
-}
-
-/** Compare the running extension version against the newest GitHub Release; if newer, offer to install
- *  the .vsix. `manual` = triggered from the command palette (report up-to-date / errors; ignore throttle
- *  + "skip this version"). */
+/** Compare the running extension version against the newest GitHub Release; if it differs, offer the
+ *  update: the same `applyUpdate` as the version chip, so this extension, the CLI and everything else
+ *  `oak update` covers move together. `manual` = triggered from the command palette (report up-to-date /
+ *  errors; ignore throttle + "skip this version"). */
 async function checkForUpdate(context: vscode.ExtensionContext, manual: boolean): Promise<void> {
   // `context.extension` is only present in a real extension host (absent under the smoke-test mock) —
   // bail before any network call if we can't read our own version.
   const current = context.extension?.packageJSON?.version ? String(context.extension.packageJSON.version) : undefined;
   if (!current) {
     if (manual) vscode.window.showWarningMessage('OAK: cannot determine the installed version.');
+    return;
+  }
+  // A local build is no release's, and none is offered to it: Update now and `oak update` leave it alone. Naming
+  // the channel replaces what differs from it; `--force` would reinstall every surface and saved machine too.
+  if (core.isLocalBuild(current)) {
+    if (manual)
+      vscode.window.showInformationMessage(
+        `OAK ${current} is a local build, which no release carries, so no update is offered for it. \`oak update --channel ${core.getUpdateChannel()}\` replaces it with your channel's newest release.`
+      );
     return;
   }
   // A gallery install on the stable channel is updated by the editor itself — this
@@ -10327,7 +12440,7 @@ async function checkForUpdate(context: vscode.ExtensionContext, manual: boolean)
     'Skip this version'
   );
   if (choice === 'Update now' || choice === 'Install it') {
-    await installVsixUpdate(vsix.browser_download_url, latest, vsix.digest);
+    await applyUpdate(null);
   } else if (choice === 'Download .vsix') {
     vscode.env.openExternal(vscode.Uri.parse(downloadUrl));
     vscode.window.showInformationMessage(
@@ -10344,6 +12457,7 @@ export function activate(context: vscode.ExtensionContext): void {
   // The running build's own version — what the Overview's version chip shows ('' under the smoke
   // mock, which has no `context.extension`; the chip then renders v— and stays inert).
   extensionVersion = String(context.extension?.packageJSON?.version ?? '');
+  EXTENSIONS_DIR = context.extensionPath ? path.dirname(context.extensionPath) : '';
   EXTENSION_ID = String(context.extension?.id ?? '');
   INSTALL_SOURCE = readInstallSource(context); // after EXTENSION_ID — the fallback match keys on it
   // Renames changed the extension id twice — 0.8.6 moved the publisher (claude-observatory →
@@ -10905,7 +13019,7 @@ export function activate(context: vscode.ExtensionContext): void {
   const searchBtn = mkStatusBtn('$(search) Search', 'OAK: search edits', 'claudeObservatory.searchEdits', 100, 'charts.purple');
   // The USAGE READOUT (matched to the reference screenshot): per agent a
   // bordered group — │ icon  bar share window  time … │ — the icon in the agent's color
-  // (✳ orange claude, ⬡ gpt), each window chunk `▰▰▰▱▱ 58% 5h` in its usage hue, the time-left
+  // (✳ orange claude, ⬡ gpt), each window chunk `▰▰▰▱▱ 58% wk` in its usage hue, the time-left
   // its own WHITE item, dim │ pipes fencing each agent so the numbers read as one belonging
   // (VS Code items are single-color, so every differently-colored piece is its own item; PyCharm
 
@@ -10916,13 +13030,14 @@ export function activate(context: vscode.ExtensionContext): void {
     usageItems.push(it);
     return it;
   };
-  // Priorities descend left→right: claude icon, claude windows ×3, gpt icon, gpt windows ×3, refresh.
+  // Priorities descend left→right: claude icon, claude windows ×2, gpt icon, gpt windows ×2, refresh.
   const claudeIcon = mkUsageItem(4.98);
-  // claude's three windows in reading order: 5h · wk · mo, as the TUI's one-line readout (frame.ts
-  // win3). The account's per-model weekly cap has no slot: the tooltip names it.
-  const claudeWin = [mkUsageItem(4.9), mkUsageItem(4.8), mkUsageItem(4.7)];
+  // claude's windows in reading order: wk · mo, as the TUI's one-line readout (frame.ts win3). No bar shows
+  // the 5-hour window, in its text or its tooltip (the Stats panel does), and the account's per-model weekly
+  // cap has no slot: the tooltip names it.
+  const claudeWin = [mkUsageItem(4.8), mkUsageItem(4.7)];
   const gptIcon = mkUsageItem(4.58);
-  const gptWin = [mkUsageItem(4.5), mkUsageItem(4.45), mkUsageItem(4.4)];
+  const gptWin = [mkUsageItem(4.45), mkUsageItem(4.4)];
   const refreshItem = mkUsageItem(4.2);
   const usageHue = (worst: number): vscode.ThemeColor =>
     new vscode.ThemeColor(worst >= 80 ? 'charts.red' : worst >= 50 ? 'charts.yellow' : 'charts.green');
@@ -10945,7 +13060,7 @@ export function activate(context: vscode.ExtensionContext): void {
   // and nothing said which timer belonged to which window). The item gaps now fall only BETWEEN
   // windows, which is the grouping. An item is one color, so the time wears its window's hue
   // here; PyCharm's single label keeps the grey-label/white-time styling exactly.
-  const setWin = (win: vscode.StatusBarItem, label: string, pct: number | null, reset: number | null, tip: string): boolean => {
+  const setWin = (win: vscode.StatusBarItem, label: string, pct: number | null, reset: number | null, tip: string, usd: string | null = null): boolean => {
     if (pct === null) {
       win.hide();
       return false;
@@ -10953,13 +13068,21 @@ export function activate(context: vscode.ExtensionContext): void {
     const until = usageUntil(reset);
     // Unified window chunk: `<label>: N% <reset>`, one shape for BOTH providers
     // (claude AND gpt) — label first, then the percent, then the time-left. Every window that goes
-    // through here (claude 5h/wk/mo, gpt 5h/wk/mo) reads identically.
-    win.text = `${label}: ${Math.round(pct)}%${until ? ` ${until}` : ''}`;
+    // through here (claude wk/mo, gpt wk/mo) reads identically. A month ends with its dollar figure (core.monthUsd).
+    win.text = `${label}: ${Math.round(pct)}%${until ? ` ${until}` : ''}${usd ? ` ${usd}` : ''}`;
     win.color = usageHue(Math.round(pct));
     win.tooltip = tip;
     win.show();
     return true;
   };
+  // A saved machine's label is herdr's, so whatever was typed into it: its control characters (ESC, BEL, TAB),
+  // bidirectional controls and zero-width characters are dropped wherever it is shown (core.plainLabel), and on
+  // the bar, which draws `$(name)` as an icon, that syntax is escaped. The tooltip is plain text (VS Code sets it as
+  // the hover's textContent), so an escape there would show.
+  const plainLabel = core.plainLabel;
+  const barLabel = (s: string): string => plainLabel(s).replace(/\$\((?=[A-Za-z0-9-]+(?:~[A-Za-z]+)?\))/g, '\\$(');
+  // A clock time to the minute, with the date when it is not today (core.relTime keeps a same-day time's seconds).
+  const usageAt = (ms: number): string => core.relTime(ms).replace(/^(\d\d:\d\d):\d\d$/, '$1');
   const usageTip = (label: string, pct: number | null, reset: number | null, est: number | null, tot: number | null): string => {
     if (pct === null) return '';
     const bits = [`${Math.trunc(pct)}%`];
@@ -10995,36 +13118,54 @@ export function activate(context: vscode.ExtensionContext): void {
       // pull above and for the same reason (a detached child on the Mac cannot read the keychain login).
       // The next sessions refresh shows what it cached.
       try { if (core.claimRemoteTitlesRefresh()) void core.refreshRemoteTitles(); } catch { /* best-effort */ }
+      // oak sync's background run, once sync is set up here, as the other pollers start it: claimed and throttled
+      // as the CLI's own kick is (core claimSyncKick), and run by the CLI, as the refresh below is.
+      try { if (!core.noBackgroundChildren() && core.claimSyncKick()) spawnOakDetached(['sync', 'now', '--quiet', '--if-due']); } catch { /* best-effort */ }
+      // The saved machines' readings of the Claude account, shown where this machine has none current: a
+      // detached CLI refresh reads them over ssh, claimed and throttled as the CLI's own kick is.
+      try { if (!core.noBackgroundChildren() && core.claimMachineUsagePull()) spawnOakDetached(['usage', '--pull-machines', '--if-due']); } catch { /* best-effort */ }
       const u = core.usageLine(cwd, '');
-      const moPct = u.monthTokens && u.monthTokensTotal ? Math.min(100, (u.monthTokens / u.monthTokensTotal) * 100) : null;
-      const musd = (v: number): string => (v >= 1000 ? `$${(v / 1000).toFixed(1)}k` : v >= 100 ? `$${Math.round(v)}` : `$${v.toFixed(1)}`);
+      // A month measured at 0 (a new bill cycle) is a share, 0%; only an unmeasured month (null) hides.
+      const moPct = u.monthTokens != null && u.monthTokensTotal ? Math.min(100, (u.monthTokens / u.monthTokensTotal) * 100) : null;
+      // Dollars as the Claude Code status line writes them, so the bar, its tooltip and that line agree.
+      const musd = core.usdText;
+      // The month's figure the bar shows after its reset: the estimate (~), or the charge Claude Code reported.
+      const mu = core.monthUsd(u);
       // The per-model weekly cap the account reports (its "Fable" row) is named in the tooltip, after
       // the week it narrows, and never gets a window of its own on the bar.
       const tip = 'OAK: Claude plan usage — the statusline’s own readout' +
-        usageTip('5h', u.fiveHourPct, u.fiveReset, u.fiveTokens, u.fiveTotal) +
         usageTip('wk', u.weekPct, u.weekReset, u.weekTokens, u.weekTotal) +
         usageTip(u.fableLabel || 'Fable', u.fablePct, u.fableReset, u.fableTokens, u.fableTotal) +
         usageTip('mo', moPct, u.monthReset ?? null, u.monthTokens, u.monthTokensTotal) +
         (u.monthReads ? `\nmo cache reads +${usageHuman(u.monthReads)}\u21ba` : '') +
-        (u.monthCost ? `\nmo ~${musd(u.monthCost)} spent${u.monthCostTotal ? ` of ~${musd(u.monthCostTotal)}` : ''}` : '') +
+        (mu && !mu.startsWith('~') ? `\nmo ${mu} spent, as Claude Code reported it`
+          : u.monthCost ? `\nmo ~${musd(u.monthCost)} spent${u.monthCostTotal ? ` of ~${musd(u.monthCostTotal)}` : ''}, estimated at today’s API list prices` : '') +
+        // When it was measured there: a machine that stops answering keeps its last reading, however old.
+        (!u.machineTipNote ? ''
+          : u.machineUnmatched ? `\nmeasured on a saved machine (${plainLabel(u.machineTipNote)})${u.machineTipAt ? ` at ${usageAt(u.machineTipAt)}` : ''}; this machine has no Claude Code login to match its account with`
+          : `\nmeasured on a saved machine signed in to the same Claude account (${plainLabel(u.machineTipNote)})${u.machineTipAt ? ` at ${usageAt(u.machineTipAt)}` : ''}`) +
+        // The saved machines whose own usage the estimates and the month add to this machine's.
+        (u.machineMeasured?.machines ? `\nestimates include usage measured on ${plainLabel(u.machineMeasured.machines)}` : '') +
+        (u.usageFreshness ? `\n${u.usageFreshness}` : '') +
         '\nClick for the Stats panel.';
       let shown = [
-        setWin(claudeWin[0], '5h', u.fiveHourPct, u.fiveReset, tip),
-        setWin(claudeWin[1], 'wk', u.weekPct, u.weekReset, tip),
-        setWin(claudeWin[2], 'mo', moPct, u.monthReset ?? null, tip),
+        setWin(claudeWin[0], 'wk', u.weekPct, u.weekReset, tip),
+        setWin(claudeWin[1], 'mo', moPct, u.monthReset ?? null, tip, mu),
       ].some(Boolean);
-      // A quota-less plan (Enterprise/API) fills no rolling bar, so all three windows hide and the
+      // A quota-less plan (Enterprise/API) fills no rolling bar, so both windows hide and the
       // whole claude group + ↻ would vanish. Mirror the PyCharm widget (ObservatoryUsageWidgetFactory)
       // and show the bill-cycle spend instead, so the group stays visible. No %: there is no denominator.
-      if (!shown && u.rollingLimits === false && u.monthCost != null) {
-        claudeWin[2].text = `mo: ~${musd(u.monthCost)}`;
-        claudeWin[2].color = undefined;
-        claudeWin[2].tooltip = tip;
-        claudeWin[2].show();
+      if (!shown && u.rollingLimits === false && mu) {
+        claudeWin[1].text = `mo: ${mu}`;
+        claudeWin[1].color = undefined;
+        claudeWin[1].tooltip = tip;
+        claudeWin[1].show();
         shown = true;
       }
       if (shown) {
-        claudeIcon.text = '\u2733';
+        // A saved machine's reading is named beside the icon, as the terminal app's bar names it, by the windows the
+        // bar shows (machineBarNote): the per-model cap is the tooltip's, which machineNote names.
+        claudeIcon.text = u.machineBarNote ? `\u2733 (${barLabel(u.machineBarNote)})` : '\u2733';
         claudeIcon.color = new vscode.ThemeColor('charts.orange');
         claudeIcon.tooltip = tip;
         claudeIcon.show();
@@ -11037,33 +13178,32 @@ export function activate(context: vscode.ExtensionContext): void {
     let gptShown = false;
     try {
       const g = core.gptUsagePanel();
-      const gtip = 'OAK: GPT quota snapshots and local usage.' +
-        usageTip('5h', g?.fivePct ?? null, g?.fiveReset ?? null, null, null) +
+      const gusd = g ? core.monthUsd(g) : null;
+      const gtip = 'OAK: GPT quota snapshots and account usage.' +
         usageTip('wk', g?.weekPct ?? null, g?.weekReset ?? null, g?.weekTok ?? null, null) +
-        (g?.monthTok ? `\nmo ${usageHuman(g.monthTok)} local tokens · UTC calendar month · ${usageUntil(g.monthReset)}` : '') +
+        (g?.monthTok != null ? `\nmo ${usageHuman(g.monthTok)} tokens · bill cycle · ${usageUntil(g.monthReset)}` : '') +
+        (gusd ? `\nmo ${gusd} spent, estimated at today’s API list prices` : '') +
+        (g?.measuredMachines ? `\nestimates include usage measured on ${plainLabel(g.measuredMachines)}` : '') +
+        (g?.usageFreshness ? `\n${g.usageFreshness}` : '') +
         '\nClick for the Stats panel.';
-      // 5h · wk · mo, the same three windows claude shows. gpt's 5h was omitted here even though it is
-      // a real quota window every other surface renders (stats panel, PyCharm tooltip); setWin hides it
-      // when the snapshot has no 5h reading.
-      const gpt5 = setWin(gptWin[0], '5h', g?.fivePct ?? null, g?.fiveReset ?? null, gtip);
-      const gptWk = setWin(gptWin[1], 'wk', g?.weekPct ?? null, g?.weekReset ?? null, gtip);
-      gptShown = gpt5 || gptWk;
+      // wk · mo, the same windows claude shows; its 5h is the Stats panel's.
+      gptShown = setWin(gptWin[0], 'wk', g?.weekPct ?? null, g?.weekReset ?? null, gtip);
       // gpt month now carries a monthly total (core back-derives monthTokTotal from the weekly fill),
       // so its % is computed exactly as claude's mo — monthTok / monthTokTotal, capped at 100 — and
       // routed through the SAME setWin helper: `mo: N% <reset>` in its threshold hue, not the bare
       // white token count it used to show. No total reported yet → fall back to
       // the token-count readout (no %), carrying the reset so it still reads like claude's.
-      const gmoPct = g?.monthTok && g?.monthTokTotal ? Math.min(100, (g.monthTok / g.monthTokTotal) * 100) : null;
+      const gmoPct = g?.monthTok != null && g?.monthTokTotal ? Math.min(100, (g.monthTok / g.monthTokTotal) * 100) : null;
       if (gmoPct !== null) {
-        if (setWin(gptWin[2], 'mo', gmoPct, g?.monthReset ?? null, gtip)) gptShown = true;
+        if (setWin(gptWin[1], 'mo', gmoPct, g?.monthReset ?? null, gtip, gusd)) gptShown = true;
       } else if (g?.monthTok) {
         const gmu = usageUntil(g.monthReset);
-        gptWin[2].text = `mo: ${usageHuman(g.monthTok)}${gmu ? ` ${gmu}` : ''}`;
-        gptWin[2].color = undefined;
-        gptWin[2].tooltip = gtip;
-        gptWin[2].show();
+        gptWin[1].text = `mo: ${usageHuman(g.monthTok)}${gmu ? ` ${gmu}` : ''}${gusd ? ` ${gusd}` : ''}`;
+        gptWin[1].color = undefined;
+        gptWin[1].tooltip = gtip;
+        gptWin[1].show();
         gptShown = true;
-      } else gptWin[2].hide();
+      } else gptWin[1].hide();
       if (gptShown) {
         gptIcon.text = '\u2b21';
         gptIcon.color = new vscode.ThemeColor('charts.blue'); // gpt's icon is BLUE, like claude's orange \u2733 \u2014 not the default white
@@ -11111,10 +13251,35 @@ export function activate(context: vscode.ExtensionContext): void {
   usageBarTimer.unref?.(); // node-side timers must never keep a test-run process alive
   context.subscriptions.push(...usageItems, { dispose: () => clearInterval(usageBarTimer) });
 
+  // oak sync's item, right of the usage readout: the last run, or the one running now, and what needs the reader. Read
+  // at start, when sync's own files change (its status, conflicts, run lock and key, and prefs.json: the watcher below),
+  // and after each action; a minute's stamp check catches what a watcher misses, and a new day. Hidden while sync is
+  // not in use.
+  const syncItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 4.1);
+  syncItem.command = 'claudeObservatory.sync';
+  syncListeners.push(() => showSyncItem(syncItem), () => promptsProvider.postSyncConflicts());
+  promptsProvider.onSessionsPosted = () => promptsProvider.postSyncConflicts();
+  let syncStamp = '';
+  const syncFiles = (root: string): string[] => ['status.json', 'conflicts.json', 'now.lock', 'key'].map((f) => path.join(root, 'sync', f)).concat(core.prefsPath());
+  // The day is in the stamp too: a new day reads again, so the run's clock time then carries its date.
+  const syncChanged = (): void => {
+    const stamp = syncFiles(core.rootDir()).map((f) => { try { const st = fs.statSync(f); return `${st.mtimeMs}:${st.size}`; } catch { return '-'; } }).join('|') + `|${new Date().toDateString()}`;
+    if (stamp === syncStamp) return;
+    syncStamp = stamp;
+    void readSyncStatus();
+  };
+  syncChanged();
+  const syncTimer = setInterval(syncChanged, 60_000);
+  syncTimer.unref?.();
+  context.subscriptions.push(syncItem, { dispose: () => clearInterval(syncTimer) },
+    vscode.commands.registerCommand('claudeObservatory.sync', () => syncCommand()),
+    vscode.commands.registerCommand('claudeObservatory.syncNow', () => syncNowCommand()),
+    vscode.commands.registerCommand('claudeObservatory.syncSetup', () => syncSetupCommand()));
+
   // The hands chip: how many sessions are waiting on the reader — hidden
   // at zero, amber otherwise; a click jumps to the most urgent one. Fed by the Timeline's sessions
   // read, so it needs no timer of its own.
-  const handsBtn = mkStatusBtn('', 'OAK: sessions waiting on you — click jumps to the next (permission, then question, then input)', 'claudeObservatory.nextAttention', 93.6);
+  const handsBtn = mkStatusBtn('', 'OAK: sessions waiting on you, other machines’ included — click jumps to the next on this machine (permission, then question, then input)', 'claudeObservatory.nextAttention', 93.6);
   promptsProvider.onHandsChanged = (n) => {
     if (!n) return handsBtn.hide();
     handsBtn.text = `$(warning) ${n}`;
@@ -11174,6 +13339,28 @@ export function activate(context: vscode.ExtensionContext): void {
 
   const updateStatusItem = () => {
     const session = currentSession();
+    const machine = currentMachine();
+    if (machine && session) {
+      const snapshot = readRemoteReview(machine, session, remoteReviewPrompt());
+      const pending = snapshot.data?.units.filter(u => u.status === 'pending') ?? [];
+      const cursor = remoteReviewCursor?.machine === machine && remoteReviewCursor.session === session ? remoteReviewCursor : undefined;
+      const files = [...new Set(pending.map(u => u.file))].sort();
+      const inFile = pending.filter(u => u.file === cursor?.file);
+      const diffAt = inFile.findIndex(u => u.id === cursor?.id), fileAt = files.indexOf(cursor?.file ?? '');
+      for (const button of navCluster) button.hide();
+      statusItem.text = `🔬 ${pending.length} · ${machine}`;
+      statusItem.tooltip = snapshot.error || `${pending.length} pending edits on ${machine}`;
+      statusItem.show();
+      if (pending.length) for (const button of [filePrevBtn, fileCountBtn, fileNextBtn, acceptAllBtn, revertAllBtn, clearBtn]) button.show();
+      if (inFile.length) for (const button of [diffPrevBtn, diffCountBtn, diffNextBtn, keepEditBtn, undoEditBtn, acceptFileBtn, rejectFileBtn]) button.show();
+      fileCountBtn.text = `File ${fileAt + 1}/${files.length}`;
+      diffCountBtn.text = `Diff ${diffAt + 1}/${inFile.length}`;
+      changeMapProvider.setNavPos({ diff: inFile.length ? { i: diffAt + 1, n: inFile.length, time: '' } : null,
+        file: files.length ? { i: fileAt + 1, n: files.length, name: cursor?.file ?? '', edits: inFile.length } : null, folder: null, prompt: null });
+      void vscode.commands.executeCommand('setContext', 'claudeObservatory.hasPending', pending.length > 0);
+      void vscode.commands.executeCommand('setContext', 'claudeObservatory.activeFileHasPending', false);
+      return;
+    }
     // DISPLAY units — the same collapse the Overview and the Sessions rows use. See `cachedReview`.
     const skip = session ? core.cancelledMemberIds(session) : new Set<number>();
     const log = session ? cachedReview(session).filter((r) => !skip.has(r.id)) : [];
@@ -11257,10 +13444,12 @@ export function activate(context: vscode.ExtensionContext): void {
       }
     }
     // Mirror the Diff/File/Folder/Prompt position into the Overview title-bar nav-bar counters (live).
+    // A long folder name is shown by its end, cut where a character starts (the webview cut it by UTF-16 unit).
+    const folderName = folderIdx >= 0 ? curFolder || '(root)' : '';
     changeMapProvider.setNavPos({
       diff: activeHasPending ? { i: diffIdx + 1, n: inFile.length, time: diffTime } : null,
       file: files.length ? { i: fileIdx >= 0 ? fileIdx + 1 : 0, n: files.length, name: fileName, edits: inFile.length } : null,
-      folder: folders.length ? { i: folderIdx >= 0 ? folderIdx + 1 : 0, n: folders.length, name: folderIdx >= 0 ? curFolder || '(root)' : '', files: folderFiles, edits: inFolder.length } : null,
+      folder: folders.length ? { i: folderIdx >= 0 ? folderIdx + 1 : 0, n: folders.length, name: folderName, shown: folderName.length > 24 ? '…' + core.graphemeTail(folderName, 23) : folderName, files: folderFiles, edits: inFolder.length } : null,
       prompt: promptPos,
     });
 
@@ -11277,7 +13466,7 @@ export function activate(context: vscode.ExtensionContext): void {
     // beside it. `syncSurface` is a no-op when it is already in the right place, which is the common case.
     //
     // The target is the same rule JetBrains' ReviewSelection.currentEditIn uses: the review cursor when it
-    // is parked in this file (so the bar agrees with ⌥⌘N, with the bar's own ‹/›, and with an auto-advance
+    // is parked in this file (so the bar agrees with ⌥⌘X N, with the bar's own ‹/›, and with an auto-advance
     // that just landed), else the file's oldest pending edit. `inFile` above is already that file's
     // pending edits, so this costs no extra scan.
     const barTarget =
@@ -11303,6 +13492,7 @@ export function activate(context: vscode.ExtensionContext): void {
     const has = Boolean(s && file && (pendingByFile(s).get(file) ?? []).length > 0);
     void vscode.commands.executeCommand('setContext', 'claudeObservatory.activeFileHasPending', has);
   };
+  remoteReviewListeners.add(updateStatusItem);
   updateStatusItem(); // visible from activation, not just after the first store event
   context.subscriptions.push(...navCluster);
 
@@ -11316,7 +13506,7 @@ export function activate(context: vscode.ExtensionContext): void {
    * cursor on it, and return it — WITHOUT opening anything.
    *
    * Separated from `reviewStep` because three surfaces now need the same choice with different follow-up:
-   * the ⌥⌘N/⌥⌘P loop opens it, the pinned review bubble re-shows itself on it, and auto-advance reveals
+   * the ⌥⌘X N / ⌥⌘X P loop opens it, the pinned review bubble re-shows itself on it, and auto-advance reveals
    * it after a resolve. Reimplementing this per caller is how the three cursors drifted apart before
    * (see the comment on `openFileAtEdit`), so there is exactly one copy.
    *
@@ -11363,6 +13553,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   // Step to the previous (dir -1) or next (dir +1) pending edit and open it, advancing the cursor.
   const reviewStep = async (dir: 1 | -1) => {
+    if (currentMachine()) { await navigateRemoteReview(dir, 'edit'); return; }
     const next = pickNextPending(dir);
     if (!next) {
       vscode.window.setStatusBarMessage('OAK: no pending edits to review 🎉', 3000);
@@ -11425,7 +13616,7 @@ export function activate(context: vscode.ExtensionContext): void {
     const rec = core.findRecord(s, pendingIds[0]);
     if (rec) await openFileAtEdit({ kind: 'edit', rec });
     vscode.window.setStatusBarMessage(
-      `OAK: reviewing prompt ${req ? `#${req.index} “${req.title}”` : promptId} — ${pendingIds.length} edit(s); ⌥⌘N steps through them`,
+      `OAK: reviewing prompt ${req ? `#${req.index} “${req.title}”` : promptId} — ${pendingIds.length} edit(s); ${process.platform === 'darwin' ? '⌥⌘X n' : 'Ctrl+Alt+X n'} steps through them`,
       4000
     );
   };
@@ -11566,7 +13757,11 @@ export function activate(context: vscode.ExtensionContext): void {
   /** The session the last refresh ran for — see the cache drop in refreshAll. `undefined` is a real
    *  value here (no session resolves yet), so it starts as a sentinel no session id can equal. */
   let lastRefreshedSession: string | undefined | symbol = FIRST_REFRESH;
+  /** Points the store watcher at where the store is now (set where that watcher is made, below). */
+  let watchStore = (): void => {};
   const refreshAll = (force = false) => {
+    watchStore();
+    if (force) for (const r of remoteReviewReads.values()) { r.at = 0; if (r.reading) r.again = true; }
     // Demo sessions leave no residue (0.8.0): once every demo edit is reviewed (e.g. Accept All), the
     // resolved records are dropped so the panels empty out. No-op for real sessions; the resulting
     // store change re-enters here once and then no-ops (the log is empty).
@@ -11579,7 +13774,7 @@ export function activate(context: vscode.ExtensionContext): void {
       lastRefreshedSession = s;
       core.clearFsCache();
     }
-    if (s) core.autoClearDemo(s);
+    if (s && !currentMachine()) core.autoClearDemo(s);
     // AFTER the auto-clear: a fully reviewed demo has just dropped its records, and that empty log is
     // the verdict a wait step is looking for.
     checkTourWatch();
@@ -11615,6 +13810,7 @@ export function activate(context: vscode.ExtensionContext): void {
   };
   // Diff axis: step the OPEN file's pending edits (wrapping) and reveal the target in the editor.
   const navDiff = async (dir: 1 | -1) => {
+    if (currentMachine()) { await navigateRemoteReview(dir, 'diff'); return; }
     const s = currentSession();
     const file = activeEditorFile();
     if (!s || !file) return;
@@ -11628,6 +13824,7 @@ export function activate(context: vscode.ExtensionContext): void {
   };
   // File axis: step across files with pending edits (wrapping), opening the target's first pending edit.
   const navFile = async (dir: 1 | -1) => {
+    if (currentMachine()) { await navigateRemoteReview(dir, 'file'); return; }
     const s = currentSession();
     if (!s) return;
     const files = pendingFilesOf(s);
@@ -11691,25 +13888,41 @@ export function activate(context: vscode.ExtensionContext): void {
       const session = currentSession();
       if (!session) return;
       const cwd = workspaceRoot() ?? process.cwd();
-      const p = core.composeCommentPrompt(session, { cwd });
+      // A saved machine's session keeps its comments there: composed there, sent to its agent, and marked sent there.
+      const machine = currentMachine();
+      const there = machine ? await oakOn(machine, ['comment', 'compose', '--session', session, '--json']) : null;
+      if (machine && !there?.json) return void vscode.window.showErrorMessage(`OAK: could not read the review comments on ${machine} — ${there?.why}`);
+      const p = there ? ((there.json as { ids?: string[] }).ids?.length ? (there.json as { text: string; ids: string[] }) : null) : core.composeCommentPrompt(session, { cwd });
       if (!p) {
-        vscode.window.showInformationMessage('OAK: no review comments to send — add some with the “+” on a line in an edit diff.');
+        vscode.window.showInformationMessage(machine ? `OAK: no review comments to send on ${machine}.` : 'OAK: no review comments to send — add some with the “+” on a line in an edit diff.');
         return;
       }
-      if (await deliverChatPrompt(p.text, `${p.ids.length} review comment(s)`, session)) core.markCommentsSent(session, p.ids);
+      if (await deliverChatPrompt(p.text, `${p.ids.length} review comment(s)`, session, machine)) {
+        try {
+          if (!machine) core.markCommentsSent(session, p.ids);
+          else if (!(await oakOn(machine, ['comment', 'mark-sent', '--session', session, '--ids', p.ids.join(','), '--json'])).json) throw new Error(`oak comment mark-sent on ${machine} did not answer`);
+        } catch (e) {
+          // Delivered, but not recorded as sent: said, since the next send would carry them again.
+          void vscode.window.showErrorMessage(`OAK: the comments were delivered but not marked sent — ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
       reviewComments.sync();
     }),
     vscode.commands.registerCommand('claudeObservatory.quoteLastReply', async () => {
       const session = currentSession();
       if (!session) return;
-      const q = core.quoteAgentOutput(session);
+      // A saved machine's session: its transcript is there, so the reply is quoted there.
+      const machine = currentMachine();
+      const there = machine ? await oakOn(machine, ['quote', '--session', session, '--json']) : null;
+      if (there && !there.json) return void vscode.window.showErrorMessage(`OAK: could not quote the reply on ${machine} — ${there.why}`);
+      const q = there ? (typeof there.json?.text === 'string' && there.json.text) || null : core.quoteAgentOutput(session);
       if (!q) {
         vscode.window.showInformationMessage('OAK: the agent has not replied yet in this session — nothing to quote.');
         return;
       }
       const note = await vscode.window.showInputBox({ title: "Add a note to the quoted reply", prompt: "The quote stays on the clipboard if you cancel." });
       await vscode.env.clipboard.writeText(q);
-      if (note !== undefined) await deliverChatPrompt(q + note, "The quoted reply", session);
+      if (note !== undefined) await deliverChatPrompt(q + note, "The quoted reply", session, machine);
     }),
     vscode.workspace.registerTextDocumentContentProvider(MD_SCHEME, obsMd),
     editPeek
@@ -11717,6 +13930,11 @@ export function activate(context: vscode.ExtensionContext): void {
 
   // The context bar drifts as the session grows; refresh it on a slow tick (unref'd so it never
   // holds the process open in tests). Tree/inline refresh is event-driven via the log watcher below.
+  const remoteReviewTimer = setInterval(() => {
+    if (currentMachine()) { reviewProvider.refresh(); fileHistoryProvider.refresh(); }
+  }, SAVED_READ_MS);
+  remoteReviewTimer.unref?.();
+  context.subscriptions.push({ dispose: () => clearInterval(remoteReviewTimer) });
   const statusTimer = setInterval(() => {
     statsProvider.refresh();
   }, 45000);
@@ -11761,15 +13979,16 @@ export function activate(context: vscode.ExtensionContext): void {
   };
 
   context.subscriptions.push(
-    vscode.commands.registerCommand('claudeObservatory.refresh', () => {
+    vscode.commands.registerCommand('claudeObservatory.refresh', async (opts?: unknown) => {
       // A user Refresh applies a newly-added `.observatoryignore`. Adding the file fires
       // no capture hook, so the sweep that drops now-ignored records (capture.ts, the WRITE path) never
-      // runs, and Refresh — a pure read — left them in the store. This command's callers are ALL user
-      // actions (the Refresh button, install-hooks, and the keep/undo/resolve/clear mutations); the
-      // auto-pollers call `refreshAll` directly and bypass this, which is exactly the invariant that keeps
-      // the sweep off a read/poll path. `dropIgnored` is self-gating — a no-op when nothing matches.
+      // runs, and Refresh — a pure read — left them in the store. The Refresh button, the palette and the
+      // Overview's refresh come here with no argument and sweep, asking first; the refreshes that follow
+      // a keep/undo/resolve/clear or an install pass NO_SWEEP, as the terminal app's do, so a mutation
+      // never raises the confirm. The auto-pollers call `refreshAll` directly and bypass this, which is
+      // exactly the invariant that keeps the sweep off a read/poll path.
       const s = currentSession();
-      if (s) { try { core.dropIgnored(s); } catch { /* a torn store still refreshes */ } }
+      if (s && opts !== NO_SWEEP) await sweepIgnoredAsking(s);
       refreshAll(true);
     }),
     // Step backward / forward through pending edits (⏮ prev · ⏭ next), keyboard-friendly.
@@ -11777,6 +13996,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('claudeObservatory.reviewPrev', () => reviewStep(-1)),
     // Stats navbar: jump to the FIRST (oldest) pending edit, and filter edits from the Stats search box.
     vscode.commands.registerCommand('claudeObservatory.reviewFirst', async () => {
+      if (currentMachine()) { await navigateRemoteReview(1, 'first'); return; }
       const s = currentSession();
       // Same set the review loop walks (`pickNextPending`) — off the raw log these two entry points
       // answered differently for one session: "review first" opened a cancelled chain that "review
@@ -11866,12 +14086,22 @@ export function activate(context: vscode.ExtensionContext): void {
       await undoEditsInFolder(s, folderLabelOf(file));
     }),
     vscode.commands.registerCommand('claudeObservatory.navViewDiff', () => {
+      const machine = currentMachine(), session = currentSession(), cursor = remoteReviewCursor;
+      if (machine) {
+        if (session && cursor?.machine === machine && cursor.session === session) void vscode.commands.executeCommand('claudeObservatory.remoteDiff', machine, session, cursor.id);
+        return;
+      }
       const cur = navCurrentRec();
       if (cur) void editPeek.show(cur.rec.id); // open the floating review bubble at the current edit
     }),
     // Nav-bar "View diff" — open the CURRENT edit as a real side-by-side diff editor (before ⟶ after),
     // not the floating bubble (that's what the status-bar Diff counter uses).
     vscode.commands.registerCommand('claudeObservatory.viewCurrentDiff', () => {
+      const machine = currentMachine(), session = currentSession(), cursor = remoteReviewCursor;
+      if (machine) {
+        if (session && cursor?.machine === machine && cursor.session === session) void vscode.commands.executeCommand('claudeObservatory.remoteDiff', machine, session, cursor.id);
+        return;
+      }
       const cur = navCurrentRec();
       if (cur) void openDiff({ kind: 'edit', rec: cur.rec });
       else vscode.window.setStatusBarMessage('OAK: open an agent edit to view its diff', 2500);
@@ -11886,6 +14116,15 @@ export function activate(context: vscode.ExtensionContext): void {
       void vscode.commands.executeCommand('claudeObservatory.chatAction', { editId: cur.rec.id });
     }),
     vscode.commands.registerCommand('claudeObservatory.navKeep', async () => {
+      const machine = currentMachine(), session = currentSession(), cursor = remoteReviewCursor;
+      if (machine) {
+        if (session && cursor?.machine === machine && cursor.session === session) {
+          await remoteDecision(machine, session, 'keep', [String(cursor.id)]);
+          refreshAll(true);
+          if (currentMachine() === machine && currentSession() === session) await navigateRemoteReview(1, 'advance', cursor.id);
+        }
+        return;
+      }
       const cur = navCurrentRec();
       if (!cur) return;
       core.keepGroup(cur.s, cur.rec.id);
@@ -11893,6 +14132,15 @@ export function activate(context: vscode.ExtensionContext): void {
       await advanceAfterResolve(cur.s, cur.rec.id);
     }),
     vscode.commands.registerCommand('claudeObservatory.navUndo', async () => {
+      const machine = currentMachine(), session = currentSession(), cursor = remoteReviewCursor;
+      if (machine) {
+        if (session && cursor?.machine === machine && cursor.session === session) {
+          await remoteDecision(machine, session, 'undo', [String(cursor.id)]);
+          refreshAll(true);
+          if (currentMachine() === machine && currentSession() === session) await navigateRemoteReview(1, 'advance', cursor.id);
+        }
+        return;
+      }
       const cur = navCurrentRec();
       if (!cur) return;
       await undoOne(cur.s, cur.rec.id);
@@ -11985,10 +14233,10 @@ export function activate(context: vscode.ExtensionContext): void {
       try {
         const p = core.readPrefs();
         core.writePrefs({ ...p, sort: next });
-      } catch {
-        /* prefs unwritable — the order still applies for this session via the payload */
+        vscode.window.setStatusBarMessage(`OAK: sorted by ${core.SORT_LABEL[next]}`, 2500);
+      } catch (e) {
+        sortNotSaved(e);
       }
-      vscode.window.setStatusBarMessage(`OAK: sorted by ${core.SORT_LABEL[next]}`, 2500);
       refreshAll();
     }),
     // Internal setters for the Overview's inline search field + filter dropdown (not contributed to the
@@ -12014,8 +14262,8 @@ export function activate(context: vscode.ExtensionContext): void {
       try {
         const p = core.readPrefs();
         core.writePrefs({ ...p, sort: next });
-      } catch {
-        /* prefs unwritable — the order still applies for this session via the payload */
+      } catch (e) {
+        sortNotSaved(e);
       }
       refreshAll();
     }),
@@ -12278,6 +14526,8 @@ export function activate(context: vscode.ExtensionContext): void {
         return;
       }
 
+      // A session of this machine's (or Auto) ends the review of a saved machine's.
+      remotePin = null;
       const cfg = vscode.workspace.getConfiguration('claudeObservatory');
       await cfg.update('session', id ?? '', vscode.ConfigurationTarget.Workspace);
       // Refresh from HERE rather than leaning on the configuration event: re-picking the session that
@@ -12289,29 +14539,79 @@ export function activate(context: vscode.ExtensionContext): void {
         3000
       );
     }),
+    // A saved machine's session (its group in a session list): reviewed there, every CLI read and verb with `--machine`.
+    vscode.commands.registerCommand('claudeObservatory.pinRemoteSession', async (machine: string, id: string) => {
+      if (demoSession || !machine || !core.isSafeSessionId(id)) return;
+      remotePin = { session: id, machine };
+      refreshAll(true);
+      vscode.window.setStatusBarMessage(`OAK: showing ${machine}’s session ${id}`, 3000);
+    }),
+    vscode.commands.registerCommand('claudeObservatory.remoteOpen', openRemoteReview),
+    vscode.commands.registerCommand('claudeObservatory.openWorkspaceWindow', openWorkspaceWindow),
+    vscode.commands.registerCommand('claudeObservatory.mountedDecision', (machine: string, session: string, verb: string, id: number) => remoteDecision(machine, session, verb, [String(id), '--units'])),
+    vscode.commands.registerCommand('claudeObservatory.remoteDiff', showRemoteDiff),
+    ...(['keep', 'undo'] as const).map((verb) =>
+      vscode.commands.registerCommand(verb === 'keep' ? 'claudeObservatory.remoteKeep' : 'claudeObservatory.remoteUndo', async (node?: RNode) => {
+        if (!node || node.kind !== 'redit' || !node.machine || !node.session || !Number.isInteger(node.id)) return;
+        const r = await oakOn(node.machine, [verb, String(node.id), '--session', node.session, '--json']);
+        if (!r.json) void vscode.window.showErrorMessage(`OAK: ${verb} did not run on ${node.machine} — ${r.why}`);
+        else vscode.window.setStatusBarMessage(`OAK: ${verb === 'keep' ? 'kept' : 'undid'} edit #${node.id} on ${node.machine}`, 3000);
+        remoteTl.clear(); // read again, with the verb's result
+        await refreshMountedReview(node.machine, node.session);
+        refreshAll(true);
+      })),
     vscode.commands.registerCommand('claudeObservatory.switchSession', async () => {
       // The list is cheap by construction (0.8.8): ids + stats only, titles from the bounded
       // sidecar-cached scan, sorted by CONVERSATION recency (transcript mtime) — no per-session log
       // parse, no whole-transcript reads, and only THIS workspace's sessions.
       const root = workspaceRoot();
-      const meta = await readSessionListing(root ?? process.cwd(), currentSession()) ?? { active: null, sessions: [] };
-      type Item = vscode.QuickPickItem & { id: string };
+      const [meta, machines] = await Promise.all([
+        readSessionListing(root ?? process.cwd(), currentSession()).then((m) => m ?? { active: null, sessions: [] }),
+        readMachineListings(root ?? process.cwd()),
+      ]);
+      type Item = vscode.QuickPickItem & { id: string; synced?: { machine: core.MachineListing; row: core.SessionMetaRow }; remote?: string; note?: boolean };
       const row = (r: core.SessionMetaRow): Item => ({
         label: (r.current ? '$(circle-filled) ' : '') + (r.title || `session ${r.id.slice(0, 8)}`),
         // agent · tier · model · store size (shared prefix — see sessionBadgePrefix), then recency + active.
         description: sessionBadgePrefix(r) + core.relTime(r.lastActiveMs) + (r.current ? ' · active' : ''),
-        detail: r.id, // matchOnDetail below — pasting an id finds its row
+        detail: [r.id, r.workspace].filter(Boolean).join(' · '), // matchOnDetail below — pasting an id finds its row
         id: r.id,
-        buttons: r.storeBytes ? [revealStoreBtn, deleteSessionBtn] : [deleteSessionBtn],
+        buttons: r.storeBytes ? [workspaceWindowBtn, revealStoreBtn, deleteSessionBtn] : [workspaceWindowBtn, deleteSessionBtn],
       });
-      // LIVE session first, then the rest by recency; the Auto row leads for un-pinning.
+      const Sep = vscode.QuickPickItemKind.Separator;
       const active = meta.sessions.filter((r) => r.current).map(row);
-      const rest = meta.sessions.filter((r) => !r.current).map(row);
-      const items: Item[] = [
-        { label: '$(sync) Auto — newest for this workspace', description: meta.active ?? 'none', id: '' },
-        ...active,
-        ...rest,
-      ];
+      const build = (): Item[] => {
+        const snap = savedMachineSnapshot(), listed = new Set<string>(), status: Item[] = [];
+        const rows: { item: Item; row: core.SessionMetaRow }[] = meta.sessions.map((r) => ({ item: row(r), row: r }));
+        const note = (label: string): void => { status.push({ label, id: '', note: true, alwaysShow: true }); };
+        if (snap.error) note(`$(warning) could not read the saved machines — ${snap.error}`);
+        for (const m of snap.machines) {
+          const ls = m.listing;
+          const state = m.error ? `could not list sessions — ${m.error} · ${m.readAt ? `last read ${core.relTime(m.readAt)}` : 'never read'}`
+            : !ls ? 'has not answered yet' : ls.fromIndex ? `from its records, synced ${core.relTime(ls.syncedAt ?? m.readAt ?? 0)}` : `read ${core.relTime(m.readAt ?? 0)}`;
+          note(`${m.label} · ${state}${m.reading ? ' · reading again…' : ''}`);
+          if (!ls) continue;
+          listed.add(m.label);
+          for (const r of ls.sessions) rows.push({ row: r, item: { label: r.title || `session ${r.id.slice(0, 8)}`,
+            description: `on ${m.label} · ${sessionBadgePrefix(r)}${core.relTime(r.lastActiveMs)}`, detail: [r.id, r.workspace].filter(Boolean).join(' · '), id: r.id, remote: m.label, buttons: [workspaceWindowBtn] } });
+        }
+        const savedLabels = new Set(snap.machines.map((m) => m.label));
+        for (const m of machines) {
+          if (listed.has(m.label)) continue;
+          if (!savedLabels.has(m.label)) note(`${m.label} · synced ${m.syncedAt ? core.relTime(m.syncedAt) : 'at a time not recorded'}`);
+          for (const r of m.sessions) rows.push({ row: r, item: { label: r.title || `session ${r.id.slice(0, 8)}`,
+            description: `${m.label} · ${sessionBadgePrefix(r)}${core.relTime(r.lastActiveMs)}`, detail: [r.id, r.workspace].filter(Boolean).join(' · '), id: r.id, synced: { machine: m, row: r }, buttons: [workspaceWindowBtn] } });
+        }
+        rows.sort((a, b) => {
+          const ah = a.row.attention?.kind !== 'idle-done' && !!a.row.attention, bh = b.row.attention?.kind !== 'idle-done' && !!b.row.attention;
+          if (ah !== bh) return ah ? -1 : 1;
+          if (ah && bh) { const rank: Record<string, number> = { permission: 0, question: 1, input: 2 };
+            return (rank[a.row.attention!.kind] ?? 9) - (rank[b.row.attention!.kind] ?? 9) || a.row.attention!.ts - b.row.attention!.ts; }
+          return b.row.lastActiveMs - a.row.lastActiveMs;
+        });
+        return [...status, { label: '$(sync) Auto — newest for this workspace', description: meta.active ?? 'none', id: '' }, ...rows.map((r) => r.item)];
+      };
+      const items = build();
       // Preselect what is IN EFFECT — the pinned session, or the Auto row when nothing is pinned — not
       // simply the live one: a picker that opens on a row you are not looking at invites a mis-click.
       const pinned = vscode.workspace.getConfiguration('claudeObservatory').get<string>('session') || '';
@@ -12320,10 +14620,22 @@ export function activate(context: vscode.ExtensionContext): void {
       qp.title = 'OAK — review which session?';
       qp.placeholder = 'newest conversation first · type to filter by name or id';
       qp.matchOnDetail = true;
-      const inEffect = pinned ? items.find((i) => i.id === pinned) : items[0];
+      qp.matchOnDescription = true;
+      const inEffect = remotePin
+        ? items.find((i) => i.remote === remotePin?.machine && i.id === remotePin?.session)
+        : pinned ? items.find((i) => i.id === pinned && !i.remote && !i.synced) : items.find((i) => !i.id && !i.note);
       if (inEffect) qp.activeItems = [inEffect];
       else if (active.length) qp.activeItems = [active[0]]; // pinned elsewhere — fall back to the live one
       let alive = true;
+      // A saved machine's read landing rebuilds the list in place, keeping the row the reader is on.
+      const onSaved = (): void => {
+        if (!alive) return;
+        const was = qp.activeItems[0];
+        qp.items = build();
+        const same = was && qp.items.find((i) => i.kind !== Sep && i.id === was.id && i.remote === was.remote && !!i.note === !!was.note);
+        if (same) qp.activeItems = [same];
+      };
+      savedListeners.add(onSaved);
       const pick = await new Promise<Item | undefined>((resolve) => {
         qp.onDidAccept(() => resolve(qp.selectedItems[0]));
         qp.onDidHide(() => { alive = false; resolve(undefined); });
@@ -12334,6 +14646,7 @@ export function activate(context: vscode.ExtensionContext): void {
         // if the picker closed anyway.
         qp.onDidTriggerItemButton(async (e) => {
           const it = e.item as Item;
+          if (e.button === workspaceWindowBtn) { await openWorkspaceWindow(it.id, it.remote || it.synced?.machine.label); return; }
           if (e.button !== deleteSessionBtn) { revealStoreFolder(it.id); return; }
           const prev = qp.ignoreFocusOut;
           qp.ignoreFocusOut = true;
@@ -12341,9 +14654,19 @@ export function activate(context: vscode.ExtensionContext): void {
           if (alive) { qp.ignoreFocusOut = prev; if (name) qp.items = qp.items.filter((x) => x.id !== it.id); }
         });
         qp.show();
+        refreshSavedMachines(); // after the list is shown: starting the reads costs a spawn, which it does not wait for
       });
+      savedListeners.delete(onSaved);
       qp.dispose();
-      if (!pick) return;
+      if (!pick || pick.note) return;
+      if (pick.remote) {
+        await vscode.commands.executeCommand('claudeObservatory.pinRemoteSession', pick.remote, pick.id);
+        return;
+      }
+      if (pick.synced) {
+        await openSyncedSession(pick.synced.machine, pick.synced.row);
+        return;
+      }
       await vscode.commands.executeCommand('claudeObservatory.pinSession', pick.id);
     }),
     /**
@@ -12393,17 +14716,20 @@ export function activate(context: vscode.ExtensionContext): void {
       } else {
         target = path.join(core.claudeConfigDir(), 'claude-observatory');
       }
+      // The move records the new location in prefs.json itself, over the file as it is then, while captures wait for it.
       const res = core.moveStore(target);
       if ('error' in res) {
         void vscode.window.showErrorMessage(`OAK: store not moved — ${res.error}`);
         return;
       }
-      const next = { ...prefs };
-      if (pick.label === MOVE) next.storeDir = target;
-      else delete next.storeDir;
-      core.writePrefs(next);
-      void vscode.window.showInformationMessage(`OAK: store moved to ${res.to}`);
-      void vscode.commands.executeCommand('claudeObservatory.refresh');
+      if (res.unrecorded) {
+        void vscode.window.showErrorMessage(`OAK: the store moved to ${res.to}, but prefs.json could not record it, so OAK looks for it where it was — ${res.unrecorded}`);
+        return;
+      }
+      const notes = [res.left, res.missed ? core.missedDuringMove(res.missed) : undefined].filter(Boolean);
+      if (notes.length) void vscode.window.showWarningMessage(`OAK: store moved to ${res.to} — ${notes.join(' — ')}`);
+      else void vscode.window.showInformationMessage(`OAK: store moved to ${res.to}`);
+      void vscode.commands.executeCommand('claudeObservatory.refresh', NO_SWEEP);
     }),
     // The Timeline's selector as a command, so the Prompts tab's chip and the palette drive one
     // implementation. ACTIVE sessions only — switching between two live conversations is the thing this
@@ -12420,7 +14746,7 @@ export function activate(context: vscode.ExtensionContext): void {
         description: sessionBadgePrefix(r) + core.relTime(r.lastActiveMs) + (r.id === current ? ' · reviewing' : ''),
         detail: r.id, // matchOnDetail below — pasting an id finds its row
         id: r.id,
-        buttons: r.storeBytes ? [revealStoreBtn, deleteSessionBtn] : [deleteSessionBtn],
+        buttons: r.storeBytes ? [workspaceWindowBtn, revealStoreBtn, deleteSessionBtn] : [workspaceWindowBtn, deleteSessionBtn],
       }));
       // Never a dead end: an active-only list can be empty, or the one you want can be an hour old.
       items.push({ label: '$(list-unordered) All sessions…', description: 'every session recorded for this workspace', id: '', all: true });
@@ -12440,6 +14766,7 @@ export function activate(context: vscode.ExtensionContext): void {
         // buttons, so it is never a delete target.
         qp.onDidTriggerItemButton(async (e) => {
           const it = e.item as Item;
+          if (e.button === workspaceWindowBtn) { await openWorkspaceWindow(it.id); return; }
           if (e.button !== deleteSessionBtn) { revealStoreFolder(it.id); return; }
           const prev = qp.ignoreFocusOut;
           qp.ignoreFocusOut = true;
@@ -12478,6 +14805,7 @@ export function activate(context: vscode.ExtensionContext): void {
     // Keep / undo the pending edit under the cursor — the review loop never has to leave the keyboard.
     vscode.commands.registerCommand('claudeObservatory.keepAtCursor', () =>
       withSession(async (s) => {
+        if (currentMachine()) { await vscode.commands.executeCommand('claudeObservatory.navKeep'); return; }
         const rec = pendingAtCursor(s);
         if (!rec) {
           vscode.window.setStatusBarMessage('OAK: no pending edit under the cursor', 3000);
@@ -12490,6 +14818,7 @@ export function activate(context: vscode.ExtensionContext): void {
     ),
     vscode.commands.registerCommand('claudeObservatory.undoAtCursor', () =>
       withSession(async (s) => {
+        if (currentMachine()) { await vscode.commands.executeCommand('claudeObservatory.navUndo'); return; }
         const rec = pendingAtCursor(s);
         if (!rec) {
           vscode.window.setStatusBarMessage('OAK: no pending edit under the cursor', 3000);
@@ -12759,12 +15088,14 @@ export function activate(context: vscode.ExtensionContext): void {
     // at a text editor behind a diff of something else. In the editor itself, advancing is the point.
     vscode.commands.registerCommand('claudeObservatory.inlineKeep', (id: number, opts?: { advance?: boolean }) =>
       withSession(async (s) => {
+        if (currentMachine()) { await remoteDecision(currentMachine()!, s, 'keep', [String(id), '--units']); return; }
         core.keepGroup(s, id);
         if (opts?.advance !== false) await advanceAfterResolve(s, id);
       })()
     ),
     vscode.commands.registerCommand('claudeObservatory.inlineUndo', (id: number, opts?: { advance?: boolean }) =>
       withSession(async (s) => {
+        if (currentMachine()) { await remoteDecision(currentMachine()!, s, 'undo', [String(id), '--units']); return; }
         await undoOne(s, id);
         if (opts?.advance !== false) await advanceAfterResolve(s, id);
       })()
@@ -12819,6 +15150,11 @@ export function activate(context: vscode.ExtensionContext): void {
     // Accept / revert every pending edit in the ACTIVE editor's file — what the per-file surfaces use.
     vscode.commands.registerCommand('claudeObservatory.keepOpenFile', () =>
       withSession((s) => {
+        const machine = currentMachine(), cursor = remoteReviewCursor;
+        if (machine) {
+          if (cursor?.machine === machine && cursor.session === s) return remoteDecision(machine, s, 'keep', ['--under', cursor.file]);
+          return;
+        }
         const file = activeEditorFile();
         if (!file) return void vscode.window.showInformationMessage('OAK: no active file.');
         keepEditsInFile(s, file, cachedLog(s).filter((r) => r.file === file));
@@ -12826,6 +15162,11 @@ export function activate(context: vscode.ExtensionContext): void {
     ),
     vscode.commands.registerCommand('claudeObservatory.undoOpenFile', () =>
       withSession(async (s) => {
+        const machine = currentMachine(), cursor = remoteReviewCursor;
+        if (machine) {
+          if (cursor?.machine === machine && cursor.session === s) return remoteDecision(machine, s, 'undo', ['--under', cursor.file]);
+          return;
+        }
         const file = activeEditorFile();
         if (!file) return void vscode.window.showInformationMessage('OAK: no active file.');
         await undoEditsInFile(s, file, cachedLog(s).filter((r) => r.file === file));
@@ -12843,13 +15184,7 @@ export function activate(context: vscode.ExtensionContext): void {
   // transcripts in it. Both watchers went silent, and the log watcher is the ONLY live path (see the
   // note at updateStatusItem), so every view stopped updating while the agent worked.
   // core/src/watch.ts already resolves them independently; this is the same rule.
-  const storeRoot = vscode.Uri.file(core.rootDir());
   const configRoot = vscode.Uri.file(core.claudeConfigDir());
-  const watcher = vscode.workspace.createFileSystemWatcher(
-    // Narrowed from machine-wide '*/log.jsonl' (0.8.8): any session anywhere used to wake every
-    // window for a full refresh. Watch the whole store dir but debounce-filter in the handler below.
-    new vscode.RelativePattern(storeRoot, '*/{log.jsonl,capture-events.jsonl,attention.json,agent.json}')
-  );
   // Capture writes land in bursts (PreToolUse + PostToolUse per edit) — debounce so one refresh
   // covers the burst instead of re-rendering every view per file event.
   let watchDebounce: ReturnType<typeof setTimeout> | undefined;
@@ -12875,10 +15210,38 @@ export function activate(context: vscode.ExtensionContext): void {
     storeStamp++; // any session's change can move the shared listing's rows (see sharedListing)
     if (relevantStoreEvent(uri)) scheduleRefresh();
   };
-  watcher.onDidChange(onStoreEvent);
-  watcher.onDidCreate(onStoreEvent);
-  watcher.onDidDelete(onStoreEvent);
-  context.subscriptions.push(watcher);
+  // Made again whenever the store has moved (this window's Store location command, the terminal app's options, `oak
+  // store --move`): left on the folder it started on, it saw no capture or verdict again, and the panels stopped
+  // following another surface's work. Every refresh checks, and an agent's transcript writes refresh.
+  let storeWatch: { root: string; watcher: vscode.FileSystemWatcher; sync: vscode.FileSystemWatcher[] } | undefined;
+  watchStore = () => {
+    const root = core.rootDir();
+    if (storeWatch?.root === root) return;
+    storeWatch?.watcher.dispose();
+    storeWatch?.sync.forEach((w) => w.dispose());
+    // oak sync's own files (its status, conflicts, run lock and key), which move with the store, and prefs.json, which
+    // holds its settings and does not: its item and inbox rows follow them.
+    const sync = [vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(vscode.Uri.file(root), 'sync/{status.json,conflicts.json,now.lock,key}')),
+      vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(vscode.Uri.file(path.dirname(core.prefsPath())), 'prefs.json'))];
+    let settle: ReturnType<typeof setTimeout> | undefined;
+    const onSync = (): void => { clearTimeout(settle); settle = setTimeout(() => void readSyncStatus(), 300); };
+    for (const w of sync) {
+      w.onDidChange(onSync);
+      w.onDidCreate(onSync);
+      w.onDidDelete(onSync);
+    }
+    const watcher = vscode.workspace.createFileSystemWatcher(
+      // Narrowed from machine-wide '*/log.jsonl' (0.8.8): any session anywhere used to wake every
+      // window for a full refresh. Watch the whole store dir but debounce-filter in onStoreEvent.
+      new vscode.RelativePattern(vscode.Uri.file(root), '*/{log.jsonl,capture-events.jsonl,attention.json,agent.json}')
+    );
+    watcher.onDidChange(onStoreEvent);
+    watcher.onDidCreate(onStoreEvent);
+    watcher.onDidDelete(onStoreEvent);
+    storeWatch = { root, watcher, sync };
+  };
+  watchStore();
+  context.subscriptions.push({ dispose: () => { storeWatch?.watcher.dispose(); storeWatch?.sync.forEach((w) => w.dispose()); } });
 
   // `workspaceRoot()` is `folders[0]`, and EVERY caller reads it live — so adding, removing or
   // reordering folders silently changes which session the whole extension is about. Nothing announced
@@ -12907,23 +15270,29 @@ export function activate(context: vscode.ExtensionContext): void {
   // filter arrivals instead: only this workspace's project dir and those of its worktree siblings are
   // this window's business. The set is cached, and any failure to compute it falls back to accepting
   // everything — a stale extra refresh is far better than a panel that stops updating.
-  let relevantDirs: Set<string> | null = null;
+  // The folders themselves (`roots`) are what a Codex rollout's write is matched by, below.
+  let relevant: { dirs: Set<string>; roots: string[] } | null = null;
   let relevantAt = 0;
-  const relevantProjectDirs = (): Set<string> | null => {
+  const relevantFolders = (): { dirs: Set<string>; roots: string[] } | null => {
     const now = Date.now();
-    if (relevantDirs && now - relevantAt < 30_000) return relevantDirs;
+    if (relevant && now - relevantAt < 30_000) return relevant;
     const cwd = workspaceRoot();
     if (!cwd) return null;
     try {
       const dirs = new Set<string>([core.canonPath(path.resolve(core.projectDir(cwd)))]);
-      for (const sib of core.listRepoSiblings(cwd, currentSession() ?? '')) dirs.add(core.canonPath(path.resolve(core.projectDir(sib.worktree))));
-      relevantDirs = dirs;
+      const roots = [core.canonPath(path.resolve(cwd))];
+      for (const sib of core.listRepoSiblings(cwd, currentSession() ?? '')) {
+        dirs.add(core.canonPath(path.resolve(core.projectDir(sib.worktree))));
+        roots.push(core.canonPath(path.resolve(sib.worktree)));
+      }
+      relevant = { dirs, roots };
       relevantAt = now;
-      return dirs;
+      return relevant;
     } catch {
       return null; // can't tell → treat every transcript as ours
     }
   };
+  const relevantProjectDirs = (): Set<string> | null => relevantFolders()?.dirs ?? null;
   let txDebounce: ReturnType<typeof setTimeout> | undefined;
   const scheduleTxRefresh = (uri?: vscode.Uri) => {
     if (uri) {
@@ -12943,8 +15312,48 @@ export function activate(context: vscode.ExtensionContext): void {
   const codexWatcher = vscode.workspace.createFileSystemWatcher(
     new vscode.RelativePattern(vscode.Uri.file(core.codexHome()), '{sessions,archived_sessions}/**/*.jsonl')
   );
-  // Codex paths are sharded by date, not workspace. Discovery decides relevance on refresh.
-  const onCodexEvent = () => scheduleTxRefresh();
+  // Codex paths are sharded by date, not workspace, so every rollout written anywhere on the machine woke this window for
+  // a full refresh. The local index knows each rollout's session and the folder it ran in (core.indexedRollouts), read
+  // here read-only and read again only when another process has changed the index (PRAGMA data_version): a write to the
+  // rollout of a session that ran elsewhere than this workspace's folder, its worktree siblings' or below one of them
+  // refreshes nothing, unless that session is on screen: pinned, connected or shown in the Timeline, or the one this
+  // workspace resolves to (which can have run in a folder above it). A rollout the index does not hold yet (a session
+  // begun since its last catch-up) still refreshes, and where the index cannot be read here, every write does, as before.
+  let rollouts: (Extract<ReturnType<typeof core.openIndexReadOnly>, { ok: true }> & { version: number; runs: ReturnType<typeof core.indexedRollouts> }) | null = null;
+  const indexedRollouts = (): ReturnType<typeof core.indexedRollouts> | null => {
+    try {
+      if (rollouts && rollouts.file !== core.indexFile()) { rollouts.close(); rollouts = null; }
+      if (!rollouts) {
+        const opened = core.openIndexReadOnly();
+        if (!opened.ok) return null;
+        rollouts = { ...opened, version: -1, runs: new Map() };
+      }
+      const version = core.dataVersion(rollouts.db);
+      if (version !== rollouts.version) rollouts = { ...rollouts, version, runs: core.indexedRollouts(rollouts.db) };
+      return rollouts.runs;
+    } catch {
+      rollouts?.close();
+      rollouts = null;
+      return null;
+    }
+  };
+  context.subscriptions.push({ dispose: () => rollouts?.close() });
+  const within = (dir: string, root: string): boolean => dir === root || dir.startsWith(root.endsWith(path.sep) ? root : root + path.sep);
+  const onScreen = (run: { id: string; cwd: string | null }): boolean => {
+    const roots = relevantFolders()?.roots;
+    const at = run.cwd ? core.canonPath(path.resolve(run.cwd)) : null;
+    if (!roots || !at || roots.some((r) => within(at, r))) return true;
+    const pinned = demoSession ?? (vscode.workspace.getConfiguration('claudeObservatory').get<string>('session', '').trim() || null);
+    if (pinned) return run.id === pinned || promptsProvider.showsSession(run.id);
+    // The session this workspace resolves to walks up from its folder: only one that ran there or above can be it, and
+    // resolving costs a walk of every rollout, so it is asked only then.
+    return promptsProvider.showsSession(run.id) || (within(roots[0], at) && run.id === currentSession());
+  };
+  const onCodexEvent = (uri: vscode.Uri) => {
+    const run = indexedRollouts()?.get(core.canonPath(path.resolve(uri.fsPath)));
+    if (run && !onScreen(run)) return; // another workspace's session, not shown here
+    scheduleTxRefresh();
+  };
   codexWatcher.onDidChange(onCodexEvent);
   codexWatcher.onDidCreate(onCodexEvent);
   codexWatcher.onDidDelete(onCodexEvent);
@@ -13036,7 +15445,7 @@ export function activate(context: vscode.ExtensionContext): void {
       // the same channel reconciles it.
       await applyUpdate(target);
     }),
-    // The chip's Update now: the FULL update — this extension + CLI + JetBrains plugin + status line.
+    // The chip's Update now: the FULL update — this extension, then `oak update` for the rest.
     vscode.commands.registerCommand('claudeObservatory.updateNow', () => applyUpdate(null))
   );
   // The demo offer takes precedence for this activation. Two unsolicited notifications on the first
@@ -13049,6 +15458,8 @@ export function activate(context: vscode.ExtensionContext): void {
   if (!offerDemo(context, () => void vscode.commands.executeCommand('claudeObservatory.startDemo'), () => void checkForUpdate(context, false))) {
     void checkForUpdate(context, false);
   }
+  watchEditorReview(context, reviewProvider, changeMapProvider);
+
 }
 
 /**

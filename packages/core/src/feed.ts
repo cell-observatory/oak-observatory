@@ -18,7 +18,8 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { findTranscript, transcriptInsightsAt } from './observe';
-import { readLog } from './store';
+import { readLog, isSafeSessionId, storeDir } from './store';
+import { projectDir } from './session';
 import { transcriptFacts } from './derived-transcript';
 import { parseTranscriptActions, readTranscriptProse, ProseIndex, ActionRecord, agentPhaseDetail, linkEditIds } from './actions';
 import { findSubagentsDir } from './subagents';
@@ -26,7 +27,7 @@ import { parseWorkflows } from './workflows';
 import { listRepoSiblings } from './fleet';
 import { cachedChangeMap } from './changemap';
 import { readCaptureEvents } from './capture-events';
-import { sessionProcesses, processOutputTail } from './processes';
+import { sessionProcesses, processKey, processOutputTail, plainProcessOutput } from './processes';
 
 export type FeedKind = 'session' | 'agent' | 'workflow' | 'task' | 'process';
 
@@ -109,6 +110,12 @@ export interface FeedResult {
   truncated: number;
   /** Newest evidence seen (ms epoch, 0 when none) — renderers show the age rather than claim "live". */
   lastTs: number;
+  /** Recorded worker completion time, never inferred from silence. */
+  endedTs?: number;
+  /** Worker log inputs, for local viewers to stat before asking for another snapshot. */
+  sources?: string[];
+  workerLogVersion?: 1;
+  session?: string;
   /** Set when the feed can only be partial, and why. */
   note?: string;
 }
@@ -216,10 +223,26 @@ function mtime(p: string): number {
   }
 }
 
+/** The parent records completion; the worker records its own activity. Missing files keep their
+ * expected paths so a viewer can wait for a newly launched worker's first write. */
+export function workerFeedPaths(cwd: string, sessionId: string, agentId: string): string[] {
+  if (!isSafeSessionId(sessionId) || !isSafeSessionId(agentId)) throw new Error('invalid worker or session id');
+  const parent = resolveSession(cwd, sessionId)?.transcript ?? path.join(projectDir(cwd), `${sessionId}.jsonl`);
+  const file = path.join(path.dirname(parent), sessionId, 'subagents', `agent-${agentId}.jsonl`);
+  return [parent, file, file.replace(/\.jsonl$/, '.meta.json'), path.join(storeDir(sessionId), 'capture-events.jsonl')];
+}
+
+export function workerFeedStamp(files: string[]): string {
+  return files.map(file => {
+    try { const s = fs.statSync(file); return `${s.dev}:${s.ino}:${s.size}:${s.mtimeMs}:${s.ctimeMs}`; }
+    catch { return '-'; }
+  }).join('|');
+}
+
 /**
  * The feed for one Overview row. `nowMs` is injectable for tests.
  */
-export function liveFeed(cwd: string, sessionId: string, ref: FeedRef, opts: { limit?: number } = {}): FeedResult {
+export function liveFeed(cwd: string, sessionId: string, ref: FeedRef, opts: { limit?: number; sinceEntry?: number } = {}): FeedResult {
   const limit = opts.limit ?? DEFAULT_LIMIT;
 
   // A fleet row can name a session in another worktree; re-point cwd so every branch below resolves.
@@ -227,9 +250,9 @@ export function liveFeed(cwd: string, sessionId: string, ref: FeedRef, opts: { l
   if (owner) cwd = owner.cwd;
 
   if (ref.kind === 'process') {
-    const proc = sessionProcesses(cwd, sessionId).find((p) => p.id === ref.id);
+    const proc = sessionProcesses(cwd, sessionId).find((p) => processKey(p) === ref.id);
     if (!proc) return empty(ref, ref.id, 'no such background shell in this session');
-    const text = processOutputTail(proc.outputPath, OUTPUT_TAIL_BYTES);
+    const text = proc.recordedOutput !== undefined ? plainProcessOutput(proc.recordedOutput) : processOutputTail(proc.outputPath, OUTPUT_TAIL_BYTES);
     const lines = text.split('\n').filter((l) => l.length > 0);
     // The output file lives in a temp dir that gets reaped. "No output yet" and "the log is gone" look
     // identical once it is deleted, and only one of them is true of a shell that already finished.
@@ -256,6 +279,7 @@ export function liveFeed(cwd: string, sessionId: string, ref: FeedRef, opts: { l
       // is the whole story.
       note: gone
         ? 'the output file has been cleaned up — nothing left to read'
+        : proc.recordedOutput !== undefined ? 'Codex output updates when the harness records a result; no output file is recorded.'
         : !proc.outputPath
         ? 'this shell has no output file to follow'
         : proc.outputBytes > OUTPUT_TAIL_BYTES
@@ -265,23 +289,39 @@ export function liveFeed(cwd: string, sessionId: string, ref: FeedRef, opts: { l
   }
 
   if (ref.kind === 'agent') {
-    const dir = findSubagentsDir(cwd, sessionId);
-    const file = dir ? path.join(dir, `agent-${ref.id}.jsonl`) : null;
-    if (!file || !fs.existsSync(file)) return empty(ref, ref.id, 'no transcript for this agent yet');
+    const sources = workerFeedPaths(cwd, sessionId, ref.id);
+    const [parent, file] = sources;
+    const facts = transcriptFacts(parent).subagents;
+    const own = transcriptFacts(file, true).subagents;
+    const meta = facts.meta.get(ref.id);
+    const ended = facts.ended.get(ref.id);
+    let stopped = 0;
+    for (const e of readCaptureEvents(sessionId, ['subagent'])) {
+      const p = e.payload as { phase?: string; context?: { agentId?: string; id?: string } };
+      if ((p.context?.agentId ?? p.context?.id) === ref.id) stopped = p.phase === 'stop' ? e.ts : 0;
+    }
+    const end = Math.max(ended?.ts ?? 0, meta?.endedTs ?? 0, stopped);
+    // A turn written after the notice resumes the worker. The small grace is shared with workerPhase:
+    // records from the finishing turn can land just after its completion notice.
+    const endedTs = end > 0 && own.vitals.lastTurnTs <= end + 2000 ? end : undefined;
+    const exists = fs.existsSync(file);
     const actions = parseTranscriptActions(file, { includeSidechain: true });
     const merged = [...proseEntries(file, true), ...actions.map((a) => fromAction(a))].sort((x, y) => x.ts - y.ts);
-    const { rows, truncated } = feedTail(merged, limit);
-    const { phase } = agentPhaseDetail(file);
-    const agentLive = phase === 'working' || phase === 'awaiting-input' || phase === 'awaiting-permission';
+    const { rows, truncated } = feedTail(merged, Math.max(limit, opts.sinceEntry === undefined ? 0 : merged.length - opts.sinceEntry));
     return {
       ref,
       // Prefer the agent's own description over its id: the id is what the reader just clicked.
-      title: (dir ? subagentLabel(dir, ref.id) : '') || ref.id,
-      running: agentLive,
-      mode: agentLive ? 'live' : 'audit',
+      title: subagentLabel(path.dirname(file), ref.id) || meta?.description || ref.id,
+      running: exists && !endedTs,
+      mode: endedTs ? 'audit' : 'live',
       entries: rows,
       truncated,
-      lastTs: mtime(file),
+      lastTs: Math.max(own.vitals.lastTs, endedTs ?? 0),
+      sources,
+      workerLogVersion: 1,
+      session: sessionId,
+      ...(endedTs ? { endedTs, note: `Worker ended at ${new Date(endedTs).toISOString()} (${ended?.ts === end ? ended.status : meta?.endedTs === end ? meta.status : 'stopped'}).` }
+        : { note: exists ? 'Following worker log; no completion recorded yet.' : 'no transcript for this agent yet — waiting for its log' }),
     };
   }
 

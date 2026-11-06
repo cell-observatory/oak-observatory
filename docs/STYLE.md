@@ -13,8 +13,8 @@ from retroactive edits.
 
 - **S1.** Keep the verb within about seven words of its grammatical subject; move long
   qualifiers to the start or end of the sentence.
-- **S2.** Express each clause's action as a verb, not an abstract noun: "the CLI indexes
-  each event", not "indexing is provided by the CLI".
+- **S2.** Express each clause's action as a verb, not an abstract noun: "the CLI records
+  each event", not "recording is provided by the CLI".
 - **S3.** Default to active voice with a named agent. Use passive only to keep an
   established topic in subject position or when the actor is genuinely irrelevant.
 - **S4.** Describe behavior in the present tense. Use the imperative for instructions.

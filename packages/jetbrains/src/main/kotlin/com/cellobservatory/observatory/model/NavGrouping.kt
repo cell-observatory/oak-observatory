@@ -26,13 +26,13 @@ object NavGrouping {
     /** Group key → its members, in shipped order. Sessions leads its group for the same reason it leads
      *  the plain tab strip: which session you are reviewing precedes every other question. */
     val GROUPS: Map<String, List<String>> = linkedMapOf(
-        NAV_ALL to listOf(SESSIONS, FLEET, WORKFLOWS, TASKS, PROCESSES),
+        NAV_ALL to listOf(SESSIONS, FLEET, PROCESSES, TASKS, WORKFLOWS),
     )
 
     /** The tab title each group carries. Members are separated by the same middle dot the product uses
      *  everywhere else for "and also". */
     val GROUP_TITLES: Map<String, String> = mapOf(
-        NAV_ALL to "Sessions · Workers · Workflows · Tasks · Processes",
+        NAV_ALL to "Sessions · Workers · Processes · Tasks · Workflows",
     )
 
     /**

@@ -30,7 +30,7 @@ import * as crypto from 'crypto';
 import * as os from 'os';
 import { projectDir, commonDir } from './session';
 import { handleHookPayload } from './capture';
-import { readLog, clearResolved, removeSession, isSafeSessionId, ensureStore, writeBlob, appendLog, allStoreSessionIds } from './store';
+import { readLog, clearResolved, removeSession, isSafeSessionId, ensureStore, writeBlob, appendLog, allStoreSessionIds, storeIndexHooks } from './store';
 import { removeUsageCursor } from './metrics';
 import { claudeConfigDir } from './paths';
 
@@ -551,8 +551,8 @@ export async function runDemo(opts: DemoOptions = {}): Promise<DemoResult> {
       message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: editId, is_error: false }] },
     });
     // Left deliberately unresolved: a tool_use with no result is what a real agent mid-call looks like,
-    // so the row's live phase reads `working` and later `awaiting-permission` — both honest, and the
-    // second is itself a state worth showing.
+    // so the row's live phase reads `working`, as a running command's does, however long it runs (a call
+    // reads `awaiting-permission` only while a permission hand is up, and the demo raises none).
     sibAssistant([{ type: 'tool_use', id: tid(), name: 'Bash', input: { command: 'python src/train.py', description: 'Re-run the entrypoint' } }]);
     return sibId;
   };
@@ -706,7 +706,7 @@ export async function runDemo(opts: DemoOptions = {}): Promise<DemoResult> {
         }) + '\n'
       );
     // Resolve each subagent tool_use so its live phase classifies structurally (a pending tool_use with
-    // no result would read as a stale permission block minutes later).
+    // no result would read as a call still running).
     const subResult = (toolUseId: string) =>
       fs.appendFileSync(
         subFile,
@@ -1105,7 +1105,7 @@ export function cleanDemo(opts: { cwd?: string; dir?: string } = {}): DemoCleanR
         fs.rmSync(path.join(proj, name), { force: true });
         fs.rmSync(path.join(proj, id), { recursive: true, force: true }); // subagents/ + workflows/
         fs.rmSync(path.join(claudeConfigDir(), 'tasks', id), { recursive: true, force: true }); // the task list (0.8.3)
-        removeSession(id); // the store (log + blobs)
+        removeSession(id, { archive: false }); // the store (log + blobs)
         // The scratch dir the outside-the-workspace write landed in — marker-gated like the workspace.
         const scr = path.join(scratchRoot(), id);
         if (fs.existsSync(path.join(scr, MARKER))) {
@@ -1136,10 +1136,19 @@ export function cleanDemo(opts: { cwd?: string; dir?: string } = {}): DemoCleanR
   for (const id of allStoreSessionIds()) {
     if (!isDemoSession(id) || sessions.includes(id)) continue;
     try {
-      removeSession(id);
+      removeSession(id, { archive: false });
       sessions.push(id);
     } catch {
       /* best-effort per session */
+    }
+  }
+  // Forgotten in the local index too, its full-text entries and usage with them (the simulator's turns were never billed),
+  // as a deliberate delete forgets a session. Where this Node has no index (an older VS Code), the next catch-up does it.
+  for (const id of sessions) {
+    try {
+      storeIndexHooks()?.forget(id);
+    } catch {
+      /* the next catch-up forgets it */
     }
   }
   if (fs.existsSync(path.join(candidate, MARKER))) {

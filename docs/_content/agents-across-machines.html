@@ -1,0 +1,182 @@
+<p>Start agents from briefs on your laptop and saved machines, follow their workers, wait for their reports, and review the changes where they were made. OAK tracks the work; each agent runs in its native Claude Code or Codex CLI, with its chatbox, in a herdr tab. After review, merge the branch with git and close the agent’s tab.</p>
+<p>This walkthrough uses three synthetic machines: <code>laptop</code>, <code>build-box</code> and <code>gpu-box</code>, each with a separate working tree. The commands and output below came from the built CLI with synthetic session files, processes and reports. Stand-ins for SSH and herdr routed requests to each machine’s isolated home; no model was called. Only the home paths have been normalized to <code>/tmp/obs-demo/&lt;machine&gt;</code>. The example demonstrates OAK’s behavior, not the agents’ ability to solve these tasks.</p>
+<p><a href="database-across-machines.html">The database across machines</a> explains how each machine builds its database, exchanges record logs and uses an encrypted backup on shared storage. <a href="database-and-sync.html">Database &amp; sync</a> provides the command and settings reference.</p>
+<h2>Set up your agent to delegate</h2>
+<p><code>oak agent setup</code> installs opt-in guidance for Claude Code and Codex. It lists every destination and managed entry before asking for permission to write. It also checks whether herdr is installed and running; <code>oak doctor --fix</code> repairs a missing setup.</p>
+<pre><code>$ oak agent setup --check --json
+# A JSON plan lists each destination, its managed part, and its state.
+$ oak agent setup
+# Choose defaults, review the listed writes, then confirm.
+$ oak agent setup --yes --project
+# Install in the current repository without a prompt.</code></pre>
+<p>User setup installs <code>skills/oak-delegate/SKILL.md</code> and <code>agents/oak-builder.md</code> under <code>CLAUDE_CONFIG_DIR</code>, or <code>~/.claude</code>. It places a marked block in <code>CODEX_HOME/AGENTS.md</code>, or <code>~/.codex/AGENTS.md</code>, and adds <code>Bash(oak agent:*)</code> to Claude Code's settings. The <a href="https://code.claude.com/docs/en/permissions#wildcard-patterns">documented permission syntax</a> limits the rule to the <code>oak agent</code> command prefix.</p>
+<p>Setup offers each CLI's configured model and effort, then preserves your choices in OAK's <code>prefs.json</code> under <code>agents</code>. It offers existing <code>~/.gradle</code>, <code>~/.npm</code> and <code>~/.cache</code> directories as Codex writable roots. <code>--yes</code> accepts these defaults. Codex always receives the agent's output folder; repeat <code>--writable-root &lt;dir&gt;</code> to add roots for one launch.</p>
+<p>Project setup uses the repository's <code>.claude</code> directory and <code>AGENTS.md</code>. Its preferences live in <code>.claude/claude-observatory/prefs.json</code> and override user defaults when starting agents there. Each scope has an <code>oak-agent-setup.json</code> ownership manifest. OAK compares installed content with that manifest before changing it. Edited content is reported and kept, including during removal.</p>
+<p><code>--check</code> reports missing, current, outdated and edited content; <code>--json</code> emits the plan for scripts. <code>--remove</code> removes only OAK's managed content, after confirmation or with <code>--yes</code>. <code>oak update</code> refreshes installed user guidance and the current repository's guidance. <code>oak uninstall</code> removes both; <code>oak uninstall --project</code> removes only the current repository's setup. Run these commands in each repository with project setup. Repeating setup without changes writes nothing.</p>
+<p>The parent uses its own agent kind unless the brief or a flag specifies another kind. It writes a brief beginning with <code># Title</code>, followed by the goal, scope, constraints, proof and deliverables. It starts the agent, runs <code>oak agent wait &lt;id&gt;</code> in the harness's background facility, reads <code>report.md</code>, reviews in OAK, merges, closes the tab and checks <code>oak agent list --all</code> for cost.</p>
+<p>The delegated agent leaves changes uncommitted. It writes <code>report.md</code> with “What changed”, “Tests (before and after results)” and “Not verified” sections, plus a binary diff that includes untracked files. It stays in its assigned worktree and output folder, uses synthetic data, raises a hand when blocked and starts no nested agents. <code>oak-builder</code> excludes Claude Code's Agent tool.</p>
+<p>Before starting work, and before editing a file other agents may touch, agents check <code>oak query files</code>, <code>oak query search --text …</code>, <code>oak query delegated --all</code> and <code>oak query findings</code>. When another active agent has pending edits to a file you are about to edit, OAK adds a note to your context; coordinate before editing. The guidance names <code>oak agent tell &lt;id&gt; &lt;text&gt;</code> for parent messages, <code>oak agent start … --after &lt;id…&gt;</code> for dependencies, and <code>oak finding add "&lt;text&gt;" [--path &lt;file&gt;]</code> for shared facts.</p>
+<h2>Create and track worktrees</h2>
+<p><code>oak agent start --kind codex --brief &lt;file&gt; --worktree [&lt;base&gt;]</code> creates a Git worktree beside the repository, named by the agent id, on branch <code>oak/&lt;id&gt;</code>. The base defaults to <code>HEAD</code>. The repository must exist and be clean; keep the brief outside it. An agent started with <code>--cwd</code> in an existing linked worktree also records its path, branch and base.</p>
+<p>The owning machine saves changed-file counts, added and removed lines, commits ahead and behind the base branch, merge state and the reading time. These fields travel with delegated records to other machines. Agent lists and the Workers rows in the terminal app, VS Code and JetBrains show a summary such as <code>3 files · +120 −8 · not merged</code>.</p>
+<p>OAK reads at most one stale worktree per refresh, with at least 30 seconds between readings of that worktree. Each read has a 1.5-second deadline, 256 KiB of output per Git command and 1 MiB of untracked file content. It reads the Git index and changed paths, without scanning session history. Binary files count as files but have no line totals. A failed or bounded-out reading is shown as unavailable. Ahead and behind use the moving base branch when available; change totals use the recorded base commit.</p>
+<p><code>oak agent close --remove-worktree &lt;id&gt;</code> removes a worktree only when it is clean and its changes are merged. A clean branch is merged when its tip is contained in the base branch, or their trees agree. After applying an uncommitted diff in the parent, reconcile the agent worktree before removal. <code>oak doctor</code> names worktrees without an agent row and merged worktrees whose agent is gone or closed. It suggests the close command and never removes them itself.</p>
+<h2>Prepare the machines and briefs</h2>
+<p>Install OAK, its capture hooks and herdr on each machine, with Node.js 22.16 or a later 22, or 24 or newer. The CLI enforces that runtime requirement. Save remote machines with <code>oak machine add &lt;label&gt; &lt;ssh-target&gt;</code>; <code>--machine</code> uses that saved label. For bidirectional sync, save each machine on the others. Sync requires the same user name on both ends.</p>
+
+<pre><code>$ oak machine list --json
+[{&quot;id&quot;:&quot;machine-build-box&quot;,&quot;label&quot;:&quot;build-box&quot;,&quot;target&quot;:&quot;builder@build-box&quot;,&quot;session&quot;:&quot;default&quot;,&quot;enabled&quot;:true,&quot;selected&quot;:false},{&quot;id&quot;:&quot;machine-gpu-box&quot;,&quot;label&quot;:&quot;gpu-box&quot;,&quot;target&quot;:&quot;builder@gpu-box&quot;,&quot;session&quot;:&quot;default&quot;,&quot;enabled&quot;:true,&quot;selected&quot;:false}]</code></pre>
+
+<p>Place each brief on the machine that will run it, beside its working tree. OAK does not copy a remote brief or clone the repository. The first Markdown heading becomes the task title. The three briefs in this example are <code>docs-brief.md</code> on laptop, <code>login-brief.md</code> on build-box, and <code>dates-brief.md</code> on gpu-box. The login brief contains:</p>
+<pre><code># Retry the login test
+
+Make the change, run its checks, and report the result.</code></pre>
+<h2>Start the agents</h2>
+<p>The brief’s filename, without <code>-brief.md</code>, supplies the id unless you pass <code>--name</code>. <code>--cwd</code> names the working tree. The output folder defaults to <code>&lt;id&gt;-out</code> beside that tree; <code>--out</code> overrides it. The completion report defaults to <code>report.md</code> there; <code>--report</code> overrides it. Start the documentation task locally and the other two on saved machines:</p>
+
+<pre><code>$ oak agent start --kind claude --brief /tmp/obs-demo/laptop/work/docs-brief.md --cwd /tmp/obs-demo/laptop/work/app
+Started docs (claude) in herdr tab &quot;docs: Document the retry policy&quot;, pane p1. Its report: /tmp/obs-demo/laptop/work/docs-out/report.md</code></pre>
+
+<pre><code>$ oak agent start --kind claude --brief /tmp/obs-demo/build-box/work/login-brief.md --cwd /tmp/obs-demo/build-box/work/app --machine build-box
+Started login (claude) on build-box in herdr tab &quot;login: Retry the login test&quot;, pane p2. Its report there: /tmp/obs-demo/build-box/work/login-out/report.md</code></pre>
+
+<pre><code>$ oak agent start --kind codex --brief /tmp/obs-demo/gpu-box/work/dates-brief.md --cwd /tmp/obs-demo/gpu-box/work/app --machine gpu-box
+Started dates (codex) on gpu-box in herdr tab &quot;dates: Cache parsed date formats&quot;, pane p3. Its report there: /tmp/obs-demo/gpu-box/work/dates-out/report.md</code></pre>
+
+<p>With a brief, the command returns after handing it to the native CLI. Claude Code accepts <code>--agent</code> and <code>--permission-mode</code>; Codex accepts <code>--model</code>, <code>--effort</code> and <code>--sandbox</code>. Defaults come from <code>agents.claude</code> and <code>agents.codex</code> in OAK’s preferences. A Codex start always adds its output folder to writable roots. OAK answers an initial folder-trust prompt by trusting the directory you named. Without <code>--brief</code>, <code>agent start</code> is the interactive launch path; a remote start then attaches the terminal there.</p>
+<h2>Track agents and workers</h2>
+<p><code>oak agent list</code> lists the agents started from this machine, including those it started remotely. This gives the orchestrator one list. Agents started independently elsewhere reach the shared database through sync; the SQL example below reads those records too.</p>
+
+<pre><code>$ oak agent list
+dates  working since 03:35:40  Cache parsed date formats
+    codex · on gpu-box · read 03:35:40 over ssh · tab dates: Cache parsed date formats
+login  working since 03:35:40  Retry the login test
+    claude · on build-box · read 03:35:40 over ssh · tab login: Retry the login test
+    └ worker Check the retry test · working · Sonnet 4.6 · 240 tok
+docs  working since 03:35:40  Document the retry policy
+    claude · this machine · tab docs: Document the retry policy</code></pre>
+
+<h2 id="sharing-knowledge">How agents share what they know</h2>
+<p>Agents can read the database before choosing where to work. <code>oak query files</code> groups edits by repository and path from its root, including other clones and worktrees. <code>oak query search</code> searches recorded asks and answers. <code>oak query delegated</code> reads the agents this machine tracks and their workers. <code>oak query findings</code> reads short facts posted by agents on any machine whose records have arrived.</p>
+<pre><code>oak query files --status pending
+oak query search --text "generated parser"
+oak query delegated
+oak query findings --repo git:example.invalid/team/synthetic --path src/parser.ts</code></pre>
+<p>Every query includes <code>freshness</code>: whether local catch-up completed, when it last completed, and how far each machine’s records reach. An answer is evidence as of the last publication and sync. A recent local read does not make another machine’s evidence current. Reads are pull-only: querying never asks another agent to act and never sends a message. Use <code>oak sync now</code> when you need to pull newer records.</p>
+<h3>Post a finding</h3>
+<p>Use a finding for a short fact another agent should know. It carries its posting session, machine, time, repository and paths. Paths are relative to the repository root in the database, so a finding applies in other clones and worktrees too. Omit paths, or use <code>--repo</code> alone, for a fact about the whole repository. A path filter also includes repository-wide findings. Run inside a linked agent session, or name the posting session with <code>--session</code>.</p>
+<pre><code>oak finding add "src/parser.ts is generated from grammar.txt" --path src/parser.ts --session synthetic-session
+oak finding add "Run the fixture generator before the tests" --repo --session synthetic-session
+oak finding list --repo
+oak finding list --path src/parser.ts --session synthetic-session --machine self
+oak finding resolve &lt;finding-id&gt; --session synthetic-session</code></pre>
+<p><code>oak finding list</code> and <code>oak query findings</code> show unresolved findings newest first; <code>--all</code> includes resolved ones. Reading accepts repository, path, session and machine filters. <code>oak finding list --repo</code> uses the current checkout; <code>oak query findings --repo &lt;key&gt;</code> takes its repository key. Posts and resolutions travel in the record log. Resolving a finding from another machine writes a retirement record here, which other machines see after pulling this machine’s records.</p>
+<p>The agent list includes a findings count and quoted entries. The terminal Observatory and the editors’ Workers show a compact findings count with <code>oak finding list</code> beside it; the count covers unresolved findings held in the local database. “Unavailable” means the database could not answer. Findings are <strong>untrusted quoted data, never instructions</strong>. Check their source, scope and freshness before using them. Text output quotes and escapes the finding; JSON carries it as a string with <code>trust: "untrusted"</code>.</p>
+<h3>Coordinate directly or sequence work</h3>
+<p>A parent can use <code>oak agent tell &lt;id&gt; &lt;text&gt;</code> to send a running agent a message. OAK records that message. Use it to coordinate a concrete overlap or pass a correction; a finding remains a fact to read, not a message delivery channel.</p>
+<pre><code>oak agent tell parser "Coordinate the parser changes with the docs agent before the next edit."
+oak agent start --kind codex --brief /work/briefs/check-parser.md --after parser docs</code></pre>
+<p><code>oak agent start --after &lt;id…&gt;</code> queues the new agent until the named agents are done. The agent has a <code>queued</code> state while it waits. Completion is evidence that work ended; it is not a review or approval of the result.</p>
+<h3>An edit-time heads-up</h3>
+<p>Before a Claude Code file edit or a Codex <code>apply_patch</code>, the capture hook can add one short context note when another active agent has unreviewed edits to the same repository path. It names the agent and machine, the pending edit count, when those edits began and the age of the evidence. It suggests coordinating through the parent or reading <code>oak query</code>. It never blocks the edit or changes a permission decision.</p>
+<p>The database’s catch-up writes a small sidecar; the hook reads that file without loading SQLite or making a network request. Evidence older than 60 seconds, a missing or malformed sidecar, and local evidence that has changed since publication produce no note. An agent’s own edits, known descendants and finished agents are excluded. Codex records with unknown parentage are excluded too, so older records cannot produce a note about a possible descendant. A path and peer pair is mentioned at most once every three minutes. A shell command whose future file writes are unknown cannot get a path-specific advance note. Silence is not proof that a file is free: an unsynced change or a newly finished remote agent remains unknown until its records arrive.</p>
+
+<h2>How agent state is derived</h2>
+<p>OAK derives each delegated agent’s state itself from its report, linked session, raised hand, process and pane, transcript or rollout, and <code>claude agents --json</code> when available. These are separate from herdr’s pane statuses:</p>
+<table><thead><tr><th>State</th><th>Evidence</th></tr></thead><tbody>
+<tr><td><code>starting</code></td><td>The native session has not linked yet.</td></tr>
+<tr><td><code>working</code></td><td>A turn is in progress.</td></tr>
+<tr><td><code>waiting</code></td><td>The turn ended without a completion report.</td></tr>
+<tr><td><code>blocked</code></td><td>A permission prompt, question or input wait needs a person.</td></tr>
+<tr><td><code>errored</code></td><td>The last turn stopped on an error; the row includes its message.</td></tr>
+<tr><td><code>done</code></td><td>A nonempty report was written since the agent started.</td></tr>
+<tr><td><code>gone</code></td><td>The process or pane ended without that report.</td></tr>
+</tbody></table>
+<p>A report marks completion, not approval of the changes. Read and review it before merging. The terminal Observatory lists delegated agents and their workers; selecting an agent pins its conversation, and <code>t</code> opens its native tab on its machine. VS Code and JetBrains list delegated agents in Workers. Every session’s in-process workers have their own log and no herdr tab.</p>
+<p>Select a worker in the Observatory or either editor’s Feed to follow its own log. From the shell, give the parent session and worker id; a remote log takes <code>--machine</code> too. Here the fixture records a reply and then the worker’s completion while the command follows it:</p>
+
+<pre><code>$ oak feed --kind agent --id check-login --session s-login --machine build-box --follow
+Check the retry test  ● live · 03:35:39 · agent
+Following worker log; no completion recorded yet.
+
+03:35:39   said — The retry test passes with the synthetic fixture.
+Worker ended at 2026-11-04T03:35:42.082Z (completed).</code></pre>
+
+<p>A completed worker’s log stays selected, with its recorded end time; a worker that resumes continues updating. Remote reads are at least ten seconds apart and failures are visible. Worker phases come from the call and its raised hand: a call with no result reads as awaiting permission while its permission hand is up, as awaiting input while the hand is an input wait, and as working otherwise.</p>
+<h2>Find who needs you</h2>
+<p><code>oak inbox</code> and the terminal’s <code>i</code> overlay list raised hands, including those other machines’ records brought through sync. The editors show them in their session selectors and Sessions. Each names its machine and whether it needs permission, an answer or input. The terminal’s <code>h</code> jump selects the most urgent local hand; a remote hand still needs its native session. Open that agent’s tab with <code>t</code> from the Observatory and answer there. A synced hand describes the last published state, so its age matters.</p>
+
+<h2>Wait for completion or a blocked turn</h2>
+<p><code>oak agent wait &lt;id…&gt;</code> defaults to <code>--until done</code>: every named agent must be done or gone, and any gone agent makes it exit 1. <code>--until blocked</code> returns when one is blocked or errored. <code>--until any</code> returns when one is neither starting nor working. A timeout exits 124. Local file watches wake the wait when evidence changes, with a two-second polling fallback; a remote agent is refreshed at most every three seconds.</p>
+<p>The synthetic Codex turn first stops on an error:</p>
+
+<pre><code>$ oak agent wait dates --until blocked --timeout 20
+dates  errored since 03:35:51  Cache parsed date formats
+    codex · on gpu-box · read 03:35:51 over ssh · tab dates: Cache parsed date formats
+    Synthetic provider is at capacity.</code></pre>
+
+<p>Handle an error or permission request in that agent’s native tab. This fixture then writes the three completion reports, after which the default wait succeeds:</p>
+
+<pre><code>$ oak agent wait docs login dates --timeout 20
+dates  done since 03:35:51  Cache parsed date formats
+    codex · on gpu-box · read 03:35:51 over ssh · tab dates: Cache parsed date formats
+login  done since 03:35:51  Retry the login test
+    claude · on build-box · read 03:35:51 over ssh · tab login: Retry the login test
+docs  done since 03:35:51  Document the retry policy
+    claude · this machine · tab docs: Document the retry policy</code></pre>
+
+<h2>Review where the changes were made</h2>
+<p>Read each report and the checks it records. In the terminal app, select the agent’s session and open Review with <code>F3</code>. A remote session’s review reads and actions run on its machine. The shell uses the same review verbs, with <code>--machine</code> selecting the saved machine:</p>
+
+<pre><code>$ oak review --session s-login --machine build-box
+s-login  whole session · 1 review unit(s)
+
+#1 tests/login.test.ts +1/−1
+Index: /tmp/obs-demo/build-box/work/app/tests/login.test.ts
+===================================================================
+--- /tmp/obs-demo/build-box/work/app/tests/login.test.ts
++++ /tmp/obs-demo/build-box/work/app/tests/login.test.ts
+@@ -1,1 +1,1 @@
+-test(&quot;login&quot;, run);
++test(&quot;login&quot;, () =&gt; retry(run, 3, 200));</code></pre>
+
+<pre><code>$ oak keep 1 --session s-login --machine build-box
+✓ kept edit #1 (tests/login.test.ts)</code></pre>
+
+<p>Keep records acceptance; it does not commit. Undo restores the captured previous content on that machine and refuses an unsafe overwrite when the file has changed since. Use <code>oak diff</code>, <code>undo</code>, <code>redo</code>, <code>comment</code> and <code>quote</code> with the same session and machine selection.</p>
+<p>VS Code and JetBrains list each saved machine in Switch Session, the Timeline selector, Sessions and Workers. Their parallel background reads share one cache per machine, with the answer’s age, errors, a ten-second refresh interval and a 45-second deadline. Selecting a saved machine’s session reads its Review, Timeline and Overview there; keep, undo, redo, comments, quotes and prompts run there. Opening an edit shows its remote patch. Review supports prompt scopes, Search, Filter, Sort, and per-edit, per-file and whole-session decisions. File History follows the remote file selected in Review. Decorations and inlays use local editor files; Open all in editor is hidden for remote Review. A record from a machine that is not saved is read-only here, with an offer to fetch the session. See <a href="editors-timeline.html#a-session-on-another-machine">remote editor review</a> for panel-specific limits.</p>
+<h2>Merge, then close the tabs</h2>
+<p>OAK does not merge. After review, commit the accepted changes in each agent’s checkout, fetch its branch into the integration checkout, and use your normal git merge or cherry-pick process. Run the combined checks there. <code>oak sync</code> shares session records and agent instructions; it does not transfer or merge repository changes. Keep, a completion report and a successful wait do not prove the branches integrate.</p>
+<p>Once the work is integrated, close the native tabs. A closed row remains available with <code>--all</code>; closing an agent before its report marks it gone.</p>
+
+<pre><code>$ oak agent close docs login dates
+Closed docs&#x27;s tab; it stays listed under `oak agent list --all` (done).
+Closed login&#x27;s tab; it stays listed under `oak agent list --all` (done).
+Closed dates&#x27;s tab; it stays listed under `oak agent list --all` (done).</code></pre>
+
+<pre><code>$ oak agent list
+no delegated agents — `oak agent start --kind claude|codex --brief &lt;file&gt;` starts one</code></pre>
+
+<p>Use <code>oak agent list --all</code> to include the closed rows. Their reports, captured edits and review decisions remain available.</p>
+<h2>Share the record across the SSH mesh</h2>
+<p>Run <code>oak sync now</code> once on each machine to begin sharing the record. Thereafter capture hooks and pollers start background runs at most every five minutes while automatic sync is enabled. The first run may need another pass while a large local database builds.</p>
+
+<pre><code>$ oak sync now
+oak sync: pulled 3 files, 8KB
+  build-box   2 files, 6KB
+  gpu-box     1 file, 2KB</code></pre>
+
+<p>Schema 5 added <code>delegated</code>, and the current database schema is 6. Its rows travel in the record log alongside sessions, prompts, answers, edits, workers, usage and raised hands. <code>oak query delegated --all</code> reads this machine’s tracked agents, including its remote pointers, and their workers; <code>workers=false</code> omits workers. To read agents independently started on every machine, join the table to <code>machines</code>. Filter <code>d.machine IS NULL</code> to select the owning machine’s records rather than also counting a caller’s remote pointer.</p>
+
+<pre><code>$ oak query sql &quot;SELECT coalesce(m.saved_label, m.label) AS machine, d.id, d.state FROM delegated d JOIN machines m USING (machine_id) WHERE d.machine IS NULL ORDER BY machine, d.id&quot; --json | jq -c &quot;.rows[]&quot;
+{&quot;machine&quot;:&quot;build-box&quot;,&quot;id&quot;:&quot;login&quot;,&quot;state&quot;:&quot;done&quot;}
+{&quot;machine&quot;:&quot;gpu-box&quot;,&quot;id&quot;:&quot;dates&quot;,&quot;state&quot;:&quot;done&quot;}
+{&quot;machine&quot;:&quot;this machine&quot;,&quot;id&quot;:&quot;docs&quot;,&quot;state&quot;:&quot;done&quot;}</code></pre>
+
+<p>A query’s own <code>--machine</code> filter takes the id, <code>self</code>, or the label you saved the machine under, and refuses any other name. <code>coalesce(m.saved_label, m.label)</code> gives the name in <code>machine_label</code>: the saved label where available, otherwise the machine’s own label. <code>oak query files</code> groups edits the same way, by repository and path from the repository’s root, across clones and worktrees. <code>oak query search --text "retry"</code> searches recorded asks and answers. Each answer includes freshness; it is evidence through the last publication and sync, not a live view of another process.</p>
+<p>For delegated agents, a remote row can come from the database when sync has read that machine within ten minutes, otherwise from its own CLI over SSH; the row says how and when it was read. A saved machine’s general session listing has a stricter cache condition: sync read it within ten minutes, its records were read whole, nothing there was active in the last two hours as its records and the files the last run saw there say, and no hand raised there in the last day is still up. Otherwise OAK asks the machine over SSH.</p>
+<p>Each machine publishes its own derived rows as its database catches up. Capture hooks request this at most once a minute and immediately when a raised hand changes. The Claude Code status line publishes through its <code>oak usage</code> call, on the renders that ask for the database’s totals (every render until those totals are whole, then about every ten minutes). A record segment is complete only at its writer’s sealed length or locally acknowledged append length. Bases retain purges, and writer lifetimes preserve ordering after a reinstall, including a clock rollback. <code>oak doctor</code> names a partly restored log and its recovery steps.</p>
+<h2>Usage and operating limits</h2>
+<p>Usage distinguishes a session’s own tokens from its total with agents. Dollars marked <code>~</code> are estimates at OAK’s versioned list prices; actual charges have no tilde. Schema 6 stores split cache-write counts and pricing context, and reprices old rows when the table changes. The month’s dollar figure follows its <code>mo</code> reset in status bars. Terminal and editor status bars omit the five-hour window; Stats, <code>oak usage</code> and the Claude Code status line retain it when the account has that limit. The status line compacts before wrapping in a narrow pane.</p>
+<p>A remote herdr server must outlive the SSH login for work to continue after the laptop disconnects; <a href="https://github.com/cell-observatory/oak-observatory/blob/dev/docs/REMOTE.md#keeping-agents-running-when-the-laptop-closes">Remote operation</a> explains the host setup. A worker on the laptop stops while it sleeps. Neither OAK’s tracking nor sync keeps a sleeping machine’s processes running.</p>
+<p>Sync carries recorded prompts, answers, paths, briefs’ control records and agent instructions to machines you trust. It does not carry login credentials. Any agent able to read the local database can read the shared record there. A synced state is the last recorded state; answering a permission request still requires the live native session. <a href="database-and-sync.html">Database &amp; sync</a> covers retention, purges, backup encryption, conflicts and exclusions.</p>

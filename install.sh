@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # OAK — one-shot installer from a clean checkout: CLI + the editor extensions for
 # whatever editors are on this machine (VS Code family and/or JetBrains) + status line + hooks.
-# Everything is built from THIS tree; nothing is downloaded. Safe to re-run. Does NOT commit anything.
+# OAK is built from THIS tree; what it needs is downloaded: the npm dependencies package-lock.json locks,
+# the herdr release herdr.lock pins, and with --jetbrains, Gradle and the IntelliJ Platform with their
+# dependencies (SECURITY.md lists each). Safe to re-run. Does NOT commit anything.
 #
 #   ./install.sh                 # skips the JetBrains plugin unless --jetbrains is given (slow build)
-#   ./install.sh --jetbrains     # also build + install the JetBrains plugin (needs JDK 21 + Gradle)
+#   ./install.sh --jetbrains     # also build + install the JetBrains plugin (needs a JDK 17 or newer)
 #
 # For a release install with no toolchain, use scripts/bootstrap.sh (or install.ps1 on Windows), which
 # also takes --channel stable|dev.
@@ -16,7 +18,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --jetbrains|--with-jetbrains) WITH_JETBRAINS=1; shift ;;
     -h|--help)
-      printf 'usage: ./install.sh [--jetbrains]\n\n  --jetbrains  also build + install the JetBrains plugin (needs JDK 21 + Gradle)\n'
+      printf 'usage: ./install.sh [--jetbrains]\n\n  --jetbrains  also build + install the JetBrains plugin. It needs a JDK 17 or newer to run the\n               Gradle wrapper, which downloads Gradle, and a JDK 21 when this machine has none.\n'
       exit 0 ;;
     *) printf 'unknown option: %s (try --help)\n' "$1" >&2; exit 1 ;;
   esac
@@ -53,7 +55,18 @@ pty_check() {
   fi
 }
 
-command -v npm >/dev/null 2>&1 || { warn "npm not found — install Node.js 20+ first."; exit 1; }
+command -v npm >/dev/null 2>&1 || { warn "npm not found — install Node.js 22 (22.16 or newer) or 24 or newer first."; exit 1; }
+# OAK needs Node.js 22 (22.16 or newer) or 24 or newer: its local index uses the SQLite built into Node, whose full-text
+# search 22 has from 22.16 and no 23 release has (core runtime.ts INDEX_NODES).
+# @vscode/vsce 4, which packages the VS Code extension below, needs 22 as well (on 20, npm installs it with only an
+# EBADENGINE warning). Checked before anything is installed.
+node_v="$(node -v 2>/dev/null || true)"; node_major="${node_v#v}"; node_minor="${node_major#*.}"; node_major="${node_major%%.*}"; node_minor="${node_minor%%.*}"
+case "$node_major" in ''|*[!0-9]*) node_major=0 ;; esac
+case "$node_minor" in ''|*[!0-9]*) node_minor=0 ;; esac
+if [ "$node_major" -lt 22 ] || [ "$node_major" -eq 23 ] || { [ "$node_major" -eq 22 ] && [ "$node_minor" -lt 16 ]; }; then
+  warn "OAK needs Node.js 22 (22.16 or newer) or 24 or newer (its local index uses the SQLite built into Node, whose full-text search 22 has from 22.16 and no 23 release has, and packaging the VS Code extension needs 22), and this is Node.js ${node_v:-(none found)}. Install one of those and re-run."
+  exit 1
+fi
 
 head "Installing workspace dependencies"
 # node-pty's install script runs under npm 12 because the root package.json allows it (`allowScripts`).
@@ -91,7 +104,7 @@ say "Packaged: $VSIX"
 
 JB_ZIP=""
 if [ "$WITH_JETBRAINS" = "1" ]; then
-  head "Building the JetBrains plugin (JDK 21 + Gradle)"
+  head "Building the JetBrains plugin with the Gradle wrapper"
   if bash scripts/install-jetbrains.sh --build-only; then
     # `command head`, not bare `head`: this script defines its own head() for section banners (above),
     # which shadows the binary. A bare pipe therefore captured the BANNER — "[6/6] -1" — as the zip

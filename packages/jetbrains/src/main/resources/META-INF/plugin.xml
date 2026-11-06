@@ -12,6 +12,7 @@
 
   <!-- Platform-only: loads in PyCharm CE/Pro, IntelliJ, WebStorm, … no Python APIs used. -->
   <depends>com.intellij.modules.platform</depends>
+  <depends optional="true" config-file="oak-terminal.xml">org.jetbrains.plugins.terminal</depends>
   <extensions defaultExtensionNs="com.intellij">
     <!-- Stripe icons need explicit 13x13 size + palette hex colors (the IDE recolors known hex
          values per theme; `currentColor` is not supported by the platform SVG icon loader). -->
@@ -36,6 +37,9 @@
                             implementation="com.cellobservatory.observatory.ui.ObservatoryActionsWidgetFactory"/>
     <statusBarWidgetFactory id="claudeObservatoryUsage" order="after claudeObservatoryActions"
                             implementation="com.cellobservatory.observatory.ui.ObservatoryUsageWidgetFactory"/>
+    <!-- oak sync's last run, hidden while sync is not in use here; a click opens its menu. -->
+    <statusBarWidgetFactory id="claudeObservatorySync" order="after claudeObservatoryUsage"
+                            implementation="com.cellobservatory.observatory.ui.SyncStatusWidgetFactory"/>
     <editorNotificationProvider implementation="com.cellobservatory.observatory.ui.editor.ObservatoryEditorBanner"/>
     <!-- The floating review bar over the code. `implementation` only, with no group id: the EP consumes
          the ActionGroup INSTANCE the provider returns, so a registered <group> would be dead weight.
@@ -56,22 +60,34 @@
               class="com.cellobservatory.observatory.actions.ReviewNextAction"
               text="OAK: Review Next Pending Edit"
               description="Jump to the oldest pending agent edit">
-        <keyboard-shortcut keymap="$default" first-keystroke="ctrl alt N"/>
-        <keyboard-shortcut keymap="Mac OS X 10.5+" first-keystroke="meta alt N" replace-all="true"/>
+        <keyboard-shortcut keymap="$default" first-keystroke="ctrl alt X" second-keystroke="N"/>
+        <keyboard-shortcut keymap="Mac OS X 10.5+" first-keystroke="meta alt X" second-keystroke="N" replace-all="true"/>
       </action>
       <action id="ClaudeObservatory.ReviewPrev"
               class="com.cellobservatory.observatory.actions.ReviewPrevAction"
               text="OAK: Review Previous Pending Edit"
               description="Step to the previous pending agent edit">
-        <keyboard-shortcut keymap="$default" first-keystroke="ctrl alt P"/>
-        <keyboard-shortcut keymap="Mac OS X 10.5+" first-keystroke="meta alt P" replace-all="true"/>
+        <keyboard-shortcut keymap="$default" first-keystroke="ctrl alt X" second-keystroke="P"/>
+        <keyboard-shortcut keymap="Mac OS X 10.5+" first-keystroke="meta alt X" second-keystroke="P" replace-all="true"/>
+      </action>
+      <action id="ClaudeObservatory.ReviewNextFile"
+              class="com.cellobservatory.observatory.actions.ReviewNextFileAction"
+              text="OAK: Review Next Changed File">
+        <keyboard-shortcut keymap="$default" first-keystroke="ctrl alt X" second-keystroke="RIGHT"/>
+        <keyboard-shortcut keymap="Mac OS X 10.5+" first-keystroke="meta alt X" second-keystroke="RIGHT" replace-all="true"/>
+      </action>
+      <action id="ClaudeObservatory.ReviewPrevFile"
+              class="com.cellobservatory.observatory.actions.ReviewPrevFileAction"
+              text="OAK: Review Previous Changed File">
+        <keyboard-shortcut keymap="$default" first-keystroke="ctrl alt X" second-keystroke="LEFT"/>
+        <keyboard-shortcut keymap="Mac OS X 10.5+" first-keystroke="meta alt X" second-keystroke="LEFT" replace-all="true"/>
       </action>
       <action id="ClaudeObservatory.AddReviewComment"
               class="com.cellobservatory.observatory.actions.AddReviewCommentAction"
               text="OAK: Add Review Comment"
               description="Comment for the agent on the pending edit under the cursor">
-        <keyboard-shortcut keymap="$default" first-keystroke="ctrl alt C"/>
-        <keyboard-shortcut keymap="Mac OS X 10.5+" first-keystroke="meta alt C" replace-all="true"/>
+        <keyboard-shortcut keymap="$default" first-keystroke="ctrl alt X" second-keystroke="C"/>
+        <keyboard-shortcut keymap="Mac OS X 10.5+" first-keystroke="meta alt X" second-keystroke="C" replace-all="true"/>
       </action>
       <action id="ClaudeObservatory.SendReviewComments"
               class="com.cellobservatory.observatory.actions.SendReviewCommentsAction"
@@ -85,8 +101,8 @@
               class="com.cellobservatory.observatory.actions.NextAttentionAction"
               text="OAK: Jump to the Next Session Waiting on You"
               description="Permission prompts first, then questions, then input waits — the needs-you inbox's order">
-        <keyboard-shortcut keymap="$default" first-keystroke="ctrl alt I"/>
-        <keyboard-shortcut keymap="Mac OS X 10.5+" first-keystroke="meta alt I" replace-all="true"/>
+        <keyboard-shortcut keymap="$default" first-keystroke="ctrl alt X" second-keystroke="H"/>
+        <keyboard-shortcut keymap="Mac OS X 10.5+" first-keystroke="meta alt X" second-keystroke="H" replace-all="true"/>
       </action>
       <action id="ClaudeObservatory.SearchConversations"
               class="com.cellobservatory.observatory.actions.SearchConversationsAction"
@@ -96,43 +112,43 @@
               class="com.cellobservatory.observatory.actions.KeepAtCursorAction"
               text="OAK: Keep Pending Edit at Cursor"
               description="Keep the pending agent edit under the cursor">
-        <keyboard-shortcut keymap="$default" first-keystroke="ctrl alt Y"/>
-        <keyboard-shortcut keymap="Mac OS X 10.5+" first-keystroke="meta alt Y" replace-all="true"/>
+        <keyboard-shortcut keymap="$default" first-keystroke="ctrl alt X" second-keystroke="A"/>
+        <keyboard-shortcut keymap="Mac OS X 10.5+" first-keystroke="meta alt X" second-keystroke="A" replace-all="true"/>
       </action>
       <action id="ClaudeObservatory.UndoAtCursor"
               class="com.cellobservatory.observatory.actions.UndoAtCursorAction"
               text="OAK: Undo Pending Edit at Cursor"
               description="Surgically undo the pending agent edit under the cursor">
-        <keyboard-shortcut keymap="$default" first-keystroke="ctrl alt U"/>
-        <keyboard-shortcut keymap="Mac OS X 10.5+" first-keystroke="meta alt U" replace-all="true"/>
+        <keyboard-shortcut keymap="$default" first-keystroke="ctrl alt X" second-keystroke="U"/>
+        <keyboard-shortcut keymap="Mac OS X 10.5+" first-keystroke="meta alt X" second-keystroke="U" replace-all="true"/>
       </action>
       <action id="ClaudeObservatory.KeepOpenFile"
               class="com.cellobservatory.observatory.actions.KeepOpenFileAction"
-              text="OAK: Accept All Edits in File"
-              description="Accept every pending agent edit in the active file">
-        <keyboard-shortcut keymap="$default" first-keystroke="ctrl alt K"/>
-        <keyboard-shortcut keymap="Mac OS X 10.5+" first-keystroke="meta alt K" replace-all="true"/>
+              text="OAK: Keep All Edits in File"
+              description="Keep every pending agent edit in the active file">
+        <keyboard-shortcut keymap="$default" first-keystroke="ctrl alt X" second-keystroke="shift A"/>
+        <keyboard-shortcut keymap="Mac OS X 10.5+" first-keystroke="meta alt X" second-keystroke="shift A" replace-all="true"/>
       </action>
       <action id="ClaudeObservatory.UndoOpenFile"
               class="com.cellobservatory.observatory.actions.UndoOpenFileAction"
-              text="OAK: Reject All Edits in File"
-              description="Revert every pending agent edit in the active file">
-        <keyboard-shortcut keymap="$default" first-keystroke="ctrl alt R"/>
-        <keyboard-shortcut keymap="Mac OS X 10.5+" first-keystroke="meta alt R" replace-all="true"/>
+              text="OAK: Undo All Edits in File"
+              description="Undo every pending agent edit in the active file">
+        <keyboard-shortcut keymap="$default" first-keystroke="ctrl alt X" second-keystroke="shift D"/>
+        <keyboard-shortcut keymap="Mac OS X 10.5+" first-keystroke="meta alt X" second-keystroke="shift D" replace-all="true"/>
       </action>
       <action id="ClaudeObservatory.DiffPrevRevision"
               class="com.cellobservatory.observatory.actions.DiffPrevRevisionAction"
               text="OAK: Diff Previous Revision"
               description="Diff the current file against the state produced by the previous agent edit">
-        <keyboard-shortcut keymap="$default" first-keystroke="ctrl alt OPEN_BRACKET"/>
-        <keyboard-shortcut keymap="Mac OS X 10.5+" first-keystroke="meta alt OPEN_BRACKET" replace-all="true"/>
+        <keyboard-shortcut keymap="$default" first-keystroke="ctrl alt X" second-keystroke="OPEN_BRACKET"/>
+        <keyboard-shortcut keymap="Mac OS X 10.5+" first-keystroke="meta alt X" second-keystroke="OPEN_BRACKET" replace-all="true"/>
       </action>
       <action id="ClaudeObservatory.DiffNextRevision"
               class="com.cellobservatory.observatory.actions.DiffNextRevisionAction"
               text="OAK: Diff Next Revision"
               description="Diff the current file against the state produced by the next agent edit">
-        <keyboard-shortcut keymap="$default" first-keystroke="ctrl alt CLOSE_BRACKET"/>
-        <keyboard-shortcut keymap="Mac OS X 10.5+" first-keystroke="meta alt CLOSE_BRACKET" replace-all="true"/>
+        <keyboard-shortcut keymap="$default" first-keystroke="ctrl alt X" second-keystroke="CLOSE_BRACKET"/>
+        <keyboard-shortcut keymap="Mac OS X 10.5+" first-keystroke="meta alt X" second-keystroke="CLOSE_BRACKET" replace-all="true"/>
       </action>
       <!-- Session-level utilities: reachable from Find Action / keybindable (no default keymaps). Each
            reuses the shared panel handler (ReviewOps / the service), so behavior never forks. -->
@@ -140,6 +156,18 @@
               class="com.cellobservatory.observatory.actions.SetupCheckAction"
               text="OAK: Setup Check (doctor)"
               description="Open the setup diagnostics — hooks, PATH, config, session, status line"/>
+      <action id="ClaudeObservatory.Sync"
+              class="com.cellobservatory.observatory.actions.SyncMenuAction"
+              text="OAK: Sync…"
+              description="oak sync across the saved machines: the last run, conflicts, the backup and the machines synced"/>
+      <action id="ClaudeObservatory.SyncNow"
+              class="com.cellobservatory.observatory.actions.SyncNowAction"
+              text="OAK: Sync Now"
+              description="Pull from the saved machines what this machine keeps (oak sync now)"/>
+      <action id="ClaudeObservatory.SyncSetup"
+              class="com.cellobservatory.observatory.actions.SyncSetupAction"
+              text="OAK: Set Up or Change the Sync Backup…"
+              description="Choose where sessions are backed up, and where a backup folder's key comes from (oak sync setup)"/>
       <action id="ClaudeObservatory.ExportSummary"
               class="com.cellobservatory.observatory.actions.ExportReviewSummaryAction"
               text="OAK: Export Review Summary"

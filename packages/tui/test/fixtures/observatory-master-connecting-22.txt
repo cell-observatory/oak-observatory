@@ -1,8 +1,8 @@
 laptop
   demo
     v claude · p1
-        drive-agents-e
-        ditor-polish
+        tidy-fixture-i
+        mporter-pass
         with every
         word preserved
         + blocked ·
@@ -19,7 +19,7 @@ laptop
         14:00:00
     v claude · p4
       no session yet
-  docs
+  docs [W window]
     v claude · p3
         Waiting for
         prompt

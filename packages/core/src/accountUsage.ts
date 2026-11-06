@@ -17,8 +17,9 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { claudeConfigDir } from './paths';
-import { spawnToolSync, spawnTool } from './spawn';
+import { spawnToolSync, spawnTool, noBackgroundChildren } from './spawn';
 import { withFileMutation } from './store';
+import { rewriteStatuslineCache } from './statusline-lock';
 
 const API_URL = 'https://api.anthropic.com/api/oauth/usage';
 // Claude Code's own OAuth token endpoint and PUBLIC client id (both read out of the shipped
@@ -262,9 +263,28 @@ export function applyAccountUsage(
   const r7 = epochSec(api.seven_day?.resets_at);
   if (p5 == null && p7 == null && r5 == null && r7 == null) return null;
   const out: Record<string, unknown> = { ...cache };
-  if (typeof p5 === 'number' && isFinite(p5)) { out.five_pct = p5; out.five_at = nowSec; }
+  // NO FIVE-HOUR LIMIT (2026-10-30): an answer that carries the weekly window and no 5h window (`five_hour` null or
+  // missing, or its utilization null) is an account with no five-hour limit, as Claude Code's own usage view reads it: it
+  // draws no Current session bar then. Verified Ultra accounts answer so. The cache records when (five_none_at), and no
+  // 5h share or reset; an answer that carries a 5h window records when too (five_seen_at). Only these answers decide it,
+  // never a share: core and the status line hide the 5h readout while the newest no-limit answer is at least as new as
+  // the newest answer with a 5h window, so neither a 0 nor any share shows.
+  const none5 = p5 == null && (p7 != null || r7 != null);
+  if (none5) out.five_none_at = nowSec;
+  else if (typeof p5 === 'number' && isFinite(p5)) out.five_seen_at = nowSec;
+  // NO 5H WINDOW RUNNING IS AN ANSWER, as the status line reads one: a 5h window whose resets_at is null, beside the
+  // weekly window an account with rolling limits reports, is no 5h window running. Its share is 0, stamped now
+  // beside the reset the cache keeps, which core and the line read as an ended window: 0%, no countdown. The share the
+  // answer gave beside no reset was read as one from a Claude Code that sends none, and given an estimated countdown.
+  // A reset the cache keeps that is still ahead names a window such an answer does not end, as the line's own pull reads
+  // it (pick_win weighs a share with no reset only where no reset is known or the known one has passed): the share
+  // recorded in it stands. A 0 beside that reset read `0% ·1h 0m` everywhere, where the line's own pull kept the share.
+  const kept5 = epochSec(cache.five_reset as string | number | undefined);
+  if (!none5 && api.five_hour?.resets_at == null && api.seven_day?.resets_at != null) {
+    if (kept5 === null || kept5 <= nowSec) { out.five_pct = 0; out.five_at = nowSec; }
+  } else if (typeof p5 === 'number' && isFinite(p5)) { out.five_pct = p5; out.five_at = nowSec; }
   if (typeof p7 === 'number' && isFinite(p7)) { out.week_pct = p7; out.week_at = nowSec; }
-  if (r5 !== null) out.five_reset = r5;
+  if (r5 !== null && !none5) out.five_reset = r5;
   if (r7 !== null) out.week_reset = r7;
   const fb = (api.limits ?? []).find((l) => l?.kind === 'weekly_scoped');
   if (fb && typeof fb.percent === 'number') {
@@ -304,29 +324,20 @@ export async function pullAccountUsage(): Promise<boolean> {
     logPull(cfg, `fetch:${String((e as Error)?.message ?? e).slice(0, 80)}`);
     return false;
   }
-  const cachePath = path.join(cfg, 'statusline-last.json');
-  let cache: Record<string, unknown> = {};
+  // Read, merged and renamed under the status line's own cache lock, as each render does: without it, this pull and a
+  // render finishing together undid each other's readings (statusline-lock.ts). Without the lock in about a second it
+  // writes nothing, as a render then skips its write, and the next pull writes what this one would have.
   try {
-    const j = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
-    if (j && typeof j === 'object') cache = j as Record<string, unknown>;
-  } catch {
-    /* first write — the merge starts from an empty cache */
-  }
-  const merged = applyAccountUsage(cache, api);
-  if (!merged) {
-    logPull(cfg, 'no-windows-in-answer');
-    return false;
-  }
-  // Old versions labelled historical Codex snapshots with the CURRENT login's fingerprint.
-  // That cannot establish event ownership after an account switch. Remove those exports on
-  // refresh; native rollouts need trustworthy account provenance before quota can be shared.
-  for (const key of ['gpt_ts', 'gpt_account', 'gpt_five_pct', 'gpt_five_reset', 'gpt_week_pct', 'gpt_week_reset']) delete merged[key];
-  try {
-    const tmp = `${cachePath}.pull.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(merged), { mode: 0o600 });
-    fs.renameSync(tmp, cachePath);
-    logPull(cfg, 'ok');
-    return true;
+    const done = await rewriteStatuslineCache(path.join(cfg, 'statusline-last.json'), (cache) => {
+      const merged = applyAccountUsage(cache, api);
+      // Old versions labelled historical Codex snapshots with the CURRENT login's fingerprint.
+      // That cannot establish event ownership after an account switch. Remove those exports on
+      // refresh; native rollouts need trustworthy account provenance before quota can be shared.
+      if (merged) for (const key of ['gpt_ts', 'gpt_account', 'gpt_five_pct', 'gpt_five_reset', 'gpt_week_pct', 'gpt_week_reset']) delete merged[key];
+      return merged;
+    });
+    logPull(cfg, done === 'written' ? 'ok' : done === 'unchanged' ? 'no-windows-in-answer' : `cache-lock-${done}`);
+    return done === 'written';
   } catch (e) {
     logPull(cfg, `write:${String((e as Error)?.message ?? e).slice(0, 80)}`);
     return false;
@@ -377,7 +388,7 @@ export function dueMonthRefresh(claimMs = 5 * 60_000): boolean {
 export function kickMonthRefresh(cwd: string): void {
   try {
     const script = path.join(claudeConfigDir(), 'statusline.sh');
-    if (!fs.existsSync(script) || !dueMonthRefresh()) return;
+    if (noBackgroundChildren() || !fs.existsSync(script) || !dueMonthRefresh()) return;
     // The payload names the workspace, not the process's directory: on Windows the process starts at
     // home, elsewhere in the caller's directory (see spawnTool).
     const child = spawnTool('bash', [script], { detached: true, stdio: ['pipe', 'ignore', 'ignore'] });

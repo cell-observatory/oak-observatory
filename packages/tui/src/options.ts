@@ -12,11 +12,13 @@
  */
 import { displayWidth, fitVisible, wrapVisible } from './textwidth';
 import { ColorDepth, Glyphs, tint } from './glyphs';
+import { syncBackupLine, type SyncView } from './observatory';
 import {
   Prefs,
   Action,
   DEFAULT_NOTIFY_KINDS,
   REBINDABLE,
+  RESERVED_KEYS,
   keyConflicts,
   ColorPref,
   GlyphPref,
@@ -25,7 +27,19 @@ import {
   THEME_NAMES,
   EditorChoice,
   editorLabel,
+  editorKind,
+  GUI_EDITOR_SOURCE,
+  GuiEditorSource,
+  relTime,
 } from '@oak-observatory/core';
+
+/** The keys of prefs.json the terminal app sets: its layout, and what this window edits (the sort key steps one of
+ *  them). It saves only these, over the file as it is then, so a key set elsewhere while it runs (`oak usage
+ *  --bill-day`, `oak titles`, a hand edit) stays as set. Two of them are set elsewhere too: `storeDir` by `oak store
+ *  --move` and the editors, and `sort` by VS Code; the app saves those only when it changes them itself. */
+export const APP_PREF_KEYS = ['layout', 'editor', 'guiEditor', 'color', 'glyphs', 'mouse', 'refreshSeconds', 'startFocus', 'sort', 'syntax',
+  'theme', 'notify', 'keys', 'blockedKeys', 'storeDir'] as const satisfies readonly (keyof Prefs)[];
+export type AppPrefKey = (typeof APP_PREF_KEYS)[number];
 
 /** What the runtime knows and this module cannot look up: the environment behind the fallbacks, and
  *  the editors found on this machine. Passed to `optionRows` AND `applyOption`, so the list ←→ steps
@@ -35,10 +49,17 @@ export interface OptionEnv {
   term?: string;
   file?: string;
   editors?: readonly EditorChoice[];
+  /** What the GUI editor's Auto resolves to here now (core's resolveGuiEditor without the setting), null when nothing
+   *  does: W would refuse. */
+  gui?: { command: string; source: GuiEditorSource } | null;
   /** The RESOLVED store root, as `rootDir()` reports it right now. Passed in rather than looked up
    *  because this module is pure — and shown even when unset, because "where is my data" is the
    *  question, and a row that only appears once you have changed it answers it for nobody. */
   store?: string;
+  /** oak sync, while it is in use here or a machine is saved (otherwise the window has no SYNC section): the last
+   *  `oak sync status --json` (null until it is read), the saved machines' labels, this workspace's project (its
+   *  identity key and folder), and the time the run's clock times are said against. Its rows run the CLI. */
+  sync?: { status: SyncView | null; machines: readonly string[]; project?: { key: string; folder: string }; now: number };
 }
 
 /**
@@ -52,6 +73,13 @@ export interface OptionEnv {
 export function editorChoices(p: Prefs, env: OptionEnv): string[] {
   const list = ['', ...(env.editors ?? []).map((e) => e.command)];
   if (p.editor && !list.includes(p.editor)) list.push(p.editor);
+  return list;
+}
+
+/** The values the GUI editor row cycles: Auto (''), the GUI editors found here, then a typed command that is neither. */
+export function guiEditorChoices(p: Prefs, env: OptionEnv): string[] {
+  const list = ['', ...(env.editors ?? []).map((e) => e.command).filter((c) => editorKind(c) === 'gui')];
+  if (p.guiEditor && !list.includes(p.guiEditor)) list.push(p.guiEditor);
   return list;
 }
 
@@ -133,18 +161,29 @@ export function optionRows(p: Prefs, env: OptionEnv = {}): OptionRow[] {
     {
       kind: 'text',
       id: 'editor',
-      label: 'Editor command',
+      label: 'Terminal editor',
       value: p.editor || (env.editor ? `${env.editor}  (from the environment)` : 'not set'),
       // The list is what THIS machine has. An editor the reader does not own is never offered, so a
       // choice made here can always be run — and the row shows the command rather than a friendly
       // name, because the flag is the part that matters and the part they would get wrong by hand.
       choices: editorChoices(p, env),
       help: named
-        ? `${named}. ←→ steps through the ${editors.length} editor(s) found here; enter types any command. Blank follows $VISUAL then $EDITOR.`
+        ? `${named}: the terminal editor \`e\` and E run. ←→ steps through the ${editors.length} editor(s) found here; enter types any command. Blank follows $VISUAL then $EDITOR.`
         : editors.length
-          ? `←→ steps through the ${editors.length} editor(s) found here; enter types any command. Blank follows $VISUAL then $EDITOR. GUI editors open their own window — \`e\` never blinks the dashboard; terminal editors take it over until they exit.`
-          : 'What `e` runs. Blank follows $VISUAL then $EDITOR. Arguments are allowed: `emacsclient -nw`.',
+          ? `The terminal editor \`e\` and E run. ←→ steps through the ${editors.length} editor(s) found here; enter types any command. Blank follows $VISUAL then $EDITOR. Terminal editors take the dashboard over until they exit; a GUI one here opens its own window.`
+          : 'The terminal editor `e` and E run. Blank follows $VISUAL then $EDITOR. Arguments are allowed: `emacsclient -nw`.',
       problem: p.editor || env.editor ? undefined : 'nothing to run — `e` will refuse until this or $EDITOR is set',
+    },
+    {
+      kind: 'text',
+      id: 'guiEditor',
+      label: 'GUI editor',
+      value: p.guiEditor || (env.gui ? `auto: ${env.gui.command}` : 'auto'),
+      choices: guiEditorChoices(p, env),
+      help: `What W opens: the session's workspace window on the Observatory, the selected edit at its line on Review. ←→ steps through Auto and the GUI editors found here; enter types any command. Auto takes the terminal editor, $VISUAL or $EDITOR when it is a GUI editor, then the editor whose terminal this is, then the first GUI editor on PATH${env.gui ? ` (now ${env.gui.command}, from ${GUI_EDITOR_SOURCE[env.gui.source]})` : ''}.`,
+      problem: p.guiEditor
+        ? editorKind(p.guiEditor) === 'gui' ? undefined : `${p.guiEditor} is a terminal editor (or one OAK does not know) — W will refuse it; pick a GUI editor, or blank for Auto`
+        : env.gui === null ? 'no GUI editor found — W will refuse until this is set' : undefined,
     },
     { kind: 'heading', id: '', label: 'DISPLAY', value: '', help: '' },
     {
@@ -234,16 +273,19 @@ export function optionRows(p: Prefs, env: OptionEnv = {}): OptionRow[] {
       help: 'A session that raises its hand again within this many seconds stays quiet — unless the new wait is more urgent. Steps by 5.',
     },
   ];
+  if (env.sync) rows.push(...syncRows(env.sync));
   rows.push({ kind: 'heading', id: '', label: 'KEYS', value: '', help: '' });
   for (const r of REBINDABLE) {
     const c = conflicts.find((x) => x.action === r.action);
+    const blocked = p.keys?.[r.action] ? undefined : p.blockedKeys?.[r.action];
     rows.push({
       kind: 'key',
       id: `key:${r.action}`,
       label: r.label,
       value: p.keys?.[r.action] ?? r.fallback,
       help: 'Enter, then press the key you want. Esc keeps the current one.',
-      problem: c ? `also bound to ${c.takenBy} — that one wins, this action has no key` : undefined,
+      problem: c ? `also bound to ${c.takenBy} — that one wins, this action has no key`
+        : blocked ? `your saved key ${blocked === ' ' ? 'space' : blocked} is now kept for the frame itself, so ${r.fallback} runs this until you choose another` : undefined,
     });
   }
   rows.push(
@@ -253,9 +295,62 @@ export function optionRows(p: Prefs, env: OptionEnv = {}): OptionRow[] {
       id: 'reset',
       label: 'Reset every option',
       value: '',
-      help: 'Back to the defaults, and deletes the preferences file.',
+      help: 'Back to the defaults for this window and the layout. Settings made outside it, such as the bill days and `oak titles --off`, are kept.',
     }
   );
+  return rows;
+}
+
+/**
+ * The SYNC section. Its truth is prefs.json, which only the CLI writes for sync: each row's work is a command the
+ * runtime starts (`oak sync setup`, which asks on the terminal where sessions are backed up and where a folder's key
+ * comes from; `--restore` when a run refused the folder's record under this machine's name; `oak sync now`; and
+ * `oak sync include` or `exclude` for a saved machine or a project), and `applyOption` leaves them alone.
+ */
+function syncRows(s: NonNullable<OptionEnv['sync']>): OptionRow[] {
+  const st = s.status;
+  const b = st?.backup ?? null;
+  const line = st ? syncBackupLine(st) : undefined;
+  const failed = line && line.status !== 'ok' ? line.text ?? line.detail ?? line.status : undefined;
+  const last = st?.last;
+  const offMachines = new Set(st?.exclude.machines ?? []);
+  const offProjects = new Set(st?.exclude.projects ?? []);
+  const rows: OptionRow[] = [
+    { kind: 'heading', id: '', label: 'SYNC', value: '', help: '' },
+    {
+      // The value a word, so it fits its column: what it names goes in the detail, which wraps.
+      kind: 'action', id: 'sync.setup', label: 'Backup', value: !b ? 'none' : b.kind,
+      detail: b?.kind === 'folder' && st
+        ? [b.path, st.key.present ? `key ${st.key.fingerprint}` : `no key here${st.key.error ? `: ${st.key.error}` : ''}`, ...(failed ? [failed] : [])].join(' · ')
+        : b?.kind === 'machine' ? b.label : failed,
+      help: 'enter runs `oak sync setup` here: it asks where sessions are backed up (nowhere else, a saved machine, or an encrypted folder) and where a folder\'s key comes from',
+    },
+  ];
+  if (line?.record) {
+    rows.push({ kind: 'action', id: 'sync.restore', label: 'This machine is a reinstall', value: '',
+      help: 'enter asks, then takes the folder\'s record under this machine\'s name over (`oak sync setup --restore`): the next run restores this machine\'s sessions from it' });
+  }
+  rows.push({
+    kind: 'action', id: 'sync.now', label: 'Sync now', value: st?.running ? 'running…' : last ? last.status : 'not run yet',
+    ...(last ? { detail: `last run ${relTime(last.at, s.now)}${last.error ? ` · it stopped: ${last.error}` : ''}` } : {}),
+    help: 'enter runs `oak sync now`: it pulls what this machine keeps from the saved machines, and shows what the run did; enter again stops a run started here',
+  });
+  // The last run whole, in an overlay that scrolls: as many lines as it has, which no row of this window could hold.
+  if (last) {
+    const failing = last.machines.filter((m) => m.errors.length > 0 || !['ok', 'disabled', 'excluded', 'duplicate', 'shared'].includes(m.status)).length;
+    const n = (k: number, one: string): string => `${k} ${one}${k === 1 ? '' : 's'}`;
+    rows.push({ kind: 'action', id: 'sync.last', label: 'The last run', value: '',
+      detail: [n(last.machines.length, 'machine'), ...(failing ? [`${failing} failed`] : []), ...(last.warnings.length ? [n(last.warnings.length, 'warning')] : [])].join(' · '),
+      help: 'enter shows `oak sync status`: each machine\'s line, the conflicts and the warnings' });
+  }
+  const toggle = (id: string, label: string, on: boolean, what: string, detail?: string): OptionRow => ({
+    kind: 'toggle', id, label, value: on ? 'on' : 'off', ...(detail ? { detail } : {}),
+    help: `enter or ←→ runs \`oak sync ${on ? 'exclude' : 'include'} ${what}\``,
+  });
+  // Each saved machine, and any machine excluded here that is no longer saved, which can still be brought back.
+  for (const m of new Set([...s.machines, ...offMachines])) rows.push(toggle(`sync.machine:${m}`, `Sync with ${m}`, !offMachines.has(m), m));
+  if (s.project) rows.push(toggle('sync.project', 'Sync this project', !offProjects.has(s.project.key), s.project.folder, `${s.project.folder} (${s.project.key})`));
+  for (const key of offProjects) if (key !== s.project?.key) rows.push(toggle(`sync.project:${key}`, 'Sync the project', false, key, key));
   return rows;
 }
 
@@ -281,6 +376,10 @@ export function applyOption(p: Prefs, id: string, dir: -1 | 1, env: OptionEnv = 
     const picked = cycle(editorChoices(p, env), p.editor ?? '');
     if (picked) next.editor = picked;
     else delete next.editor;
+  } else if (id === 'guiEditor') {
+    const picked = cycle(guiEditorChoices(p, env), p.guiEditor ?? '');
+    if (picked) next.guiEditor = picked;
+    else delete next.guiEditor;
   } else if (id === 'color') next.color = cycle(COLORS, p.color ?? 'auto');
   else if (id === 'glyphs') next.glyphs = cycle(GLYPHS, p.glyphs ?? 'auto');
   else if (id === 'sort') next.sort = cycle(SORT_KEYS, p.sort ?? 'time');
@@ -307,18 +406,29 @@ export function applyOption(p: Prefs, id: string, dir: -1 | 1, env: OptionEnv = 
 /** Set a captured value — the text of the editor row, or the key of a binding row. */
 export function setOption(p: Prefs, id: string, value: string): Prefs {
   const next: Prefs = { ...p, keys: p.keys ? { ...p.keys } : {} };
-  if (id === 'editor') {
-    if (value.trim()) next.editor = value.trim();
-    else delete next.editor;
+  if (id === 'editor' || id === 'guiEditor') {
+    if (value.trim()) next[id] = value.trim();
+    else delete next[id];
     return next;
   }{}
   if (id.startsWith('key:')) {
     const action = id.slice(4) as Action;
     const fallback = REBINDABLE.find((r) => r.action === action)?.fallback;
     if (!value || [...value].length !== 1) return p; // unchanged: a non-key press cancels the capture
+    // Space, the digits, `:` and the marks are the frame's own, and the Observatory's letters would give
+    // one key two meanings across the tabs: refused, with the reason, rather than saved and never fired.
+    if (RESERVED_KEYS.has(value)) {
+      return { ...p, __reject: `${value === ' ' ? 'space' : value} is kept for the frame itself (space, the digits, : ' \` and the Observatory's c d f t v B H J K L R X | -) — choose another key` };
+    }
     if (value === fallback) delete next.keys![action];
     else next.keys![action] = value;
     if (!Object.keys(next.keys!).length) delete next.keys;
+    // A key chosen here replaces the saved one the frame had kept out of the keymap.
+    if (next.blockedKeys?.[action]) {
+      next.blockedKeys = { ...next.blockedKeys };
+      delete next.blockedKeys[action];
+      if (!Object.keys(next.blockedKeys).length) delete next.blockedKeys;
+    }
     return next;
   }
   return p;
@@ -341,43 +451,32 @@ export function renderOptions(
   depth: ColorDepth
 ): string[] {
   const out: string[] = [];
-  const valueW = Math.min(28, Math.max(8, Math.floor(cols * 0.3)));
-  const labelW = Math.max(10, cols - valueW - 6);
-  for (let i = scroll; i < rows.length && out.length < height; i++) {
-    const r = rows[i];
-    if (r.kind === 'heading') {
-      out.push(fitVisible(out.length ? '' : ' ', cols));
-      if (out.length < height) out.push(fitVisible(`  ${tint(r.label, 'accent', depth)}`, cols));
-      continue;
-    }
-    const on = i === cursor;
-    // The value is padded to a fixed column so the whole list reads as a table; a ragged right edge
-    // makes "which of these did I change" a scan rather than a glance.
-    const label = pad(r.label, labelW);
-    const value = r.value;
-    const line = `  ${on ? g.closed : ' '} ${label} ${pad(value, valueW)}`;
-    out.push(
-      depth === 'none' || !on
-        ? fitVisible(line, cols)
-        : fitVisible(`\x1b[7m${line}\x1b[0m`, cols)
-    );
-    // ALWAYS, not only when selected — see `detail`. Wrapped rather than fitted: this is a path, and
-    // a cut path is the one thing this product never renders.
-    if (r.detail && out.length < height) {
-      for (const seg of wrapVisible(r.detail, Math.max(8, cols - 6))) {
-        if (out.length >= height) break;
-        out.push(fitVisible(depth === 'none' ? `      ${seg}` : `      \x1b[2m${seg}\x1b[0m`, cols));
-      }
-    }
-    if (r.problem && out.length < height) {
-      out.push(fitVisible(`      ${tint(`! ${r.problem}`, 'risk', depth)}`, cols));
-    }
-    if (on && r.help && out.length < height) {
-      out.push(fitVisible(depth === 'none' ? `      ${r.help}` : `      \x1b[2m${r.help}\x1b[0m`, cols));
-    }
-  }
+  for (let i = scroll; i < rows.length && out.length < height; i++) out.push(...optionRowLines(rows[i], i === cursor, out.length === 0, cols, g, depth));
   while (out.length < height) out.push(fitVisible('', cols));
   return out.slice(0, height);
+}
+
+/** The lines one row of the window draws (`first`: at the top of the window, where a heading needs no blank line
+ *  above it). The runtime measures with it too, so the selected row is kept on screen however many lines rows draw. */
+export function optionRowLines(r: OptionRow, on: boolean, first: boolean, cols: number, g: Glyphs, depth: ColorDepth): string[] {
+  if (r.kind === 'heading') return [fitVisible(first ? ' ' : '', cols), fitVisible(`  ${tint(r.label, 'accent', depth)}`, cols)];
+  const valueW = Math.min(28, Math.max(8, Math.floor(cols * 0.3)));
+  const labelW = Math.max(10, cols - valueW - 6);
+  // The value is padded to a fixed column so the whole list reads as a table; a ragged right edge
+  // makes "which of these did I change" a scan rather than a glance. A label wider than its column (a long machine
+  // name) wraps above the value rather than being cut.
+  const parts = displayWidth(r.label) <= labelW ? [r.label] : wrapVisible(r.label, labelW);
+  const lines = parts.map((p, i) => `  ${on && i === 0 ? g.closed : ' '} ${i < parts.length - 1 ? p : `${pad(p, labelW)} ${pad(r.value, valueW)}`}`);
+  const out = lines.map((line) => (depth === 'none' || !on ? fitVisible(line, cols) : fitVisible(`\x1b[7m${line}\x1b[0m`, cols)));
+  const dim = (seg: string): string => fitVisible(depth === 'none' ? `      ${seg}` : `      \x1b[2m${seg}\x1b[0m`, cols);
+  // ALWAYS, not only when selected — see `detail`. Wrapped rather than fitted: this is a path, and
+  // a cut path is the one thing this product never renders. A detail of several lines (the last sync run, a
+  // machine a line) keeps them.
+  if (r.detail) out.push(...r.detail.split('\n').flatMap((l) => wrapVisible(l, Math.max(8, cols - 6))).map(dim));
+  // The problem and the help are wrapped too: a sentence cut at the window's edge says less than it should.
+  if (r.problem) out.push(...wrapVisible(`! ${r.problem}`, Math.max(8, cols - 6)).map((seg) => fitVisible(`      ${tint(seg, 'risk', depth)}`, cols)));
+  if (on && r.help) out.push(...wrapVisible(r.help, Math.max(8, cols - 6)).map(dim));
+  return out;
 }
 
 function pad(s: string, w: number): string {

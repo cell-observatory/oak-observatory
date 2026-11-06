@@ -13,6 +13,7 @@ import com.intellij.execution.process.ProcessAdapter
 import com.intellij.execution.process.ProcessEvent
 import com.intellij.execution.process.ProcessOutputTypes
 import com.intellij.execution.util.ExecUtil
+import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.util.Key
 import com.intellij.openapi.util.SystemInfo
 import java.io.File
@@ -70,11 +71,29 @@ object ObservatoryCli {
         env("LOCALAPPDATA")?.let { add("$it\\Volta\\bin\\$name.exe"); add("$it\\pnpm\\$name.cmd") }
     }
 
-    private fun commandLine(args: List<String>, workDir: String?): GeneralCommandLine {
+    private val machineContext = ThreadLocal<String?>()
+    internal fun currentMachine(): String? = machineContext.get()
+
+    /** Capture the target before scheduling work; a later selection must never retarget that work. */
+    fun <T> onMachine(machine: String?, work: () -> T): T {
+        val before = machineContext.get()
+        machineContext.set(machine)
+        return try { work() } finally { machineContext.set(before) }
+    }
+
+    internal fun targetArgs(args: List<String>): List<String> {
+        val machine = machineContext.get() ?: return args
+        if ("--machine" in args || "--session" !in args) return args
+        // A local project's root has no meaning on the selected machine.
+        val root = args.indexOf("--root")
+        return args.filterIndexed { i, _ -> root < 0 || i !in root..root + 1 } + listOf("--machine", machine)
+    }
+
+    internal fun commandLine(args: List<String>, workDir: String?): GeneralCommandLine {
         // Windows: npm installs the CLI as a .cmd shim, which ProcessBuilder can't exec directly —
         // route through cmd.exe (which also does PATH+PATHEXT resolution for the bare fallback).
         val bin = resolveBin()
-        val exec = if (SystemInfo.isWindows) listOf("cmd", "/c", bin) + args else listOf(bin) + args
+        val exec = if (SystemInfo.isWindows) listOf("cmd", "/c", bin) + targetArgs(args) else listOf(bin) + targetArgs(args)
         val cmd = GeneralCommandLine(exec)
             .withCharset(Charsets.UTF_8)
             .withRedirectErrorStream(false)
@@ -83,6 +102,7 @@ object ObservatoryCli {
         ObservatorySettings.instance.state.configDir?.takeIf { it.isNotBlank() }?.let {
             cmd.withEnvironment("CLAUDE_CONFIG_DIR", it)
         }
+        if ("--machine" in targetArgs(args)) cmd.withEnvironment("OAK_MACHINE_TIMEOUT_MS", (if (args.firstOrNull() == "install-extensions") 180_000 else SavedMachines.DEADLINE_MS).toString())
         return cmd
     }
 
@@ -144,7 +164,7 @@ object ObservatoryCli {
 
         /** ONE definition of the cache key — [peek] and [view] must agree, or a peek silently never
          *  hits and the picker pays a full spawn every time it opens. */
-        private fun cacheKey(session: String?, workDir: String?) = "${session.orEmpty()}\u0000${workDir.orEmpty()}"
+        private fun cacheKey(session: String?, workDir: String?) = "${currentMachine().orEmpty()}\u0000${session.orEmpty()}\u0000${workDir.orEmpty()}"
 
         /** The cached batch for [k] if it is still inside the window, else null. */
         private fun fresh(k: String): Map<String, String?>? = synchronized(lock) {
@@ -197,7 +217,8 @@ object ObservatoryCli {
                 // tick permanently disabled batching for the rest of the IDE session, putting every
                 // later tick back on eight spawns, which is the regression this batch exists to prevent.
                 // Returning an empty map already makes THIS tick fall back per-view; the next tick retries.
-                if (r.stderr.contains("unknown command")) unsupported = true
+                if (currentMachine() != null) lastProblems = listOf("Could not read session on ${currentMachine()} — ${failureMessage(r.stdout, r.stderr, "no answer")}")
+                else if (r.stderr.contains("unknown command")) unsupported = true
                 return emptyMap()
             }
             return try {
@@ -223,6 +244,7 @@ object ObservatoryCli {
 
     fun run(args: List<String>, workDir: String? = null, stdin: String? = null, timeoutMs: Int = 30_000): CliResult {
         val cmd = commandLine(args, workDir)
+        val deadline = if ("--machine" in targetArgs(args)) (if (args.firstOrNull() == "install-extensions") 185_000 else SavedMachines.DEADLINE_MS + 5_000) else timeoutMs
         return try {
             val out = if (stdin != null) {
                 val proc = cmd.createProcess()
@@ -236,19 +258,19 @@ object ObservatoryCli {
                 val tOut = Thread { proc.inputStream.bufferedReader(Charsets.UTF_8).use { outBuf.append(it.readText()) } }
                 val tErr = Thread { proc.errorStream.bufferedReader(Charsets.UTF_8).use { errBuf.append(it.readText()) } }
                 tOut.start(); tErr.start()
-                if (proc.waitFor(timeoutMs.toLong(), TimeUnit.MILLISECONDS)) {
+                if (proc.waitFor(deadline.toLong(), TimeUnit.MILLISECONDS)) {
                     tOut.join(1000); tErr.join(1000)
                     CliResult(proc.exitValue(), outBuf.toString(), errBuf.toString())
                 } else {
                     proc.destroyForcibly()
                     tOut.join(500); tErr.join(500)
-                    CliResult(-1, outBuf.toString(), "oak timed out after ${timeoutMs}ms")
+                    CliResult(-1, outBuf.toString(), "oak timed out after ${deadline}ms")
                 }
             } else {
-                val o = ExecUtil.execAndGetOutput(cmd, timeoutMs)
+                val o = ExecUtil.execAndGetOutput(cmd, deadline)
                 // ExecUtil signals a timeout via isTimeout, not a non-zero exit — treat it as a failure
                 // so callers don't mistake a killed run's partial output for a result.
-                if (o.isTimeout) CliResult(-1, o.stdout, "oak timed out after ${timeoutMs}ms")
+                if (o.isTimeout) CliResult(-1, o.stdout, "oak timed out after ${deadline}ms")
                 else CliResult(o.exitCode, o.stdout, o.stderr)
             }
             out
@@ -268,16 +290,60 @@ object ObservatoryCli {
     /** Drop a whole session from the store (`clean --drop <id>`). */
     fun dropSession(session: String, workDir: String?): CliResult = run(listOf("clean", "--drop", session), workDir)
 
-    /** Remove a session from every picker and purge its captured edits for good (`sessions --delete <id>`),
-     *  backed by core.deleteSession. The agent's OWN transcript/rollout is left untouched — the durable
-     *  hidden-list is what keeps it gone — and `sessions --undelete <id>` lists the session again, never its
-     *  edits. [confirmedPending] is how many edits still pending review the caller's dialog named, and
+    /** Remove a session from every picker and purge its captured edits (`sessions --delete <id>`), backed by
+     *  core.deleteSession: for good, or with a backup folder set, here only (deleteWords). The agent's OWN
+     *  transcript/rollout is left untouched — the durable hidden-list is what keeps it gone — and `sessions
+     *  --undelete <id>` lists the session again: without its edits, or with what of them a backup folder holds once
+     *  the next `oak sync now` runs. [confirmedPending] is how many edits still pending review the caller's dialog named, and
      *  [seenThrough] the newest edit id of the listing it counted from (its row's `lastEdit`): the CLI refuses
      *  a session with more pending than that count, or with a pending edit newer than that id, so no edit
      *  captured after the listing is purged unseen, even one that joined a change the count included. */
     fun deleteSession(session: String, workDir: String?, confirmedPending: Int, seenThrough: Long?): CliResult =
         run(listOf("sessions", "--delete", session) + (if (confirmedPending > 0) listOf("--force-pending", confirmedPending.toString()) else emptyList()) +
             (if (seenThrough != null) listOf("--seen-through", seenThrough.toString()) else emptyList()) + "--json", workDir)
+
+    // --- oak sync: its status, its actions, and its settings, which the CLI keeps in prefs.json ---
+
+    /** `sync status --json`: what the last run left, read from this machine's store alone (no ssh); with [root], also that
+     *  folder's project as `sync exclude` keys it, and whether it is excluded. */
+    fun syncStatus(workDir: String?, root: String? = null): CliResult =
+        run(listOf("sync", "status", "--json") + (root?.let { listOf("--root", it) } ?: emptyList()), workDir, timeoutMs = 30_000)
+
+    /** `sync status` as the CLI prints it: every machine's line whole, the conflicts and the warnings. */
+    fun syncStatusText(workDir: String?): CliResult = run(listOf("sync", "status"), workDir, timeoutMs = 30_000)
+
+    /** `sync now --json`, stopped (with the ssh it started) when [indicator] is cancelled. A run asks every saved machine
+     *  and may move gigabytes, so it may take an hour. Every machine failing exits 1 with its JSON on stdout. */
+    fun syncNow(workDir: String?, indicator: com.intellij.openapi.progress.ProgressIndicator): CliResult = try {
+        val o = com.intellij.execution.process.CapturingProcessHandler(commandLine(listOf("sync", "now", "--json"), workDir))
+            .runProcessWithProgressIndicator(indicator, 60 * 60_000)
+        when {
+            o.isCancelled -> CliResult(-1, o.stdout, "stopped")
+            o.isTimeout -> CliResult(-1, o.stdout, "oak timed out after an hour")
+            else -> CliResult(o.exitCode, o.stdout, o.stderr)
+        }
+    } catch (e: Exception) {
+        CliResult(-1, "", e.message ?: "failed to launch oak")
+    }
+
+    /** `sync setup <args> --json`, with a pasted [key] on standard input (`--import-key`). It previews a first run,
+     *  which asks every saved machine, so it may take minutes. A folder that needs its key from elsewhere exits 1 with
+     *  `needsKey` in its JSON. */
+    fun syncSetup(args: List<String>, key: String?, workDir: String?): CliResult =
+        run(listOf("sync", "setup") + args + "--json", workDir, stdin = key, timeoutMs = 600_000)
+
+    /** `sync resolve <id> --json`: the other machine's copy goes to sync's trash, and this machine's file stands. */
+    fun syncResolve(id: String, workDir: String?): CliResult = run(listOf("sync", "resolve", id, "--json"), workDir, timeoutMs = 60_000)
+
+    /** `sync include|exclude <machine|project> --json`: a saved machine by its label, a project by a folder or its key. */
+    fun syncSelect(include: Boolean, what: String, workDir: String?): CliResult =
+        run(listOf("sync", if (include) "include" else "exclude", what, "--json"), workDir, timeoutMs = 60_000)
+
+    /** The saved machines' labels, from herdr's own list (`machine list --json`); none when herdr is not here. */
+    fun machineLabels(workDir: String?): List<String> = runCatching {
+        JsonParser.parseString(run(listOf("machine", "list", "--json"), workDir).stdout).asJsonArray
+            .mapNotNull { it.takeIf { e -> e.isJsonObject }?.asJsonObject?.get("label")?.takeIf { l -> l.isJsonPrimitive }?.asString?.takeIf { l -> l.isNotBlank() } }
+    }.getOrDefault(emptyList())
 
     /** True only when [r] is the CLI saying it deleted [session] (`{"deleted": "<id>"}`). A CLI from before
      *  `sessions --delete` (0.9.5, which the plugin still drives through its `claude-observatory` fallback)
@@ -288,19 +354,55 @@ object ObservatoryCli {
 
     /** Announce a raised hand on the desktop IF DUE (`notify --session …`, 2026-09-15): core's once-per-
      *  machine claim and cooldown decide — the plugin cannot call core, so the row's facts go over as
-     *  flags and the SAME rule every surface uses answers. Fire-and-forget; never on the EDT. */
-    fun notifyHand(session: String, kind: String, ts: Long, title: String?, message: String, agent: String, workDir: String?): CliResult =
+     *  flags and the SAME rule every surface uses answers. Fire-and-forget; never on the EDT. A
+     *  permission prompt is posted only if it still stands after its wait, which the CLI sits out: up to
+     *  90 s (core's AUTO_REVIEW_WAIT_MS) for a Codex session under Auto-review, so the budget covers it. */
+    fun notifyHand(session: String, kind: String, ts: Long, title: String?, message: String, agent: String, workDir: String?,
+        host: String? = null, machine: String? = null): CliResult =
         run(
-            listOf("notify", "--session", session, "--kind", kind, "--ts", ts.toString(), "--title", title ?: "", "--message", message, "--agent", agent, "--json"),
+            listOf("notify", "--session", session, "--kind", kind, "--ts", ts.toString(), "--title", title ?: "", "--message", message, "--agent", agent) +
+                // Another machine's hand (a `syncedHands` row): claimed under that machine, announced at once, naming it.
+                (if (host != null) listOf("--host", host, "--machine", machine ?: host) else emptyList()) + "--json",
             workDir,
-            timeoutMs = 10_000,
+            timeoutMs = 100_000,
         )
 
-    /** Every conversation's asks and answers, ranked (`search --json --query <text>`).
-     *  The first search builds core's per-session index, so its timeout is generous. The whole result,
-     *  so a failed run is never read as "no hits". */
-    fun search(query: String, workDir: String?): CliResult =
-        run(listOf("search", "--json", "--query", query, "--limit", "30"), workDir, timeoutMs = 120_000)
+    /** Whether [notifyHand]'s hand still stood when its wait ended (`stillUp`): a permission prompt pops up
+     *  only then. True when the CLI does not say (one older than the field, or a run that failed), so a
+     *  hand is never lost to a missing answer. */
+    fun handStillUp(r: CliResult): Boolean = !r.ok || try {
+        JsonParser.parseString(r.stdout).asJsonObject.get("stillUp")?.takeIf { it.isJsonPrimitive }?.asBoolean ?: true
+    } catch (_: Exception) {
+        true
+    }
+
+    /** Each machine answers independently; callers run this off the EDT. */
+    fun search(query: String, workDir: String?, machine: String? = null): CliResult =
+        run(listOf("search", "--json", "--query=$query", "--per-session", "--limit", "200") +
+            (machine?.let { listOf("--machine", it) } ?: emptyList()), workDir, timeoutMs = SavedMachines.DEADLINE_MS + 5_000)
+
+    data class ConversationSearch(val hits: List<com.cellobservatory.observatory.model.SearchHit>, val errors: List<String>)
+    fun searchMachines(query: String, workDir: String?): ConversationSearch {
+        val app = ApplicationManager.getApplication()
+        fun start(machine: String?) = app.executeOnPooledThread<Pair<List<com.cellobservatory.observatory.model.SearchHit>, String?>> {
+            val r = search(query, workDir, machine)
+            val valid = r.ok && runCatching { JsonParser.parseString(r.stdout).asJsonObject.get("hits")?.isJsonArray == true }.getOrDefault(false)
+            if (valid) com.cellobservatory.observatory.model.SearchParser.parse(r.stdout).map { it.copy(machine = machine) } to null
+            else emptyList<com.cellobservatory.observatory.model.SearchHit>() to "${machine ?: "This machine"}: ${failureMessage(r.stdout, r.stderr, "search did not answer")}"
+        }
+        val local = start(null)
+        val listing = run(listOf("machine", "list", "--json"), workDir, timeoutMs = SavedMachines.DEADLINE_MS + 5_000)
+        val machines = runCatching {
+            check(listing.ok)
+            JsonParser.parseString(listing.stdout).asJsonArray.mapNotNull { e ->
+                val m = e.asJsonObject
+                if (m.get("enabled")?.asBoolean == false) null else m.get("label")?.asString?.takeIf { it.isNotBlank() }
+            }.distinct()
+        }.getOrNull()
+        val results = (listOf(local) + machines.orEmpty().map(::start)).map { it.get() }
+        val errors = results.mapNotNull { it.second } + if (machines == null) listOf("Saved machines: ${failureMessage(listing.stdout, listing.stderr, "machine list did not answer")}") else emptyList()
+        return ConversationSearch(results.flatMap { it.first }, errors)
+    }
 
     /** The next session waiting on the reader (`inbox --next [--after <id>] --json` → `{next, hand}`),
      *  by core's ranking. The whole result, so a failed read is never read as "nobody waiting". */
@@ -695,8 +797,8 @@ object ObservatoryCli {
 
     /** Per-pending-edit geometry in the LIVE buffer text (may be unsaved): added lines, deleted hunks and
      *  churn. Parsing lives in [LocateParser] so the payload contract is testable without a subprocess. */
-    fun locate(session: String, file: String, currentText: String, workDir: String?): List<Placement> {
-        val r = run(listOf("locate", "--file", file, "--session", session), workDir, stdin = currentText)
+    fun locate(session: String, file: String, currentText: String, workDir: String?, includeUndone: Boolean = false): List<Placement> {
+        val r = run(listOf("locate", "--file", file, "--session", session) + (if (includeUndone) listOf("--include-undone") else emptyList()), workDir, stdin = currentText)
         if (!r.ok) return emptyList()
         return LocateParser.parse(r.stdout)
     }
@@ -717,22 +819,65 @@ object ObservatoryCli {
         }
     }
 
+    /** What [ignoreWouldDrop] found: a count, a CLI too old to count, or no count at all. */
+    sealed interface IgnoreCount {
+        data class Would(val n: Int) : IgnoreCount
+        /** The CLI answers review protocol below 2: it would ignore `--dry-run` and sweep, so it was not asked. */
+        object OlderCli : IgnoreCount
+        /** No count: no CLI, a failure, or an answer without a whole-number `wouldDrop`. */
+        object Unknown : IgnoreCount
+    }
+
+    /** `ignore --dry-run --session <id> --json` — how many recorded edits the sweep would drop, dropping
+     *  nothing. It first checks `__review-protocol --level` is at least 2: an older CLI ignores `--dry-run`
+     *  and SWEEPS, so it is never asked. No count is an error, never 0. */
+    fun ignoreWouldDrop(workDir: String?, session: String): IgnoreCount {
+        if (session.isBlank()) return IgnoreCount.Unknown
+        val lv = run(listOf("__review-protocol", "--level"), workDir)
+        if (!lv.ok) return IgnoreCount.Unknown
+        val level = lv.stdout.trim().toIntOrNull() ?: return IgnoreCount.Unknown
+        if (level < 2) return IgnoreCount.OlderCli
+        val r = run(listOf("ignore", "--dry-run", "--session", session, "--json"), workDir)
+        if (!r.ok) return IgnoreCount.Unknown
+        return try {
+            val n = JsonParser.parseString(r.stdout).asJsonObject.get("wouldDrop")
+                ?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isNumber }?.asDouble ?: return IgnoreCount.Unknown
+            n.toInt().takeIf { it >= 0 && it.toDouble() == n }?.let { IgnoreCount.Would(it) } ?: IgnoreCount.Unknown
+        } catch (_: Exception) {
+            IgnoreCount.Unknown
+        }
+    }
+
     /** `ignore --session <id>` — runs the sweep (core.dropIgnored) that drops records a newly-added
-     *  `.observatoryignore` now covers. A USER Refresh calls this before re-reading: adding the file fires
-     *  no capture hook, so the capture-time sweep never runs and a plain refresh (a read) leaves the
-     *  now-ignored records. Self-gating (a no-op when nothing matches). Best-effort. */
+     *  `.observatoryignore` now covers. A USER Refresh calls this, after [ignoreWouldDrop] and a confirm:
+     *  adding the file fires no capture hook, so the capture-time sweep never runs and a plain refresh
+     *  (a read) leaves the now-ignored records. Self-gating (a no-op when nothing matches). */
     fun ignoreSweep(workDir: String?, session: String): Boolean {
         if (session.isBlank()) return false
         return run(listOf("ignore", "--session", session, "--json"), workDir).ok
     }
 
-    /** `store --move <dir>` (or `--default`). The move is the CLI's, shared with every other front end. */
+    /** `store --move <dir>` (or `--default`). The move is the CLI's, shared with every other front end. A move that
+     *  stands can carry notes ([storeMoveNotes]). The budget is a long copy's, not a read's: timed out, the CLI is
+     *  killed part way through the move. */
     fun storeMove(workDir: String?, dir: String?): ChangeResult {
-        val res = run(if (dir == null) listOf("store", "--default") else listOf("store", "--move", dir), workDir)
-        return ChangeResult(if (res.ok) null else res.stderr.trim().ifBlank { "could not move the store" })
+        val res = run(if (dir == null) listOf("store", "--default") else listOf("store", "--move", dir), workDir, timeoutMs = 600_000)
+        return if (res.ok) ChangeResult(null, storeMoveNotes(res.stderr)) else ChangeResult(res.stderr.trim().ifBlank { "could not move the store" })
     }
 
-    data class ChangeResult(val error: String?)
+    /** What the IDE says when `store --move` fails: the CLI's reason, as a refusal. Except a move that stood but
+     *  `prefs.json` could not record: said as "Store not moved — the store moved to …", it contradicted itself. */
+    internal fun storeMoveFailure(error: String): String {
+        val why = error.removePrefix("oak: ")
+        return if (why.startsWith("the store moved to ")) why.replaceFirstChar { it.uppercase() } else "Store not moved — $why"
+    }
+
+    /** The `note:` lines a move that stood prints on stderr: what the removal of the original left behind, and the
+     *  edits agents made meanwhile that could not wait for the move. */
+    internal fun storeMoveNotes(stderr: String): List<String> =
+        stderr.lines().map { it.trim() }.filter { it.startsWith("note:") }.map { it.removePrefix("note:").trim() }.filter { it.isNotEmpty() }
+
+    data class ChangeResult(val error: String?, val notes: List<String> = emptyList())
 
     /** `sessions --json` — every store session incl. its human-readable title (0.8.6), for the chooser.
      *
@@ -756,6 +901,32 @@ object ObservatoryCli {
         }
         val r = run(args, workDir)
         return if (r.ok) r.stdout else null
+    }
+
+    /** This machine's session listing (as [sessionsJson] reads it, [reviewing] kept in it) with every other machine's
+     *  sessions this machine's local index holds from its records (`sessions --json --synced`, 0.11.0), whose `machines`
+     *  [com.cellobservatory.observatory.model.SessionsParser.machines] reads; null when the CLI did not answer. */
+    fun syncedSessionsJson(workDir: String?, reviewing: String? = null): String? {
+        val r = run(buildList {
+            add("sessions"); add("--json"); add("--synced")
+            reviewing?.takeIf { it.isNotBlank() }?.let { add("--session"); add(it) }
+        }, workDir)
+        return if (r.ok) r.stdout else null
+    }
+
+    /** Bring one session here from the machine that made it, else the backup (`sync fetch <id> --json`), stopped (with the
+     *  ssh it started) when [indicator] is cancelled: its answer names where it now is (`path`) and the machine it came
+     *  from, or why each machine tried gave nothing. */
+    fun syncFetch(session: String, indicator: com.intellij.openapi.progress.ProgressIndicator): CliResult = try {
+        val o = com.intellij.execution.process.CapturingProcessHandler(commandLine(listOf("sync", "fetch", session, "--json"), null))
+            .runProcessWithProgressIndicator(indicator, 600_000)
+        when {
+            o.isCancelled -> CliResult(-1, o.stdout, "stopped")
+            o.isTimeout -> CliResult(-1, o.stdout, "oak timed out after ten minutes")
+            else -> CliResult(o.exitCode, o.stdout, o.stderr)
+        }
+    } catch (e: Exception) {
+        CliResult(-1, "", e.message ?: "failed to launch oak")
     }
 
     fun statsJson(session: String?, workDir: String?): String? {
@@ -962,9 +1133,12 @@ object ObservatoryCli {
      *  exit code, output volume. No OS pid is reported because none exists to report: the transcript
      *  never records one, and guessing it from local processes breaks the moment the agent runs over
      *  SSH or in a container. */
-    fun processesJson(session: String, workDir: String?): String? {
-        ViewBatch.view("processes", session, workDir)?.let { return it }
+    /** [failed] gets why a saved machine's read failed (null when it answered, or on this machine). */
+    fun processesJson(session: String, workDir: String?, failed: (String?) -> Unit = {}): String? {
+        ViewBatch.view("processes", session, workDir)?.let { failed(null); return it }
         val r = run(listOf("processes", "--session", session, "--json"), workDir)
+        val machine = currentMachine()
+        failed(if (r.ok || machine == null) null else failureMessage(r.stdout, r.stderr, "$machine did not answer"))
         return if (r.ok) r.stdout else null
     }
 
@@ -1008,7 +1182,50 @@ object ObservatoryCli {
     /** A bounded tail of what ONE thing is doing: an agent, a workflow run, a task, a background shell,
      *  or the session itself. core decides whether the source is still writing ('live') or has finished
      *  ('audit'), so both editors follow — and stop following — the same things. */
-    fun feedJson(session: String, kind: String, id: String, limit: Int, workDir: String?): String? {
+    /** Called on a pooled thread. Each remote read has the shared deadline; quiet local shells stay open. */
+    fun followProcessOutput(session: String, id: String, workDir: String?, machine: String?, cancelled: () -> Boolean, onSnapshot: (String) -> Unit): CliResult {
+        return try {
+            val args = listOf("processes", "--follow", id, "--session", session, "--json") +
+                (machine?.let { listOf("--machine", it) } ?: workDir?.let { listOf("--root", it) }.orEmpty())
+            val handler = OSProcessHandler(commandLine(args, workDir))
+            val pending = StringBuilder()
+            val error = StringBuffer()
+            val received = java.util.concurrent.atomic.AtomicBoolean(false)
+            val invalid = java.util.concurrent.atomic.AtomicBoolean(false)
+            handler.addProcessListener(object : ProcessAdapter() {
+                override fun onTextAvailable(event: ProcessEvent, outputType: Key<*>) {
+                    if (cancelled()) return
+                    if (outputType == ProcessOutputTypes.STDERR) { if (error.length < 8192) error.append(event.text); return }
+                    if (outputType != ProcessOutputTypes.STDOUT || invalid.get()) return
+                    pending.append(event.text)
+                    if (pending.length > 512 * 1024) { invalid.set(true); error.append("Oversized process snapshot"); handler.destroyProcess(); return }
+                    while (true) {
+                        val end = pending.indexOf("\n")
+                        if (end < 0) break
+                        val line = pending.substring(0, end)
+                        pending.delete(0, end + 1)
+                        if (line.isBlank()) continue
+                        val valid = runCatching {
+                            val o = JsonParser.parseString(line).asJsonObject
+                            o.get("processLogVersion")?.asInt == 1 && o.getAsJsonObject("ref")?.get("id")?.asString == id && o.has("process") && o.get("entries")?.isJsonArray == true
+                        }.getOrDefault(false)
+                        if (!valid) { invalid.set(true); error.append("Update OAK on the session’s machine for live process output"); handler.destroyProcess(); return }
+                        received.set(true)
+                        onSnapshot(line)
+                    }
+                }
+            })
+            handler.startNotify()
+            val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos((SavedMachines.DEADLINE_MS + 5000).toLong())
+            while (!handler.waitFor(200)) {
+                if (cancelled()) { handler.destroyProcess(); return CliResult(-1, "", "cancelled") }
+                if (!received.get() && System.nanoTime() > deadline) { handler.destroyProcess(); return CliResult(-1, "", "Process output did not answer before the shared deadline") }
+            }
+            CliResult(if (invalid.get() || !received.get()) -1 else handler.exitCode ?: -1, "", error.toString())
+        } catch (e: Exception) { CliResult(-1, "", e.message ?: "Could not follow process output") }
+    }
+
+    fun feedJson(session: String, kind: String, id: String, limit: Int, workDir: String?, machine: String? = null): String? {
         val args = buildList {
             add("feed"); add("--kind"); add(kind)
             if (id.isNotBlank()) { add("--id"); add(id) }
@@ -1017,12 +1234,19 @@ object ObservatoryCli {
             // workspace — a sibling worktree's feed is unreadable without it.
             add("--feed-limit"); add(limit.toString())
             add("--limit"); add(limit.toString())
-            workDir?.let { add("--root"); add(it) }
+            if (machine != null) { add("--machine"); add(machine) } else workDir?.let { add("--root"); add(it) }
             add("--session"); add(session)
             add("--json")
         }
         val r = run(args, workDir)
-        return if (r.ok) r.stdout else null
+        if (machine == null) return if (r.ok) r.stdout else null
+        if (kind != "agent") return if (r.ok) r.stdout else com.google.gson.Gson().toJson(mapOf(
+            "ref" to mapOf("kind" to kind, "id" to id), "entries" to emptyList<Any>(), "title" to "Session on $machine",
+            "mode" to "audit", "note" to "Read failed on $machine: ${failureMessage(r.stdout, r.stderr, "no answer")}"))
+        val compatible = r.ok && runCatching { com.google.gson.JsonParser.parseString(r.stdout).asJsonObject.get("workerLogVersion")?.asInt == 1 }.getOrDefault(false)
+        if (compatible) return r.stdout
+        return com.google.gson.Gson().toJson(mapOf("ref" to mapOf("kind" to kind, "id" to id), "entries" to emptyList<Any>(),
+            "title" to id, "mode" to "live", "note" to "Worker log unavailable on $machine: ${if (r.ok) "update OAK there for live worker logs" else r.stderr.ifBlank { "SSH read failed" }}"))
     }
 
     /** Zero-token chat handoff: core assembles a ready-to-paste review prompt for an edit / subagent /
@@ -1087,10 +1311,17 @@ object ObservatoryCli {
      */
     fun prompt(session: String, text: String, workDir: String?, commentIds: List<String> = emptyList()): String? {
         val args = mutableListOf("prompt", "--session", session, "--text=$text", "--json")
-        if (commentIds.isNotEmpty()) { args.add("--comment-ids"); args.add(commentIds.joinToString(",")) }
+        val machine = currentMachine()
+        if (commentIds.isNotEmpty() && machine == null) { args.add("--comment-ids"); args.add(commentIds.joinToString(",")) }
         val r = run(args, workDir, timeoutMs = HEAVY_TIMEOUT_MS)
         val o = runCatching { JsonParser.parseString(r.stdout).asJsonObject }.getOrNull()
-        if (r.ok && o?.get("sent")?.takeIf { it.isJsonPrimitive }?.asBoolean == true) return null
+        if (r.ok && o?.get("sent")?.takeIf { it.isJsonPrimitive }?.asBoolean == true) {
+            if (machine != null && commentIds.isNotEmpty()) {
+                val marked = run(listOf("comment", "mark-sent", "--ids", commentIds.joinToString(","), "--session", session, "--json"), workDir)
+                if (!marked.ok) return "Sent to the agent on $machine, but could not mark its comments sent: ${failureMessage(marked.stdout, marked.stderr, "no answer")}. Do not resend the prompt."
+            }
+            return null
+        }
         if (r.stderr.startsWith("oak timed out")) return "`oak prompt` did not answer within ${HEAVY_TIMEOUT_MS / 60_000} minutes — the prompt may still have been delivered; check the session's pane before sending it again"
         return o?.get("reason")?.takeIf { it.isJsonPrimitive }?.asString?.takeIf { it.isNotBlank() }
             ?: failureMessage(r.stdout, r.stderr, "`oak prompt` did not answer").removePrefix("oak: ")
@@ -1135,11 +1366,62 @@ object ObservatoryCli {
         val stranded: Boolean,
         val stableLatest: String?,
         val devLatest: String?,
-    )
+        /** How this plugin's own build stands against the channel, as core words it for VS Code's menu:
+         *  current / update available / not on this channel / local build. Null when the CLI predates
+         *  `--compare`. */
+        val pluginReason: String? = null,
+        /** The checkout the CLI is linked to. `oak update` leaves such a CLI alone and the CLI offers it no
+         *  release (`updateAvailable` and `stranded` are false), so the row names the link instead. */
+        val linked: String? = null,
+        /** The CLI is the copy `oak machine add` pushed, which `oak update` leaves to `oak machine add`. */
+        val provisioned: Boolean = false,
+        /** The CLI is a local build (`X.Y.Z-dev.0`, which no release carries): the CLI offers it no release
+         *  (`updateAvailable` and `stranded` are false), and `oak update` leaves it alone. */
+        val local: Boolean = false,
+    ) {
+        /** The CLI row's note: null while it matches the channel. */
+        val cliReason: String? get() = when {
+            linked != null -> "linked to a checkout"
+            provisioned -> "copied by oak machine add"
+            local -> "local build"
+            stranded -> "not on this channel"
+            updateAvailable -> "update available"
+            else -> null
+        }
+        /** Any surface differs from the channel, in either direction: the chip's dot (VS Code parity). */
+        val anyDiffers: Boolean get() = updateAvailable || pluginReason == "update available" || pluginReason == "not on this channel"
+        /** Some surface sits ABOVE the channel, so Update moves it down onto it. */
+        val anyStranded: Boolean get() = stranded || pluginReason == "not on this channel"
+        /** Some surface is a local build, which Update Now leaves alone: its row says so, not "up to date". */
+        val anyLocal: Boolean get() = local || pluginReason == "local build"
+    }
 
     /** One row of `update --json`: what a surface has installed, and what the channel says it should
-     *  have. `reason` is core's UpdateReason — current / behind / ahead / switching / missing / forced. */
-    data class UpdateSurface(val surface: String, val label: String, val from: String?, val to: String, val reason: String)
+     *  have. `reason` is core's UpdateReason — current / behind / ahead / switching / missing / forced /
+     *  managed / linked / provisioned / local. */
+    data class UpdateSurface(val surface: String, val label: String, val from: String?, val to: String, val reason: String, val pluginsDir: String? = null)
+
+    /** This machine's part of `update --json`: its surfaces, and the details of what the update leaves to
+     *  the user (`manual` components: a project's own settings file, which it never writes), each naming
+     *  the command to run. */
+    data class UpdatePlan(val surfaces: List<UpdateSurface>, val manual: List<String>)
+
+    /** The plan's row for THIS IDE's plugin when it needs work: the JetBrains row whose plugins folder is
+     *  [pluginsPath]. Several IDEs can have the plugin, and the first row was often another one. A CLI
+     *  that names no folder answers with the first JetBrains row that needs work, as before. */
+    fun thisIdeRow(plan: List<UpdateSurface>, pluginsPath: String): UpdateSurface? {
+        val rows = plan.filter { it.surface == "jetbrains" }
+        fun canon(p: String) = try { File(p).canonicalPath } catch (_: Exception) { File(p).absolutePath }
+        val mine = if (rows.any { it.pluginsDir != null }) rows.filter { it.pluginsDir != null && canon(it.pluginsDir) == canon(pluginsPath) } else rows
+        return mine.firstOrNull { it.reason != "current" }
+    }
+
+    /** THIS IDE's JetBrains row of [plan], whatever its reason: the one whose plugins folder is [pluginsPath].
+     *  Null when no row names it, as from a CLI older than `pluginsDir`. */
+    fun thisIdeSurface(plan: List<UpdateSurface>, pluginsPath: String): UpdateSurface? {
+        fun canon(p: String) = try { File(p).canonicalPath } catch (_: Exception) { File(p).absolutePath }
+        return plan.firstOrNull { it.surface == "jetbrains" && it.pluginsDir != null && canon(it.pluginsDir) == canon(pluginsPath) }
+    }
 
     /**
      * `update --json` — the whole plan, as DATA, installing nothing.
@@ -1148,16 +1430,26 @@ object ObservatoryCli {
      * (`out.contains("everything is up to date")`), which broke the moment the wording moved and gave
      * people "no restart needed" after a real install. Ask before, act, ask again.
      */
-    fun updatePlan(channel: String?, workDir: String?): List<UpdateSurface>? {
+    fun updatePlan(channel: String?, workDir: String?): UpdatePlan? {
+        // `--here`: only this machine's rows are read, so the saved machines are asked once, by the
+        // `update` that follows, not twice. A CLI older than `--here` ignores it.
         val args = buildList {
-            add("update"); add("--json")
+            add("update"); add("--json"); add("--here")
             if (channel != null) { add("--channel"); add(channel) }
         }
         val r = run(args, workDir, timeoutMs = 60_000)
         if (!r.ok) return null
+        return parseUpdatePlan(r.stdout)
+    }
+
+    /** The plan's `surfaces`, and the details of its `manual` components. The rest of its `components`
+     *  and its `machines` (OAK's setup, the saved machines) are the CLI's to act on: this plugin runs
+     *  `update` for all of them and reads only this machine's rows here, so a saved machine's own plan,
+     *  nested in its row, is never mistaken for this IDE's. A CLI older than the components has none. */
+    internal fun parseUpdatePlan(stdout: String): UpdatePlan? {
         return try {
-            val arr = JsonParser.parseString(r.stdout).asJsonObject.getAsJsonArray("surfaces")
-            arr.map { el ->
+            val plan = JsonParser.parseString(stdout).asJsonObject
+            val surfaces = plan.getAsJsonArray("surfaces").map { el ->
                 val o = el.asJsonObject
                 fun s(k: String) = o.get(k)?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isString }?.asString
                 UpdateSurface(
@@ -1166,21 +1458,32 @@ object ObservatoryCli {
                     from = s("from"),
                     to = s("to") ?: "",
                     reason = s("reason") ?: "",
+                    pluginsDir = s("pluginsDir"),
                 )
             }
+            val manual = (plan.get("components")?.takeIf { it.isJsonArray }?.asJsonArray?.toList() ?: emptyList())
+                .mapNotNull { it.takeIf { c -> c.isJsonObject }?.asJsonObject }
+                .filter { it.get("state")?.takeIf { s -> s.isJsonPrimitive }?.asString == "manual" }
+                .mapNotNull { it.get("detail")?.takeIf { d -> d.isJsonPrimitive }?.asString }
+            UpdatePlan(surfaces, manual)
         } catch (_: Exception) {
             null
         }
     }
 
-    /** `version --check --json` — the version dropdown's payload: the installed CLI version, the
-     *  followed channel, and both channels' newest releases (one GitHub fetch, CLI-side). Null when
-     *  the CLI is missing, offline, or predates the channels. */
-    fun versionCheck(workDir: String?): VersionCheck? {
-        val r = run(listOf("version", "--check", "--json"), workDir)
+    /** `version --check --json [--compare <plugin>]` — the version dropdown's payload: the installed CLI
+     *  version, the followed channel, both channels' newest releases (one GitHub fetch, CLI-side), and
+     *  how [plugin] (this plugin's own version) stands against the channel. Null when the CLI is
+     *  missing, offline, or predates the channels. */
+    fun versionCheck(workDir: String?, plugin: String? = null): VersionCheck? {
+        val r = run(listOf("version", "--check", "--json") + (plugin?.takeIf { it.isNotBlank() }?.let { listOf("--compare", it) } ?: emptyList()), workDir)
         if (!r.ok) return null
+        return parseVersionCheck(r.stdout)
+    }
+
+    internal fun parseVersionCheck(stdout: String): VersionCheck? {
         return try {
-            val o = JsonParser.parseString(r.stdout).asJsonObject
+            val o = JsonParser.parseString(stdout).asJsonObject
             fun s(k: String) = o.get(k)?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isString }?.asString
             VersionCheck(
                 current = s("current") ?: "",
@@ -1190,14 +1493,25 @@ object ObservatoryCli {
                 stranded = o.get("stranded")?.takeIf { it.isJsonPrimitive }?.asBoolean ?: false,
                 stableLatest = s("stableLatest"),
                 devLatest = s("devLatest"),
+                pluginReason = o.get("compared")?.takeIf { it.isJsonObject }?.asJsonObject?.get("reason")
+                    ?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isString }?.asString,
+                linked = s("linked"),
+                provisioned = o.get("provisioned")?.takeIf { it.isJsonPrimitive }?.asBoolean ?: false,
+                local = o.get("local")?.takeIf { it.isJsonPrimitive }?.asBoolean ?: false,
             )
         } catch (_: Exception) {
             null
         }
     }
 
-    /** `update [--channel X]` — the ONE updater for every surface: refreshes the CLI, both editor
-     *  plugins, and the status line; `--channel` also switches release channels. LONG (downloads) —
+    /** How long `update` may run. On top of this machine's downloads and installs, it reads herdr's
+     *  machine list (15 s), each saved machine's plan (45 s) and then runs its update (180 s), and a run
+     *  stopped at its deadline stops the ssh it started on them. VS Code gives it the same. */
+    const val UPDATE_TIMEOUT_MS = 15 * 60_000
+
+    /** `update [--channel X]` — the ONE updater for every surface: refreshes the CLI, the editor
+     *  extensions and plugins, OAK's setup (hooks, status line, herdr) and every saved machine;
+     *  `--channel` also switches release channels. LONG (downloads) —
      *  callers run it on a pooled thread and tell the user to restart the IDE afterwards. */
     fun update(channel: String?, workDir: String?): Pair<Boolean, String> {
         val args = buildList {
@@ -1206,7 +1520,7 @@ object ObservatoryCli {
                 add("--channel"); add(channel)
             }
         }
-        val r = run(args, workDir, timeoutMs = 300_000)
+        val r = run(args, workDir, timeoutMs = UPDATE_TIMEOUT_MS)
         return r.ok to (if (r.ok) r.stdout else failureMessage(r.stdout, r.stderr, "the CLI exited ${r.exitCode} without saying why"))
     }
 
@@ -1229,20 +1543,20 @@ object ObservatoryCli {
      * stderr. It is not: the CLI's "could not update the VS Code extension" path exits 1 while writing
      * to stdout, and on Windows stderr held nothing but a Node DEP0190 deprecation warning — so the
      * toast showed the warning and hid the reason (#45). Prefer stderr MINUS the noise; then the lines
-     * of stdout that read as trouble; then its tail, where a summary lives.
+     * of stdout that read as trouble; then its tail, where a summary lives. Never cut short: a notification
+     * wraps it.
      */
-    fun failureMessage(stdout: String, stderr: String, fallback: String, maxLen: Int = 300): String {
-        fun cap(s: String) = if (s.length > maxLen) s.take(maxLen - 1).trimEnd() + "…" else s
+    fun failureMessage(stdout: String, stderr: String, fallback: String): String {
         // trimEnd on every line, matching the TS: otherwise the two editors show the same failure with
         // different trailing whitespace, and the parity this function exists for is only approximate.
         val realStderr =
             stderr.lines().map { it.trimEnd() }.filter { it.isNotBlank() && !NODE_NOISE.containsMatchIn(it) }
                 .joinToString("\n").trim()
-        if (realStderr.isNotEmpty()) return cap(realStderr)
+        if (realStderr.isNotEmpty()) return realStderr
         val out = stdout.lines().map { it.trimEnd() }.filter { it.isNotBlank() }
         val flagged = out.filter { LOOKS_LIKE_TROUBLE.containsMatchIn(it) }
-        if (flagged.isNotEmpty()) return cap(flagged.joinToString("\n").trim())
-        if (out.isNotEmpty()) return cap(out.takeLast(3).joinToString("\n").trim())
+        if (flagged.isNotEmpty()) return flagged.joinToString("\n").trim()
+        if (out.isNotEmpty()) return out.takeLast(3).joinToString("\n").trim()
         return fallback
     }
 

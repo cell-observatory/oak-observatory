@@ -14,7 +14,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { rootDir } from './store';
 import { snapshotFromCli, type HerdrOptions, type HerdrTransport } from './herdr';
-import { readHerdrPaneLink } from './herdr-link';
+import { readHerdrPaneLink, reportHerdrSession } from './herdr-link';
+import { CODEX_MEMORY_TITLE, isCodexMemorySession, readCodexAgentMeta } from './codex';
 import { listedSessionTitle } from './observe';
 import type { PaneProcessInfo, SessionSnapshot } from './herdr-api';
 
@@ -167,9 +168,13 @@ export function reconcileHerdrTabs(
     // older list put the old title back until the list refreshed.
     if (nextOwned[tab.tab_id] !== undefined && opts.listedAt !== undefined && (opts.claimedAt?.[tab.tab_id] ?? -Infinity) > opts.listedAt) continue;
     const sid = sessionOf(tab);
+    // Codex's memory-writing thread never names a tab. herdr shows it in a pane only when its hooks reported
+    // it there, as an OAK before 0.11.0 did, from the pane of the session that ran it; that pane goes back to
+    // its session (`syncSessionTab`), which names the tab. OAK's session lists give that thread this title.
+    const title = sid ? titleOf(sid)?.trim() : undefined;
     // An agent took over a btop tab: its kind names the tab until the session has a title, so it never
     // passes for the monitor's tab (and is never typed into as one).
-    const name = (sid ? titleOf(sid)?.trim() : undefined) || (btop ? agent : undefined);
+    const name = (title === CODEX_MEMORY_TITLE ? undefined : title) || (btop ? agent : undefined);
     if (!name) continue;
     // A label that already reads the session's name is OAK's too: another OAK named it, or a rename that
     // reported failure landed after all.
@@ -195,6 +200,16 @@ const AGENT_KIND_LABELS = new Set(['claude', 'codex', 'gpt', 'agent']);
  */
 function isPlaceholderLabel(label: string, position: number | undefined): boolean {
   return label === String(position) || AGENT_KIND_LABELS.has(label.trim().toLowerCase());
+}
+
+/** A tab name worth showing instead of a session title, even before the live tab-naming pass runs. */
+export function herdrTabTitle(snapshot: Pick<SessionSnapshot, 'tabs'> | null | undefined, tabId: string | undefined): string | undefined {
+  const tabs = snapshot?.tabs ?? [];
+  const tab = tabs.find(t => t.tab_id === tabId);
+  if (!tab) return undefined;
+  const position = tabs.filter(t => t.workspace_id === tab.workspace_id).findIndex(t => t.tab_id === tabId) + 1;
+  const label = tab.label.trim();
+  return label && !isPlaceholderLabel(label, position) ? label : undefined;
 }
 
 const sidecar = (): string => path.join(rootDir(), 'herdr-tabs.json');
@@ -230,8 +245,9 @@ function replaceFile(file: string, value: unknown): void {
     fs.renameSync(tmp, file);
   } finally { fs.rmSync(tmp, { force: true }); }
 }
-/** The longest wait for another process's hold on the ownership record: a hold lasts one read and one
- *  write, so a longer one is a holder that is stuck, and the record is written through it. */
+/** The longest wait for another process's hold on the ownership record, or on one machine's renames: a
+ *  hold on the record lasts one read and one write, and one on a machine's renames lasts while its tabs
+ *  are renamed, so a longer wait is for a holder that is stuck, and the pass goes on without the lock. */
 const OWNED_LOCK_MS = 2000;
 /**
  * Record the claims this pass changed on one machine, and no others. The terminal app's pass (one per
@@ -240,20 +256,32 @@ const OWNED_LOCK_MS = 2000;
  * lost claim left its tab stuck on an old OAK-given title. So the file is read again under its lock and
  * only the tabs whose claim moved from `before` to `after` are written, of `tabs` alone when the pass
  * speaks for no others. A claim written carries `at`, when the title it names was read; none when the
- * pass could not say.
+ * pass could not say. Each is a compare-and-swap: a claim another writer changed after this pass read the
+ * record (`before`) is theirs and newer, and is left as it is. A pass that read before a session's own sync
+ * saved had dropped the sync's new claim as a lapsed old one. `renames` run first, each only while its
+ * tab's claim is still the one in `before`, under a lock of the machine's own that is held until the
+ * claims are saved: a pass that renamed after a sync had renamed and saved left the tab on its own older
+ * title, which no claim named, so no pass renamed it again. The record's own lock is taken only for the
+ * read and the write after the renames: held through a saved machine's renames (seconds over ssh), it made
+ * the local pass wait out `OWNED_LOCK_MS` and write without it, and the slow pass then wrote back the
+ * record it had read before its renames, over the local pass's claims.
  */
-async function saveOwned(machine: string, before: Record<string, string>, after: Record<string, string>, tabs?: string[], at?: number): Promise<void> {
+async function saveOwned(machine: string, before: Record<string, string>, after: Record<string, string>, tabs?: string[], at?: number,
+  renames: HerdrTabAction[] = [], rename?: (action: HerdrTabAction) => Promise<void>): Promise<void> {
   const has = (map: Record<string, string>, tab: string): boolean => Object.prototype.hasOwnProperty.call(map, tab);
-  const changed = (tabs ?? [...new Set([...Object.keys(before), ...Object.keys(after)])])
-    .filter(tab => has(before, tab) !== has(after, tab) || before[tab] !== after[tab]);
-  if (!changed.length) return;
+  const claimOf = (map: Record<string, unknown>, tab: string): string | undefined => typeof map[tab] === 'string' ? map[tab] as string : undefined;
+  if (!renames.length && !(tabs ?? [...Object.keys(before), ...Object.keys(after)]).some(tab => has(before, tab) !== has(after, tab) || before[tab] !== after[tab])) return;
   const write = (): true => {
     const all = readRecord(sidecar());
     const mine = { ...mapOf(all[machine]) };
+    // After the renames: one that failed records the label its tab still wears.
+    const changed = (tabs ?? [...new Set([...Object.keys(before), ...Object.keys(after)])])
+      .filter(tab => has(before, tab) !== has(after, tab) || before[tab] !== after[tab]);
     const allTimes = readRecord(claimTimes());
     const held = JSON.stringify(allTimes[machine] ?? null);
     const times = { ...mapOf(allTimes[machine]) };
     for (const tab of changed) {
+      if (claimOf(mine, tab) !== claimOf(before, tab)) continue;
       if (has(after, tab)) mine[tab] = after[tab];
       else delete mine[tab];
       if (has(after, tab) && at !== undefined) times[tab] = at;
@@ -269,7 +297,17 @@ async function saveOwned(machine: string, before: Record<string, string>, after:
     replaceFile(sidecar(), all);
     return true;
   };
-  try { if (await withStoreLock(`${sidecar()}.lock`, OWNED_LOCK_MS, write) === undefined) write(); }
+  const renameAndWrite = async (): Promise<true> => {
+    // The claim is read again before each rename: a sync that gave up waiting for this lock while an
+    // earlier rename ran may have renamed and claimed a later tab meanwhile.
+    for (const action of renames) {
+      if (claimOf(mapOf(readRecord(sidecar())[machine]), action.tab_id!) === claimOf(before, action.tab_id!)) await rename!(action);
+    }
+    if (await withStoreLock(`${sidecar()}.lock`, OWNED_LOCK_MS, write) === undefined) write();
+    return true;
+  };
+  const machineLock = path.join(rootDir(), `herdr-names.${machine.replace(/[^A-Za-z0-9_.-]/g, '_')}.lock`);
+  try { if (await withStoreLock(machineLock, OWNED_LOCK_MS, renameAndWrite) === undefined) await renameAndWrite(); }
   catch { /* a tidy tab bar is never worth failing a refresh */ }
 }
 
@@ -336,11 +374,11 @@ function alive(pid: number): boolean {
  *  these verbs to whatever server HERDR_SOCKET_PATH named, and made btop tabs on a person's live one. */
 function herdrCalls(machine: string | undefined, options: HerdrOptions | undefined, { herdrRequest, herdrOnMachine }: HerdrTransport) {
   if (machine) {
-    const cli = (argv: string[]) => herdrOnMachine(machine, argv, options) as Promise<{ result?: Record<string, unknown> } | null>;
+    const cli = (argv: string[], emptyOk = false) => herdrOnMachine(machine, argv, { ...options, emptyOk }) as Promise<{ result?: Record<string, unknown> } | null>;
     return {
       snapshot: async () => snapshotFromCli(await herdrOnMachine(machine, ['api', 'snapshot'], options), options),
       processInfo: async (pane: string) => (await cli(['pane', 'process-info', '--pane', pane]))?.result?.process_info as PaneProcessInfo | undefined,
-      sendText: (pane: string, text: string) => cli(['pane', 'send-text', pane, text]),
+      sendText: (pane: string, text: string) => cli(['pane', 'send-text', pane, text], true),
       labelPane: (pane: string, label: string) => cli(['pane', 'rename', pane, label]),
       createBtop: async (workspace: string) => (await cli(['tab', 'create', '--workspace', workspace, '--label', BTOP_LABEL]))?.result as TabCreated | undefined,
       moveFirst: async (_tab: string) => { /* herdr's CLI has no `tab move`: a saved machine's btop keeps its place */ },
@@ -467,6 +505,18 @@ async function tidy(opts: Parameters<typeof ensureHerdrTabs>[0], machineKey: str
     await launch(tab, pane, created?.root_pane?.terminal_id ?? '', true);
   }
   const terminalOf = (pane: string): string => snapshot.panes.find(p => p.pane_id === pane)?.terminal_id ?? '';
+  async function rename(action: HerdrTabAction): Promise<void> {
+    try {
+      await call.rename(action.tab_id!, action.label);
+      done.push(action);
+    } catch {
+      // Failed, or timed out and may still land: the label the tab wears stays OAK's, so the next
+      // pass tries again (a label that reads the new name is OAK's anyway).
+      const wearing = snapshot.tabs.find(t => t.tab_id === action.tab_id)?.label;
+      if (wearing !== undefined) nextOwned[action.tab_id!] = wearing;
+    }
+  }
+  const renames: HerdrTabAction[] = [];
 
   for (const action of actions) {
     if (opts.only !== undefined && action.tab_id !== opts.only) continue;
@@ -493,20 +543,11 @@ async function tidy(opts: Parameters<typeof ensureHerdrTabs>[0], machineKey: str
         }
       } else if (action.kind === 'launch-monitor') {
         await launch(action.tab_id!, action.pane_id!, terminalOf(action.pane_id!), false);
-      } else {
-        try {
-          await call.rename(action.tab_id!, action.label);
-          done.push(action);
-        } catch {
-          // Failed, or timed out and may still land: the label the tab wears stays OAK's, so the next
-          // pass tries again (a label that reads the new name is OAK's anyway).
-          const wearing = snapshot.tabs.find(t => t.tab_id === action.tab_id)?.label;
-          if (wearing !== undefined) nextOwned[action.tab_id!] = wearing;
-        }
-      }
+      } else if (names) renames.push(action); // under the machine's lock, in saveOwned
+      else await rename(action);
     } catch { /* one action failing must not stop the others */ }
   }
-  if (names) await saveOwned(machineKey, owned, nextOwned, opts.only === undefined ? undefined : [opts.only], opts.listedAt);
+  if (names) await saveOwned(machineKey, owned, nextOwned, opts.only === undefined ? undefined : [opts.only], opts.listedAt, renames, rename);
   return done;
 }
 
@@ -517,9 +558,10 @@ async function tidy(opts: Parameters<typeof ensureHerdrTabs>[0], machineKey: str
  * changed, so a tab follows its session while the terminal app is closed. The server is the one the
  * session's capture link names; the tab is found through the server's own record of the session, since a
  * pane id recorded earlier goes stale when its tab moves. `title` is the session's listed title
- * (`listedSessionTitle`, read here when omitted); a session with none, or with no link, reads nothing.
+ * (`listedSessionTitle`, read here when omitted); a session with no link, or a non-Codex one with no title, reads nothing.
  * The terminal app on another machine asks for this too (`oak __tab-sync --machine`), so OAK's names for
- * a server's tabs are recorded once, on the machine that runs it.
+ * a server's tabs are recorded once, on the machine that runs it. A Codex session whose linked pane herdr
+ * gives to Codex's memory-writing thread reports itself there again first (`isCodexMemoryCwd`), titled or not.
  */
 export async function syncSessionTab(opts: {
   session: string;
@@ -532,15 +574,33 @@ export async function syncSessionTab(opts: {
   herdrOptions?: HerdrOptions;
 }): Promise<HerdrTabAction[]> {
   const link = readHerdrPaneLink(opts.session);
-  if (!link) return [];
+  // A memory-writing thread never names a tab (an OAK before 0.11.0 linked it to its session's pane).
+  if (!link || isCodexMemorySession(opts.session)) return [];
   const listedAt = Date.now();
   const title = (opts.title === undefined ? listedSessionTitle(opts.session) : opts.title)?.trim();
-  if (!title) return [];
+  // A Codex session with no title yet still takes its pane back below; nothing else can happen untitled.
+  const codex = !!readCodexAgentMeta(opts.session);
+  if (!title && !codex) return [];
   const herdrOptions = link.socketPath ? { ...opts.herdrOptions, socketPath: link.socketPath } : opts.herdrOptions;
-  const snapshot = await herdrCalls(undefined, herdrOptions, opts.transport).snapshot();
-  const pane = snapshot.agents?.find(a => a.agent_session?.value === opts.session)?.pane_id;
+  const call = herdrCalls(undefined, herdrOptions, opts.transport);
+  const paneOf = (s: SessionSnapshot) => s.agents?.find(a => a.agent_session?.value === opts.session)?.pane_id;
+  let snapshot = await call.snapshot();
+  let pane = paneOf(snapshot);
+  // Codex's memory-writing agent holds this Codex session's pane: an OAK before 0.11.0 reported it to herdr
+  // from the agent's hooks, and the tab took its name. The session takes its pane back, then names the tab.
+  if (pane === undefined && codex) {
+    const held = snapshot.agents?.find(a => a.pane_id === link.paneId)?.agent_session?.value
+      ?? snapshot.panes.find(p => p.pane_id === link.paneId)?.agent_session?.value;
+    if (held && held !== opts.session && isCodexMemorySession(held)) {
+      try {
+        await reportHerdrSession(opts.session, 'codex', link, herdrOptions, opts.transport, true);
+        snapshot = await call.snapshot();
+        pane = paneOf(snapshot);
+      } catch { /* the next turn boundary tries again */ }
+    }
+  }
   const tab = pane === undefined ? undefined : snapshot.panes.find(p => p.pane_id === pane)?.tab_id;
-  if (!tab) return [];
+  if (!tab || !title) return [];
   return ensureHerdrTabs({ snapshot, titleOf: id => (id === opts.session ? title : undefined), only: tab, listedAt, adopt: opts.claimed,
     transport: opts.transport, herdrOptions });
 }

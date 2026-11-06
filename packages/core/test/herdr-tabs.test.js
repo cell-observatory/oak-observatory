@@ -202,16 +202,16 @@ test('herdr tabs: a tab labelled with its agent\'s own terminal title follows th
   // Claude Code titles its terminal with its ai-title. OAK named the tab with it before claude.ai's
   // title for the session arrived, and the record of that was lost.
   const titled = (n, tabN, title) => ({ ...pane(n, tabN), terminal_title_stripped: title });
-  const s = snap([tab(1, BTOP_LABEL), tab(2, 'Claude Code UI bugs')], [titled(2, 2, 'Claude Code UI bugs')], [agent(2, 'sess-a')]);
-  const { actions, owned } = reconcileHerdrTabs(s, titles({ 'sess-a': 'Cursor and panel issues' }), {}, { btop: false });
-  assert.deepEqual(actions, [{ kind: 'rename', tab_id: 'w1:t2', label: 'Cursor and panel issues' }]);
-  assert.deepEqual(owned, { 'w1:t2': 'Cursor and panel issues' });
+  const s = snap([tab(1, BTOP_LABEL), tab(2, 'Fixture parser fixes')], [titled(2, 2, 'Fixture parser fixes')], [agent(2, 'sess-a')]);
+  const { actions, owned } = reconcileHerdrTabs(s, titles({ 'sess-a': 'Fix the fixture parser' }), {}, { btop: false });
+  assert.deepEqual(actions, [{ kind: 'rename', tab_id: 'w1:t2', label: 'Fix the fixture parser' }]);
+  assert.deepEqual(owned, { 'w1:t2': 'Fix the fixture parser' });
   // A label the person chose stays theirs, whatever the terminal title reads.
-  const theirs = snap([tab(1, BTOP_LABEL), tab(2, 'my notes')], [titled(2, 2, 'Claude Code UI bugs')], [agent(2, 'sess-a')]);
-  assert.deepEqual(reconcileHerdrTabs(theirs, titles({ 'sess-a': 'Cursor and panel issues' }), {}, { btop: false }).actions, []);
+  const theirs = snap([tab(1, BTOP_LABEL), tab(2, 'my notes')], [titled(2, 2, 'Fixture parser fixes')], [agent(2, 'sess-a')]);
+  assert.deepEqual(reconcileHerdrTabs(theirs, titles({ 'sess-a': 'Fix the fixture parser' }), {}, { btop: false }).actions, []);
   // Only the pane holding the session speaks for it: a shell beside it, titled like the tab, does not.
-  const shell = snap([tab(1, BTOP_LABEL), tab(2, 'user@host: ~')], [titled(3, 2, 'user@host: ~'), titled(2, 2, 'Claude Code UI bugs')], [agent(2, 'sess-a')]);
-  assert.deepEqual(reconcileHerdrTabs(shell, titles({ 'sess-a': 'Cursor and panel issues' }), {}, { btop: false }).actions, []);
+  const shell = snap([tab(1, BTOP_LABEL), tab(2, 'user@host: ~')], [titled(3, 2, 'user@host: ~'), titled(2, 2, 'Fixture parser fixes')], [agent(2, 'sess-a')]);
+  assert.deepEqual(reconcileHerdrTabs(shell, titles({ 'sess-a': 'Fix the fixture parser' }), {}, { btop: false }).actions, []);
 });
 
 test('herdr tabs: a claim made from a title read after the pass\'s list is left as it is until the list catches up', () => {
@@ -582,15 +582,20 @@ const record = () => path.join(rootDir(), 'herdr-tabs.json');
 const owned = () => { try { return JSON.parse(fs.readFileSync(record(), 'utf8')); } catch { return {}; } };
 /** Forget every claim: each test below starts from a record no other test wrote. */
 const resetOwned = () => fs.rmSync(record(), { force: true });
-/** Record `session`'s pane link the way its capture hook does inside herdr. */
+/** A link already verified and recorded by a capture hook in that pane. */
 function linkPane(session, paneId, socketPath) {
-  const saved = { HERDR_PANE_ID: process.env.HERDR_PANE_ID, HERDR_SOCKET_PATH: process.env.HERDR_SOCKET_PATH };
-  Object.assign(process.env, { HERDR_PANE_ID: paneId, HERDR_SOCKET_PATH: socketPath });
-  try { linkHerdrPane(session); }
-  finally { for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } }
+  fs.mkdirSync(storeDir(session), { recursive: true });
+  fs.writeFileSync(path.join(storeDir(session), 'herdr.json'), JSON.stringify({ paneId, socketPath, at: Date.now() }));
 }
 const syncOf = herdr => (session, title) => syncSessionTab({ session, title, transport, herdrOptions: { timeoutMs: 5000 } });
 const until = async (check, ms = 10000) => { for (const end = Date.now() + ms; !check() && Date.now() < end;) await new Promise(r => setTimeout(r, 50)); return check(); };
+/** Resolves true once a pass finds `lock` held (it reads the holder from the file), false after 10 s. */
+const lockTried = async (lock) => {
+  const read = fs.readFileSync;
+  let tried = false;
+  fs.readFileSync = function (file, ...rest) { if (String(file) === lock) tried = true; return read.call(this, file, ...rest); };
+  try { return await until(() => tried); } finally { fs.readFileSync = read; }
+};
 
 test('herdr tab sync: a session\'s own sync names its tab after its title and follows a new one, leaving btop, every other tab and a person\'s label alone', async t => {
   const herdr = await fakeHerdr(t, { 'tab.rename': ok });
@@ -712,11 +717,15 @@ test('herdr tab sync: `oak __tab-sync` takes the title the session list shows �
 // --- the hooks start it: inside herdr only, throttled, detached, silent -----------------------------
 
 function hookSandbox(t) {
-  const keys = ['HERDR_PANE_ID', 'HERDR_SOCKET_PATH', 'HERDR_BIN_PATH', 'CODEX_HOME', 'CODEX_THREAD_ID', 'OAK_TAB'];
+  t.mock.method(require('../dist/herdr-context'), 'herdrPaneContextSync', () => process.env.HERDR_PANE_ID
+    ? { nested: true, paneId: process.env.HERDR_PANE_ID, socketPath: process.env.HERDR_SOCKET_PATH }
+    : { nested: false });
+  const keys = ['HERDR_PANE_ID', 'HERDR_SOCKET_PATH', 'HERDR_BIN_PATH', 'CODEX_HOME', 'CODEX_THREAD_ID', 'OAK_TAB', 'OAK_NO_BACKGROUND'];
   const saved = Object.fromEntries(keys.map(k => [k, process.env[k]]));
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-tabsync-hooks-'));
   Object.assign(process.env, { HERDR_PANE_ID: 'w1:p2', HERDR_SOCKET_PATH: path.join(dir, 'herdr.sock'), HERDR_BIN_PATH: path.join(dir, 'herdr'), CODEX_HOME: path.join(dir, 'codex') });
   delete process.env.CODEX_THREAD_ID; delete process.env.OAK_TAB;
+  delete process.env.OAK_NO_BACKGROUND; // the bootstrap's switch; spawnTool is mocked, so nothing starts
   const spawned = [];
   t.mock.method(spawn, 'spawnTool', (file, args, options) => {
     spawned.push({ file, args, detached: options?.detached, stdio: options?.stdio });
@@ -832,25 +841,273 @@ test('herdr tab sync: the capture bundle itself starts the sync and returns at o
   fs.writeFileSync(rollout, rec({ type: 'session_meta', timestamp: '2026-01-01T00:00:00Z', payload: { id: X, cwd: codexHome } }));
   fs.writeFileSync(path.join(codexHome, 'session_index.jsonl'), rec({ id: X, thread_name: 'Bundle thread', updated_at: '2026-01-01' }));
   herdr.snapshot = homeSnap([tab(1, '1'), tab(2, '2')], [pane(1, 1), pane(2, 2)], [agent(1, S, 'w1', 'claude'), agent(2, X, 'w1', 'codex')]);
-  const env = pane => ({ ...process.env, CODEX_HOME: codexHome, HERDR_PANE_ID: pane, HERDR_SOCKET_PATH: herdr.socketPath, HERDR_BIN_PATH: herdr.binary });
-  // The hook runs synchronously here, so this process's scripted herdr cannot answer anything until it
-  // has exited: a hook that waited for the sync would hang to its timeout instead of returning at once.
-  const hook = (args, pane, payload) => {
+  // OAK_NO_BACKGROUND cleared: the detached sync is what this test runs, and it waits for each one to finish.
+  const env = pane => ({ ...process.env, CODEX_HOME: codexHome, HERDR_PANE_ID: pane, HERDR_SOCKET_PATH: herdr.socketPath, HERDR_BIN_PATH: herdr.binary, OAK_NO_BACKGROUND: '' });
+  // Keep this server's event loop free for the hook's bounded membership check.
+  const hook = async (args, pane, payload) => {
     const started = Date.now();
-    const r = cp.spawnSync(process.execPath, [OAK, 'capture', ...args], { input: JSON.stringify(payload), env: env(pane), encoding: 'utf8', timeout: 20000 });
+    const r = await new Promise(resolve => {
+      const child = cp.execFile(process.execPath, [OAK, 'capture', ...args], { env: env(pane), encoding: 'utf8', timeout: 20000 },
+        (error, stdout, stderr) => resolve({ status: error?.code ?? 0, stdout, stderr }));
+      child.stdin.end(JSON.stringify(payload));
+    });
     assert.deepEqual([r.status, r.stdout, r.stderr], [0, '', ''], `${args.join(' ') || 'capture'} exits 0 and prints nothing`);
     return Date.now() - started;
   };
-  const ms = hook([], 'w1:p1', { session_id: S, cwd: codexHome, hook_event_name: 'Stop' });
-  assert.equal(herdr.requests.length, 0, 'nothing reached herdr while the hook ran');
+  const ms = await hook([], 'w1:p1', { session_id: S, cwd: codexHome, hook_event_name: 'Stop' });
+  assert.equal(herdr.calls('pane.process_info').length, 1, 'the hook verified its pane before linking');
   // A sync that held the hook's stdout would keep it open until herdr answered or it gave up (4 s),
   // and the agent waits for that pipe to close.
   assert.ok(ms < 3000, `the hook returned at once, its output closed (${ms} ms)`);
   assert.ok(await until(() => herdr.calls('tab.rename').length === 1), 'the detached sync renamed the tab');
   assert.deepEqual(herdr.calls('tab.rename'), [{ tab_id: 'w1:t1', label: 'Bundle tidy-up' }]);
-  hook(['--agent', 'codex'], 'w1:p2', { session_id: X, cwd: codexHome, hook_event_name: 'Stop', transcript_path: rollout, model: 'fixture-model' });
+  await hook(['--agent', 'codex'], 'w1:p2', { session_id: X, cwd: codexHome, hook_event_name: 'Stop', transcript_path: rollout, model: 'fixture-model' });
   assert.ok(await until(() => herdr.calls('tab.rename').length === 2), 'the Codex hook\'s sync renamed its tab');
   assert.deepEqual(herdr.calls('tab.rename')[1], { tab_id: 'w1:t2', label: 'Bundle thread' });
+  // Each sync saves its claim after its rename: one saved after this test ended landed in the next one's record.
+  assert.ok(await until(() => owned().local?.['w1:t1'] === 'Bundle tidy-up' && owned().local?.['w1:t2'] === 'Bundle thread'), 'both syncs saved their claims');
+});
+
+// --- Codex's background threads and the pane they run in (2026-09-30) ---------------------------------
+// Codex runs its memory-writing agent inside the process of the session in a pane, so the agent's hooks
+// carry that pane's HERDR_PANE_ID. They reported the agent's thread to herdr as the pane's session, with
+// the `startup` SessionStart that lets herdr replace the session there, and its tab took the agent's name:
+// every Codex tab came to read "Codex memory update".
+
+/** A scripted herdr that keeps each pane's session the way herdr 0.9.1 does (verified on a private
+ *  server): a report takes a pane another session holds only when it names a session start, and once a
+ *  pane saw a sequenced report, an unsequenced one changes nothing. Tabs keep the names they are given. */
+async function identityHerdr(t, tabs, panes) {
+  const held = {}, sequenced = {};
+  const herdr = await fakeHerdr(t, {
+    'session.snapshot': () => ({ type: 'session_snapshot', snapshot: { version: '0.9.1', protocol: 22, workspaces: [workspace('w1', 'work')], tabs,
+      panes: panes.map(p => ({ ...p, agent_session: held[p.pane_id] ? { value: held[p.pane_id] } : null })),
+      agents: Object.entries(held).map(([pane_id, value]) => ({ pane_id, agent: 'codex', agent_session: { value } })) } }),
+    'pane.report_agent_session': ({ pane_id, agent_session_id, session_start_source, seq }) => {
+      if (seq == null && sequenced[pane_id]) return { type: 'ok' };
+      if (seq != null) sequenced[pane_id] = true;
+      if (!held[pane_id] || held[pane_id] === agent_session_id || session_start_source) held[pane_id] = agent_session_id;
+      return { type: 'ok' };
+    },
+    'tab.rename': ({ tab_id, label }) => { tabs.find(tb => tb.tab_id === tab_id).label = label; return { type: 'ok' }; },
+  });
+  return herdr && Object.assign(herdr, { held, sequenced });
+}
+
+/** A Codex home with one rollout per `{ id: thread name }`, and the capture bundle run as Codex runs its
+ *  hook in pane `w1:p3`, with the throttle aged so each hook's turn boundary may start a sync. */
+function codexPane(t, herdr, threads) {
+  const cp = require('node:child_process');
+  const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-memtab-'));
+  const saved = process.env.CODEX_HOME;
+  process.env.CODEX_HOME = codexHome; // this process's own reads (the memory check) see the same home
+  t.after(() => { if (saved === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = saved; fs.rmSync(codexHome, { recursive: true, force: true }); });
+  const rec = o => JSON.stringify(o) + '\n';
+  const rollouts = {};
+  fs.mkdirSync(path.join(codexHome, 'sessions'), { recursive: true });
+  for (const [id, name] of Object.entries(threads)) {
+    rollouts[id] = path.join(codexHome, 'sessions', `${id}.jsonl`);
+    fs.writeFileSync(rollouts[id], rec({ type: 'session_meta', timestamp: '2026-01-01T00:00:00Z', payload: { id, cwd: codexHome, source: 'cli' } }));
+    fs.appendFileSync(path.join(codexHome, 'session_index.jsonl'), rec({ id, thread_name: name, updated_at: '2026-01-01' }));
+  }
+  const env = { ...process.env, CODEX_HOME: codexHome, HERDR_PANE_ID: 'w1:p3', HERDR_SOCKET_PATH: herdr.socketPath, HERDR_BIN_PATH: herdr.binary, OAK_NO_BACKGROUND: '' };
+  delete env.CODEX_THREAD_ID;
+  // Asynchronously: the hook's identity report waits for the scripted herdr, which answers from this process.
+  const hook = payload => {
+    try { pastWindow(payload.session_id); } catch { /* never kicked */ }
+    return new Promise(resolve => {
+      const child = cp.execFile(process.execPath, [OAK, 'capture', '--agent', 'codex'], { env, encoding: 'utf8', timeout: 20000 }, (error, stdout, stderr) => {
+        assert.deepEqual([error?.code ?? 0, stdout, stderr], [0, '', ''], `${payload.hook_event_name} exits 0 and prints nothing`);
+        resolve();
+      });
+      child.stdin.end(JSON.stringify({ model: 'fixture-model', ...payload }));
+    });
+  };
+  return { codexHome, rollouts, hook, memories: path.join(codexHome, 'memories') };
+}
+const settle = ms => new Promise(r => setTimeout(r, ms));
+
+test('herdr tab sync: Codex\'s memory-writing thread never takes its session\'s pane or renames its tab, and neither does an Auto-review thread — real capture hooks', async t => {
+  const tabs = [tab(2, '1'), tab(3, '2')]; // herdr's own names: their positions
+  const herdr = await identityHerdr(t, tabs, [pane(2, 2), pane(3, 3)]);
+  if (!herdr) return;
+  resetOwned();
+  const R = 'fixture-root-thread', M = 'fixture-memory-thread', M2 = 'fixture-memory-v2-thread', G = 'fixture-guardian-thread';
+  const x = codexPane(t, herdr, { [R]: 'Write parser tests' });
+  // The root thread starts in the pane and names its tab at its first turn.
+  await x.hook({ session_id: R, cwd: x.codexHome, hook_event_name: 'SessionStart', source: 'startup', transcript_path: x.rollouts[R] });
+  assert.equal(herdr.held['w1:p3'], R, 'the root thread holds its pane');
+  await x.hook({ session_id: R, cwd: x.codexHome, hook_event_name: 'UserPromptSubmit', turn_id: 'turn-1', prompt: 'Write the parser tests', transcript_path: x.rollouts[R] });
+  assert.ok(await until(() => tabs[1].label === 'Write parser tests'), 'the root thread\'s sync named its tab');
+  const renames = herdr.calls('tab.rename').length;
+  // The memory-writing agent, as Codex 0.159.2 runs its hooks: its own ephemeral thread in
+  // <CODEX_HOME>/memories (or memories_v2), a `startup` SessionStart, no transcript, then its one prompt
+  // and its tool calls (no Stop: Codex runs only managed Stop hooks for it).
+  for (const [id, dir] of [[M, x.memories], [M2, `${x.memories}_v2`]]) {
+    const memory = { session_id: id, cwd: dir, transcript_path: null, permission_mode: 'bypassPermissions' };
+    await x.hook({ ...memory, hook_event_name: 'SessionStart', source: 'startup' });
+    await x.hook({ ...memory, hook_event_name: 'UserPromptSubmit', turn_id: 'mem-turn', prompt: '## Memory Writing Agent: Phase 2 (Consolidation)' });
+    await x.hook({ ...memory, hook_event_name: 'PreToolUse', turn_id: 'mem-turn', tool_name: 'Bash', tool_use_id: 'call-1', tool_input: { command: 'ls' } });
+    await x.hook({ ...memory, hook_event_name: 'PostToolUse', turn_id: 'mem-turn', tool_name: 'Bash', tool_use_id: 'call-1', tool_input: { command: 'ls' }, tool_response: '' });
+    assert.equal(herdr.held['w1:p3'], R, `the pane keeps the root thread (${path.basename(dir)})`);
+    assert.ok(!fs.existsSync(path.join(storeDir(id), 'herdr.json')), 'no pane link for the memory thread');
+    assert.ok(!fs.existsSync(path.join(storeDir(id), 'herdr-tab.kick')), 'no tab sync started for the memory thread');
+  }
+  assert.deepEqual(herdr.calls('pane.report_agent_session').map(c => c.agent_session_id), [R], 'only the root thread was ever reported');
+  // An Auto-review (guardian) thread: Codex 0.159.2 runs it with hooks off and under the parent's session
+  // id. An older Codex that ran its hooks under its own id reports no SessionStart (it is a subagent), so
+  // it cannot take the pane from the root thread either.
+  fs.writeFileSync(path.join(x.codexHome, 'sessions', `${G}.jsonl`), JSON.stringify({ type: 'session_meta', payload: { id: G, cwd: x.codexHome, source: { subagent: { other: 'guardian' } }, thread_source: 'guardian_review', parent_thread_id: R } }) + '\n');
+  const guardian = { session_id: G, cwd: x.codexHome, transcript_path: path.join(x.codexHome, 'sessions', `${G}.jsonl`) };
+  await x.hook({ ...guardian, hook_event_name: 'UserPromptSubmit', turn_id: 'g-turn', prompt: 'Assess this action' });
+  await x.hook({ ...guardian, hook_event_name: 'PreToolUse', turn_id: 'g-turn', tool_name: 'Read', tool_input: {} });
+  assert.equal(herdr.held['w1:p3'], R, 'the pane keeps the root thread (Auto-review)');
+  // Any sync these hooks started has had time to rename; none did.
+  await settle(2500);
+  assert.equal(herdr.calls('tab.rename').length, renames, 'no tab was renamed after a background thread');
+  assert.deepEqual(tabs.map(tb => tb.label), ['1', 'Write parser tests']);
+  assert.deepEqual(owned().local, { 'w1:t3': 'Write parser tests' });
+});
+
+test('herdr tab sync: a pane and tab an older OAK gave Codex\'s memory thread go back to the root thread at its next turn, with no record repaired', async t => {
+  const tabs = [tab(3, '3')];
+  const herdr = await identityHerdr(t, tabs, [pane(3, 3)]);
+  if (!herdr) return;
+  resetOwned();
+  const R = 'fixture-healed-root', M = 'fixture-stale-memory';
+  const x = codexPane(t, herdr, { [R]: 'Port the fixture exporter' });
+  await x.hook({ session_id: R, cwd: x.codexHome, hook_event_name: 'SessionStart', source: 'startup', transcript_path: x.rollouts[R] });
+  assert.equal(herdr.held['w1:p3'], R);
+  // What an OAK before this fix left: the memory thread's store, its link to the root thread's pane, the
+  // pane given to it (a sequenced `startup` report), and the tab named, and claimed, after it.
+  fs.mkdirSync(storeDir(M), { recursive: true });
+  fs.writeFileSync(path.join(storeDir(M), 'agent.json'), JSON.stringify({ agent: 'codex', cwd: x.memories, updated: Date.now() }));
+  fs.writeFileSync(path.join(storeDir(M), 'herdr.json'), JSON.stringify({ paneId: 'w1:p3', socketPath: herdr.socketPath, at: Date.now() + 1, reported: true, sessionStartSource: 'startup' }));
+  herdr.held['w1:p3'] = M;
+  tabs[0].label = 'Codex memory update';
+  fs.mkdirSync(path.dirname(record()), { recursive: true });
+  fs.writeFileSync(record(), JSON.stringify({ local: { 'w1:t3': 'Codex memory update' } }));
+  // The memory thread's own sync names nothing, even with a title to give.
+  assert.deepEqual(await syncOf(herdr)(M, 'Codex memory update'), []);
+  // …not even over a name OAK gave the tab, which a session's own sync may otherwise replace.
+  tabs[0].label = 'Port the fixture exporter';
+  fs.writeFileSync(record(), JSON.stringify({ local: { 'w1:t3': 'Port the fixture exporter' } }));
+  assert.deepEqual(await syncOf(herdr)(M, 'Codex memory update'), [], 'not even over the root thread\'s name');
+  assert.equal(tabs[0].label, 'Port the fixture exporter');
+  tabs[0].label = 'Codex memory update';
+  fs.writeFileSync(record(), JSON.stringify({ local: { 'w1:t3': 'Codex memory update' } }));
+  // The root thread's next turn: its hook's sync takes the pane back and names the tab.
+  await x.hook({ session_id: R, cwd: x.codexHome, hook_event_name: 'UserPromptSubmit', turn_id: 'turn-2', prompt: 'Next', transcript_path: x.rollouts[R] });
+  assert.ok(await until(() => tabs[0].label === 'Port the fixture exporter'), 'the tab wears the root thread\'s name again');
+  assert.equal(herdr.held['w1:p3'], R, 'the pane holds the root thread again');
+  const heal = herdr.calls('pane.report_agent_session').at(-1);
+  assert.equal(heal.agent_session_id, R);
+  assert.equal(heal.session_start_source, 'startup', 'the report names the root thread\'s own start, so herdr replaces');
+  assert.ok(heal.seq > 0, 'sequenced, so herdr does not ignore it');
+  assert.ok(await until(() => owned().local?.['w1:t3'] === 'Port the fixture exporter'), 'the claim follows');
+});
+
+test('herdr tab sync: a Codex session with no title yet still takes back a pane an older OAK gave its memory thread', async t => {
+  const tabs = [tab(3, '3')];
+  const herdr = await identityHerdr(t, tabs, [pane(3, 3)]);
+  if (!herdr) return;
+  resetOwned();
+  const R = 'fixture-untitled-root', M = 'fixture-untitled-memory';
+  const x = codexPane(t, herdr, { [R]: 'Port the fixture exporter' });
+  await x.hook({ session_id: R, cwd: x.codexHome, hook_event_name: 'SessionStart', source: 'startup', transcript_path: x.rollouts[R] });
+  fs.mkdirSync(storeDir(M), { recursive: true });
+  fs.writeFileSync(path.join(storeDir(M), 'agent.json'), JSON.stringify({ agent: 'codex', cwd: x.memories, updated: Date.now() }));
+  herdr.held['w1:p3'] = M;
+  tabs[0].label = 'Codex memory update';
+  const reports = herdr.calls('pane.report_agent_session').length;
+  // No title to give: the pane goes back to the root thread, and the tab is left as it is.
+  assert.deepEqual(await syncOf(herdr)(R, ''), []);
+  assert.equal(herdr.held['w1:p3'], R, 'the pane holds the root thread again');
+  assert.equal(herdr.calls('pane.report_agent_session').length, reports + 1);
+  assert.equal(tabs[0].label, 'Codex memory update', 'no name without a title');
+  // Control: a Claude session with no title reads nothing from herdr.
+  const snapshots = herdr.calls('session.snapshot').length;
+  fs.mkdirSync(storeDir('fixture-untitled-claude'), { recursive: true });
+  fs.writeFileSync(path.join(storeDir('fixture-untitled-claude'), 'herdr.json'), JSON.stringify({ paneId: 'w1:p3', socketPath: herdr.socketPath, at: Date.now() }));
+  assert.deepEqual(await syncOf(herdr)('fixture-untitled-claude', ''), []);
+  assert.equal(herdr.calls('session.snapshot').length, snapshots, 'no herdr read for an untitled Claude session');
+});
+
+test('herdr tabs: the terminal app\'s pass never names a tab after the memory thread herdr shows in its pane; the root thread names it once the pane is back (2026-10-06)', () => {
+  // OAK's session list titles Codex's memory-writing thread "Codex memory update", and the pass names a tab
+  // after the session herdr reports in its pane: an older OAK's hook had reported the thread there.
+  const list = titles({ 'fixture-root': 'Tidy the fixture importer', 'fixture-memory': 'Codex memory update' });
+  const held = (label) => snap([tab(9, label)], [pane(9, 9)], [agent(9, 'fixture-memory', 'w1', 'codex')]);
+  assert.deepEqual(reconcileHerdrTabs(held('1'), list, {}, { btop: false }), { actions: [], owned: {} }, 'a tab with herdr\'s own name');
+  // …nor over the root thread's name, which OAK gave the tab and still claims.
+  const claim = { 'w1:t9': 'Tidy the fixture importer' };
+  assert.deepEqual(reconcileHerdrTabs(held('Tidy the fixture importer'), list, claim, { btop: false }), { actions: [], owned: claim });
+  // Control: once the pane is the root thread's again, a tab named after the memory thread before takes its name.
+  const back = snap([tab(9, 'Codex memory update')], [pane(9, 9)], [agent(9, 'fixture-root', 'w1', 'codex')]);
+  assert.deepEqual(reconcileHerdrTabs(back, list, { 'w1:t9': 'Codex memory update' }, { btop: false }).actions,
+    [{ kind: 'rename', tab_id: 'w1:t9', label: 'Tidy the fixture importer' }]);
+});
+
+// herdr itself decides whether a report replaces the session it holds in a pane (the session start the report
+// names, its sequence), so the heal is also run against the installed herdr (HERDR_BIN, else herdr on PATH or in
+// ~/.local/bin), on a sandboxed server kept off the network. Verified 2026-10-06 on herdr 0.9.1 and 0.9.3.
+test('herdr tab sync: a real herdr gives the root thread back the pane its memory thread\'s report took (live sandbox)', { timeout: 30000 }, async t => {
+  const bin = process.env.HERDR_BIN || require('../dist/herdr-install').findHerdrBin();
+  const sleeper = ['/bin/sleep', '/usr/bin/sleep'].find(f => fs.existsSync(f));
+  if (!bin || !sleeper || process.platform === 'win32') {
+    const why = `SKIP LIVE HEAL: ${!bin ? 'no herdr binary' : 'no POSIX sleep to stand in for codex'}; the heal is verified against the scripted herdr only.`;
+    console.error(why); t.skip(why); return;
+  }
+  const cp = require('node:child_process');
+  const box = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-heal-'));
+  const env = { ...process.env, HOME: box, XDG_CONFIG_HOME: path.join(box, 'config'), XDG_DATA_HOME: path.join(box, 'data'),
+    XDG_STATE_HOME: path.join(box, 'state'), XDG_CACHE_HOME: path.join(box, 'cache'), HERDR_SOCKET_PATH: path.join(box, 'h.sock'), SHELL: '/bin/sh' };
+  for (const key of ['HERDR_SESSION', 'HERDR_PANE_ID', 'HERDR_TAB_ID', 'HERDR_WORKSPACE_ID', 'HERDR_ENV']) delete env[key];
+  fs.mkdirSync(path.join(env.XDG_CONFIG_HOME, 'herdr'), { recursive: true });
+  fs.writeFileSync(path.join(env.XDG_CONFIG_HOME, 'herdr', 'config.toml'), '[update]\nversion_check = false\nmanifest_check = false\n');
+  const server = cp.spawn(bin, ['server'], { env, stdio: 'ignore' });
+  const codexHome = process.env.CODEX_HOME;
+  t.after(async () => {
+    if (codexHome === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = codexHome;
+    if (server.exitCode === null && server.signalCode === null) {
+      server.kill('SIGTERM');
+      if (!await until(() => server.exitCode !== null || server.signalCode !== null, 2000)) server.kill('SIGKILL');
+    }
+    fs.rmSync(box, { recursive: true, force: true });
+  });
+  process.env.CODEX_HOME = path.join(box, 'codex');
+  const opts = { socketPath: env.HERDR_SOCKET_PATH, binary: bin, timeoutMs: 5000 };
+  assert.ok(await until(() => fs.existsSync(env.HERDR_SOCKET_PATH)), 'the sandboxed server came up');
+  const paneId = (await transport.herdrRequest('workspace.create', { cwd: box, label: 'heal', focus: true }, opts)).root_pane.pane_id;
+  // herdr lists a pane among its agents, where a session's pane is looked up, only while an agent runs there.
+  fs.mkdirSync(path.join(box, 'bin'));
+  fs.copyFileSync(sleeper, path.join(box, 'bin', 'codex'));
+  fs.chmodSync(path.join(box, 'bin', 'codex'), 0o755);
+  await transport.herdrRequest('pane.send_text', { pane_id: paneId, text: `exec ${path.join(box, 'bin', 'codex')} 60\n` }, opts);
+  let snapshot;
+  const held = async () => (snapshot = await transport.herdrSnapshot(opts)).agents.find(a => a.pane_id === paneId);
+  for (const end = Date.now() + 10000; (await held())?.agent !== 'codex' && Date.now() < end;) await new Promise(r => setTimeout(r, 100));
+  assert.equal((await held())?.agent, 'codex', 'herdr sees codex run in the pane');
+  const R = 'fixture-live-root', M = 'fixture-live-memory';
+  const link = { paneId, socketPath: env.HERDR_SOCKET_PATH, at: Date.now(), reported: true, sessionStartSource: 'startup' };
+  for (const [id, cwd] of [[R, box], [M, path.join(process.env.CODEX_HOME, 'memories')]]) {
+    fs.mkdirSync(storeDir(id), { recursive: true });
+    fs.writeFileSync(path.join(storeDir(id), 'agent.json'), JSON.stringify({ agent: 'codex', cwd, updated: Date.now() }));
+    fs.writeFileSync(path.join(storeDir(id), 'herdr.json'), JSON.stringify(link));
+  }
+  // The reports the hooks made, with the hooks' own arguments (herdr-link.ts reportHerdrSessionSync): the root
+  // thread's start, then, from an OAK before 0.11.0, the memory thread's.
+  const report = id => cp.execFileSync(bin, ['pane', 'report-agent-session', paneId, '--source', 'herdr:codex', '--agent', 'codex',
+    '--agent-session-id', id, '--seq', String(BigInt(Date.now()) * 1_000_000n), '--session-start-source', 'startup'], { env, stdio: 'ignore', timeout: 10000 });
+  report(R);
+  await new Promise(r => setTimeout(r, 20)); // a later sequence than the root thread's
+  report(M);
+  assert.equal((await held())?.agent_session?.value, M, 'the memory thread took the pane');
+  const done = await syncSessionTab({ session: R, title: 'Tidy the fixture importer', transport, herdrOptions: { timeoutMs: 5000 } });
+  assert.equal((await held())?.agent_session?.value, R, 'the pane is the root thread\'s again');
+  assert.deepEqual(done.map(a => a.label), ['Tidy the fixture importer']);
+  const tabId = snapshot.panes.find(p => p.pane_id === paneId).tab_id;
+  assert.equal(snapshot.tabs.find(tb => tb.tab_id === tabId).label, 'Tidy the fixture importer');
 });
 
 // --- the ownership record under concurrency -----------------------------------------------------------
@@ -1066,6 +1323,194 @@ test('herdr tabs record: a pass that reads the record while a session\'s own syn
   assert.deepEqual(await ensureHerdrTabs({ snapshot: JSON.parse(JSON.stringify(server)), titleOf: titles({ 'sess-o': 'New title' }), monitor: null,
     listedAt: Date.now(), transport, herdrOptions: { socketPath: herdr.socketPath, timeoutMs: 5000 } }), []);
   assert.deepEqual(owned(), { local: { 'w1:t1': 'New title' } });
+});
+
+// The same race one step earlier: a pass that read the record BEFORE a session's own sync wrote either file,
+// over a snapshot taken after that sync renamed the tab. The pass saw its own older claim on a tab that no
+// longer wears it, so it dropped that claim, and its save erased the sync's newer one: the tab then kept that
+// title while its session's title moved on. Each claim a save changes is now a compare-and-swap against the
+// claim the pass read.
+test('herdr tabs record: a pass that read the record before a session\'s own sync saved its claim never erases that claim', async t => {
+  let server;
+  const herdr = await fakeHerdr(t, { 'tab.rename': ({ tab_id, label }) => { server.tabs.find(x => x.tab_id === tab_id).label = label; return ok(); } });
+  if (!herdr) return;
+  resetOwned();
+  server = homeSnap([tab(1, 'Old title')], [pane(1, 1)], [agent(1, 'sess-c', 'w1', 'claude')]);
+  herdr.snapshot = server;
+  fs.mkdirSync(path.dirname(record()), { recursive: true });
+  fs.writeFileSync(record(), JSON.stringify({ local: { 'w1:t1': 'Old title' } }));
+  linkPane('sess-c', 'w1:p1', herdr.socketPath);
+  const listed = Date.now(); // the app read its list: the title was 'Old title'
+  // The session's own sync holds the record's lock while it saves; the tab already wears its new title.
+  const lock = `${record()}.lock`;
+  fs.writeFileSync(lock, `${process.pid}:sync`);
+  server.tabs[0].label = 'New title';
+  const pass = ensureHerdrTabs({ snapshot: JSON.parse(JSON.stringify(server)), titleOf: titles({ 'sess-c': 'Old title' }), monitor: null,
+    listedAt: listed, transport, herdrOptions: { socketPath: herdr.socketPath, timeoutMs: 5000 } });
+  // The pass has read the record and waits on the lock. The sync writes what its save writes, then lets go.
+  assert.ok(await lockTried(lock), 'the pass waits on the lock');
+  fs.writeFileSync(path.join(rootDir(), 'herdr-tabs.at.json'), JSON.stringify({ local: { 'w1:t1': Date.now() } }));
+  fs.writeFileSync(record(), JSON.stringify({ local: { 'w1:t1': 'New title' } }));
+  fs.rmSync(lock);
+  assert.deepEqual(await pass, [], 'the pass renames nothing');
+  assert.deepEqual(owned(), { local: { 'w1:t1': 'New title' } }, 'and keeps the claim the sync saved after it read the record');
+  // So the tab follows its session's next title.
+  assert.deepEqual(await syncSessionTab({ session: 'sess-c', title: 'Newer title', transport, herdrOptions: { timeoutMs: 5000 } }),
+    [{ kind: 'rename', tab_id: 'w1:t1', label: 'Newer title' }]);
+  // Control: a claim nobody changed since the pass read it is still the pass's to drop (a person renamed the tab).
+  server.tabs[0].label = 'my notes';
+  assert.deepEqual(await ensureHerdrTabs({ snapshot: JSON.parse(JSON.stringify(server)), titleOf: titles({ 'sess-c': 'Newer title' }), monitor: null,
+    listedAt: Date.now(), transport, herdrOptions: { socketPath: herdr.socketPath, timeoutMs: 5000 } }), []);
+  assert.deepEqual(owned(), { local: {} });
+});
+
+// The title moved twice while one pass ran: the pass read the record and its list (the second title), then
+// the session's own sync renamed the tab to the third title and saved that claim, and only then did the
+// pass rename the tab. Its save then kept the sync's claim, as it should, but the tab wore the pass's older
+// title, which no claim named: every later pass took that for a person's name and the tab never followed its
+// session again. A pass re-reads the claim under the record's lock before it renames a tab.
+test('herdr tabs record: a pass never renames a tab whose claim a session\'s own sync changed after the pass read the record', async t => {
+  let server;
+  const herdr = await fakeHerdr(t, {
+    'tab.rename': ({ tab_id, label }) => { server.tabs.find(x => x.tab_id === tab_id).label = label; return ok(); },
+    // The pass starts the monitor first; the sync lands meanwhile: it renamed the tab and saved its claim.
+    'pane.process_info': ({ pane_id }) => {
+      server.tabs[1].label = 'Third title';
+      fs.writeFileSync(path.join(rootDir(), 'herdr-tabs.at.json'), JSON.stringify({ local: { 'w1:t2': Date.now() } }));
+      fs.writeFileSync(record(), JSON.stringify({ local: { 'w1:t2': 'Third title' } }));
+      return processInfo.replaced(pane_id);
+    },
+  });
+  if (!herdr) return;
+  resetOwned();
+  server = homeSnap([tab(1, BTOP_LABEL), tab(2, 'First title')], [monitor(1, 1), pane(2, 2)], [agent(2, 'sess-t', 'w1', 'claude')]);
+  herdr.snapshot = server;
+  fs.mkdirSync(path.dirname(record()), { recursive: true });
+  fs.writeFileSync(record(), JSON.stringify({ local: { 'w1:t2': 'First title' } }));
+  fs.rmSync(path.join(rootDir(), 'herdr-tabs.at.json'), { force: true });
+  linkPane('sess-t', 'w1:p2', herdr.socketPath);
+  const done = await ensureHerdrTabs({ snapshot: JSON.parse(JSON.stringify(server)), titleOf: titles({ 'sess-t': 'Second title' }), monitor: '/usr/bin/htop',
+    timing: fast, listedAt: Date.now(), transport, herdrOptions: { socketPath: herdr.socketPath, timeoutMs: 5000 } });
+  assert.deepEqual(done, [], 'the pass renames nothing');
+  assert.equal(server.tabs[1].label, 'Third title', 'the tab keeps the title the sync gave it');
+  assert.deepEqual(owned(), { local: { 'w1:t2': 'Third title' } });
+  // So the tab follows its session's next title.
+  assert.deepEqual(await syncSessionTab({ session: 'sess-t', title: 'Fourth title', transport, herdrOptions: { timeoutMs: 5000 } }),
+    [{ kind: 'rename', tab_id: 'w1:t2', label: 'Fourth title' }]);
+  assert.equal(server.tabs[1].label, 'Fourth title');
+  // The claim is read again under the machine's lock: a sync that holds it while it renames and saves is waited for.
+  const lock = path.join(rootDir(), 'herdr-names.local.lock');
+  fs.writeFileSync(lock, `${process.pid}:sync`);
+  const pass = ensureHerdrTabs({ snapshot: JSON.parse(JSON.stringify(server)), titleOf: titles({ 'sess-t': 'Fifth title' }), monitor: null,
+    listedAt: Date.now(), transport, herdrOptions: { socketPath: herdr.socketPath, timeoutMs: 5000 } });
+  assert.ok(await lockTried(lock), 'the pass waits on the lock');
+  server.tabs[1].label = 'Sixth title';
+  fs.writeFileSync(path.join(rootDir(), 'herdr-tabs.at.json'), JSON.stringify({ local: { 'w1:t2': Date.now() } }));
+  fs.writeFileSync(record(), JSON.stringify({ local: { 'w1:t2': 'Sixth title' } }));
+  fs.rmSync(lock);
+  assert.deepEqual(await pass, []);
+  assert.equal(server.tabs[1].label, 'Sixth title');
+  assert.deepEqual(owned(), { local: { 'w1:t2': 'Sixth title' } });
+});
+
+// A pass renames under a lock, and waits for another's only `OWNED_LOCK_MS` (2 s) before it goes on without it.
+// A pass whose renames outlasted that (a saved machine over ssh) then wrote back the record it had read
+// before its renames, over the claim the other writer saved meanwhile: that tab was never renamed again.
+test('herdr tabs record: a pass whose renames outlast the lock wait keeps the claims saved meanwhile', async t => {
+  let server;
+  const herdr = await fakeHerdr(t, { 'tab.rename': ({ tab_id, label }) => { server.tabs.find(x => x.tab_id === tab_id).label = label; return ok(); } });
+  if (!herdr) return;
+  resetOwned();
+  server = homeSnap([tab(1, 'A old'), tab(2, 'B old')], [pane(1, 1), pane(2, 2)], [agent(1, 'sess-a', 'w1', 'claude'), agent(2, 'sess-b', 'w1', 'claude')]);
+  herdr.snapshot = server;
+  fs.mkdirSync(path.dirname(record()), { recursive: true });
+  fs.writeFileSync(record(), JSON.stringify({ local: { 'w1:t1': 'A old', 'w1:t2': 'B old' } }));
+  fs.rmSync(path.join(rootDir(), 'herdr-tabs.at.json'), { force: true });
+  linkPane('sess-b', 'w1:p2', herdr.socketPath);
+  const slow = { ...transport, herdrRequest: async (m, p, o) => { if (m === 'tab.rename') await new Promise(r => setTimeout(r, 2600)); return transport.herdrRequest(m, p, o); } };
+  const pass = ensureHerdrTabs({ snapshot: JSON.parse(JSON.stringify(server)), titleOf: titles({ 'sess-a': 'A new', 'sess-b': 'B old' }), monitor: null,
+    listedAt: Date.now(), transport: slow, herdrOptions: { socketPath: herdr.socketPath, timeoutMs: 10000 } });
+  await new Promise(r => setTimeout(r, 200));
+  // B's own sync, in a process of its own, while the pass is still renaming A.
+  const script = `const core = require(${JSON.stringify(path.resolve(__dirname, '../dist'))});
+    core.syncSessionTab({ session: 'sess-b', title: 'B new', transport: core, herdrOptions: { timeoutMs: 5000 } }).then(d => console.log(JSON.stringify(d)), e => { console.error(e); process.exit(1); });`;
+  const sync = await new Promise((resolve, reject) => require('node:child_process').execFile(process.execPath, ['-e', script], { env: process.env, timeout: 20000 },
+    (error, stdout) => (error ? reject(error) : resolve(JSON.parse(stdout)))));
+  assert.deepEqual(sync, [{ kind: 'rename', tab_id: 'w1:t2', label: 'B new' }]);
+  assert.deepEqual(await pass, [{ kind: 'rename', tab_id: 'w1:t1', label: 'A new' }]);
+  assert.deepEqual(server.tabs.map(x => x.label), ['A new', 'B new']);
+  assert.deepEqual(owned(), { local: { 'w1:t1': 'A new', 'w1:t2': 'B new' } }, 'the slow pass keeps the claim the sync saved meanwhile');
+  // So B's tab follows its session's next title.
+  assert.deepEqual(await syncSessionTab({ session: 'sess-b', title: 'B newer', transport, herdrOptions: { timeoutMs: 5000 } }),
+    [{ kind: 'rename', tab_id: 'w1:t2', label: 'B newer' }]);
+});
+
+// A sync that gave up waiting for the machine's lock renamed and claimed its tab while the pass was still on
+// an earlier rename. The pass had read the claims once, before its renames, so it then renamed that tab back
+// to its own older title, which no claim named: the tab was never renamed again.
+test('herdr tabs record: a pass reads the claim again before each rename, so a tab a sync claimed meanwhile is left alone', async t => {
+  let server;
+  let entered = false;
+  let release;
+  const held = new Promise(resolve => { release = resolve; });
+  const herdr = await fakeHerdr(t, { 'tab.rename': ({ tab_id, label }) => { server.tabs.find(x => x.tab_id === tab_id).label = label; return ok(); } });
+  if (!herdr) return;
+  resetOwned();
+  server = homeSnap([tab(1, 'A old'), tab(2, 'B old')], [pane(1, 1), pane(2, 2)], [agent(1, 'sess-a', 'w1', 'claude'), agent(2, 'sess-b', 'w1', 'claude')]);
+  herdr.snapshot = server;
+  fs.mkdirSync(path.dirname(record()), { recursive: true });
+  fs.writeFileSync(record(), JSON.stringify({ local: { 'w1:t1': 'A old', 'w1:t2': 'B old' } }));
+  fs.rmSync(path.join(rootDir(), 'herdr-tabs.at.json'), { force: true });
+  linkPane('sess-b', 'w1:p2', herdr.socketPath);
+  // The pass's first rename (tab A) is held until B's sync is done.
+  const slow = { ...transport, herdrRequest: async (m, p, o) => {
+    if (m === 'tab.rename' && p.tab_id === 'w1:t1') { entered = true; await held; }
+    return transport.herdrRequest(m, p, o);
+  } };
+  const pass = ensureHerdrTabs({ snapshot: JSON.parse(JSON.stringify(server)), titleOf: titles({ 'sess-a': 'A new', 'sess-b': 'B pass' }), monitor: null,
+    listedAt: Date.now() - 5000, transport: slow, herdrOptions: { socketPath: herdr.socketPath, timeoutMs: 10000 } });
+  try {
+    assert.ok(await until(() => entered), 'the pass is renaming tab A, holding the machine\'s lock');
+    // B's own sync, in a process of its own: it waits out the lock, then renames and claims B without it.
+    const script = `const core = require(${JSON.stringify(path.resolve(__dirname, '../dist'))});
+      core.syncSessionTab({ session: 'sess-b', title: 'B new', transport: core, herdrOptions: { timeoutMs: 5000 } }).then(d => console.log(JSON.stringify(d)), e => { console.error(e); process.exit(1); });`;
+    const sync = await new Promise((resolve, reject) => require('node:child_process').execFile(process.execPath, ['-e', script], { env: process.env, timeout: 20000 },
+      (error, stdout) => (error ? reject(error) : resolve(JSON.parse(stdout)))));
+    assert.deepEqual(sync, [{ kind: 'rename', tab_id: 'w1:t2', label: 'B new' }]);
+  } finally { release(); }
+  await pass;
+  assert.deepEqual(server.tabs.map(x => x.label), ['A new', 'B new'], 'the pass does not rename B back to its older title');
+  assert.deepEqual(owned(), { local: { 'w1:t1': 'A new', 'w1:t2': 'B new' } });
+});
+
+// The terminal app runs one pass per machine at once. A saved machine's renames held the whole record's lock,
+// so the local pass waited 2 s behind them, wrote without the lock, and then lost its claim to the slow
+// pass's write.
+test('herdr tabs record: a saved machine\'s slow renames never hold up the local pass or undo its claims', async () => {
+  resetOwned();
+  fs.mkdirSync(path.dirname(record()), { recursive: true });
+  fs.writeFileSync(record(), JSON.stringify({ local: { 'L:t1': 'Old L' }, box: { 'B:t1': 'Old B' } }));
+  fs.rmSync(path.join(rootDir(), 'herdr-tabs.at.json'), { force: true });
+  const one = (ws, label) => ({ workspaces: [workspace(ws, 'home')], tabs: [tab(1, label, ws)], panes: [pane(1, 1, ws)], agents: [agent(1, `sess-${ws}`, ws, 'claude')] });
+  let release;
+  const remoteRename = new Promise(resolve => { release = resolve; });
+  const renamed = [];
+  const fake = {
+    herdrRequest: async (method, params) => { renamed.push(['local', params?.label]); return { type: 'ok' }; },
+    herdrOnMachine: async (machine, argv) => { if (argv[0] === 'tab' && argv[1] === 'rename') { await remoteRename; renamed.push([machine, argv.at(-1)]); } return { result: {} }; },
+  };
+  const remote = ensureHerdrTabs({ machine: 'box', snapshot: one('B', 'Old B'), titleOf: titles({ 'sess-B': 'New B' }), only: 'B:t1', transport: fake, listedAt: Date.now() });
+  await new Promise(r => setTimeout(r, 100));
+  const started = Date.now();
+  const safety = setTimeout(() => release(), 5000);
+  await ensureHerdrTabs({ snapshot: one('L', 'Old L'), titleOf: titles({ 'sess-L': 'New L' }), monitor: null, transport: fake, listedAt: Date.now() });
+  const waited = Date.now() - started;
+  release();
+  clearTimeout(safety);
+  await remote;
+  assert.ok(waited < 1000, `the local pass waited ${waited} ms for the saved machine's rename`);
+  assert.deepEqual(renamed, [['local', 'New L'], ['box', 'New B']]);
+  assert.deepEqual(owned(), { local: { 'L:t1': 'New L' }, box: { 'B:t1': 'New B' } });
 });
 
 test('herdr tabs record: a claim\'s time holds back a pass with an older list, but not one taken before the clock was set back', async t => {

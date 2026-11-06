@@ -15,7 +15,7 @@ import { newProcessFacts, foldProcessFacts, ProcessFacts } from './processes';
 
 // Bump whenever any of the constituent folds changes its stored shape or interpretation. The version
 // is part of the cache FILE NAME, so `pruneStaleMaps` can reclaim the generation a bump supersedes.
-export const TRANSCRIPT_FACTS_VERSION = 11; // 9: subagent facts keep each background task's completion notice (`ended`); 10: every id in a notice, the latest enqueue, and each agent's last turn (`vitals.lastTurnTs`); 11: a meta user record is a turn
+export const TRANSCRIPT_FACTS_VERSION = 17; // 9: subagent facts keep each background task's completion notice (`ended`); 10: every id in a notice, the latest enqueue, and each agent's last turn (`vitals.lastTurnTs`); 11: a meta user record is a turn; 12: an agent's usage counts each message id once (`subagents.usageIds`); 13: at its largest snapshot (`usageIds` maps each id to it); 14: foreground worker completion time; 16: worker shells and Codex exec sessions; 17: a worker's shell ends from its queued-command attachment
 const VERSION = TRANSCRIPT_FACTS_VERSION;
 const GUARD_BYTES = 128;
 // Two guards proved only that the first and last 128 bytes of the parsed region survived, so an
@@ -70,7 +70,7 @@ function emptyFacts(): TranscriptFacts {
 function fold(facts: TranscriptFacts, line: Buffer, includeSidechain: boolean, offset: number): void {
   let o: any;
   try { o = JSON.parse(line.toString('utf8')); } catch { return; }
-  if (!o || typeof o !== 'object' || Array.isArray(o)) return;
+  if (!o || typeof o !== 'object' || Array.isArray(o) || o.type === 'api-request-blob') return;
   foldSubagentFacts(facts.subagents, o);
   foldProcessFacts(facts.processes, o);
   foldActionFacts(facts.actions, o, includeSidechain, offset, line.length);
@@ -133,7 +133,7 @@ function guards(fd: number, cursor: number): string {
   return h.digest('hex');
 }
 function validFacts(f: TranscriptFacts): boolean {
-  return !!f && f.subagents?.spawns instanceof Map && f.subagents.meta instanceof Map && f.subagents.ended instanceof Map &&
+  return !!f && f.subagents?.spawns instanceof Map && f.subagents.meta instanceof Map && f.subagents.ended instanceof Map && f.subagents.usageIds instanceof Map &&
     Array.isArray(f.subagents.todos) && typeof f.subagents.vitals?.firstTs === 'number' && typeof f.subagents.vitals.lastTurnTs === 'number' &&
     f.processes?.byToolUse instanceof Map && f.processes.byId instanceof Map &&
     f.processes.stopped instanceof Map && Array.isArray(f.processes.pendingEnd) &&

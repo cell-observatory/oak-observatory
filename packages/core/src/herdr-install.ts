@@ -28,6 +28,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as crypto from 'crypto';
+import { isDeepStrictEqual } from 'util';
 import { spawnTool, spawnToolSync } from './spawn';
 import { compareVersions } from './semver';
 import { HERDR_LOCK } from './herdr-lock';
@@ -596,7 +597,8 @@ export async function ensureHerdr(opts: EnsureHerdrOptions = {}): Promise<HerdrR
     const defaults = [sidebar ? 'sidebar widths' : '', theme ? 'gruvbox theme' : ''].filter(Boolean).join(' and ');
     const check = (): { ok: boolean; said: string } => {
       const r = run(bin, ['config', 'check']);
-      return { ok: r.status === 0 && /config:\s*ok/.test(r.stdout), said: (r.stderr || r.stdout).split('\n').find((l) => /\S/.test(l) && !/config:\s*ok/.test(l)) ?? '' };
+      // herdr prints `config: issues found` first, on stdout, and its reason on the next line.
+      return { ok: r.status === 0 && /config:\s*ok/.test(r.stdout), said: (r.stderr || r.stdout).split('\n').find((l) => /\S/.test(l) && !/config:\s*(ok|issues found)\s*$/.test(l)) ?? '' };
     };
     const precheck = before !== null && defaults ? check() : { ok: true, said: '' };
     if (!precheck.ok) {
@@ -753,18 +755,96 @@ export function probeLoginSession(env: NodeJS.ProcessEnv, platform: NodeJS.Platf
 const HERDR_SIDEBAR_MIN_WIDTH = 48;
 const HERDR_SIDEBAR_MAX_WIDTH = 72;
 
-/** True when the person set no sidebar width — table key or dotted key, any of the three. */
+/** True when the person set no sidebar width, any of the three, however the `ui` table is written. A file
+ *  smol-toml cannot parse is read line by line, as before (`\uFEFF?` lets a first line follow the byte
+ *  order mark that may open the file), and herdr's own check then judges it. */
 function sidebarWidthsAbsent(text: string): boolean {
-  return !/^[ \t]*(?:ui\.)?sidebar_(?:min_|max_)?width[ \t]*=/m.test(text);
+  try {
+    const ui = parseToml(text).ui;
+    return !(ui && typeof ui === 'object' && ['sidebar_width', 'sidebar_min_width', 'sidebar_max_width'].some((k) => Object.prototype.hasOwnProperty.call(ui, k)));
+  } catch {
+    return !/^\uFEFF?[ \t]*(?:ui\.)?sidebar_(?:min_|max_)?width[ \t]*=/m.test(text);
+  }
+}
+
+/** The same TOML, whatever order its keys were written in. */
+function canonToml(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonToml);
+  if (!value || typeof value !== 'object' || value instanceof Date) return value;
+  return Object.fromEntries(Object.keys(value).sort().map((k) => [k, canonToml((value as Record<string, unknown>)[k])]));
+}
+
+/**
+ * `text` with `entries` added to its top-level `table`, written in the form the file already gives that table, or null when
+ * it has no such table or no such form: under its `[table]` header (spaced, quoted or followed by a comment), inside its inline table
+ * (`ui = { … }`), or among its dotted keys at the root (`ui.status_indicators = …`, where a `[ui]` header after them would
+ * define the table a second time, which herdr refuses). Each place is kept only when the result parses to the file's own
+ * TOML plus exactly these keys, so a header inside a multiline string, or a dotted key under another table, is passed
+ * over. The file's own line ending is used, and a byte order mark that opens it stays first.
+ */
+function withTableKeys(text: string, table: 'ui' | 'theme', entries: [string, string | number][], eol: string): string | null {
+  const value = (v: string | number): string => (typeof v === 'number' ? String(v) : JSON.stringify(v));
+  let expected: unknown;
+  try {
+    const before = parseToml(text);
+    const own = before[table];
+    if (!own || typeof own !== 'object' || Array.isArray(own)) return null;
+    expected = canonToml({ ...before, [table]: { ...own, ...Object.fromEntries(entries) } });
+  } catch {
+    return null;
+  }
+  const means = (next: string): boolean => {
+    try { return isDeepStrictEqual(canonToml(parseToml(next)), expected); } catch { return false; }
+  };
+  // Any quoted key may spell it (`["th\u0065me"]`): the check passes over one that names another table.
+  const name = `(?:${table}|"(?:[^"\\\\\\r\\n]|\\\\.)*"|'[^'\\r\\n]*')`;
+  const candidates: string[] = [];
+  // Under a `[table]` header, right after it.
+  for (const header of text.matchAll(new RegExp(`^\\uFEFF?[ \\t]*\\[[ \\t]*${name}[ \\t]*\\][ \\t]*(?:#.*)?(?:\\r?\\n|$)`, 'gm'))) {
+    const at = header.index! + header[0].length;
+    candidates.push(text.slice(0, at) + (text[at - 1] === '\n' ? '' : eol) + entries.map(([k, v]) => `${k} = ${value(v)}${eol}`).join('') + text.slice(at));
+  }
+  // Inside an inline table, before its closing brace: past quoted strings and nested braces and brackets.
+  for (const inline of text.matchAll(new RegExp(`^\\uFEFF?[ \\t]*${name}[ \\t]*=[ \\t]*\\{`, 'gm'))) {
+    const open = inline.index! + inline[0].length;
+    let depth = 1, quote = '', end = -1;
+    for (let i = open; i < text.length && end < 0; i++) {
+      const c = text[i];
+      if (quote) { if (c === '\\' && quote === '"') i++; else if (c === quote) quote = ''; }
+      else if (c === '"' || c === "'") quote = c;
+      else if (c === '{' || c === '[') depth++;
+      else if ((c === '}' || c === ']') && --depth === 0) end = i;
+    }
+    if (end < 0) continue;
+    const body = text.slice(open, end);
+    const keys = entries.map(([k, v]) => `${k} = ${value(v)}`).join(', ');
+    candidates.push(body.trim() ? `${text.slice(0, open + body.trimEnd().length)}, ${keys}${text.slice(open + body.trimEnd().length)}`
+      : `${text.slice(0, open)} ${keys} ${text.slice(end)}`);
+  }
+  // Among its dotted keys at the root, just before one of them.
+  for (const dotted of text.matchAll(new RegExp(`^(\\uFEFF?)[ \\t]*${name}[ \\t]*\\.`, 'gm'))) {
+    const at = dotted.index! + dotted[1].length;
+    candidates.push(text.slice(0, at) + entries.map(([k, v]) => `${table}.${k} = ${value(v)}${eol}`).join('') + text.slice(at));
+  }
+  return candidates.find(means) ?? null;
+}
+
+/** `entries` written into `table` of herdr's config: where the file already has that table (`withTableKeys`), or as a new
+ *  `[table]` at the end (TOML allows a super-table after its sub-tables, and this file already holds `[ui.toast]` on a
+ *  stock install). A file none of those forms fits gets the new table too, and herdr's own check then refuses it. */
+function addTableKeys(text: string, table: 'ui' | 'theme', entries: [string, string | number][]): string {
+  const nl = text.indexOf('\n');
+  const eol = nl > 0 && text[nl - 1] === '\r' ? '\r\n' : '\n';
+  const lines = entries.map(([k, v]) => `${k} = ${typeof v === 'number' ? v : JSON.stringify(v)}${eol}`).join('');
+  return withTableKeys(text, table, entries, eol) ?? `${text}${text && !text.endsWith('\n') ? eol : ''}${text ? eol : ''}[${table}]${eol}${lines}`;
 }
 
 /**
  * Add OAK's sidebar widths to herdr's `config.toml` unless the person set any sidebar width
- * themselves — theirs wins, whatever it is. Append-only: the two keys go right under the existing
- * `[ui]` header, or into a new `[ui]` table at the end (TOML allows a super-table after its
- * sub-tables, and this file already holds `[ui.toast]` on a stock install). Nothing else is
- * reordered or rewritten. `kept` means it was left alone; `set` means the caller must have herdr
- * parse it before trusting it — and only then keep a backup of what was there.
+ * themselves — theirs wins, whatever it is. Append-only: the two keys go into the `ui` table as the
+ * file writes it (`addTableKeys`), or into a new `[ui]` table at the end. Nothing else is reordered
+ * or rewritten. `kept` means it was left alone; `set` means the caller must have herdr parse it
+ * before trusting it — and only then keep a backup of what was there.
  */
 export function ensureHerdrSidebarConfig(file: string): 'set' | 'kept' {
   let text = '';
@@ -774,11 +854,7 @@ export function ensureHerdrSidebarConfig(file: string): 'set' | 'kept' {
     /* no config yet — herdr runs on its defaults, and the file below becomes its config */
   }
   if (!sidebarWidthsAbsent(text)) return 'kept';
-  const keys = `sidebar_min_width = ${HERDR_SIDEBAR_MIN_WIDTH}\nsidebar_max_width = ${HERDR_SIDEBAR_MAX_WIDTH}\n`;
-  const header = /^\[ui\][ \t]*(?:#.*)?\r?\n/m;
-  const next = header.test(text)
-    ? text.replace(header, (m) => m + keys)
-    : `${text}${text && !text.endsWith('\n') ? '\n' : ''}${text ? '\n' : ''}[ui]\n${keys}`;
+  const next = addTableKeys(text, 'ui', [['sidebar_min_width', HERDR_SIDEBAR_MIN_WIDTH], ['sidebar_max_width', HERDR_SIDEBAR_MAX_WIDTH]]);
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, next);
   return 'set';
@@ -794,24 +870,12 @@ function themeNameAbsent(text: string): boolean {
   }
 }
 
-/** Add gruvbox only when no theme name exists. Like the widths, the caller validates and backs up. */
+/** Add gruvbox only when no theme name exists, into the `theme` table as the file writes it (`addTableKeys`). Like the
+ *  widths, the caller validates and backs up. */
 export function ensureHerdrThemeConfig(file: string): 'set' | 'kept' {
   const text = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
   if (!themeNameAbsent(text)) return 'kept';
-  const key = 'name = "gruvbox"\n';
-  let at = -1;
-  for (const header of text.matchAll(/^[ \t]*\[[ \t]*(?:theme|"(?:[^"\\\r\n]|\\.)*"|'[^'\r\n]*')[ \t]*\][ \t]*(?:#.*)?(?:\r?\n|$)/gm)) {
-    try {
-      if (!parseToml(header[0]).theme) continue; // quoted keys can spell theme with Unicode escapes
-      // A header-looking line inside a multiline string leaves this prefix unparseable.
-      parseToml(text.slice(0, header.index! + header[0].length));
-      at = header.index! + header[0].length;
-      break;
-    } catch { /* keep looking for the actual table */ }
-  }
-  const next = at >= 0
-    ? text.slice(0, at) + (text[at - 1] === '\n' ? '' : '\n') + key + text.slice(at)
-    : `${text}${text && !text.endsWith('\n') ? '\n' : ''}${text ? '\n' : ''}[theme]\n${key}`;
+  const next = addTableKeys(text, 'theme', [['name', 'gruvbox']]);
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, next);
   return 'set';

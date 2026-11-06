@@ -24,7 +24,7 @@ object ColumnLayout {
     const val MIN_COLUMN_PX = 200
 
     /** The key a divider's remembered proportion is stored under. Index counted from the LEFT, so a member
-     *  appended later (Processes, once the CLI answers for it) adds a key and renames none: the keys for
+     *  appended later adds a key and renames none: the keys for
      *  [members] are always a prefix of the keys for `members + one more`. */
     fun dividerKey(group: String, index: Int): String = "$group:$index"
 

@@ -1,7 +1,7 @@
 laptop
   demo
     v claude · p1
-        drive-agents-editor-polish with every
+        tidy-fixture-importer-pass with every
         word preserved
         + blocked · Opus · 900 tok · 2
         pending · 14:00:00
@@ -11,7 +11,7 @@ laptop
         pending · 14:00:00
     v claude · p4
       waiting for session
-  docs
+  docs [W window]
     v claude · p3
         Waiting for prompt
         + idle · Opus · 900 tok · 0 pending ·

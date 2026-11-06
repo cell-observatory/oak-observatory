@@ -13,7 +13,6 @@ import com.intellij.openapi.actionSystem.impl.SimpleDataContext
 import com.intellij.openapi.ui.TestDialogManager
 import com.intellij.openapi.ui.TestInputDialog
 import com.intellij.testFramework.PlatformTestUtil
-import com.intellij.testFramework.fixtures.BasePlatformTestCase
 import java.io.File
 
 /**
@@ -21,7 +20,7 @@ import java.io.File
  * waiting on you" are claims about every session, and they used to be what a failed or timed-out CLI
  * run produced. The actions run for real, with the CLI pinned to /bin/false.
  */
-class FailedReadsTest : BasePlatformTestCase() {
+class FailedReadsTest : ObservatoryPlatformTestCase() {
 
     private var savedBin: String? = null
     private val seen = mutableListOf<Notification>()

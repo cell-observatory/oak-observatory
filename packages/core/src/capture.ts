@@ -9,8 +9,8 @@
  * are fully undoable too. The Bash walk is bounded (skips vendor/build dirs, caps the file count) and
  * degrades silently when a tree is too large; set CLAUDE_OBSERVATORY_NO_BASH=1 to opt out entirely.
  *
- * HARD RULES (preserve zero-token, non-blocking behavior):
- *   - never write to stdout (nothing must reach the model context)
+ * HARD RULES (preserve non-blocking behavior):
+ *   - stdout carries only optional PreToolUse heads-up context; never a permission decision
  *   - never throw out of runCapture(); the caller always exit(0)
  *   - a capture failure degrades silently and never blocks or slows Claude's edit
  *
@@ -23,6 +23,9 @@ import * as os from 'os';
 import * as path from 'path';
 import { canonPath } from './paths';
 import { linkHerdrPane, kickTabSync } from './herdr-link';
+import { linkDelegated } from './delegated-link';
+import { emitEditHeadsUp } from './edit-heads-up';
+import { kickSync } from './sync-kick';
 import { ignoreContext } from './ignore';
 import {
   storeDir,
@@ -54,6 +57,7 @@ import {
   enrichCaptureFromHook,
   withFileMutation,
   clearAbandonedToolStaging,
+  captureOutsideMoves,
 } from './store';
 import { blankLineOnlyChange } from './merge';
 
@@ -110,6 +114,8 @@ export interface HookPayload {
   model?: string;
   original_tool_name?: string;
   native_turn_id?: string;
+  /** The subagent a hook fired in (Claude Code and Codex both send it there); absent in the main agent. */
+  agent_id?: string;
 }
 
 function captureMetadata(payload: HookPayload): Partial<EditRecord> {
@@ -488,12 +494,11 @@ function pruneStatCache(cache: BashStatCache, root: string, visited: { has(file:
  * A directory the Bash full-tree snapshot must NOT treat as a working tree.
  *
  * The walk records every file whose content differs across the command, which is the right model for
- * a project directory and completely wrong for `$HOME` or a filesystem root: a session that ran
- * `install neovim` from the home directory recorded 2,445 "edits" — `.Xauthority`,
- * `.CFUserTextEncoding`, `.bash_history`, shell state, caches — against ONE real Write. None of them
- * were changes the agent made; they were files that happened to move while a command ran, and the
- * session's review list was 99.8% noise. Sweeping a person's home directory into a snapshot store is
- * also the wrong thing to do on its own terms.
+ * a project directory and completely wrong for `$HOME` or a filesystem root: an install run from the
+ * home directory records thousands of "edits" (shell history and state, desktop files, caches) against
+ * the one file the agent wrote. None of them are changes the agent made; they are files that happened to
+ * move while a command ran, and they bury the review list in noise. Sweeping a person's home directory
+ * into a snapshot store is also the wrong thing to do on its own terms.
  *
  * Deliberately narrow: a project without a VCS marker is still a project, so the test is the specific
  * pair of places that are never one, not a positive test for project-ness.
@@ -606,9 +611,9 @@ function handlePostBash(session: string, payload: HookPayload): string[] {
    * The Bash walk INFERS edits from a before/after tree diff, so it sees every side effect of a
    * command, not only what the agent meant to change. A file that goes from absent to zero bytes (or
    * back) is the degenerate case: there is no content, so the diff is empty, and the row renders as
-   * "+0 −0" with nothing behind it. One real session — `install neovim`, run from the home directory
-   * — produced 2,241 of these out of 2,446 records: postgres relation stubs from `initdb`, plus
-   * `.Xauthority`, `.tig_history`, `btmp`. 91.6% of the review list was rows with nothing to review.
+   * "+0 −0" with nothing behind it. A command run from the home directory can produce thousands of
+   * these (an `initdb` writes a database's relation stubs, and shells and desktops touch their own
+   * files), until rows with nothing to review fill most of the list.
    *
    * Counted, not swallowed: one marker per command says how many there were. Edit / Write /
    * NotebookEdit are untouched — a zero-byte file Claude created ON PURPOSE is a real edit.
@@ -765,6 +770,8 @@ export function handleHookPayload(payload: HookPayload, eventMs = Date.now()): v
   if (!(TOOL_EVENTS.has(payload.hook_event_name ?? '') && payload.runtime === 'codex')) {
     try { noteAttention(payload, eventMs); } catch { /* attention is a convenience, never worth failing a hook over */ }
   }
+  // A finished subagent captures nothing, so its hook never waits on the mutex behind another call's walk.
+  if (payload.hook_event_name === 'SubagentStop') return;
   const run = () => handleHookPayloadUnlocked(payload);
   try {
     withFileMutation(captureMutex(payload.session_id), run, CAPTURE_MUTEX_BUDGET_MS);
@@ -785,6 +792,7 @@ function tabLinkPath(session: string): string {
 }
 export function linkTab(session: string, kind?: 'codex', sessionStartSource?: string): void {
   linkHerdrPane(session, kind, sessionStartSource);
+  linkDelegated(session);
   const tab = process.env.OAK_TAB;
   if (!tab) return;
   try {
@@ -839,7 +847,9 @@ function noteAttention(payload: HookPayload, eventMs: number): void {
     // "waiting for you — Bash" on either agent — and the call, so that call's result lowers it.
     // Request-only, like codex: NOTHING goes to stdout (an empty reply is the documented "no
     // decision"); observation must never adjudicate.
-    writeAttention(session, { kind: 'permission', message: String(payload.tool_name ?? 'tool'), ts: Date.now() }, toolCallKey(payload));
+    writeAttention(session, { kind: 'permission', message: String(payload.tool_name ?? 'tool'), ts: Date.now() }, askOf(payload));
+  } else if (ev === 'SubagentStop') {
+    noteSubagentStop(session, payload.agent_id);
   } else if (ev === 'SessionEnd' || ev === 'UserPromptSubmit') {
     // SessionEnd: the session is over, and a hand still raised (a permission prompt, a question)
     // would otherwise stay up forever, the observatory saying it waits for the person.
@@ -856,7 +866,10 @@ function handleHookPayloadUnlocked(payload: HookPayload): void {
   try {
     const session = payload.session_id;
     if (!session) return;
-    linkTab(session);
+    // A Codex tool call arrives here too; Codex's memory-writing thread never links its session's pane.
+    if (payload.runtime !== 'codex' || !(require('./codex') as typeof import('./codex')).isCodexMemoryCwd(payload.cwd)) linkTab(session);
+    // A turn's end or a finished tool call starts a due background sync (sync-kick.ts: one stat when none is due).
+    if (payload.hook_event_name === 'Stop' || payload.hook_event_name === 'PostToolUse') kickSync();
     const isBash = payload.tool_name === 'Bash';
     if (isBash && process.env.CLAUDE_OBSERVATORY_NO_BASH) return; // opt-out escape hatch
     if (payload.hook_event_name === 'PreToolUse') {
@@ -929,10 +942,22 @@ export interface AttentionState {
   ts: number;
 }
 
-/** attention.json as stored: a permission prompt also keeps the calls it waits on (toolCallKey), more
- *  than one while prompts for parallel calls are up at once. Kept out of readAttention's answer. */
+/** One call a permission prompt waits on: its key (toolCallKey), and the subagent that asked for it
+ *  (absent for the main agent: a subagent shares its parent's session). */
+export interface PermissionAsk {
+  key: string;
+  agent?: string;
+}
+
+/** attention.json as stored: a permission prompt also keeps the calls it waits on, more than one while
+ *  prompts for parallel calls are up at once. Kept out of readAttention's answer. */
 interface StoredAttention extends AttentionState {
-  calls?: string[];
+  calls?: PermissionAsk[];
+}
+
+/** The call a PermissionRequest names, and who asked for it. */
+export function askOf(p: HookPayload): PermissionAsk {
+  return { key: toolCallKey(p), ...(p.agent_id ? { agent: p.agent_id } : {}) };
 }
 
 function attentionPath(session: string): string {
@@ -970,7 +995,16 @@ function writeStored(session: string, a: StoredAttention): void {
 /** Lower the standing hand: the ledger closes the wait, then the file goes. */
 function lowerHand(session: string, a: StoredAttention | null): void {
   if (a && a.kind !== 'idle-done') ledgerAppend(session, { ev: 'down', kind: a.kind, since: a.ts, t: Date.now() });
+  if (a) handMoved = true;
   try { fs.unlinkSync(attentionPath(session)); } catch { /* gone meanwhile */ }
+}
+
+/** Whether this process raised, changed or lowered a session's hand. The capture hooks then start the background
+ *  catch-up that publishes it whatever the last one's claim (index location.ts kickIndexBuild `now`): one started a
+ *  moment before, by the same call's earlier hook, may have read the hand before it moved. */
+let handMoved = false;
+export function handMovedHere(): boolean {
+  return handMoved;
 }
 
 /** Object keys in sorted order at every depth, so two serializations of one input compare equal. */
@@ -997,27 +1031,50 @@ export function toolCallKey(p: { turn_id?: string; prompt_id?: string; tool_name
 /**
  * A tool call's hook, for attention, before any capture filtering — every tool Codex reports, and the
  * edit tools and Bash that Claude Code's capture hooks match. Its start is the agent acting again:
- * whatever it waited on is answered. Its result (PostToolUse, or PostToolUseFailure for a call that
- * failed) answers the permission prompt raised for that same call — never another's, never a question
- * — and shows a turn that had ended is running again (a Stop hook continued it; Codex can deliver a
- * command's result through a later poll that has no start of its own). `eventMs` is when the hook
- * started (the hook process's own start), and neither ever lowers a hand raised after it: a parallel
- * call's hook that ran late, or one that waited on a lock, is not progress past a newer prompt.
+ * whatever it waited on is answered, except the calls another agent asked for: a subagent shares its
+ * parent's session, so its call starting answers only its own prompts, never the parent's, and the
+ * parent's call answers none of a subagent's. A prompt that names no call is answered by any start. Its result
+ * (PostToolUse, or PostToolUseFailure for a call that failed) answers the permission prompt raised for
+ * that same call — never another's, never a question — and shows a turn that had ended is running
+ * again (a Stop hook continued it; Codex can deliver a command's result through a later poll that has
+ * no start of its own). `eventMs` is when the hook started (the hook process's own start), and neither
+ * ever lowers a hand raised after it: a parallel call's hook that ran late, or one that waited on a
+ * lock, is not progress past a newer prompt.
  */
 export function noteToolCall(session: string, p: HookPayload & { turn_id?: string }, eventMs: number): void {
-  if (p.hook_event_name === 'PreToolUse') {
-    clearAttention(session, eventMs);
-    return;
-  }
+  const start = p.hook_event_name === 'PreToolUse';
   let key: string | undefined;
-  const answered = (a: StoredAttention | null): boolean =>
-    !!a && (a.kind === 'idle-done' ? a.ts <= eventMs : a.kind === 'permission' && !!a.calls?.includes((key ??= toolCallKey(p))));
-  if (!answered(readStored(session))) return; // no hand, or not this call's: no lock taken
+  const by = p.agent_id ?? '';
+  // The calls this event leaves waiting, or null when it answers nothing of the standing hand.
+  const left = (a: StoredAttention | null): PermissionAsk[] | null => {
+    if (!a) return null;
+    if (a.kind !== 'permission') return a.ts <= eventMs && (start || a.kind === 'idle-done') ? [] : null;
+    if (start && a.ts > eventMs) return null;
+    const calls = a.calls ?? [];
+    if (start && !calls.length) return [];
+    const kept = calls.filter((c) => c.key !== (key ??= toolCallKey(p)) && !(start && (c.agent ?? '') === by));
+    return kept.length < calls.length ? kept : null;
+  };
+  settleAttention(session, left);
+}
+
+/** A subagent finished (Claude Code's and Codex's SubagentStop both name it): the prompts it raised are
+ *  over, whatever became of their calls — a denied call reports no result, and nothing of the subagent
+ *  runs again to lower them. Its parent's prompts, and one that names no call, stay up. */
+export function noteSubagentStop(session: string, agent: string | undefined): void {
+  if (!agent) return;
+  settleAttention(session, (a) => (a?.kind === 'permission' && a.calls?.some((c) => c.agent === agent) ? a.calls.filter((c) => c.agent !== agent) : null));
+}
+
+/** Apply `left` (the calls still waiting, or null for no change) to the standing hand: first unlocked, so
+ *  an event that answers nothing takes no lock, then again under the lock. */
+function settleAttention(session: string, left: (a: StoredAttention | null) => PermissionAsk[] | null): void {
+  if (!left(readStored(session))) return;
   withAttention(session, () => {
     const a = readStored(session);
-    if (!answered(a)) return;
-    const rest = a!.calls?.filter((k) => k !== key) ?? [];
-    if (a!.kind === 'permission' && rest.length) writeStored(session, { ...a!, calls: rest });
+    const rest = left(a);
+    if (!rest) return;
+    if (rest.length) writeStored(session, { ...a!, calls: rest });
     else lowerHand(session, a);
   });
 }
@@ -1038,18 +1095,20 @@ function ledgerAppend(session: string, e: { ev: 'up'; kind: string; t: number } 
 /** A message that is a bare tool name (`Bash`), as PermissionRequest reports, rather than prose. */
 const isToolName = (s: string): boolean => !!s && !/\s/.test(s);
 
-/** Raise (or restate) a hand. `call` is the permission prompt's call (toolCallKey), when the event names one. */
-export function writeAttention(session: string, state: AttentionState, call?: string): void {
+/** Raise (or restate) a hand. `ask` is the permission prompt's call, when the event names one. */
+export function writeAttention(session: string, state: AttentionState, ask?: PermissionAsk): void {
   withAttention(session, () => {
     const prev = readStored(session);
     const standing = prev && prev.kind !== 'idle-done' ? prev : null;
     let next: StoredAttention = state;
+    const call = ask?.key;
+    const has = (a: StoredAttention, k: string): boolean => !!a.calls?.some((c) => c.key === k);
     if (state.kind !== 'idle-done') {
       // One prompt is one hand. A report that names no call (Notification never does), a standing hand
       // that names none, or the same call named again, is the SAME prompt; a different call's prompt is
       // a new hand, and the calls still standing stay with it (parallel calls can each have one up).
-      const calls = [...(standing?.calls ?? []), ...(call && !standing?.calls?.includes(call) ? [call] : [])];
-      if (standing && standing.kind === state.kind && (!call || !standing.calls?.length || standing.calls.includes(call))) {
+      const calls = [...(standing?.calls ?? []), ...(ask && !(standing && has(standing, ask.key)) ? [ask] : [])];
+      if (standing && standing.kind === state.kind && (!call || !standing.calls?.length || has(standing, call))) {
         // The SAME wait reported twice — PermissionRequest and Notification both fire for one
         // prompt (2026-09-15). Keep the ORIGINAL ts: every surface announces once per ts, and a
         // fresh stamp here would toast the same prompt again. Keep the tool name over the prose
@@ -1063,6 +1122,7 @@ export function writeAttention(session: string, state: AttentionState, call?: st
     } else if (standing) {
       ledgerAppend(session, { ev: 'down', kind: standing.kind, since: standing.ts, t: state.ts });
     }
+    if (!prev || prev.kind !== next.kind || prev.ts !== next.ts || prev.message !== next.message) handMoved = true;
     writeStored(session, next);
   });
 }
@@ -1105,7 +1165,15 @@ function readStored(session: string): StoredAttention | null {
   try {
     const raw = JSON.parse(fs.readFileSync(attentionPath(session), 'utf8')) as StoredAttention;
     if (raw && (raw.kind === 'permission' || raw.kind === 'input' || raw.kind === 'idle-done') && typeof raw.ts === 'number') {
-      const calls = Array.isArray(raw.calls) ? raw.calls.filter((k): k is string => typeof k === 'string') : [];
+      // A call is a bare key as OAK 0.10 wrote it, or a PermissionAsk (any other field, such as the
+      // `cmd` an earlier build kept, is dropped).
+      const calls = (Array.isArray(raw.calls) ? (raw.calls as unknown[]) : []).flatMap((c): PermissionAsk[] => {
+        if (typeof c === 'string') return [{ key: c }];
+        const o = c as Partial<PermissionAsk> | null;
+        return o && typeof o.key === 'string'
+          ? [{ key: o.key, ...(typeof o.agent === 'string' && o.agent ? { agent: o.agent } : {}) }]
+          : [];
+      });
       return { kind: raw.kind, message: String(raw.message ?? ''), ts: raw.ts, ...(calls.length ? { calls } : {}) };
     }
     return null;
@@ -1119,13 +1187,37 @@ export function readAttention(session: string): AttentionState | null {
   return a && { kind: a.kind, message: a.message, ts: a.ts };
 }
 
+/** Who a session's permission prompt waits on: the agent that asked each call it names ('' for the main agent, a
+ *  subagent by its id), and the main agent for a prompt that names no call; null while no permission prompt is up. */
+export function permissionAskers(session: string): Set<string> | null {
+  const a = readStored(session);
+  if (a?.kind !== 'permission') return null;
+  return new Set(a.calls?.length ? a.calls.map((c) => c.agent ?? '') : ['']);
+}
+
 export function runCapture(): void {
   try {
     const raw = fs.readFileSync(0, 'utf8');
     if (!raw.trim()) return;
-    // The hook process's own start is when its event happened, however long it then waited (stdin, a lock).
-    handleHookPayload(JSON.parse(raw) as HookPayload, performance.timeOrigin);
+    const payload = JSON.parse(raw) as HookPayload;
+    // The hook process's own start is when its event happened, however long it then waited (stdin, a lock, a move).
+    captureOutsideMoves(() => handleHookPayload(payload, performance.timeOrigin), missedCapture(payload));
+    if (payload.hook_event_name === 'PreToolUse' && CAPTURED_TOOLS.has(payload.tool_name ?? '')) {
+      const file = payload.tool_input?.file_path ?? payload.tool_input?.notebook_path;
+      if (typeof file === 'string') emitEditHeadsUp(payload.session_id, payload.cwd, [file]);
+    }
   } catch {
     // Silent by design: capture must never block, slow, or perturb an edit.
   }
+}
+
+/** What a hook that could not wait for a store move lost, for the skip the move records: a Post's edit, and a Bash
+ *  command's from its Pre. An edit tool's Pre that could not wait is said by its Post, which then finds no
+ *  before-snapshot; a Bash command's Post finds no snapshot of its tree and records nothing, so its Pre says it. */
+export function missedCapture(p: HookPayload): { session: string; file: string } | undefined {
+  if (!p.session_id) return undefined;
+  if (p.hook_event_name === 'PreToolUse' && p.tool_name === 'Bash') return { session: p.session_id, file: '<bash-tree>' };
+  if (p.hook_event_name !== 'PostToolUse' && p.hook_event_name !== 'PostToolUseFailure') return undefined;
+  const named = p.tool_input?.file_path ?? p.tool_input?.notebook_path;
+  return { session: p.session_id, file: typeof named === 'string' && named ? named : `<${p.tool_name ?? 'capture'}>` };
 }

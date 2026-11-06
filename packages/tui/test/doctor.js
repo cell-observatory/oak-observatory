@@ -5,21 +5,24 @@ const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
 const net = require('node:net');
-const cp = require('node:child_process');
 const core = require('../../core/dist');
+// herdr's commands run through this launcher (a saved machine's with `detached`, which execFile ignores).
+const spawn = require('../../core/dist/spawn');
 const { diagnoseNativeSpawn, ptyBuildFix } = require('../dist/native');
 
 test('doctor forwarding: one fake herdr command per machine, slow/fast boundary and SSH target', async t => {
   let clock = 0;
   const calls = [];
   const machines = [8000, 8001, 1000].map((ms, i) => ({ id: `${i}`, label: `machine-${i}`, target: `user@host-${i}`, session: 'default', enabled: i !== 2, selected: false, ms }));
-  t.mock.method(cp, 'execFile', (file, args, options, callback) => {
+  t.mock.method(spawn, 'execFileTool', (file, args, options, callback) => {
     calls.push(args);
     assert.equal(file, '/fake/herdr.exe');
     if (args[0] === 'machine') callback(null, JSON.stringify(machines), '');
     else {
       assert.deepEqual(args.slice(2), ['pane', 'list']);
       assert.equal(options.timeout, 30000);
+      // Forwarded: apart from the terminal, with askpass refused, as every herdr command for a saved machine.
+      assert.deepEqual([options.detached, options.env.SSH_ASKPASS_REQUIRE], [true, 'never']);
       clock += machines.find(m => m.label === args[1]).ms;
       callback(null, 'pane table (plain text, not JSON)\n', '');
     }
@@ -35,7 +38,7 @@ test('doctor forwarding: one fake herdr command per machine, slow/fast boundary 
 
 test('doctor forwarding: slow failed call remains a warning with multiplexing advice', async t => {
   let clock = 0;
-  t.mock.method(cp, 'execFile', (_file, args, options, callback) => {
+  t.mock.method(spawn, 'execFileTool', (_file, args, options, callback) => {
     if (args[0] === 'machine') return callback(null, JSON.stringify([{ id: '1', label: 'box', target: 'box', session: '', enabled: true, selected: false }]), '');
     assert.equal(options.timeout, 9000);
     clock = 9000;
@@ -45,6 +48,34 @@ test('doctor forwarding: slow failed call remains a warning with multiplexing ad
   assert.equal(check.level, 'warn');
   assert.match(check.detail, /timed out/);
   assert.match(check.fix, /ControlMaster auto/);
+});
+
+// The row named the failure as `HerdrError: Error: Custom { kind: ConnectionAborted, error: "…" }`: the class, then
+// herdr's Rust Debug form. It reads as herdr's message (2026-10-13).
+test('doctor forwarding: a machine herdr cannot reach is named by herdr\'s own message', async t => {
+  t.mock.method(spawn, 'execFileTool', (_file, args, _options, callback) => {
+    if (args[0] === 'machine') return callback(null, JSON.stringify([{ id: '1', label: 'build-box', target: 'build-box', session: 'default', enabled: true, selected: false }]), '');
+    callback(Object.assign(new Error('Command failed'), { code: 1 }), '',
+      `Error: Custom { kind: ConnectionAborted, error: "machine 'build-box' (session default): remote SSH connection failed: ssh: connect to host fixture.invalid port 22: Operation timed out" }\n`);
+  });
+  const [check] = await core.diagnoseHerdrForwarding({ binary: '/fake/herdr.exe', now: () => 0, env: {} });
+  assert.equal(check.level, 'warn');
+  assert.equal(check.detail, "pane list took 0.0 s; machine 'build-box' (session default): remote SSH connection failed: ssh: connect to host fixture.invalid port 22: Operation timed out");
+  assert.match(check.fix, /^Check SSH access to build-box/);
+});
+
+// A machine whose herdr is too old to forward OAK's commands answered: the fix sent the person to check ssh and that
+// herdr runs there, when what fixes it is a newer herdr on that machine (2026-10-13).
+test('doctor forwarding: a machine whose herdr is too old to forward is told to update herdr there', async t => {
+  t.mock.method(spawn, 'execFileTool', (_file, args, _options, callback) => {
+    if (args[0] === 'machine') return callback(null, JSON.stringify([{ id: '1', label: 'build-box', target: 'user@build-box', session: 'default', enabled: true, selected: false }]), '');
+    callback(Object.assign(new Error('Command failed'), { code: 1 }), '',
+      `Error: Custom { kind: Other, error: "machine 'build-box' (session default): remote binary discovery failed: remote Herdr does not support machine API forwarding; update Herdr on this machine" }\n`);
+  });
+  const [check] = await core.diagnoseHerdrForwarding({ binary: '/fake/herdr.exe', now: () => 0, env: {} });
+  assert.equal(check.level, 'warn');
+  assert.match(check.detail, /does not support machine API forwarding/);
+  assert.equal(check.fix, 'Update herdr on build-box: run `oak doctor --fix` there, or OAK\'s installer where OAK is not installed.');
 });
 
 function focusFixture(t, hello) {
@@ -119,7 +150,7 @@ test('doctor PTY: helper copied as 0644 fails inspection, repair retries the spa
     exports.calls = 0;
     exports.spawn = (command, args) => {
       exports.calls++;
-      require('assert').equal(command, '/bin/echo');
+      require('assert/strict').equal(command, '/bin/echo');
       fs.accessSync(require('path').join(__dirname, ${JSON.stringify(relative)}), fs.constants.X_OK);
       return { onData() {}, onExit(fn) { queueMicrotask(() => fn({ exitCode: 0 })); }, kill() {} };
     };

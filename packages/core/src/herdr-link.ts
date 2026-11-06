@@ -3,8 +3,9 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { storeDir } from './store';
 import type { HerdrOptions, HerdrTransport } from './herdr';
-import { spawnTool, spawnToolSync } from './spawn';
+import { spawnTool, spawnToolSync, noBackgroundChildren } from './spawn';
 import { oakCliEntry } from './cli-entry';
+import { herdrPaneContextSync } from './herdr-context';
 
 export interface HerdrPaneLink { paneId: string; socketPath?: string; at: number; reported?: boolean; sessionStartSource?: string }
 
@@ -19,14 +20,15 @@ export function readHerdrPaneLink(session: string): HerdrPaneLink | null {
 
 /** Called by linkTab for both Claude hooks and Codex ingestion, even without OAK_TAB. */
 export function linkHerdrPane(session: string, kind?: 'codex', sessionStartSource?: string): void {
-  const paneId = process.env.HERDR_PANE_ID;
+  const { paneId, socketPath } = herdrPaneContextSync();
   if (!paneId) return;
-  const socketPath = process.env.HERDR_SOCKET_PATH;
   try {
     const previous = readHerdrPaneLink(session);
     const same = previous?.paneId === paneId && previous.socketPath === socketPath;
     const link: HerdrPaneLink = same ? previous : { paneId, socketPath, at: Date.now() };
-    if (kind === 'codex' && sessionStartSource) link.sessionStartSource = sessionStartSource;
+    // A session start (a resume included) makes this the pane's newest session: the Observatory's heal
+    // gives the pane to the newest link, so a resumed session must not keep the time it first linked.
+    if (kind === 'codex' && sessionStartSource) { link.sessionStartSource = sessionStartSource; link.at = Date.now(); }
     const save = () => {
       fs.mkdirSync(storeDir(session), { recursive: true, mode: 0o700 });
       fs.writeFileSync(path.join(storeDir(session), 'herdr.json'), JSON.stringify(link), { mode: 0o600 });
@@ -54,10 +56,10 @@ export const TAB_SYNC_KICK_MS = 5000;
  * session's title while the terminal app is closed (herdr-tabs.ts `syncSessionTab`). The capture hooks
  * call it at turn boundaries. Only inside herdr, at most once per TAB_SYNC_KICK_MS per session, and only
  * through the oak CLI entry the running bundle registered (cli-entry.ts): a process with none starts
- * nothing. Never blocks, never throws, never writes to stdout: the child's stdio is ignored.
+ * nothing. After the bounded pane check, the sync is detached and silent: the child's stdio is ignored.
  */
 export function kickTabSync(session: string, cli: string | undefined = oakCliEntry()): void {
-  if (!process.env.HERDR_PANE_ID || !cli) return;
+  if (!cli || noBackgroundChildren() || !herdrPaneContextSync().nested) return;
   try {
     const marker = path.join(storeDir(session), 'herdr-tab.kick');
     // Within the window on either side of now: a file time can read a fraction of a millisecond past
@@ -76,7 +78,8 @@ export function kickTabSync(session: string, cli: string | undefined = oakCliEnt
  * No shell or stdout, no server startup, no Python dependency. A failure is retried by the next
  * Codex hook; successful links are reused until SessionStart or a pane/socket move. */
 export function reportHerdrSessionSync(session: string, kind: string, link: HerdrPaneLink): boolean {
-  if (!link.socketPath) return false;
+  const context = herdrPaneContextSync();
+  if (!context.nested || context.paneId !== link.paneId || context.socketPath !== link.socketPath) return false;
   try {
     // Required here, not at the top: every capture hook loads this module, and only a Codex hook in a
     // herdr pane gets this far. The installer module brings smol-toml and codex-hook-trust with it.
@@ -95,10 +98,12 @@ export function reportHerdrSessionSync(session: string, kind: string, link: Herd
 }
 
 /** herdr ignores identity reports from other sources, including "oak". `transport`: the caller's own
- *  (see HerdrTransport), so an injected core is never bypassed. */
+ *  (see HerdrTransport), so an injected core is never bypassed. `replace`: take the pane from the session
+ *  herdr holds there now, which herdr allows only a sequenced report that names a session start (herdr 0.9.1). */
 export function reportHerdrSession(session: string, kind: string, link: HerdrPaneLink, opts: HerdrOptions = {},
-  { herdrRequest }: Pick<HerdrTransport, 'herdrRequest'> = require('./herdr') as typeof import('./herdr')): Promise<unknown> {
+  { herdrRequest }: Pick<HerdrTransport, 'herdrRequest'> = require('./herdr') as typeof import('./herdr'), replace = false): Promise<unknown> {
   return herdrRequest('pane.report_agent_session', {
     pane_id: link.paneId, agent: kind, agent_session_id: session, source: `herdr:${kind}`,
+    ...(replace ? { seq: Date.now() * 1_000_000, session_start_source: link.sessionStartSource || 'resume' } : {}),
   }, { ...opts, ...(link.socketPath ? { socketPath: link.socketPath } : {}) });
 }

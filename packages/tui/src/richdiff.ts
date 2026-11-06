@@ -22,8 +22,14 @@
  * **Both channels must survive losing colour.** At `depth === 'none'` the bands are gone, so the
  * `+`/`-` marker is what remains and it is always present — never replaced by the band, only
  * reinforced by it. A monochrome terminal loses the shape and keeps the meaning.
+ *
+ * **What the file holds is shown, the characters that hide included.** A bidirectional control or a zero-width
+ * character in a line of code changes how it runs without changing how it reads (Trojan Source), and the frame drops
+ * them from every cell (sanitizeCell). Here each is drawn as a dim mark that names it, `⟨U+202E⟩`, measured and
+ * wrapped like the rest of the line, and so is a joiner inside an ASCII identifier (core's revealHidden).
  */
 
+import { graphemes, revealHidden, HIDDEN_MARK_SOURCE } from '@oak-observatory/core';
 import { displayWidth, fitVisible, sanitizeCell, sliceVisible, wrapVisible } from './textwidth';
 import { ColorDepth, Glyphs, glyphs as defaultGlyphs } from './glyphs';
 import { diffWordsWithSpace } from 'diff';
@@ -187,6 +193,21 @@ export function parsePatch(patch: string): DiffLine[] {
 }
 
 /**
+ * The post-edit line of a patch's first change, where W opens an edit: its first added line, or, for a removal, the
+ * line that now stands where the removed one was (never below 1). 0 for a patch that changes nothing.
+ */
+export function firstChangedLine(patch: string): number {
+  let next = 0;
+  for (const l of parsePatch(patch)) {
+    if (l.kind === 'hunk') next = Number(/\+(\d+)/.exec(l.text)?.[1] ?? next);
+    else if (l.kind === 'add') return l.n ?? Math.max(1, next);
+    else if (l.kind === 'del') return Math.max(1, next);
+    else next = (l.n ?? next) + 1;
+  }
+  return 0;
+}
+
+/**
  * Read `:comment`'s argument. `12: note` anchors the note to line 12 of the file after the edit, as the
  * editors' gutter and the CLI's `--line` do; any other text is a note on the whole edit. The line must be
  * one the diff numbers — an added or context line of this edit — so a note never lands where the reader
@@ -298,7 +319,8 @@ export function boundPatch(patch: string, keep: number): { patch: string; hidden
 export function renderRichDiff(patch: string, opts: RichDiffOpts): string[] {
   const { cols, color: depth } = opts;
   const g = opts.glyphs ?? defaultGlyphs();
-  const lines = markIntraline(parsePatch(patch));
+  // Revealed before the changed spans are found, so a hidden character the edit added is marked as changed.
+  const lines = markIntraline(parsePatch(patch).map((l) => (l.kind === 'hunk' ? l : { ...l, text: revealHidden(l.text) })));
   const out: string[] = [];
 
   // Header: the verb and the WHOLE path, wrapped if it must be, never abbreviated.
@@ -358,7 +380,7 @@ export function renderRichDiff(patch: string, opts: RichDiffOpts): string[] {
     parts.forEach((part, i) => {
       const n = i === 0 ? num : ' '.repeat(gutter);
       const m = i === 0 ? mark : ' ';
-      const plain = `${n} ${m}${part}`;
+      const plain = `${n} ${m}${dimMarks(part, depth)}`;
       if (depth === 'none' || kind === 'ctx') {
         // A context line has no band, so the foreground is the only channel it has.
         const lit = opts.syntax && depth !== 'none' ? `${dim(n, depth)} ${m}${highlightSource(part, depth, asSource && inBlock)}` : plain;
@@ -381,7 +403,7 @@ export function renderRichDiff(patch: string, opts: RichDiffOpts): string[] {
       // Syntax FIRST (foreground), then the intraline band walks it (background). `offset` counts
       // visible characters, which is what the spans are measured in, so highlighting must not shift
       // them — `hot` copies escapes without advancing that count.
-      const painted = opts.syntax ? highlightSource(part, depth, asSource && inBlock) : part;
+      const painted = opts.syntax ? highlightSource(part, depth, asSource && inBlock) : dimMarks(part, depth);
       const body = `${dim(n, depth)} ${m}${l.spans && l.spans.length ? hot(painted, l.spans, offset, band, depth, kind === 'add') : painted}`;
       out.push(`${bg}${fitVisible(pad(stripReset(body), cols), cols)}\x1b[0m`);
     });
@@ -426,14 +448,21 @@ function hot(part: string, spans: [number, number][], offset: number, band: { rg
 }
 
 const dim = (s: string, depth: ColorDepth) => (depth === 'none' ? s : `\x1b[2m${s}\x1b[22m`);
+/** The marks revealHidden put in a line, dimmed: SGR 2 and 22, which leave the line's colour and band as they are. */
+const MARKS = new RegExp(HIDDEN_MARK_SOURCE, 'g');
+const dimMarks = (s: string, depth: ColorDepth) => (depth === 'none' ? s : s.replace(MARKS, (mk) => `\x1b[2m${mk}\x1b[22m`));
 /** Drop full resets so they cannot cancel the band mid-line; attribute-scoped resets are kept. */
 const stripReset = (s: string) => s.replace(/\x1b\[0m/g, '\x1b[39m');
 
-/** Break at exactly `w` columns, preserving every character including leading whitespace. */
+/** The marks again, captured, to split a line around them (made once: hardWrap runs for each long line of a frame). */
+const MARK_SPLIT = new RegExp(`(${HIDDEN_MARK_SOURCE})`);
+
+/** Break at exactly `w` columns, preserving every character, whole, including leading whitespace, and each mark of a
+ *  hidden character whole. */
 function hardWrap(s: string, w: number): string[] {
   const out: string[] = [];
   let line = '';
-  for (const ch of s) {
+  for (const ch of s.split(MARK_SPLIT).flatMap((part, i) => (i % 2 ? [part] : graphemes(part)))) {
     if (displayWidth(line + ch) > w) {
       out.push(line);
       line = '';

@@ -10,7 +10,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { ActionRecord, categoryOf, attributeEditIds, targetOf } from './actions';
-import { num, toMs, transcriptForSession, userPrompt } from './asks';
+import { num, toMs, transcriptForSession, userPrompt, PromptReader, PromptReaderState } from './asks';
 import { findCodexRollout } from './codex';
 import { StringDecoder } from 'string_decoder';
 import { createHash } from 'crypto';
@@ -19,6 +19,7 @@ import { hookPermissionEntries } from './feed';
 import { findTranscript } from './observe';
 import { firstCwdLine } from './session';
 import { EditRecord, readLog, rootDir, isSafeSessionId, logPath } from './store';
+import { graphemeHead } from './graphemes';
 
 type ToolKind = 'read' | 'edit' | 'delete' | 'move' | 'search' | 'execute' | 'think' | 'fetch' | 'other';
 interface ToolUpdate {
@@ -185,7 +186,9 @@ function turnStartBefore(file: string, cursor: number, limit = 1): number {
     let position = cursor;
     let partial = Buffer.alloc(0);
     let prompts = 0;
+    const promptReader = new PromptReader();
     let boundary = cursor;
+    let crossingTools = false;
     let complete = false;
     const needed = new Set<string>();
     while (position > 0) {
@@ -201,18 +204,21 @@ function turnStartBefore(file: string, cursor: number, limit = 1): number {
           const text = bytes.toString('utf8', previous + 1, end);
           try {
             const row = JSON.parse(text);
-            if (row && !Array.isArray(row) && row.isSidechain !== true) {
+            if (row && !Array.isArray(row) && row.isSidechain !== true && row.type !== 'api-request-blob') {
               const blocks = row.message?.content;
               if (Array.isArray(blocks)) for (const block of blocks) {
                 if (block?.type === 'tool_result' && typeof block.tool_use_id === 'string') needed.add(block.tool_use_id);
                 if (block?.type === 'tool_use' && typeof block.id === 'string') needed.delete(block.id);
               }
+              const prompt = promptReader.read(row);
               if (userPrompt(row) !== null) {
-                prompts++;
-                if (prompts >= limit) {
-                  boundary = position + previous + 1;
-                  if (!needed.size) return boundary;
+                if (prompt !== null) {
+                  prompts++;
+                  // One earlier ask confirms that the boundary is not a delivery copy.
+                  if (prompts > limit && !needed.size) return crossingTools ? position + previous + 1 : boundary;
                 }
+                if (prompts <= limit) boundary = position + previous + 1;
+                if (prompts >= limit && needed.size) crossingTools = true;
               }
             }
           } catch { /* malformed complete records cannot hide an earlier prompt */ }
@@ -227,6 +233,7 @@ function turnStartBefore(file: string, cursor: number, limit = 1): number {
 }
 
 interface ResumeState {
+  prompts: PromptReaderState;
   active: { turn: number; promptTs: number; lastTs: number; lastOffset: number; stopReason: string; pending: string[]; lastWasAnswer: boolean } | null;
   nextTurn: number;
   lastTurn: number;
@@ -235,7 +242,7 @@ interface ResumeState {
   seenUsage: string[];
 }
 interface Checkpoint {
-  version: 1;
+  version: 2;
   guard: string;
   file: string;
   root: string;
@@ -274,7 +281,7 @@ function resume(file: string, session: string, cursor: number): { hit: Checkpoin
   if (!hit && cache) {
     try { hit = JSON.parse(fs.readFileSync(cache, 'utf8')); } catch { /* cold or torn cache */ }
   }
-  if (!hit || hit.version !== 1 || hit.file !== file || hit.cursor !== cursor || !hit.state
+  if (!hit || hit.version !== 2 || hit.file !== file || hit.cursor !== cursor || !hit.state
     || !Array.isArray(hit.state.tools) || !Array.isArray(hit.state.planIds) || !Array.isArray(hit.state.seenUsage)
     || (hit.state.active && !Array.isArray(hit.state.active.pending))) return { hit: null, replaced: false };
   const st = fs.statSync(file);
@@ -284,7 +291,7 @@ function resume(file: string, session: string, cursor: number): { hit: Checkpoin
 }
 function checkpoint(file: string, session: string, root: string, cursor: number, state: ResumeState): void {
   const st = fs.statSync(file);
-  const value: Checkpoint = { version: 1, guard: cursorGuard(file, cursor), file, root, ino: st.ino, size: st.size, mtimeMs: st.mtimeMs, cursor, state };
+  const value: Checkpoint = { version: 2, guard: cursorGuard(file, cursor), file, root, ino: st.ino, size: st.size, mtimeMs: st.mtimeMs, cursor, state };
   if (checkpoints.size >= 8) checkpoints.delete(checkpoints.keys().next().value!);
   checkpoints.set(file, value);
   const cache = checkpointPath(session);
@@ -307,7 +314,7 @@ function editActions(file: string, session: string, includeSidechain = false): A
   let out: ActionRecord[] = [], cursor = 0;
   if (cache) try {
     const old = JSON.parse(fs.readFileSync(cache, 'utf8'));
-    if (old.version === 1 && old.file === file && old.ino === stat.ino && old.size <= stat.size
+    if (old.version === 2 && old.file === file && old.ino === stat.ino && old.size <= stat.size
       && (old.size !== stat.size || old.mtimeMs === stat.mtimeMs) && Array.isArray(old.actions)
       && Number.isSafeInteger(old.cursor) && old.cursor >= 0 && old.cursor <= old.size && old.guard === cursorGuard(file, old.cursor)) {
       out = old.actions;
@@ -331,7 +338,7 @@ function editActions(file: string, session: string, includeSidechain = false): A
         if (!/"name"\s*:\s*"(?:Edit|Write|MultiEdit|NotebookEdit|apply_patch)"/.test(line) && !line.includes('\\u')) continue;
         try {
           const row = JSON.parse(line);
-          if (!row || (!includeSidechain && row.isSidechain === true) || row.message?.role !== 'assistant' || !Array.isArray(row.message.content)) continue;
+          if (!row || (!includeSidechain && row.isSidechain === true) || row.type === 'api-request-blob' || row.message?.role !== 'assistant' || !Array.isArray(row.message.content)) continue;
           for (const block of row.message.content) if (block?.type === 'tool_use' && typeof block.name === 'string' && categoryOf(block.name) === 'edit')
             out.push(actionFromBlock(block, toMs(row.timestamp ?? row.ts)));
         } catch { /* torn or non-object record */ }
@@ -343,7 +350,7 @@ function editActions(file: string, session: string, includeSidechain = false): A
   if (cache && fs.existsSync(logPath(session))) try {
     fs.mkdirSync(path.dirname(cache), { recursive: true, mode: 0o700 });
     const tmp = `${cache}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify({ version: 1, file, ino: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs, cursor, guard: cursorGuard(file, cursor), actions: out }), { mode: 0o600 });
+    fs.writeFileSync(tmp, JSON.stringify({ version: 2, file, ino: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs, cursor, guard: cursorGuard(file, cursor), actions: out }), { mode: 0o600 });
     fs.renameSync(tmp, cache);
   } catch { /* exact attribution still works without persistence */ }
   return out;
@@ -354,7 +361,7 @@ function boundText(text: string): string {
     .split('\n')
     .map((line) =>
       line.length > TEXT_LINE_LIMIT
-        ? `${line.slice(0, TEXT_LINE_LIMIT)} …(+${Math.round((line.length - TEXT_LINE_LIMIT) / 1024)}k chars)`
+        ? `${graphemeHead(line, TEXT_LINE_LIMIT)} …(+${Math.round((line.length - TEXT_LINE_LIMIT) / 1024)}k chars)`
         : line
     )
     .join('\n');
@@ -362,7 +369,7 @@ function boundText(text: string): string {
 
 function boundThought(text: string): string {
   const one = text.replace(/\s+/g, ' ');
-  return one.length > THOUGHT_LIMIT ? `${one.slice(0, THOUGHT_LIMIT)}…` : one;
+  return one.length > THOUGHT_LIMIT ? `${graphemeHead(one, THOUGHT_LIMIT)}…` : one;
 }
 
 function toolKind(a: ActionRecord): ToolKind {
@@ -529,6 +536,7 @@ function buildConversation(session: string, opts: ConversationOptions): Conversa
   const tools = new Map<string, ActionRecord>(saved?.state.tools);
   const planIds = new Set<string>(saved?.state.planIds);
   const seenUsage = new Set<string>(saved?.state.seenUsage);
+  const prompts = new PromptReader(saved?.state.prompts);
   const records = editRecords(session);
   const agent = agentName(session);
   const events: InternalEvent[] = [];
@@ -582,16 +590,16 @@ function buildConversation(session: string, opts: ConversationOptions): Conversa
     } catch {
       continue;
     }
-    if (o === null || typeof o !== 'object' || Array.isArray(o) || o.isSidechain === true) continue;
+    if (o === null || typeof o !== 'object' || Array.isArray(o) || o.isSidechain === true || o.type === 'api-request-blob') continue;
     const ts = toMs(o.timestamp ?? o.ts);
-    const prompt = userPrompt(o);
+    const prompt = prompts.read(o);
     if (prompt !== null) {
       if (active) finish(active.lastTs, active.stopReason || 'end_turn', ts || active.lastTs);
       const turn = nextTurn++;
       lastTurn = turn;
       active = { turn, promptTs: ts, lastTs: ts, lastOffset: eventOffset, stopReason: 'end_turn', pending: new Set(), lastWasAnswer: false };
       promptStarts.push({ turn, ts });
-      const promptId = typeof o.uuid === 'string' ? o.uuid : typeof o.nativeTurnId === 'string' ? o.nativeTurnId : undefined;
+      const promptId = typeof o.promptId === 'string' ? o.promptId : typeof o.uuid === 'string' ? o.uuid : typeof o.nativeTurnId === 'string' ? o.nativeTurnId : undefined;
       events.push({
         ts,
         turn,
@@ -709,7 +717,7 @@ function buildConversation(session: string, opts: ConversationOptions): Conversa
   if (agent === 'claude' && active && active.lastWasAnswer && active.pending.size === 0) finish(active.lastTs, active.stopReason || 'end_turn', undefined, active.lastOffset);
 
   checkpoint(transcript, session, root, range.cursor, { active: active ? { ...active, pending: [...active.pending] } : null,
-    nextTurn, lastTurn, tools: [...tools], planIds: [...planIds], seenUsage: [...seenUsage] });
+    nextTurn, lastTurn, prompts: prompts.state(), tools: [...tools], planIds: [...planIds], seenUsage: [...seenUsage] });
   // The turn window bounds an INITIAL read only. An incremental read delivers every appended record:
   // the cursor advances past everything read, so a consumer that was hidden while more than `limit`
   // turns arrived would append the newest ones to its history and lose the middle permanently.

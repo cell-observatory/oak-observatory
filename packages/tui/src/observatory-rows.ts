@@ -1,17 +1,19 @@
+import { processKey, plainProcessOutput } from '@oak-observatory/core';
 /** Conversation rows reuse the Agent's text and action renderer; all inputs are plain values. */
 import * as path from 'path';
-import { compactTokens, compactDuration, relTime, agentKindLabel, realSessionTitle, UNKNOWN_WORKSPACE, type ConversationEvent, type HerdrApi } from '@oak-observatory/core';
+import { agentWorktreeSummary, compactTokens, compactDuration, graphemes, relTime, agentKindLabel, realSessionTitle, paneAgentState, UNKNOWN_WORKSPACE, type ConversationEvent, type HerdrApi } from '@oak-observatory/core';
 import { agentBlob, agentTextRows, animGlyph, boxAround, type DashState, type DashRow } from './frame';
-import { agentStateFace, agentStateOf, currentTheme, promptGround, tint, type Glyphs, type ColorDepth, type StateKey } from './glyphs';
+import { agentStateFace, agentStateOf, currentTheme, promptGround, tint, type AgentState, type Glyphs, type ColorDepth, type StateKey } from './glyphs';
 import { displayWidth, fuzzyMatch, sanitizeCell, sliceVisible, stripSgr, wrapVisible } from './textwidth';
-import { observatoryReply, observatorySessions, type ObservatoryConversation, type ObservatoryMachine, type ObservatorySession } from './observatory';
+import { hasActiveWorker, observatoryReply, observatorySessions, syncBackupLine, syncInUse, syncLocalText, syncMachineText, type ObservatoryConversation, type ObservatoryMachine, type ObservatorySession } from './observatory';
 
 /** Preserve ANSI and all content even when a single colored word exceeds the pane width. */
 function wrapRows(value: string, width: number): string[] {
   const cols = Math.max(1, width);
   return value.split('\n').flatMap(line => {
     const rows: string[] = [];
-    let tokens: string[] = sanitizeCell(line).match(/\x1b\[[0-9;:]*m|[\s\S]/gu) || [];
+    // Colour escapes and whole characters: a row never breaks inside an emoji sequence or between a letter and its accent.
+    let tokens: string[] = sanitizeCell(line).split(/(\x1b\[[0-9;:]*m)/).flatMap((part, i) => (i % 2 ? [part] : graphemes(part)));
     let style = '';
     while (tokens.length) {
       let used = 0, end = 0, space = -1;
@@ -35,20 +37,42 @@ function wrapRows(value: string, width: number): string[] {
   });
 }
 
-function chip(s: ObservatorySession, g: Glyphs, depth: ColorDepth, now?: number): string {
-  // A live pane is authoritative, including explicit unknown/done. OAK's age heuristic belongs
-  // only to un-paned sessions; agentStateOf would otherwise turn herdr's done into idle.
-  const status = s.pane?.agent_status ?? agentStateOf(s.fleet.phase || s.meta.phase || '', {
+/** A live pane's state as core reads it: herdr's word, or working with a question waiting (paneAgentState). */
+const paneState = (s: ObservatorySession, at: number) => (s.pane ? paneAgentState(s.pane, s.meta, at) : undefined);
+
+/** What a working pane adds while a question it asked waits: the waiting state's own glyph and tint (blocked's
+ *  face, `?` in every glyph tier) and the word Codex's footer uses for it ("? 1 question"). */
+function questionMark(g: Glyphs, depth: ColorDepth): string {
+  const face = agentStateFace('blocked', g);
+  return tint(`${face.glyph} question`, face.key, depth);
+}
+
+/** A session's state as its row says it: a live pane is authoritative, including explicit unknown/done. OAK's age
+ *  heuristic belongs only to un-paned sessions; agentStateOf would otherwise turn herdr's done into idle. */
+function sessionStatus(s: ObservatorySession, at: number): AgentState {
+  if (s.fleet.state) return DELEGATED_FACE[s.fleet.state] ?? 'unknown';
+  return paneState(s, at)?.status ?? agentStateOf(s.fleet.phase || s.meta.phase || '', {
     active: s.meta.active, waiting: s.meta.attention && s.meta.attention.kind !== 'idle-done',
   });
-  const face = agentStateFace(status, g);
-  return now === undefined ? tint(`${face.glyph} ${face.label}`, face.key, depth)
-    : `${animGlyph(status, now, g, depth)} ${tint(face.label, face.key, depth)}`;
+}
+
+function chip(s: ObservatorySession, g: Glyphs, depth: ColorDepth, at: number, now?: number): string {
+  const pane = paneState(s, at);
+  const status = sessionStatus(s, at);
+  const face = { ...agentStateFace(status, g), ...(s.fleet.state ? { label: s.fleet.state } : {}) };
+  const question = pane?.question ? ` · ${questionMark(g, depth)}` : '';
+  return (now === undefined ? tint(`${face.glyph} ${face.label}`, face.key, depth)
+    : `${animGlyph(status, now, g, depth)} ${tint(face.label, face.key, depth)}`) + question;
 }
 
 /** Stand-ins for the spinners of live sessions: one cell wide, as the glyphs are, and put in when the
  *  frame is drawn. */
 const SPIN = { working: '\uE000', blocked: '\uE001' } as const;
+/** A session's worker group lists its workers by state in this order: a person is needed first, then running. Each
+ *  state reads as the session rows and herdr say it: a worker waiting on a person is `blocked`. */
+const WORKER_STATES = ['blocked', 'working'] as const;
+/** A delegated agent's state (core delegated.ts) drawn with the face of the session state it reads as. */
+const DELEGATED_FACE: Record<string, AgentState> = { queued: 'idle', starting: 'unknown', working: 'working', waiting: 'idle', blocked: 'blocked', errored: 'errored', done: 'done', gone: 'unknown' };
 const masterMemo = new Map<string, { inputs: unknown[]; rows: DashRow[]; live: [number, keyof typeof SPIN][] }>();
 
 /**
@@ -58,9 +82,9 @@ const masterMemo = new Map<string, { inputs: unknown[]; rows: DashRow[]; live: [
  * archived and its folds open.
  */
 export function observatoryMasterRows(state: DashState, cols: number, g: Glyphs, depth: ColorDepth): DashRow[] {
-  const views = state.views as { sessions?: { sessions?: unknown }; multitask?: { agents?: unknown } } | null | undefined;
+  const views = state.views as { sessions?: { sessions?: unknown }; multitask?: { agents?: unknown; delegated?: unknown; findings?: unknown } } | null | undefined;
   const inputs = [state.observatory?.machines, state.observatory?.owners, state.observatory?.machineError, views?.sessions, views?.sessions?.sessions,
-    views?.multitask?.agents, state.open, state.filter, state.allSessions, state.scopeWorker, new Date(state.now).toDateString()];
+    views?.multitask?.agents, views?.multitask?.delegated, views?.multitask?.findings, state.open, state.filter, state.allSessions, state.scopeWorker, state.observatoryFold, Object.values(state.observatory?.details ?? {}).map(d => `${d.selection.machineId}:${d.selection.session}`).join('\0'), new Date(state.now).toDateString(), state.sync];
   const key = `${cols}\u001f${depth}\u001f${currentTheme()}\u001f${JSON.stringify(g)}`;
   let memo = masterMemo.get(key);
   if (!memo || memo.inputs.some((v, i) => v !== inputs[i])) {
@@ -104,23 +128,34 @@ function buildMasterRows(state: DashState, cols: number, g: Glyphs, depth: Color
   // A session's live status: a herdr pane is authoritative; a paneless (store-only) session earns it
   // from its own phase. WORKING or BLOCKED — or the one the reader has pinned — is surfaced; everything
   // else folds, so a machine's live agents are not lost among hundreds of quiet-but-unresolved sessions.
-  const statusOf = (s: ObservatorySession): string => s.pane?.agent_status ?? agentStateOf(s.fleet.phase || s.meta.phase || '', {
-    active: s.meta.active, waiting: s.meta.attention && s.meta.attention.kind !== 'idle-done',
-  });
+  const statusOf = (s: ObservatorySession): string => sessionStatus(s, state.now);
   const byRecency = (a: ObservatorySession, b: ObservatorySession) => (b.meta.lastActiveMs || 0) - (a.meta.lastActiveMs || 0);
+  const doneKey = (s: ObservatorySession): string => `done:${s.machineId === 'unresolved' ? machines.find(m => m.local)?.id : s.machineId}`;
+  const picked = (s: ObservatorySession): boolean => [state.scopeWorker, ...Object.values(state.observatory?.details ?? {}).map(d => d.selection)]
+    .some(p => p?.session === s.session && (!p.machineId || p.machineId === s.machineId));
+  // Completion is the row's status: a done session folds even with edits left to review (the fold row counts them).
+  // Picks, the watched session and sessions with active workers stay visible; searching reveals matches. Only this
+  // machine's `current` is the watched session: another machine's listing marks the newest session of ITS launch folder.
+  const thisMachine = (s: ObservatorySession): boolean => s.machineId === 'unresolved' || machines.some(m => m.id === s.machineId && m.local);
+  // Finished: its row says done, or, with no herdr pane to say otherwise, its hooks recorded a finished turn (the rule the
+  // editors' lists fold by). A live pane keeps its own state: looking at a running agent does not fold it away.
+  const finished = (s: ObservatorySession): boolean => statusOf(s) === 'done' || (!s.pane && s.meta.attention?.kind === 'idle-done' && !s.meta.active);
+  const done = new Set(sessions.filter(s => finished(s) && !state.filter
+    && !hasActiveWorker(s.meta) && !(s.meta.current && thisMachine(s)) && (!picked(s) || state.open.has(doneKey(s)))));
   const storeOnly = sessions.filter(s => !s.pane);
   const surfaced = (s: ObservatorySession): boolean => {
     const st = statusOf(s);
     // The session OAK is watching right now (`current`) always shows under its machine, even between
     // turns when its phase reads idle — otherwise the running session vanishes into the fold below.
     // The reader's selection shows there too, unless its fold is open and already lists it: pulling it
-    // out of the open fold moved it away from under the arrows that picked it.
-    return st === 'working' || st === 'blocked' || s.meta.current === true
+    // out of the open fold moved it away from under the arrows that picked it. A session with a worker still
+    // at it is live whatever its own turn reads, and its workers' rows show under it.
+    return machines.some(m => m.id === s.machineId && !m.local) || st === 'working' || st === 'blocked' || s.meta.current === true || workerGroupOf(s) !== undefined
       || (state.scopeWorker?.session === s.session && !state.open.has(s.meta.pending > 0 ? 'earlier' : 'archived'));
   };
   // Post-pivot every store-only session is on this machine (remote session gather was retired), so a
   // live paneless session belongs under the local node.
-  const liveLocal = storeOnly.filter(surfaced).sort(byRecency);
+  const liveLocal = storeOnly.filter(s => surfaced(s) || done.has(s) || (finished(s) && (picked(s) || !!state.filter))).sort(byRecency);
   // Newest first, with a LIVE agent counted as now: a working workspace rises and a quiet one sinks.
   // Two live agents tie and keep herdr's own order, so the list does not reshuffle under the pointer
   // while both write.
@@ -133,12 +168,53 @@ function buildMasterRows(state: DashState, cols: number, g: Glyphs, depth: Color
   };
   const newest = (group: Group): number => Math.max(...group.entries.map(activity));
   const watched = (group: Group): number => (group.entries.some(e => e.session?.meta.current === true) ? 1 : 0);
+  // What oak sync last did, under each machine while sync is in use here: this machine's run and its backup, and what
+  // the run pulled from each saved machine or why it could not, in the CLI's words. Continuations of the machine's row.
+  const syncRows = (machine: ObservatoryMachine): void => {
+    const sync = state.sync;
+    if (!syncInUse(sync)) return;
+    const label = (word: string, bad: boolean) => tint(word, bad ? 'risk' : 'undone', depth);
+    if (machine.local) {
+      const t = syncLocalText(sync, state.now);
+      const failed = syncBackupLine(sync);
+      add(`machine:${machine.id}:sync`, `  ${label('sync', !!sync.last?.error || sync.conflicts.length > 0)} · ${t.run}`, { cont: true });
+      add(`machine:${machine.id}:backup`, `  ${label('backup', !!failed && failed.status !== 'ok')} · ${t.backup}`, { cont: true });
+      return;
+    }
+    const said = syncMachineText(sync, machine.label, state.now);
+    if (said) add(`machine:${machine.id}:sync`, `  ${label('sync', said.failed)} · ${said.text}`, { cont: true });
+  };
+  const windowTarget = (entries: ObservatorySession[]): ObservatorySession | undefined => {
+    const roots = entries.map(s => s.meta.workspacePath || s.root);
+    if (!roots.length || roots.some(root => !root || !path.isAbsolute(root)) || new Set(roots).size !== 1) return;
+    return { ...entries[0], root: roots[0] };
+  };
+  const windowRow = (key: string, cells: string, entries: ObservatorySession[]): void => {
+    const target = windowTarget(entries);
+    const button = ' [W window]';
+    if (target && displayWidth(cells) + button.length > cols) {
+      add(key, cells, { workspaceWindow: target });
+      add(`${key}:window`, '  ' + button.trim(), { workspaceWindow: target, cont: true,
+        buttons: [{ action: 'workspace-window', x: 2, w: button.length - 1 }] });
+    } else add(key, cells + (target ? button : ''), target ? { workspaceWindow: target,
+      buttons: [{ action: 'workspace-window', x: displayWidth(cells) + 1, w: button.length - 1 }] } : {});
+  };
   for (const machine of machines) {
     const error = `  not reachable · ${machine.error}`;
     const compactError = machine.error && displayWidth(error) > cols;
-    add(`machine:${machine.id}`, tint(`${machine.label}${compactError ? ' ✗' : ''}`, 'accent', depth));
+    windowRow(`machine:${machine.id}`, tint(`${machine.label}${compactError ? ' ✗' : ''}`, 'accent', depth),
+      sessions.filter(s => s.machineId === machine.id || (machine.local && s.machineId === 'unresolved')));
     if (machine.error) { if (!compactError) add(`machine:${machine.id}:error`, error); }
     else if (!machine.snapshot) { add(`machine:${machine.id}:loading`, '  connecting…'); }
+    syncRows(machine);
+    for (const w of machine.sessions?.workers ?? []) if (w.state === 'queued') {
+      add(`queued:${w.key}`, `  ${w.title}`);
+      add(`queued:${w.key}:state`, `    queued · waiting on ${(w.after ?? []).join(', ')}`, { cont: true });
+    }
+    // A saved machine's sessions read from this machine's index (oak sync brought its records), not from it: said, with
+    // when that run read it.
+    const fromRecords = !machine.local && machine.sessions?.fromIndex === true && typeof machine.sessions.syncedAt === 'number' ? machine.sessions.syncedAt : null;
+    if (fromRecords !== null) add(`machine:${machine.id}:records`, `  ${tint('sessions', 'undone', depth)} · from its records, synced ${relTime(fromRecords, state.now)}`, { cont: true });
     const groups: Group[] = [];
     const join = (id: string, label: string, number: number, entry: Entry): void => {
       const group = groups.find(x => x.id === id);
@@ -148,35 +224,55 @@ function buildMasterRows(state: DashState, cols: number, g: Glyphs, depth: Color
     if (!machine.error) for (const pane of machine.snapshot?.panes ?? []) {
       if (!pane.agent && !pane.agent_session) continue;
       const ws = paneWorkspace(machine, pane);
-      join(ws.id, ws.label, ws.number, { pane, session: sessions.find(s => s.machineId === machine.id && s.paneId === pane.pane_id) });
+      const session = sessions.find(s => s.machineId === machine.id && s.paneId === pane.pane_id);
+      if (state.filter && !session) continue;
+      join(ws.id, ws.label, ws.number, { pane, session });
     }
     // This machine's LIVE agents that are not in a herdr pane — a claude/codex the user ran in a plain
     // terminal still shows under its machine, even while herdr is connecting or unreachable (store-only
     // sessions do not depend on the herdr snapshot), never buried in the fold below. A project that
     // shares a herdr workspace's name joins that workspace rather than repeating its header.
-    if (machine.local) for (const s of liveLocal) {
+    for (const s of liveLocal.filter(s => machine.local ? s.machineId === machine.id || s.machineId === 'unresolved' : s.machineId === machine.id)) {
       const label = projectOf(s);
       join(groups.find(x => x.label === label)?.id ?? `project:${label}`, label, Infinity, { session: s });
     }
     // The workspace of the session OAK is watching comes first on its machine.
     groups.sort((a, b) => watched(b) - watched(a) || desc(newest(a), newest(b)) || desc(b.number, a.number));
-    for (const group of groups) {
-      add(`workspace:${machine.id}:${group.id}`, `  ${tint(group.label, 'agent', depth)}`);
-      for (const { pane, session } of group.entries.sort((a, b) => desc(activity(a), activity(b)))) {
-        if (!pane) { renderSession(session!, '    '); continue; }
-        // The pane line is part of its session's entry: a click on it pins that session too.
-        add(`pane:${machine.id}:${pane.pane_id}`, `    ${g.open} ${agentKindLabel(pane.agent_session?.agent || pane.agent || 'unknown')} · ${pane.pane_id}`,
-          session ? { scope: session } : {});
-        if (session) renderSession(session, '      ');
-        else if (!pane.agent_session) add(`pane:${machine.id}:${pane.pane_id}:identity`,
-          cols >= 25 ? '      waiting for session' : '      no session yet');
+    const doneGroups = groups.map(group => ({ ...group, entries: group.entries.filter(e => e.session && done.has(e.session)) })).filter(group => group.entries.length);
+    drawGroups(groups.map(group => ({ ...group, entries: group.entries.filter(e => !e.session || !done.has(e.session)) })).filter(group => group.entries.length));
+    const count = doneGroups.reduce((n, group) => n + group.entries.length, 0);
+    if (count) {
+      const fold = `done:${machine.id}`;
+      const pending = doneGroups.reduce((n, group) => n + group.entries.reduce((m, e) => m + (e.session?.meta.pending || 0), 0), 0);
+      add(fold, ` ${state.observatoryFold === fold ? '>' : ' '} ${tint(`${state.open.has(fold) ? g.open : g.closed} ${count} done${pending ? ` · ${pending} pending` : ''}`, 'undone', depth)}`, { openPath: fold });
+      if (state.open.has(fold)) drawGroups(doneGroups, true);
+    }
+    function drawGroups(list: Group[], folded = false): void {
+      const indent = folded ? '  ' : '';
+      for (const group of list) {
+        windowRow(`workspace:${machine.id}:${group.id}${folded ? ':done' : ''}`, `${indent}  ${tint(group.label, 'agent', depth)}`,
+          group.entries.every(e => e.session) ? group.entries.map(e => e.session!) : []);
+        for (const { pane, session } of group.entries.sort((a, b) => desc(activity(a), activity(b)))) {
+          if (!pane) { renderSession(session!, indent + '    '); continue; }
+          // The pane line is part of its session's entry: a click on it pins that session too.
+          add(`pane:${machine.id}:${pane.pane_id}`, `${indent}    ${g.open} ${agentKindLabel(pane.agent_session?.agent || pane.agent || 'unknown')} · ${pane.pane_id}`,
+            session ? { scope: session } : {});
+          if (session) renderSession(session, indent + '      ');
+          else if (!pane.agent_session) add(`pane:${machine.id}:${pane.pane_id}:identity`,
+            indent + (cols >= 25 ? '      waiting for session' : '      no session yet'));
+        }
       }
     }
   }
   if (!state.observatory?.machines.length) add('machine:loading', 'herdr · connecting…');
   if (state.observatory?.machineError) add('machines:error', 'machines ✗');
+  delegatedRows();
+  const findings = (state.views as { multitask?: { findings?: { count: number | null } } } | null)?.multitask?.findings;
+  if (findings) add('findings', tint(`findings · ${findings.count ?? 'unavailable'} · oak finding list`, 'accent', depth));
   // Everything else with pending edits — quiet, waiting to be reviewed — folds into one collapsed row.
-  const earlier = storeOnly.filter(s => !surfaced(s) && s.meta.pending > 0).sort(byRecency);
+  // Never a session already drawn under its machine (a pinned or filtered finished one): it was listed, and counted, twice.
+  const drawnLocal = new Set(liveLocal);
+  const earlier = storeOnly.filter(s => !done.has(s) && !drawnLocal.has(s) && !surfaced(s) && s.meta.pending > 0).sort(byRecency);
   const foldGroup = (fold: string, label: string, group: ObservatorySession[], accent: 'accent' | 'undone') => {
     if (!group.length) return;
     const openGlyph = state.open.has(fold) ? g.open : g.closed;
@@ -184,30 +280,122 @@ function buildMasterRows(state: DashState, cols: number, g: Glyphs, depth: Color
     if (state.open.has(fold)) group.forEach(s => renderSession(s, '  '));
   };
   foldGroup('earlier', 'earlier', earlier, 'accent');
-  // Resolved sessions (nothing pending) only exist here under Show archived; they fold too.
-  foldGroup('archived', 'archived', storeOnly.filter(s => !(s.meta.pending > 0)).sort(byRecency), 'undone');
+  // Resolved sessions (nothing pending) only exist here under Show archived; they fold too. One with a worker still at it
+  // is listed under its machine, not archived.
+  foldGroup('archived', 'archived', storeOnly.filter(s => !done.has(s) && statusOf(s) !== 'done' && !(s.meta.pending > 0) && !hasActiveWorker(s.meta)).sort(byRecency), 'undone');
   return { rows, live };
 
   function renderSession(s: ObservatorySession, indent: string): void {
     const key = `session:${s.machineId}:${s.paneId || ''}:${s.session}`;
-    const selected = state.scopeWorker?.session === s.session && (!state.scopeWorker.machineId || state.scopeWorker.machineId === s.machineId);
-    add(key, `${indent}${selected ? '>' : ' '} ${s.label}`, { scope: s });
+    const group = workerGroupOf(s);
+    // The mark sits on the session's row, or on the row of its worker group the reader picked while that row is
+    // drawn (a worker that has finished since, or a closed group, leaves it on the session).
+    const ofThis = state.scopeWorker?.session === s.session && (!state.scopeWorker.machineId || state.scopeWorker.machineId === s.machineId);
+    const pick = ofThis && group ? pickIn(group) : undefined;
+    add(key, `${indent}${ofThis && !pick ? '>' : ' '} ${s.label}`, { scope: s });
     // The rich stat line the flat sessions list used to carry: a status, the model, the edit count and diffstat, the
     // token total, pending, and when it was last active — each tinted so the row reads at a glance. A
     // LIVE session shows its animated status word; a quiet one shows just a coloured dot, so the list is
     // not a column of "unknown" for every session whose agent is not running right now.
     const m = s.meta;
-    const status = s.pane?.agent_status ?? agentStateOf(m.phase || s.fleet.phase || '', {
-      active: m.active, waiting: m.attention && m.attention.kind !== 'idle-done',
-    });
-    const face = agentStateFace(status, g);
+    const pane = paneState(s, state.now);
+    const status = sessionStatus(s, state.now);
+    const face = { ...agentStateFace(status, g), ...(s.fleet.state ? { label: s.fleet.state } : {}) };
     const spinning = status === 'working' || status === 'blocked';
     // Show the status WORD when a pane vouches for it or the agent is live; a paneless quiet session
     // shows just its coloured dot, so an unknown phase does not print "unknown" on every row.
     const statusCell = spinning ? `${SPIN[status]} ${tint(face.label, face.key, depth)}`
-      : s.pane ? tint(`${face.glyph} ${face.label}`, face.key, depth)
+      : s.pane || s.fleet.state ? tint(`${face.glyph} ${face.label}`, face.key, depth)
       : depth === 'none' ? face.glyph : tint(face.glyph, face.key, depth);
-    const bits = [statusCell];
+    // The spinner is the first cell after the indent, so it lands on the first of the rows this adds.
+    if (spinning) live.push([rows.length, status]);
+    add(`${key}:state`, `${indent}  ${[statusCell, ...(pane?.question ? [questionMark(g, depth)] : []), ...stats(m)].join(' · ')}`, { scope: s, cont: true });
+    if (group) workerRows(s, key, indent, group, pick);
+  }
+
+  // A session's workers that are still at it (core's `activeWorkers`: working, or waiting on a person), grouped
+  // under it so they never flood the list: one summary row counting them by state, collapsed by default, which →,
+  // Enter or a click opens and ←, Enter or a second click closes. Open, a sub-group per state, waiting first, each
+  // worker two rows as a session is: its title, then its stat row. A finished worker is never listed: the pinned
+  // detail's Workers keeps it. The fold is remembered per session (`state.open`) for the life of the app.
+  type WorkerGroup = { fold: string; open: boolean; count: number; byState: [typeof WORKER_STATES[number], Record<string, any>[]][] };
+  function workerGroupOf(s: ObservatorySession): WorkerGroup | undefined {
+    const workers: Record<string, any>[] = Array.isArray(s.meta.activeWorkers) ? s.meta.activeWorkers : [];
+    const byState = WORKER_STATES.map(st => [st, workers.filter(w => agentStateOf(String(w.phase ?? '')) === st)] as [typeof st, Record<string, any>[]])
+      .filter(([, list]) => list.length);
+    const count = byState.reduce((n, [, list]) => n + list.length, 0);
+    const fold = `workers:${s.machineId}:${s.session}`;
+    return count ? { fold, open: state.open.has(fold), count, byState } : undefined;
+  }
+  /** The row of the group the reader picked, while it is drawn: `all` (the summary), a state's header, or a worker. */
+  function pickIn(group: WorkerGroup): string | undefined {
+    const { workers, agentId } = state.scopeWorker ?? {};
+    if (workers === 'all') return 'all';
+    if (!group.open) return undefined;
+    if (workers && group.byState.some(([st]) => st === workers)) return workers;
+    return agentId && group.byState.some(([, list]) => list.some(w => String(w.agentId) === agentId)) ? `agent:${agentId}` : undefined;
+  }
+  function workerRows(s: ObservatorySession, key: string, indent: string, group: WorkerGroup, pick: string | undefined): void {
+    const mark = (item: string): string => (pick === item ? '>' : ' ');
+    // A state's cell, as a session's status cell draws it: the spinner, then its word in the state's colour.
+    const cell = (st: typeof WORKER_STATES[number], text: string): string => `${SPIN[st]} ${tint(text, agentStateFace(st, g).key, depth)}`;
+    const counts = [...group.byState].reverse().map(([st, list]) => cell(st, `${list.length} ${agentStateFace(st, g).label}`));
+    addLive(group.fold, `${indent}${mark('all')} ${group.open ? g.open : g.closed} ${group.count} worker${group.count === 1 ? '' : 's'} · ${counts.join(' · ')}`,
+      { scope: { ...s, workers: 'all' }, openPath: group.fold });
+    if (!group.open) return;
+    for (const [st, list] of group.byState) {
+      addLive(`${group.fold}:${st}`, `${indent}  ${mark(st)} ${cell(st, agentStateFace(st, g).label)} (${list.length})`, { scope: { ...s, workers: st } });
+      for (const w of list) {
+        const agentId = String(w.agentId);
+        // Its rows scope to the worker, as a Workers row in the detail does: picking it previews and pins its session.
+        const scope = { ...s, agentId };
+        add(`${key}:worker:${agentId}`, `${indent}    ${mark(`agent:${agentId}`)} ${String(w.title || agentId)}`, { scope });
+        // A phase no transcript record states is a guess, marked `~` as the editors' Workers lists mark it: a wait that
+        // only a call left unanswered suggests (a permission prompt, or a long command) in a session no OAK hook records,
+        // or a quiet background worker.
+        const word = `${agentStateFace(st, g).label}${w.phaseConfidence === 'heuristic' ? '~' : ''}`;
+        addLive(`${key}:worker:${agentId}:state`, `${indent}        ${[cell(st, word), ...stats(w)].join(' · ')}`, { scope, cont: true });
+      }
+    }
+  }
+  // The agents OAK started from a brief (`oak agent start --brief`, the multitask view's `delegated`), each with OAK's own
+  // state and when it began, the error it stopped on, and its workers still at it. A row whose agent has a session
+  // previews and pins it, as a session's row does, and `t` (↗ herdr) opens its tab, on its machine.
+  function delegatedRows(): void {
+    const list = ((state.views as { multitask?: { delegated?: unknown } } | null | undefined)?.multitask?.delegated ?? []) as Record<string, any>[];
+    if (!Array.isArray(list) || !list.length) return;
+    add('delegated', tint(`agents · ${list.length}`, 'accent', depth));
+    for (const a of list) {
+      if (a.state === 'queued' && machines.some(m => m.sessions?.workers?.some(w => w.key.endsWith(`:delegated:${a.id}`)))) continue;
+      const machine = a.machine ? machines.find(m => m.label === a.machine) : machines.find(m => m.local);
+      const scope = typeof a.session === 'string' && a.session
+        ? { session: a.session, root: String(a.cwd || ''), label: String(a.title || a.id), machineId: machine?.id, paneId: a.pane || undefined } : undefined;
+      add(`delegated:${a.id}`, `  ${a.id} · ${a.title}`, scope ? { scope } : {});
+      const face = agentStateFace(DELEGATED_FACE[a.state] ?? 'unknown', g);
+      const bits = [tint(`${face.glyph} ${a.state}`, face.key, depth), `since ${relTime(a.since, state.now)}`, a.kind, [a.model, a.effort].filter(Boolean).join(' '),
+        a.state === 'queued' ? `waiting on ${(a.after ?? []).join(', ')}` : '', a.machine ? `on ${a.machine}` : '', a.tab ? `tab ${a.remoteId ?? a.id}` : '', a.tokens ? tint(`${compactTokens(a.tokens)} tok`, 'undone', depth) : '',
+        a.cost ? `$${Number(a.cost).toFixed(2)}` : ''].filter(Boolean);
+      const tree = agentWorktreeSummary(a.worktree);
+      if (tree) bits.push(tree);
+      add(`delegated:${a.id}:state`, `    ${bits.join(' · ')}`, { ...(scope ? { scope } : {}), cont: true });
+      if (a.error) add(`delegated:${a.id}:error`, `    ${tint(String(a.error), 'risk', depth)}`, { ...(scope ? { scope } : {}), cont: true });
+      for (const w of Array.isArray(a.workers) ? a.workers : []) {
+        add(`delegated:${a.id}:worker:${w.id}`, `    └ ${w.title} · ${w.state}${w.model ? ` · ${w.model}` : ''}`, scope ? { scope: { ...scope, agentId: String(w.id) } } : {});
+      }
+    }
+  }
+
+  /** `add`, registering each spinner stand-in on the row it wrapped onto. */
+  function addLive(key: string, cells: string, extra: Partial<DashRow> = {}): void {
+    const from = rows.length;
+    add(key, cells, extra);
+    for (let i = from; i < rows.length; i++) for (const st of WORKER_STATES) if (rows[i].cells.includes(SPIN[st])) live.push([i, st]);
+  }
+
+  // The stats a session's row and its workers' rows carry after their status, each tinted so a row reads at a
+  // glance: the model, the edit count and diffstat, the token total, pending, and when it was last active.
+  function stats(m: Record<string, any>): string[] {
+    const bits: string[] = [];
     if (m.model) bits.push(tint(String(m.model), 'agent', depth));
     if (m.edits) bits.push(`${m.edits} edit${m.edits === 1 ? '' : 's'}`);
     if (m.added || m.removed) bits.push(`${tint(`+${compactTokens(m.added || 0)}`, 'kept', depth)} ${tint(`−${compactTokens(m.removed || 0)}`, 'risk', depth)}`);
@@ -215,12 +403,8 @@ function buildMasterRows(state: DashState, cols: number, g: Glyphs, depth: Color
     bits.push(`${m.pending ?? 0} pending`);
     // The clock time, as every other list shows it — never an age (0.10.0: "Timestamps now show the
     // exact time, not an age").
-    const at = m.lastActiveMs ? tint(relTime(m.lastActiveMs, state.now), 'undone', depth) : '';
-    // The spinner is the first cell after the indent, so it lands on the first of the rows this adds.
-    if (spinning) live.push([rows.length, status]);
-    add(`${key}:state`, `${indent}  ${bits.join(' · ')}${at ? ` · ${at}` : ''}`, { scope: s, cont: true });
-    // No Workers fold here: its facts came from a whole-fleet read the Observatory never polls (it lists
-    // sessions only), so it never showed. A pinned session's detail lists its Workers.
+    if (m.lastActiveMs) bits.push(tint(relTime(m.lastActiveMs, state.now), 'undone', depth));
+    return bits;
   }
 }
 
@@ -231,7 +415,7 @@ const bodyMemo = new WeakMap<ConversationEvent[], Map<string, { open: ReadonlySe
 
 /** Draft/caret/focus changes repaint only the reply row, not thousands of transcript rows. */
 function sameBody(a: ObservatoryConversation | undefined, b: ObservatoryConversation | undefined): boolean {
-  return a?.events === b?.events && a?.previews === b?.previews && a?.optimistic === b?.optimistic
+  return a?.processes === b?.processes && a?.processError === b?.processError && a?.feed === b?.feed && a?.events === b?.events && a?.previews === b?.previews && a?.optimistic === b?.optimistic
     && a?.selection === b?.selection && a?.cursor === b?.cursor && a?.loadedAt === b?.loadedAt;
 }
 
@@ -243,7 +427,7 @@ export function observatoryReplyRow(state: DashState, paneId: string, cols: numb
   const tier = (labels: string[]) => labels.find(s => displayWidth(s) <= budget) || labels.at(-1)!;
   if (reason) return tint(tier(['Sending…', 'Sending']), 'undone', depth);
   const reply = detail.reply;
-  if (!reply?.focused) return tint(tier(['i reply · Enter sends · esc leaves', 'i reply · esc leaves', 'i reply']), 'undone', depth);
+  if (!reply?.focused) return tint(tier(['c reply · Enter sends · esc leaves', 'c reply · esc leaves', 'c reply']), 'undone', depth);
   const text = sanitizeCell(reply.text);
   const caret = displayWidth(sanitizeCell(reply.text.slice(0, reply.caret)));
   const room = Math.max(1, budget - 2);
@@ -264,7 +448,7 @@ export function observatoryDetailRows(state: DashState, cols: number, g: Glyphs,
   const fleet = detail?.fleet ?? session?.fleet ?? {};
   const title = realSessionTitle(meta.title) || selection?.label || 'Select a session';
   const machine = session?.machine || state.observatory?.machines.find(m => m.id === selection?.machineId)?.label || 'local';
-  const status = session ? chip(session, g, depth) : '';
+  const status = session ? chip(session, g, depth, state.now) : '';
   const errors = (state.observatory?.machines || []).filter(m => m.error).map(m => `${m.label} · not reachable · ${m.error}`);
   if (state.observatory?.machineError) errors.push(`machines · not reachable · ${state.observatory.machineError}`);
   const signature = JSON.stringify([selection?.session, selection?.machineId, title, machine, status, meta.model, meta.tokens, meta.pending,
@@ -283,23 +467,88 @@ export function observatoryDetailRows(state: DashState, cols: number, g: Glyphs,
     wrapRows(cells.slice(prefix.length), cols - indent.length).forEach((line, i) =>
       rows.push({ ids: [], key: i ? `${key}:wrap:${i}` : key, cells: indent + line, ...extra, ...(i ? { cont: true } : {}) }));
   };
+  const processRows = (): void => {
+    const view = detail?.processes;
+    const processes = view?.processes ?? [];
+    const list = selection?.agentId ? processes.filter(p => p.workerId === selection.agentId) : processes;
+    section('Processes', list, p => ({ key: p.running ? 'live' : p.exitCode ? 'risk' : 'kept', active: p.running }), 'running', 'finished', (p, face, key) => {
+      const id = processKey(p as import('@oak-observatory/core').BackgroundProcess);
+      add(key, `  ${plainProcessOutput(p.description || p.command)} · ${p.running ? 'running' : p.status} · ${compactDuration(p.runtimeMs)}${p.exitCode === null ? '' : ` · exit ${p.exitCode}`}${p.workerId ? ` · worker ${p.workerId}` : ''}`,
+        { scope: { ...selection!, agentId: undefined, processId: id } });
+      if (view?.previews?.[id]) add(`${key}:preview`, '    ' + view.previews[id].replace(/\n/g, '\n    '), { cont: true });
+    });
+    if (detail?.processError) add('process:error', `Processes unavailable: ${detail.processError}`);
+    else if (!view) add('process:loading', '  Reading shells…');
+    else if (!list.length) add('process:empty', '  No shells in this session');
+  };
+  if (selection?.processId) {
+    add('process:header', `${selection.label} · ${machine} · process output`);
+    processRows();
+    const snapshot = detail?.processes?.selected;
+    if (snapshot) {
+      add('process:command', plainProcessOutput(snapshot.process.command));
+      if (snapshot.note) add('process:note', snapshot.note);
+      snapshot.outputTail.split('\n').forEach((line, i) => add(`process:output:${i}`, plainProcessOutput(line)));
+    } else if (!detail?.processError) add('process:loading', 'Loading process output…');
+    detailMemo.set(key, { signature, detail, open: state.open, rows });
+    return rows;
+  }
+  if (selection?.agentId) {
+    const feed = detail?.feed;
+    add('worker:header', `${feed?.title || selection.agentId} · ${machine} · worker log`);
+    if (detail?.error) add('worker:error', detail.error);
+    else if (!feed) add('worker:loading', detail ? 'Loading worker log…' : 'Click or press Enter to open this worker’s log.');
+    if (feed) {
+      if (feed.note) add('worker:status', feed.note);
+      if (feed.truncated) add('worker:earlier', `… ${feed.truncated} earlier entries not shown · oak feed --kind agent --id ${selection.agentId} --session ${selection.session} --limit <n>`);
+      feed.entries.forEach((entry, i) => {
+        const at = entry.ts ? new Date(entry.ts).toISOString() + ' ' : '';
+        add(`worker:${i}`, `${at}${entry.ok === false ? 'failed · ' : ''}${entry.label}${entry.target ? ' · ' + entry.target : ''}`);
+        if (entry.reasoning) add(`worker:${i}:text`, entry.reasoning);
+        if (entry.cmd) add(`worker:${i}:cmd`, entry.cmd);
+        if (entry.note) add(`worker:${i}:note`, entry.note);
+      });
+      if (!feed.entries.length) add('worker:empty', 'Nothing recorded yet.');
+    }
+    processRows();
+    detailMemo.set(key, { signature, detail, open: state.open, rows });
+    return rows;
+  }
   const header = [title, machine, status, meta.model, `${compactTokens(meta.tokens || 0)} tokens`, `${meta.pending || 0} pending`].filter(Boolean).join(' · ');
   wrapVisible(header, Math.max(8, cols)).forEach((line, i) => add(`detail:header:${i}`, line));
   errors.forEach((error, i) => add(`detail:machine-error:${i}`, error));
-  const jumps = '↗ herdr   ⌕ review';
-  if (selection) add('detail:jumps', jumps, { scope: selection, buttons: [
-    { action: 'herdr', x: 0, w: displayWidth('↗ herdr') }, { action: 'review', x: displayWidth('↗ herdr   '), w: displayWidth('⌕ review') },
-  ] });
+  // The session's buttons; resolve and stop ask first (R and X from the keyboard). A narrow pane breaks them
+  // across rows between buttons, each row with its own buttons' offsets: wrapped as one line, every row
+  // carried the first row's, so a click on a button carried to the next row fired the one drawn above it.
+  if (selection) {
+    const labels: [string, string][] = [['herdr', '↗ herdr'], ['review', '⌕ review'], ['resolve', '⚑ resolve'], ['kill', '■ stop']];
+    let line = '';
+    let buttons: { action: string; x: number; w: number }[] = [];
+    let n = 0;
+    const flush = (): void => {
+      rows.push({ ids: [], key: n ? `detail:jumps:${n}` : 'detail:jumps', cells: line, scope: selection, buttons, ...(n ? { cont: true } : {}) });
+      n++;
+    };
+    for (const [action, text] of labels) {
+      const w = displayWidth(text);
+      if (line && displayWidth(line) + 3 + w > cols) { flush(); line = ''; buttons = []; }
+      buttons.push({ action, x: line ? displayWidth(line) + 3 : 0, w });
+      line = line ? `${line}   ${text}` : text;
+    }
+    flush();
+  }
   if (!detail) add('detail:preview', tint('A click or Enter pins this conversation · ↑↓ previews it here and in Review', 'undone', depth));
   else {
     if (detail.loading) add('detail:loading', 'loading conversation…');
     else if (detail.error) add('detail:error', detail.error);
     else if (!detail.events.length && !detail.optimistic?.length) add('detail:empty', 'No conversation events yet.');
-    if (detail.reply?.error) add('detail:reply-error', `Reply failed: ${detail.reply.error}`);
+    if (detail.reply?.error) add('detail:reply-error', `Draft retained: ${detail.reply.error}`);
     // A loop, not a spread: a long conversation's rows outnumber what one call may take as arguments.
-    for (const row of conversationRows(state, detail, cols, g, depth)) rows.push(row);
-    sections();
+    // A call with no result yet is the one the session waits on while it waits on a person (blocked), and is running
+    // otherwise.
+    for (const row of conversationRows(state, detail, cols, g, depth, !!session && sessionStatus(session, state.now) === 'blocked')) rows.push(row);
   }
+  if (selection) sections();
   if (detailMemo.size > 64) detailMemo.clear();
   detailMemo.set(key, { signature, detail, open: state.open, rows });
   return rows;
@@ -329,13 +578,14 @@ export function observatoryDetailRows(state: DashState, cols: number, g: Glyphs,
       const cost = [
         entry.model ? tint(String(entry.model), 'agent', depth) : '',
         entry.effort ? tint(String(entry.effort), 'agent', depth) : '',
-        entry.ts ? tint(relTime(entry.ts, detail!.loadedAt), 'undone', depth) : '',
+        entry.ts ? tint(relTime(entry.ts, detail?.loadedAt ?? state.now), 'undone', depth) : '',
         `${entry.edits || 0} edit${entry.edits === 1 ? '' : 's'}`,
         tint(`↑${compactTokens(entry.tokensIn || 0)} ↓${compactTokens(entry.tokensOut || 0)} ↺${compactTokens(entry.tokensCacheRead || 0)}`, 'undone', depth),
         entry.durationMs ? tint(compactDuration(entry.durationMs), 'undone', depth) : '',
       ].filter(Boolean).join(' · ');
       add(`${key}:cost`, `    ${tint(`+${entry.added || 0}`, 'kept', depth)} ${tint(`−${entry.removed || 0}`, 'risk', depth)} · ${cost}`, { cont: true });
     });
+    processRows();
     section('Tasks', fleet.todos ?? [], taskFace, 'open', 'done', (entry, face, key) =>
       add(key, `  ${tint(face.glyph, face.key, depth)} ${entry.content} · ${tint(face.word, face.key, depth)}`));
   }
@@ -376,10 +626,11 @@ const unitMemo = new Map<string, WeakMap<ConversationEvent, UnitRows>>();
 
 /** Native transcript events share toolCallId updates; merge completions into their action box.
  * Adjacent text chunks join before line styling, preserving streamed markdown and tables. */
-export function conversationRows(state: DashState, detail: ObservatoryConversation, cols: number, g: Glyphs, depth: ColorDepth): DashRow[] {
+export function conversationRows(state: DashState, detail: ObservatoryConversation, cols: number, g: Glyphs, depth: ColorDepth, waiting = false): DashRow[] {
   let cache = bodyMemo.get(detail.events);
   if (!cache) bodyMemo.set(detail.events, cache = new Map());
-  const key = `${cols}\u001f${depth}\u001f${currentTheme()}\u001f${JSON.stringify(g)}`;
+  // Whether the session waits on a person draws its unsettled calls, and moves without a new event: part of the key.
+  const key = `${cols}\u001f${depth}\u001f${currentTheme()}\u001f${JSON.stringify(g)}\u001f${waiting}`;
   const hit = cache.get(key);
   if (hit && hit.open === state.open && sameBody(hit.detail, detail)) return hit.rows;
   let units = unitMemo.get(key);
@@ -474,7 +725,7 @@ export function conversationRows(state: DashState, detail: ObservatoryConversati
       const label = target && title.endsWith(` ${target}`) ? title.slice(0, -target.length).trimEnd() : title;
       const entry = { kind: input.permission ? 'permission' : 'action', label, target,
         category: tool.kind === 'execute' ? 'exec' : tool.kind, detail: content, ts, editId: tool.editId,
-        ok: tool.status === 'completed' ? true : tool.status === 'failed' ? false : undefined };
+        ok: tool.status === 'completed' ? true : tool.status === 'failed' ? false : undefined, waiting };
       const blob = agentBlob(blobState, entry, { g, depth, width: Math.max(8, cols), open: !open, box: true });
       blob.rows.forEach((line, n) => add(line, {
         ...(n === 0 ? { openPath: fold } : { cont: true }),

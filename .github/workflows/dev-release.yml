@@ -24,7 +24,7 @@ jobs:
   dev-release:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:
           node-version: 22
@@ -70,12 +70,14 @@ jobs:
       - run: npm ci
       - run: npm test
       - run: bash test/e2e.sh
-      - run: npm run release
-      - uses: actions/setup-java@v5
+      # release.sh builds the JetBrains plugin when JAVA_HOME has a JDK, so the JDK and Gradle's cache come
+      # first: after it, the wrapper downloaded Gradle uncached, with no retry, on the runner's default JDK.
+      - uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: 21
-      - uses: gradle/actions/setup-gradle@v4
+      - uses: gradle/actions/setup-gradle@v5
+      - run: npm run release
       - run: ./gradlew buildPlugin --console=plain
         working-directory: packages/jetbrains
       # Placed here, not beside the stamp: it uses core's own comparator, and core has to be BUILT

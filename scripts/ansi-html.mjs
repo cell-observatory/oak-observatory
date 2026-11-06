@@ -27,7 +27,11 @@ function ansiToHtml(line) {
     let fg = st.fg, bg = st.bg;
     if (st.inverse) { fg = st.bg ?? '#0d0d10'; bg = st.fg ?? '#c9cdd3'; }
     if (fg) parts.push(`color:${fg}`);
-    if (bg) parts.push(`background:${bg}`);
+    // An inline span paints its background over the font's whole ascent-plus-descent (1.32em in
+    // JetBrains Mono), taller than the row, so a coloured cell covered the top of the row below it (the
+    // tab pills over herdr's second row). An inline-block with no height of its own is as tall as its
+    // line box, so it paints exactly one row at whatever line-height the page sets.
+    if (bg) parts.push(`background:${bg};display:inline-block;vertical-align:top`);
     if (st.bold) parts.push('font-weight:700');
     if (st.dim) parts.push('opacity:.62');
     return parts.join(';');

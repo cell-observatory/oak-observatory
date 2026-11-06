@@ -25,9 +25,9 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 ROOT=$PWD
 
 # CI's matrix, from .github/workflows/{linux,macos,windows}.yml.
-NODES=(20 22 24)
+NODES=(22.16 24)
 MODE=${1:-}
-[ "$MODE" = "--quick" ] && NODES=(20)
+[ "$MODE" = "--quick" ] && NODES=(22.16)
 
 RUNTIME=""
 for c in podman docker; do command -v "$c" >/dev/null 2>&1 && { RUNTIME=$c; break; }; done

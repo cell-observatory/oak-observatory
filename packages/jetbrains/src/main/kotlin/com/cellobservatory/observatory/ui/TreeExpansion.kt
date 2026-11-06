@@ -25,6 +25,8 @@ fun expandAllBounded(tree: JTree) {
     }
     val rootPath = TreePath(root)
     tree.expandPath(rootPath)
+    // Thousands of top-level files are already visible; opening each one defeats the bound.
+    if (model.getChildCount(root) > EXPAND_ALL_CAP) return
     for (i in 0 until model.getChildCount(root)) {
         tree.expandPath(rootPath.pathByAddingChild(model.getChild(root, i)))
     }

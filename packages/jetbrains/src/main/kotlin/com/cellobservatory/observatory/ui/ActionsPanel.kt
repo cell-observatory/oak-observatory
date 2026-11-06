@@ -94,6 +94,7 @@ class ActionsPanel(private val project: Project) : SimpleToolWindowPanel(true, t
                 if (e.clickCount != 2) return
                 // A conflict row opens the contested file itself.
                 ((actionsTree.lastSelectedPathComponent as? DefaultMutableTreeNode)?.userObject as? Collision)?.let { c ->
+                    if (ObservatoryService.getInstance(project).currentMachine() != null) return
                     val vf = com.intellij.openapi.vfs.LocalFileSystem.getInstance().refreshAndFindFileByPath(c.file)
                     if (vf == null) ReviewOps.notify(project, "File not found: ${c.file}", com.intellij.notification.NotificationType.WARNING)
                     else com.intellij.openapi.fileEditor.FileEditorManager.getInstance(project).openFile(vf, true)
@@ -102,6 +103,7 @@ class ActionsPanel(private val project: Project) : SimpleToolWindowPanel(true, t
                 val a = (actionsTree.lastSelectedPathComponent as? DefaultMutableTreeNode)?.userObject as? ActionRecord ?: return
                 val id = a.editId ?: return // only file-edit actions link to a reviewable store record
                 val session = session() ?: return
+                ObservatoryService.getInstance(project).currentMachine()?.let { RemoteEditorReview.open(project, it, session, edit = id); return }
                 val rec = StoreReader.findRecord(session, id) ?: return
                 Navigate.openFileAtEdit(project, session, rec)
             }
@@ -158,6 +160,7 @@ class ActionsPanel(private val project: Project) : SimpleToolWindowPanel(true, t
      *  audit sections: the writes that left the workspace and the Egress destinations. The fleet/subagent
      *  categories are already dropped in core — the panel only paints. */
     private fun repaintActions() {
+        border = ObservatoryService.getInstance(project).currentMachine()?.let { javax.swing.BorderFactory.createTitledBorder("On $it") } ?: com.intellij.util.ui.JBUI.Borders.empty()
         actionsRoot.removeAllChildren()
         // Conflicts lead — they need eyes NOW (unlike the calm categories below, they start expanded).
         val cols = collisions

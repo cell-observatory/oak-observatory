@@ -1,5 +1,6 @@
 package com.cellobservatory.observatory.ui
 
+import com.cellobservatory.observatory.model.ActiveWorker
 import com.cellobservatory.observatory.model.SessionRow
 import org.junit.Assert.*
 import org.junit.Test
@@ -27,5 +28,13 @@ class ChangeMapPanelSessionsTest {
         assertEquals(1, groups.first().hidden)
         assertEquals(3, groups.first().count)
         assertEquals("live", groups.last().recent.single().id)
+    }
+
+    @Test fun `active filter keeps a quiet session whose workers are at it, not one whose workers finished`() {
+        val busy = row("busy", "~/app", 9).copy(activeWorkers = listOf(ActiveWorker("a1", "Review", "awaiting-permission")))
+        val done = row("done", "~/app", 2).copy(activeWorkers = listOf(ActiveWorker("a2", "Finished", "done")))
+        val groups = overviewSessionGroups(listOf(busy, done), null, now, true)
+        assertEquals(listOf("busy"), groups.single().recent.map { it.id })
+        assertEquals(1, groups.single().hidden)
     }
 }

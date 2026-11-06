@@ -131,7 +131,7 @@ test('native keys: lone escape flushes; unrelated control after it remains a sep
   assert.deepEqual(input.push(Buffer.from('\x01n')).map(p => p.events[0].key), ['escape', 'a', 'n']);
 });
 
-test('built CLI PTY: CSI-u leader quit restores the host keyboard mode', { timeout: 25000 }, t => require('./fixtures/herdr-pty-probe.cjs')(t, 'leader-quit'));
+test("built CLI PTY: CSI-u herdr prefix then quit restores the host keyboard mode", { timeout: 25000 }, t => require('./fixtures/herdr-pty-probe.cjs')(t, 'prefix-quit'));
 
 test('native input frames ESC plus a WHOLE code point, at every read boundary', () => {
   const { createDecoder } = require('../dist/input');

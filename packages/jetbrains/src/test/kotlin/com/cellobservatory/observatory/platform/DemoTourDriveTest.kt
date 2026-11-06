@@ -4,7 +4,6 @@ import com.cellobservatory.observatory.core.ObservatoryCli
 import com.cellobservatory.observatory.services.ObservatoryService
 import com.cellobservatory.observatory.ui.tour.TourController
 import com.intellij.openapi.application.ApplicationManager
-import com.intellij.testFramework.fixtures.BasePlatformTestCase
 import java.io.File
 
 /**
@@ -16,7 +15,7 @@ import java.io.File
  * PATH, because that is an environment fact, not a defect — but it says so loudly rather than passing
  * silently, since a test that quietly tests nothing is worse than no test.
  */
-class DemoTourDriveTest : BasePlatformTestCase() {
+class DemoTourDriveTest : ObservatoryPlatformTestCase() {
 
     private lateinit var home: File
     private lateinit var work: File

@@ -111,7 +111,12 @@ export const CODEX_MODEL_MARKER = '# added by oak init; oak uninstall removes it
  */
 export function rewireCodexConfigText(text: string, model: string, marker = ''): string {
   const tail = marker ? ` ${marker}` : '';
-  const lines = text.length ? text.split('\n') : [];
+  // A byte order mark that opens the file stays first: Codex refuses a config.toml that holds one
+  // anywhere else, and keys spliced in before a first table, or a rewritten first line, would move or
+  // drop it.
+  const bom = text.startsWith('\uFEFF') ? '\uFEFF' : '';
+  const body = text.slice(bom.length);
+  const lines = body.length ? body.split('\n') : [];
   let inTable = false;
   let sawModel = false;
   let sawProvider = false;
@@ -138,7 +143,7 @@ export function rewireCodexConfigText(text: string, model: string, marker = ''):
     const at = firstTable === -1 ? out.length : firstTable;
     out.splice(at, 0, ...missing);
   }
-  return oneFinalNewline(out.join('\n'));
+  return bom + oneFinalNewline(out.join('\n'));
 }
 
 /** `text` ending in exactly one newline. A loop: `.replace(/\n*$/, '\n')` retried the end-of-text
@@ -192,7 +197,8 @@ export function unwireCodexModel(): string | null {
   let inTable = false;
   let removed = false;
   let model: string | null = null;
-  const kept = text.split('\n').filter((line) => {
+  const bom = text.startsWith('\uFEFF') ? '\uFEFF' : ''; // stays first, as the wiring left it
+  const kept = text.slice(bom.length).split('\n').filter((line) => {
     if (/^\s*\[/.test(line)) inTable = true;
     if (inTable || !line.endsWith(` ${CODEX_MODEL_MARKER}`)) return true;
     model = /^\s*model\s*=\s*"([^"]*)"/.exec(line)?.[1] ?? model;
@@ -201,6 +207,6 @@ export function unwireCodexModel(): string | null {
   });
   if (!removed) return null;
   // Trailing blank lines collapse to one newline, as the wiring wrote the file.
-  fs.writeFileSync(p, oneFinalNewline(kept.join('\n')));
+  fs.writeFileSync(p, bom + oneFinalNewline(kept.join('\n')));
   return model ?? 'ollama';
 }

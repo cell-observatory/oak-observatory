@@ -48,6 +48,8 @@ const review = (session, file) => ({
 
 let state, lastFrame;
 const requests = [], mutations = [], runs = [], runMachines = [], swept = [], commented = [];
+/** What `ignore --dry-run` answers on a saved machine; `refresh-remote-old` swaps in an older build's answers. */
+let dryAnswer = JSON.stringify({ wouldDrop: 2 });
 // `launch-late-local*`: this machine's own listing is held back until the probe lets it through; `holdRemote`
 // holds a saved machine's review reads the same way.
 let holdLocal = check === 'launch-late-local' || check === 'launch-late-local-review';
@@ -81,7 +83,7 @@ backend.createBackend = () => {
         if (codexOnly) await new Promise(resolve => { answerListing = resolve; });
         return JSON.stringify({ active: null, ...localCatalog });
       }
-      return args[0] === 'views' ? JSON.stringify({ sessions: localCatalog }) : args[0] === 'ignore' ? JSON.stringify({ droppedNow: 2 }) : ''; },
+      return args[0] === 'views' ? JSON.stringify({ sessions: localCatalog }) : args[0] === 'ignore' ? (args.includes('--dry-run') ? dryAnswer : JSON.stringify({ droppedNow: 2 })) : ''; },
   };
 };
 const catalogs = { 'build-box': buildCatalog };
@@ -94,12 +96,21 @@ let answerBuild = () => { throw new Error('build-box was never asked'); };
 const spawned = [];
 /** This machine's newest session, as the launch default and the newer-session hint read it. */
 let defaultSession = noLocal ? null : 'local-a';
-const core = { ...realCore,
+/** The machine's newest session as the local index names it (undefined: no index here, so the walk answers), and how many
+ *  times the walk (defaultTuiSession) was asked. */
+let indexNewest;
+let walked = 0;
+const core = { ...realCore, takeAgentSetupNotice: () => null,
   readPrefs: () => ({ color: 'none', glyphs: 'ascii', layout: { active: ['pin', 'cursor', 'launch-newest', 'launch-late-local', 'launch-no-local', 'launch-r-key', 'launch-mouse-switch', 'launch-resolve-remote', 'launch-enter-quiet', 'launch-feed-quiet', 'launch-local-newest', 'launch-codex-only', 'launch-listing-fails'].includes(check) ? 'observatory' : 'review' } }), writePrefs() {},
   findHerdrBin: () => '/fake/herdr', ensureHerdrTabs: undefined, resolveMonitor: () => null,
-  sessionWorkspace: () => null, defaultTuiSession: () => defaultSession, startAgentSession() { throw Error('no agents in this probe'); },
-  deleteSession: (id) => deleted.push(id), dropIgnored: (id) => { swept.push(id); return { dropped: 0, files: [] }; },
-  addComment: (session, o) => { commented.push({ session, ...o }); return { id: 'c1' }; }, pendingCommentCount: () => 1,
+  sessionWorkspace: () => null, defaultTuiSession: () => { walked++; return defaultSession; }, indexedNewestSession: () => indexNewest,
+  startAgentSession() { throw Error('no agents in this probe'); },
+  deleteSession: (id) => deleted.push(id), dropIgnored: (id) => { swept.push(id); return { dropped: 0, files: [] }; }, countIgnored: () => 1,
+  addComment: (session, o) => {
+    if (o.text === 'cannot be saved') throw new Error(`the review comments of session ${session} could not be saved: ENOSPC: no space left on device`);
+    commented.push({ session, ...o });
+    return { id: 'c1' };
+  }, pendingCommentCount: () => 1,
   connectDaemon: async () => null, ensureDaemon: async () => ({ client: null, why: 'disabled in probe' }),
   dueRemoteUsageGather: () => false, dueAccountUsagePull: () => false, kickMonthRefresh() {}, usageLine: () => null, usageBrief: () => null,
   siblingOverviewCached: () => null, subagentDigests: () => [], detectEditors: () => [],
@@ -160,10 +171,12 @@ const lastRequest = () => requests[requests.length - 1];
   const launch = check === 'launch' ? { session: 'remote-quiet', elsewhere: true } : check === 'first-run-root' || noLocal ? '' : 'local-a';
   // `launch-*` names neither a session nor a workspace, and runs outside any repo (the probe's own home).
   // `first-run-root`: `oak tui --root <dir>` whose launch resolved no session, while that workspace has one.
-  if (check.startsWith('launch-')) process.chdir(home);
+  // `hint-index` too: the machine's newest session is asked only outside any workspace.
+  if (check.startsWith('launch-') || check === 'hint-index') process.chdir(home);
   // `hint-legacy-pin`: the session is pinned by the legacy variable alone, not by --session.
   if (check === 'hint-legacy-pin') process.env.CLAUDE_CHANGES_SESSION = 'local-a';
-  tui.runTui(core, check.startsWith('launch-') || check.startsWith('hint-') ? ['--no-server'] : check === 'first-run-root' ? ['--root', home, '--no-server']
+  // `hint-inline-pin`: the session is pinned by `--session=<id>`.
+  tui.runTui(core, check === 'hint-inline-pin' ? ['--session=local-a', '--no-server'] : check.startsWith('launch-') || check.startsWith('hint-') ? ['--no-server'] : check === 'first-run-root' ? ['--root', home, '--no-server']
     : ['--session', typeof launch === 'string' ? launch : launch.session, '--no-server'], () => launch);
   if (check === 'launch') {
     // Before any saved machine has answered, nothing is read from this machine's store for it.
@@ -251,20 +264,20 @@ const lastRequest = () => requests[requests.length - 1];
     // A session on build-box, pinned in the Observatory, is the one Review shows — read there.
     await click('Remote live');
     assert.equal(state.observatory.details['obs-detail']?.selection.session, 'remote-live');
-    await key('\x01' + '3');
+    await key('\x1b3');
     assert.equal(tab(), 'review');
     assert.equal(state.session, 'remote-live');
     assert.deepEqual([lastRequest().session, lastRequest().machine], ['remote-live', 'build-box']);
     await wait();
     assert.match(text(), /on build-box/);
     // …and a session on this machine, pinned, is read here.
-    await key('\x01' + '2');
+    await key('\x1b2');
     await click('Local work');
-    await key('\x01' + '3');
+    await key('\x1b3');
     assert.equal(state.session, 'local-a');
     assert.deepEqual([lastRequest().session, lastRequest().machine], ['local-a', undefined]);
     // The find palette offers every saved machine's sessions too, and opens one where it lives.
-    await key('\x0f'); await key('Remote quiet');
+    await key(':'); await key('Remote quiet');
     assert.ok(state.overlay.lines.some(l => /session\s+Remote quiet\s.*build-box/.test(l.replace(/\x1b\[[0-9;]*m/g, ''))), state.overlay.lines.join('\n'));
     await key('\r');
     assert.deepEqual([state.session, lastRequest().session, lastRequest().machine], ['remote-quiet', 'remote-quiet', 'build-box']);
@@ -274,21 +287,27 @@ const lastRequest = () => requests[requests.length - 1];
     await key('\x1b[B'); await key('\x1b[B');
     assert.equal(state.scopeWorker?.session, 'remote-live', text());
     assert.equal(state.observatory.details['obs-detail'], undefined, 'previewed, not pinned');
-    await key('\x01' + '3');
+    await key('\x1b3');
     assert.equal(tab(), 'review');
     assert.equal(state.session, 'remote-live');
     assert.deepEqual([lastRequest().session, lastRequest().machine], ['remote-live', 'build-box']);
     await wait();
     assert.match(text(), /Remote live  remote-l  on build-box/);
     // Back on this machine's row: read here again.
-    await key('\x01' + '2'); await key('\x1b[A'); await key('\x01' + '3');
+    await key('\x1b2'); await key('\x1b[A'); await key('\x1b3');
     assert.equal(state.session, 'local-a');
     assert.deepEqual([lastRequest().session, lastRequest().machine], ['local-a', undefined]);
   } else if (check === 'launch-newest') {
     // No session named, outside any repo: once build-box answers, Review is on its newer session.
     assert.equal(tab(), 'observatory');
     assert.match(state.status, /Review is on Remote live on build-box, active more recently/);
-    await key('\x01' + '3');
+    // `:ignore` here counts in the session Review moved to, on its machine, not in the launch session.
+    assert.equal(state.session, 'local-a');
+    await key(':ignore\r'); await wait();
+    const dry = runs.findIndex(a => a[0] === 'ignore');
+    assert.deepEqual([runs[dry], runMachines[dry]], [['ignore', '--dry-run', '--session', 'remote-live', '--json'], 'build-box']);
+    await key('n'); await wait();
+    await key('\x1b3');
     assert.equal(state.session, 'remote-live');
     assert.deepEqual([lastRequest().session, lastRequest().machine], ['remote-live', 'build-box']);
     // The launch session is no newcomer: the hint stays quiet after Review moved off it… Each step is one
@@ -296,12 +315,12 @@ const lastRequest = () => requests[requests.length - 1];
     const real = Date.now;
     let skew = 31_000;
     Date.now = () => real() + skew;
-    await key('\x01' + '2'); await wait();
+    await key('\x1b2'); await wait();
     assert.doesNotMatch(state.status, /a newer session is live/);
     // …and still names one that starts later (the same step, so the check above did run).
     defaultSession = 'local-new';
     skew = 62_000;
-    await key('\x01' + '3'); await wait();
+    await key('\x1b3'); await wait();
     assert.match(state.status, /a newer session is live — press b to switch/);
   } else if (check === 'launch-late-local') {
     // build-box answered first: nothing is decided until this machine's own listing, the bar, is read…
@@ -349,7 +368,7 @@ const lastRequest = () => requests[requests.length - 1];
     // Leaving Review before build-box answers is not acting in it: build-box's answer still moves it.
     assert.equal(tab(), 'review');
     assert.equal(state.tabs.find(t => t.id === 'review').session, 'local-a');
-    await key('\x01' + '2');
+    await key('\x1b2');
     assert.equal(tab(), 'observatory');
     answerBuild();
     await wait();
@@ -357,18 +376,19 @@ const lastRequest = () => requests[requests.length - 1];
   } else if (check === 'promptscope-switch') {
     // A prompt's scope names edits of the session it was chosen in: a switch drops it, the Observatory's
     // cursor included (the new session's Traces read "nothing yet").
-    await key('\x1bOQ'); await wait();
+    await key('\x1bOS'); await wait();
     await key('\r'); await wait();
     assert.ok(state.promptScope, 'control: a prompt scope is set');
-    await key('\x01' + '2'); await key('\x1b[B'); await key('\x1b[B'); await key('\x01' + '3'); await wait();
+    await key('\x1b2'); await key('\x1b[B'); await key('\x1b[B'); await key('\x1b3'); await wait();
     assert.equal(state.session, 'remote-live');
     assert.equal(state.promptScope, null);
   } else if (check === 'launch-r-key') {
-    // The launch rule moved Review off this machine's session while the Observatory was up; `r` with nothing
-    // selected opens Review on the session it moved to, read there (it reopened the launch session).
+    // The launch rule moved Review off this machine's session while the Observatory was up; the palette's
+    // "Review this session" with nothing selected opens Review on the session it moved to, read there (the
+    // Observatory's `r`, before 0.11.0, reopened the launch session).
     assert.equal(state.tabs.find(t => t.id === 'review').session, 'remote-live');
     assert.equal(state.scopeWorker, null, 'control: nothing is selected');
-    await key('r'); await wait();
+    await key(':'); await key('Review this session'); await key('\r'); await wait();
     assert.equal(tab(), 'review');
     assert.deepEqual([state.session, lastRequest().session, lastRequest().machine], ['remote-live', 'remote-live', 'build-box']);
   } else if (check === 'launch-local-newest') {
@@ -376,17 +396,17 @@ const lastRequest = () => requests[requests.length - 1];
     // the one Review opens on, read here; build-box's newer-than-the-default session does not win.
     assert.equal(state.tabs.find(t => t.id === 'review').session, 'local-codex');
     assert.match(state.status, /^Review is on Local codex, active more recently$/);
-    await key('\x01' + '3'); await wait();
+    await key('\x1b3'); await wait();
     assert.deepEqual([state.session, lastRequest().session, lastRequest().machine], ['local-codex', 'local-codex', undefined]);
   } else if (check === 'launch-resolve-remote') {
-    // With nothing selected, `a` and `x` act on the session Review is on, which the rule put on build-box:
+    // With nothing selected, `R` and `X` act on the session Review is on, which the rule put on build-box:
     // the confirmation names the machine, and an agent there is stopped there.
     assert.equal(state.tabs.find(t => t.id === 'review').session, 'remote-live');
-    await key('a');
+    await key('R');
     assert.match(state.confirm?.label ?? '', /accept every pending edit in .* on build-box and clear its store/);
     await key('n');
     assert.equal(state.confirm, null);
-    await key('x');
+    await key('X');
     assert.equal(state.confirm, null, 'nothing to confirm: this machine cannot stop it');
     assert.match(state.status, /runs on build-box: stop its agent there/);
   } else if (check === 'launch-enter-quiet' || check === 'launch-feed-quiet') {
@@ -422,7 +442,7 @@ const lastRequest = () => requests[requests.length - 1];
     answerListing(); await wait();
     assert.equal(state.tabs.find(t => t.id === 'review').session, 'local-codex');
     assert.match(state.status, /^Review is on Local codex, active more recently$/);
-    await key('\x01' + '3'); await wait();
+    await key('\x1b3'); await wait();
     assert.deepEqual([state.session, lastRequest().session, lastRequest().machine], ['local-codex', 'local-codex', undefined]);
   } else if (check === 'launch-listing-fails') {
     // This machine's listing failed: the rule still decides, on the saved machines' sessions.
@@ -446,11 +466,11 @@ const lastRequest = () => requests[requests.length - 1];
     let skew = 31_000;
     Date.now = () => real() + skew;
     defaultSession = id;
-    await key('\x01' + '2'); await wait();
+    await key('\x1b2'); await wait();
     assert.doesNotMatch(state.status ?? '', /a newer session is live/);
     fs.appendFileSync(file, line({ timestamp: new Date(real()).toISOString(), type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'And the index.' }] } }));
     skew = 62_000;
-    await key('\x01' + '3'); await wait();
+    await key('\x1b3'); await wait();
     assert.match(state.status, /a newer session is live — press b to switch/);
   } else if (check === 'hint-resumed') {
     // A session that only reopened after launch (herdr restoring its pane runs `claude --resume`) is newest by
@@ -467,18 +487,34 @@ const lastRequest = () => requests[requests.length - 1];
     let skew = 31_000;
     Date.now = () => real() + skew;
     defaultSession = 'local-resumed';
-    await key('\x01' + '2'); await wait();
+    await key('\x1b2'); await wait();
     assert.doesNotMatch(state.status ?? '', /a newer session is live/);
     fs.appendFileSync(file, line({ type: 'user', timestamp: new Date(real()).toISOString(), message: { role: 'user', content: 'And the index.' } }));
     skew = 62_000;
-    await key('\x01' + '3'); await wait();
+    await key('\x1b3'); await wait();
     assert.match(state.status, /a newer session is live — press b to switch/);
-  } else if (check === 'hint-legacy-pin') {
-    // The legacy session variable pins the session as --session does, so no newcomer is hinted at.
+  } else if (check === 'hint-index') {
+    // Outside any workspace the machine's newest session comes from the local index: the walk of every transcript is not
+    // asked for it.
+    const project = path.join(home, '.claude', 'projects', '-probe-work');
+    fs.mkdirSync(project, { recursive: true });
+    const file = path.join(project, 'local-indexed.jsonl');
+    const line = (o) => JSON.stringify({ sessionId: 'local-indexed', cwd: '/probe/work', ...o }) + '\n';
+    fs.writeFileSync(file, line({ type: 'user', timestamp: new Date().toISOString(), message: { role: 'user', content: 'Start here.' } }));
+    const real = Date.now;
+    Date.now = () => real() + 31_000;
+    indexNewest = 'local-indexed';
+    defaultSession = 'local-walked';
+    const before = walked;
+    await key('\x1b2'); await wait();
+    assert.match(state.status, /a newer session is live — press b to switch/);
+    assert.equal(walked, before, 'the index answered: no walk');
+  } else if (check === 'hint-legacy-pin' || check === 'hint-inline-pin') {
+    // The legacy session variable, or `--session=<id>`, pins the session as --session does, so no newcomer is hinted at.
     const real = Date.now;
     Date.now = () => real() + 31_000;
     defaultSession = 'local-new';
-    await key('\x01' + '2'); await wait();
+    await key('\x1b2'); await wait();
     assert.doesNotMatch(state.status ?? '', /a newer session is live/);
   } else if (check === 'first-run-root') {
     // The first read adopts the workspace's session instead of crashing the app at startup.
@@ -490,7 +526,7 @@ const lastRequest = () => requests[requests.length - 1];
     // (`:comment 3 tests fail` became "tests fail" on line 3, and line 9999 of a short edit was taken).
     await wait(300);
     // Pick the edit (Traces, then a cursor move): its diff is fetched and shown.
-    await key('\x1bOR'); await key('\x1b[B'); await key('\x1b[A'); await wait(300);
+    await key('\x1b[15~'); await key('\x1b[B'); await key('\x1b[A'); await wait(300);
     assert.equal(state.diffMeta?.id, 7, 'control: the edit\'s diff is shown');
     await key(':comment 12: guard the empty case\r');
     assert.deepEqual(commented.at(-1), { session: 'local-a', unit: 7, line: 12, text: 'guard the empty case' });
@@ -503,9 +539,14 @@ const lastRequest = () => requests[requests.length - 1];
     assert.equal(state.status, 'line 9999 is not in this edit\'s diff, which shows lines 10–13');
     await key(':comment the whole edit\r');
     assert.deepEqual(commented.at(-1), { session: 'local-a', unit: 7, line: 0, text: 'the whole edit' }, 'no number: the whole edit');
+    // A comment the store cannot save is said in the status line, never reported as added (the CLI exits 1).
+    const saved = commented.length;
+    await key(':comment cannot be saved\r');
+    assert.equal(commented.length, saved, 'control: the store refused it');
+    assert.equal(state.status, 'the comment was not saved: the review comments of session local-a could not be saved: ENOSPC: no space left on device');
     // A session on another machine: the same anchor, written there by its own oak.
     await key('b'); await key('Remote quiet'); await key('\r'); await wait(300);
-    await key('\x1bOR'); await key('\x1b[B'); await key('\x1b[A'); await wait(300);
+    await key('\x1b[15~'); await key('\x1b[B'); await key('\x1b[A'); await wait(300);
     await key(':comment 13: there too\r'); await wait();
     assert.deepEqual(runs.find(a => a[0] === 'comment'), ['comment', 'add', '--session', 'remote-quiet', '--edit', '7', '--line', '13', '--text=there too', '--json']);
   } else if (check === 'refresh-remote') {
@@ -513,14 +554,68 @@ const lastRequest = () => requests[requests.length - 1];
     await key('b'); await key('Remote quiet'); await key('\r'); await wait();
     assert.equal(state.session, 'remote-quiet');
     await key('r'); await wait();
-    const at = runs.findIndex(a => a[0] === 'ignore');
+    // It counts there first, and asks with that count before dropping anything.
+    const dry = runs.findIndex(a => a[0] === 'ignore');
+    assert.deepEqual([runs[dry], runMachines[dry]], [['ignore', '--dry-run', '--session', 'remote-quiet', '--json'], 'build-box']);
+    assert.match(state.confirm?.label ?? '', /drop the 2 recorded edits/);
+    await key('y'); await wait();
+    const at = runs.findIndex(a => a[0] === 'ignore' && !a.includes('--dry-run'));
     assert.deepEqual([runs[at], runMachines[at]], [['ignore', '--session', 'remote-quiet', '--json'], 'build-box']);
     assert.deepEqual(swept, [], 'nothing is swept on this machine for it');
     assert.match(state.status, /dropped 2 now-ignored edits/);
     // Control: this machine's session is swept here, as before.
     await key('b'); await key('Local work'); await key('\r'); await wait();
     await key('r'); await wait();
+    assert.match(state.confirm?.label ?? '', /drop the 1 recorded edit /);
+    await key('y'); await wait();
     assert.deepEqual(swept, ['local-a']);
+  } else if (check === 'refresh-remote-old') {
+    // An older OAK there answers a --dry-run with no count: as 0.10 does, having swept (the CLI's protocol
+    // check now stops that), or with the CLI's refusal. Neither is 0 — nothing is confirmed or run after it.
+    await key('b'); await key('Remote quiet'); await key('\r'); await wait();
+    for (const [answer, said] of [[JSON.stringify({ session: 'remote-quiet', droppedNow: 2 }), /on build-box: update OAK on build-box · /],
+      ['oak: update OAK on build-box — this build does not support the requested review protocol', /on build-box: update OAK on build-box — this build does not support/]]) {
+      dryAnswer = answer;
+      const from = runs.length;
+      await key('r'); await wait();
+      assert.ok(!state.confirm, 'no confirm without a count');
+      assert.deepEqual(runs.slice(from).filter(a => a[0] === 'ignore'), [['ignore', '--dry-run', '--session', 'remote-quiet', '--json']]);
+      assert.match(state.status, said);
+      assert.match(state.status, /refreshed without dropping/);
+    }
+    assert.deepEqual(swept, []);
+  } else if (check === 'palette-ignore') {
+    // `:ignore` is the refresh's sweep on the REVIEWED session, where its store is, counted and confirmed
+    // first. It ran the bare verb: an unconfirmed sweep of the launch directory's session, on this machine.
+    await key('b'); await key('Remote quiet'); await key('\r'); await wait();
+    await key(':ignore\r'); await wait();
+    const dry = runs.findIndex(a => a[0] === 'ignore');
+    assert.deepEqual([runs[dry], runMachines[dry]], [['ignore', '--dry-run', '--session', 'remote-quiet', '--json'], 'build-box']);
+    assert.match(state.confirm?.label ?? '', /drop the 2 recorded edits/);
+    await key('n'); await wait();
+    await key('b'); await key('Local work'); await key('\r'); await wait();
+    await key(':ignore\r'); await wait();
+    assert.match(state.confirm?.label ?? '', /drop the 1 recorded edit /);
+    await key('n'); await wait();
+    assert.deepEqual(runs.filter(a => a[0] === 'ignore' && !a.includes('--dry-run')), [], 'nothing swept on a remote');
+    assert.deepEqual(swept, [], 'nor here: n drops nothing');
+    // From the Observatory it is still the session Review shows, where its store is, and the confirm names it.
+    await key('b'); await key('Remote quiet'); await key('\r'); await wait();
+    await key('\x1b2');
+    assert.equal(tab(), 'observatory');
+    const from = runs.length;
+    await key(':ignore\r'); await wait();
+    const there = runs.findIndex((a, i) => i >= from && a[0] === 'ignore');
+    assert.deepEqual([runs[there], runMachines[there]], [['ignore', '--dry-run', '--session', 'remote-quiet', '--json'], 'build-box']);
+    assert.match(state.confirm?.label ?? '', /drop the 2 recorded edits in remote-q on build-box that /);
+    await key('n'); await wait();
+    // The Observatory's cursor moves Review off the session last shown there, and `:ignore` follows it.
+    await key('\x1b[B'); await wait();
+    assert.deepEqual([state.tabs.find(t => t.id === 'review').session, state.session], ['local-a', 'remote-quiet']);
+    await key(':ignore\r'); await wait();
+    assert.match(state.confirm?.label ?? '', /drop the 1 recorded edit in local-a that /);
+    await key('n'); await wait();
+    assert.deepEqual(runs.slice(from).filter(a => a[0] === 'ignore'), [['ignore', '--dry-run', '--session', 'remote-quiet', '--json']], 'counted here');
   } else if (check === 'switch-forgets') {
     // A selection is the session's it was made in: marks and the shown diff made on one session must not
     // follow a switch to another on the same machine, where `u` would revert whatever has that id there.

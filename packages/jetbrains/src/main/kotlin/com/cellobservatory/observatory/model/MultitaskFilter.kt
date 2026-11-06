@@ -16,7 +16,8 @@ object MultitaskFilter {
         phase == "working" || phase == "awaiting-input" || phase == "awaiting-permission"
 
     fun agentActive(a: RunningAgent): Boolean =
-        isActivePhase(a.phase) || a.subagents.any { isActivePhase(it.phase) }
+        if (a.state != null) a.state in setOf("queued", "working", "waiting", "blocked")
+        else isActivePhase(a.phase) || a.subagents.any { isActivePhase(it.phase) }
 
     fun workflowActive(w: WorkflowRun): Boolean = w.running
 
@@ -24,7 +25,7 @@ object MultitaskFilter {
     fun showAgent(a: RunningAgent, activeOnly: Boolean, dismissed: Set<String>): Boolean {
         val active = agentActive(a)
         if (activeOnly && !active) return false
-        return active || a.session !in dismissed
+        return active || a.key !in dismissed
     }
 
     fun showWorkflow(w: WorkflowRun, activeOnly: Boolean, dismissed: Set<String>): Boolean {
@@ -35,7 +36,7 @@ object MultitaskFilter {
     /** Dismissed-and-still-inactive items — feeds the "N hidden · show all" affordance. */
     fun hiddenCount(res: MultitaskResult?, dismissedAgents: Set<String>, dismissedWorkflows: Set<String>): Int {
         res ?: return 0
-        return res.agents.count { it.session in dismissedAgents && !agentActive(it) } +
+        return res.agents.count { it.key in dismissedAgents && !agentActive(it) } +
             res.workflows.count { it.id in dismissedWorkflows && !it.running }
     }
 }

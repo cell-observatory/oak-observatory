@@ -7,9 +7,14 @@
  * and nothing in this repo measured properly before — the only wrapper (`wrapText` in the CLI) counts
  * characters, which is fine for the plain ASCII it was written for and wrong for a dashboard.
  *
- * Zero imports on purpose: this is a leaf primitive, used by the pure frame renderer, which must stay
- * testable without a terminal.
+ * Two imports, core's rule for where a character ends and its class of hidden characters, each from a module of no
+ * imports: this is a leaf primitive, used by the pure frame renderer, which must stay testable without a terminal.
+ * Every cut here ends where a character does, so a family emoji, a flag, a skin tone or a letter with its accent is
+ * kept whole or left out whole.
  */
+
+import { graphemeEnd } from '@oak-observatory/core/dist/graphemes';
+import { HIDDEN_SOURCE } from '@oak-observatory/core/dist/hidden';
 
 /** SGR — the colour/attribute escapes (`ESC [ … m`). The one class safe to keep inside a frame,
  *  because it moves no cursor and erases nothing. */
@@ -23,6 +28,23 @@ const SGR = /\x1b\[[0-9;:]*m/g;
 const NON_SGR =
   // eslint-disable-next-line no-control-regex
   /\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|\x1b[PX^_][^\x1b]*(?:\x1b\\)?|\x1b\[[0-9;:?<>!]*[A-Za-ln-z@`{|}~]|\x1b[()][\x20-\x7e]|\x1b[@-Z\\-_]/g;
+
+/** What a terminal draws as nothing that still acts on the text around it, dropped from untrusted cell text: the
+ *  bidirectional controls, which reorder the text after them (the rest of the row included) in a terminal that lays
+ *  out right-to-left text (U+061C, U+200E, U+200F, U+202A-U+202E, U+2066-U+2069), the zero-width characters that
+ *  only hide in it (U+200B, U+FEFF, U+2060-U+2064, U+206A-U+206F), the line and paragraph separators (U+2028,
+ *  U+2029), the soft hyphen and the Khmer inherent vowels (U+00AD, U+17B4, U+17B5), the Hangul fillers (U+115F,
+ *  U+1160, U+3164, U+FFA0), drawn as a blank, and the tag characters outside England's,
+ *  Scotland's and Wales's flags (U+E0001, U+E0020-U+E007F), which spell out text no one sees: core's hidden.ts.
+ *  `charWidth` gave most of them a column the terminal does not draw. The zero-width joiner (U+200D) and non-joiner
+ *  (U+200C) stay: an emoji family, a flag or an Indic letter is built with the one, and Persian and Indic words are
+ *  written with the other (a file name with it, printed without it, names no file); neither reorders anything, and
+ *  neither measures anything. The combining grapheme joiner, the Mongolian vowel separator and the variation selectors
+ *  stay too. Core's plainLabel drops the same set from a saved machine's label. A file's text is not a cell's: the
+ *  diff shows each of them as a mark that names it, a joiner, a vowel separator or a variation selector with only
+ *  ASCII text beside it too, and a variation selector after another one (richdiff.ts, core's revealHidden), because a
+ *  line of code that hides one runs differently from how it reads. */
+const HIDDEN = new RegExp(HIDDEN_SOURCE, 'gu');
 
 /** Remove SGR sequences, leaving the visible characters. */
 export function stripSgr(s: string): string {
@@ -41,7 +63,8 @@ export function stripSgr(s: string): string {
  *
  * C0 controls (including CR, which would return the cursor to column 0 mid-row) become spaces rather
  * than vanishing, so a value's visible width never silently shrinks; TAB is included, because its width
- * depends on the terminal's tab stops and is therefore unmeasurable here.
+ * depends on the terminal's tab stops and is therefore unmeasurable here. Bidirectional controls and
+ * zero-width characters (HIDDEN) are dropped: they have no width to keep.
  */
 export function sanitizeCell(s: string): string {
   // Split on SGR (the capturing group puts the matches at odd indices) so colour survives verbatim
@@ -54,8 +77,17 @@ export function sanitizeCell(s: string): string {
       i % 2 === 1
         ? part
         : // eslint-disable-next-line no-control-regex
-          part.replace(NON_SGR, '').replace(/[\x00-\x1f\x7f-\x9f]/g, ' ')
+          part.replace(NON_SGR, '').replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').replace(HIDDEN, '')
     )
+    .join('');
+}
+
+/** `sanitizeCell` for text that keeps its lines: a line break (LF or CRLF) and a tab pass through, and
+ *  every other control goes as it does in a cell. The CLI's human output goes through this. */
+export function sanitizeText(s: string): string {
+  return s
+    .split(/(\r?\n|\t)/)
+    .map((part, i) => (i % 2 === 1 ? part : sanitizeCell(part)))
     .join('');
 }
 
@@ -70,7 +102,7 @@ export function sanitizeCell(s: string): string {
  * the safe direction — an over-narrow estimate can wrap a line, an over-wide one cannot.
  */
 function charWidth(cp: number): number {
-  if (cp === 0x200b || cp === 0x200d || cp === 0xfeff) return 0; // ZWSP / ZWJ / BOM
+  if (cp === 0x200b || cp === 0x200c || cp === 0x200d || cp === 0xfeff) return 0; // ZWSP / ZWNJ / ZWJ / BOM
   if (
     (cp >= 0x0300 && cp <= 0x036f) || // combining diacriticals
     (cp >= 0x0483 && cp <= 0x0489) ||
@@ -116,6 +148,17 @@ export function displayWidth(s: string): number {
   return w;
 }
 
+/** Columns the code points of `s` from `from` to `to` occupy: one character's, measured as displayWidth measures it. */
+function spanWidth(s: string, from: number, to: number): number {
+  let w = 0;
+  for (let k = from; k < to; ) {
+    const cp = s.codePointAt(k)!;
+    w += charWidth(cp);
+    k += cp > 0xffff ? 2 : 1;
+  }
+  return w;
+}
+
 /**
  * Pad or clip to exactly `cols` display columns.
  *
@@ -140,12 +183,16 @@ export function fitVisible(s: string, cols: number): string {
         continue;
       }
     }
-    const ch = String.fromCodePoint(s.codePointAt(i)!);
-    const cw = charWidth(ch.codePointAt(0)!);
-    if (w + cw > cols) break; // a wide char that would straddle the edge is dropped whole
-    out += ch;
+    // One UTF-16 unit that is not a control, a joiner or half of a pair, with nothing after it that could join it, is a
+    // character of its own (as graphemeEnd would say): most of every row, borders included, without the call.
+    const c = s.charCodeAt(i);
+    const single = (c >= 0xa0 ? c !== 0x200d && (c < 0xd800 || c > 0xdfff) : c >= 0x20 && c < 0x7f) && !(s.charCodeAt(i + 1) >= 0x300);
+    const end = single ? i + 1 : graphemeEnd(s, i);
+    const cw = single ? charWidth(c) : spanWidth(s, i, end);
+    if (w + cw > cols) break; // a character that would straddle the edge is dropped whole
+    out += single ? s[i] : s.slice(i, end);
     w += cw;
-    i += ch.length;
+    i = end;
   }
   if (sawSgr && !out.endsWith('\x1b[0m')) out += '\x1b[0m'; // only when something is still open
   return out + ' '.repeat(cols - w);
@@ -230,10 +277,10 @@ export function wrapVisible(s: string, cols: number): string[] {
           continue;
         }
       }
-      const ch = String.fromCodePoint(word.codePointAt(i)!);
-      const cw = charWidth(ch.codePointAt(0)!);
+      const end = graphemeEnd(word, i);
+      const cw = spanWidth(word, i, end);
       if (width && width + cw > cols) emit();
-      line += ch; width += cw; i += ch.length;
+      line += word.slice(i, end); width += cw; i = end;
     }
   }
   if (line || !lines.length) lines.push(line);
@@ -353,11 +400,13 @@ export function sliceVisible(s: string, from: number, width: number): string {
   if (width <= 0) return '';
   let col = 0;
   let out = '';
-  for (const ch of s) {
-    const w = displayWidth(ch);
+  for (let i = 0; i < s.length; ) {
+    const end = graphemeEnd(s, i);
+    const w = spanWidth(s, i, end);
     if (col + w > from + width) break;
-    if (col >= from) out += ch;
+    if (col >= from) out += s.slice(i, end);
     col += w;
+    i = end;
   }
   return out;
 }
@@ -374,7 +423,8 @@ export function reverseVisibleSpan(s: string, from: number, to: number, sgr?: st
   // (OSC 11) replaces reverse video where the caller has one — same run-length discipline.
   const OPEN = sgr ?? '\x1b[7m';
   const CLOSE = sgr ? '\x1b[0m' : '\x1b[27m';
-  const ESC = /\x1b\[[0-9;]*m/g;
+  // Colour in either form the frame passes (`;` or `:` between its numbers): the band covers the cells the copy takes.
+  const ESC = /\x1b\[[0-9;:]*m/g;
   const parts: { esc: boolean; text: string }[] = [];
   let at = 0;
   for (const m of s.matchAll(ESC)) {
@@ -396,8 +446,9 @@ export function reverseVisibleSpan(s: string, from: number, to: number, sgr?: st
       if (inRun) out += OPEN; // the embedded sequence may have reset attributes — reassert
       continue;
     }
-    for (const ch of p.text) {
-      const w = displayWidth(ch);
+    for (let i = 0; i < p.text.length; ) {
+      const end = graphemeEnd(p.text, i);
+      const w = spanWidth(p.text, i, end);
       const overlaps = col <= to && col + w - 1 >= from;
       if (overlaps && !inRun) {
         out += OPEN;
@@ -406,12 +457,19 @@ export function reverseVisibleSpan(s: string, from: number, to: number, sgr?: st
         out += CLOSE;
         inRun = false;
       }
-      out += ch;
+      out += p.text.slice(i, end);
       col += w;
+      i = end;
     }
   }
   if (inRun) out += CLOSE;
   return out;
+}
+
+/** A span's two ends in reading order, whichever way the drag went: ONE rule for the band, the kept selection and the
+ *  copy, which had three copies of it. */
+export function spanEnds<P extends { row: number; col: number }>(p: P, q: P): { a: P; b: P } {
+  return p.row < q.row || (p.row === q.row && p.col <= q.col) ? { a: p, b: q } : { a: q, b: p };
 }
 
 /** A pane's text columns, and the rows that say where their own text is (a boxed prompt's words sit
@@ -448,9 +506,7 @@ export function sliceSpan(
   release: { row: number; col: number },
   clip?: SpanClip
 ): string {
-  const fwd = anchor.row < release.row || (anchor.row === release.row && anchor.col <= release.col);
-  const a = fwd ? anchor : release;
-  const b = fwd ? release : anchor;
+  const { a, b } = spanEnds(anchor, release);
   const out: string[] = [];
   for (let r = Math.max(0, a.row); r <= b.row && r < lines.length; r++) {
     const cols = spanCols(r, a, b, clip);
@@ -462,14 +518,62 @@ export function sliceSpan(
     // `col >= from` slicing dropped exactly that glyph).
     let piece = '';
     let col = 0;
-    for (const ch of line) {
-      const w = displayWidth(ch);
+    // A character at a time, whole: a letter comes with its combining accents (`café` written with one copied as `cafe`),
+    // and an emoji sequence with every part, its joiners included, when any of its cells is in the span.
+    for (let i = 0; i < line.length; ) {
+      const end = graphemeEnd(line, i);
+      const w = spanWidth(line, i, end);
       if (col > to) break;
-      if (col + w - 1 >= from) piece += ch;
+      if (col + w - 1 >= from) piece += line.slice(i, end);
       col += w;
+      i = end;
     }
     out.push(piece.trimEnd());
   }
   if (clip) while (out.length > 1 && out[out.length - 1] === '') out.pop();
   return out.join('\n');
+}
+
+/**
+ * What a drag selects from the painted rows (`plain`, SGR already stripped): `sliceSpan`'s text, with the status row's
+ * rule. That row (`bottom.first`) cuts the status (`bottom.status`) at the terminal's edge rather than wrapping it, so a
+ * selection that starts in the status text the row shows and reaches the edge (`cols`), or runs on past the row, takes
+ * the whole status. The row shows all of the status, the part the edge left, or the part a toast beside it left, and
+ * none of it under a toast that covers the row: a selection that starts in a toast copies the toast as it is shown.
+ */
+export function selectedText(
+  plain: readonly string[],
+  a: { row: number; col: number },
+  b: { row: number; col: number },
+  clip: SpanClip | undefined,
+  bottom: { first: number; status: string } | null,
+  cols: number
+): string {
+  const ends = spanEnds(a, b);
+  const from = ends.a;
+  let to = ends.b;
+  const whole = bottom ? stripSgr(bottom.status).trimEnd() : '';
+  const shown = bottom ? plain[bottom.first] ?? '' : '';
+  let k = 0; // how much of the status the row shows
+  while (k < shown.length && k < whole.length && shown[k] === whole[k]) k++;
+  // The row shows some of the status and not all of it, and the selection covers the row from a cell of that text to
+  // the edge, or past the row.
+  const cut = !!bottom && k > 0 && k < whole.length && from.row <= bottom.first && bottom.first <= to.row
+    && (to.row > bottom.first || to.col >= cols - 1) && (from.row < bottom.first || from.col < displayWidth(whole.slice(0, k)));
+  if (!bottom || !cut) return sliceSpan(plain, from, to, clip);
+  const rows = [...plain];
+  rows[bottom.first] = whole;
+  if (to.row === bottom.first) to = { row: to.row, col: Number.MAX_SAFE_INTEGER };
+  return sliceSpan(rows, from, to, { x0: clip?.x0 ?? 0, x1: clip?.x1 ?? cols - 1, rows: new Map([[bottom.first, [0, Number.MAX_SAFE_INTEGER] as const]]) });
+}
+
+/** How many characters `text` holds as a reader counts them, with the word: `1 char`, `12 chars`. A letter and the
+ *  combining accents after it are one, and so are an emoji built from several (a flag, one with a skin tone, a family
+ *  joined by zero-width joiners) and a CRLF line break, by core's rule for where a character ends (graphemeEnd), which
+ *  every cut in this module keeps to; a copy's toast counted UTF-16 units, and said `1 chars`. Not Intl.Segmenter: it
+ *  ends the process (SIGSEGV) on a Node with no full ICU data (Fedora's and RHEL's without nodejs-full-i18n). */
+export function charCount(text: string): string {
+  let n = 0;
+  for (let i = 0; i < text.length; i = graphemeEnd(text, i)) n++;
+  return `${n} ${n === 1 ? 'char' : 'chars'}`;
 }

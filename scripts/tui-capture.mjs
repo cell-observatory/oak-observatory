@@ -7,19 +7,27 @@ const require = createRequire(import.meta.url);
 const core = require('../packages/core/dist');
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-export function validateFrame(frame, { conversation = false, herdr = false } = {}) {
+export function validateFrame(frame, { conversation = false, herdr = false, review = false } = {}) {
   const text = frame.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '');
   if (!text.trim() || /not reachable|could not launch|not installed|doctor --fix/i.test(text))
     throw new Error('TUI media has no healthy live frame; existing media was not replaced.');
   // CURRENCY, not only health. Every published TUI still showed the retired `[+]` tab a day after it
   // was removed, because nothing here asked WHICH product the frame came from. The three fixed tab
-  // names with no `[+]` cell are the cheapest fingerprint of the current bar.
-  if (!(/\bherdr\b/.test(text) && /\bobservatory\b/i.test(text) && /\breview\b/i.test(text)) || text.includes('[+]'))
-    throw new Error('TUI media shows a retired tab bar (missing a fixed tab name, or a [+] cell); existing media was not replaced.');
+  // names, each after its key (F1 to F3), with no `[+]` cell are the cheapest fingerprint of the current bar.
+  if (!(/\bF1 herdr\b/.test(text) && /\bF2 observatory\b/i.test(text) && /\bF3 review\b/i.test(text)) || text.includes('[+]'))
+    throw new Error('TUI media shows a retired tab bar (missing a fixed tab name or its key, or a [+] cell); existing media was not replaced.');
+  // The same for the keys: 0.11.0 retired the ctrl+a leader and moved reply from i to c, and a frame
+  // hinting either came from an older build.
+  if (/\bctrl\+a [a-z0-9]|\bi reply\b/.test(text))
+    throw new Error('TUI media shows retired keys (a ctrl+a leader or i reply); existing media was not replaced.');
+  // …and the keys a tab's row must name today (frame.ts OBS_HINTS, KEY_HINTS): the published demo went on
+  // showing an Observatory with no W window and a Review with no e/E · W, and nothing above objected.
+  if ((conversation && !/· W window ·/.test(text)) || (review && !/\be\/E( terminal editor)? · W\b/.test(text)))
+    throw new Error('TUI media shows an older key row (no W window on the Observatory, or no e/E · W on Review); existing media was not replaced.');
   if (conversation && (/Select a session|Enter pins this conversation|loading conversation|No conversation events yet/i.test(text)
     // The detail opens at the NEWEST event, so its header (`↗ herdr`) scrolls away in a long
-    // conversation; the pinned-detail hint line (`i reply`) is on every frame with a live pane.
-    || !text.includes('workstation') || !(text.includes('↗ herdr') || /\bi reply\b/.test(text))))
+    // conversation; the pinned-detail hint line (`c reply`) is on every frame with a live pane.
+    || !text.includes('workstation') || !(text.includes('↗ herdr') || /\bc reply\b/.test(text))))
     throw new Error('TUI media needs a pinned demo conversation; existing media was not replaced.');
   if (herdr && (/mouse-first|[↵⏎].*continue|integrations/i.test(text) || !text.includes('OAK demo · disposable session')))
     throw new Error('herdr media still shows onboarding or has no seeded pane; existing media was not replaced.');
@@ -53,7 +61,7 @@ export async function startCaptureServer(binary, home, cwd) {
     }
     if (!ready) throw lastError;
     const workspace = await core.herdrRequest('workspace.create', { cwd, label: 'OAK demo', focus: true });
-    const tab = await core.herdrRequest('tab.create', { cwd, label: 'Demo checks', focus: true, workspace_id: workspace.workspace.workspace_id });
+    const tab = await core.herdrRequest('tab.create', { cwd, focus: true, workspace_id: workspace.workspace.workspace_id });
     const panes = [workspace.root_pane.pane_id, tab.root_pane.pane_id];
     for (const pane_id of panes) {
       await core.herdrRequest('pane.send_text', { pane_id,
@@ -103,7 +111,8 @@ export async function startCaptureServer(binary, home, cwd) {
             // deleted from the hint line — so a perfectly healthy frame timed out for a day and the
             // message blamed the pane. Anything worded stays a moving target; the bar does not.
             const plain = frame.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '');
-            if (plain.includes('OAK demo · disposable session') && /\bherdr\b/.test(plain)) return validateFrame(frame, { herdr: true });
+            // The status line reads `starting…` until OAK's first read lands; a shot taken then shows no counts.
+            if (plain.includes('OAK demo · disposable session') && /\bherdr\b/.test(plain) && !plain.includes('starting…')) return validateFrame(frame, { herdr: true });
           }
           throw new Error('No herdr frame matched the capture gate (a seeded pane and the numbered tab bar) in 10s; existing media was not replaced.');
         } finally { try { child?.kill(); } catch {} term.dispose(); }

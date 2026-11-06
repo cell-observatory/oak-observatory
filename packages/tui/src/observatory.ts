@@ -1,6 +1,56 @@
 /** Snapshot identity and pinned conversations. No transport or filesystem work in this model. */
-import { isSafeSessionId, realSessionTitle, type ConversationEvent, type HerdrApi } from '@oak-observatory/core';
+import { backupFolderPath, herdrTabTitle, isSafeSessionId, paneAgentState, plainLabel, realSessionTitle, relTime, type ConversationEvent, type HerdrApi, type SyncStatusResult } from '@oak-observatory/core';
 import type { DashState } from './frame';
+
+/** One machine's line of oak sync's last run, as `oak sync status --json` gives it: `text` is what the CLI prints
+ *  after the machine's label (an older CLI leaves it out). */
+export type SyncLine = NonNullable<SyncStatusResult['last']>['machines'][number] & { text?: string };
+/** `oak sync status --json`. */
+export type SyncView = Omit<SyncStatusResult, 'last'> & { last: (Omit<NonNullable<SyncStatusResult['last']>, 'machines'> & { machines: SyncLine[] }) | null };
+
+/** oak sync is in use here: a run set it up, a backup is chosen, or a conflict is open. Its rows show only then, so
+ *  a machine that never chose to sync sees nothing of it. */
+export function syncInUse(v: SyncView | undefined): v is SyncView {
+  return !!v && (v.setUp || !!v.backup || v.conflicts.length > 0);
+}
+
+/** The backup folder's own line of the last run (`backup (<path>)`), while that folder is the backup: the line a run
+ *  left for a folder no longer chosen says nothing of the backup now, nor which record to take over. */
+export function syncBackupLine(v: SyncView): SyncLine | undefined {
+  const b = v.backup;
+  return b?.kind === 'folder' ? v.last?.machines.find((m) => m.label === `backup (${backupFolderPath(b.path)})`) : undefined;
+}
+
+/** What the last run did with one saved machine, by its label as the run names it, in the CLI's words, and whether that
+ *  was a failure (a machine left out on purpose is none); null when sync is not in use. */
+export function syncMachineText(v: SyncView | undefined, label: string, now: number): { text: string; failed: boolean } | null {
+  if (!syncInUse(v)) return null;
+  const line = v.last?.machines.find((m) => plainLabel(m.label) === plainLabel(label));
+  if (!line || !v.last) return { text: v.last ? `not asked in the last run (${relTime(v.last.at, now)})` : 'not asked yet', failed: false };
+  const text = line.text ?? line.detail ?? line.status;
+  if (line.status === 'ok' && !line.errors.length) return { text: `pulled ${text} at ${relTime(v.last.at, now)}`, failed: false };
+  return { text, failed: line.errors.length > 0 || !['ok', 'disabled', 'excluded', 'duplicate', 'shared'].includes(line.status) };
+}
+
+/** This machine's sync, in two lines: the last run (or the one running now) with the conflicts and warnings it left, and
+ *  the backup with its state: a folder's key, and the folder's own line when the run could not use it. */
+export function syncLocalText(v: SyncView, now: number): { run: string; backup: string } {
+  const n = (k: number, one: string): string => `${k} ${one}${k === 1 ? '' : 's'}`;
+  const run = [v.running ? 'running now' : v.last ? `last run ${relTime(v.last.at, now)} (${v.last.status})` : 'no run yet',
+    ...(v.last?.error ? [`it stopped: ${v.last.error}`] : []),
+    ...(v.conflicts.length ? [`${n(v.conflicts.length, 'conflict')} in the inbox`] : []),
+    ...(v.last?.warnings.length ? [`${n(v.last.warnings.length, 'warning')} in the options`] : [])].join(' · ');
+  const b = v.backup;
+  const failed = syncBackupLine(v);
+  const backup = !b ? 'none: each session stays on the machine that made it'
+    : b.kind === 'machine' ? b.label
+      : [b.path, v.key.present ? `key ${v.key.fingerprint}` : `no key here${v.key.error ? `: ${v.key.error}` : ''}`,
+        ...(failed && failed.status !== 'ok' ? [failed.text ?? failed.detail ?? failed.status] : [])].join(' · ');
+  return { run, backup };
+}
+
+/** How an open conflict is resolved, as `oak inbox` says it: a diverged session only by deleting the copy. */
+export const syncConflictResolution = (reason: string): string => (reason === 'diverged' ? 'delete the copy to keep yours' : 'edit your file or delete the copy');
 
 export interface ObservatoryMachine {
   id: string;
@@ -8,8 +58,9 @@ export interface ObservatoryMachine {
   local?: boolean;
   snapshot?: HerdrApi.SessionSnapshot;
   error?: string;
-  /** Catalog read on this machine; never joined to a same-id row in the local catalog. */
-  sessions?: { sessions: Record<string, any>[] };
+  /** Catalog read on this machine; never joined to a same-id row in the local catalog. `fromIndex`: read from this
+   *  machine's local index (that machine's records, as oak sync brought them at `syncedAt`), not from that machine. */
+  sessions?: { sessions: Record<string, any>[]; workers?: Record<string, any>[]; fromIndex?: boolean; syncedAt?: number };
   sessionsError?: string;
 }
 export interface ObservatorySelection {
@@ -18,10 +69,20 @@ export interface ObservatorySelection {
   label: string;
   machineId?: string;
   paneId?: string;
+  /** One of the session's workers, when the reader picked its row in the master: the master marks it, and its
+   *  own log is what a pin opens. */
+  agentId?: string;
+  processId?: string;
+  /** A row of the session's worker group the reader picked in the master: its summary (`all`), or the header of
+   *  its workers in one state (`blocked`, `working`). */
+  workers?: string;
 }
 export interface ObservatoryConversation {
   selection: ObservatorySelection;
   events: ConversationEvent[];
+  feed?: import('@oak-observatory/core').FeedResult;
+  processes?: ReturnType<typeof import('@oak-observatory/core').processView>;
+  processError?: string;
   cursor: number | null;
   source?: string;
   transcriptPath?: string | null;
@@ -61,11 +122,20 @@ export function observatoryReply(state: DashState, paneId: string) {
   const session = selection && observatorySessions(state).find(s => s.session === selection.session
     && (!selection.machineId || s.machineId === selection.machineId));
   const machine = state.observatory?.machines.find(m => m.id === session?.machineId);
-  const reason = !detail ? 'Pin a session to reply' : !session?.pane || !machine ? 'No live pane'
+  // A Codex agent working with a question waiting is still herdr's blocked pane, which refuses a prompt: the reply
+  // waits for the answer too, and says why in the words its row uses.
+  const reason = !detail ? 'Pin a session to reply' : selection?.processId ? 'Process output is read-only' : selection?.agentId ? 'Worker log is read-only' : !session?.pane || !machine ? 'No live pane'
+    : paneAgentState(session.pane, session.meta, state.now).question ? 'Question waiting · answer in herdr'
     : session.pane.agent_status === 'blocked' ? 'Blocked · answer in herdr'
     : detail.reply?.sending ? 'Sending…' : undefined;
   const target = machine?.snapshot?.agents.find(a => a.pane_id === session?.paneId)?.name || session?.paneId;
   return { detail, session, machine, target, reason };
+}
+
+/** Whether a session's row lists a worker still at it (core's `activeWorkers`: working, or waiting on a person). The
+ *  Observatory keeps such a session as it keeps one with pending edits, and draws its worker group under it. */
+export function hasActiveWorker(meta: Record<string, any> | undefined): boolean {
+  return Array.isArray(meta?.activeWorkers) && meta.activeWorkers.some((w: any) => /^(working|awaiting-input|awaiting-permission)$/.test(String(w?.phase ?? '')));
 }
 
 export function observatorySessions(state: DashState): ObservatorySession[] {
@@ -92,17 +162,30 @@ export function observatorySessions(state: DashState): ObservatorySession[] {
     for (const [session, pane] of best) {
       joined.add(session);
       const meta = metadata.get(session) ?? {};
-      const f = machine.local ? workers.get(session) ?? {} : {};
+      const f = machine.sessions?.workers?.find(w => w.session === session) ?? (machine.local ? workers.get(session) ?? {} : {});
       rows.push({ session, machineId: machine.id, machine: machine.label, paneId: pane.pane_id, pane,
         // A placeholder ("New Claude session") is not a name: the pane's own title outranks it.
-        root: f.worktree || pane.cwd || '', label: realSessionTitle(meta.title) || f.title || pane.title || session.slice(0, 12),
+        root: f.worktree || pane.cwd || '', label: f.state ? f.title : herdrTabTitle(machine.snapshot, pane.tab_id) || realSessionTitle(meta.title) || f.title || pane.title || session.slice(0, 12),
         agent: pane.agent_session?.agent || pane.agent || meta.agent || 'unknown', meta, fleet: f });
     }
+  }
+  for (const machine of state.observatory?.machines ?? []) for (const w of machine.sessions?.workers ?? []) {
+    if (!w.session || rows.some(r => r.machineId === machine.id && r.session === w.session)) continue;
+    joined.add(w.session);
+    const meta = (machine.local ? byId.get(w.session) : machine.sessions?.sessions.find(r => r.id === w.session)) ?? {};
+    rows.push({ session: w.session, root: w.worktree, label: w.title, machineId: machine.id, machine: machine.label,
+      agent: w.kind, meta: { ...meta, tokens: w.tokens, lastActiveMs: w.lastActiveMs }, fleet: w });
+  }
+  for (const machine of state.observatory?.machines ?? []) if (!machine.local) for (const meta of machine.sessions?.sessions ?? []) {
+    if (rows.some(s => s.machineId === machine.id && s.session === meta.id)) continue;
+    if (!state.allSessions && !(meta.pending > 0) && !meta.current && !hasActiveWorker(meta)) continue;
+    rows.push({ session: meta.id, root: meta.workspacePath || '', label: realSessionTitle(meta.title) || meta.id.slice(0, 12),
+      machineId: machine.id, machine: machine.label, agent: meta.agent || 'unknown', meta, fleet: {} });
   }
   // Store-only sessions retain OAK's own liveness, but liveness does not grant retention: D9 is
   // precisely has-pane OR pending. A quiet, resolved session appears only with show archived.
   for (const meta of store) {
-    if (state.observatory?.owners?.[meta.id] || joined.has(meta.id) || (!state.allSessions && !(meta.pending > 0) && !meta.current)) continue;
+    if (state.observatory?.owners?.[meta.id] || joined.has(meta.id) || (!state.allSessions && !(meta.pending > 0) && !meta.current && !hasActiveWorker(meta))) continue;
     const f = workers.get(meta.id) ?? {};
     rows.push({ session: meta.id, root: f.worktree || '', label: realSessionTitle(meta.title) || f.title || meta.id.slice(0, 12),
       machineId: 'unresolved', machine: meta.machine || 'local', agent: meta.agent || 'unknown', meta, fleet: f });
@@ -189,6 +272,10 @@ export function pickerSessionRows(state: DashState, local: readonly Record<strin
   if (listError) rows.push({ id: '!machines', machine: 'saved machines', error: listError, note: `could not read the saved machines — ${listError}` });
   for (const m of state.observatory?.machines ?? []) {
     if (m.local) continue;
+    // Read from this machine's index: said once, before its rows, with when oak sync brought them.
+    if (m.sessions?.fromIndex === true && typeof m.sessions.syncedAt === 'number' && m.sessions.sessions.length) {
+      rows.push({ id: `!${m.label}:records`, machine: m.label, owner: m.label, note: `${m.label}'s sessions as its records hold them, synced ${relTime(m.sessions.syncedAt)}` });
+    }
     if (m.sessions) for (const row of m.sessions.sessions) rows.push({ ...row, machine: m.label, owner: m.label });
     else rows.push({ id: `!${m.label}`, machine: m.label, owner: m.label, error: m.sessionsError,
       note: m.sessionsError ? `could not list ${m.label}'s sessions — ${m.sessionsError.replace(/^oak: /, '')}`
@@ -197,13 +284,13 @@ export function pickerSessionRows(state: DashState, local: readonly Record<strin
   return rows;
 }
 
-/** The one state transition used by ctrl+a o, openConversation, and plugin/review jumps.
+/** The one state transition used by herdr's prefix then M, openConversation, and plugin/review jumps.
  * Runtime switching/fetching wraps this pure transition; no drive is started by navigating. */
-export function selectAndPin(state: DashState, session: string, paneId = 'obs-detail', machineId?: string): DashState {
-  const selection = observatorySelection(state, session, machineId);
+export function selectAndPin(state: DashState, session: string, paneId = 'obs-detail', machineId?: string, within?: Pick<ObservatorySelection, 'agentId' | 'workers' | 'processId'>): DashState {
+  const selection = { ...observatorySelection(state, session, machineId), ...within };
   const observatory = state.observatory ?? { machines: [], details: {} };
   const old = observatory.details[paneId];
-  const same = old?.selection.session === session && old.selection.machineId === selection.machineId;
+  const same = old?.selection.session === session && old.selection.machineId === selection.machineId && old.selection.agentId === selection.agentId && old.selection.processId === selection.processId;
   // A half-typed reply belongs to its conversation. Re-pinning the leaf — one click in the master —
   // parks it with its session, and pinning that session again brings it back; the other session is
   // never offered it. A reply already on its way has nothing left to park.
@@ -211,7 +298,7 @@ export function selectAndPin(state: DashState, session: string, paneId = 'obs-de
   const draftKey = (s: ObservatorySelection): string => `${s.machineId ?? ''}:${s.session}`;
   if (!same && old?.reply?.text && !old.reply.sending) drafts[draftKey(old.selection)] = { text: old.reply.text, caret: old.reply.caret,
     focused: false, ...(old.reply.commentIds ? { commentIds: old.reply.commentIds } : {}) };
-  const parked = same ? undefined : drafts[draftKey(selection)];
+  const parked = same || selection.agentId || selection.processId ? undefined : drafts[draftKey(selection)];
   if (parked) delete drafts[draftKey(selection)];
   const detail = same ? old : {
     selection, events: [], cursor: null, loadedAt: state.now, loading: true, previews: {}, ...(parked ? { reply: parked } : {}),

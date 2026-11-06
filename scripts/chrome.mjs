@@ -18,9 +18,33 @@ export function resolveChrome(env = process.env) {
   throw new Error('Chrome/Chromium is unavailable; set CHROME_BIN to an executable browser path.');
 }
 
-/** Chrome keeps a Unix socket under TMPDIR and dies with SIGTRAP when that path is too long (measured:
- *  a TMPDIR of 60 characters works, 66 does not), so a longer one is replaced by /tmp for the browser. */
-const browserEnv = () => (process.platform === 'win32' || tmpdir().length <= 60 ? process.env : { ...process.env, TMPDIR: '/tmp' });
+/** Run as the reader is, Chrome opens their ~/.pki/nssdb, writes mimeapps.list and ~/.cache, registers with
+ *  the desktop session over D-Bus, asks the desktop's keyring for its keys (on KDE that is KWallet, through
+ *  KLauncher) and contacts Google in the background. Each launch gets these flags, and a temporary home that
+ *  holds its profile, XDG directories and TMPDIR, with no session or system bus, display or desktop. The home
+ *  is under /tmp: Chrome keeps a Unix socket under TMPDIR and dies with SIGTRAP when that path is too long
+ *  (measured: a TMPDIR of 60 characters works, 66 does not). --disable-background-networking still left
+ *  connections to three Google hosts (Chrome 138), so no host name resolves; a page that loads from the
+ *  network passes its own --host-resolver-rules after these, and the later one wins. */
+const ISOLATION_FLAGS = ['--password-store=basic', '--use-mock-keychain', '--disable-background-networking', '--no-first-run',
+  '--host-resolver-rules=MAP * ~NOTFOUND'];
+const DESKTOP = ['DISPLAY', 'WAYLAND_DISPLAY', 'XAUTHORITY', 'XDG_RUNTIME_DIR', 'XDG_CURRENT_DESKTOP', 'XDG_SESSION_DESKTOP', 'XDG_SESSION_TYPE',
+  'DESKTOP_SESSION', 'SESSION_MANAGER', 'KDE_FULL_SESSION', 'KDE_SESSION_VERSION', 'KDE_SESSION_UID', 'GNOME_DESKTOP_SESSION_ID'];
+function isolatedEnv(home, env = process.env) {
+  const out = { ...env, HOME: home, USERPROFILE: home, TMPDIR: home, XDG_CONFIG_HOME: join(home, '.config'), XDG_CACHE_HOME: join(home, '.cache'),
+    XDG_DATA_HOME: join(home, '.local', 'share'), XDG_STATE_HOME: join(home, '.local', 'state'),
+    DBUS_SESSION_BUS_ADDRESS: 'disabled:', DBUS_SYSTEM_BUS_ADDRESS: 'disabled:' };
+  for (const key of DESKTOP) delete out[key];
+  return out;
+}
+
+/** execFileSync for Chrome, with the isolation above; the home goes with the run. */
+export function runChrome(chrome, args, options = {}) {
+  const home = mkdtempSync(join(process.platform === 'win32' ? tmpdir() : '/tmp', 'oak-chrome-'));
+  try {
+    return execFileSync(chrome, [...ISOLATION_FLAGS, `--user-data-dir=${join(home, 'profile')}`, ...args], { ...options, env: isolatedEnv(home) });
+  } finally { rmSync(home, { recursive: true, force: true }); }
+}
 
 /** Headless Chrome lays a page out in a viewport shorter than `--window-size` (87 CSS px in Chrome 138)
  *  and paints nothing below it, so a screenshot loses that much of the page at the bottom. Measured once
@@ -28,8 +52,8 @@ const browserEnv = () => (process.platform === 'win32' || tmpdir().length <= 60 
 let viewportLoss;
 function measureViewportLoss(chrome, args, width, height) {
   const flags = args.filter(a => a.startsWith('--') && !a.startsWith('--window-size=') && !a.startsWith('--screenshot'));
-  const dom = execFileSync(chrome, [...flags, `--window-size=${width},${height}`, '--dump-dom', 'data:text/html,<script>document.write(innerHeight)</script>'],
-    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60000, env: browserEnv() });
+  const dom = runChrome(chrome, [...flags, `--window-size=${width},${height}`, '--dump-dom', 'data:text/html,<script>document.write(innerHeight)</script>'],
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60000 });
   const inner = Number(/<body>(\d+)/.exec(dom)?.[1]);
   if (!Number.isFinite(inner)) throw new Error('could not measure the headless viewport');
   return Math.max(0, height - inner);
@@ -56,7 +80,7 @@ export function capturePng(chrome, args) {
     const [width, height] = size ? size.slice('--window-size='.length).split(',').map(Number) : [];
     if (size) viewportLoss ??= measureViewportLoss(chrome, args, width, height);
     const run = size ? args.map(a => (a === size ? `--window-size=${width},${height + viewportLoss}` : a)) : args;
-    execFileSync(chrome, [...run, `--screenshot=${file}`], { stdio: 'pipe', timeout: 60000, env: browserEnv() });
+    runChrome(chrome, [...run, `--screenshot=${file}`], { stdio: 'pipe', timeout: 60000 });
     const bytes = readFileSync(file);
     if (bytes.length < 24 || !bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])))
       throw new Error('Chrome returned an empty or invalid PNG; existing media was not replaced.');

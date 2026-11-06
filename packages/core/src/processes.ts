@@ -16,10 +16,16 @@
  * is what the agent itself uses to read or kill the shell.
  */
 import * as fs from 'fs';
+import * as path from 'path';
 import { findTranscript } from './observe';
 import { transcriptFacts } from './derived-transcript';
 
 export interface BackgroundProcess {
+  /** The worker whose transcript named this shell, when it is not the parent session. */
+  workerId?: string;
+  /** Codex exposes output in exec/write_stdin results, without a task output file. */
+  recordedOutput?: string;
+  recordedBytes?: number;
   /** The harness's background shell id (e.g. `bpkyyxbff`) — how the agent reads or kills it. */
   id: string;
   /** The tool_use that launched it, so a renderer can jump to it in the action timeline. */
@@ -71,6 +77,9 @@ function tag(text: string, name: string): string {
  * Every background shell this session launched, oldest first. `nowMs` is injectable so a caller (and
  * the tests) can pin the live runtime of a still-running shell.
  */
+/** A worker's last words and its shells' last output can trail its completion notice by this much. */
+const WORKER_END_GRACE_MS = 120_000;
+
 export function sessionProcesses(cwd: string, sessionId: string, nowMs?: number): BackgroundProcess[] {
   const transcript = findTranscript(cwd, sessionId);
   if (!transcript) return [];
@@ -79,28 +88,51 @@ export function sessionProcesses(cwd: string, sessionId: string, nowMs?: number)
   // is exactly the cost this codebase keeps removing). The LIVE half deliberately is not: a running
   // shell's runtime advances with the clock, and its output file grows without touching the transcript,
   // so caching either would freeze the two numbers the tab exists to show.
-  return parseProcesses(transcript).map((p) => {
+  const processes = parseProcesses(transcript);
+  const workers = path.join(path.dirname(transcript), sessionId, 'subagents');
+  try {
+    for (const file of fs.readdirSync(workers)) {
+      const match = /^agent-(.+)\.jsonl$/.exec(file);
+      if (match) processes.push(...parseProcesses(path.join(workers, file), true).map(p => ({ ...p, workerId: match[1] })));
+    }
+  } catch { /* no worker transcripts yet */ }
+  // A background worker ends with its completion notice; a foreground one with its spawn's terminal tool result (meta).
+  const workerFacts = transcriptFacts(transcript).subagents;
+  const workerEndedTs = (id: string): number => workerFacts.ended.get(id)?.ts || workerFacts.meta.get(id)?.endedTs || 0;
+  return processes.map((p) => {
     const out = { ...p };
     if (out.outputPath) {
       try {
         const st = fs.statSync(out.outputPath);
         out.outputBytes = st.size;
-        out.lastOutputTs = st.mtimeMs;
+        // Whole milliseconds, as every other stamp: a fractional mtime made the runtime change once the clock passed
+        // its fraction, so an idle follow emitted a snapshot nothing had changed.
+        out.lastOutputTs = Math.floor(st.mtimeMs);
       } catch {
         /* the file is gone (tmp reaped) — leave the zeros, they are honest */
       }
+    }
+    // A worker's shell reports its end only to that worker. Once the parent holds the worker's own completion notice,
+    // a shell of it with no end, no later turn of the worker and no output since can no longer report one: it is not
+    // listed as running for good.
+    const workerEnd = out.running && out.workerId ? workerEndedTs(out.workerId) : 0;
+    if (workerEnd > 0 && Math.max(out.lastEvidenceTs || 0, out.lastOutputTs || 0) <= workerEnd + WORKER_END_GRACE_MS) {
+      out.running = false;
+      out.status = 'no end recorded';
     }
     // Finished → its real span. Still open → up to the newest evidence (its own output, the session's
     // last record), and never past now.
     const openUntil = Math.min(now, Math.max(out.lastOutputTs || 0, out.lastEvidenceTs || 0, out.startedTs));
     out.runtimeMs = Math.max(0, (out.endedTs || openUntil) - out.startedTs);
     return out;
-  });
+  }).sort((a, b) => Number(b.running) - Number(a.running) || a.startedTs - b.startedTs);
 }
 
+export function processKey(p: BackgroundProcess): string { return p.workerId ? `${p.workerId}:${p.id}` : p.id; }
+
 /** The transcript-derived skeleton of every background shell — pure, so it memoizes cleanly. */
-function parseProcesses(transcript: string): BackgroundProcess[] {
-  return processesFromFacts(transcriptFacts(transcript).processes);
+function parseProcesses(transcript: string, includeSidechain = false): BackgroundProcess[] {
+  return processesFromFacts(transcriptFacts(transcript, includeSidechain).processes);
 }
 
 /** Compact cursor state; pending completions and kills remain unresolved until projection. */
@@ -109,20 +141,26 @@ export interface ProcessFacts {
   byId: Map<string, BackgroundProcess>;
   pendingEnd: { id: string; toolUseId: string; ts: number; status: string; summary: string; outputFile: string }[];
   stopped: Map<string, number>;
+  codexPolls: Map<string, string>;
   lastRecordTs: number;
 }
 export function newProcessFacts(): ProcessFacts {
-  return { byToolUse: new Map(), byId: new Map(), pendingEnd: [], stopped: new Map(), lastRecordTs: 0 };
+  return { byToolUse: new Map(), byId: new Map(), pendingEnd: [], stopped: new Map(), codexPolls: new Map(), lastRecordTs: 0 };
 }
 
 /** Fold one record, retaining the original parser's notification ordering. */
 export function foldProcessFacts(facts: ProcessFacts, o: any): void {
+  if (o?.type === 'api-request-blob') return;
   const { byToolUse, byId, pendingEnd, stopped } = facts;
   const ts = toMs(o.timestamp ?? o.ts);
   if (ts > facts.lastRecordTs) facts.lastRecordTs = ts;
 
-  // The completion notification is its own record type, with no `message` at all.
-  if (typeof o.content === 'string' && o.content.includes('<task-notification>')) {
+  // The completion notification is its own record type, with no `message` at all. A worker's transcript records it
+  // as a queued-command attachment instead; read both, or every worker shell stays "running" for good.
+  const notice = typeof o.content === 'string' ? o.content
+    : o?.type === 'attachment' && o.attachment?.type === 'queued_command' && typeof o.attachment.prompt === 'string' ? o.attachment.prompt : '';
+  if (notice.includes('<task-notification>')) {
+    o = { ...o, content: notice };
     const id = tag(o.content, 'task-id');
     const p = id ? byId.get(id) : undefined;
     if (!p) {
@@ -154,10 +192,14 @@ export function foldProcessFacts(facts: ProcessFacts, o: any): void {
   }
 
   const msg = o.message;
-  if (!msg || !Array.isArray(msg.content) || o.isSidechain === true) return;
+  if (!msg || !Array.isArray(msg.content)) return;
 
   if (msg.role === 'assistant') {
     for (const b of msg.content) {
+      if (o.runtime === 'codex' && b?.type === 'tool_use' && b.name === 'write_stdin') {
+        facts.codexPolls.set(b.id, `codex-${b.input?.session_id}`);
+        continue;
+      }
       if (b?.type === 'tool_use' && b.name === 'TaskStop') {
         const killed = b.input && typeof b.input === 'object' && typeof b.input.task_id === 'string' ? b.input.task_id : '';
         if (killed) stopped.set(killed, ts);
@@ -165,7 +207,7 @@ export function foldProcessFacts(facts: ProcessFacts, o: any): void {
       }
       if (b?.type !== 'tool_use' || b.name !== 'Bash') continue;
       const input = b.input && typeof b.input === 'object' ? b.input : {};
-      if (input.run_in_background !== true) continue;
+      if (input.run_in_background !== true && o.runtime !== 'codex') continue;
       const rec: BackgroundProcess = {
         id: '', // filled in from the result
         toolUseId: typeof b.id === 'string' ? b.id : null,
@@ -187,6 +229,27 @@ export function foldProcessFacts(facts: ProcessFacts, o: any): void {
   }
 
   if (msg.role === 'user') {
+    if (o.runtime === 'codex') {
+      for (const b of msg.content) {
+        if (b?.type !== 'tool_result') continue;
+        const text = typeof b.content === 'string' ? b.content : '';
+        const poll = facts.codexPolls.get(b.tool_use_id);
+        facts.codexPolls.delete(b.tool_use_id);
+        const rec = poll ? byId.get(poll) : byToolUse.get(b.tool_use_id);
+        if (!rec) continue;
+        const running = /Process running with session ID (\d+)/.exec(text);
+        if (!rec.id && !running) { byToolUse.delete(b.tool_use_id); continue; }
+        if (running) { rec.id = `codex-${running[1]}`; byId.set(rec.id, rec); }
+        const output = text.includes('\nOutput:\n') ? text.slice(text.indexOf('\nOutput:\n') + 9) : '';
+        rec.recordedOutput = ((rec.recordedOutput || '') + output).slice(-16 * 1024);
+        rec.recordedBytes = (rec.recordedBytes || 0) + Buffer.byteLength(output);
+        rec.outputBytes = rec.recordedBytes;
+        rec.lastOutputTs = ts;
+        const ended = /Process exited with code (-?\d+)/.exec(text);
+        if (ended) { rec.running = false; rec.status = 'completed'; rec.exitCode = Number(ended[1]); rec.endedTs = ts; }
+      }
+      return;
+    }
     // The result names the shell: `toolUseResult.backgroundTaskId`, with the output path in its text.
     const bgId = o.toolUseResult && typeof o.toolUseResult.backgroundTaskId === 'string' ? o.toolUseResult.backgroundTaskId : '';
     if (!bgId) return;
@@ -262,12 +325,13 @@ export function processOutputTail(outputPath: string | null, maxBytes = 16 * 102
   if (!outputPath) return '';
   let fd: number | undefined;
   try {
-    const st = fs.statSync(outputPath);
+    fd = fs.openSync(outputPath, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
+    const st = fs.fstatSync(fd);
+    if (!st.isFile()) return '';
     if (st.size === 0) return '';
     const start = Math.max(0, st.size - maxBytes);
     const len = st.size - start;
     const buf = Buffer.alloc(len);
-    fd = fs.openSync(outputPath, 'r');
     const n = fs.readSync(fd, buf, 0, len, start);
     let text = buf.toString('utf8', 0, n);
     // A mid-character cut at the window start would render as U+FFFD — drop the partial first line.
@@ -275,7 +339,7 @@ export function processOutputTail(outputPath: string | null, maxBytes = 16 * 102
       const nl = text.indexOf('\n');
       text = nl >= 0 ? text.slice(nl + 1) : text;
     }
-    return text;
+    return plainProcessOutput(text);
   } catch {
     return ''; // the file is gone or unreadable — an empty preview, never a thrown panel
   } finally {
@@ -287,4 +351,15 @@ export function processOutputTail(outputPath: string | null, maxBytes = 16 * 102
       }
     }
   }
+}
+
+/** Shell output is text, never a terminal program (including colours and unterminated strings). */
+export function plainProcessOutput(text: string): string {
+  return text
+    .replace(/(?:\x1b\]|\u009d)[^\x07\x1b\u009c]*(?:\x07|\x1b\\|\u009c|$)/g, '')
+    .replace(/(?:\x1b[PX^_]|[\u0090\u0098\u009e\u009f])[^\x1b\u009c]*(?:\x1b\\|\u009c|$)/g, '')
+    .replace(/(?:\x1b\[|\u009b)[\x30-\x3f]*[\x20-\x2f]*[\x40-\x7e]?/g, '')
+    .replace(/\x1b[\x20-\x2f]*[\x30-\x7e]/g, '')
+    .replace(/\r\n/g, '\n').replace(/\r/g, '\n')
+    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/g, '');
 }
