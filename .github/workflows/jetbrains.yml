@@ -32,7 +32,7 @@ jobs:
     # The dev-container Node image: Debian with git, python3, make and g++ (node-pty compiles from source on Linux), jq
     # in /usr/bin (the status-line tests run with only the system folders on PATH), a C.UTF-8 locale, and user 1000.
     container:
-      image: mcr.microsoft.com/devcontainers/javascript-node:22-bookworm
+      image: mcr.microsoft.com/devcontainers/javascript-node:24-bookworm
       # --init: the runner starts the container on `tail -f /dev/null`, which never collects an ended process, so a test
       # that stops a child would see it linger as a zombie; docker's init is process 1 instead and collects them.
       options: --user 1000:1000 --init

@@ -58,16 +58,17 @@ export function detectAgentWorktree(cwd: string): AgentWorktree | undefined {
   return { path: root, repository, branch: branchAt(root), base, baseBranch };
 }
 
-/** Only Git reads the index and changed paths. Six bounded commands, 256 KiB each, with a 1.5 s total deadline.
- * The caller persists the timestamp and reads at most one stale worktree per refresh, once per 30 seconds. */
-export function readAgentWorktree(w: AgentWorktree, now = Date.now()): AgentGitState {
+/** Only Git reads the index and changed paths. Six bounded commands, 256 KiB each, with a 1.5 s total deadline (a third
+ * of it a command). The caller persists the timestamp and reads at most one stale worktree per refresh, once per 30
+ * seconds. A removal reads with a longer deadline. */
+export function readAgentWorktree(w: AgentWorktree, now = Date.now(), budgetMs = 1500): AgentGitState {
   const start = Date.now();
   const state: AgentGitState = { files: 0, added: 0, removed: 0, ahead: 0, behind: 0, merged: false, dirty: false, readMs: now, durationMs: 0, calls: 0 };
   const run = (args: string[]) => {
-    const left = 1500 - (Date.now() - start);
-    if (left <= 0) throw new Error('worktree read exceeded 1500 ms');
+    const left = budgetMs - (Date.now() - start);
+    if (left <= 0) throw new Error(`worktree read exceeded ${budgetMs} ms`);
     state.calls++;
-    return git(w.path, args, Math.min(500, left));
+    return git(w.path, args, Math.min(Math.floor(budgetMs / 3), left));
   };
   try {
     const target = w.baseBranch || w.base;
@@ -90,7 +91,7 @@ export function readAgentWorktree(w: AgentWorktree, now = Date.now()): AgentGitS
       const stat = fs.lstatSync(file);
       if (!stat.isFile()) continue;
       bytes += stat.size;
-      if (bytes > 1024 * 1024 || Date.now() - start > 1500) throw new Error('untracked diff exceeds the bounded worktree read');
+      if (bytes > 1024 * 1024 || Date.now() - start > budgetMs) throw new Error('untracked diff exceeds the bounded worktree read');
       const content = fs.readFileSync(file);
       if (!content.includes(0)) state.added += content.toString('utf8').split('\n').length - (content.length === 0 || content[content.length - 1] === 10 ? 1 : 0);
     }
@@ -115,8 +116,11 @@ export function removeAgentWorktree(w: AgentWorktree): void {
   // Only a worktree OAK made, on its `oak/<id>` branch. An agent started inside the user's own worktree records that
   // tree too, and removing it would take its ignored files (a local .env) with it.
   if (!w.branch?.startsWith('oak/')) throw new Error(`${w.path} is not a worktree OAK made (branch ${w.branch ?? 'detached'}); remove it with git yourself if you mean to`);
-  const state = readAgentWorktree(w);
-  if (state.error || state.dirty || !state.merged) throw new Error('worktree must be clean and merged before removal; review its changes in OAK first');
+  // A removal waits on Git as this file's other one-off Git commands do (10 s), not as a refresh does: a status in a large
+  // tree, or on a slow machine, takes longer than a refresh allows. A read that fails says so, not that the tree has work.
+  const state = readAgentWorktree(w, Date.now(), 10000);
+  if (state.error && !state.dirty) throw new Error(`could not read the worktree before removal (${state.error}); nothing was removed`);
+  if (state.dirty || !state.merged) throw new Error('worktree must be clean and merged before removal; review its changes in OAK first');
   git(w.repository, ['worktree', 'remove', '--', w.path], 10000);
   w.removedMs = Date.now();
   // The agent's own branch goes with its worktree. `-d` refuses a branch that is not merged into HEAD, which then stays.

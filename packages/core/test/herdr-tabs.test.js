@@ -823,7 +823,17 @@ test('herdr tab sync: Codex\'s hooks start it at turn boundaries and on a resume
 });
 
 test('herdr tab sync: the capture bundle itself starts the sync and returns at once, printing nothing — Claude and Codex', async t => {
-  const herdr = await fakeHerdr(t, { 'tab.rename': ok });
+  let hookPid, hookClosed;
+  const herdr = await fakeHerdr(t, {
+    // This test exercises capture's detached sync; process-table ancestry has its own context tests.
+    'pane.process_info': ({ pane_id }) => ({ type: 'pane_process_info', process_info: { pane_id, shell_pid: hookPid } }),
+    'session.snapshot': async () => {
+      // A sync holding capture's output open cannot finish: its answer waits for the pipe to close.
+      await hookClosed.promise;
+      return { type: 'session_snapshot', snapshot: { version: '0.9.1', protocol: 22, ...herdr.snapshot } };
+    },
+    'tab.rename': ok,
+  });
   if (!herdr) return;
   resetOwned();
   const cp = require('node:child_process');
@@ -845,22 +855,23 @@ test('herdr tab sync: the capture bundle itself starts the sync and returns at o
   const env = pane => ({ ...process.env, CODEX_HOME: codexHome, HERDR_PANE_ID: pane, HERDR_SOCKET_PATH: herdr.socketPath, HERDR_BIN_PATH: herdr.binary, OAK_NO_BACKGROUND: '' });
   // Keep this server's event loop free for the hook's bounded membership check.
   const hook = async (args, pane, payload) => {
+    hookClosed = Promise.withResolvers();
     const started = Date.now();
     const r = await new Promise(resolve => {
       const child = cp.execFile(process.execPath, [OAK, 'capture', ...args], { env: env(pane), encoding: 'utf8', timeout: 20000 },
         (error, stdout, stderr) => resolve({ status: error?.code ?? 0, stdout, stderr }));
+      hookPid = child.pid;
       child.stdin.end(JSON.stringify(payload));
     });
+    hookClosed.resolve();
     assert.deepEqual([r.status, r.stdout, r.stderr], [0, '', ''], `${args.join(' ') || 'capture'} exits 0 and prints nothing`);
-    return Date.now() - started;
+    t.diagnostic(`${args.join(' ') || 'Claude'} capture closed its output in ${Date.now() - started} ms, before the snapshot reply`);
   };
-  const ms = await hook([], 'w1:p1', { session_id: S, cwd: codexHome, hook_event_name: 'Stop' });
+  await hook([], 'w1:p1', { session_id: S, cwd: codexHome, hook_event_name: 'Stop' });
   assert.equal(herdr.calls('pane.process_info').length, 1, 'the hook verified its pane before linking');
-  // A sync that held the hook's stdout would keep it open until herdr answered or it gave up (4 s),
-  // and the agent waits for that pipe to close.
-  assert.ok(ms < 3000, `the hook returned at once, its output closed (${ms} ms)`);
   assert.ok(await until(() => herdr.calls('tab.rename').length === 1), 'the detached sync renamed the tab');
   assert.deepEqual(herdr.calls('tab.rename'), [{ tab_id: 'w1:t1', label: 'Bundle tidy-up' }]);
+  assert.ok(await until(() => owned().local?.['w1:t1'] === 'Bundle tidy-up'), 'the Claude sync saved its claim before the next hook');
   await hook(['--agent', 'codex'], 'w1:p2', { session_id: X, cwd: codexHome, hook_event_name: 'Stop', transcript_path: rollout, model: 'fixture-model' });
   assert.ok(await until(() => herdr.calls('tab.rename').length === 2), 'the Codex hook\'s sync renamed its tab');
   assert.deepEqual(herdr.calls('tab.rename')[1], { tab_id: 'w1:t2', label: 'Bundle thread' });

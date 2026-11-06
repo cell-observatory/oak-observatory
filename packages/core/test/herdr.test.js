@@ -38,7 +38,7 @@ function sandbox(t) {
 
 async function eventually(check, message, timeout = 3000) {
   const deadline = Date.now() + timeout;
-  while (!check()) {
+  while (!await check()) {
     assert.ok(Date.now() < deadline, message);
     await sleep(10);
   }
@@ -992,11 +992,15 @@ socketTest('herdr: live sandbox bootstrap, events, session identity, focused pan
     await exited;
     clearTimeout(force);
   });
-  await eventually(() => {
+  const readyAt = Date.now();
+  await eventually(async () => {
     if (failure) throw failure;
     assert.equal(server.exitCode, null, `herdr server exited: ${stderr}`);
-    return fs.existsSync(box.socketPath);
-  }, 'sandbox server socket', 10000);
+    // bind publishes the socket before listen accepts connections. Only a pong proves readiness.
+    try { return (await core.herdrRequest('ping', {}, box)).type === 'pong'; }
+    catch (error) { if (error.code !== 'server_not_running') throw error; return false; }
+  }, 'sandbox server answers ping', 10000);
+  t.diagnostic(`Sandbox server answered ping after ${Date.now() - readyAt} ms`);
   const opts = { ...box, binary };
   const created = await core.herdrRequest('workspace.create', { cwd: box.dir, label: 'oak-client-test', focus: true }, opts);
   const pane_id = created.root_pane.pane_id;

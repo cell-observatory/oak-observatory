@@ -24,7 +24,7 @@ async function fakeHerdr(t, handlers) {
     let buffer = '';
     socket.setEncoding('utf8');
     socket.on('error', () => {});
-    socket.on('data', chunk => {
+    socket.on('data', async chunk => {
       buffer += chunk;
       const end = buffer.indexOf('\n');
       if (end < 0) return;
@@ -34,7 +34,7 @@ async function fakeHerdr(t, handlers) {
       try {
         const handler = handlers[request.method];
         if (!handler) throw Object.assign(new Error(`unscripted ${request.method}`), { code: 'unknown_method' });
-        reply = { id: request.id, result: handler(request.params ?? {}) };
+        reply = { id: request.id, result: await handler(request.params ?? {}) };
       } catch (error) { reply = { id: request.id, error: { code: error.code || 'failed', message: error.message } }; }
       socket.end(JSON.stringify(reply) + '\n');
     });

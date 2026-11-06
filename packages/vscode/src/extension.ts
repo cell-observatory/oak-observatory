@@ -7026,7 +7026,8 @@ async function syncSetupCommand(): Promise<void> {
     return;
   }
   const dir = await vscode.window.showOpenDialog({ canSelectFolders: true, canSelectFiles: false, canSelectMany: false, openLabel: 'Back up here', title: 'OAK — the backup folder, as this machine reaches it' });
-  if (dir?.length) await runSyncSetup(['--folder', dir[0].fsPath], saved);
+  // Canonical (#43): the CLI records the folder as given, and every other surface spells a drive letter upper-case.
+  if (dir?.length) await runSyncSetup(['--folder', canonFsPath(dir[0])], saved);
 }
 
 async function runSyncSetup(args: string[], saved: string[], key?: string): Promise<void> {

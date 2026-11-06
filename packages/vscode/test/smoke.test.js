@@ -6419,6 +6419,8 @@ else if (all.includes('--machine lab-a')) {
         assert.equal(item.visible, false, 'sync not in use: nothing shows');
         // A run 30 s ago that pulled from build-box, and one open conflict on a plan.
         for (const [f, text] of [[plan, 'one\nleft\n'], [copy, 'one\nright\n']]) { fs.mkdirSync(path.dirname(f), { recursive: true }); fs.writeFileSync(f, text); }
+        // sync names this machine's file by its real path: on Windows the long one, where a temp folder is spelled `RUNNER~1`.
+        const planReal = fs.realpathSync.native(plan);
         const at = Date.now() - 30_000;
         fs.writeFileSync(path.join(sync, 'status.json'), JSON.stringify({ at, durationMs: 800, status: 'ok', warnings: [], machines: [{ label: 'build-box', host: 'h1', status: 'ok',
           pulled: { files: 2, bytes: 2048 }, conflicts: 1, pending: { files: 0, bytes: 0 }, errors: [], lastOkAt: at }] }));
@@ -6444,13 +6446,13 @@ else if (all.includes('--machine lab-a')) {
         assert.ok(tip.includes('backup: none: each session stays on the machine that made it'));
         assert.ok(tip.includes('1 open conflict: the Timeline\'s session list has it'));
         await until(() => posts.some((m) => m.type === 'syncConflicts' && m.rows.length), 'the inbox rows are posted');
-        assert.deepEqual(posts.findLast((m) => m.type === 'syncConflicts').rows, [{ id: 'c0ffee000001', family: 'plans', name: 'm.md', from: 'build-box', file: plan, copy,
+        assert.deepEqual(posts.findLast((m) => m.type === 'syncConflicts').rows, [{ id: 'c0ffee000001', family: 'plans', name: 'm.md', from: 'build-box', file: planReal, copy,
           resolution: 'edit your file or delete the copy' }]);
-        // Open both copies: the other machine's on the left, this machine's on the right.
+        // Open both copies: the other machine's on the left, this machine's on the right, as vscode.Uri.file spells them.
         const diffs = diffCalls.length;
         tlMsg({ type: 'syncConflict', id: 'c0ffee000001', act: 'open' });
         await until(() => diffCalls.length > diffs, 'a diff opens');
-        assert.deepEqual(diffCalls.at(-1).map((a) => (a && a.fsPath) || a), [copy, plan, 'm.md: build-box\'s copy \u2194 yours']);
+        assert.deepEqual(diffCalls.at(-1).map((a) => (a && a.fsPath) || a), [toFsPath(copy), toFsPath(planReal), 'm.md: build-box\'s copy \u2194 yours']);
         // Delete the copy: asked first, then `oak sync resolve`, whose trash keeps it; this machine's file stands.
         const asked = [];
         vscode.window.showWarningMessage = (m, opts, ...items) => { asked.push({ m, opts, items }); return Promise.resolve(items[0]); };
@@ -6459,7 +6461,7 @@ else if (all.includes('--machine lab-a')) {
         await until(() => infoMessages.some((m) => m === 'OAK sync: build-box\'s copy of m.md is in sync\u2019s trash, and yours stands.'), 'it says what it did');
         assert.equal(asked[0].m, 'Delete build-box\'s copy of plans m.md?');
         assert.equal(asked[0].opts.modal, true);
-        assert.match(asked[0].opts.detail, /It goes to sync's trash, and this machine's file stands: .*plans\/m\.md\./);
+        assert.equal(asked[0].opts.detail, `It goes to sync's trash, and this machine's file stands: ${planReal}.`);
         assert.ok(!fs.existsSync(copy), 'the copy goes');
         assert.deepEqual(JSON.parse(fs.readFileSync(path.join(sync, 'conflicts.json'), 'utf8')), [], 'closed at once');
         assert.equal(fs.readFileSync(plan, 'utf8'), 'one\nleft\n', 'yours stands');
@@ -6492,7 +6494,7 @@ else if (all.includes('--machine lab-a')) {
         quickPick = (items) => items.find((it) => /plans n\.md from build-box/.test(it.label ?? '')) ?? items.find((it) => it === 'Open both copies');
         await commands['claudeObservatory.sync']();
         await until(() => diffCalls.length > diffsNow, 'its pick opens both copies');
-        assert.deepEqual(diffCalls.at(-1).map((a) => (a && a.fsPath) || a), [copy2, plan2, 'n.md: build-box\'s copy \u2194 yours']);
+        assert.deepEqual(diffCalls.at(-1).map((a) => (a && a.fsPath) || a), [toFsPath(copy2), toFsPath(fs.realpathSync.native(plan2)), 'n.md: build-box\'s copy \u2194 yours']);
         // A copy deleted by hand since the run is a conflict resolved: said, and nothing opens.
         fs.rmSync(copy2);
         tlMsg({ type: 'syncConflict', id: 'c0ffee000002', act: 'open' });
@@ -6568,12 +6570,23 @@ else if (all.includes('--machine lab-a')) {
         // A folder whose record under this machine's name this machine has not written: setup asks whether this machine is
         // a reinstall, and takes the record over when it is. An OAK that answers as the CLI does, recording what it was asked.
         const asks = path.join(other, 'asks.log');
-        const fake = path.join(fakeBin, 'oak-setup');
-        fs.writeFileSync(fake, `#!${process.execPath}\nconst a = process.argv.slice(2); require('fs').appendFileSync(${JSON.stringify(asks)}, a.join(' ') + '\\n');\n` +
+        // Each fake is a node script behind a launcher: a shell script here, a `.cmd` on Windows, which runs no `#!` line.
+        const nodeFake = (name, js) => {
+          const script = path.join(fakeBin, name + '.js'), win = process.platform === 'win32';
+          fs.writeFileSync(script, js);
+          const bin = path.join(fakeBin, win ? name + '.cmd' : name);
+          fs.writeFileSync(bin, win ? `@"${process.execPath}" "${script}" %*\r\n` : `#!/bin/sh\nexec "${process.execPath}" "${script}" "$@"\n`, { mode: 0o755 });
+          return bin;
+        };
+        const fake = nodeFake('oak-setup', `const a = process.argv.slice(2); require('fs').appendFileSync(${JSON.stringify(asks)}, a.join(' ') + '\\n');\n` +
           `if (a[0] === 'machine') process.stdout.write('[]');\n` +
           `else if (a[1] === 'setup') process.stdout.write(JSON.stringify({ syncSetup: 1, backup: { kind: 'folder', path: ${JSON.stringify(share)} }, key: null, ` +
-          `record: a.includes('--restore') ? { state: 'unclaimed', lastWrite: 'last written by laptop', claimed: true } : { state: 'unclaimed', lastWrite: 'last written by laptop' }, plan: null }));\n`, { mode: 0o755 });
+          `record: a.includes('--restore') ? { state: 'unclaimed', lastWrite: 'last written by laptop', claimed: true } : { state: 'unclaimed', lastWrite: 'last written by laptop' }, plan: null }));\n`);
         process.env.CLAUDE_OBSERVATORY_BIN = fake;
+        // The folder picked goes to the CLI canonical (#43), as every other surface spells it: VS Code's fsPath lower-cases
+        // a drive letter, which a folder named as Windows names it shows on every platform (this fake never reads it).
+        const shareC = process.platform === 'win32' ? share : `C:${share}`;
+        openDialogAnswer = [vscode.Uri.file(shareC)];
         const restoreAsked = [];
         vscode.window.showWarningMessage = (m, opts, ...items) => { restoreAsked.push({ m, opts, items }); return Promise.resolve(items[0]); };
         quickPick = 2;
@@ -6583,15 +6596,14 @@ else if (all.includes('--machine lab-a')) {
         assert.match(restoreAsked[0].opts.detail, /^last written by laptop\.\n\nIf this machine is a reinstall of that one/);
         assert.deepEqual(restoreAsked[0].items, ['This machine is a reinstall: restore from it']);
         assert.deepEqual(fs.readFileSync(asks, 'utf8').trim().split('\n').filter((l) => l.startsWith('sync setup')),
-          [`sync setup --folder ${share} --json`, `sync setup --folder ${share} --restore --json`], 'asked again with --restore');
+          [`sync setup --folder ${shareC} --json`, `sync setup --folder ${shareC} --restore --json`], 'asked again with --restore');
         await until(() => infoMessages.filter((m) => m.startsWith('OAK sync is set up')).length > setUpBefore, 'and says it is set up');
         assert.ok(infoMessages.filter((m) => m.startsWith('OAK sync is set up')).at(-1).includes('This machine took the folder’s record over: the next run restores its sessions from it.'), 'and that it took the record over');
         // The CLI's answer when the record is left as it is: a plan made without the backup folder, and why (planError),
         // which the record's note already says. Setup says it once, with the plan's preview, and nothing of a plan not made.
-        const fakeRefused = path.join(fakeBin, 'oak-setup-refused');
-        fs.writeFileSync(fakeRefused, `#!${process.execPath}\nconst a = process.argv.slice(2);\nif (a[0] === 'machine') process.stdout.write('[]');\n` +
+        const fakeRefused = nodeFake('oak-setup-refused', `const a = process.argv.slice(2);\nif (a[0] === 'machine') process.stdout.write('[]');\n` +
           `else if (a[1] === 'setup') process.stdout.write(JSON.stringify({ syncSetup: 1, backup: { kind: 'folder', path: ${JSON.stringify(share)} }, key: null, ` +
-          `record: { state: 'unclaimed', lastWrite: 'last written by laptop' }, plan: { machines: [{ pulls: [] }] }, planError: "the backup folder holds a record under this machine's name" }));\n`, { mode: 0o755 });
+          `record: { state: 'unclaimed', lastWrite: 'last written by laptop' }, plan: { machines: [{ pulls: [] }] }, planError: "the backup folder holds a record under this machine's name" }));\n`);
         process.env.CLAUDE_OBSERVATORY_BIN = fakeRefused;
         vscode.window.showWarningMessage = () => Promise.resolve(undefined);
         quickPick = 2;
@@ -6603,10 +6615,9 @@ else if (all.includes('--machine lab-a')) {
         assert.doesNotMatch(saidRefused, /could not be made/);
         // Another machine's writer, or a copy of this one's (state `other`): the record's note says it is not this machine's,
         // and the plan's reason, which names what to do in that case, is said with the preview.
-        const fakeOther = path.join(fakeBin, 'oak-setup-other');
-        fs.writeFileSync(fakeOther, `#!${process.execPath}\nconst a = process.argv.slice(2);\nif (a[0] === 'machine') process.stdout.write('[]');\n` +
+        const fakeOther = nodeFake('oak-setup-other', `const a = process.argv.slice(2);\nif (a[0] === 'machine') process.stdout.write('[]');\n` +
           `else if (a[1] === 'setup') process.stdout.write(JSON.stringify({ syncSetup: 1, backup: { kind: 'folder', path: ${JSON.stringify(share)} }, key: null, ` +
-          `record: { state: 'other', lastWrite: 'last written by laptop' }, plan: { machines: [{ pulls: [] }] }, planError: "another machine has a copy of this machine's sync state." }));\n`, { mode: 0o755 });
+          `record: { state: 'other', lastWrite: 'last written by laptop' }, plan: { machines: [{ pulls: [] }] }, planError: "another machine has a copy of this machine's sync state." }));\n`);
         process.env.CLAUDE_OBSERVATORY_BIN = fakeOther;
         quickPick = 2;
         const setUpOther = infoMessages.filter((m) => m.startsWith('OAK sync is set up')).length;
@@ -6616,9 +6627,8 @@ else if (all.includes('--machine lab-a')) {
           /A first run here would pull nothing\. The backup folder cannot be used: another machine has a copy of this machine's sync state\.$/);
         // A key made here: a modal message, whose detail says how each other machine takes it, with the setup that brings
         // the key and the folder together (`oak sync key --from` alone is refused where another folder is set).
-        const fakeMade = path.join(fakeBin, 'oak-setup-made');
-        fs.writeFileSync(fakeMade, `#!${process.execPath}\nconst a = process.argv.slice(2);\nif (a[0] === 'machine') process.stdout.write('[]');\n` +
-          `else if (a[1] === 'setup') process.stdout.write(JSON.stringify({ syncSetup: 1, backup: { kind: 'folder', path: ${JSON.stringify(share)} }, key: { fingerprint: 'ab12-cd34', made: true, imported: false }, plan: { machines: [{ pulls: [] }] } }));\n`, { mode: 0o755 });
+        const fakeMade = nodeFake('oak-setup-made', `const a = process.argv.slice(2);\nif (a[0] === 'machine') process.stdout.write('[]');\n` +
+          `else if (a[1] === 'setup') process.stdout.write(JSON.stringify({ syncSetup: 1, backup: { kind: 'folder', path: ${JSON.stringify(share)} }, key: { fingerprint: 'ab12-cd34', made: true, imported: false }, plan: { machines: [{ pulls: [] }] } }));\n`);
         process.env.CLAUDE_OBSERVATORY_BIN = fakeMade;
         const modal = [];
         const realInfo = vscode.window.showInformationMessage;
@@ -6660,34 +6670,39 @@ else if (all.includes('--machine lab-a')) {
         assert.deepEqual(fs.readFileSync(asks, 'utf8').trim().split('\n').filter((l) => l.startsWith('sync setup')), [`sync setup --folder ${folderNow} --restore --json`]);
         vscode.window.showWarningMessage = was.warn;
         process.env.CLAUDE_OBSERVATORY_BIN = TREE_OAK;
-        // A saved machine as the backup, chosen in the picker; the CLI's preview asks it over ssh, which fails.
-        fs.writeFileSync(machinesFile, JSON.stringify([{ id: 'm1', label: 'build-box', target: 'builder@build-box.example', session: 'default', enabled: true, selected: false }]));
-        quickPick = (items) => items.find((it) => it.label === 'A saved machine…') ?? items.find((it) => it === 'build-box');
-        await commands['claudeObservatory.syncSetup']();
-        await until(() => infoMessages.some((m) => m.startsWith('OAK sync is set up: the backup is build-box.')), 'set up with the saved machine');
-        assert.deepEqual(JSON.parse(fs.readFileSync(core.prefsPath(), 'utf8')).sync.backup, { kind: 'machine', label: 'build-box' });
-        // The refusal the last run left for the folder before says nothing of this backup: no reinstall row.
-        let rows = [];
-        quickPick = (items) => { rows = items.map((it) => it.label); return undefined; };
-        await commands['claudeObservatory.sync']();
-        assert.ok(rows.length && !rows.some((l) => /This machine is a reinstall/.test(l)), rows.join(' | '));
-        // A folder whose key this machine lacks, the key copied from that machine: asked of it over ssh (the stub fails, and
-        // the CLI's words say so).
-        const other3 = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-sync-other-'));
-        tmpDirs.push(other3);
-        const share3 = path.join(other3, 'share');
-        assert.equal(core.spawnToolSync(TREE_OAK, ['sync', 'backup', '--folder', share3], { env: { ...process.env, HOME: path.join(other3, 'h'), USERPROFILE: path.join(other3, 'h') }, encoding: 'utf8' }).status, 0);
-        const copyAsked = [];
-        vscode.window.showWarningMessage = (m, opts, ...items) => { copyAsked.push({ m, opts, items }); return Promise.resolve(items[0]); };
-        quickPick = (items) => items.find((it) => it.label === 'A folder…') ?? items.find((it) => it === 'build-box');
-        openDialogAnswer = [vscode.Uri.file(share3)];
         assert.deepEqual(errorMessages, [], 'no step before this one said an error');
-        await commands['claudeObservatory.syncSetup']();
-        assert.deepEqual(copyAsked[0].items, ['Copy it from a saved machine…', 'Paste it…'], 'a saved machine: the key can come from it');
-        await until(() => errorMessages.length > 0, 'it says why the copy failed');
-        assert.match(errorMessages[0], /^OAK: sync was not set up — .*build-box/);
-        assert.ok(fs.readFileSync(sshLog, 'utf8').includes('builder@build-box.example'), 'the key was asked of the saved machine');
-        vscode.window.showWarningMessage = was.warn;
+        // A saved machine is reached through herdr and ssh, which OAK runs as herdr.exe and ssh.exe on Windows; the stubs are
+        // POSIX scripts and cannot stand in for them there, so the steps with a saved machine are checked on macOS and Linux.
+        if (process.platform !== 'win32') {
+          // A saved machine as the backup, chosen in the picker; the CLI's preview asks it over ssh, which fails.
+          fs.writeFileSync(machinesFile, JSON.stringify([{ id: 'm1', label: 'build-box', target: 'builder@build-box.example', session: 'default', enabled: true, selected: false }]));
+          quickPick = (items) => items.find((it) => it.label === 'A saved machine…') ?? items.find((it) => it === 'build-box');
+          await commands['claudeObservatory.syncSetup']();
+          await until(() => infoMessages.some((m) => m.startsWith('OAK sync is set up: the backup is build-box.')), 'set up with the saved machine');
+          assert.deepEqual(JSON.parse(fs.readFileSync(core.prefsPath(), 'utf8')).sync.backup, { kind: 'machine', label: 'build-box' });
+          // The refusal the last run left for the folder before says nothing of this backup: no reinstall row.
+          let rows = [];
+          quickPick = (items) => { rows = items.map((it) => it.label); return undefined; };
+          await commands['claudeObservatory.sync']();
+          assert.ok(rows.length && !rows.some((l) => /This machine is a reinstall/.test(l)), rows.join(' | '));
+          // A folder whose key this machine lacks, the key copied from that machine: asked of it over ssh (the stub fails, and
+          // the CLI's words say so).
+          const other3 = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-sync-other-'));
+          tmpDirs.push(other3);
+          const share3 = path.join(other3, 'share');
+          assert.equal(core.spawnToolSync(TREE_OAK, ['sync', 'backup', '--folder', share3], { env: { ...process.env, HOME: path.join(other3, 'h'), USERPROFILE: path.join(other3, 'h') }, encoding: 'utf8' }).status, 0);
+          const copyAsked = [];
+          vscode.window.showWarningMessage = (m, opts, ...items) => { copyAsked.push({ m, opts, items }); return Promise.resolve(items[0]); };
+          quickPick = (items) => items.find((it) => it.label === 'A folder…') ?? items.find((it) => it === 'build-box');
+          openDialogAnswer = [vscode.Uri.file(share3)];
+          assert.deepEqual(errorMessages, [], 'no step before this one said an error');
+          await commands['claudeObservatory.syncSetup']();
+          assert.deepEqual(copyAsked[0].items, ['Copy it from a saved machine…', 'Paste it…'], 'a saved machine: the key can come from it');
+          await until(() => errorMessages.length > 0, 'it says why the copy failed');
+          assert.match(errorMessages[0], /^OAK: sync was not set up — .*build-box/);
+          assert.ok(fs.readFileSync(sshLog, 'utf8').includes('builder@build-box.example'), 'the key was asked of the saved machine');
+          vscode.window.showWarningMessage = was.warn;
+        }
         // Sync no longer in use (no run, no backup, no conflict): the item hides again.
         assert.equal(core.spawnToolSync(TREE_OAK, ['sync', 'setup', '--none', '--json'], { encoding: 'utf8' }).status, 0);
         for (const f of ['status.json', 'conflicts.json']) fs.rmSync(path.join(sync, f), { force: true });

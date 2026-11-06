@@ -16,7 +16,7 @@ for (const scenario of ['valid', 'tty', 'tty-retry', 'stale', 'foreign', 'timeou
   // Cleanup runs in registration order and stops at the first throw: removing home first, while the app still wrote to it,
   // threw ENOTEMPTY and skipped the kill and the server's stop, so a failing run hung the suite. Stop the app, then remove.
   const served = scenario === 'tty-retry' ? 'tty' : scenario;
-  const server = await require('../../core/test/fixtures/pane-context.cjs')(t, home, served, { delay: 200, awaitPid: true });
+  const server = await require('../../core/test/fixtures/pane-context.cjs')(t, home, served, { awaitPid: true });
   const marker = path.join(home, 'client-env');
   const binary = path.join(home, 'herdr');
   if (scenario === 'tty-retry') {
@@ -39,18 +39,21 @@ for (const scenario of ['valid', 'tty', 'tty-retry', 'stale', 'foreign', 'timeou
     terminal.dispose();
     fs.rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   });
-  const tty = spawnSync('ps', ['-p', String(child.pid), '-o', 'tty='], { encoding: 'utf8' }).stdout.trim();
-  server.update({ pid: child.pid, ...(served === 'tty' ? { tty: `/dev/${tty}` } : {}) });
   let firstPaint = 0;
   child.onData(data => {
-    terminal.write(data);
-    if (!firstPaint && /F[123]/.test(data)) firstPaint = Date.now();
+    terminal.write(data, () => {
+      if (!firstPaint && /F[123]/.test(data)) firstPaint = Date.now();
+    });
   });
   const until = async predicate => { for (const end = Date.now() + 6000; !predicate() && Date.now() < end;) await new Promise(r => setTimeout(r, 20)); assert.ok(predicate()); };
   await until(() => firstPaint && server.calls().some(c => c.method === 'pane.process_info'));
-  const requestedAt = server.calls().find(c => c.method === 'pane.process_info').at;
-  assert.ok(firstPaint < requestedAt + 200, 'first frame precedes the delayed membership answer');
   const row = () => terminal.buffer.active.getLine(0)?.translateToString(true) ?? '';
+  assert.match(row(), /F1 herdr/, 'first frame precedes the membership answer');
+  // On macOS spawn returns before spawn-helper acquires the controlling tty. The first frame proves
+  // that helper has exec'd the app; only now can ps supply the pane's tty to the waiting server.
+  const tty = spawnSync('ps', ['-p', String(child.pid), '-o', 'tty='], { encoding: 'utf8' }).stdout.trim();
+  assert.ok(tty && !/^[?\-]+$/.test(tty), `the painted child has a controlling tty: ${JSON.stringify(tty)}`);
+  server.update({ pid: child.pid, ...(served === 'tty' ? { tty: `/dev/${tty}` } : {}) });
   const nested = scenario === 'valid' || served === 'tty';
   if (nested) await until(() => !row().includes('herdr'));
   else { await new Promise(r => setTimeout(r, 600)); assert.match(row(), /F1 herdr/); }

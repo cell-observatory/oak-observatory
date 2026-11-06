@@ -18,6 +18,9 @@ function fixture(t) {
     assert.equal(options.env.GIT_OPTIONAL_LOCKS, '0');
     const a = args.slice(args.indexOf('-C') + 2);
     state.calls.push(a);
+    // A status that takes `statusMs`: past its timeout, spawnSync kills it and says ETIMEDOUT.
+    if (a[0] === 'status' && options.timeout < (state.statusMs ?? 0))
+      return { status: null, signal: 'SIGTERM', error: Object.assign(new Error('spawnSync git ETIMEDOUT'), { code: 'ETIMEDOUT' }), stdout: '', stderr: '' };
     let stdout = '';
     if (a[0] === 'status') stdout = state.status;
     else if (a[0] === 'rev-parse') stdout = a.includes('--abbrev-ref') || a.includes('--symbolic-full-name') ? 'main\n' : state.head + '\n';
@@ -57,6 +60,18 @@ test('agent worktree: create, detect --cwd, refuse dirty/missing repositories an
   core.removeAgentWorktree(w);
   assert.equal(fs.existsSync(w.path), false);
   assert.ok(f.state.calls.some(a => a[0] === 'worktree' && a[1] === 'remove' && !a.includes('--force')));
+});
+
+test('agent worktree: removal waits on a Git slower than a refresh allows, and says when it could not read (Windows CI 2026-11-06)', (t) => {
+  const f = fixture(t);
+  const w = core.createAgentWorktree(f.work, 'agent-x'), v = core.createAgentWorktree(f.work, 'agent-y');
+  f.state.statusMs = 800; // a status in a large tree, or on a slow machine: past a refresh's 500 ms a call
+  assert.match(core.readAgentWorktree(w).error, /ETIMEDOUT/, 'control: the refresh read gives up on it');
+  core.removeAgentWorktree(w);
+  assert.equal(fs.existsSync(w.path), false, 'a clean, merged worktree is removed');
+  f.state.statusMs = 60000; // past the removal's wait too
+  assert.throws(() => core.removeAgentWorktree(v), /^Error: could not read the worktree before removal \(agent worktree: spawnSync git ETIMEDOUT\); nothing was removed$/);
+  assert.ok(fs.existsSync(v.path), 'a worktree it could not read stays');
 });
 
 test('agent worktree: clean, dirty, ahead, behind, merged, binary and untracked changes', (t) => {

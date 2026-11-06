@@ -22617,9 +22617,11 @@ function quotaLineRig(now) {
   const inst = cp.spawnSync('bash', [path.resolve(__dirname, '../../cli/statusline/install-statusline.sh'), '--force'], { env, encoding: 'utf8' });
   assert.equal(inst.status, 0, `installer runs — ${(inst.stderr || '').trim()}`);
   if (now !== undefined) {
-    // One clock for the shell, its Python scan and the terminal port, even on a slow runner.
+    // One clock for the shell (its epoch, and the time and day line 1 shows), its Python scan and the terminal port,
+    // even on a slow runner, whose renders straddle a minute: GNU date takes `-d @<epoch>`, BSD date `-r <epoch>`.
     const file = path.join(cdir, 'statusline.sh');
-    fs.writeFileSync(file, `date() { if [ "$*" = +%s ]; then echo ${now}; else command date "$@"; fi; }\n` + fs.readFileSync(file, 'utf8'));
+    fs.writeFileSync(file, `date() { case "$*" in +%s) echo ${now} ;; +*) command date -d @${now} "$@" 2>/dev/null || command date -r ${now} "$@" ;; *) command date "$@" ;; esac; }\n` +
+      fs.readFileSync(file, 'utf8'));
     env.STATUSLINE_NOW = String(now);
   }
   const render = (state, input, cache, extra = {}, bash = 'bash') => {
@@ -23526,18 +23528,31 @@ test('statusline: a render waits about a second for a held cache lock, then writ
   // eslint-disable-next-line no-control-regex
   const vis = (s) => s.replace(/\x1b\[[0-9;]*m/g, '');
   const entries = () => (fs.existsSync(f.lock) ? fs.readdirSync(f.lock).map((n) => n.replace(/^\d+\./, 'T.')) : null);
+  // The wait is timed inside the render, around the lock's wait alone. A render's whole time is mostly process starts,
+  // which on a Windows runner (about 4 s a render) vary by more than the wait: a render with the lock held, which waits
+  // and skips the write, ran 217 ms and once 1272 ms shorter than the same render with it free.
+  const script = path.join(rig.cdir, 'statusline.sh');
+  const src = fs.readFileSync(script, 'utf8');
+  assert.ok(src.includes('\n_lock && _sweep\n'), 'control: the render takes the lock here');
+  fs.writeFileSync(script, src.replace('\n_lock && _sweep\n', '\nTIMEFORMAT=%3R; { time _lock; } 2>> "$OAK_TEST_LOCK_WAITS" && _sweep\n'));
+  rig.env.OAK_TEST_LOCK_WAITS = path.join(rig.home, 'lock-waits');
+  const waits = () => (fs.existsSync(rig.env.OAK_TEST_LOCK_WAITS) ? fs.readFileSync(rig.env.OAK_TEST_LOCK_WAITS, 'utf8').trim().split('\n')
+    .map((l) => Math.round(Number(l.replace(',', '.')) * 1000)) : []);
   f.reset();
   const base = await startRender(rig, input); // the same render with the lock free
   assert.equal(f.read().five_pct, 25, 'control: with the lock free, the render writes');
+  assert.equal(waits().length, 1, 'control: the render timed its lock');
   const held = async (name, setup, extra = {}, bash = 'bash') => {
     f.reset();
     setup();
     const before = entries();
+    const timed = waits().length;
     const r = await startRender(rig, input, extra, bash);
     assert.equal(r.code, 0, name);
     assert.match(vis(r.out.split('\n')[2] || ''), /^5h +~1\.5M\/6M +25% /, `${name}: the line is drawn — got ${JSON.stringify(vis(r.out))}`);
-    const waited = r.ms - base.ms;
-    assert.ok(waited >= 600 && waited <= 3000, `${name}: it waited about a second, and no longer — ${waited} ms over the free lock's ${base.ms} ms`);
+    assert.equal(waits().length, timed + 1, `${name}: control: the render timed its lock`);
+    const waited = waits().at(-1);
+    assert.ok(waited >= 600 && waited <= 3000, `${name}: it waited about a second, and no longer — ${waited} ms for the lock, in a render of ${r.ms} ms (${base.ms} ms with the lock free)`);
     assert.deepEqual(f.read(), f.cache, `${name}: and wrote nothing`);
     return { before, after: entries() };
   };
@@ -24833,9 +24848,10 @@ test('statusline: a narrow pane compacts the line before it wraps it, never cuts
   // anything. Now the gauges go to text, then lose their token figures, and only then wrap; line 2 drops its parts from
   // the output style up and keeps the model and the context figure on one row; the title wraps at its spaces. A session
   // that started agents shows its own tokens and its tokens with them, each labelled.
-  const rig = quotaLineRig();
-  if (!rig) return t.skip('python3 or jq is not installed');
+  // One clock for every render: rows drawn a minute apart differ in the time line 1 shows.
   const nowS = Math.floor(Date.now() / 1000);
+  const rig = quotaLineRig(nowS);
+  if (!rig) return t.skip('python3 or jq is not installed');
   const state = { v: 2, last_scan: nowS, tpp5: 60000, tpp7: 300000, tppE5: 60000, tppE7: 300000, R5: 41_000_000, a30: 0,
     mo_start: nowS - 10 * 86400, mo_end: nowS + 20 * 86400 + 30, fc: {} };
   const r5 = nowS + 4 * 3600 + 30;

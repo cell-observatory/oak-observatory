@@ -4,6 +4,7 @@ if (!isMainThread) {
   const net = require('node:net');
   const fs = require('node:fs');
   const sockets = new Set();
+  const pending = new Set();
   const server = net.createServer(socket => {
     sockets.add(socket);
     socket.on('close', () => sockets.delete(socket));
@@ -28,15 +29,19 @@ if (!isMainThread) {
       };
       // `awaitPid`: a test that learns the pane's pid only after starting its client holds the answer until it is set,
       // so a slow machine cannot answer for a pane with no process yet.
-      const answer = () => workerData.awaitPid && workerData.pid === undefined && Date.now() - asked < 10000 ? setTimeout(answer, 10) : reply();
-      const asked = Date.now();
+      const answer = () => workerData.awaitPid && workerData.pid === undefined ? pending.add(reply) : reply();
       if (workerData.delay) setTimeout(answer, workerData.delay); else answer();
     });
   });
   server.on('error', error => parentPort.postMessage({ error: error.message }));
   // Where herdr's clients connect: the marker itself, or on Windows the named pipe it names.
   server.listen(require('../../dist/herdr').herdrConnectPath({ HERDR_SOCKET_PATH: workerData.socketPath }), () => parentPort.postMessage({ ready: true }));
-  parentPort.on('message', message => Object.assign(workerData, message));
+  parentPort.on('message', message => {
+    Object.assign(workerData, message);
+    if (workerData.pid === undefined) return;
+    for (const reply of pending) reply();
+    pending.clear();
+  });
 } else {
   module.exports = async function paneServer(t, dir, scenario, options = {}) {
     const path = require('node:path');

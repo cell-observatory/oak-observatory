@@ -316,7 +316,11 @@ export function repoRoot(cwd: string): string | null {
           try {
             const buf = Buffer.alloc(255);
             const value = buf.toString('utf8', 0, fs.readSync(fd, buf, 0, buf.length, 0));
-            validHead = /^ref:[ \t\r\n\f\v]*refs\//.test(value) || /^[0-9a-fA-F]{40}/.test(value);
+            // git's own test: `ref:`, any ASCII whitespace, then `refs/`. Written out, not as a regex: that regex beside
+            // herdr.ts's Codex row was enough to keep CodeQL's ReDoS query from finishing (2026-11-06).
+            let at = value.startsWith('ref:') ? 4 : -1;
+            while (at >= 0 && at < value.length && ' \t\r\n\f\v'.includes(value[at])) at++;
+            validHead = (at >= 0 && value.startsWith('refs/', at)) || /^[0-9a-fA-F]{40}/.test(value);
           } finally { fs.closeSync(fd); }
         }
         if (validHead) {
