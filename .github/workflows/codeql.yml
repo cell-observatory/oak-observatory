@@ -20,14 +20,9 @@ permissions:
 jobs:
   analyze:
     name: Analyze (${{ matrix.language }})
-    # The organization's self-hosted Linux runners (the labels every one of them carries), in a fresh container whose
-    # Node the TypeScript extractor needs, as uid 1000, the runner accounts' own.
-    runs-on: [self-hosted, Linux, X64]
-    container:
-      image: mcr.microsoft.com/devcontainers/javascript-node:22-bookworm
-      # --init: the runner starts the container on `tail -f /dev/null`, which never collects an ended process, so a test
-      # that stops a child would see it linger as a zombie; docker's init is process 1 instead and collects them.
-      options: --user 1000:1000 --init
+    # GitHub-hosted: the analysis takes about a minute here. In a container on the self-hosted runners the JavaScript
+    # analysis stalled on its last query for over half an hour (2026-11-06), holding a runner.
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
