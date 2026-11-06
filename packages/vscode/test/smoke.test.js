@@ -6432,8 +6432,8 @@ else if (all.includes('--machine lab-a')) {
         // sync's own files are watched: a change reads its status again, through the CLI.
         const watcher = fsWatchers.find((w) => String(w.pattern) === 'sync/{status.json,conflicts.json,now.lock,key}' && !w.disposed);
         assert.ok(watcher, 'sync\'s files are watched');
-        assert.equal(watcher.base.fsPath, core.rootDir(), 'in the store, wherever it is');
-        assert.ok(fsWatchers.some((w) => w.pattern === 'prefs.json' && !w.disposed && w.base.fsPath === path.dirname(core.prefsPath())), 'and prefs.json where it is, beside the config, not the store');
+        assert.equal(watcher.base.fsPath, toFsPath(core.rootDir()), 'in the store, wherever it is');
+        assert.ok(fsWatchers.some((w) => w.pattern === 'prefs.json' && !w.disposed && w.base.fsPath === toFsPath(path.dirname(core.prefsPath()))), 'and prefs.json where it is, beside the config, not the store');
         watcher.change.forEach((f) => f());
         await until(() => item.visible, 'the item shows once sync is in use');
         assert.equal(item.text, '$(sync) OAK sync: 1 conflict');
