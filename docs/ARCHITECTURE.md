@@ -613,8 +613,8 @@ share would put SQLite's write-ahead log where it is unsafe, and a store move wo
 **Runtime.** Node's built-in `node:sqlite`, loaded the first time the database is asked for (never when core loads, and
 never by the capture hook, which does not open SQLite). The database needs FTS5, which the Node releases before 22.16 lack
 (22.13, 22.14 and 22.15 were checked) and 22.16 has, and no Node 23 release has (each was checked; those before 23.11
-also lack `StatementSync.columns`, which every query reads its columns with), so OAK needs Node.js 22 (22.16 or newer)
-or 24 or newer (`INDEX_NODES` in `runtime.ts`, which the CLI startup guard, install checks, `engines` and
+also lack `StatementSync.columns`, which every query reads its columns with). OAK supports Node.js 24 or newer
+(`INDEX_NODES` in `runtime.ts`, which the CLI startup guard, install checks, `engines` and
 `oak machine add` follow). The CLI refuses unsupported Node versions before dispatch, including `help`; the capture
 hooks alone still record there (the capture bundle runs on Node 20), with the same warning on stderr. An editor
 embedding core can still fall back to file readers when its host lacks SQLite. A Node built against the system's SQLite has whatever that has, so FTS5 is probed rather than assumed. Node 22 prints an

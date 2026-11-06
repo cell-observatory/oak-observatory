@@ -24,14 +24,13 @@ export function indexDir(): string {
   return path.join(claudeConfigDir(), 'claude-observatory-index');
 }
 
-/** Whether a Node release runs the index, by its version (`v24.1.0` or `24.1.0`; runtime.ts INDEX_NODES): 22.16 and the 22
- *  releases after it, and 24 and later. Here, by its version alone, so the capture hooks' kick loads nothing that reads
- *  SQLite. */
+/** Whether OAK supports a Node release to run the index, by its version (`v24.1.0` or `24.1.0`; runtime.ts INDEX_NODES):
+ *  24 and later. Here, by its version alone, so the capture hooks' kick loads nothing that reads SQLite. */
 export function nodeRunsIndex(version: string): boolean {
   const m = /^v?(\d+)\.(\d+)\./.exec(version.trim());
   if (!m) return false;
   const major = Number(m[1]);
-  return major >= 24 || (major === 22 && Number(m[2]) >= 16);
+  return major >= 24;
 }
 
 /** How often a background build may be started. */

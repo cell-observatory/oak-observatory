@@ -48,19 +48,19 @@ test('CLI launcher: unsupported Node is refused before loading OAK, while captur
   b.env.XDG_CACHE_HOME = path.join(b.home, 'cache');
   for (const version of ['20.19.0', '22.15.1', '23.11.1', '22.16.0', '24.0.0']) {
     fs.writeFileSync(preload, `Object.defineProperty(process.versions, 'node', { value: '${version}' }); Object.defineProperty(process, 'version', { value: 'v${version}' });`);
-    const supported = ['22.16.0', '24.0.0'].includes(version);
+    const supported = version === '24.0.0';
     const r = run(b, process.execPath, ['--require', preload, cli, '--version']);
     assert.equal(r.status, supported ? 0 : 1, `${version}: ${r.stdout}${r.stderr}`);
     if (supported) assert.match(r.stdout, /^oak /);
     else {
       assert.equal(r.stdout, '');
-      assert.ok(r.stderr.includes(`needs Node.js 22 (22.16 or newer) or 24 or newer; found v${version}`), r.stderr);
+      assert.ok(r.stderr.includes(`needs Node.js 24 or newer; found v${version}`), r.stderr);
       assert.equal(fs.existsSync(b.env.XDG_CACHE_HOME), false, 'refusal precedes even the compile cache');
       assert.equal(fs.existsSync(b.env.CLAUDE_CONFIG_DIR), false, 'no store or settings written');
       const capture = run(b, process.execPath, ['--require', preload, cli, 'capture']);
       assert.equal(capture.status, 0, 'an unsupported Node must not block the agent tool call');
       assert.equal(capture.stdout, '');
-      assert.match(capture.stderr, /needs Node.js 22/);
+      assert.match(capture.stderr, /needs Node.js 24/);
       // And it still records (review 2026-11-05): an update that lands on the Node 0.10 ran on must not silently stop
       // recording edits. A home of its own, so the checks above stay about the refusal.
       const c = fixture(t), ws = path.join(c.home, 'ws'), file = path.join(ws, 'a.txt');
@@ -653,10 +653,9 @@ test('CLI machine add: also installs the oak stack + capture hooks on the remote
   assert.doesNotMatch(again.stdout, /oak sync setup/, 'declined: not offered again');
 });
 
-// OAK needs a Node that runs the local index (node:sqlite with FTS5: 22 from 22.16, no 23 release, 24 and later), on the
-// remote as here: any other Node there is named, and nothing of oak is copied.
-test('CLI machine add: a remote whose Node cannot run the local index (before 22.16, or any 23) is named and is not given oak', { skip: process.platform === 'win32' && 'POSIX fake tools' }, t => {
-  for (const [node, installs] of [['v22.15.1', false], ['v20.11.0', false], ['v23.4.0', false], ['v23.11.1', false], ['v22.16.0', true], ['v24.18.0', true]]) {
+// OAK needs Node 24 or later on the remote as here: any other Node there is named, and nothing of oak is copied.
+test('CLI machine add: a remote whose Node is older than 24 is named and is not given oak', { skip: process.platform === 'win32' && 'POSIX fake tools' }, t => {
+  for (const [node, installs] of [['v22.15.1', false], ['v20.11.0', false], ['v23.11.1', false], ['v22.16.0', false], ['v24.0.0', true], ['v24.18.0', true]]) {
     const b = fixture(t);
     const bin = path.join(b.home, 'bin');
     fs.mkdirSync(bin, { recursive: true });
@@ -669,7 +668,7 @@ test('CLI machine add: a remote whose Node cannot run the local index (before 22
     assert.equal(result.status, 0, result.stderr + result.stdout);
     const l = fs.readFileSync(b.env.MACHINE_ADD_LOG, 'utf8');
     assert.equal(/scp .*index\.js testtgt:/.test(l), installs, `${node}: ${l}`);
-    assert.equal(result.stdout.includes(`oak not installed on testtgt: needs Node.js 22 (22.16 or newer) or 24 or newer (found ${node})`), !installs, `${node}: ${result.stdout}`);
+    assert.equal(result.stdout.includes(`oak not installed on testtgt: needs Node.js 24 or newer (found ${node})`), !installs, `${node}: ${result.stdout}`);
     assert.match(l, /herdr machine add testtgt --label testlbl/, `${node}: still saves the machine in herdr`);
   }
 });
@@ -750,7 +749,7 @@ test('CLI machine add: an oak there that is not its launcher is left as it is, a
   b.env.REMOTE = remote;
   const log = path.join(b.home, 'tools.log');
   b.env.TOOLS_LOG = log;
-  // ssh runs the remote command in the remote home, as sshd does, with Node 22.16+ on its PATH; scp copies there.
+  // ssh runs the remote command in the remote home, as sshd does, with Node 24+ on its PATH; scp copies there.
   fs.writeFileSync(path.join(bin, 'ssh'), `#!/bin/sh
 [ "$1" = -G ] && exit 0
 for a in "$@"; do last="$a"; done
@@ -3917,8 +3916,8 @@ test('CLI __after-update: the installed CLI reports what it did to the one that 
   assert.equal(/Local database/.test(r.stdout), !realCore.indexRuntime().ok, 'nothing said where this Node runs the index');
   const old = run(f.b, process.execPath, [cli, '__after-update'], { env: { ...f.b.env, OAK_INDEX_TEST_MODULE: 'oak-no-such-sqlite' }, timeout: 60000 });
   assert.equal(old.status, 0, old.stderr);
-  assert.match(old.stdout, /Local database: this Node \(v[\d.]+\) has no node:sqlite; the database needs Node\.js 22 \(22\.16 or newer\) or 24 or newer/);
-  assert.match(old.stdout, /→ Install Node\.js 22 \(22\.16 or newer\) or 24 or newer \(this is v[\d.]+\)\./);
+  assert.match(old.stdout, /Local database: this Node \(v[\d.]+\) has no node:sqlite; the database needs Node\.js 24 or newer/);
+  assert.match(old.stdout, /→ Install Node\.js 24 or newer \(this is v[\d.]+\)\./);
 });
 
 test('CLI update: stopped while its saved machines run, it stops each ssh it started there', { skip: process.platform === 'win32' && 'POSIX fakes' }, async t => {

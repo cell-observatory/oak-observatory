@@ -143,13 +143,13 @@ module.exports = { DatabaseSync, constants: {} };`);
   core.resetIndexRuntime();
   let rt = core.indexRuntime();
   assert.equal(rt.ok, false);
-  assert.match(rt.reason, /no full-text search \(FTS5\).*; the database needs Node\.js 22 \(22\.16 or newer\) or 24 or newer$/);
-  // `oak query --status` names the releases that run it, beside the oldest (no 23 release is one).
-  assert.deepEqual([core.indexStatus().floor, core.indexStatus().nodes], ['22.16.0', 'Node.js 22 (22.16 or newer) or 24 or newer']);
+  assert.match(rt.reason, /no full-text search \(FTS5\).*; the database needs Node\.js 24 or newer$/);
+  // `oak query --status` names the releases OAK supports to run it, beside the oldest.
+  assert.deepEqual([core.indexStatus().floor, core.indexStatus().nodes], ['24.0.0', 'Node.js 24 or newer']);
   process.env.OAK_INDEX_TEST_MODULE = path.join(f.dir, 'absent.cjs');
   core.resetIndexRuntime();
   rt = core.indexRuntime();
-  assert.match(rt.reason, /has no node:sqlite.*22\.16/);
+  assert.match(rt.reason, /has no node:sqlite.*Node\.js 24 or newer/);
   // FTS5 from the system's SQLite, with the node:sqlite of a release before 22.16 (no StatementSync.columns).
   const older = path.join(f.dir, 'older-sqlite.cjs');
   fs.writeFileSync(older, `class DatabaseSync { constructor() {} prepare() { return { get: () => ({ v: '3.47.2', n: 1 }) }; } exec() {} close() {} }
@@ -159,7 +159,7 @@ module.exports = { DatabaseSync, StatementSync, constants: {} };`);
   core.resetIndexRuntime();
   rt = core.indexRuntime();
   assert.equal(rt.ok, false);
-  assert.match(rt.reason, /no StatementSync\.columns.*22\.16/);
+  assert.match(rt.reason, /no StatementSync\.columns.*Node\.js 24 or newer/);
   delete process.env.OAK_INDEX_TEST_MODULE;
   process.env.OAK_INDEX = 'off';
   core.resetIndexRuntime();
@@ -1763,7 +1763,7 @@ test('index: a damaged index file is reported by the status and doctor\'s row, n
   // A Node with no FTS5 is told to upgrade, not to move the file.
   process.env.OAK_INDEX_TEST_MODULE = path.join(f.dir, 'absent.cjs');
   core.resetIndexRuntime();
-  assert.match(core.diagnoseIndex().fix, /^Install Node\.js 22 \(22\.16 or newer\) or 24 or newer \(this is v[\d.]+\)\.$/);
+  assert.match(core.diagnoseIndex().fix, /^Install Node\.js 24 or newer \(this is v[\d.]+\)\.$/);
   delete process.env.OAK_INDEX_TEST_MODULE;
   core.resetIndexRuntime();
   // A file this Node can run but cannot open (not this user's to read) is neither: the detail says what failed.

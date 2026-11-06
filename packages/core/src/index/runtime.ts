@@ -15,14 +15,15 @@
  */
 import type * as Sqlite from 'node:sqlite';
 
-/** The oldest Node whose bundled SQLite has FTS5 (22.13 to 22.15 do not). */
-export const INDEX_NODE_FLOOR = '22.16.0';
+/** The oldest Node OAK supports. Its bundled SQLite has FTS5, as 22.16 and later 22 releases' do (22.13 to 22.15 do not),
+ *  but OAK supports 24 and later only. */
+export const INDEX_NODE_FLOOR = '24.0.0';
 
 /** The Node releases that run the index, as their own builds decide it (probed on 22.13, 22.15, 22.16 and 22.23, on
  *  every 23 release, and on the first and latest 24, 25 and 26): 22.16 and the 22 releases after it, and 24 and later.
  *  No 23 release does: its SQLite has no FTS5, that of 23.11 (the first 23 with StatementSync.columns) included.
- *  `engines` in the CLI's package.json and the install checks say the same. */
-export const INDEX_NODES = 'Node.js 22 (22.16 or newer) or 24 or newer';
+ *  OAK supports 24 and later: `engines` in the CLI's package.json and the install checks say the same. */
+export const INDEX_NODES = 'Node.js 24 or newer';
 
 /** Whether a Node release runs the index, by its version (`v24.1.0` or `24.1.0`; INDEX_NODES): what the install
  *  checks and `oak machine add` ask of a Node they cannot probe. Kept beside the index's location, which loads nothing

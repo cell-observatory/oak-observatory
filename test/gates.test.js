@@ -133,11 +133,10 @@ test('installers: a failed or missing oak at the hooks prompt does not end the s
   }
 });
 
-test('install.sh and bootstrap.sh stop on a Node.js that cannot run the local index (before 22.16, or any 23), before they install anything', { skip: process.platform === 'win32' && 'POSIX bash' }, t => {
-  // The local index uses the SQLite built into Node, with full-text search on 22 only from 22.16 (22.13 and 22.15 lack
-  // it), on no 23 release, and on every 24 and later (core INDEX_NODES, which these checks agree with), and @vscode/vsce 4
-  // needs Node.js 22, which npm installs on 20 with only an EBADENGINE warning. Each script's npm here logs each call and
-  // fails, so a run ends at its first one; bootstrap.sh's curl does the same.
+test('install.sh and bootstrap.sh stop on a Node.js older than 24, before they install anything', { skip: process.platform === 'win32' && 'POSIX bash' }, t => {
+  // OAK supports Node.js 24 and later (core INDEX_NODES, which these checks agree with); 22.16 runs the index too, but is
+  // not supported. Each script's npm here logs each call and fails, so a run ends at its first one; bootstrap.sh's curl
+  // does the same.
   const box = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-install-node-'));
   t.after(() => fs.rmSync(box, { recursive: true, force: true }));
   fs.copyFileSync(path.join(root, 'install.sh'), path.join(box, 'install.sh'));
@@ -154,8 +153,8 @@ test('install.sh and bootstrap.sh stop on a Node.js that cannot run the local in
     return { status: r.status, out: r.stdout + r.stderr, log: fs.existsSync(log) ? fs.readFileSync(log, 'utf8') : '' };
   };
   const core = require(path.join(root, 'packages/core/dist/index.js'));
-  const refused = ['v22.15.0', 'v22.0.0', 'v20.19.0', 'v18.20.4', 'v23.0.0', 'v23.10.0', 'v23.11.1'];
-  const taken = ['v22.16.0', 'v22.23.4', 'v24.0.0', 'v24.18.0', 'v26.13.0'];
+  const refused = ['v22.16.0', 'v22.23.4', 'v22.15.0', 'v20.19.0', 'v18.20.4', 'v23.0.0', 'v23.11.1'];
+  const taken = ['v24.0.0', 'v24.18.0', 'v26.13.0'];
   for (const version of [...refused, ...taken]) assert.equal(core.nodeRunsIndex(version), taken.includes(version), `the index's own rule: ${version}`);
   // `engines`, which npm checks with this same semver, as npm calls it (npm-install-checks: includePrerelease), takes
   // exactly those. (semver is no dependency of this repository's own: npm hoists it from the toolchain's, and the require
@@ -163,13 +162,13 @@ test('install.sh and bootstrap.sh stop on a Node.js that cannot run the local in
   const engines = JSON.parse(read('packages/cli/package.json')).engines.node;
   for (const version of [...refused, ...taken]) assert.equal(require('semver').satisfies(version, engines, { includePrerelease: true }), taken.includes(version), `engines ${engines}: ${version}`);
   // install.ps1, which no run here executes (nor does CI), holds the same rule and words.
-  assert.match(read('install.ps1'), /-lt 22 -or \[int\]\(\$nodeParts\[0\]\) -eq 23 -or \(\[int\]\(\$nodeParts\[0\]\) -eq 22 -and \[int\]\(\$nodeParts\[1\]\) -lt 16\)/);
-  assert.ok(read('install.ps1').includes('OAK needs Node.js 22 (22.16 or newer) or 24 or newer, and this is Node.js $nodeVersion.'));
+  assert.match(read('install.ps1'), /if \(\[int\]\(\$nodeParts\[0\]\) -lt 24\) \{/);
+  assert.ok(read('install.ps1').includes('OAK needs Node.js 24 or newer, and this is Node.js $nodeVersion.'));
   for (const script of ['install.sh', 'bootstrap.sh']) {
     for (const version of refused) {
       const r = run(script, version);
       assert.equal(r.status, 1, `${script} ${version}: ${r.out}`);
-      assert.ok(r.out.includes('needs Node.js 22 (22.16 or newer) or 24 or newer') && r.out.includes(`this is Node.js ${version}.`), `${script} ${version}: ${r.out}`);
+      assert.ok(r.out.includes('needs Node.js 24 or newer') && r.out.includes(`this is Node.js ${version}.`), `${script} ${version}: ${r.out}`);
       assert.equal(r.log, '', `${script} ${version}: nothing is installed`);
     }
   }
@@ -361,19 +360,19 @@ test('workflows: every setup-node step is the current major, and Pages builds on
   for (const file of fs.readdirSync(path.join(root, '.github/workflows'))) {
     for (const m of read(`.github/workflows/${file}`).matchAll(/actions\/setup-node@(v\d+)/g)) assert.equal(m[1], 'v7', file);
   }
-  assert.match(read('.github/workflows/pages.yml'), /setup-node@v7\n\s+with:\n\s+node-version: 22\n/);
+  assert.match(read('.github/workflows/pages.yml'), /setup-node@v7\n\s+with:\n\s+node-version: 24\n/);
 });
 
-test('workflows: Gradle and the JDK are set up before release.sh builds the JetBrains plugin, and packaging runs on Node 22', () => {
+test('workflows: Gradle and the JDK are set up before release.sh builds the JetBrains plugin, and packaging runs on Node 24', () => {
   // Set up after `npm run release`, the wrapper downloaded Gradle uncached and with no retry. @vscode/vsce 4 and
-  // its @azure dependencies need Node 22. vscode.yml runs on a self-hosted runner, which has no default JDK.
+  // its @azure dependencies need Node 22 or newer; OAK supports 24. vscode.yml runs on a self-hosted runner, which has no default JDK.
   assert.match(read('scripts/release.sh'), /gradlew buildPlugin/, 'release.sh builds the plugin itself');
   for (const [file, steps] of [['release.yml', ['actions/setup-java@', 'gradle/actions/setup-gradle@']],
     ['dev-release.yml', ['actions/setup-java@', 'gradle/actions/setup-gradle@']], ['vscode.yml', ['actions/setup-java@', 'gradle/actions/setup-gradle@']]]) {
     const src = read(`.github/workflows/${file}`), release = src.indexOf('- run: npm run release');
     assert.ok(release > 0, `${file} runs npm run release`);
     for (const step of steps) assert.ok(src.includes(step) && src.indexOf(step) < release, `${file}: ${step} comes before npm run release`);
-    assert.match(src, /node-version: 22\n/, `${file} packages the VS Code extension on Node 22`);
+    assert.match(src, /node-version: 24\n/, `${file} packages the VS Code extension on Node 24`);
   }
 });
 
@@ -1199,8 +1198,8 @@ test('the docs say where a file, a machine, a hand and a phase come from, as the
   assert.match(read('packages/cli/src/index.ts'), /const synced = core\.readSyncedHands\(Date\.now\(\), includeDone\);/);
   assert.match(readme, /are read from it as it stands, caught up or not/);
   assert.match(guide, /read from it as it stands, caught up or not/);
-  // `oak machine add` installs OAK only where Node runs the index: 22.16 and later 22, or 24 and up (never 23).
-  assert.match(read('packages/core/src/index/location.ts'), /return major >= 24 \|\| \(major === 22 && Number\(m\[2\]\) >= 16\);/);
+  // `oak machine add` installs OAK only where it supports the Node: 24 and up.
+  assert.match(read('packages/core/src/index/location.ts'), /return major >= 24;/);
   assert.doesNotMatch(agents, /Where the target has Node\.js 22\.16 or newer,/);
   // machine_label: the saved label, else the machine's own name; a query's --machine takes the id, self and a saved label
   // (query.ts machineIds), and refuses any other name.

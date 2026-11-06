@@ -81,7 +81,7 @@ The table below records historical results for an earlier backend. They do not q
 |---|---|---|
 | PyCharm / JetBrains | Shared core/CLI review policies, usage separation, watchers and legacy store reader | Historical 193 Java 21 tests; PyCharm 2026.1 Stats/usage inspection with the packaged plugin; Plugin Verifier for IntelliJ 2025.2 and PyCharm 2026.1. These checks predate the current Feed tab |
 | Remote backend / containers | Backend-owned homes/store, `CODEX_HOME`, Python SSH scanner includes native and archived Codex | Real SSH discovery of native Claude/Codex histories in custom homes; full Remote-SSH/Gateway/WSL IDE qualification remains separate |
-| Linux / Node | Node 22.16+ on 22, or 24+, advertised (20+ through 0.10); deterministic suites on 22.16 and 24 | Historical checks covered Node 20, 22 and 24 |
+| Linux / Node | Node 24+ advertised (20+ through 0.10); deterministic suites on 24 | Historical checks covered Node 20, 22 and 24 |
 | macOS | Native arm64 runtime and client checks | 643 JavaScript tests, 193 JetBrains tests, Node 20/22 parity, actual VS Code host, successful native Claude/GPT capture and Undo/Redo; native failure-recovery limitation R27 remains open. These historical checks do not qualify the current backend |
 | Windows | Existing CI lane and platform path/spawn implementation retained | No Windows runner used; Linux/macOS skip three Windows-only checks |
 

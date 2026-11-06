@@ -12,11 +12,11 @@
  * Node makes the rest of the path itself, and its recursive mkdir never returns under a folder that answers ENOENT to a
  * mkdir (one of /proc). `oak uninstall` names the same folder.
  */
-const [major, minor] = process.versions.node.split('.').map(Number);
-const old = major < 22 || major === 23 || (major === 22 && minor < 16);
+const major = Number(process.versions.node.split('.')[0]);
+const old = major < 24;
 const capture = process.argv[2] === 'capture' && !process.argv.includes('--help') && !process.argv.includes('-h');
 if (old) {
-  process.stderr.write(`oak: needs Node.js 22 (22.16 or newer) or 24 or newer; found ${process.version}. Install a supported Node and re-run.\n`);
+  process.stderr.write(`oak: needs Node.js 24 or newer; found ${process.version}. Install a supported Node and re-run.\n`);
   // The capture hooks keep recording (exit 0, never blocking the agent's tool call): the capture bundle runs on the Node
   // 0.10 supported (20 and newer), so an update that lands on an older Node does not silently stop recording edits
   // (review 2026-11-05). Everything else refuses, before the compile cache.

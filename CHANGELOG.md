@@ -10,7 +10,7 @@ the release notes.
 
 ### Upgrading from 0.10.0
 
-- **Node.js 22.16 or newer, or 24 or newer.** 0.10 ran on Node 20, and `oak update` installs this release there with
+- **Node.js 24 or newer.** 0.10 ran on Node 20, and `oak update` installs this release there with
   only npm's `EBADENGINE` warning. Every `oak` command then refuses to start until Node is upgraded; the capture hooks
   still record edits meanwhile. Check with `node --version` before updating.
 
@@ -519,9 +519,9 @@ the release notes.
   that carries the weekly window and no five-hour window is not taken for this:
   Claude Code leaves a five-hour window out of that input once its reset has passed, so an account whose window has
   ended sends one too. `oak update` or `oak statusline` refreshes an installed status line.
-- OAK needs Node.js 22 (22.16 or newer) or 24 or newer (it needed 20), enforced by the CLI before command dispatch: its local database uses the SQLite built into
-  Node, whose full-text search 22 has from 22.16 and no 23 release has. The install scripts and `oak machine add` check
-  for it, and CI runs on Node 22.16 and Node 24. An older OAK may install this release under an unsupported Node
+- OAK needs Node.js 24 or newer (it needed 20), enforced by the CLI before command dispatch: its local database uses
+  the SQLite built into Node, with full-text search. The install scripts and `oak machine add` check for it, and CI
+  runs on Node 24. An older OAK may install this release under an unsupported Node
   with npm’s `EBADENGINE` warning, but the new CLI refuses to start until Node is upgraded. The capture hooks keep
   recording edits there, saying on stderr that Node needs upgrading. An editor embedding core can still fall back to
   file readers when its own host lacks SQLite.
@@ -722,7 +722,7 @@ the release notes.
   gone. It stayed waiting.
 - On Windows, the local database catches up. NTFS gives most files an id above 2^53, which the database stored but
   could not read back as a number, so no catch-up finished and `oak usage` read no totals from the index.
-- On Windows 11 24H2 and Windows Server 2025 with Node 22.16 or 24.0–24.1, OAK keeps each transcript's derived facts
+- On Windows 11 24H2 and Windows Server 2025 with Node 24.0–24.1, OAK keeps each transcript's derived facts
   between reads, and the status line's usage read writes nothing when nothing changed. Those Node versions report
   another device for a file's path than for the open file, so no read counted as complete and every view re-read
   whole transcripts.

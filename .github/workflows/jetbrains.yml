@@ -45,7 +45,7 @@ jobs:
       - uses: gradle/actions/setup-gradle@v5
       - uses: actions/setup-node@v7
         with:
-          node-version: 22
+          node-version: 24
       # The headless-IDE tests drive the REAL CLI, so put it on PATH.
       - run: npm ci && npm run build && npm link -w oak-observatory
       - run: oak --version

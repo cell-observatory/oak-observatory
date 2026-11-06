@@ -12,7 +12,7 @@ oak tui
 
 `oak machine add <label> <ssh-target>` installs the version pinned in `herdr.lock` on the target over SSH,
 verifies its checksum, starts its server, and registers the machine in herdr. Where the target has
-Node.js 22 (22.16 or newer) or 24 or newer, it then copies OAK to `~/.local/lib/oak`, with a launcher at
+Node.js 24 or newer, it then copies OAK to `~/.local/lib/oak`, with a launcher at
 `~/.local/bin/oak`, and installs the capture hooks. An `oak` already on the target's PATH that it did not put there,
 installed by npm or linked to a checkout, is left as it is, and the capture hooks are installed with it. Use SSH keys or an
 existing SSH configuration; the operation is non-interactive. The herdr tab is its real client,

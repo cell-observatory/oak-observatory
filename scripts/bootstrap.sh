@@ -65,14 +65,13 @@ case "$CHANNEL" in
   *) warn "unknown channel \"$CHANNEL\" — use stable or dev"; exit 1 ;;
 esac
 
-command -v npm  >/dev/null 2>&1 || { warn "npm not found — install Node.js 22 (22.16 or newer) or 24 or newer first."; exit 1; }
-# OAK needs Node.js 22 (22.16 or newer) or 24 or newer: its local index uses the SQLite built into Node, whose full-text
-# search 22 has from 22.16 and no 23 release has (core runtime.ts INDEX_NODES).
-node_v="$(node -v 2>/dev/null || true)"; node_major="${node_v#v}"; node_minor="${node_major#*.}"; node_major="${node_major%%.*}"; node_minor="${node_minor%%.*}"
+command -v npm  >/dev/null 2>&1 || { warn "npm not found — install Node.js 24 or newer first."; exit 1; }
+# OAK needs Node.js 24 or newer (core runtime.ts INDEX_NODES): its local index uses the SQLite built into Node, with
+# full-text search.
+node_v="$(node -v 2>/dev/null || true)"; node_major="${node_v#v}"; node_major="${node_major%%.*}"
 case "$node_major" in ''|*[!0-9]*) node_major=0 ;; esac
-case "$node_minor" in ''|*[!0-9]*) node_minor=0 ;; esac
-if [ "$node_major" -lt 22 ] || [ "$node_major" -eq 23 ] || { [ "$node_major" -eq 22 ] && [ "$node_minor" -lt 16 ]; }; then
-  warn "OAK needs Node.js 22 (22.16 or newer) or 24 or newer, and this is Node.js ${node_v:-(none found)}. Install one of those and re-run."
+if [ "$node_major" -lt 24 ]; then
+  warn "OAK needs Node.js 24 or newer, and this is Node.js ${node_v:-(none found)}. Install it and re-run."
   exit 1
 fi
 command -v curl >/dev/null 2>&1 || { warn "curl not found — install curl first."; exit 1; }

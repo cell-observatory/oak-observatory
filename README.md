@@ -83,8 +83,8 @@ OAK complements Claude Code's `/rewind`, which works a whole turn at a time, wit
 ## Quickstart
 
 **1 — Install** the CLI, the terminal app and the editor extensions from the latest
-[release](https://github.com/cell-observatory/oak-observatory/releases) (requires Node.js 22.16 or a later 22,
-or 24 or newer, and `python3` on Linux and macOS; on Linux, also `make` and a C++ compiler for node-pty, the
+[release](https://github.com/cell-observatory/oak-observatory/releases) (requires Node.js 24 or newer, and
+`python3` on Linux and macOS; on Linux, also `make` and a C++ compiler for node-pty, the
 terminal app's herdr tab, with `oak attach` as the route that needs no PTY; see **Platforms** below):
 
 ```bash
@@ -518,8 +518,7 @@ may hold phantom `+N −0` / `+0 −N` edit pairs from that bug — they heal on
 ./install.sh --jetbrains     # also build + install the JetBrains plugin (needs a JDK 17 or newer)
 ```
 
-OAK needs Node.js 22 (22.16 or newer) or 24 or newer: its local database uses the SQLite built into Node, whose full-text
-search 22 has from 22.16 and no 23 release has.
+OAK needs Node.js 24 or newer: its local database uses the SQLite built into Node, with full-text search.
 
 Or step by step:
 
@@ -554,7 +553,7 @@ bash script and needs `jq` on the PATH, on every platform). Refresh the vendored
 
 ```bash
 npm run build:vscode
-cd packages/vscode && npm run package     # -> oak-observatory.vsix (needs Node.js 22.16 or a later 22, or 24 or newer)
+cd packages/vscode && npm run package     # -> oak-observatory.vsix (needs Node.js 24 or newer)
 code --install-extension oak-observatory.vsix
 ```
 

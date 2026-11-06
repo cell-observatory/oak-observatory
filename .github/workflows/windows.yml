@@ -20,10 +20,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 24 is here for one reason: DEP0190 is not a runtime warning on 20 or 22, so without a
-        # lane that emits it, "the update no longer prints a deprecation warning" (#45) is a claim
-        # CI cannot check. The reporter was on 24.18.
-        node: ['22.16', 24]
+        # OAK supports Node 24 and later (core INDEX_NODES). DEP0190 is a runtime warning on 24, so this lane
+        # also checks that "the update no longer prints a deprecation warning" (#45); the reporter was on 24.18.
+        node: [24]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7

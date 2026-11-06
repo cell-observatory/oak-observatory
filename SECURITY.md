@@ -59,8 +59,8 @@ connection and permissions. OAK’s network paths are:
   or an older one: it copies this machine's herdr when the platform and version match,
   and otherwise first downloads the target's binary from herdr's GitHub releases and
   verifies its checksum. On macOS it removes the binary's quarantine attribute. It
-  saves the machine in herdr (`herdr machine add`). When the target has Node.js 22 (22.16 or
-  newer) or 24 or newer, it then copies OAK's own files (`cli.js`, `capture.js`, `index.js`,
+  saves the machine in herdr (`herdr machine add`). When the target has Node.js 24 or newer,
+  it then copies OAK's own files (`cli.js`, `capture.js`, `index.js`,
   `package.json`, `THIRD_PARTY_NOTICES.md` and OAK's herdr plugin) to
   `~/.local/lib/oak`, writes an `oak` launcher to `~/.local/bin`, appends a line that
   puts `~/.local/bin` on the PATH to `~/.profile`, `~/.bashrc` and `~/.zprofile`

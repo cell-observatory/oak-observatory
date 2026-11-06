@@ -58,18 +58,18 @@ switch ($Channel) {
 # the reason the CLI has to route its own npm calls through cmd.exe.
 $npm = Get-Command npm -ErrorAction SilentlyContinue
 if (-not $npm) {
-    Warn 'npm not found - install Node.js 22 (22.16 or newer) or 24 or newer first: https://nodejs.org/en/download'
+    Warn 'npm not found - install Node.js 24 or newer first: https://nodejs.org/en/download'
     Dim  'or: winget install OpenJS.NodeJS.LTS'
     exit 1
 }
 $nodeVersion = (& node --version) -replace '^v', ''
 # Parenthesised deliberately: `[int](expr)[0]` relies on cast-vs-index precedence, which is a coin flip
 # to read and a real PowerShell gotcha.
-# Node.js 22 (22.16 or newer) or 24 or newer: OAK's local index uses the SQLite built into Node, whose full-text search
-# 22 has from 22.16 and no 23 release has (core runtime.ts INDEX_NODES).
+# Node.js 24 or newer (core runtime.ts INDEX_NODES): OAK's local index uses the SQLite built into Node, with full-text
+# search.
 $nodeParts = $nodeVersion -split '\.'
-if ([int]($nodeParts[0]) -lt 22 -or [int]($nodeParts[0]) -eq 23 -or ([int]($nodeParts[0]) -eq 22 -and [int]($nodeParts[1]) -lt 16)) {
-    Warn "OAK needs Node.js 22 (22.16 or newer) or 24 or newer, and this is Node.js $nodeVersion."
+if ([int]($nodeParts[0]) -lt 24) {
+    Warn "OAK needs Node.js 24 or newer, and this is Node.js $nodeVersion."
     exit 1
 }
 

@@ -8,7 +8,7 @@ Standalone, git-free, **per-edit Keep / Undo for [Claude Code](https://claude.co
 
 Install oak, get herdr. The backend is a hard dependency pinned at 0.9.1 in `herdr.lock`;
 installation verifies its checksum and preserves newer versions already installed. OAK needs Node.js
-22 (22.16 or newer) or 24 or newer: its local database uses the SQLite built into Node, whose full-text search 22 has from 22.16 and no 23 release has. On Linux, npm compiles node-pty, the helper the terminal app's herdr tab runs herdr in:
+24 or newer: its local database uses the SQLite built into Node, with full-text search. On Linux, npm compiles node-pty, the helper the terminal app's herdr tab runs herdr in:
 that needs `python3`, `make` and a C++ compiler (`g++`, or whatever `$CXX` names), and npm 12 runs the
 build only with `--allow-scripts=node-pty`. Without them the herdr tab cannot start and `oak doctor`
 warns; fix what it names, then reinstall OAK (re-run its installer, or
