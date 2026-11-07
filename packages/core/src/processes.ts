@@ -355,8 +355,11 @@ export function processOutputTail(outputPath: string | null, maxBytes = 16 * 102
 
 /** Shell output is text, never a terminal program (including colours and unterminated strings). */
 export function plainProcessOutput(text: string): string {
+  // An OSC string runs to its terminator or the end of the text; one cut short by any other escape is left for the
+  // passes below, as before. Taking the terminator as optional, instead of failing and retrying from each introducer
+  // inside the string, keeps the pass linear.
   return text
-    .replace(/(?:\x1b\]|\u009d)[^\x07\x1b\u009c]*(?:\x07|\x1b\\|\u009c|$)/g, '')
+    .replace(/(?:\x1b\]|\u009d)[^\x07\x1b\u009c]*(\x07|\x1b\\|\u009c)?/g, (s, end, at, all) => end !== undefined || at + s.length === all.length ? '' : s)
     .replace(/(?:\x1b[PX^_]|[\u0090\u0098\u009e\u009f])[^\x1b\u009c]*(?:\x1b\\|\u009c|$)/g, '')
     .replace(/(?:\x1b\[|\u009b)[\x30-\x3f]*[\x20-\x2f]*[\x40-\x7e]?/g, '')
     .replace(/\x1b[\x20-\x2f]*[\x30-\x7e]/g, '')

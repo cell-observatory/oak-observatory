@@ -35,6 +35,13 @@ test('process output is plain text, including OSC, CSI, DCS, C0 and C1 controls'
   assert.equal(core.processOutputTail(b.outputs[0]), 'hello red\nworld');
 });
 
+// An OSC string that never ends backtracked quadratically on a long run of C1 OSC introducers (CodeQL's
+// js/polynomial-redos input); the timeout stops a regression instead of hanging the run.
+test('process output stays fast on a long run of OSC introducers', () => {
+  const plain = () => core.plainProcessOutput('\u009d'.repeat(100_000) + '\x1bx');
+  assert.equal(require('node:vm').runInNewContext('plain()', { plain }, { timeout: 2000 }), '');
+});
+
 for (const pollOnly of [false, true]) test(`process follow ${pollOnly ? 'poll fallback' : 'watch'} updates appends, rotates, stops and cancels`, async t => {
   const b = fixture(t), seen = [];
   const stop = core.followProcessOutput(b.work, 'parent', 'shell-0', { onSnapshot: s => seen.push(s), onError: e => { throw e; }, pollMs: pollOnly ? 40 : 2000, ...(pollOnly ? { watch: () => { throw new Error('watch unavailable'); } } : {}) });

@@ -1155,6 +1155,16 @@ test('herdr: codexScreenWorking reads Codex\'s timer row above its current promp
   for (const [what, screen] of Object.entries(not)) assert.equal(core.codexScreenWorking(screen), false, what);
 });
 
+// JavaScript's backtracking engine took exponential time on herdr's pattern when queued lines' whitespace could also take
+// the line breaks between them (CodeQL's js/redos input); the port decides it in linear time, and the timeout stops a
+// regression instead of hanging the run.
+test('herdr: codexScreenWorking stays fast on many queued lines that never match', () => {
+  const pump = '\n(press\n›⠁\tto\tinterrupt\tand\tsend\timmediately)\n•\tMessages\tto\tbe\tsubmitted\tafter\tnext\ttool\tcall';
+  const screen = 'Working (5s)\n•\tMessages\tto\tbe\tsubmitted\tafter\tnext\ttool\tcall' + pump.repeat(40) + '\n─\n›\n';
+  const decide = () => core.codexScreenWorking(screen);
+  assert.equal(require('node:vm').runInNewContext('decide()', { decide }, { timeout: 2000 }), false);
+});
+
 /** A PATH whose first entry holds an `ssh` that machineSsh finds (execFileTool is mocked, so it never runs): without
  *  one, machineSsh asks nothing on POSIX either, as on Windows. */
 function pathWithSsh(t) {

@@ -127,7 +127,7 @@ test('workers: Claude native status is shared across processes for ten seconds, 
   const module = path.resolve(__dirname, '../dist/delegated');
   const now = Date.now();
   const read = at => {
-    const r = cp.spawnSync(process.execPath, ['-e', `Date.now = () => ${at}; console.log(JSON.stringify([...require(${JSON.stringify(module)}).claudeNativeStatus(${JSON.stringify(bin)})]));`], { encoding: 'utf8' });
+    const r = cp.spawnSync(process.execPath, ['-e', `Date.now = () => ${at}; console.log(JSON.stringify([...require(process.argv[1]).claudeNativeStatus(process.argv[2])]));`, module, bin], { encoding: 'utf8' });
     assert.equal(r.status, 0, r.stderr);
     return JSON.parse(r.stdout);
   };

@@ -330,7 +330,7 @@ test('A file\'s hidden characters show as marks in the review bubble, the Feed\'
   const joinedPatch = ['--- a/x.js', '+++ b/x.js', '@@ -1 +1,6 @@', ...[...inIdentifier, ...builtWith].map((l) => `+${l}`)].join('\n');
   const joinedBubble = fn('diffHtml')(joinedPatch);
   for (const l of inIdentifier) assert.ok(joinedBubble.includes(marked(l).replace(/ /g, '\u00a0').replace(/⟨U\+[0-9A-F]{4}⟩/g, (m) => `<span style="${consts.HIDDEN_SPAN}">${m}</span>`)), `the bubble shows the joiner in ${JSON.stringify(l)}: ${joinedBubble}`);
-  for (const l of builtWith) assert.ok(joinedBubble.includes(l.replace(/ /g, '\u00a0').replace(/"/g, '"')), `the bubble keeps ${JSON.stringify(l)}`);
+  for (const l of builtWith) assert.ok(joinedBubble.includes(l.replace(/ /g, '\u00a0')), `the bubble keeps ${JSON.stringify(l)}`);
   for (const l of inIdentifier) assert.equal(fn('ghostText')([l]), `− ${marked(l)}`, 'the deletion ghost shows it');
   for (const l of builtWith) assert.equal(fn('ghostText')([l]), `− ${l}`, 'and keeps an emoji, a conjunct and a Persian word as they are');
   const joinedSandbox = { core: { ...core, findRecord: () => ({ id: 8 }), coloredDiff: () => joinedPatch } };

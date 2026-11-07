@@ -286,8 +286,9 @@ test('capture rejects blank, unreachable, unpinned, onboarding and STALE frames'
 test('the published terminal demo shows the current app, each caption over the frame its beat drew', async () => {
   const { validateFrame } = await load('tui-capture.mjs');
   const src = fs.readFileSync(path.resolve(scripts, '../docs/media/tui-frames.js'), 'utf8');
+  const untag = (html) => { let prev; do { prev = html; html = html.replace(/<[^>]*>/g, ''); } while (html !== prev); return html; };
   const frames = JSON.parse(src.slice(src.indexOf('=') + 1).replace(/;\s*$/, ''))
-    .map(({ cap, html }) => ({ cap, text: html.replace(/<[^>]*>/g, '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&') }));
+    .map(({ cap, html }) => ({ cap, text: untag(html).replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&') }));
   assert.ok(frames.length > 2);
   // The gate that guards the capture, run again on what was published: a stale file fails it.
   for (const f of frames) {

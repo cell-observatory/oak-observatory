@@ -31,7 +31,7 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { createHash } from 'crypto';
+import { createHash, scryptSync } from 'crypto';
 import { rootDir } from './store';
 import { claudeJsonPath } from './paths';
 import { fileWithinLast, withinLast } from './stamp';
@@ -111,7 +111,7 @@ export interface MachineUsageOwn {
  *  machine, so readings are never relayed from machine to machine. */
 export interface MachineUsageBrief {
   brief: 1;
-  /** The first 12 hex digits of sha256(Claude Code's account id); null where Claude Code has no login. */
+  /** Claude Code's account id as claudeAccountTag hashes it; null where Claude Code has no login. */
   account: string | null;
   at: number;
   five: MachineUsageWindow | null;
@@ -204,7 +204,8 @@ function statKey(file: string): string {
 let tagMemo: { key: string; tag: string | null; read: boolean } | null = null;
 
 /** This machine's Claude account, as a 12-hex-digit hash of the account id Claude Code keeps for its login;
- *  null with no login. Re-read only when the file changes (it can be megabytes). */
+ *  null with no login. Re-read only when the file changes (it can be megabytes). The hash is scrypt's, with one salt for
+ *  every OAK so that each machine signed in to an account names it alike; the id itself never leaves the machine. */
 export function claudeAccountTag(): string | null {
   return accountMemo().tag;
 }
@@ -225,7 +226,7 @@ function accountMemo(): { tag: string | null; read: boolean } {
   try {
     const id = JSON.parse(fs.readFileSync(file, 'utf8'))?.oauthAccount?.accountUuid;
     read = true;
-    if (typeof id === 'string' && id) tag = createHash('sha256').update(id).digest('hex').slice(0, 12);
+    if (typeof id === 'string' && id) tag = scryptSync(id, 'oak-claude-account', 6).toString('hex');
   } catch (error) {
     read = (error as NodeJS.ErrnoException).code === 'ENOENT'; // no Claude Code config here
   }

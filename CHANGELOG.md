@@ -1618,6 +1618,11 @@ the release notes.
   Observatory Timeline".
 - The Timeline's labels in VS Code wrap between words, so "Context" no longer breaks inside the word. The Feed's
   first row is no longer hidden under the line above the list; a shadow marks the edge once the list is scrolled.
+- Text OAK reads from a pane, a transcript or a configuration file can no longer stall it. Reading a Codex pane's
+  status row, a model name, a shell's output, a git remote, a mount table or an `oak sync` key took time that grew
+  with the square of the input's length, or exponentially for a Codex screen; each now takes linear time and reads the
+  same text the same way. `oak agent setup` refuses a plan that names `__proto__` or another built-in property as an
+  agent, instead of writing into a shared object.
 
 ## [0.10.0] — 2026-09-28
 
