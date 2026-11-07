@@ -1,5 +1,5 @@
 Codex demo · local · ~ unknown · GPT · 900 tokens · 1 pending
-↗ herdr   ⌕ review
+↗ herdr   ⌕ review   ⚑ resolve   ■ stop
 +- You                                                                  15:00:02 +
 |Patch the Codex demo and plan the checks.                                       |
 +--------------------------------------------------------------------------------+
@@ -31,4 +31,6 @@ The Codex patch is ready.
 Codex checks pass.
 — turn ended · end_turn · 0 edits
 Workers · 0
+Processes · 0
+  Reading shells…
 Tasks · 0

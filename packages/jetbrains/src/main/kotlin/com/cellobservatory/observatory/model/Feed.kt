@@ -70,6 +70,8 @@ data class Feed(
     /** Each attributed row's bounded inline diff, by edit id: removed then added lines, and how many the
      *  bound left out. Built where the feed is FETCHED, off the EDT — never by the renderer. */
     val previews: Map<Int, Pair<List<String>, Int>> = emptyMap(),
+    /** Local inputs: check for new activity before fetching this worker again. */
+    val sources: List<String> = emptyList(),
 ) {
     val live: Boolean get() = mode == "live"
 }
@@ -93,6 +95,7 @@ object FeedParser {
             note = str(o, "note"),
             recap = str(o, "recap"),
             recapSource = str(o, "recapSource"),
+            sources = o.getAsJsonArray("sources")?.mapNotNull { it.takeIf { v -> v.isJsonPrimitive && v.asJsonPrimitive.isString }?.asString } ?: emptyList(),
         )
     } catch (_: Exception) {
         null

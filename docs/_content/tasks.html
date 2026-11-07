@@ -13,3 +13,5 @@
   <div class="ct"><span class="ctitle">One model, everywhere</span>
   <p>The same strict spans drive <code>task-keep</code>, <code>task-undo</code>, and <code>task-clear</code> on the CLI and in both editors. Accepting a task accepts its strict span alone — never a neighbouring task's edits.</p></div>
 </div>
+
+<p>For a session on a saved machine, both editors run Accept, Reject, Clear and Clear Completed there, using <code>task-keep</code>, <code>task-undo</code> and <code>task-clear --machine</code>. These verbs resolve the strict task span on that machine. If the remote CLI cannot perform the action, it reports a failure; no local task is changed.</p>

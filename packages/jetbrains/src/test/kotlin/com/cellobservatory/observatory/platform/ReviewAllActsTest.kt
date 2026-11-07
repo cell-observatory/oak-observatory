@@ -6,7 +6,6 @@ import com.cellobservatory.observatory.ui.ReviewAllEditor
 import com.cellobservatory.observatory.ui.ReviewAllSpec
 import com.cellobservatory.observatory.ui.ReviewAllVirtualFile
 import com.intellij.openapi.util.Disposer
-import com.intellij.testFramework.fixtures.BasePlatformTestCase
 import com.intellij.util.ui.UIUtil
 import java.awt.Component
 import java.awt.Container
@@ -22,7 +21,7 @@ import javax.swing.JLabel
  * REAL editor component against a real on-disk store; no CLI is needed because the row sync reads
  * the store directly.
  */
-class ReviewAllActsTest : BasePlatformTestCase() {
+class ReviewAllActsTest : ObservatoryPlatformTestCase() {
 
     private lateinit var cfg: java.nio.file.Path
     private val session = "acts-test"

@@ -1,7 +1,6 @@
 package com.cellobservatory.observatory.platform
 
 import com.cellobservatory.observatory.core.ObservatoryCli
-import com.intellij.testFramework.fixtures.BasePlatformTestCase
 import java.io.File
 
 /**
@@ -9,7 +8,7 @@ import java.io.File
  * spawns against a CLI that has no `views`. Neither property is visible to a unit test of the parsers:
  * both are about how many processes we start and whether the answers survive being batched.
  */
-class ViewBatchTest : BasePlatformTestCase() {
+class ViewBatchTest : ObservatoryPlatformTestCase() {
 
     private fun cliOnPath(): Boolean = runCatching {
         ProcessBuilder("oak", "--version").start().waitFor() == 0

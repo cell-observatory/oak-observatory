@@ -7,7 +7,7 @@
  * pinned against a synthetic `BOARD` fixture (a sidebar over a stacked board — the observatory's own former
  * shape), and the real `OBSERVATORY_TREE` gets its own block pinning the two-pane arrangement it ships.
  */
-const assert = require('node:assert');
+const assert = require('node:assert/strict');
 const path = require('node:path');
 
 const tui = require(path.join(__dirname, '..', 'dist', 'index.js'));
@@ -325,8 +325,8 @@ const BOARD = {
   assert.strictEqual(obs.length, 30, 'the tree frame is exactly the terminal height');
   assert.strictEqual(rev.length, 30, 'the dock frame is too');
 
-  // Both share the single-row tab bar (row 0, no rules); observatory is the bracketed active tab on row 0.
-  assert.ok(/\[ observatory \]/.test(obs[0]), 'observatory is the bracketed tab');
+  // Both share the single-row tab bar (row 0, no rules); observatory is the bracketed active tab on row 0, after its key.
+  assert.ok(/\[ F2 observatory \]/.test(obs[0]), 'observatory is the bracketed tab');
 
   // The tree tab drops the window bar AND the session row: row 1 (right under the tab bar) is already the
   // tree body — the Sessions master title — and the session producer rendered its title through it.
@@ -495,7 +495,7 @@ const BOARD = {
 
 console.log('tree: carve, seams, render, dispatch, select, scroll, split/close, and parse/persist — all pinned');
 
-// PANE MOVES: the pure ops the title drag, ctrl+a H/J/K/L and the view
+// PANE MOVES: the pure ops the title drag, H/J/K/L and the view
 // picker apply. Each keeps every OTHER leaf where it was, never invents or drops a pane, and is a no-op
 // on a bad id — a drop that lands nowhere must leave the layout exactly as it stood.
 {

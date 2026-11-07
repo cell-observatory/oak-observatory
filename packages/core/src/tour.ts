@@ -268,7 +268,7 @@ function allSteps(): DemoStep[] {
       id: 'sessions',
       title: 'Sessions — which one you are reviewing',
       body:
-        'The Overview begins with the question that precedes every other one: which session these panels are showing. Sessions are grouped by workspace on this machine, the editor’s workspace first. Rows follow conversation recency; selecting a local row switches the whole observatory. Each row shows its title and statistics.',
+        'The Overview begins with the question that precedes every other one: which session these panels are showing. Sessions from every machine share one list, newest activity first. Remote rows keep their machine badge, and each machine’s state stays above the rows. Search, Active and Sort cover the whole list; selecting a local row switches the whole observatory. Each row shows its title and statistics.',
       view: 'overview',
       tab: 'sessions',
       tip: 'Selecting a local row switches what the whole observatory reviews.',
@@ -289,7 +289,7 @@ function allSteps(): DemoStep[] {
       id: 'timeline-session',
       title: 'Choosing which session the timeline shows',
       body:
-        'The selector at the top of the Timeline names the session the observatory is reviewing. Picking another one switches every panel, so moving between two live conversations is one click. The Overview Sessions tab lists every session, grouped by workspace.',
+        'The selector at the top of the Timeline names the session the observatory is reviewing. Picking another one switches every panel, so moving between two live conversations is one click. The Overview Sessions tab merges every machine’s sessions in the chosen order, newest activity first by default.',
       view: 'prompts',
       tip: 'Picking a session here switches every panel; the Overview lists them all.',
       anchor: 'session-picker',

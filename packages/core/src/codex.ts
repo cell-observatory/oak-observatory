@@ -25,14 +25,15 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as crypto from 'crypto';
-import { storeDir, ensureStore, appendSkip, clearAbandonedToolStaging } from './store';
-import { handleHookPayload, noteToolCall, HookPayload } from './capture';
+import { storeDir, ensureStore, appendSkip, clearAbandonedToolStaging, rootDir, captureOutsideMoves, isSafeSessionId } from './store';
+import { handleHookPayload, noteToolCall, missedCapture, HookPayload } from './capture';
 import { appendCaptureEvent } from './capture-events';
 import { priceUsage } from './pricing';
 import { codexPromptText, codexTranscriptFile, codexUsageDeltas } from './codex-events';
 import { cachedByFiles, readLines } from './fscache';
 import { plainTitle } from './format';
 import { canonPath } from './paths';
+import { graphemeHead } from './graphemes';
 
 /** $CODEX_HOME override honored the way codex itself honors it (verified: sessions/config land there). */
 export function codexHome(): string {
@@ -151,6 +152,229 @@ export function readCodexAgentMeta(session: string): CodexAgentMeta | null {
   }
 }
 
+/**
+ * Is this the working folder of Codex's memory-writing agent? Codex runs that agent as an ephemeral thread
+ * of its own, in `<CODEX_HOME>/memories` (`memories_v2` for its second memory format), inside the process of
+ * the session that started it: its hooks carry that session's herdr pane, its own thread id, a `startup`
+ * SessionStart and no transcript. It is never the pane's own session. Paths compare as written, then by
+ * their real paths, so a symlinked CODEX_HOME (or macOS's /var for /private/var) still matches. Codex's
+ * default home (`~/.codex`) counts as well, by HOME and by the account's own home folder: Codex runs each
+ * hook with its own environment through the person's login shell (`$SHELL -lc`, Codex 0.156 to 0.160.1),
+ * whose startup files can change CODEX_HOME or HOME before the hook reads them.
+ */
+export function isCodexMemoryCwd(cwd: string | undefined): boolean {
+  if (!cwd) return false;
+  const at = canonPath(path.resolve(cwd));
+  const dir = path.basename(at);
+  // Only a folder of that name is compared, so a project's row costs no lookup.
+  if (dir !== 'memories' && dir !== 'memories_v2') return false;
+  const home = codexHome();
+  const parentIs = (h: string | null) => h !== null && canonPath(path.resolve(h)) === path.dirname(at);
+  if (parentIs(home) || parentIs(path.join(os.homedir(), '.codex')) || parentIs(accountCodexHome())) return true;
+  const real = (p: string) => { try { return canonPath(fs.realpathSync.native(p)); } catch { return null; } };
+  const memoriesReal = real(path.join(home, dir)); // a missing folder is no memory thread's; the cwd is resolved only when it exists
+  return memoriesReal !== null && memoriesReal === real(at);
+}
+
+/** Codex's default home in the account's own home folder, which no environment changes; read once. */
+let accountHome: string | null | undefined;
+function accountCodexHome(): string | null {
+  if (accountHome === undefined) {
+    try { accountHome = path.join(os.userInfo().homedir, '.codex'); } catch { accountHome = null; /* an account with no home entry */ }
+  }
+  return accountHome;
+}
+
+/** A recorded Codex session that is the memory-writing agent's thread (see `isCodexMemoryCwd`). */
+export function isCodexMemorySession(session: string): boolean {
+  return isCodexMemoryCwd(readCodexAgentMeta(session)?.cwd);
+}
+
+/**
+ * Does Codex's Auto-review, rather than the person, answer this session's permission prompts? Codex
+ * sends a prompt to its guardian reviewer when the thread's `approvals_reviewer` is `auto_review` (or
+ * the legacy `guardian_subagent`) and its approval policy is `on-request` or granular, and to the
+ * person otherwise. The rollout records both in each turn's `turn_context` and in the
+ * `thread_settings_applied` a change during a thread writes, so the last of those is the setting in
+ * force. It is read from the end, since a long turn can put it megabytes back, no further back than
+ * ROLLOUT_SCAN_BYTES, and memoized on the rollout's size: an unchanged rollout is not read again. The
+ * rollout is the session's own (the root thread's): a subagent's hooks name the subagent's rollout,
+ * which `upsertAgentMeta` never records.
+ */
+export function codexAutoReview(session: string): boolean {
+  const file = readCodexAgentMeta(session)?.transcriptPath;
+  if (!file) return false;
+  let fd: number;
+  try {
+    fd = fs.openSync(file, 'r');
+  } catch {
+    return false;
+  }
+  try {
+    const size = fs.fstatSync(fd).size;
+    const memo = autoReviewMemo.get(file);
+    if (memo && memo.size === size) return memo.auto;
+    const s = lastApprovalSettings(fd, size);
+    const policy = s?.approval_policy;
+    const auto = !!s && (s.approvals_reviewer === 'auto_review' || s.approvals_reviewer === 'guardian_subagent')
+      && (policy === 'on-request' || (!!policy && typeof policy === 'object' && 'granular' in policy));
+    autoReviewMemo.set(file, { size, auto });
+    return auto;
+  } catch {
+    return false;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+const autoReviewMemo = new Map<string, { size: number; auto: boolean }>();
+const REVIEWER_KEY = Buffer.from('"approvals_reviewer":"');
+
+/** How far back from its end a rollout is searched. A turn's records sit well inside it; an older Codex
+ *  that records no approval settings would otherwise be read whole, hundreds of megabytes, on every hand. */
+export const ROLLOUT_SCAN_BYTES = 32 << 20;
+const SCAN_CHUNK = 1 << 20;
+const NL = Buffer.from('\n');
+/** The longest rollout line read whole: a settings record is a few KB. */
+const LINE_CAP = 4 << 20;
+
+/** Where `needle` last starts in the file before `before`, no earlier than `floor`; -1 if nowhere. Read
+ *  backwards in chunks that overlap by the needle's length, so a match across a chunk boundary is found. */
+function lastIndexIn(fd: number, needle: Buffer, before: number, floor: number): number {
+  for (let end = before; end > floor;) {
+    const start = Math.max(floor, end - SCAN_CHUNK);
+    const buf = Buffer.alloc(Math.min(before, end + needle.length - 1) - start);
+    fs.readSync(fd, buf, 0, buf.length, start);
+    const i = buf.lastIndexOf(needle);
+    if (i >= 0) return start + i;
+    end = start;
+  }
+  return -1;
+}
+
+/** The line holding byte `at`: where it starts, and its text up to LINE_CAP bytes. */
+function lineAt(fd: number, at: number, size: number, floor: number): { from: number; text: string } {
+  const from = lastIndexIn(fd, NL, at, floor) + 1;
+  const line = Buffer.alloc(Math.min(size, from + LINE_CAP) - from);
+  fs.readSync(fd, line, 0, line.length, from);
+  const nl = line.indexOf(NL);
+  return { from, text: line.subarray(0, nl < 0 ? line.length : nl).toString('utf8') };
+}
+
+/** The approval settings of the rollout's last `turn_context` or `thread_settings_applied` record. */
+function lastApprovalSettings(fd: number, size: number): { approvals_reviewer?: unknown; approval_policy?: unknown } | null {
+  const floor = Math.max(0, size - ROLLOUT_SCAN_BYTES);
+  for (let before = size; before > floor;) {
+    const at = lastIndexIn(fd, REVIEWER_KEY, before, floor);
+    if (at < 0) return null;
+    const { from, text } = lineAt(fd, at, size, floor);
+    try {
+      const o = JSON.parse(text);
+      const p = o?.payload;
+      if (o?.type === 'turn_context' && p) return p;
+      if (o?.type === 'event_msg' && p?.type === 'thread_settings_applied' && p.thread_settings) return p.thread_settings;
+    } catch {
+      /* a torn last line, still being written: look further back */
+    }
+    before = from;
+  }
+  return null;
+}
+
+/** The `event_msg` records that bound a turn, as the rollout fixtures and the readers that already key on them
+ *  (agentPhaseDetail, the conversation adapter) know them: true for its start, false for its two ends. Each holds
+ *  one of the two needles; a line that holds one only inside a tool's output is not such a record. */
+const TURN_BOUNDARY: Record<string, boolean> = { task_started: true, task_complete: false, turn_aborted: false };
+const TURN_NEEDLES = [Buffer.from('"type":"task_'), Buffer.from('"type":"turn_aborted"')];
+
+/**
+ * The last turn boundary in the bytes from `floor` to `size` (true for a start, false for an end, undefined for none),
+ * read back from the end a chunk at a time, and where the file's last line break ends (`floor` when there is none).
+ * `lineStart`: a line begins at `floor`; otherwise the line cut there is not read. The first chunk is small, as a
+ * finished turn's end is the last record or close to it; each one after doubles, up to SCAN_CHUNK.
+ */
+function lastTurnBoundary(fd: number, size: number, floor: number, lineStart: boolean): { boundary?: boolean; whole: number } {
+  let whole = -1;
+  // The start of the line cut at `end`, read in the step before: it runs on to a line break.
+  let carry = Buffer.alloc(0);
+  for (let end = size, step = 64 << 10; end > floor; step = Math.min(SCAN_CHUNK, step * 2)) {
+    const start = Math.max(floor, end - step);
+    const chunk = Buffer.alloc(end - start);
+    fs.readSync(fd, chunk, 0, chunk.length, start);
+    const block = carry.length ? Buffer.concat([chunk, carry]) : chunk;
+    if (whole < 0) {
+      const nl = block.lastIndexOf(0x0a);
+      if (nl >= 0) whole = start + nl + 1;
+    }
+    // Up to its first line break, a block holds the end of a line that began before it, unless a line begins there.
+    const cut = start > floor || !lineStart;
+    const first = cut ? block.indexOf(0x0a) : -1;
+    for (let before = cut && first < 0 ? 0 : block.length; before > 0;) {
+      const at = Math.max(...TURN_NEEDLES.map((needle) => block.lastIndexOf(needle, before - 1)));
+      if (at <= first) break;
+      const from = block.lastIndexOf(0x0a, at) + 1;
+      const to = block.indexOf(0x0a, at);
+      try {
+        const o = JSON.parse(block.subarray(from, to < 0 ? block.length : to).toString('utf8'));
+        const type = o?.type === 'event_msg' ? o.payload?.type : undefined;
+        if (typeof type === 'string' && Object.prototype.hasOwnProperty.call(TURN_BOUNDARY, type)) {
+          return { boundary: TURN_BOUNDARY[type], whole: whole < 0 ? floor : whole };
+        }
+      } catch {
+        /* a torn last line, still being written: look further back */
+      }
+      before = from;
+    }
+    carry = cut ? block.subarray(0, first < 0 ? block.length : first) : Buffer.alloc(0);
+    end = start;
+  }
+  return { whole: whole < 0 ? floor : whole };
+}
+
+/** What the last read of each rollout found: its stamp, where its last whole line ended and the bytes before that. */
+const turnScans = new Map<string, { ino: number; size: number; mtimeMs: number; whole: number; anchor: Buffer; open: boolean | null }>();
+
+/** The bytes just before `at`: unchanged at a later read, the file was only appended to since. */
+function anchorAt(fd: number, at: number): Buffer {
+  const bytes = Buffer.alloc(Math.min(64, at));
+  fs.readSync(fd, bytes, 0, bytes.length, at - bytes.length);
+  return bytes;
+}
+
+/**
+ * Whether the rollout's last turn is still running: its last turn boundary is a `task_started`, with no
+ * `task_complete` or `turn_aborted` after it. Read back from the end until that boundary, no further than
+ * ROLLOUT_SCAN_BYTES. Codex only appends to a rollout, so one read before is read again only from where its last
+ * whole line ended: a long turn is not read whole on every listing. False for a rollout that holds no turn; null
+ * when that is unknown: the file cannot be read, or its last boundary lies past the scan.
+ */
+export function codexTurnOpen(file: string): boolean | null {
+  let fd: number;
+  try {
+    fd = fs.openSync(file, 'r');
+  } catch {
+    return null;
+  }
+  try {
+    const { ino, size, mtimeMs } = fs.fstatSync(fd);
+    const last = turnScans.get(file);
+    if (last && last.ino === ino && last.size === size && last.mtimeMs === mtimeMs) return last.open;
+    const window = Math.max(0, size - ROLLOUT_SCAN_BYTES);
+    const grew = last && last.ino === ino && size > last.size && last.whole >= window && anchorAt(fd, last.whole).equals(last.anchor) ? last : undefined;
+    const floor = grew ? grew.whole : window;
+    const scan = lastTurnBoundary(fd, size, floor, !!grew || floor === 0);
+    const open = scan.boundary ?? (grew ? grew.open : floor > 0 ? null : false);
+    turnScans.delete(file);
+    if (turnScans.size >= 1024) turnScans.delete(turnScans.keys().next().value!);
+    turnScans.set(file, { ino, size, mtimeMs, whole: scan.whole, anchor: anchorAt(fd, scan.whole), open });
+    return open;
+  } catch {
+    return null;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
 /** Write-if-changed: this runs on every hook event, and identical content must cost one read, not a write. */
 function upsertAgentMeta(session: string, p: CodexHookPayload): void {
   const existing = readCodexAgentMeta(session);
@@ -158,7 +382,9 @@ function upsertAgentMeta(session: string, p: CodexHookPayload): void {
     agent: 'codex',
     cwd: p.cwd || existing?.cwd,
     provider: p.model_provider || existing?.provider,
-    transcriptPath: p.transcript_path || existing?.transcriptPath,
+    // A subagent's hooks name another rollout: its own, or on its SubagentStop its parent's, itself a
+    // subagent's when subagents nest. Only the main agent's hooks name the session's.
+    transcriptPath: (p.agent_id ? undefined : p.transcript_path) || existing?.transcriptPath,
     model: p.model || existing?.model,
     permissionMode: p.permission_mode || existing?.permissionMode,
     updated: existing?.updated ?? Date.now(),
@@ -173,10 +399,20 @@ function upsertAgentMeta(session: string, p: CodexHookPayload): void {
     return;
   }
   next.updated = Date.now();
+  // tmp + rename, 0600 like the rest of the store: written in place, a reader (the listings, every hook of the session)
+  // could find the file half written and read no Codex session at all, and a new file took the default mode.
+  const file = agentMetaPath(session);
+  const tmp = `${file}.${process.pid}.tmp`;
   try {
-    fs.writeFileSync(agentMetaPath(session), JSON.stringify(next));
+    fs.writeFileSync(tmp, JSON.stringify(next), { mode: 0o600 });
+    fs.renameSync(tmp, file);
   } catch {
     /* capture must never block an edit over metadata */
+    try {
+      fs.rmSync(tmp, { force: true });
+    } catch {
+      /* nothing was left */
+    }
   }
 }
 
@@ -228,7 +464,10 @@ export function handleCodexHookPayload(p: CodexHookPayload, eventMs = Date.now()
     if (!session || !p.hook_event_name) return;
     ensureStore(session);
     upsertAgentMeta(session, p);
-    {
+    // The memory-writing agent runs inside the pane's own session: linking it, or naming a tab after it,
+    // took the pane's identity and its tab's name from that session (both tabs read "Codex memory update").
+    const background = isCodexMemoryCwd(p.cwd);
+    if (!background) {
       // The tab↔session link, same as claude's hooks (the app exports OAK_TAB into a native tab's PTY).
       const { linkTab } = require('./capture') as typeof import('./capture');
       linkTab(session, 'codex', p.hook_event_name === 'SessionStart' ? p.source || 'startup' : undefined);
@@ -264,7 +503,7 @@ export function handleCodexHookPayload(p: CodexHookPayload, eventMs = Date.now()
 
     // A turn boundary, or a thread resumed in a pane: its title may have changed, or the pane's tab may
     // not wear it yet, so the herdr tab follows it (detached, as Claude's hooks do).
-    if (ev === 'UserPromptSubmit' || ev === 'Stop' || (ev === 'SessionStart' && p.source === 'resume')) {
+    if (!background && (ev === 'UserPromptSubmit' || ev === 'Stop' || (ev === 'SessionStart' && p.source === 'resume'))) {
       (require('./herdr-link') as typeof import('./herdr-link')).kickTabSync(session);
     }
     if (ev === 'UserPromptSubmit') {
@@ -275,8 +514,8 @@ export function handleCodexHookPayload(p: CodexHookPayload, eventMs = Date.now()
       return;
     }
     if (ev === 'PermissionRequest') {
-      const { writeAttention, toolCallKey } = require('./capture') as typeof import('./capture');
-      writeAttention(session, { kind: 'permission', message: String(p.tool_name ?? 'tool'), ts: Date.now() }, toolCallKey(p));
+      const { writeAttention, askOf } = require('./capture') as typeof import('./capture');
+      writeAttention(session, { kind: 'permission', message: String(p.tool_name ?? 'tool'), ts: Date.now() }, askOf(p));
       // Request-only: codex reports the ask, never the answer, through this event. The feed's
       // pairing already tolerates an outcome that never arrives. NOTHING goes to stdout — an empty
       // reply is the documented "no decision" and observation must never become adjudication.
@@ -307,6 +546,7 @@ export function handleCodexHookPayload(p: CodexHookPayload, eventMs = Date.now()
       return;
     }
     if (ev === 'SubagentStart' || ev === 'SubagentStop') {
+      if (ev === 'SubagentStop') (require('./capture') as typeof import('./capture')).noteSubagentStop(session, p.agent_id);
       appendCaptureEvent(session, 'subagent', { phase: ev === 'SubagentStart' ? 'start' : 'stop', context: p.agent_id ? { agentId: p.agent_id, agentType: p.agent_type ?? null, parentSessionId: session } : p.subagent ?? null });
       return;
     }
@@ -320,7 +560,12 @@ export function runCodexCapture(): void {
   try {
     const raw = fs.readFileSync(0, 'utf8');
     if (!raw.trim()) return;
-    handleCodexHookPayload(JSON.parse(raw) as CodexHookPayload, performance.timeOrigin);
+    const payload = JSON.parse(raw) as CodexHookPayload;
+    captureOutsideMoves(() => handleCodexHookPayload(payload, performance.timeOrigin), missedCapture(payload));
+    if (payload.hook_event_name === 'PreToolUse' && payload.tool_name === 'apply_patch') {
+      const files = patchFiles(payload);
+      if (files) (require('./edit-heads-up') as typeof import('./edit-heads-up')).emitEditHeadsUp(payload.session_id, payload.cwd, files);
+    }
   } catch {
     /* silent by design */
   }
@@ -378,6 +623,22 @@ export function readCodexRollout(file: string): CodexRolloutSummary {
   });
 }
 
+/** The files a Codex title was read from besides its own rollout and Codex's thread names (a brief its prompt hands its
+ *  task to, the session an Auto-review thread reviews), collected while `codexTitleInputs` runs: the local index reads a
+ *  title again when one of them changes. */
+let titleReads: Set<string> | null = null;
+export function codexTitleInputs<T>(read: () => T): { value: T; files: string[] } {
+  const outer = titleReads;
+  const mine = new Set<string>();
+  titleReads = mine;
+  try {
+    return { value: read(), files: [...mine] };
+  } finally {
+    titleReads = outer;
+    if (outer) for (const f of mine) outer.add(f);
+  }
+}
+
 /** Codex 0.154 stores user-visible names in session_index.jsonl. The last record for an id
  * wins; key the cache to the INDEX too so a rename updates even if the rollout does not move.
  * The name, else the rollout's own title, else the first real prompt, then goes through `taskTitle`,
@@ -402,19 +663,19 @@ function codexTitle(file: string, id: string, followReview: boolean): string | n
   // whose one prompt is Codex's assessment request wrapped around the reviewed session's transcript.
   // Its task is reviewing that session, so it is named after it (found among the listed rollouts: a
   // search of Codex's tree per row would repeat on every listing for a parent that is gone).
-  const source = meta?.source as { subagent?: { other?: unknown } } | undefined;
-  if (meta && (meta.thread_source === 'guardian_review' || source?.subagent?.other === 'guardian')) {
+  if (meta && isReviewMeta(meta)) {
     if (!followReview) return null;
     const parent = meta.parent_thread_id;
-    const reviewed = typeof parent === 'string' && parent !== id
-      ? codexTitle(codexSessionSources().find((s) => s.id === parent)?.file ?? '', parent, false) : null;
+    const parentFile = typeof parent === 'string' && parent !== id ? codexSessionSources().find((s) => s.id === parent)?.file ?? '' : '';
+    if (parentFile) titleReads?.add(parentFile);
+    const reviewed = typeof parent === 'string' && parent !== id ? codexTitle(parentFile, parent, false) : null;
     return reviewed ? `Auto-review: ${reviewed}` : 'Auto-review';
   }
   // Codex's memory-writing agent runs as an EPHEMERAL thread in `<CODEX_HOME>/memories`: it writes no
   // rollout, so only its hooks report it, from that folder. Its one prompt is Codex's template
   // ("## Memory Writing Agent: Phase 2 (Consolidation)" and 50 KB more), which names nothing.
   const cwd = typeof meta?.cwd === 'string' ? meta.cwd : readCodexAgentMeta(id)?.cwd;
-  if (cwd && canonPath(path.resolve(cwd)) === canonPath(path.join(codexHome(), 'memories'))) return CODEX_MEMORY_TITLE;
+  if (isCodexMemoryCwd(cwd)) return CODEX_MEMORY_TITLE;
   // Only a name that asks for something to be carried out can hand its task to a brief the prompt
   // names; every other name is kept at the cost of the index lookup alone.
   const named = titles.get(id);
@@ -428,16 +689,25 @@ function codexTitle(file: string, id: string, followReview: boolean): string | n
   return plain && derived ? firstPhrase(plain) : plain;
 }
 
-/** A long derived title's first phrase: through its first sentence end (a `.`, `?` or `!` before a space,
- *  as a Claude row cuts its first prompt) or up to its first clause break (` — `, `: `, `; `), whichever
- *  comes first and keeps 12 characters and two words (brief headings written as goal sentences made
- *  Codex titles less useful). A whole phrase, never an ellipsis: a title of 64 characters or fewer
- *  (a list row's length) stays whole, and so does one with no break. */
+/** A long derived title's first phrase. A phrase keeps 12 characters and two words (brief headings written
+ *  as goal sentences made Codex titles less useful, and so did a first prompt's long first sentence). The
+ *  first sentence (through a `.`, `?` or `!` before a space, as a Claude row cuts its first prompt) wins
+ *  when it ends within 64 characters, so a leading clause such as "In packages/core" never stands alone.
+ *  Otherwise the shortest phrase among the clause breaks (` — `, `: `, `; `, `, `) and that sentence. A
+ *  whole phrase, never an ellipsis: a title of 64 characters or fewer (a list row's length) stays whole,
+ *  and so does one with no break. */
 function firstPhrase(text: string): string {
   if (text.length <= 64) return text;
-  const cuts = [/^(.*?[.?!])(?=\s)/.exec(text)?.[1], /^(.*?)\s*(?:\s[—–]\s|:\s|;\s)/.exec(text)?.[1]]
-    .map((c) => c?.trim()).filter((c): c is string => !!c && c.length >= 12 && /\s/.test(c)); // a phrase, not a lone `file.ts`
-  return cuts.sort((a, b) => a.length - b.length)[0] ?? text;
+  const phrase = (c: string | undefined): c is string => !!c && c.length >= 12 && /\s/.test(c); // a phrase, not a lone `file.ts`
+  const sentence = /^(.*?[.?!])(?=\s)/.exec(text)?.[1]?.trim();
+  if (phrase(sentence) && sentence.length <= 64) return sentence;
+  // Prefixes grow with each break, so the first one that is a phrase is the shortest.
+  let clause: string | undefined;
+  for (const m of text.matchAll(/\s*(?:\s[—–]\s|[:;,]\s)/g)) {
+    const c = text.slice(0, m.index).trim();
+    if (phrase(c)) { clause = c; break; }
+  }
+  return [clause, sentence].filter(phrase).sort((a, b) => a.length - b.length)[0] ?? text;
 }
 
 /** What a Codex memory-writing thread is listed as, beside the guardian's "Auto-review". */
@@ -496,19 +766,22 @@ function handoffTarget(title: string, prompt: string | null): string | null {
   const hit = own.find(briefOf);
   if (hit || !prompt || prompt === title) return hit ?? null;
   if (!ownWords(rest, null).length) return handoffTarget(prompt, null);
-  return (prompt.slice(0, 4096).match(MARKDOWN_REF) ?? []).find(briefOf) ?? null; // the prompt names its brief up front
+  return (graphemeHead(prompt, 4096).match(MARKDOWN_REF) ?? []).find(briefOf) ?? null; // the prompt names its brief up front
 }
 
 /** A markdown document's title: its first line when that is a heading, without the `#`s and without a
- *  leading "Task:" / "Task (…):" label. */
-function markdownTitle(text: string): string | null {
+ *  leading "Task:" / "Task (…):" label. Exported for tests. */
+export function markdownTitle(text: string): string | null {
   const first = text.trimStart().split(/\r?\n/, 1)[0]; // trimStart also drops a byte-order mark
-  const heading = /^#{1,6}[ \t]+(.*)$/.exec(first)?.[1].replace(/(?:^|[ \t])#+[ \t]*$/, '');
+  // The lookahead pins the blank run to its full length: without it, a line that runs into a bare CR
+  // retried every shorter run against the whole rest of the line (quadratic).
+  const heading = /^#{1,6}[ \t]+(?![ \t])(.*)$/.exec(first)?.[1].replace(/(?:^|[ \t])#+[ \t]*$/, '');
   return heading?.replace(/^task(?:\s*\([^)]*\))?\s*:/i, '').replace(/\s+/g, ' ').trim() || null;
 }
 
 /** A brief's title, from its first 8 KiB on this machine; cached on the file's stamp, so an edit shows. */
 function briefTitle(file: string): string | null {
+  titleReads?.add(file);
   return cachedByFiles('codex-brief-title', [file], () => {
     try {
       if (!fs.statSync(file).isFile()) return null; // never open a FIFO, or a directory named *.md
@@ -550,14 +823,26 @@ function taskTitle(title: string | null, prompt: string | null, cwd: string | nu
   return heading && ownWords(heading, file).length ? heading : title;
 }
 
-interface CodexSessionMeta { id?: string; session_id?: string; cwd?: string; parent_thread_id?: unknown; thread_source?: unknown; source?: unknown }
+export interface CodexSessionMeta { id?: string; session_id?: string; cwd?: string; parent_thread_id?: unknown; thread_source?: unknown; source?: unknown }
+
+/** Does this session_meta record one of Auto-review's `guardian` threads: by the thread source newer
+ *  Codex writes, or the subagent source it writes as well (the only one an older Codex wrote)? */
+function isReviewMeta(meta: CodexSessionMeta): boolean {
+  const source = meta.source as { subagent?: { other?: unknown } } | undefined;
+  return meta.thread_source === 'guardian_review' || source?.subagent?.other === 'guardian';
+}
+
 /**
  * A rollout's head, read once per file stamp: its session_meta, whether a user message appears, and
  * whether the WHOLE file fit in the buffer. A rollout that fit entirely yet carries no user message is
  * an empty stub (a launch that died before its first turn — a failed sandbox, an app-server probe);
  * listing it as a session is noise. A large file has content by definition. Null when unreadable.
  */
-function codexRolloutHead(file: string): { meta: CodexSessionMeta | null; userMsg: boolean; whole: boolean } | null {
+/** What a rollout's head says (`codexRolloutHead`): its session_meta, whether a user message appears, and whether the whole
+ *  file fit in the buffer. */
+export interface CodexRolloutHead { meta: CodexSessionMeta | null; userMsg: boolean; whole: boolean }
+
+export function codexRolloutHead(file: string): CodexRolloutHead | null {
   try {
     return cachedByFiles('codex-head', [file], () => {
       const fd = fs.openSync(file, 'r');
@@ -580,36 +865,54 @@ function codexRolloutHead(file: string): { meta: CodexSessionMeta | null; userMs
   }
 }
 
-export interface CodexSessionSource { id: string; cwd: string; file: string; mtimeMs: number; archived: boolean }
+/** `review`: an Auto-review thread (`isReviewMeta`), read from the head the scan reads anyway. */
+export interface CodexSessionSource { id: string; cwd: string; file: string; mtimeMs: number; archived: boolean; review: boolean }
 // resolveSessionId calls this once per unresolved store session (via describeSession), so without a
 // memo a store of N sessions × M rollouts walks the codex tree N times — the dominant per-invocation
 // cost before any work begins (measured 118ms→583ms as rollouts grow). A short TTL collapses a burst
 // of calls to one walk while a long-lived process still sees a new session within the window; the key
 // includes codexHome() so a CODEX_HOME change (tests, relocation) invalidates immediately.
 let sourcesMemo: { at: number; home: string; val: CodexSessionSource[] } | null = null;
-export function codexSessionSources(): CodexSessionSource[] {
+/** What `codexSessionSources` reads, for a caller that already holds it: the rollouts newest first with their
+ *  modification times, each one's head, and whether it is a mirrored copy (the local index answers all three from what
+ *  it recorded at the file's stamp). */
+export interface CodexSourceReader {
+  rollouts(): { file: string; mtimeMs: number }[];
+  head(file: string): CodexRolloutHead | null;
+  mirrored(file: string): boolean;
+}
+/** A throwaway run's workspace that is gone: a temp-dir scratch from a probe or an old review, which the listings hide.
+ *  Scoped to temp roots so a real project on an unmounted drive is never dropped. Asked when a listing is made, since
+ *  the folder can go after the session was last read (the local index asks it again for the facts it holds). */
+export function goneTempWorkspace(cwd: string): boolean {
+  const tmpRoots = [os.tmpdir(), '/tmp', '/private/tmp', '/var/folders'].map((r) => path.resolve(r) + path.sep);
+  return tmpRoots.some((r) => path.resolve(cwd).startsWith(r)) && !fs.existsSync(cwd);
+}
+
+export function codexSessionSources(reader?: CodexSourceReader): CodexSessionSource[] {
   const home = codexHome();
   const now = Date.now();
-  if (sourcesMemo && sourcesMemo.home === home && now - sourcesMemo.at < 1000) return sourcesMemo.val;
-  const tmpRoots = [os.tmpdir(), '/tmp', '/private/tmp', '/var/folders'].map((r) => path.resolve(r) + path.sep);
+  if (!reader && sourcesMemo && sourcesMemo.home === home && now - sourcesMemo.at < 1000) return sourcesMemo.val;
   const out: CodexSessionSource[] = [];
-  for (const file of recentCodexRollouts(Number.MAX_SAFE_INTEGER)) {
+  const files = reader ? reader.rollouts() : recentCodexRollouts(Number.MAX_SAFE_INTEGER).map((file) => ({ file, mtimeMs: -1 }));
+  for (const { file, mtimeMs } of files) {
     try {
-      const head = codexRolloutHead(file);
+      const head = reader ? reader.head(file) : codexRolloutHead(file);
       const meta = head?.meta;
       const id = meta?.id ?? meta?.session_id;
       if (!head || typeof id !== 'string' || typeof meta?.cwd !== 'string') continue;
+      // An id no store path can take (a rollout written by hand, or damaged) is no session OAK can list: listed, the
+      // first store lookup threw and took the whole listing with it.
+      if (!isSafeSessionId(id)) continue;
       if (head.whole && !head.userMsg) continue;                       // empty stub — no conversation
       const cwd = meta.cwd;
-      if ((require('./session') as typeof import('./session')).isMirroredTranscript(file).mirrored) continue;
-      // Hide a throwaway run whose temp-dir workspace is gone (a /tmp scratch from a probe or an old
-      // review). Scoped to temp roots so a real project on an unmounted drive is never dropped.
-      if (tmpRoots.some((r) => path.resolve(cwd).startsWith(r)) && !fs.existsSync(cwd)) continue;
+      if (reader ? reader.mirrored(file) : (require('./session') as typeof import('./session')).isMirroredTranscript(file).mirrored) continue;
+      if (goneTempWorkspace(cwd)) continue;
       out.push({ id, cwd, file,
-        mtimeMs: fs.statSync(file).mtimeMs, archived: file.startsWith(path.join(codexHome(), 'archived_sessions') + path.sep) });
+        mtimeMs: mtimeMs >= 0 ? mtimeMs : fs.statSync(file).mtimeMs, archived: file.startsWith(path.join(codexHome(), 'archived_sessions') + path.sep), review: isReviewMeta(meta) });
     } catch { /* raced with deletion */ }
   }
-  sourcesMemo = { at: now, home, val: out };
+  if (!reader) sourcesMemo = { at: now, home, val: out };
   return out;
 }
 
@@ -794,10 +1097,15 @@ function atomicConfigWrite(file: string, text: string, expected?: string): void 
  * Surgical, append-only trust-state editing. config.toml is the user's file with the user's
  * comments: existing lines are NEVER rewritten — our stale state tables (matched by table header)
  * are removed as whole blocks, fresh ones appended at EOF. Anything else in the file survives
- * byte-for-byte.
+ * byte-for-byte. A table's `enabled` is the user's own switch (Codex writes it), so a fresh
+ * table keeps the value its predecessor had: a reinstall never turns back on a hook the user turned off.
  */
 function upsertStateTables(content: string, entries: { key: string; hash: string }[], owned: Set<string>): string {
-  const lines = content.length ? content.split('\n') : [];
+  const states = (parseToml(content).hooks as { state?: Record<string, { enabled?: unknown }> } | undefined)?.state;
+  // A byte order mark that opens the file stays first, also when the table after it is one of ours.
+  const bom = content.startsWith('\uFEFF') ? '\uFEFF' : '';
+  const body = content.slice(bom.length);
+  const lines = body.length ? body.split('\n') : [];
   const kept: string[] = [];
   let skipping = false;
   for (const line of lines) {
@@ -813,9 +1121,13 @@ function upsertStateTables(content: string, entries: { key: string; hash: string
   while (kept.length && kept[kept.length - 1].trim() === '') kept.pop();
   const out = kept.join('\n');
   const tables = entries
-    .map(({ key, hash }) => `[hooks.state."${key.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"]\ntrusted_hash = "${hash}"`)
+    .map(({ key, hash }) => {
+      const enabled = states?.[key]?.enabled;
+      return `[hooks.state."${key.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"]\ntrusted_hash = "${hash}"` +
+        (typeof enabled === 'boolean' ? `\nenabled = ${enabled}` : '');
+    })
     .join('\n\n');
-  return `${out}${out.length ? '\n\n' : ''}${tables}\n`;
+  return `${bom}${out}${out.length ? '\n\n' : ''}${tables}\n`;
 }
 
 export interface CodexInstallResult {
@@ -940,6 +1252,40 @@ export function uninstallCodexHooks(isOurs: (cmd: string) => boolean): CodexUnin
   return { hooksJson, stateRemoved };
 }
 
+/**
+ * Remove the status line the bundled status line's installer configured in Codex's config.toml: the lines it
+ * marks `# oak-statusline`, and the `[tui]` table it added when nothing of the person's is left in it. A
+ * `[tui]` header of the installer's with keys the person added under it stays, as does any other line. A
+ * byte order mark first stays first. True when the file changed.
+ */
+export function uninstallCodexStatusline(file: string = codexConfigTomlPath()): boolean {
+  const text = readConfig(file);
+  if (!text.includes('# oak-statusline')) return false;
+  const bom = text.startsWith('\uFEFF') ? '\uFEFF' : '';
+  const lines = text.slice(bom.length).split('\n');
+  const ours = (ln: string): boolean => ln.includes('# oak-statusline');
+  // A CRLF file's lines keep their CR here (Windows' Python writes one in text mode): it is no part of a header,
+  // and a line of it alone is blank, as the installer reads it.
+  const header = (ln: string): boolean => /^\s*\[\s*tui\s*\]\s*(#.*)?$/.test(ln.replace(/\r$/, ''));
+  const blank = (ln: string): boolean => ln === '' || ln === '\r';
+  const out: string[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (!ours(lines[i])) { out.push(lines[i]); continue; }
+    if (!header(lines[i])) continue;
+    // The table runs to the next header: kept while anything of the person's is in it.
+    let j = i + 1;
+    while (j < lines.length && !/^\s*\[/.test(lines[j]) && (!lines[j].trim() || ours(lines[j]))) j++;
+    if (j < lines.length && !/^\s*\[/.test(lines[j])) { out.push(lines[i]); continue; }
+    // Dropped, with the blank line the installer put before it.
+    if (out.length && blank(out[out.length - 1])) out.pop();
+  }
+  while (out.length && blank(out[out.length - 1])) out.pop();
+  const next = bom + (out.length ? out.join('\n') + '\n' : '');
+  if (next === text) return false;
+  atomicConfigWrite(file, next, text);
+  return true;
+}
+
 export interface CodexHooksStatus {
   hooksJsonPath: string;
   installed: boolean;
@@ -949,6 +1295,9 @@ export interface CodexHooksStatus {
    *  silent-skip danger zones and render as warnings, because codex will NOT say why hooks are off. */
   trust: 'trusted' | 'partial' | 'missing' | 'no-config';
   disabled?: boolean;
+  /** The events whose hook of ours the user turned off in Codex (`enabled = false` in its state table,
+   *  Codex's own switch). Codex shows that itself, so it is not a trust problem, and OAK leaves it. */
+  userDisabled: string[];
   configError?: string;
 }
 
@@ -974,6 +1323,7 @@ export function codexHooksStatus(isOurs: (cmd: string) => boolean): CodexHooksSt
   }
   let trust: CodexHooksStatus['trust'] = 'no-config';
   let disabled = false, configError: string | undefined;
+  const userDisabled: string[] = [];
   if (installed && installedCommand) {
     try {
       const config = fs.readFileSync(codexConfigTomlPath(), 'utf8');
@@ -992,14 +1342,16 @@ export function codexHooksStatus(isOurs: (cmd: string) => boolean): CodexHooksSt
         const key = codexHookKey(file, ev, idx).replace(/:0$/, `:${hi}`);
         const state = states?.[key];
         const hash = codexHookHash(ev, handler.command!);
-        if ((CODEX_HOOK_EVENTS as readonly string[]).includes(ev) && state?.enabled !== false && state?.trusted_hash === hash) have += 1;
+        if (!(CODEX_HOOK_EVENTS as readonly string[]).includes(ev)) continue;
+        if (state?.trusted_hash === hash) have += 1;
+        if (state?.enabled === false) userDisabled.push(ev);
       }
       trust = !disabled && have === want ? 'trusted' : have > 0 ? 'partial' : 'missing';
     } catch (e) {
       trust = 'no-config'; configError = String((e as Error).message);
     }
   }
-  return { hooksJsonPath: file, installed, installedCommand, foreignGroups, trust, disabled, configError };
+  return { hooksJsonPath: file, installed, installedCommand, foreignGroups, trust, disabled, userDisabled, configError };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1068,6 +1420,15 @@ function resetMs(v: unknown): number | null {
   return null;
 }
 
+/** Older codex wrote `resets_in_seconds` in place of `resets_at`: the seconds the window had left when the reading was
+ *  taken, so it resets at the reading's own timestamp plus them, never at now plus them. Null when the window carries
+ *  no such count, or the reading no timestamp: nothing then dates the reset (the rollout's mtime moves with every later
+ *  line, and an ended window read from it opened again). */
+function resetAfter(seconds: unknown, readAt: number | null): number | null {
+  const s = numOrNull(seconds);
+  return s === null || readAt === null ? null : Math.round(readAt + s * 1000);
+}
+
 /**
  * Read what codex last reported about the account's quota, credit and spend.
  *
@@ -1099,11 +1460,16 @@ export function codexUsage(file?: string): CodexUsage {
   return base;
 }
 
+/** Codex's built-in local providers (and the profile `ollama launch codex` writes): a turn they
+ *  served costs nothing per token, so leaving it out of a dollar sum loses nothing. */
+const LOCAL_CODEX_PROVIDERS = new Set(['ollama', 'lmstudio', 'ollama-launch']);
+
 /** Cache one cumulative event series per file set; window boundaries never create new cache kinds.
- * Exact timestamp queries stay cheap even when a rolling seven-day fallback moves every poll. */
+ * Exact timestamp queries stay cheap even when a rolling seven-day fallback moves every poll.
+ * `moUsdKnown` is false when the month holds a turn from a HOSTED provider OAK has no price for. */
 export function codexCycleUsage(cycleStartMs: number, weekStartMs: number, endMs = Infinity): { moTok: number; moReads: number; moUsd: number; moUsdKnown: boolean; weekTok: number } {
   const files = recentCodexRollouts(Number.MAX_SAFE_INTEGER);
-  const series = cachedByFiles('codex-cycle-events-v3', files, () => {
+  const series = cachedByFiles('codex-cycle-events-v4', files, () => {
     const seen = new Set<string>();
     const events = files.flatMap((file) => codexUsageDeltas(file)).filter((d) => {
       if (seen.has(d.id)) return false;
@@ -1113,7 +1479,8 @@ export function codexCycleUsage(cycleStartMs: number, weekStartMs: number, endMs
     return events.map((d) => {
       const price = priceUsage(d.provider && d.provider !== 'openai' ? `provider:${d.provider}/${d.model}` : d.model, d.usage);
       tok += d.usage.input + d.usage.output + d.usage.cacheWrite;
-      reads += d.usage.cacheRead; usd += price.usd; unknown += price.known ? 0 : 1;
+      reads += d.usage.cacheRead; usd += price.usd;
+      unknown += price.known || LOCAL_CODEX_PROVIDERS.has(d.provider ?? '') ? 0 : 1;
       return { ts: d.ts, tok, reads, usd, unknown };
     });
   });
@@ -1169,9 +1536,75 @@ export interface GptUsagePanel {
   monthReads: number | null;
   monthCost: number | null;
   monthCostTotal: number | null;
+  usageSource: 'database' | 'local';
+  measuredMachines: string;
+  usageFreshness?: string;
 }
 
+/** The weekly budget gptUsagePanel last derived from a live sample, and when: `{ weekTotal, at }` in the store
+ *  root (a file, which no store walker takes for a session). A week with no sample yet, as right after Codex's
+ *  weekly reset until GPT is used again, has no fill to derive it from, and the month estimate vanished. */
+const GPT_WEEK_BUDGET = 'gpt-week-budget.json';
+/** How long a remembered budget stands in: a few weeks with no sample, then it is no longer the plan's. */
+const GPT_WEEK_BUDGET_MS = 35 * 86400_000;
+
+function rememberedGptWeekTotal(now: number, scope: string): number | null {
+  try {
+    const m = JSON.parse(fs.readFileSync(path.join(rootDir(), GPT_WEEK_BUDGET), 'utf8'));
+    const fresh = typeof m?.at === 'number' && now - m.at >= 0 && now - m.at < GPT_WEEK_BUDGET_MS;
+    return fresh && (m.scope ?? 'local') === scope && typeof m.weekTotal === 'number' && m.weekTotal > 0 ? m.weekTotal : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Keep `weekTotal` as the remembered budget, replaced whole (a temporary file renamed over it). The same
+ *  value is written again only once a day, since every refresh of a status readout derives it. */
+function rememberGptWeekTotal(weekTotal: number, now: number, scope: string): void {
+  const file = path.join(rootDir(), GPT_WEEK_BUDGET);
+  try {
+    const was = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (was?.scope === scope && was?.weekTotal === weekTotal && typeof was.at === 'number' && now - was.at >= 0 && now - was.at < 86400_000) return;
+  } catch { /* none yet, or unreadable: written below */ }
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const tmp = `${file}.${process.pid}.${crypto.randomUUID()}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify({ weekTotal, at: now, scope }));
+    try { fs.renameSync(tmp, file); } catch (error) { fs.rmSync(tmp, { force: true }); throw error; }
+  } catch { /* a read of the usage never fails over its estimate */ }
+}
+
+/** The newest reading on this machine, taken after `since` (ms; null: any), of a 5-hour window still running at `now`,
+ *  or null: what an ended window in one rollout's last reading defers to. */
+function newerRunningFive(since: number | null, now: number): { pct: number; reset: number } | null {
+  let best: CodexUsage | null = null;
+  for (const f of recentCodexRollouts(8)) {
+    const u = codexUsageFile(f);
+    if (u.fivePct === null || u.fiveReset === null || u.fiveReset <= now || u.snapshotMs === null) continue;
+    if (since !== null && u.snapshotMs <= since) continue;
+    if (best === null || u.snapshotMs > best.snapshotMs!) best = u;
+  }
+  return best ? { pct: best.fivePct!, reset: best.fiveReset! } : null;
+}
+
+type GptDatabase = {
+  account: string | null;
+  db: import('node:sqlite').DatabaseSync;
+  cycle(monthStart: number, weekStart: number, now: number): ReturnType<typeof import('./index/usage').codexWindowTotals>;
+  close(): void;
+};
+let gptDatabase: (() => GptDatabase | null) | undefined;
+/** Registered by the database API, as store hooks are: capture loads Codex without loading the database builders. */
+export function setGptDatabaseReader(read: () => GptDatabase | null): void { gptDatabase = read; }
+
 export function gptUsagePanel(session?: string, now = Date.now()): GptUsagePanel | null {
+  const database = process.env.OAK_INDEX === 'off' ? null : gptDatabase?.();
+  try { return gptUsageFromDatabase(session, now, database ?? undefined); }
+  finally { database?.close(); }
+}
+
+function gptUsageFromDatabase(session: string | undefined, now: number, database?: GptDatabase): GptUsagePanel | null {
+  const db = database?.db;
   const source = session ? findCodexRollout(session) : null;
   const live = session ? (source ? codexUsage(source) : EMPTY_CODEX_USAGE()) : codexUsage();
   let fivePct = live.fivePct;
@@ -1182,11 +1615,33 @@ export function gptUsagePanel(session?: string, now = Date.now()): GptUsagePanel
   // That bound evidence outranks unbound rollout history, even after switching accounts locally.
   const { cachedCodexAccountQuota } = require('./codex-account') as typeof import('./codex-account');
   let quota = cachedCodexAccountQuota(now);
+  const account = codexAccountId() ?? database?.account ?? null;
+  const quotaAt = quota?.snapshotMs ?? 0;
+  if (db && account) {
+    for (const kind of ['five', 'week'] as const) {
+      const row = db.prepare(`SELECT pct, reset_ms, measured_ms FROM usage_readings WHERE agent = 'codex' AND kind = ?
+        AND account = ? AND source = 'app-server' AND measured_ms <= ? ORDER BY measured_ms DESC, machine_id DESC LIMIT 1`)
+        .get(kind, account, now + 5000) as { pct: number; reset_ms: number; measured_ms: number } | undefined;
+      if (row && now - row.measured_ms <= 30 * 60_000 && row.measured_ms >= quotaAt) {
+        quota ??= { version: 1, source: 'app-server', account, snapshotMs: row.measured_ms, fivePct, fiveReset, weekPct, weekReset };
+        if (kind === 'week') { quota.weekPct = row.pct; quota.weekReset = row.reset_ms; }
+        else { quota.fivePct = row.pct; quota.fiveReset = row.reset_ms; }
+      }
+    }
+  }
   if (quota) {
     fivePct = quota.fivePct; fiveReset = quota.fiveReset;
     weekPct = quota.weekPct; weekReset = quota.weekReset;
   }
-  if (fiveReset !== null && fiveReset <= now) { fivePct = null; fiveReset = null; }
+  // A 5-hour window whose reset has passed, with no newer reading, is over, as Claude's is (usageReading): its share
+  // is 0 and it has no reset, so it keeps its slot at 0% with no countdown. A newer reading is looked for in every recent
+  // rollout: the one read here is a named session's, or the one written last, and another session may have read the
+  // quota since, in the next window. That reading stands. A plan with no 5-hour window reports none and shows none. A
+  // weekly window refilled at its reset, so its last share goes.
+  if (fiveReset !== null && fiveReset <= now) {
+    const newer = quota ? null : newerRunningFive(live.snapshotMs, now);
+    fivePct = newer ? newer.pct : 0; fiveReset = newer ? newer.reset : null;
+  }
   if (weekReset !== null && weekReset <= now) { weekPct = null; weekReset = null; }
   const ctxPct = live.ctxTokens !== null && live.ctxSize ? Math.min(100, (live.ctxTokens / live.ctxSize) * 100) : null;
   // The gpt month is the BILL CYCLE when a gpt bill day is configured (the user's OpenAI subscription
@@ -1222,17 +1677,38 @@ export function gptUsagePanel(session?: string, now = Date.now()): GptUsagePanel
     monthReset = Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1);
   }
   const weekStart = weekReset !== null ? weekReset - 7 * 86400_000 : now - 7 * 86400_000;
-  const cyc = codexCycleUsage(monthStart, weekStart, now);
-  if (fivePct === null && weekPct === null && ctxPct === null && cyc.moTok <= 0) return null;
+  const cyc = database ? database.cycle(monthStart, weekStart, now)
+    : { ...codexCycleUsage(monthStart, weekStart, now), measuredMachines: 'this machine alone', budgetScope: 'local', localEquivalent: true, usageFreshness: '' };
   // MONTH budget, estimated the SAME way claude's statusline does (install-statusline.sh:886 —
   // `tk30 = t7 * mdays/7`, and the month % = month_tok / month_tok_total): project a calibrated
   // shorter window across the cycle. gpt exposes no monthly quota %, so we back-derive the WEEKLY
   // budget from its own reported fill — tokens measured this week ÷ the fraction of the week used
   // (weekPct/100), the single-sample form of claude's tokens-per-percent calibration — then scale it
   // to the month by days. `monthTok / monthTokTotal` in `usageBrief` then reads as a % exactly like
-  // claude's `monthTokens / monthTokensTotal`. Both inputs must be real (recent local weekly tokens +
-  // a live weekly %) or the budget stays unknown, the same honest gap claude leaves uncalibrated.
-  const weekTotal = weekPct !== null && weekPct > 0 && cyc.weekTok > 0 ? Math.round(cyc.weekTok / (weekPct / 100)) : null;
+  // claude's `monthTokens / monthTokensTotal`. Both inputs must be real (weekly database tokens +
+  // a live weekly %) or the budget stays unknown, the same honest gap claude leaves uncalibrated. A week with no
+  // sample yet (Codex's weekly reset, and no GPT use since) takes the budget the last sampled week gave, for
+  // up to GPT_WEEK_BUDGET_MS; a fresh sample always wins and is remembered.
+  const sampled = weekPct !== null && weekPct > 0 && cyc.weekTok > 0 ? Math.round(cyc.weekTok / (weekPct / 100)) : null;
+  if (sampled !== null) rememberGptWeekTotal(sampled, now, cyc.budgetScope);
+  let previous: number | null = null;
+  if (sampled === null && db && account) {
+    const last = db.prepare(`SELECT pct, reset_ms, measured_ms FROM usage_readings WHERE agent = 'codex' AND kind = 'week'
+      AND source = 'app-server' AND account = ? AND pct > 0 AND reset_ms IS NOT NULL AND measured_ms BETWEEN ? AND ?
+      ORDER BY measured_ms DESC, machine_id DESC LIMIT 1`).get(account, now - GPT_WEEK_BUDGET_MS, now) as
+      { pct: number; reset_ms: number; measured_ms: number } | undefined;
+    if (last) {
+      const tokens = db.prepare(`SELECT total(input + output + cache_create) AS tokens FROM usage_messages
+        WHERE agent = 'codex' AND ts >= ? AND ts <= ? AND (account IS NULL OR account = ?)`)
+        .get(last.reset_ms - 7 * 86400_000, Math.min(last.measured_ms, last.reset_ms - 1), account) as { tokens: number };
+      if (tokens.tokens > 0) previous = Math.round(tokens.tokens * 100 / last.pct);
+    }
+  }
+  const weekTotal = sampled ?? previous ?? rememberedGptWeekTotal(now, cyc.budgetScope)
+    ?? (cyc.localEquivalent && cyc.budgetScope !== 'local' ? rememberedGptWeekTotal(now, 'local') : null);
+  // Nothing to show: no window has a share and the cycle holds no turns. A cycle measured at 0 beside a known budget
+  // is a reading (0%), and keeps the panel when no window has a share, as Claude's month keeps its group.
+  if (fivePct === null && weekPct === null && ctxPct === null && cyc.moTok <= 0 && !(cyc.moTok === 0 && weekTotal !== null)) return null;
   const monthDays = Math.max(1, Math.round((monthReset - monthStart) / 86400_000));
   const monthTokTotal = weekTotal !== null ? Math.round((weekTotal * monthDays) / 7) : null;
   const monthCostTotal = null;
@@ -1242,16 +1718,21 @@ export function gptUsagePanel(session?: string, now = Date.now()): GptUsagePanel
     weekTok: cyc.weekTok > 0 ? cyc.weekTok : null,
     weekTotal,
     monthStart, monthReset,
-    monthTok: cyc.moTok > 0 ? cyc.moTok : null,
+    // A cycle with no GPT turns yet is a measured 0 once its budget is known, and reads 0%; null hid the
+    // month. Without a budget there is no share to show, so the month stays unknown.
+    monthTok: cyc.moTok > 0 ? cyc.moTok : cyc.moTok === 0 && monthTokTotal !== null ? 0 : null,
     monthTokTotal,
     monthReads: cyc.moReads > 0 ? cyc.moReads : null,
     // Show the PRICED SUBSET: the sum of the events we could price (cloud/OpenAI turns), even when
-    // the month also holds unpriceable ones. An unpriceable event is a local model (ollama/lmstudio),
-    // whose real API cost is $0, so excluding it from the dollar figure is accurate — not a gap. Only a
-    // month with NO priced spend at all (moUsd === 0) stays unavailable. Before this, one local turn
-    // flipped the whole GPT month's $ to "—" beside real cloud spend.
-    monthCost: cyc.moUsd > 0 ? cyc.moUsd : null,
+    // the month also holds unpriceable LOCAL ones (ollama/lmstudio), whose real API cost is $0, so
+    // excluding them from the dollar figure is accurate — not a gap. Before this, one local turn
+    // flipped the whole GPT month's $ to "—" beside real cloud spend. An unpriced turn from a HOSTED
+    // custom provider (an OpenRouter model missing from the price table) is real spend, so it makes
+    // the month's $ unavailable rather than understated. A month with NO priced spend stays unavailable.
+    monthCost: cyc.moUsd > 0 && cyc.moUsdKnown ? cyc.moUsd : null,
     monthCostTotal,
+    usageSource: db ? 'database' : 'local', measuredMachines: cyc.measuredMachines,
+    usageFreshness: cyc.usageFreshness,
   };
 }
 
@@ -1291,11 +1772,11 @@ function codexUsageFile(target: string): CodexUsage {
     const rl = p.rate_limits as Record<string, unknown> | undefined;
     if (rl) {
       for (const key of ['primary', 'secondary']) {
-        const w = rl[key] as { used_percent?: unknown; window_minutes?: unknown; window_duration_mins?: unknown; resets_at?: unknown } | null | undefined;
+        const w = rl[key] as { used_percent?: unknown; window_minutes?: unknown; window_duration_mins?: unknown; resets_at?: unknown; resets_in_seconds?: unknown } | null | undefined;
         if (!w) continue;
         const mins = numOrNull(w.window_minutes) ?? numOrNull(w.window_duration_mins);
         const pct = numOrNull(w.used_percent);
-        const at = resetMs(w.resets_at);
+        const at = resetMs(w.resets_at) ?? resetAfter(w.resets_in_seconds, state.quotaTs);
         // Classify by the duration codex reports, never by which slot it occupies. Codex 0.154 added
         // a MONTHLY window (~43200 min) beside the 5-hour (300) and weekly (10080) ones; the old
         // ">= a day is weekly" rule swallowed the monthly's ~30-day reset into the weekly slot. Bound
@@ -1332,14 +1813,16 @@ function codexUsageFile(target: string): CodexUsage {
   return out;
 }
 
-/** `codexUsage` with rolled-over windows dropped: a window whose `resets_at` has passed refilled
- *  at that boundary, so its recorded percentage is no longer true — showing it would claim spent
- *  quota that is back. A window with a percentage but no reset timestamp is kept (nothing proves
- *  it stale). For surfaces that render "current" quota, like the IDE status bars. */
+/** `codexUsage` with rolled-over windows dropped: a window whose reset has passed (its `resets_at`, or
+ *  the reading's time plus its `resets_in_seconds`) refilled at that boundary, so its recorded
+ *  percentage is no longer true — showing it would claim spent quota that is back. A 5-hour window
+ *  whose reset has passed is over and reads 0 with no reset, as gptUsagePanel reads it. A window with
+ *  a percentage but neither is kept (nothing proves it stale). For surfaces that render "current"
+ *  quota, like the IDE status bars. */
 export function codexUsageLive(file?: string): CodexUsage {
   const u = { ...codexUsage(file) };
   const now = Date.now();
-  if (u.fiveReset !== null && u.fiveReset <= now) { u.fivePct = null; u.fiveReset = null; }
+  if (u.fiveReset !== null && u.fiveReset <= now) { u.fivePct = 0; u.fiveReset = null; }
   if (u.weekReset !== null && u.weekReset <= now) { u.weekPct = null; u.weekReset = null; }
   return u;
 }

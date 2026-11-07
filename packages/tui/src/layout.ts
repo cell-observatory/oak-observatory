@@ -210,6 +210,9 @@ export interface LayoutRequest {
    * only where there are tabs to put on it.
    */
   tabs?: readonly string[];
+  /** The same tabs' names without their keys (`F2 observatory` is `observatory`): a strip that would scroll with the
+   *  keys shown, and fits whole without them, shows every tab by name. */
+  tabNames?: readonly string[];
   /** Box the session navbar (boxed glyph tier): the top chrome grows by two rows, and the renderer
    *  and hit-test both read the resolved layout — never a second source of truth. */
   navBox?: boolean;
@@ -277,44 +280,45 @@ export const DRAG_COL_FLOOR = 6;
  * are absent until they render; the docs say which, rather than the strip implying otherwise.
  */
 export const PANE_SPECS: readonly PaneSpec[] = [
-  // DECLARATION ORDER IS WINDOW-BAR ORDER, and the bar reads left to right as F1..F6. The keys number
-  // the regions in the order a review moves through them — who is doing the work, what was asked, what
-  // it changed, what else is going on — and Detail is last because it is what the others point at.
+  // DECLARATION ORDER IS WINDOW-BAR ORDER. F1 to F3 are OAK's tabs, so the window keys start at F4: the
+  // four windows Review shows read left to right as F4..F7, in the order a review moves through them —
+  // what was asked, what it changed — and Detail is last because it is what the others point at. The
+  // Agent strip and Dashboards, which Review hides and no other tab draws, take F8 and F9.
   //
   // Claude leads: the agent's own window — a status row (model, liveness, pending count, the last
   // ask), a LIVE TAIL of the session feed beneath it, and the door back into the conversation
-  // (F1 again opens the Agent SCREEN — the drive surface; `r` keeps the native `claude --resume`
+  // (F8 again opens the Agent SCREEN — the drive surface; `r` keeps the native `claude --resume`
   // handover for hook-observed Claude sessions). `min` 4 is the smallest honest live pane:
   // title + status + two tail rows; `want` 10 gives the tail room without displacing a workspace.
   // Titled 'Agent', not 'Claude': the strip shows whichever agent the
   // session ran — hook-observed Claude or an ACP-driven one. The internal id stays 'claude';
   // renaming code identity is churn with zero reader value.
-  { id: 'claude', n: 1, dock: 'top', title: 'Agent', min: 4, want: 10, yield: 0, tabs: [] },
+  { id: 'claude', n: 8, dock: 'top', title: 'Agent', min: 4, want: 10, yield: 0, tabs: [] },
   // Prompts sits ABOVE Traces in the left column now — a sub-split of the left cell, mirroring Map over Diff on the
   // right. `dock: 'left'` puts it in the band (not the top strips); like Map its width is the column's
   // and its height is the split, so `want` is inert (0), and its `min` never claims column width because
   // it is not in `COLUMNS`.
-  { id: 'prompts', n: 2, dock: 'left', title: 'Prompts', min: 3, want: 0, yield: 0, tabs: [] },
+  { id: 'prompts', n: 4, dock: 'left', title: 'Prompts', min: 3, want: 0, yield: 0, tabs: [] },
   // ONE list (labelled Review, like the editors); opening a prompt scopes it to the picked ask (esc clears).
   // Titled for the WINDOW, not its contents: the editors call this Observatory Traces, and a reader
   // moving between the terminal and an IDE should not have to learn two names for one thing.
   // min 36, not 30: the left column now stacks MAP over Traces, and Map needs 36
   // columns for its own table — so the column, and every drag of its seam, must reserve Map's width too.
-  { id: 'traces', n: 3, dock: 'left', title: 'Traces', min: 36, want: 42, yield: 3, tabs: [] },
+  { id: 'traces', n: 5, dock: 'left', title: 'Traces', min: 36, want: 42, yield: 3, tabs: [] },
   // The MAP: a REAL pane above Diff in the centre column (two separate
   // panels with their own chrome and their own keys, never two faces of one window; the face swap
   // was an auto-revert bug factory). It shares the centre column's WIDTH — `min` matches Diff's for
   // that reason — and its HEIGHT is the split: 20% of the column by default, dragged at the seam
   // like every other seam. It navigates: the node under its cursor scopes the Traces list.
-  { id: 'map', n: 4, dock: 'centre', title: 'Map', min: 36, want: 0, yield: 4, tabs: [] },
+  { id: 'map', n: 6, dock: 'centre', title: 'Map', min: 36, want: 0, yield: 4, tabs: [] },
   // The DIFF: the selected edit, rendered rich, below the map. `nav` buys the action row (Keep,
   // Undo, prev/next) that acts on the edit being shown.
-  { id: 'detail', n: 5, dock: 'centre', title: 'Diff', min: 36, want: 0, yield: 4, nav: true, tabs: [] },
+  { id: 'detail', n: 7, dock: 'centre', title: 'Diff', min: 36, want: 0, yield: 4, nav: true, tabs: [] },
   // Everything that is not the edit under review. Observations and Actions arrived here when the
   // right-hand sidebar went. Ordered by what a review reaches for: who did the work and under what
   // plan, then what was observed and what was run, then the machinery.
   {
-    id: 'dashboards', n: 6, dock: 'bottom', title: 'Dashboards', min: 7, want: 10, yield: 2,
+    id: 'dashboards', n: 9, dock: 'bottom', title: 'Dashboards', min: 7, want: 10, yield: 2,
     // WORKERS, not "Fleet" and not "Agents". One word per concept: an AGENT is
     // the product that ran the session (claude, codex); a WORKER is a session doing work — the same
     // entity seen as an actor rather than as a record. "Fleet" named the collection and left the row
@@ -330,7 +334,7 @@ export const PANE_SPECS: readonly PaneSpec[] = [
  * One chip per pane, one function key each.
  *
  * One documented exception to "a pane's key pressed again zooms it": the Claude strip has nothing to
- * zoom into, so F1 again LAUNCHES Claude instead — the drill-in gesture, applied to the pane whose
+ * zoom into, so F8 again LAUNCHES Claude instead — the drill-in gesture, applied to the pane whose
  * drill-in is the agent itself.
  */
 export interface BarEntry {
@@ -339,12 +343,12 @@ export interface BarEntry {
   title: string;
 }
 export const BAR_ENTRIES: readonly BarEntry[] = [
-  { key: 1, pane: 'claude', title: 'Agent' },
-  { key: 2, pane: 'prompts', title: 'Prompts' },
-  { key: 3, pane: 'traces', title: 'Traces' },
-  { key: 4, pane: 'map', title: 'Map' },
-  { key: 5, pane: 'detail', title: 'Diff' },
-  { key: 6, pane: 'dashboards', title: 'Dashboards' },
+  { key: 8, pane: 'claude', title: 'Agent' },
+  { key: 4, pane: 'prompts', title: 'Prompts' },
+  { key: 5, pane: 'traces', title: 'Traces' },
+  { key: 6, pane: 'map', title: 'Map' },
+  { key: 7, pane: 'detail', title: 'Diff' },
+  { key: 9, pane: 'dashboards', title: 'Dashboards' },
 ];
 
 /**
@@ -432,9 +436,12 @@ export function resolveLayout(req: LayoutRequest): Layout {
   // Reserve the right end of the tab row for the Workers rollup, which rides the SAME row rather
   // than taking chrome from 3 rows to 4 (the reason it is not a strip of its own). Outer cells use
   // herdr's four columns of padding, one-column gaps, and minimum width of eight.
-  const tabFit = tabLabels.length
-    ? tabSpansFor(tabLabels, 0, Math.max(0, cols - WORKERS_ROLLUP_W), req.activeTab ?? 0, 4, 1, 8)
-    : null;
+  const fitTabs = (labels: readonly string[]) => tabSpansFor(labels, 0, Math.max(0, cols - WORKERS_ROLLUP_W), req.activeTab ?? 0, 4, 1, 8);
+  let tabFit = tabLabels.length ? fitTabs(tabLabels) : null;
+  if (tabFit && (tabFit.pre || tabFit.post) && req.tabNames?.length === tabLabels.length) {
+    const named = fitTabs(req.tabNames);
+    if (!named.pre && !named.post) tabFit = named;
+  }
   const tabbar = tabFit?.spans ?? [];
   const tabbarMore = { pre: tabFit?.pre ?? null, post: tabFit?.post ?? null };
   // One row MORE than the chrome ladder reserves: the status row is drawn only when it has
@@ -486,7 +493,7 @@ export function resolveLayout(req: LayoutRequest): Layout {
   }
   // The Claude strip is carved LAST, above Prompts on screen but below everything in priority: it is
   // a status readout, and every other window is a workspace. When rows run short it goes first —
-  // before Prompts, before Dashboards — and folded it keeps its chip and the F1 launch
+  // before Prompts, before Dashboards — and folded it keeps its chip and the F8 launch
   // gesture, so nothing is lost but two rows of summary.
   let clH = 0;
   const clOpen = zoom === 'claude' || (!min.has('claude') && zoom === null);
@@ -613,13 +620,13 @@ export function resolveLayout(req: LayoutRequest): Layout {
       blocked.push({ pane: 'dashboards', needRows: COL_FLOOR + BY_ID.dashboards.min });
     }
     // The TOP dock refuses loudly too. This was a real gap before the Claude strip arrived: a short
-    // terminal force-minimized Prompts with a note that nothing rendered, so F2 focused a boxless pane
+    // terminal force-minimized Prompts with a note that nothing rendered, so its F-key focused a boxless pane
     // in silence. `blocked` is what the status row reads, so Prompts reports there when rows — not the
     // reader — are what closed it.
     //
     // The CLAUDE strip is deliberately exempt. `blocked` exists because a folded pane's function is
     // otherwise LOST; folded Claude loses nothing a status line could restore — the chip stays on the
-    // bar, and F1 still focuses it and launches the agent. Reporting it would park
+    // bar, and F8 still focuses it and launches the agent. Reporting it would park
     // "Claude needs 32 body rows" on the status row of every ~34-row terminal permanently, hiding the
     // messages that row exists to carry (mutation results, errors, "nothing selected").
     if (!boxes.some((b) => b.id === 'prompts') && bodyH - COL_FLOOR < BY_ID.prompts.min && open.length) {
@@ -928,7 +935,7 @@ export function defaultMinimized(cols: number, rows: number): Set<PaneId> {
   // size and still spare its rows — it is the lowest-priority window, and a first paint that opens
   // it by folding a workspace would invert that. Same step-function shape as the rest. With min 4,
   // prompts.want 6, dashboards.want 10 and COL_FLOOR 16 this folds below 36 body rows (a 40-row
-  // terminal) — acceptable: the seam, `<`/`>`, zoom and F1 all reopen it larger on demand.
+  // terminal) — acceptable: the seam, `<`/`>`, zoom and F8 all reopen it larger on demand.
   const dashRows = out.has('dashboards') ? 0 : BY_ID.dashboards.want;
   if (bodyH - COL_FLOOR - BY_ID.prompts.want - dashRows < BY_ID.claude.min) out.add('claude');
   // Detail yields before Traces at startup: with one column left, the list you act ON is worth more

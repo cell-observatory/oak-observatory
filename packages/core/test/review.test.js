@@ -1,4 +1,4 @@
-const { test } = require('node:test');
+const { test, after } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
@@ -8,8 +8,12 @@ const C = require('../dist');
 const child = path.join(__dirname, 'fixtures/store-review.cjs');
 const DAY = 86400000;
 
+// The temp dirs fresh() makes, removed when this file ends (a direct `node --test` run left them behind).
+const tmpDirs = [];
+after(() => { for (const dir of tmpDirs) fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5 }); });
 function fresh() {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-review-test-'));
+  tmpDirs.push(base);
   process.env.CLAUDE_CONFIG_DIR = path.join(base, 'claude');
   process.env.CODEX_HOME = path.join(base, 'codex');
   fs.mkdirSync(process.env.CLAUDE_CONFIG_DIR);
@@ -143,7 +147,48 @@ test('review: historical quota is never relabelled after account switches or mer
   } finally { global.fetch = fetch; }
 });
 
-test('review: exact quota resets exclude prior-window tokens and polling uses one event cache', () => {
+test('review: the GPT month estimate outlives Codex\'s weekly reset, from the budget the last sampled week gave (2026-10-07)', (t) => {
+  const mode = process.env.OAK_INDEX;
+  process.env.OAK_INDEX = 'off'; // The local memo and event cache are the database-unavailable fallback.
+  t.after(() => { if (mode === undefined) delete process.env.OAK_INDEX; else process.env.OAK_INDEX = mode; });
+  // The weekly budget is derived from the week's own fill (tokens / weekPct). Right after the weekly reset the
+  // fill reads nothing until GPT is used again, and the month estimate vanished from every surface.
+  const { cwd } = fresh(), now = Date.parse('2026-10-20T12:00:00Z'), reset = now - DAY;
+  const memory = () => path.join(C.rootDir(), 'gpt-week-budget.json');
+  rollout(cwd, [event(now - 2 * DAY, 1000, 10, reset)]);
+  const mdays = (g) => Math.round((g.monthReset - g.monthStart) / DAY);
+  // A week with a sample: its budget is used, and remembered.
+  const sampled = C.gptUsagePanel(undefined, now - 2 * DAY + 60000);
+  assert.deepEqual([sampled.weekPct, sampled.weekTotal], [10, 10000]);
+  assert.deepEqual(JSON.parse(fs.readFileSync(memory(), 'utf8')), { weekTotal: 10000, at: now - 2 * DAY + 60000, scope: 'local' });
+  // After the reset: no fill, so the remembered budget gives the month its total.
+  const after = C.gptUsagePanel(undefined, now);
+  assert.deepEqual([after.weekPct, after.weekTotal, after.monthTokTotal], [null, 10000, Math.round((10000 * mdays(after)) / 7)]);
+  // The file is no session: the store's walkers pass over it.
+  assert.equal(C.allStoreSessionIds().includes('gpt-week-budget.json'), false);
+  assert.equal(C.listSessions().some((s) => s.id === 'gpt-week-budget.json'), false);
+  // A memory older than 35 days is not the plan's any more.
+  fs.writeFileSync(memory(), JSON.stringify({ weekTotal: 10000, at: now - 36 * DAY }));
+  assert.deepEqual([C.gptUsagePanel(undefined, now).weekTotal, C.gptUsagePanel(undefined, now).monthTokTotal], [null, null]);
+  fs.writeFileSync(memory(), JSON.stringify({ weekTotal: 10000, at: now - 34 * DAY }));
+  assert.equal(C.gptUsagePanel(undefined, now).weekTotal, 10000, 'control: one 34 days old still stands in');
+  // A fresh sample in the new week wins, also where the store cannot be written to remember it, and it
+  // replaces the memory where it can.
+  rollout(cwd, [event(now - 2 * DAY, 1000, 10, reset), event(now - 60000, 1300, 1, now + 6 * DAY)]);
+  if (process.platform !== 'win32') {
+    fs.chmodSync(C.rootDir(), 0o555);
+    try { assert.equal(C.gptUsagePanel(undefined, now).weekTotal, 30000); } finally { fs.chmodSync(C.rootDir(), 0o755); }
+    assert.equal(JSON.parse(fs.readFileSync(memory(), 'utf8')).weekTotal, 10000, 'not written there');
+  }
+  const fresh2 = C.gptUsagePanel(undefined, now);
+  assert.deepEqual([fresh2.weekPct, fresh2.weekTotal], [1, 30000]);
+  assert.deepEqual(JSON.parse(fs.readFileSync(memory(), 'utf8')), { weekTotal: 30000, at: now, scope: 'local' });
+});
+
+test('review: exact quota resets exclude prior-window tokens and polling uses one event cache', (t) => {
+  const mode = process.env.OAK_INDEX;
+  process.env.OAK_INDEX = 'off'; // The local memo and event cache are the database-unavailable fallback.
+  t.after(() => { if (mode === undefined) delete process.env.OAK_INDEX; else process.env.OAK_INDEX = mode; });
   const { cwd } = fresh(), now = Date.now(), start = Math.floor(now / DAY) * DAY - 4 * DAY + 12 * 3600000;
   rollout(cwd, [event(start - 1, 1000), event(start, 1100), event(start + 1, 1200), event(now - 60000, 1200, 10, start + 7 * DAY)]);
   assert.equal(C.gptUsagePanel().weekTok, 200);
@@ -187,6 +232,62 @@ test('review: a stale Claude monthly reset rolls forward to the next boundary, n
   const fut = Math.floor((now + 20 * DAY) / 1000);
   fs.writeFileSync(path.join(C.claudeConfigDir(), 'statusline-last.json'), JSON.stringify({ month_reset: fut, month_tok: 5000, month_tok_total: 100000 }));
   assert.equal(C.usageLine(cwd, 'stale-month').monthReset, fut * 1000, 'a future anchor is unchanged');
+});
+
+test('review: a month that just rolled over with no usage reads 0%, and a month never measured still hides (2026-10-14)', () => {
+  // Both bill cycles rolled over and nothing has run since. The statusline's month refresh wrote a v3 cache
+  // with the cycle measured at 0 beside its budget and reset; GPT's last turn sits in the old cycle, its
+  // weekly window still live and its week budget remembered. Both zeros were read as "no data": the bar
+  // dropped both months, and Claude's whole group with them, since it had no other window.
+  const tui = require('../../tui/dist/index.js');
+  const { cwd } = fresh(), now = Date.now(), d = new Date(now);
+  const start = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1);
+  const reset = Math.floor(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1) / 1000);
+  const cache = path.join(C.claudeConfigDir(), 'statusline-last.json');
+  const writeCache = (o) => fs.writeFileSync(cache, JSON.stringify(o));
+  writeCache({ v: 3, month_tok: 0, month_tok_total: 111423689, month_reset: reset, month_meas: 0, month_reads: 0, month_cost: 0, month_cost_total: 0 });
+  const lastCycle = rollout(cwd, [event(start - 3600000, 50000, 30, now + 3 * DAY)]);
+  fs.mkdirSync(C.rootDir(), { recursive: true });
+  fs.writeFileSync(path.join(C.rootDir(), 'gpt-week-budget.json'), JSON.stringify({ weekTotal: 1000000, at: now }));
+  const bar = () => tui.statuslineFor({ now, usageBoth: C.usageBrief(cwd), usage: C.usageLine(cwd, '') }, 160, {}, 'none', 1)[0].replace(/\s+$/, '');
+
+  const u = C.usageLine(cwd, ''), g = C.gptUsagePanel();
+  assert.deepEqual([u.monthTokens, u.monthTokensTotal], [0, 111423689], 'Claude: the measured 0 is kept, beside its budget');
+  assert.equal(g.monthTok, 0, 'GPT: a cycle with no turns yet is a measured 0');
+  assert.ok(g.monthTokTotal > 0, 'control: GPT has a month budget to share against');
+  const brief = C.usageBrief(cwd);
+  assert.deepEqual([brief.claude.month.pct, brief.gpt.month.pct], [0, 0], 'both months are a 0% share');
+  assert.match(bar(), /^✳ claude mo: 0%(?: |$)/, 'Claude keeps its group on its month alone');
+  assert.match(bar(), /\| {2}⬡ gpt wk: 30% .* · mo: 0%(?: |$)/, 'GPT keeps its month');
+  assert.deepEqual([u.monthReads, u.monthCost, u.monthCostTotal, g.monthReads, g.monthCost], [null, null, null, null, null],
+    'a measured zero adds no reads and no dollar figure');
+  // GPT's week rolls over too, with no use since: its month, measured at 0 beside the remembered budget, keeps
+  // the group, as Claude's does.
+  rollout(cwd, [event(start - 3600000, 50000, 30, now - 3600000)]);
+  assert.deepEqual([C.gptUsagePanel()?.weekPct, C.gptUsagePanel()?.monthTok], [null, 0], 'GPT: no week, and the month measured at 0');
+  assert.match(bar(), /\| {2}⬡ gpt mo: 0%(?: |$)/, 'GPT keeps its group on its month alone');
+  rollout(cwd, [event(start - 3600000, 50000, 30, now + 3 * DAY)]);
+
+  // Never measured, one rule at a time: no Claude month, so its group hides beside GPT's.
+  for (const [why, o] of [
+    ['a cache that never measured the month', { v: 3 }],
+    ['a scan with no budget yet', { v: 3, month_tok: 0, month_tok_total: 0, month_reset: reset }],
+    ['a cache from an older statusline schema', { month_tok: 0, month_tok_total: 111423689, month_reset: reset }],
+    ['a cache with no cycle reset', { v: 3, month_tok: 0, month_tok_total: 111423689 }],
+  ]) {
+    writeCache(o);
+    assert.equal(C.usageLine(cwd, '').monthTokens, null, why);
+    assert.match(bar(), /^⬡ gpt /, `${why}: Claude has nothing to show, so its group hides`);
+  }
+  // GPT with no budget (no live share to derive it from and none remembered): no share, so no month.
+  fs.rmSync(lastCycle);
+  fs.rmSync(path.join(C.rootDir(), 'gpt-week-budget.json'));
+  rollout(cwd, [event(start - 3600000, 50000, 0, now + 3 * DAY)], 'review-usage-unsampled');
+  assert.deepEqual([C.gptUsagePanel().monthTok, C.gptUsagePanel().monthTokTotal], [null, null], 'GPT: no budget, no month');
+  assert.match(bar(), /^⬡ gpt wk: 0% \S+ \S+$/, 'GPT keeps its week and shows no month');
+  // GPT never used on this machine: no panel at all.
+  fs.rmSync(path.join(process.env.CODEX_HOME, 'sessions'), { recursive: true });
+  assert.equal(C.gptUsagePanel(), null, 'GPT never used here');
 });
 
 test('review: model-free quota RPC binds the backend account and closes its process on every outcome', async () => {
@@ -304,11 +405,11 @@ test('review: a forked rollout\'s first token_count takes the turn\'s own last_t
 test('review: oak clean never treats a non-session store directory as an empty stub', () => {
   fresh();
   const root = C.storeDir('x').replace(/\/x$/, '');
-  for (const d of ['.file-locks', 'runtime-transcripts', 'remote-cache', 'agent-prefs-codex-acp']) {
+  for (const d of ['.file-locks', 'runtime-transcripts', 'remote-cache', 'herdr-ssh', 'agent-prefs-codex-acp']) {
     fs.mkdirSync(path.join(root, d), { recursive: true });
     assert.equal(C.pruneEmptySession(d), false, `${d} is reserved, never pruned`);
   }
-  assert.ok(!C.allStoreSessionIds().some((id) => ['.file-locks', 'runtime-transcripts', 'remote-cache'].includes(id) || id.startsWith('agent-prefs-')),
+  assert.ok(!C.allStoreSessionIds().some((id) => ['.file-locks', 'runtime-transcripts', 'remote-cache', 'herdr-ssh'].includes(id) || id.startsWith('agent-prefs-')),
     'reserved dirs are not listed as sessions');
 });
 
@@ -358,6 +459,19 @@ test('review: deleting a session with edits pending review is refused unless for
   assert.ok(!fs.existsSync(C.storeDir('del-pending')), '…with its store');
   C.unhideSession('del-pending');
   assert.equal(C.readLog('del-pending').length, 0, 'undelete lists the session again without its edits');
+  // With oak sync's backup folder set, which keeps a copy of the store, the refusal says what the CLI says there.
+  const prefsWas = fs.existsSync(C.prefsPath()) ? fs.readFileSync(C.prefsPath(), 'utf8') : null;
+  fs.mkdirSync(path.dirname(C.prefsPath()), { recursive: true });
+  fs.writeFileSync(C.prefsPath(), JSON.stringify({ sync: { backup: { kind: 'folder', path: '/mnt/share/oak-backup' } } }));
+  try {
+    C.ensureStore('del-pending-folder');
+    C.appendLog('del-pending-folder', { id: 1, ts: 1000, tool: 'Edit', file, status: 'pending',
+      beforeBlob: C.writeBlob('del-pending-folder', Buffer.from('before\n')), afterBlob: C.writeBlob('del-pending-folder', Buffer.from('after\n')) });
+    assert.throws(() => C.deleteSession('del-pending-folder'), /1 edit pending review; deleting the session would purge it here \(the backup folder keeps its copy\), so it was not deleted/);
+  } finally {
+    if (prefsWas === null) fs.rmSync(C.prefsPath(), { force: true });
+    else fs.writeFileSync(C.prefsPath(), prefsWas);
+  }
   // Nothing pending: no confirmation of edits is needed.
   C.ensureStore('del-kept');
   C.appendLog('del-kept', { id: 1, ts: 1000, tool: 'Edit', file, status: 'kept',
@@ -428,6 +542,59 @@ test('review: a delete refuses an edit captured after its listing, even one that
   assert.equal(again.lastEdit, 3);
   C.deleteSession(S, { confirmedPending: again.pending, seenThrough: again.lastEdit });
   assert.ok(C.isSessionHidden(S) && !fs.existsSync(C.storeDir(S)), 'deleted');
+});
+
+// A rewrite drops records: clearing resolved edits, sweeping ones an ignore rule now covers, or repairing a
+// case-phantom pair (`oak clean --phantoms`). When the newest
+// went, the next capture took a dropped id, at or below the `lastEdit` a delete dialog had already read, so a
+// delete confirmed from that dialog purged the new edit unseen. Every rewrite now leaves the next id on the
+// log's first line, and ids only grow. The large log takes nextId's bounded tail read; the small ones its full read.
+test('review: after a log rewrite a new edit never reuses a dropped id, so a delete confirmed before it refuses', () => {
+  const { cwd } = fresh();
+  const ignore = path.join(cwd, '.observatoryignore');
+  const rewrites = [
+    ['clear-resolved', 3, (S) => C.clearResolved(S)],
+    ['clear-ids', 3, (S) => C.clearResolvedIds(S, [2, 3]).cleared],
+    ['ignore-sweep', 3, (S) => { fs.writeFileSync(ignore, 'c*.py\n'); try { return C.dropIgnored(S).dropped; } finally { fs.rmSync(ignore); } }],
+    ['clear-large', 400, (S) => C.clearResolved(S)],
+    // The newest two are a pending case-phantom pair: one file under two drive-letter cases, created and deleted.
+    ['repair-phantoms', 3, (S) => C.repairCasePhantoms(S).pairs, true],
+  ];
+  for (const [name, n, rewrite, phantoms] of rewrites) {
+    const S = `reuse-${name}`;
+    C.ensureStore(S);
+    const rec = (file) => C.appendLog(S, { ts: Date.now(), tool: 'Edit', file: path.join(cwd, file), status: 'pending', promptId: 'ask-1',
+      beforeBlob: C.writeBlob(S, Buffer.from('a\n')), afterBlob: C.writeBlob(S, Buffer.from(`${file}\n`)) });
+    if (phantoms) {
+      for (let i = 1; i <= n - 2; i++) rec(`a${i}.py`);
+      const blob = C.writeBlob(S, Buffer.from('ci\n'));
+      C.appendLog(S, { ts: Date.now(), tool: 'Bash', file: 'C:\\repo\\ci.yml', status: 'pending', beforeBlob: null, afterBlob: blob });
+      C.appendLog(S, { ts: Date.now(), tool: 'Bash', file: 'c:\\repo\\ci.yml', status: 'pending', beforeBlob: blob, afterBlob: null });
+    } else {
+      for (let i = 1; i <= n; i++) rec(i === n ? 'c.py' : i === n - 1 ? 'c2.py' : `a${i}.py`);
+      for (const id of [n - 1, n]) C.setStatus(S, id, 'kept');
+    }
+    if (n > 3) assert.ok(fs.statSync(C.logPath(S)).size > 64 * 1024, 'control: large enough for the tail read');
+    const shown = C.sessionCounts(S);
+    assert.equal(shown.lastEdit, n);
+    assert.ok(rewrite(S) >= 1, `control: ${name} dropped records`);
+    assert.ok(C.readLog(S).every((r) => r.id < n - 1), `control: ${name} dropped the newest`);
+    assert.equal(rec('d.py').id, n + 1, `${name}: the next id is past every id the log ever held`);
+    assert.throws(() => C.deleteSession(S, { confirmedPending: n + 1, seenThrough: shown.lastEdit }),
+      new RegExp(`^Error: ${S} captured an edit after the listing this delete was confirmed from`), name);
+    assert.ok(C.readLog(S).some((r) => r.id === n + 1) && !C.isSessionHidden(S), `${name}: refused, nothing purged`);
+    // A second rewrite that drops the edit it just gave out keeps the floor, and the log still reads the same.
+    C.setStatus(S, n + 1, 'kept');
+    C.clearResolved(S);
+    assert.equal(fs.readFileSync(C.logPath(S), 'utf8').split('\n').filter((l) => l.includes('"id-floor"')).length, 1, 'one floor line');
+    assert.equal(rec('e.py').id, n + 2, `${name}: still past it after another rewrite`);
+    assert.deepEqual(C.readLog(S).map((r) => r.id), [...Array.from({ length: n - 2 }, (_, i) => i + 1), n + 2]);
+  }
+  // A log no rewrite has touched, or one an earlier build rewrote, has no floor line: ids go on from its newest.
+  const S = 'reuse-old-log';
+  C.ensureStore(S);
+  fs.writeFileSync(C.logPath(S), [1, 2].map((id) => JSON.stringify({ id, ts: id, tool: 'Edit', file: path.join(cwd, 'x.py'), status: 'pending', beforeBlob: null, afterBlob: null })).join('\n') + '\n');
+  assert.equal(C.nextId(S), 3);
 });
 
 // The counts read the log more than once. An edit captured while they are counted must come out newer than the
@@ -504,4 +671,34 @@ C.withFileMutation(C.captureMutex('del-busy'), () => {
   } finally {
     capture.kill();
   }
+});
+
+test('review: the GPT month $ is unavailable, not understated, when a hosted custom provider has no price', () => {
+  // The month $ sums the turns OAK can price and used to skip every unpriced one as a $0 local turn.
+  // A hosted custom provider (an OpenRouter model outside the price table) is real spend.
+  const month = (provider, model) => {
+    const { cwd } = fresh(), now = Date.now();
+    rollout(cwd, [event(now - 60000, 1_000_000)]);
+    const file = path.join(process.env.CODEX_HOME, 'sessions', 'rollout-custom.jsonl');
+    fs.writeFileSync(file, [{ type: 'session_meta', payload: { id: 'custom', cwd, model_provider: provider } },
+      { type: 'turn_context', payload: { model, model_provider: provider } }, event(now - 30000, 1_000_000)].map(JSON.stringify).join('\n') + '\n');
+    return C.gptUsagePanel().monthCost;
+  };
+  assert.equal(month('ollama', 'laguna-xs.2:latest'), 1.75, 'a local turn is $0: the month shows the priced OpenAI turn');
+  assert.equal(month('ollama-launch', 'laguna-xs.2:latest'), 1.75, 'including the profile `ollama launch codex` writes');
+  assert.equal(Math.round(month('openrouter', 'poolside/laguna-s-2.1') * 100) / 100, 1.84, 'a listed OpenRouter model adds its price');
+  assert.equal(month('openrouter', 'mistralai/devstral-2'), null, 'an unlisted hosted model makes the month unavailable');
+});
+
+test('review: a GPT budget remembered from local readings stands in on a database that knows only this machine', () => {
+  // Upgrading from 0.10 leaves a budget remembered from local readings. On a database holding only this machine's
+  // rows the union is that same machine's usage, so the budget still stands in for a week with no sample yet, rather
+  // than the month reading as unknown until GPT is used again. Independent of the date: the last turn is outside the week.
+  const { cwd } = fresh(), now = Date.now();
+  rollout(cwd, [event(now - 8 * DAY, 50000, 30, now + 3 * DAY)]);
+  fs.mkdirSync(C.rootDir(), { recursive: true });
+  fs.writeFileSync(path.join(C.rootDir(), 'gpt-week-budget.json'), JSON.stringify({ weekTotal: 1000000, at: now }));
+  const g = C.gptUsagePanel();
+  assert.equal(g.weekTok, null, 'control: the week holds no sample');
+  assert.ok(g.monthTokTotal > 0, 'the remembered budget gives the month a share');
 });

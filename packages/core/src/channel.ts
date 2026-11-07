@@ -14,8 +14,9 @@
  */
 import * as fs from 'fs';
 import * as path from 'path';
-import { rootDir } from './store';
+import { rootDir, outsideStoreMoves } from './store';
 import { isNewer } from './semver';
+import { graphemeHead } from './graphemes';
 
 export type UpdateChannel = 'stable' | 'dev';
 
@@ -38,6 +39,11 @@ export function getUpdateChannel(): UpdateChannel {
  * worked silently does not survive. The error names the file, the cause, and the override.
  */
 export function setUpdateChannel(ch: UpdateChannel): void {
+  // A setting kept in the store: written outside any store move, not where the store was.
+  outsideStoreMoves(() => setUpdateChannelUnguarded(ch));
+}
+
+function setUpdateChannelUnguarded(ch: UpdateChannel): void {
   const dir = rootDir();
   const file = path.join(dir, 'channel');
   try {
@@ -97,8 +103,7 @@ export function versionOfRelease(r: { tag_name?: string; name?: string } | null 
   // mirror), and an unanchored scan with unbounded `\d+` runs is polynomial on adversarial digit
   // strings. Nine digits per component and a 128-char suffix cover every version this project can
   // ever mint, at provably linear cost.
-  const m = String(r.name ?? '')
-    .slice(0, 256)
+  const m = graphemeHead(String(r.name ?? ''), 256)
     .match(/\d{1,9}\.\d{1,9}\.\d{1,9}(?:-[0-9A-Za-z][0-9A-Za-z.-]{0,127})?/);
   return m ? m[0] : null;
 }

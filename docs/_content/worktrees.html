@@ -14,3 +14,5 @@
 
 <h2>The fleet ties them together</h2>
 <p>Every running agent across the repository's worktrees is unified into one board — the <a href="workflows-fleet.html">fleet</a>. That's where you watch siblings race, see which is furthest along, and catch two of them heading for the same file before they collide.</p>
+
+<p>Repository discovery checks a valid <code>.git</code> directory or <code>gitdir: </code> pointer, including HEAD and the common directory’s objects and refs. It honors <code>GIT_CEILING_DIRECTORIES</code>; an empty directory or arbitrary file named <code>.git</code> does not make a repository. Path-only conflict correlation does not copy content; separately, <code>oak sync</code> can share captured session records between saved machines.</p>

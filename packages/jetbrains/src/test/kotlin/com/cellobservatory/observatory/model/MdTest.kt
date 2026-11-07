@@ -31,6 +31,13 @@ class MdTest : TestCase() {
         // Java's \s is ASCII: a Unicode line or paragraph separator is not heading text (JS \S would take it).
         assertEquals(MdLineKind.Para("# \u2028x"), Md.classify("# \u2028x"))
         assertEquals(MdLineKind.Heading(1, ""), Md.classify("# \u2029"))
+        // The class `[^\s\u0085\u2028\u2029]` is Java-specific and must stay: a plain `\S` takes each of
+        // these characters as the start of the text, which changes every line below.
+        assertEquals(MdLineKind.Heading(1, ""), Md.classify("# \u2028"))
+        assertEquals(MdLineKind.Heading(1, ""), Md.classify("# \u0085"))
+        assertEquals(MdLineKind.Para("# \u0085x"), Md.classify("# \u0085x"))
+        assertEquals(MdLineKind.Para("- \u2028x"), Md.classify("- \u2028x"))
+        assertEquals(MdLineKind.Bullet(0, ""), Md.classify("- \u0085"))
     }
 
     fun testFenceContractCases() {

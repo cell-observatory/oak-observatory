@@ -3,6 +3,8 @@ package com.cellobservatory.observatory.ui.inline
 import com.cellobservatory.observatory.core.ClaudePaths
 import com.cellobservatory.observatory.model.EditRecord
 import com.cellobservatory.observatory.model.Placement
+import com.cellobservatory.observatory.model.graphemeHead
+import com.cellobservatory.observatory.model.revealHidden
 import com.cellobservatory.observatory.services.ObservatoryService
 import com.cellobservatory.observatory.services.PlacementsCache
 import com.cellobservatory.observatory.settings.ObservatorySettings
@@ -69,10 +71,13 @@ private val GHOST_FG = JBColor(Color(0xB3, 0x26, 0x1E), Color(0xE5, 0x53, 0x4B))
  * This is the ONE carve-out from the standing "never ellipsize content text" rule. An after-line-end inlay
  * has no width to wrap into and no tooltip to hang the rest on, and the label is a POINTER to the diff
  * rather than the content: the full removed text is one click away on the ✦ lens or the gutter star.
+ *
+ * A bidirectional control or zero-width character in it shows as the mark that names it (`⟨U+202E⟩`), after the cut,
+ * so no mark is cut: drawn as it is, it shows as nothing and reorders the label around it.
  */
 internal fun ghostLabel(lines: List<String>): String {
     val head = (lines.firstOrNull { it.isNotBlank() } ?: "").trim()
-    val shown = if (head.length > 60) head.take(59) + "…" else head
+    val shown = revealHidden(if (head.length > 60) graphemeHead(head, 59) + "…" else head)
     val more = lines.size - 1
     return if (more > 0) "− $shown …(+$more)" else "− $shown"
 }
@@ -178,7 +183,7 @@ class InlineOverlay(private val project: Project) : Disposable {
         val pending = if (file == null || session == null) emptyList()
         // A cancelled-out chain owns no line to annotate and no decision to offer, so it gets no lens
         // — the same rule the gutter, the Review tree and VS Code's decorations follow.
-        else ClaudePaths.storeKey(file).let { key -> service.log().filter { it.pending && !service.isHidden(it) && it.file == key } }
+        else com.cellobservatory.observatory.ui.RemoteEditorReview.fileKey(project, file).let { key -> service.reviewRecords().filter { (it.pending || service.currentMachine() != null && it.undone) && !service.isHidden(it) && it.file == key } }
         if (!ObservatorySettings.instance.state.inlineReview ||
             editor.document.lineCount > MAX_INLINE_LINES ||
             file == null || session == null || pending.isEmpty()
@@ -417,6 +422,7 @@ private class EditGutterRenderer(
     private val session: String,
     private val rec: EditRecord,
 ) : GutterIconRenderer() {
+    private val machine = ObservatoryService.getInstance(project).currentMachine()
     override fun getIcon(): Icon = com.cellobservatory.observatory.ui.Icons.Star
     override fun getTooltipText() = "Agent edit #${rec.id} · ${rec.tool} — click to see the changes"
     override fun equals(other: Any?) = (other as? EditGutterRenderer)?.rec?.id == rec.id
@@ -426,13 +432,16 @@ private class EditGutterRenderer(
     // Right-click path: the platform renders this menu natively (reasoning lives on the card).
     override fun getPopupMenuActions(): DefaultActionGroup = DefaultActionGroup(
         simple("Keep #${rec.id}", NavTint.KEEP) { ReviewOps.keep(project, session, rec.id) },
-        simple("Undo #${rec.id}", NavTint.UNDO) { ReviewOps.undoOrRedo(project, session, rec, redo = false) },
+        simple("${if (rec.undone) "Redo" else "Undo"} #${rec.id}", NavTint.UNDO) { ReviewOps.undoOrRedo(project, session, rec, redo = rec.undone) },
         simple("Diff #${rec.id}", AllIcons.Actions.Diff) { Diffs.show(project, session, rec) },
         simple("Chat About #${rec.id}", AllIcons.General.Balloon) { ReviewOps.chatAbout(project, session, rec.id) },
     )
 
     private fun simple(text: String, icon: Icon, run: () -> Unit) = object : AnAction(text, null, icon) {
-        override fun actionPerformed(e: AnActionEvent) = run()
+        override fun actionPerformed(e: AnActionEvent) {
+            val svc = ObservatoryService.getInstance(project)
+            if (svc.currentMachine() == machine && svc.currentSession() == session) run()
+        }
     }
 
     // Left-click path: show the edit's before ⟷ after diff (the reasoning + actions now live on the

@@ -30,9 +30,10 @@ placeholder, so no copyright holder is asserted here beyond "the herdr authors".
 ## smol-toml
 
 - Source: <https://github.com/squirrelchat/smol-toml>
-- Version: 1.8.0; license: BSD-3-Clause.
-- Bundled into the CLI (`packages/cli/dist/index.js`) and VS Code extension
-  (`packages/vscode/dist/extension.js`) to parse and edit TOML configuration.
+- Version: 1.9.1; license: BSD-3-Clause.
+- Bundled into the CLI (`packages/cli/dist/cli.js`, and its capture hook,
+  `packages/cli/dist/capture.js`) and VS Code extension (`packages/vscode/dist/extension.js`) to
+  parse and edit TOML configuration; also an installed runtime dependency of core.
 
 ```text
 Copyright (c) Squirrel Chat et al., All rights reserved.
@@ -65,7 +66,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 - Source: <https://github.com/xtermjs/xterm.js>
 - Version: 6.0.0; license: MIT.
-- Bundled into the CLI (`packages/cli/dist/index.js`) for terminal emulation.
+- Bundled into the CLI (`packages/cli/dist/cli.js`) for terminal emulation.
 
 The installed package supplies its copyright notices in the distributed source map and declares
 MIT in its manifest. Those notices and the full MIT permission terms are reproduced below.
@@ -108,8 +109,9 @@ SOFTWARE.
 
 - Source: <https://github.com/kpdecker/jsdiff>
 - Version: 9.0.0; license: BSD-3-Clause.
-- Bundled into the CLI (`packages/cli/dist/index.js`) and VS Code extension
-  (`packages/vscode/dist/extension.js`); also an installed runtime dependency of core.
+- Bundled into the CLI (`packages/cli/dist/cli.js`, and its capture hook,
+  `packages/cli/dist/capture.js`) and VS Code extension (`packages/vscode/dist/extension.js`); also
+  an installed runtime dependency of core.
 
 ```text
 BSD 3-Clause License

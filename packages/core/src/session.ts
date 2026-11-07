@@ -214,7 +214,8 @@ export function resolveSessionId(cwd: string): string | null {
   const cx = require('./codex') as typeof import('./codex');
   const store = require('./store') as typeof import('./store');
   const hidden = store.hiddenSessions(); // a deleted session is never auto-resolved as the active one
-  const candidates = cx.codexSessionSources().filter((x) => !x.archived && !hidden.has(x.id)).map((x) => ({ id: x.id, cwd: canonPath(x.cwd), ts: x.mtimeMs }));
+  // Nor is an Auto-review thread: it reviews another session's approval, and the session lists leave it out.
+  const candidates = cx.codexSessionSources().filter((x) => !x.archived && !hidden.has(x.id) && !x.review).map((x) => ({ id: x.id, cwd: canonPath(x.cwd), ts: x.mtimeMs }));
   let dir = canonPath(path.resolve(cwd));
   for (;;) {
     const s = newestSessionIn(projectDir(dir));
@@ -276,25 +277,68 @@ export function newestSessionGlobal(): string | null {
  * session, exactly as every CLI verb resolves. OUTSIDE any repo — a shell at $HOME, the Desktop —
  * there is no workspace to scope to, and the walk-up used to land on whatever stale session was
  * once launched from an ancestor directory; "open the observatory" from nowhere means "show me what
- * Claude is doing NOW", so the machine-wide newest wins there.
+ * Claude is doing NOW", so the machine-wide newest wins there. A workspace the reader NAMED
+ * (`oak tui --root <dir>`, `named`) is always that workspace's own session, in a repo or not.
  */
-export function defaultTuiSession(cwd: string): string | null {
-  return repoRoot(cwd) ? resolveSessionId(cwd) : newestSessionGlobal() ?? resolveSessionId(cwd);
+export function defaultTuiSession(cwd: string, named = false): string | null {
+  return named || repoRoot(cwd) ? resolveSessionId(cwd) : newestSessionGlobal() ?? resolveSessionId(cwd);
 }
 
 /**
- * Walk up from `cwd` to the nearest ancestor directory that holds a `.git` entry (file OR dir),
+ * Walk up from `cwd` to the nearest ancestor directory that holds a valid `.git` directory or gitdir file,
  * mirroring resolveSessionId's parent walk. Returns that directory (the repo/worktree root) or
  * null if none is found. The transcript `cwd` is Claude's launch cwd, frequently a subdirectory
  * (e.g. packages/foo) that has no `.git` of its own — so this walk-up is required before resolving
- * the shared common git dir.
+ * the shared common git dir. Honor Git's discovery ceilings, including in CLI children that inherit them.
  */
 export function repoRoot(cwd: string): string | null {
+  const ceilings = new Set((process.env.GIT_CEILING_DIRECTORIES || '').split(path.delimiter).filter((p) => path.isAbsolute(p)).map((p) => {
+    try { return canonPath(fs.realpathSync(p)); } catch { return canonPath(path.resolve(p)); }
+  }));
   let dir = path.resolve(cwd);
   for (;;) {
-    if (fs.existsSync(path.join(dir, '.git'))) return dir;
+    const marker = path.join(dir, '.git');
+    try {
+      const st = fs.statSync(marker, { throwIfNoEntry: false });
+      let gitDir = marker;
+      if (st?.isFile() && st.size <= 1024 * 1024) {
+        const pointer = fs.readFileSync(marker, 'utf8').replace(/[\r\n]+$/, '');
+        gitDir = pointer.startsWith('gitdir: ') && pointer.length > 8 ? path.resolve(dir, pointer.slice(8)) : '';
+      }
+      if (gitDir && (st?.isDirectory() || st?.isFile())) {
+        // Git checks HEAD in the worktree's admin dir, then objects/refs in its common dir.
+        const head = path.join(gitDir, 'HEAD');
+        const headStat = fs.lstatSync(head, { throwIfNoEntry: false });
+        let validHead = false;
+        if (headStat?.isSymbolicLink()) validHead = fs.readlinkSync(head).startsWith('refs/');
+        else if (headStat?.isFile()) {
+          const fd = fs.openSync(head, 'r');
+          try {
+            const buf = Buffer.alloc(255);
+            const value = buf.toString('utf8', 0, fs.readSync(fd, buf, 0, buf.length, 0));
+            // git's own test: `ref:`, any ASCII whitespace, then `refs/`. Written out, not as a regex: that regex beside
+            // herdr.ts's Codex row was enough to keep CodeQL's ReDoS query from finishing (2026-11-06).
+            let at = value.startsWith('ref:') ? 4 : -1;
+            while (at >= 0 && at < value.length && ' \t\r\n\f\v'.includes(value[at])) at++;
+            validHead = (at >= 0 && value.startsWith('refs/', at)) || /^[0-9a-fA-F]{40}/.test(value);
+          } finally { fs.closeSync(fd); }
+        }
+        if (validHead) {
+          const commonFile = path.join(gitDir, 'commondir');
+          const common = fs.existsSync(commonFile) ? path.resolve(gitDir, fs.readFileSync(commonFile, 'utf8').replace(/[\r\n]+$/, '')) : gitDir;
+          fs.accessSync(path.join(common, 'objects'), fs.constants.X_OK);
+          fs.accessSync(path.join(common, 'refs'), fs.constants.X_OK);
+          return dir;
+        }
+      }
+    } catch { /* unreadable or incomplete metadata is not a repository */ }
     const parent = path.dirname(dir);
     if (parent === dir) return null;
+    if (ceilings.size) {
+      let physical = parent;
+      try { physical = fs.realpathSync(parent); } catch { /* a missing ancestor: compare its path */ }
+      if (ceilings.has(canonPath(physical))) return null;
+    }
     dir = parent;
   }
 }

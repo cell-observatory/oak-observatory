@@ -7,13 +7,15 @@
  * gated: the Windows install path is a zip + Expand-Archive and is not exercised here.
  *
  * Requires the built dist (npm test builds first). */
-const { test } = require('node:test');
+const { test, after } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 const C = require('../dist');
+// smol-toml 1.9 returns objects with a null prototype; these assertions compare content, so read plain objects.
+const parseToml = (text) => JSON.parse(JSON.stringify(require('smol-toml').parse(text)));
 
 const POSIX = { skip: process.platform === 'win32' && 'the fixture herdr is a POSIX shell script' };
 const PINNED = '0.9.1';
@@ -41,7 +43,7 @@ function fakeHerdr({ version = PINNED, log, claude = 'not installed', codex = 'n
       '  server) echo "fake herdr server up" ;;',
       // `bad-after` fails only once OAK's widths or theme are in the file — post-edit rejection. Pure sh:
       // the fake's PATH holds no grep.
-      `  config) case "$2" in check) found=0; while IFS= read -r l; do case "$l" in *${rejectKey}*) found=1 ;; esac; done < "$OAK_TEST_CONFIG" 2>/dev/null; if [ "${configCheck}" = ok ] || { [ "${configCheck}" = bad-after ] && [ "$found" = 0 ]; }; then echo "config: ok"; else echo "config: error: bad key" >&2; exit 1; fi ;; esac ;;`,
+      `  config) case "$2" in check) if [ "${configCheck}" = herdr-refuses ]; then echo "config: issues found"; echo "unknown config key ui.bogus; ignoring key"; exit 1; fi; found=0; while IFS= read -r l; do case "$l" in *${rejectKey}*) found=1 ;; esac; done < "$OAK_TEST_CONFIG" 2>/dev/null; if [ "${configCheck}" = ok ] || { [ "${configCheck}" = bad-after ] && [ "$found" = 0 ]; }; then echo "config: ok"; else echo "config: error: bad key" >&2; exit 1; fi ;; esac ;;`,
       'esac',
       'exit 0',
     ].join('\n') + '\n'
@@ -55,9 +57,13 @@ function writeExec(file, body) {
   return file;
 }
 
+// The temp dirs bed() makes, removed when this file ends (a direct `node --test` run left them behind).
+const tmpDirs = [];
+after(() => { for (const dir of tmpDirs) fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5 }); });
 /** One sandbox: a fake HOME, a PATH we control, a config dir the code must create itself. */
 function bed() {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-herdr-'));
+  tmpDirs.push(base);
   const b = {
     base,
     home: path.join(base, 'home'),
@@ -119,6 +125,31 @@ async function until(predicate, ms = 5000) {
     await new Promise((r) => setTimeout(r, 25));
   }
 }
+
+// On Windows a console program started by a process with no console of its own opens a window: the install runs from VS
+// Code's extension host, from the CLI a JetBrains IDE runs, and from a refresh started detached, and the herdr server it
+// starts has no console either. Only Windows shows the window, so the spawn recorder reads what each launch asked for.
+test('herdr: the install starts each herdr command and the server with no console window on Windows (windowsHide)', POSIX, () => {
+  const b = withPython(bed());
+  const payload = Buffer.from(fakeHerdr({ log: b.log }));
+  const payloadFile = path.join(b.base, 'payload');
+  fs.writeFileSync(payloadFile, payload);
+  const spawns = path.join(b.base, 'spawns.jsonl');
+  const script = `const C = require(${JSON.stringify(path.resolve(__dirname, '../dist'))});
+    const b = ${JSON.stringify(b)}, payload = require('fs').readFileSync(${JSON.stringify(payloadFile)});
+    C.ensureHerdr({ platform: 'linux', arch: 'x64', home: b.home, env: { PATH: b.pathDir }, configDir: b.configDir, pluginDir: b.plugin,
+      loginSession: () => (${JSON.stringify(NO_LOGIN())}), lock: ${JSON.stringify(lockFor(payload))}, download: async () => payload })
+      .then((r) => process.stdout.write(JSON.stringify({ serverStarted: r.serverStarted })));`;
+  const r = require('child_process').spawnSync(process.execPath, ['--require', path.resolve(__dirname, '../../tui/test/fixtures/spawn-recorder.cjs'), '-e', script],
+    { env: { ...process.env, OAK_SPAWN_LOG: spawns }, encoding: 'utf8', timeout: 60000 });
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(JSON.parse(r.stdout), { serverStarted: true });
+  const herdr = fs.readFileSync(spawns, 'utf8').trim().split('\n').map((l) => JSON.parse(l)).filter((e) => e.file === b.dest);
+  const verbs = herdr.map((e) => e.args.join(' '));
+  for (const verb of ['--version', 'status', 'integration status', 'server']) assert.ok(verbs.includes(verb), `the install ran \`herdr ${verb}\`: ${JSON.stringify(verbs)}`);
+  assert.deepEqual(herdr.filter((e) => !e.windowsHide).map((e) => e.args.join(' ')), [], 'every herdr command asks for no window');
+  assert.equal(herdr.find((e) => e.args[0] === 'server').detached, true, 'the server is the one started detached');
+});
 
 test('herdr: missing → downloads the pin, verifies it, installs it executable, wires it up', POSIX, async () => {
   const b = withPython(bed());
@@ -574,7 +605,7 @@ test('herdr theme: a new table goes at the end, preserves other names and subtab
   const report = await installed(b, { server: 'running' });
   const after = fs.readFileSync(file, 'utf8');
   assert.equal(after, before + '\n\n[theme]\n' + THEME_KEY);
-  assert.equal(require('smol-toml').parse(after).theme.name, 'gruvbox');
+  assert.equal(parseToml(after).theme.name, 'gruvbox');
   assert.equal(report.themeConfigured, true);
   assert.equal(report.sidebarConfigured, false);
   assert.deepEqual(report.warnings, []);
@@ -606,8 +637,8 @@ test('herdr theme: inserts under an existing nameless header, preserving comment
     assert.deepEqual(report.warnings, [], before);
     const after = fs.readFileSync(file, 'utf8');
     assert.equal(after, prefix + header + (header.endsWith('\n') ? '' : '\n') + THEME_KEY + tail);
-    assert.deepEqual(require('smol-toml').parse(after), {
-      ...require('smol-toml').parse(before), theme: { ...require('smol-toml').parse(before).theme, name: 'gruvbox' },
+    assert.deepEqual(parseToml(after), {
+      ...parseToml(before), theme: { ...parseToml(before).theme, name: 'gruvbox' },
     }, 'the theme name is the only semantic change');
   }
 });
@@ -686,7 +717,7 @@ test('herdr theme: both defaults share exactly one original backup and reload, a
   assert.equal(backups.length, 1);
   assert.equal(fs.readFileSync(path.join(b.configDir, backups[0]), 'utf8'), before);
   assert.equal(fs.statSync(path.join(b.configDir, backups[0])).mode & 0o777, 0o600);
-  assert.deepEqual(require('smol-toml').parse(fs.readFileSync(file, 'utf8')), {
+  assert.deepEqual(parseToml(fs.readFileSync(file, 'utf8')), {
     ui: { sidebar_min_width: 48, sidebar_max_width: 72 }, theme: { name: 'gruvbox' },
   });
   assert.equal(argv(b).filter(a => a === 'server reload-config').length, 1);
@@ -698,23 +729,97 @@ test('herdr theme: both defaults share exactly one original backup and reload, a
   assert.ok(!argv(b).includes('config check') && !argv(b).includes('server reload-config'));
 });
 
-test('herdr theme: nameless inline/dotted tables cannot be extended with [theme], so rejection preserves them', POSIX, async () => {
-  for (const declaration of ['theme = { auto_switch = false }\n', 'theme.auto_switch = false\n']) {
+// A table written as dotted keys (`ui.status_indicators = …`) or inline (`ui = { … }`) is DEFINED there: a `[ui]` or
+// `[theme]` header after it defines it twice, which herdr refuses ("duplicate key `ui` in document root"), so OAK put the
+// file back and warned on every run. The keys now go where the file's own table is, in its form, its line ending and
+// after its byte order mark; a header-looking line inside a string is text, and gets no keys.
+const TABLE_SHAPES = [
+  ['root dotted keys, then tables',
+    'ui.status_indicators = "symbols"\ntheme.auto_switch = false # mine\n\n[keys]\nprefix = "ctrl+b"\n',
+    'ui.sidebar_min_width = 48\nui.sidebar_max_width = 72\nui.status_indicators = "symbols"\ntheme.name = "gruvbox"\ntheme.auto_switch = false # mine\n\n[keys]\nprefix = "ctrl+b"\n'],
+  ['inline tables, a brace inside a string',
+    'ui = { status_indicators = "symbols" }\ntheme = { custom = { sidebar_bg = "#}{0" } } # mine\n',
+    'ui = { status_indicators = "symbols", sidebar_min_width = 48, sidebar_max_width = 72 }\ntheme = { custom = { sidebar_bg = "#}{0" }, name = "gruvbox" } # mine\n'],
+  // An escaped quote is part of the string: the brace after it is too.
+  ['inline tables, an escaped quote and a brace inside a string',
+    'ui = { status_indicators = "symbols" }\ntheme = { custom = { sidebar_bg = "#\\"}{0" } } # mine\n',
+    'ui = { status_indicators = "symbols", sidebar_min_width = 48, sidebar_max_width = 72 }\ntheme = { custom = { sidebar_bg = "#\\"}{0" }, name = "gruvbox" } # mine\n'],
+  ['an empty inline table, CRLF', 'ui = {}\r\n','ui = { sidebar_min_width = 48, sidebar_max_width = 72 }\r\n\r\n[theme]\r\nname = "gruvbox"\r\n'],
+  ['quoted dotted keys beside a sub-table, BOM and CRLF',
+    '\uFEFF"ui" . status_indicators = "symbols"\r\n[ui.toast]\r\ndelivery = "off"\r\n',
+    '\uFEFFui.sidebar_min_width = 48\r\nui.sidebar_max_width = 72\r\n"ui" . status_indicators = "symbols"\r\n[ui.toast]\r\ndelivery = "off"\r\n\r\n[theme]\r\nname = "gruvbox"\r\n'],
+  ['a spaced, quoted header with a comment, and a header that ends the file',
+    '[ "ui" ] # mine\nstatus_indicators = "symbols"\n[theme]',
+    '[ "ui" ] # mine\nsidebar_min_width = 48\nsidebar_max_width = 72\nstatus_indicators = "symbols"\n[theme]\nname = "gruvbox"\n'],
+  ['headers inside a multiline string',
+    '[[keys.command]]\nkey = "prefix+g"\ncommand = """\n[ui]\n[theme]\n"""\n',
+    '[[keys.command]]\nkey = "prefix+g"\ncommand = """\n[ui]\n[theme]\n"""\n\n[ui]\nsidebar_min_width = 48\nsidebar_max_width = 72\n\n[theme]\nname = "gruvbox"\n'],
+  ['an empty file', '', '[ui]\nsidebar_min_width = 48\nsidebar_max_width = 72\n\n[theme]\nname = "gruvbox"\n'],
+];
+
+test('herdr sidebar and theme: a table written as dotted keys or inline gets the keys in that form, and nothing is restored (2026-10-08)', POSIX, async () => {
+  for (const [shape, before, after] of TABLE_SHAPES) {
     const b = withPython(bed());
     const file = path.join(b.configDir, 'config.toml');
     fs.mkdirSync(b.configDir, { recursive: true });
-    const before = declaration + USER_WIDTH;
     fs.writeFileSync(file, before);
-    require('smol-toml').parse(before);
-    assert.equal(C.ensureHerdrThemeConfig(file), 'set');
-    assert.throws(() => require('smol-toml').parse(fs.readFileSync(file, 'utf8')), /table|key/i);
+    const report = await installed(b, { server: 'running' });
+    assert.deepEqual(report.warnings, [], shape);
+    assert.deepEqual([report.sidebarConfigured, report.themeConfigured], [true, true], shape);
+    assert.equal(fs.readFileSync(file, 'utf8'), after, shape);
+    // The two defaults are the only change in what the file means.
+    const was = before ? parseToml(before) : {};
+    assert.deepEqual(parseToml(after), { ...was, ui: { ...was.ui, sidebar_min_width: 48, sidebar_max_width: 72 }, theme: { ...was.theme, name: 'gruvbox' } }, shape);
+    assert.equal(argv(b).filter((a) => a === 'server reload-config').length, 1, shape);
+  }
+  // A width set under another table is not the ui table's: herdr reads no width there.
+  const other = path.join(bed().base, 'other.toml');
+  fs.writeFileSync(other, '[theme]\nui.sidebar_min_width = 30\n');
+  assert.equal(C.ensureHerdrSidebarConfig(other), 'set');
+  assert.deepEqual(parseToml(fs.readFileSync(other, 'utf8')).ui, { sidebar_min_width: 48, sidebar_max_width: 72 });
+});
+
+test('herdr sidebar and theme: the installed herdr accepts every config the writers produce (live check, herdr 0.9.1 and 0.9.3 on 2026-10-08)', POSIX, async (t) => {
+  const bin = process.env.HERDR_BIN || C.findHerdrBin();
+  if (!bin) { t.skip('SKIP LIVE CONFIG CHECK: no herdr binary; the shapes are checked against smol-toml only'); return; }
+  const box = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-herdr-check-'));
+  tmpDirs.push(box);
+  const env = { PATH: process.env.PATH, HOME: box, XDG_CONFIG_HOME: path.join(box, 'config'), XDG_DATA_HOME: path.join(box, 'data'),
+    XDG_STATE_HOME: path.join(box, 'state'), XDG_CACHE_HOME: path.join(box, 'cache'), XDG_RUNTIME_DIR: path.join(box, 'run'), HERDR_SOCKET_PATH: path.join(box, 'h.sock') };
+  const check = (file) => require('child_process').spawnSync(bin, ['config', 'check'], { env: { ...env, HERDR_CONFIG_PATH: file }, encoding: 'utf8', timeout: 20000 });
+  // Control: the check refuses what herdr refuses, a second [ui] after dotted ui keys.
+  const twice = path.join(box, 'twice.toml');
+  fs.writeFileSync(twice, 'ui.status_indicators = "symbols"\n\n[ui]\nsidebar_min_width = 48\nsidebar_max_width = 72\n');
+  assert.notEqual(check(twice).status, 0, 'herdr refuses a table defined twice');
+  for (const [shape, before] of TABLE_SHAPES) {
+    const file = path.join(box, 'config.toml');
     fs.writeFileSync(file, before);
-    const report = await installed(b, { configCheck: 'bad-after', rejectKey: 'gruvbox', server: 'running' });
-    assert.equal(report.themeConfigured, false);
-    assert.equal(fs.readFileSync(file, 'utf8'), before);
-    assert.ok(report.warnings.some(w => /rejected the gruvbox theme.*restored it/.test(w)));
-    assert.ok(!argv(b).includes('server reload-config'));
-    assert.ok(!fs.readdirSync(b.configDir).some(f => f.includes('.bak-oak-')));
+    C.ensureHerdrSidebarConfig(file);
+    C.ensureHerdrThemeConfig(file);
+    const r = check(file);
+    assert.ok(r.status === 0 && /config: ok/.test(r.stdout), `${shape}: ${r.stdout}${r.stderr}`);
+  }
+});
+
+test('herdr sidebar and theme: a byte order mark that opens the file stays first, and a header or width right after it counts', POSIX, async () => {
+  // Missed, a [ui] or [theme] header after the mark got a second table, and a width there a duplicate key.
+  const BOM = '\uFEFF';
+  for (const [before, after, sidebar] of [
+    [BOM + '[ui]\nstatus_indicators = "symbols"\n\n[theme]\nauto_switch = false\n',
+      BOM + '[ui]\nsidebar_min_width = 48\nsidebar_max_width = 72\nstatus_indicators = "symbols"\n\n[theme]\nname = "gruvbox"\nauto_switch = false\n', true],
+    [BOM + '[theme]\nauto_switch = false\n', BOM + '[theme]\nname = "gruvbox"\nauto_switch = false\n\n[ui]\nsidebar_min_width = 48\nsidebar_max_width = 72\n', true],
+    [BOM + 'ui.sidebar_min_width = 20\n', BOM + 'ui.sidebar_min_width = 20\n\n[theme]\nname = "gruvbox"\n', false],
+  ]) {
+    const b = withPython(bed());
+    const file = path.join(b.configDir, 'config.toml');
+    fs.mkdirSync(b.configDir, { recursive: true });
+    fs.writeFileSync(file, before);
+    const report = await installed(b);
+    assert.deepEqual(report.warnings, [], before);
+    assert.equal(report.sidebarConfigured, sidebar, before);
+    assert.equal(report.themeConfigured, true, before);
+    assert.equal(fs.readFileSync(file, 'utf8'), after);
+    parseToml(fs.readFileSync(file, 'utf8'));
   }
 });
 
@@ -893,7 +998,7 @@ test('herdr identity leak: GIT_EDITOR=true rides with the identity; only `herdr 
 // --- the server must outlive the LOGIN that started it, not just the process ----------------------
 // A laptop lid closing ended the ssh login that had started the workstation's herdr server; logind
 // (KillUserProcesses=yes) then SIGTERMed that login's whole scope — server, panes, agents — although
-// the server was setsid'd with no terminal. Measured 2026-09-23, 7 of 7 kills that day.
+// the server was setsid'd with no terminal. It did so on every lid close that ended such a login.
 const SESSION = '0::/user.slice/user-1000.slice/session-7.scope\n';
 const loginFacts = (over = {}) => ({ cgroup: SESSION, linger: true, killUserProcesses: true, systemdRun: '/usr/bin/systemd-run', ...over });
 
@@ -945,11 +1050,15 @@ test('herdr: the server start follows the launch plan, and its warning reaches t
   assert.ok(report.warnings.some((w) => /enable-linger/.test(w)), report.warnings.join(' | '));
 });
 
-// The argv above against REAL systemd: the started process must land in its own user scope. Runs only
-// where this user can start one (skipped in CI containers and off Linux); kills what it started.
-const REAL_SYSTEMD_RUN = process.platform === 'linux' && ['/usr/bin/systemd-run', '/bin/systemd-run'].find((p) => fs.existsSync(p));
+// The argv above against REAL systemd: the started process must land in its own user scope. Opt-in
+// (OAK_LIVE_SYSTEMD=1), as it starts transient scopes in this user's systemd, and then only where this user
+// can start one (not in CI containers or off Linux); kills what it started.
+const LIVE_SYSTEMD = process.env.OAK_LIVE_SYSTEMD === '1';
+const REAL_SYSTEMD_RUN = LIVE_SYSTEMD && process.platform === 'linux' && ['/usr/bin/systemd-run', '/bin/systemd-run'].find((p) => fs.existsSync(p));
 const CAN_SCOPE = Boolean(REAL_SYSTEMD_RUN) && require('child_process').spawnSync(REAL_SYSTEMD_RUN, ['--user', '--scope', '--quiet', '--collect', '--', 'true'], { timeout: 10000, killSignal: 'SIGKILL' }).status === 0;
-test('herdr: on a real systemd host the started server lands in its own user scope, outside every login', { skip: !CAN_SCOPE && 'needs `systemd-run --user --scope` (Linux with a user manager)' }, async () => {
+test('herdr: on a real systemd host the started server lands in its own user scope, outside every login', {
+  skip: !LIVE_SYSTEMD ? 'set OAK_LIVE_SYSTEMD=1 to start real systemd user scopes' : !CAN_SCOPE && 'needs `systemd-run --user --scope` (Linux with a user manager)',
+}, async () => {
   const b = withPython(bed());
   const rec = path.join(b.base, 'server');
   // A replacer FUNCTION: in a replacement string `$$` means a literal `$`, and the pid would be lost.
@@ -1034,4 +1143,15 @@ test('login probe: nested scopes are recognized and synchronous probes use hard 
   assert.equal(calls.at(-1).opts.killSignal, 'SIGKILL');
   assert.equal(C.probeKillUserProcesses({}, 'darwin'), null);
   assert.equal(calls.length, 3, 'off Linux the setting is not probed');
+});
+
+test('herdr sidebar and theme: a config herdr refuses as it is is left alone, and the warning gives herdr\'s reason, not its heading', POSIX, async () => {
+  // herdr 0.9.1 to 0.9.3 print `config: issues found` first, on stdout, then the reason, and exit 1.
+  const b = withPython(bed());
+  const file = path.join(b.configDir, 'config.toml');
+  fs.mkdirSync(b.configDir, { recursive: true });
+  fs.writeFileSync(file, '[ui]\nbogus = 1\n');
+  const report = await installed(b, { configCheck: 'herdr-refuses' });
+  assert.equal(fs.readFileSync(file, 'utf8'), '[ui]\nbogus = 1\n');
+  assert.ok(report.warnings.some((w) => /rejects .* as it is \(unknown config key ui\.bogus; ignoring key\)/.test(w)), report.warnings.join('\n'));
 });

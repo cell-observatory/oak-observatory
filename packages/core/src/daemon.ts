@@ -236,14 +236,33 @@ export function connectDaemon(opts: { client: string; timeoutMs?: number; inspec
   });
 }
 
-export function pidAlive(pid: number): boolean {
+/** `reaped`: also count a zombie (exited, its parent has not collected it yet) as gone. Signal 0 still reaches a zombie, so
+ *  an old server whose parent never collected it read as one that "did not stop", and blocked a new one from starting.
+ *  It costs a `ps` outside Linux, so only the focus server and delegated agents ask for it. */
+export function pidAlive(pid: number, opts: { reaped?: boolean } = {}): boolean {
   if (!Number.isSafeInteger(pid) || pid <= 0) return false;
   try {
     process.kill(pid, 0);
-    return true;
   } catch (e) {
     return (e as NodeJS.ErrnoException).code === 'EPERM';
   }
+  return !(opts.reaped && isZombie(pid));
+}
+
+function isZombie(pid: number): boolean {
+  if (process.platform === 'win32') return false;
+  if (process.platform === 'linux') {
+    try {
+      // `pid (comm) S …`: the name may hold spaces and parentheses, so the state follows the LAST `)`.
+      const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+      return stat.slice(stat.lastIndexOf(')') + 2, stat.lastIndexOf(')') + 3) === 'Z';
+    } catch {
+      return false;
+    }
+  }
+  const { spawnToolSync } = require('./spawn') as typeof import('./spawn');
+  const r = spawnToolSync('ps', ['-o', 'stat=', '-p', String(pid)], { encoding: 'utf8', timeout: 1000 });
+  return r.status === 0 && /^\s*Z/.test(String(r.stdout));
 }
 
 export function readDaemonPid(): number | null {
@@ -263,7 +282,7 @@ export function readDaemonPid(): number | null {
 export function reclaimStaleDaemon(): boolean {
   const p = daemonPaths();
   const pid = readDaemonPid();
-  if (pid !== null && pidAlive(pid)) return false;
+  if (pid !== null && pidAlive(pid, { reaped: true })) return false;
   let removed = false;
   for (const f of [p.pid, ...(process.platform === 'win32' ? [] : [p.sock])]) {
     try {
@@ -358,7 +377,7 @@ export interface DaemonStatus {
 export async function daemonStatus(): Promise<DaemonStatus> {
   const p = daemonPaths();
   const pid = readDaemonPid();
-  const base: DaemonStatus = { running: false, pid, protocol: null, build: '', generation: '', started: 0, sock: p.sock, log: p.log, stale: pid !== null && !pidAlive(pid) };
+  const base: DaemonStatus = { running: false, pid, protocol: null, build: '', generation: '', started: 0, sock: p.sock, log: p.log, stale: pid !== null && !pidAlive(pid, { reaped: true }) };
   const c = await connectDaemon({ client: 'status', timeoutMs: 1500, inspect: true });
   if (!c) return base;
   try {
@@ -372,7 +391,7 @@ export async function daemonStatus(): Promise<DaemonStatus> {
 export async function stopDaemon(timeoutMs = 5000): Promise<{ stopped: boolean; why: string }> {
   const c = await connectDaemon({ client: 'stop', timeoutMs: 1500, inspect: true });
   const pid = c?.hello.pid ?? readDaemonPid();
-  if (!c && (pid === null || !pidAlive(pid))) {
+  if (!c && (pid === null || !pidAlive(pid, { reaped: true }))) {
     reclaimStaleDaemon();
     return { stopped: false, why: 'no oak server is running' };
   }
@@ -389,7 +408,7 @@ export async function stopDaemon(timeoutMs = 5000): Promise<{ stopped: boolean; 
     c.close();
   }
   const deadline = Date.now() + timeoutMs;
-  while (pid !== null && pidAlive(pid) && Date.now() < deadline) {
+  while (pid !== null && pidAlive(pid, { reaped: true }) && Date.now() < deadline) {
     if (Date.now() > deadline - timeoutMs / 2) {
       try {
         process.kill(pid, 'SIGTERM');
@@ -400,7 +419,7 @@ export async function stopDaemon(timeoutMs = 5000): Promise<{ stopped: boolean; 
     await new Promise((r) => setTimeout(r, 100));
   }
   reclaimStaleDaemon();
-  return pid !== null && pidAlive(pid) ? { stopped: false, why: `the oak server (pid ${pid}) did not stop` } : { stopped: true, why: '' };
+  return pid !== null && pidAlive(pid, { reaped: true }) ? { stopped: false, why: `the oak server (pid ${pid}) did not stop` } : { stopped: true, why: '' };
 }
 
 /** A focus endpoint owns no terminals. Replace a mismatched build before a TUI attaches to it. */

@@ -89,8 +89,8 @@ private class BarContext(
 
     /** Every record for this file, pending or not — the file-scoped verbs take the whole file. */
     fun allInFile(): List<EditRecord> {
-        val key = ClaudePaths.storeKey(path)
-        return ObservatoryService.getInstance(project).log().filter { it.file == key }
+        val key = com.cellobservatory.observatory.ui.RemoteEditorReview.fileKey(project, path)
+        return ObservatoryService.getInstance(project).reviewRecords().filter { it.file == key }
     }
 }
 
@@ -104,8 +104,8 @@ private fun barContext(e: AnActionEvent): BarContext? {
     val path = pathOf(e) ?: return null
     val service = ObservatoryService.getInstance(project)
     val session = service.currentSession() ?: return null
-    val key = ClaudePaths.storeKey(path) // hoisted: this runs per button per toolbar tick
-    val pending = service.log().filter { it.pending && it.file == key }.sortedBy { it.id }
+    val key = com.cellobservatory.observatory.ui.RemoteEditorReview.fileKey(project, path) // hoisted: this runs per button per toolbar tick
+    val pending = service.reviewRecords().filter { it.pending && it.file == key }.sortedBy { it.id }
     if (pending.isEmpty()) return null
     return BarContext(project, session, path, pending)
 }
@@ -149,7 +149,7 @@ private class FloatingUndo : FloatingBarAction("Undo", "Undo this edit — the o
 }
 
 /** Step the file's pending edits. Parks the SERVICE review cursor rather than keeping one of its own:
- *  the banner, ⌥⌘N/P, the status bar and the auto-advance all read that cursor, and a fourth position
+ *  the banner, ⌥⌘X N / P, the status bar and the auto-advance all read that cursor, and a fourth position
  *  would drift from it the moment the reader used two of the surfaces. */
 private abstract class FloatingDiffStep(text: String, description: String, icon: Icon, private val dir: Int) :
     FloatingBarAction(text, description, icon) {
@@ -206,7 +206,7 @@ private abstract class FloatingFileStep(text: String, description: String, icon:
         val here = ClaudePaths.storeKey(c.path)
         val idx = files.indexOf(here)
         val target = files[((if (idx < 0) 0 else idx) + dir + files.size) % files.size]
-        val first = ObservatoryService.getInstance(c.project).log()
+        val first = ObservatoryService.getInstance(c.project).reviewRecords()
             .filter { it.pending && it.file == target }.minByOrNull { it.id } ?: return
         ObservatoryService.getInstance(c.project).parkReviewCursor(first.id)
         Navigate.openFileAtEdit(c.project, c.session, first)
@@ -365,7 +365,7 @@ private class FloatingSpotlight : ToggleAction(
 private class FloatingClearResolved :
     FloatingBarAction("Clear Resolved", "Clear this session's resolved edits (keeps every file as it is)", NavTint.CLEAR) {
     override fun run(c: BarContext) {
-        val resolved = ObservatoryService.getInstance(c.project).log().count { !it.pending }
+        val resolved = ObservatoryService.getInstance(c.project).reviewRecords().count { !it.pending }
         if (resolved > 0) ReviewOps.clearResolved(c.project, c.session, resolved)
         else ReviewOps.notify(c.project, "No resolved edits to clear")
     }

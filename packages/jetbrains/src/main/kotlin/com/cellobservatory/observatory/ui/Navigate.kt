@@ -33,6 +33,14 @@ object Navigate {
     /** Open a file by its record path, no caret placement — the Review tree's FILE rows use this
      *  (parity with the VS Code Review list, where the filename itself opens the file). */
     fun openFile(project: Project, path: String) {
+        val svc = ObservatoryService.getInstance(project)
+        svc.currentMachine()?.let { machine ->
+            svc.currentSession()?.let { RemoteEditorReview.open(project, machine, it, file = path) }
+            return
+        }
+        openLocalFile(project, path)
+    }
+    fun openLocalFile(project: Project, path: String) {
         val vf = LocalFileSystem.getInstance()
             .refreshAndFindFileByPath(com.intellij.openapi.util.io.FileUtil.toSystemIndependentName(path))
         if (vf == null) {
@@ -43,19 +51,28 @@ object Navigate {
     }
 
     fun openFileAtEdit(project: Project, session: String, rec: EditRecord) {
+        ObservatoryService.getInstance(project).currentMachine()?.let { machine ->
+            ObservatoryService.getInstance(project).selectRemoteReviewFile(rec.file)
+            RemoteEditorReview.open(project, machine, session, edit = rec.id)
+            return
+        }
+        openLocalFileAtEdit(project, session, rec.id, rec.file, rec.file)
+    }
+
+    fun openLocalFileAtEdit(project: Project, session: String, id: Int, remoteFile: String, localFile: String, machine: String? = null) {
         // Record paths are OS-native (backslashes on Windows); the VFS wants system-independent.
         val vf = LocalFileSystem.getInstance()
-            .refreshAndFindFileByPath(com.intellij.openapi.util.io.FileUtil.toSystemIndependentName(rec.file))
+            .refreshAndFindFileByPath(com.intellij.openapi.util.io.FileUtil.toSystemIndependentName(localFile))
         if (vf == null) {
-            ReviewOps.notify(project, "File not found: ${rec.file}", NotificationType.WARNING)
+            ReviewOps.notify(project, "File not found: $localFile", NotificationType.WARNING)
             return
         }
         val editor = FileEditorManager.getInstance(project).openTextEditor(OpenFileDescriptor(project, vf), true) ?: return
         val text = editor.document.text
-        ProgressManager.getInstance().run(object : Task.Backgroundable(project, "Locating edit #${rec.id}", false) {
+        ProgressManager.getInstance().run(object : Task.Backgroundable(project, "Locating edit #$id", false) {
             override fun run(indicator: ProgressIndicator) {
-                val line = ObservatoryCli.locate(session, rec.file, text, project.basePath)
-                    .find { it.id == rec.id }
+                val line = ObservatoryCli.onMachine(machine) { ObservatoryCli.locate(session, remoteFile, text, project.basePath, includeUndone = machine != null) }
+                    .find { it.id == id }
                     // A PURE deletion added no lines, so there is nothing of it left to jump onto — land on
                     // the surviving line its first removed hunk now follows, or the edit is unreachable and
                     // the caret stays put (VS Code's anchorLines makes the same fallback).
@@ -79,11 +96,13 @@ object Navigate {
             ?: return onFound(null)
         val caretLine = editor.caretModel.logicalPosition.line
         val text = editor.document.text
-        val pending = service.log().filter { it.pending && it.file == ClaudePaths.storeKey(file) }
+        val fileKey = RemoteEditorReview.fileKey(project, file) ?: return onFound(null)
+        val machine = service.currentMachine()
+        val pending = service.reviewRecords().filter { it.pending && it.file == fileKey }
         if (pending.isEmpty()) return onFound(null)
         ProgressManager.getInstance().run(object : Task.Backgroundable(project, "Resolving edit at cursor", false) {
             override fun run(indicator: ProgressIndicator) {
-                val hit = ObservatoryCli.locate(session, file, text, project.basePath)
+                val hit = ObservatoryCli.onMachine(machine) { ObservatoryCli.locate(session, fileKey, text, project.basePath) }
                     // Same anchor rule as the overlay: the lines the edit added, or — for a pure deletion —
                     // the surviving line its removed hunk now follows.
                     .find { p ->

@@ -6,7 +6,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { claudeConfigDir } from './paths';
-import { rootDir } from './store';
+import { rootDir, outsideStoreMoves } from './store';
 
 export const MATCHER = 'Edit|Write|MultiEdit|NotebookEdit|Bash';
 
@@ -49,16 +49,26 @@ export function isOurCommand(cmd: string): boolean {
   return /(\boak\b|claude[-_](observatory|changes)|claude_review)/.test(cmd) && /capture(\.js)?["']?\s*$/.test(cmd.trim());
 }
 
-function readSettings(file: string): { path: string; exists: boolean; data: any } {
-  if (!fs.existsSync(file)) return { path: file, exists: false, data: {} };
-  const data = JSON.parse(fs.readFileSync(file, 'utf8')); // throws on invalid JSON — caller handles
-  return { path: file, exists: true, data };
+/** The text of a settings file, without the byte order mark an editor may have put first, which JSON.parse
+ *  refuses (`init` called such a file invalid JSON, `status` found no hooks in it); `bom` is that mark, kept
+ *  for the write back, as codex.ts keeps one in config.toml. */
+function readJsonText(file: string): { text: string; bom: string } {
+  const raw = fs.readFileSync(file, 'utf8');
+  const bom = raw.startsWith('\uFEFF') ? '\uFEFF' : '';
+  return { text: raw.slice(bom.length), bom };
+}
+
+function readSettings(file: string): { path: string; exists: boolean; data: any; bom: string } {
+  if (!fs.existsSync(file)) return { path: file, exists: false, data: {}, bom: '' };
+  const { text, bom } = readJsonText(file);
+  const data = JSON.parse(text); // throws on invalid JSON — caller handles
+  return { path: file, exists: true, data, bom };
 }
 
 /** readSettings for the WRITE paths: a malformed settings.json becomes a GUIDING error (naming the
  *  file and pointing at the .bak) instead of a raw SyntaxError. The read-only probes above degrade
  *  quietly, but a mutation must stop loudly so the user repairs the JSON before we rewrite it. */
-function readSettingsForWrite(file: string): { path: string; exists: boolean; data: any } {
+function readSettingsForWrite(file: string): { path: string; exists: boolean; data: any; bom: string } {
   try {
     return readSettings(file);
   } catch (e) {
@@ -71,9 +81,9 @@ function readSettingsForWrite(file: string): { path: string; exists: boolean; da
 /** Atomically replace the settings file: write a temp sibling, then rename it into place, so a crash
  *  mid-write can never truncate the user's settings.json. Mirrors the cache writers (store/analyze).
  *  Callers write the .bak first, so a rare rename failure still leaves a recovery copy. */
-function writeSettingsFile(p: string, data: any): void {
+function writeSettingsFile(p: string, data: any, bom = ''): void {
   const tmp = `${p}.tmp-${process.pid}`;
-  fs.writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n');
+  fs.writeFileSync(tmp, bom + JSON.stringify(data, null, 2) + '\n');
   fs.renameSync(tmp, p); // atomic: a concurrent reader sees old-or-new, never a torn file
 }
 
@@ -158,7 +168,8 @@ function addTo(events: Record<string, HookGroup[]>, event: string, command: stri
 /**
  * The matcher OUR group carries for one event. Claude Code matches it against a different field
  * per event (tool name for Pre/PostToolUse, PostToolUseFailure and PermissionRequest, the notification TYPE for
- * Notification, nothing for Stop and UserPromptSubmit), so one string cannot serve them all:
+ * Notification, the agent type for SubagentStop, nothing for Stop and UserPromptSubmit), so one string
+ * cannot serve them all:
  * the tool list on a Notification group is compared to `permission_prompt` and never matches —
  * which is exactly what the 2026-09-02 attention install did, so claude's permission and input
  * hands never fired live (Stop, which ignores matchers, did). Capture stays scoped to the edit
@@ -242,16 +253,22 @@ function writeLedger(files: LedgerEntry[]): void {
   fs.renameSync(tmp, ledgerPath()); // atomic, like every store write
 }
 
+/** The ledger is the store's, and cannot be rebuilt (it is how `oak uninstall` finds every file it installed into), so
+ *  it is read and written outside any store move (outsideStoreMoves). */
 function recordInstall(file: string, scope: 'user' | 'project'): void {
-  const files = readLedger().filter((e) => e.path !== file);
-  files.push({ path: file, scope, ts: Date.now() });
-  writeLedger(files);
+  outsideStoreMoves(() => {
+    const files = readLedger().filter((e) => e.path !== file);
+    files.push({ path: file, scope, ts: Date.now() });
+    writeLedger(files);
+  });
 }
 
 function forgetInstall(file: string): void {
-  const files = readLedger();
-  const kept = files.filter((e) => e.path !== file);
-  if (kept.length !== files.length) writeLedger(kept);
+  outsideStoreMoves(() => {
+    const files = readLedger();
+    const kept = files.filter((e) => e.path !== file);
+    if (kept.length !== files.length) writeLedger(kept);
+  });
 }
 
 /** The scope a settings path implies. Everything that is not THE user settings file is a project
@@ -262,7 +279,7 @@ function scopeOf(file: string): 'user' | 'project' {
 
 /** Install both hook entries. `command` is the exact shell command Claude Code will run. */
 export function installHooks(command: string, file: string = settingsPath()): InstallResult {
-  const { path: p, exists, data } = readSettingsForWrite(file);
+  const { path: p, exists, data, bom } = readSettingsForWrite(file);
   if (!exists) fs.mkdirSync(path.dirname(p), { recursive: true });
   const hooks = (data.hooks = data.hooks || {});
   const migrated = migrateMatchers(hooks);
@@ -282,7 +299,7 @@ export function installHooks(command: string, file: string = settingsPath()): In
       backupPath = p + '.bak';
       fs.writeFileSync(backupPath, fs.readFileSync(p));
     }
-    writeSettingsFile(p, data);
+    writeSettingsFile(p, data, bom);
   }
   // Recorded on EVERY install call, changed or not: an unchanged re-init over a pre-ledger install
   // is exactly the moment the ledger learns about it. A ledger failure must not fail an install
@@ -298,7 +315,7 @@ export function installHooks(command: string, file: string = settingsPath()): In
 
 /** Remove any of our capture hooks. */
 export function uninstallHooks(file: string = settingsPath()): InstallResult {
-  const { path: p, exists, data } = readSettingsForWrite(file);
+  const { path: p, exists, data, bom } = readSettingsForWrite(file);
   if (!exists || !data.hooks) {
     // Nothing installed here — and the ledger should not claim otherwise.
     try {
@@ -323,7 +340,7 @@ export function uninstallHooks(file: string = settingsPath()): InstallResult {
   }
   if (changed) {
     fs.writeFileSync(p + '.bak', fs.readFileSync(p));
-    writeSettingsFile(p, data);
+    writeSettingsFile(p, data, bom);
   }
   let ledgerError: string | undefined;
   try {
@@ -397,12 +414,13 @@ export interface InstallStatusRow {
  *  command that exits non-zero — so without it that command's snapshot was never claimed and its
  *  changes never recorded, 2026-09-26; attention: Notification/Stop, 2026-09-02; structured
  *  attention: PermissionRequest names the TOOL a permission prompt waits on and UserPromptSubmit
- *  marks the turn's start, 2026-09-15 — the pair codex has had since its hooks landed). A healthy
+ *  marks the turn's start, 2026-09-15 — the pair codex has had since its hooks landed; SubagentStop
+ *  lowers the permission prompts a finished subagent left up). A healthy
  *  install has exactly one of our command per event, so `installStatus().entries ===
  *  HEALTHY_HOOK_ENTRIES`; more is the doubled-hook defect, fewer a partial install. Consumers (CLI
  *  status/doctor) and the installer itself iterate this constant, never a literal, so adding an event
  *  here cannot leave a stale count behind. */
-export const CAPTURE_HOOK_EVENTS = ['PreToolUse', 'PostToolUse', 'PostToolUseFailure', 'Notification', 'Stop', 'PermissionRequest', 'UserPromptSubmit', 'SessionEnd'] as const;
+export const CAPTURE_HOOK_EVENTS = ['PreToolUse', 'PostToolUse', 'PostToolUseFailure', 'Notification', 'Stop', 'PermissionRequest', 'UserPromptSubmit', 'SessionEnd', 'SubagentStop'] as const;
 export const HEALTHY_HOOK_ENTRIES = CAPTURE_HOOK_EVENTS.length;
 
 /** The events in CAPTURE_HOOK_EVENTS that carry no entry of ours: what an install written by an older
@@ -543,7 +561,8 @@ export function referencesOurStatusline(
 /**
  * Revert the bundled status line — but ONLY if settings.json's `statusLine.command` still points at
  * OUR `<configDir>/statusline.sh` (never disturb a user's own custom statusLine). Also removes the
- * vendored script, its cache and its tab-title record. Part of `uninstall --all`.
+ * vendored script, its cache, what killed renders left beside the cache, and its tab-title record. Part of
+ * `uninstall --all`.
  */
 export function uninstallStatusline(file: string = settingsPath()): {
   changed: boolean;
@@ -552,7 +571,7 @@ export function uninstallStatusline(file: string = settingsPath()): {
   /** True when the script was deliberately LEFT because a setting still points at it. */
   scriptKept: boolean;
 } {
-  const { path: p, exists, data } = readSettingsForWrite(file);
+  const { path: p, exists, data, bom } = readSettingsForWrite(file);
   const ourScript = path.join(claudeConfigDir(), 'statusline.sh');
   let changed = false;
   const sl = data.statusLine as { command?: string } | undefined;
@@ -561,7 +580,7 @@ export function uninstallStatusline(file: string = settingsPath()): {
     delete data.statusLine;
     changed = true;
     fs.writeFileSync(p + '.bak', fs.readFileSync(p));
-    writeSettingsFile(p, data);
+    writeSettingsFile(p, data, bom);
   }
   // Deleting the script while a surviving setting still points AT OUR SCRIPT is worse than leaving
   // both: Claude Code then errors on every render, once a minute, with nothing naming us. That is what
@@ -591,6 +610,28 @@ export function uninstallStatusline(file: string = settingsPath()): {
       /* best-effort */
     }
   }
+  // What renders killed inside their write left beside the cache: their temporary files, and stale locks renamed aside.
+  // By the status line's own rule (its _sweep): more than two minutes from now either way, so a render still writing keeps
+  // its file, and never the lock itself or a link.
+  let names: string[] = [];
+  try {
+    names = fs.readdirSync(claudeConfigDir());
+  } catch {
+    /* no config directory */
+  }
+  for (const name of names) {
+    const tmp = name.startsWith('statusline-last.json.tmp.');
+    if (!tmp && !/^statusline-last\.json\.lock\..*\./.test(name)) continue;
+    try {
+      const f = path.join(claudeConfigDir(), name);
+      const st = fs.lstatSync(f);
+      if ((tmp ? st.isFile() : st.isDirectory()) && Math.abs(Date.now() - st.mtimeMs) > 120_000) {
+        fs.rmSync(f, { recursive: true, force: true });
+      }
+    } catch {
+      /* best-effort: another user's, as a render run under sudo leaves it */
+    }
+  }
   // The script's record of the tab titles it started a sync for (a pane id and a session title each):
   // conversation content, and as disposable as its cache.
   try {
@@ -611,7 +652,7 @@ export function uninstallStatusline(file: string = settingsPath()): {
 export function statuslineInstalled(): boolean {
   const dir = claudeConfigDir();
   try {
-    const settings = JSON.parse(fs.readFileSync(path.join(dir, 'settings.json'), 'utf8'));
+    const settings = JSON.parse(readJsonText(path.join(dir, 'settings.json')).text);
     const cmd = settings?.statusLine?.command;
     // The FULL config-dir path, matching uninstallStatusline — a bare 'statusline.sh' substring also
     // matched a user's own ~/tools/my-statusline.sh, and `update` would then have overwritten a status

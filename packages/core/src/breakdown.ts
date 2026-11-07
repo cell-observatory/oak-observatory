@@ -16,6 +16,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { claudeConfigDir } from './paths';
+import { graphemeHead } from './graphemes';
 import { priceUsage, UsageSplit } from './pricing';
 import { codexUsageDeltas } from './codex-events';
 import { codexHome } from './codex';
@@ -29,10 +30,15 @@ export interface BreakdownBucket {
   usdKnown: boolean;
   usdApprox: boolean; // any part priced via a family fallback
   messages: number;
+  /** By session: a worker transcript's row names the session that started it… */
+  parent?: string;
+  /** …and that session's row, its own, carries the figure with every agent of it listed here. */
+  tree?: { agents: number; tokens: number; cacheRead: number; usd: number; usdKnown: boolean; usdApprox: boolean; messages: number };
 }
 
 export interface AgentBreakdown {
   agent: 'claude' | 'codex';
+  usageSource?: 'database' | 'local';
   sinceMs: number;
   buckets: BreakdownBucket[];
   totals: { tokens: number; cacheRead: number; usd: number; usdApprox: boolean; usdKnown: boolean; messages: number };
@@ -77,6 +83,8 @@ interface Acc {
   usdKnown: boolean;
   usdApprox: boolean;
   messages: number;
+  parent?: string;
+  tree?: BreakdownBucket['tree'];
 }
 
 function accInto(map: Map<string, Acc>, key: string, split: UsageSplit, model: string): void {
@@ -122,6 +130,10 @@ export function claudeBreakdown(
   projectsDir?: string,
   billDay: number | null = null
 ): AgentBreakdown {
+  if (!projectsDir) {
+    const stored = databaseBreakdown('claude', by, sinceMs, weekAnchorMs, billDay);
+    if (stored) return stored;
+  }
   const proj = projectsDir ?? path.join(claudeConfigDir(), 'projects');
   // Global dedup: the biggest snapshot per message id wins, wherever it appears; the bucket is
   // decided by that snapshot's own line (its timestamp/model/session), so a fork's copy never
@@ -164,6 +176,7 @@ export function claudeBreakdown(
       } catch {
         continue;
       }
+      if (o?.type === 'api-request-blob') continue;
       const m = o?.message;
       const u = m?.usage;
       if (!u || typeof u !== 'object') continue;
@@ -174,6 +187,10 @@ export function claudeBreakdown(
         output: Number(u.output_tokens) || 0,
         cacheWrite: Number(u.cache_creation_input_tokens) || 0,
         cacheRead: Number(u.cache_read_input_tokens) || 0,
+        // The writes kept an hour, where the line splits them by lifetime; fast mode and US-only inference where recorded.
+        cacheWrite1h: u.cache_creation && typeof u.cache_creation === 'object' ? Number(u.cache_creation.ephemeral_1h_input_tokens) || 0 : null,
+        speed: typeof u.speed === 'string' ? u.speed : null,
+        geo: typeof u.inference_geo === 'string' ? u.inference_geo : null,
       };
       const unit = split.input + split.output + split.cacheWrite;
       const mid = typeof m.id === 'string' && m.id ? m.id : `${fp}:${tsMs}:${unit}`;
@@ -185,6 +202,7 @@ export function claudeBreakdown(
   }
   const map = new Map<string, Acc>();
   const sessLabel = new Map<string, string>();
+  const parentOf = new Map<string, string>();
   for (const b of best.values()) {
     let key: string;
     if (by === 'week') key = weekKey(b.tsMs, weekAnchorMs);
@@ -192,12 +210,31 @@ export function claudeBreakdown(
     else if (by === 'model') key = b.model || '(unknown model)';
     else {
       key = path.basename(b.file, '.jsonl');
-      sessLabel.set(key, path.basename(path.dirname(b.file)));
+      // A worker's transcript (`<session>/subagents/…`) is a row of its own, named for the session that started it.
+      const parts = path.relative(proj, b.file).split(path.sep);
+      if (parts[2] === 'subagents') parentOf.set(key, parts[1]);
+      sessLabel.set(key, parts[2] === 'subagents' ? `agent of ${graphemeHead(parts[1], 8)}…` : path.basename(path.dirname(b.file)));
     }
     accInto(map, key, b.t, b.model);
   }
+  // A session's row is its own turns; one that started agents also carries the figure with them, so its own never reads as
+  // the task's.
+  for (const [key, parent] of parentOf) {
+    const w = map.get(key)!;
+    const p = map.get(parent);
+    w.parent = parent;
+    if (!p) continue;
+    const t = (p.tree ??= { agents: 0, tokens: p.tokens, cacheRead: p.cacheRead, usd: p.usd, usdKnown: p.usdKnown, usdApprox: p.usdApprox, messages: p.messages });
+    t.agents += 1;
+    t.tokens += w.tokens;
+    t.cacheRead += w.cacheRead;
+    t.usd += w.usd;
+    t.usdKnown &&= w.usdKnown;
+    t.usdApprox ||= w.usdApprox;
+    t.messages += w.messages;
+  }
   const labelOf = (k: string): string =>
-    by === 'week' ? `week of ${k}` : by === 'session' ? `${k.slice(0, 8)}… (${sessLabel.get(k) ?? ''})` : k;
+    by === 'week' ? `week of ${k}` : by === 'session' ? `${graphemeHead(k, 8)}… (${sessLabel.get(k) ?? ''})` : k;
   return finish('claude', sinceMs, map, labelOf);
 }
 
@@ -209,6 +246,10 @@ export function codexBreakdown(
   sessionsDir?: string,
   billDay: number | null = null
 ): AgentBreakdown {
+  if (!sessionsDir) {
+    const stored = databaseBreakdown('codex', by, sinceMs, weekAnchorMs, billDay);
+    if (stored) return stored;
+  }
   // Walk both live and archived rollouts, via codexHome() (honours CODEX_HOME the way every other
   // codex reader does — an inline env read diverged on a whitespace-only value). Archived rollouts were
   // silently absent from the GPT usage breakdown while present in every other codex view.
@@ -244,6 +285,45 @@ export function codexBreakdown(
     }
   }
   const labelOf = (k: string): string =>
-    by === 'week' ? `week of ${k}` : by === 'session' ? `${k.slice(0, 28)}… (${sessLabel.get(k) ?? ''})` : k;
+    by === 'week' ? `week of ${k}` : by === 'session' ? `${graphemeHead(k, 28)}… (${sessLabel.get(k) ?? ''})` : k;
   return finish('codex', sinceMs, map, labelOf);
+}
+
+function databaseBreakdown(agent: 'claude' | 'codex', by: BreakdownBy, since: number, week: number | null, bill: number | null): AgentBreakdown | null {
+  if (process.env.OAK_INDEX === 'off') return null;
+  const ix = require('./index/api') as typeof import('./index/api');
+  const opened = ix.useIndex({ kick: true });
+  if (!opened.ok) return null;
+  try {
+    const usage = require('./index/usage') as typeof import('./index/usage');
+    const account = agent === 'claude' ? usage.countedAccount(opened.db).account
+      : (require('./codex') as typeof import('./codex')).codexAccountId() ?? usage.codexAccountOf(opened.db);
+    const map = new Map<string, Acc>();
+    const parents = new Map<string, string>();
+    const rows = opened.db.prepare(`SELECT * FROM usage_messages WHERE agent = ? AND ts >= ? AND ts <= ?
+      AND (? IS NULL OR account IS NULL OR account = ?)`).all(agent, since, Date.now(), account, account);
+    for (const r of rows) {
+      const session = String(r.session_id), worker = r.worker ? String(r.worker) : null;
+      const key = by === 'week' ? weekKey(Number(r.ts), week) : by === 'month' ? monthKey(Number(r.ts), bill)
+        : by === 'model' ? String(r.model) : worker ?? session;
+      if (by === 'session' && worker) parents.set(worker, session);
+      const model = agent === 'codex' && r.provider && r.provider !== 'openai' ? `provider:${r.provider}/${r.model}` : String(r.model);
+      accInto(map, key, { input: Number(r.input), output: Number(r.output), cacheWrite: Number(r.cache_create),
+        cacheWrite1h: r.cache_create_1h == null ? null : Number(r.cache_create_1h), cacheRead: Number(r.cache_read),
+        speed: r.speed as string | null, geo: r.geo as string | null }, model);
+    }
+    for (const [key, parent] of parents) {
+      const w = map.get(key)!, p = map.get(parent);
+      w.parent = parent;
+      if (!p) continue;
+      const tree = (p.tree ??= { agents: 0, tokens: p.tokens, cacheRead: p.cacheRead, usd: p.usd, usdKnown: p.usdKnown, usdApprox: p.usdApprox, messages: p.messages });
+      tree.agents++; tree.tokens += w.tokens; tree.cacheRead += w.cacheRead; tree.usd += w.usd; tree.messages += w.messages;
+      tree.usdKnown &&= w.usdKnown; tree.usdApprox ||= w.usdApprox;
+    }
+    const names = new Map((opened.db.prepare('SELECT session_id, cwd FROM sessions').all() as { session_id: string; cwd: string | null }[])
+      .map((r) => [r.session_id, r.cwd ? path.basename(r.cwd) : 'session']));
+    const label = (key: string): string => by === 'week' ? `week of ${key}` : by !== 'session' ? key
+      : `${graphemeHead(key, agent === 'claude' ? 8 : 28)}… (${parents.has(key) ? `agent of ${graphemeHead(parents.get(key)!, 8)}…` : names.get(key) ?? 'session'})`;
+    return { ...finish(agent, since, map, label), usageSource: 'database' };
+  } finally { opened.close(); }
 }

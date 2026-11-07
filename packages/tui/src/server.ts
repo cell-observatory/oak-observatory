@@ -22,7 +22,7 @@ export function runServer(core: Core, opts: { idleExitMs?: number } = {}): void 
     }
   }
   const existing = core.readDaemonPid();
-  if (existing !== null && core.pidAlive(existing)) die(`already running (pid ${existing})`);
+  if (existing !== null && core.pidAlive(existing, { reaped: true })) die(`already running (pid ${existing})`);
   core.reclaimStaleDaemon();
   const generation = crypto.randomUUID(), started = Date.now(), build = core.buildStamp();
   const clients = new Map<net.Socket, { hello: boolean; watch: boolean }>();
@@ -35,9 +35,15 @@ export function runServer(core: Core, opts: { idleExitMs?: number } = {}): void 
     if (idle) clearTimeout(idle);
     for (const sock of clients.keys()) { send(sock, { event: 'bye' }); sock.end(); }
     server.close();
-    for (const file of [paths.pid, ...(process.platform === 'win32' ? [] : [paths.sock])]) {
-      try { fs.unlinkSync(file); } catch { /* already removed */ }
+    // Its own endpoint only: the socket while it is the one this server bound, the pidfile while it names this process.
+    // Removed by path, a server started since where the store is now (moved back here) lost its socket and pidfile while
+    // it ran: unreachable, and a second one was started beside it.
+    let own = false;
+    try { own = fs.readFileSync(paths.pid, 'utf8').trim() === String(process.pid); } catch { /* none */ }
+    if (process.platform !== 'win32') {
+      try { if (bound !== null ? fs.statSync(paths.sock).ino === bound : own) fs.unlinkSync(paths.sock); } catch { /* already removed */ }
     }
+    if (own) try { fs.unlinkSync(paths.pid); } catch { /* already removed */ }
     setTimeout(() => process.exit(0), 50).unref();
   };
   const armIdle = (): void => {
@@ -85,11 +91,30 @@ export function runServer(core: Core, opts: { idleExitMs?: number } = {}): void 
     sock.on('error', () => { /* close handles cleanup */ });
     sock.on('close', () => { clients.delete(sock); armIdle(); });
   });
+  // The endpoint lives in the store, and a store move takes it away from this server: a renamed folder carries the
+  // socket and pidfile off, a copied one leaves the socket out, and a new path too long for a socket (or any move, on
+  // Windows) names another endpoint. Clients look where the store is now, so they could not reach this server, and its
+  // pidfile kept a new one from starting. It stops instead, and the terminal app's reconnect starts one where the store went.
+  let bound: number | null = null;
+  const moved = (): boolean => {
+    if (core.daemonPaths().sock !== paths.sock) return true;
+    if (bound === null) return false;
+    try { return fs.statSync(paths.sock).ino !== bound; } catch { return true; }
+  };
+  const followStore = (): void => {
+    if (stopping) return;
+    if (moved()) { log('the store moved; stopping, so the next OAK terminal starts a focus server where it went'); shutdown(); return; }
+    setTimeout(followStore, 2000).unref();
+  };
   server.on('error', error => die(`cannot listen on ${paths.sock}: ${error.message}`));
   server.listen(paths.sock, () => {
-    if (process.platform !== 'win32') fs.chmodSync(paths.sock, 0o600);
+    if (process.platform !== 'win32') {
+      fs.chmodSync(paths.sock, 0o600);
+      try { bound = fs.statSync(paths.sock).ino; } catch { /* unknown: the store's location alone decides */ }
+    }
     fs.writeFileSync(paths.pid, String(process.pid), { mode: 0o600 });
     log(`focus endpoint listening on ${paths.sock}`); armIdle();
+    setTimeout(followStore, 2000).unref();
   });
   process.on('SIGTERM', shutdown);
   process.on('SIGINT', shutdown);

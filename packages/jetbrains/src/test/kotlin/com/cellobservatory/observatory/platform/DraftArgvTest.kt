@@ -4,7 +4,6 @@ import com.cellobservatory.observatory.core.ClaudePaths
 import com.cellobservatory.observatory.core.ObservatoryCli
 import com.cellobservatory.observatory.core.StoreReader
 import com.cellobservatory.observatory.settings.ObservatorySettings
-import com.intellij.testFramework.fixtures.BasePlatformTestCase
 import java.io.File
 import java.nio.file.Files
 
@@ -15,7 +14,7 @@ import java.nio.file.Files
  * "needs --text", and the prompt toast then dropped the CLI's reason. Runs this tree's CLI (the test
  * task pins it) against a demo store in a throwaway config dir.
  */
-class DraftArgvTest : BasePlatformTestCase() {
+class DraftArgvTest : ObservatoryPlatformTestCase() {
 
     private lateinit var cfg: File
     private lateinit var work: File

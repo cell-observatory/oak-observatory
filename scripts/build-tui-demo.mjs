@@ -33,6 +33,9 @@ fs.mkdirSync(scratch, { recursive: true });
 const home = fs.mkdtempSync(path.join(scratch, 'home-'));
 const ws = fs.realpathSync(fs.mkdtempSync(path.join(scratch, 'workspace-')));
 fs.mkdirSync(path.join(ws, '.git'), { recursive: true });
+// Repository discovery validates HEAD and the common directory, even in a synthetic checkout.
+for (const dir of ['objects', 'refs']) fs.mkdirSync(path.join(ws, '.git', dir));
+fs.writeFileSync(path.join(ws, '.git', 'HEAD'), 'ref: refs/heads/demo\n');
 process.env.HOME = home; process.env.USERPROFILE = home;
 process.env.CLAUDE_CONFIG_DIR = path.join(home, 'claude');
 process.env.XDG_CONFIG_HOME = path.join(home, 'config');
@@ -62,16 +65,21 @@ const once = (session, tab = 'observatory') => {
       cwd: ws, encoding: 'utf8', env: { ...capture.env, COLUMNS: String(COLS), LINES: String(ROWS) },
     });
   } catch (error) { throw new Error('TUI media needs permission to execute the built CLI', { cause: error }); }
-  return validateFrame(frame, { conversation: tab === 'observatory' });
+  return validateFrame(frame, { conversation: tab === 'observatory', review: tab === 'review' });
 };
 
 // --- replay the demo, capturing a real frame at every beat ----------------------------------------
 console.log('▸ replaying the demo, one --once frame per beat…');
 const beats = [];
+// A beat logs its caption BEFORE it writes anything, so the frame taken at a log line shows the beat
+// before it: each caption waits for the next line (or the end of the replay) and takes that frame.
+let caption = null;
+const take = () => { const f = caption && once(null); if (f) beats.push({ cap: caption, frame: f }); };
 const res = await core.runDemo({
   fast: true, cwd: ws,
-  log: (line) => { const f = once(null); if (f) beats.push({ cap: line.trim(), frame: f }); },
+  log: (line) => { take(); caption = line.trim(); },
 });
+take();
 // a couple of settled end frames: the main session, then its sibling if the demo made one
 beats.push({ cap: `✓ ${core.reviewUnits(res.session, 'pending').filter((u) => !u.cancelled).length} pending change(s) to review`, frame: once(res.session) });
 if (res.sibling) beats.push({ cap: 'A second agent on demo/hotfix — siblings on one board', frame: once(res.sibling) });

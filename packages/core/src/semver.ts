@@ -52,3 +52,29 @@ export function compareVersions(a: string, b: string): number {
 export function isNewer(latest: string, current: string): boolean {
   return compareVersions(latest, current) > 0;
 }
+
+/**
+ * A version no release carries: `X.Y.Z-dev.0`. The version committed on `dev` is the next target as
+ * `<target>-dev.0`, and CI stamps every rolling pre-release `<target>-dev.<run>`, from run 1 up, so an
+ * install at dev.0 was built from a checkout. The updaters leave one alone unless asked by name
+ * (`--force`, or a channel chosen).
+ */
+export function isLocalBuild(version: string | null | undefined): boolean {
+  const pre = prereleaseOf(String(version ?? ''));
+  return pre !== null && pre.length === 2 && pre[0] === 'dev' && pre[1] === '0';
+}
+
+/**
+ * How an installed build stands against its channel's newest release, in the words the version menus
+ * show beside each surface. Following a channel means MATCHING it, so an install above the channel (a
+ * channel just switched downward) is its own state rather than "current"; a local build (isLocalBuild)
+ * is on no channel, and nothing is offered to it. No known release (offline, or none published) reads
+ * as current: there is nothing to differ from.
+ */
+export type ChannelReason = 'current' | 'update available' | 'not on this channel' | 'local build';
+export function channelReason(latest: string | null | undefined, installed: string): ChannelReason {
+  const cmp = latest ? compareVersions(latest, installed) : 0;
+  if (latest && cmp === 0) return 'current';
+  if (isLocalBuild(installed)) return 'local build';
+  return cmp === 0 ? 'current' : cmp > 0 ? 'update available' : 'not on this channel';
+}

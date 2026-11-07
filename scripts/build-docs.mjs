@@ -40,6 +40,9 @@ const NAV = [
     { slug: 'actions', title: 'Actions', deck: 'Actions record every tool call an agent made, in order, with its result.' },
     { slug: 'edits', title: 'Edits & the change map', deck: 'Edits are the reviewable unit; the change map summarizes them all.' },
     { slug: 'capture', title: 'Transcript, store & hook', deck: 'The transcript and the hook-fed store are the two token-free sources everything derives from.' },
+    { slug: 'database-across-machines', title: 'The database across machines', deck: 'Each machine builds its own database from local sources and shared record logs, while a shared storage server holds an encrypted backup.' },
+    { slug: 'database-and-sync', title: 'Database & sync', deck: 'Each machine keeps a local database of its sessions, and oak sync shares what each database derives, and the agents’ files, with your other machines.' },
+    { slug: 'agents-across-machines', title: 'Multi-agent work across machines', deck: 'Start agents on several machines, watch and review them from one, and let each agent read what the others did.' },
   ]},
   { group: 'The surfaces', pages: [
     { slug: 'observations', title: 'Observations', deck: 'Observations pair each edit with the reasoning recorded near it, plus flags.' },
@@ -71,7 +74,7 @@ const NAV = [
   ]},
   { group: 'Editor extensions', pages: [
     { slug: 'editors', title: 'Editor extensions', deck: 'The VS Code extension and the JetBrains plugin render one record in two editors.' },
-    { slug: 'editors-overview', title: 'The Overview panel', deck: 'The Overview panel is the master-detail board: Sessions, Workers, Workflows, Tasks, and Processes.' },
+    { slug: 'editors-overview', title: 'The Overview panel', deck: 'The Overview panel is the master-detail board: Sessions, Workers, Processes, Tasks, and Workflows.' },
     { slug: 'editors-traces', title: 'The Traces sidebar', deck: 'The Traces sidebar lists every pending edit, grouped by file, with Keep and Undo on each row.' },
     { slug: 'editors-inline', title: 'Inline review', deck: 'Inline review surfaces pending edits in the editor itself, under a floating review bar.' },
     { slug: 'editors-stacked', title: 'The stacked diff view', deck: '“Open all in editor” stacks every pending diff into one scroll, each with its own verbs.' },

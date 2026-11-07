@@ -5,6 +5,7 @@ import { storeDir, rootDir, ensureStore } from './store';
 import { isSafeSessionId } from './store';
 import { ignoreContext } from './ignore';
 import { cachedByFiles, readLines } from './fscache';
+import { graphemeHead } from './graphemes';
 
 export function captureEventsPath(session: string): string {
   return path.join(storeDir(session), 'capture-events.jsonl');
@@ -16,12 +17,13 @@ export function captureEventsPath(session: string): string {
 const ensuredStores = new Set<string>();
 
 /** Hook lifecycle evidence is retained with the session. Ignored file content and oversized event values
- * are redacted with a marker; capture still interprets the original bounded protocol message. */
+ * are redacted with a marker; capture still interprets the original bounded protocol message. An oversized
+ * value is cut where a character ends, never inside an emoji's surrogate pair. */
 export function appendCaptureEvent(session: string, kind: string, payload: unknown, cwd?: string): void {
   const ensuredKey = `${rootDir()}:${session}`;
   if (!ensuredStores.has(ensuredKey)) { ensureStore(session); ensuredStores.add(ensuredKey); }
   const clean = (v: unknown, depth = 0): unknown => {
-    if (typeof v === 'string') return v.length > 262144 ? v.slice(0, 262144) + '\n[Observatory: oversized event value truncated]' : v;
+    if (typeof v === 'string') return v.length > 262144 ? graphemeHead(v, 262144) + '\n[Observatory: oversized event value truncated]' : v;
     if (!v || typeof v !== 'object') return v;
     if (depth > 30) return { redacted: 'nesting limit' };
     if (Array.isArray(v)) return v.slice(0, 10000).map(x => clean(x, depth + 1));

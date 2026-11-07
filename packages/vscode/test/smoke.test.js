@@ -1,12 +1,18 @@
 /* Extension smoke test — loads the built bundle against a minimal `vscode` mock and drives its
    commands over an isolated store. Run with `node --test` (npm test builds the bundle first). */
-const { test } = require('node:test');
-const assert = require('node:assert');
+const { test, after } = require('node:test');
+const assert = require('node:assert/strict');
 const Module = require('module');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
 require('./editor-fixes.test');
+require('./remote-review.test');
+require('./editor-remoting.test');
+require('./stacked-scale.test');
+require('./workspace-window.test');
+require('./workspace-review.test');
+require('./remote-parity.test');
 
 // Fixtures below own their temporary HOMEs. An inherited custom config root would send the
 // extension and its real CLI children to a different store/registry than the seeded fixtures.
@@ -22,10 +28,15 @@ process.env.CLAUDE_OBSERVATORY_BIN = TREE_OAK;
 
 const core = require('../../core/dist/index.js');
 const BUNDLE = process.env.OAK_VSCODE_TEST_BUNDLE || path.resolve(__dirname, '../dist/extension.js');
+// The first test's HOME and workspace, removed when this file ends: the tests after it still write under
+// that HOME, and a direct `node --test` run left both behind.
+const tmpDirs = [];
+after(() => { for (const dir of tmpDirs) fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5 }); });
 
-test('extension: three views, click commands, inline annotations, chat, status styling, undo', async () => {
+test('extension: three views, click commands, inline annotations, chat, status styling, undo', async (t) => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-ext-home-'));
   const ws = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-ext-ws-'));
+  tmpDirs.push(home, ws);
   process.env.HOME = home;
   process.env.USERPROFILE = home; // os.homedir() reads USERPROFILE on Windows, HOME elsewhere
   // Positive control for the pin: the tree's CLI answers through its bin link. A fresh build that left
@@ -120,6 +131,7 @@ test('extension: three views, click commands, inline annotations, chat, status s
   let progressCancelled = false; // drives the demo replay's cancellation path without a 17s paced run
   const openTabs = []; // window.tabGroups contents — exitDemo must close the demo's editors
   const infoMessages = []; // every showInformationMessage — the first-run offer must not appear here
+  const statusMessages = []; // every setStatusBarMessage
   const warnMessages = []; // every showWarningMessage — a refusal has to SAY why, not fail silently
   const fsWatchers = []; // every createFileSystemWatcher: { pattern, change: [its onDidChange handlers] }
   let infoPick; // what the mock reader clicks on the next showInformationMessage (undefined = dismiss)
@@ -202,7 +214,7 @@ test('extension: three views, click commands, inline annotations, chat, status s
   const toFsPath = (p) => (p && p.length >= 2 && p[1] === ':' && p[0] >= 'A' && p[0] <= 'Z' ? p[0].toLowerCase() + p.slice(1) : p);
   const Uri = {
     file: (p) => ({ scheme: 'file', path: p, fsPath: toFsPath(p) }),
-    from: (o) => ({ scheme: o.scheme, path: o.path, query: o.query || '' }),
+    from: (o) => ({ scheme: o.scheme, authority: o.authority || '', path: o.path, query: o.query || '' }),
     joinPath: (base, ...parts) => ({ scheme: 'file', path: [base && base.path, ...parts].filter(Boolean).join('/'), fsPath: toFsPath([base && base.fsPath, ...parts].filter(Boolean).join('/')) }),
   };
   const doc = {
@@ -218,6 +230,7 @@ test('extension: three views, click commands, inline annotations, chat, status s
     RelativePattern: class { constructor(b, p) { this.base = b; this.pattern = p; } },
     Uri,
     TreeItemCollapsibleState: { None: 0, Collapsed: 1, Expanded: 2 },
+    QuickPickItemKind: { Separator: -1, Default: 0 },
     StatusBarAlignment: { Left: 1, Right: 2 },
     ColorThemeKind: { Light: 1, Dark: 2, HighContrast: 3, HighContrastLight: 4 },
     OverviewRulerLane: { Left: 1, Center: 2, Right: 4, Full: 7 },
@@ -235,9 +248,9 @@ test('extension: three views, click commands, inline annotations, chat, status s
       registerTextDocumentContentProvider: (s, p) => { contentProviders[s] = p; return { dispose() {} }; },
       // Each watcher's handlers, so a test can report a change another tool made.
       createFileSystemWatcher: (pattern) => {
-        const w = { pattern: pattern && pattern.pattern !== undefined ? pattern.pattern : pattern, change: [] };
+        const w = { pattern: pattern && pattern.pattern !== undefined ? pattern.pattern : pattern, base: pattern && pattern.base, change: [], disposed: false };
         fsWatchers.push(w);
-        return { onDidChange: (f) => { w.change.push(f); }, onDidCreate() {}, onDidDelete() {}, dispose() {} };
+        return { onDidChange: (f) => { w.change.push(f); }, onDidCreate() {}, onDidDelete() {}, dispose() { w.disposed = true; } };
       },
       onDidChangeTextDocument: () => ({ dispose() {} }),
       onDidChangeConfiguration: (cb) => { configHandlers.push(cb); return { dispose() {} }; },
@@ -263,7 +276,7 @@ test('extension: three views, click commands, inline annotations, chat, status s
       // them, "this window is not on the bar" is indistinguishable from "it was, a render ago",
       // and left-to-right order (which is priority order) cannot be asserted at all.
       createStatusBarItem: (_align, priority) => { const it = { text: '', tooltip: '', command: undefined, backgroundColor: undefined, priority, visible: false, show() { this.visible = true; }, hide() { this.visible = false; }, dispose() {} }; statusBarItems.push(it); return it; },
-      setStatusBarMessage: () => ({ dispose() {} }),
+      setStatusBarMessage: (m) => { statusMessages.push(String(m)); return { dispose() {} }; },
       createTextEditorDecorationType: () => ({ id: ++decoCounter, dispose() {} }),
       registerFileDecorationProvider: (p) => { decoProvider = p; return { dispose() {} }; },
       registerWebviewViewProvider: (id, p) => { webviewProviders[id] = p; return { dispose() {} }; },
@@ -298,8 +311,10 @@ test('extension: three views, click commands, inline annotations, chat, status s
       showInputBox: () => Promise.resolve(inputBoxValue),
       // The Feed tab's + opens the NATIVE file dialog; the mock answers with
       // one workspace file so the round-trip back to an @mention is testable.
-      showOpenDialog: (opts) => { openDialogAsks.push(opts || {}); return Promise.resolve(openDialogAnswer); },
-      showQuickPick: (items) => Promise.resolve(quickPick === null ? undefined : items[quickPick]),
+      // A function answer runs while the dialog is open (a setting another surface makes meanwhile), then answers.
+      showOpenDialog: (opts) => { openDialogAsks.push(opts || {}); return Promise.resolve(typeof openDialogAnswer === 'function' ? openDialogAnswer() : openDialogAnswer); },
+      // `quickPick` is the index chosen, or a function of the items and options that answers (a multi-select's array).
+      showQuickPick: (items, opts) => Promise.resolve(quickPick === null ? undefined : typeof quickPick === 'function' ? quickPick(items, opts) : items[quickPick]),
       // The session switch pickers use createQuickPick (for per-row buttons — the store-folder reveal).
       // The mock resolves the picker's own Promise on show(): it accepts the item `createQuickPickChoose`
       // returns (firing onDidAccept with it as selectedItems), or hides when that is null/undefined.
@@ -383,12 +398,15 @@ test('extension: three views, click commands, inline annotations, chat, status s
   Module._load = function (req, ...rest) {
     return req === 'vscode' ? vscode : origLoad.call(this, req, ...rest);
   };
+  // Disposed when the test ends, as VS Code does when the window closes: they hold the local index open and watch a folder
+  // under HOME, and Windows refuses to remove a folder while either is open.
+  const subscriptions = [];
   try {
     const ext = require(BUNDLE);
     // globalState backs the tour's remembered float/dock preference.
     const globalState = new Map();
     ext.activate({
-      subscriptions: [],
+      subscriptions,
       extensionUri: Uri.file(ws),
       globalState: { get: (k, d) => (globalState.has(k) ? globalState.get(k) : d), update: (k, v) => { globalState.set(k, v); return Promise.resolve(); } },
     });
@@ -473,6 +491,26 @@ test('extension: three views, click commands, inline annotations, chat, status s
     assert.match(extSrc, /commentingRangeProvider[\s\S]{0,220}?\/after\//, 'it enables commenting ranges on after-docs — not the disabled [] of the button bar');
     assert.match(extSrc, /core\.addComment\(session, \{ unit: id, line, text: reply\.text \}\)/, 'the reply-submit stores the typed comment through core');
     assert.match(extSrc, /core\.composeCommentPrompt[\s\S]{0,320}?deliverChatPrompt[\s\S]{0,200}?markCommentsSent/, 'send composes → drafts (never auto-sends) → marks the ledger');
+    // A comment the store cannot save is said, and never drawn in its thread as if it were saved (0.11.0).
+    {
+      const CS = 'fixture-comment-unsaved';
+      core.ensureStore(CS);
+      core.appendLog(CS, { id: core.nextId(CS), ts: Date.now(), tool: 'Edit', file: path.join(ws, 'comment-unsaved.txt'), status: 'pending',
+        beforeBlob: core.writeBlob(CS, Buffer.from('a\n')), afterBlob: core.writeBlob(CS, Buffer.from('b\n')) });
+      const unit = core.reviewEdits(CS)[0].id;
+      fs.mkdirSync(path.join(core.storeDir(CS), 'comments.json', 'taken'), { recursive: true }); // a folder takes the file's name: the write fails
+      const errors = [], err = vscode.window.showErrorMessage;
+      vscode.window.showErrorMessage = (m) => { errors.push(String(m)); return Promise.resolve(undefined); };
+      const reply = { text: 'not saved', thread: { uri: vscode.Uri.from({ scheme: 'claude-edit', path: '/after/comment-unsaved.txt', query: `s=${CS}&e=${unit}` }), range: { start: { line: 0 } }, comments: [] } };
+      try {
+        commands['claudeObservatory.addReviewComment'](reply);
+      } finally {
+        vscode.window.showErrorMessage = err;
+        core.removeSession(CS);
+      }
+      assert.match(errors[0] ?? '', /^OAK: the comment was not saved — .*could not be saved/, 'the reply-submit says the comment was not saved');
+      assert.deepEqual(reply.thread.comments, [], 'and draws nothing in the thread');
+    }
     const ctxMenu = (pkg.contributes.menus['comments/commentThread/context'] || []).filter((m) => /claudeObservatoryReview/.test(m.when || ''));
     assert.deepEqual(ctxMenu.map((m) => m.command), ['claudeObservatory.addReviewComment'], 'the reply button is addReviewComment, scoped to the review controller');
     for (const { command } of pkg.contributes.commands)
@@ -503,6 +541,14 @@ test('extension: three views, click commands, inline annotations, chat, status s
     // singleViewPaneContainerTitle, the platform's escape hatch, is not in the `views` contribution schema.
     assert.equal(timeline[0].name, containerTitles.claudeObservatoryPrompts,
       'the one Timeline view is named for its container, so the header reads the container title alone');
+    // A view dragged into ANOTHER container draws ViewPane.calculateTitle(): `${containerTitle}: ${name}`,
+    // where containerTitle is the view's contextualTitle or, without one, its home container's title.
+    // VS Code 1.144 skips the prefix when the two are equal; the fork in the user's screenshot did not, and
+    // the header read "OBSERVATORY TIMELINE: OBSERVATORY TIMELINE". A contextualTitle of its own reads once
+    // on either host.
+    const movedTitle = (v) => `${v.contextualTitle || containerTitles.claudeObservatoryPrompts}: ${v.name}`;
+    assert.ok(!movedTitle(timeline[0]).startsWith(timeline[0].name + ':'),
+      `the Timeline moved out of its container reads its name once: "${movedTitle(timeline[0])}"`);
     // 0.9.0: the Timeline container is a separate draggable unit rather than tabs wedged beside
     // Overview and Stats. VS Code offers no manifest option to place a view in the secondary side bar,
     // but a container of its own is what makes dragging it there stick cleanly. (Its one view is
@@ -791,12 +837,15 @@ test('extension: three views, click commands, inline annotations, chat, status s
       // carries live HTML. Its presence proves the plain-text fallback; its content pins escaping.
       const xf = path.join(ws, 'xss.constructor');
       const xb1 = core.writeBlob(S, Buffer.from('safe\n'));
-      const xb2 = core.writeBlob(S, Buffer.from('safe\n<script>alert(1)</script>\n'));
+      // …and a Trojan Source line: a right-to-left override in it, drawn as it is, reorders the line around it.
+      // A joiner hidden inside an identifier shows too; an emoji family keeps its joiners.
+      const xb2 = core.writeBlob(S, Buffer.from('safe\n<script>alert(1)</script>\nif (ok\u202e) {} // \u200bnote\nif (is\u200dadmin && foo\u200cbar) {} // \u{1F468}\u200d\u{1F469}\u200d\u{1F467}\n'));
       const xid = core.nextId(S);
       core.appendLog(S, { id: xid, ts: 9600, tool: 'Edit', file: xf, beforeBlob: xb1, afterBlob: xb2, status: 'pending' });
       const nPanels = webviewPanels.length;
       rvOnMsg({ type: 'openAllStacked' });
-      await new Promise((r) => setImmediate(r)); // renderStacked is async (grammar resolution) — let the first render land
+      const renderDeadline = Date.now() + 15000;
+      while (!webviewPanels.at(-1)?.webview.html.includes(`data-acts="${sid}"`) && Date.now() < renderDeadline) await new Promise(r => setTimeout(r, 10));
       assert.equal(webviewPanels.length, nPanels + 1, 'openAllStacked opens ONE webview panel');
       const sp = webviewPanels[webviewPanels.length - 1];
       assert.ok(/stacked/.test(sp.title), 'the tab is titled as the stacked view');
@@ -835,6 +884,12 @@ test('extension: three views, click commands, inline annotations, chat, status s
       assert.ok(sp.webview.html.includes(`class="id">#${xid}<`), 'a *.constructor file still renders as a block');
       assert.ok(!sp.webview.html.includes('<script>alert(1)'), 'hostile diff content is never live markup');
       assert.ok(sp.webview.html.includes('&lt;script&gt;alert(1)&lt;/script&gt;'), '…it is escaped text');
+      assert.ok(sp.webview.html.includes('<span class="hid">⟨U+202E⟩</span>') && sp.webview.html.includes('<span class="hid">⟨U+200B⟩</span>'),
+        'a hidden character in the file shows as the mark that names it, dimmed');
+      assert.ok(!/[\u202e\u200b]/.test(sp.webview.html), '…and none is left in the page to reorder or hide the text');
+      assert.ok(/is(?:<[^>]*>)*<span class="hid">⟨U\+200D⟩<\/span>(?:<[^>]*>)*admin/.test(sp.webview.html) && /foo(?:<[^>]*>)*<span class="hid">⟨U\+200C⟩<\/span>(?:<[^>]*>)*bar/.test(sp.webview.html),
+        'a joiner inside an identifier shows, across the highlighter\'s tags');
+      assert.ok(sp.webview.html.includes('\u{1F468}\u200d\u{1F469}\u200d\u{1F467}'), '…and an emoji family keeps its joiners');
       // Wrap, never a horizontal bar; a tall block scrolls inside its own box.
       assert.ok(sp.webview.html.includes('white-space:pre-wrap') && sp.webview.html.includes('overflow-wrap:anywhere'),
         'lines wrap to the window');
@@ -845,8 +900,7 @@ test('extension: three views, click commands, inline annotations, chat, status s
       assert.ok(!sp.webview.html.includes('data-chat'), 'no per-block Chat button (dropped by request, 2026-08-20)');
       // The one side-by-side entry point (the sidebar's second opener is gone): the stacked bar's
       // button → the native multi-diff, fed every pending block.
-      sp.recv({ type: 'sideBySide' });
-      await new Promise((r) => setImmediate(r));
+      await sp.recv({ type: 'sideBySide' });
       assert.equal(changesCalls.length, 1, 'the Side-by-side button opens the native multi-diff');
       assert.match(String(changesCalls[0][0]), /change\(s\)/, '…titled with the scope');
       assert.ok(changesCalls[0][1].length >= 2, '…carrying a resource triple per pending block');
@@ -893,7 +947,8 @@ test('extension: three views, click commands, inline annotations, chat, status s
       fs.writeFileSync(pf, 'x\nY\nz\n');
       configValues.openAllPreviewLines = 2; // four patch lines shown; this block has five (@@, x, -y, +Y, z)
       rvOnMsg({ type: 'openAllStacked' });
-      await new Promise((r) => setImmediate(r));
+      const budgetDeadline = Date.now() + 15000;
+      while (!webviewPanels.at(-1)?.webview.html.includes(`data-acts="${pid}"`) && Date.now() < budgetDeadline) await new Promise(r => setTimeout(r, 10));
       const bp = webviewPanels[webviewPanels.length - 1];
       assert.ok(bp.webview.html.includes('+1 more diff line — this block is previewed'), 'one line past the budget is "1 more diff line"');
       delete configValues.openAllPreviewLines;
@@ -1251,8 +1306,8 @@ test('extension: three views, click commands, inline annotations, chat, status s
           'the QuickPick per-row delete uses a trash ThemeIcon button');
         assert.match(src, /async function confirmAndDeleteSession\(id: string\): Promise<string \| null>/,
           'the shared confirm+delete body exists');
-        assert.match(src, /confirmAndDeleteSession[\s\S]{0,1200}modal: true[\s\S]{0,300}NOT deleted[\s\S]{0,700}--undelete \$\{id\} lists the session again, without its edits/,
-          '…behind a modal confirm that says the transcript is NOT deleted and what the undelete command brings back');
+        assert.match(src, /confirmAndDeleteSession[\s\S]{0,1200}const said = core\.deleteWords\(\);[\s\S]{0,200}modal: true[\s\S]{0,300}NOT deleted[\s\S]{0,900}--undelete \$\{id\} lists the session again, \$\{said\.after\}/,
+          '…behind a modal confirm that says the transcript is NOT deleted and what the undelete command brings back, as the CLI says it for the backup set');
         assert.doesNotMatch(src, /[Rr]estore it any time|restore with:? +oak sessions --undelete/, 'no delete surface promises undelete restores the edits');
         assert.match(src, /core\.deleteSession\(id, \{ confirmedPending: pending, seenThrough \}\);[\s\S]{0,300}showErrorMessage[\s\S]{0,300}pinned === id[\s\S]{0,200}sessions\[0\]\?\.id[\s\S]{0,120}pinSession/,
           '…deletes through core.deleteSession, says so when core refuses, and re-pins the newest remaining when the pinned one is deleted');
@@ -1271,7 +1326,7 @@ test('extension: three views, click commands, inline annotations, chat, status s
         assert.match(src, /m\.type === 'deleteSession' && typeof m\.id === 'string' && m\.id\)[\s\S]{0,420}confirmAndDeleteSession\(id\)/,
           'the Timeline host handler deletes through the shared body');
         // Surface C — BOTH command-palette QuickPicks (switchSession + switchActiveSession).
-        assert.equal((src.match(/buttons: r\.storeBytes \? \[revealStoreBtn, deleteSessionBtn\] : \[deleteSessionBtn\]/g) || []).length, 2,
+        assert.equal((src.match(/buttons: r\.storeBytes \? \[workspaceWindowBtn, revealStoreBtn, deleteSessionBtn\] : \[workspaceWindowBtn, deleteSessionBtn\]/g) || []).length, 2,
           'both session QuickPicks give every row the delete button');
         assert.equal((src.match(/e\.button !== deleteSessionBtn\) \{ revealStoreFolder\(it\.id\); return; \}[\s\S]{0,200}confirmAndDeleteSession\(it\.id\)[\s\S]{0,140}qp\.items = qp\.items\.filter/g) || []).length, 2,
           'both QuickPicks confirm+delete on the trash button and drop the row from the live list');
@@ -1454,6 +1509,41 @@ test('extension: three views, click commands, inline annotations, chat, status s
         assert.ok(tlProvider.headRef && tlProvider.headRef.kind === 'process' && tlProvider.headRef.id === 'bg123', 'the head follows the pick');
         tlMsg({ type: 'agentHeadClear' });
         assert.equal(tlProvider.headRef, null, 'the chip’s ✕ clears back to the connected session');
+
+        if (process.platform !== 'win32') {
+          const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-process-editor-'));
+          const oldBin = process.env.CLAUDE_OBSERVATORY_BIN;
+          const calls = path.join(dir, 'calls');
+          const bin = path.join(dir, 'oak');
+          fs.writeFileSync(bin, `#!${process.execPath}\n` +
+            `const fs=require('fs'), args=process.argv.slice(2); fs.appendFileSync(${JSON.stringify(calls)},JSON.stringify({args,deadline:process.env.OAK_MACHINE_TIMEOUT_MS})+'\\n');\n` +
+            `if(args[0]!=='processes'||args[1]!=='--follow'){process.stdout.write('{}');process.exit();}\n` +
+            `const send=label=>process.stdout.write(JSON.stringify({processLogVersion:1,ref:{kind:'process',id:'shell-0'},process:{running:true},entries:[{kind:'output',label}],outputTail:label,mode:'live'})+'\\n');\n` +
+            `send('EDITOR FIRST');setTimeout(()=>send('EDITOR APPENDED'),100);\n`, { mode: 0o755 });
+          try {
+            process.env.CLAUDE_OBSERVATORY_BIN = bin;
+            tlView.visible = true;
+            tlProvider.showing.feed = true;
+            for (const machine of [undefined, 'synthetic-box']) {
+              posts.length = 0;
+              tlProvider.followHead({ kind: 'process', id: 'shell-0', session: 'synthetic-parent', cwd: dir, machine });
+              const deadline = Date.now() + 5000;
+              while (!posts.some(p => p.type === 'agentFeed' && p.feed?.outputTail === 'EDITOR APPENDED') && Date.now() < deadline)
+                await new Promise(r => setTimeout(r, 25));
+              assert.ok(posts.some(p => p.feed?.outputTail === 'EDITOR FIRST'), 'the selected process posts the first snapshot');
+              assert.ok(posts.some(p => p.feed?.outputTail === 'EDITOR APPENDED'), 'output appends reach the actual Timeline provider');
+              const call = JSON.parse(fs.readFileSync(calls, 'utf8').trim().split('\n').at(-1));
+              assert.equal(call.deadline, '45000');
+              assert.deepEqual(call.args.slice(0, 3), ['processes', '--follow', 'shell-0']);
+              if (machine) { assert.ok(call.args.includes(machine)); assert.ok(!call.args.includes('--root')); }
+            }
+          } finally {
+            tlView.visible = false;
+            tlProvider.followHead(null);
+            if (oldBin === undefined) delete process.env.CLAUDE_OBSERVATORY_BIN; else process.env.CLAUDE_OBSERVATORY_BIN = oldBin;
+            fs.rmSync(dir, { recursive: true, force: true });
+          }
+        }
       }
     }
 
@@ -1484,12 +1574,9 @@ test('extension: three views, click commands, inline annotations, chat, status s
     assert.doesNotMatch(stView.webview.html, /id="ustale"/, 'the stale-cache banner is gone — its story rides the section tooltip');
     assert.match(stView.webview.html, /id="uref"/, 'the manual refresh sits beside the Usage title');
     assert.match(stView.webview.html, /type:'usageRefresh'/, '…and posts the refresh message');
-    // The `$` row prices the month at list prices and projects it over the whole month: both figures are
-    // estimates, and each carries `~` on either tab (the projected total had none).
-    for (const [utab, u, want] of [
-      ['claude', { monthTokens: 1200000, monthTokensTotal: 4000000, monthCost: 18, monthCostTotal: 40 }, ['~$18.00', '~$40.00']],
-      ['gpt', { gptWeekPct: 30, gptMonthTok: 900000, gptMonthTokTotal: 3000000, gptMonthCost: 12.5, gptMonthCostTotal: 41 }, ['~$12.50', '~$41.00']],
-    ]) {
+    // The Stats webview's script, run in a sandbox on the `utab` tab: `listener` takes a message as the host posts it,
+    // and `elFor` gives the element it drew into.
+    const usageView = (utab) => {
       const vm = require('node:vm');
       const els = new Map();
       const mk = () => ({ textContent: '', innerHTML: '', style: {}, parentElement: { style: {} }, addEventListener() {},
@@ -1504,8 +1591,120 @@ test('extension: three views, click commands, inline annotations, chat, status s
       vm.createContext(sandbox);
       const scripts = [...stView.webview.html.matchAll(/<script[^>]*>([\s\S]*?)<\/script[^>]*>/gi)];
       vm.runInContext(scripts[scripts.length - 1][1], sandbox);
+      return { elFor, listener };
+    };
+    await t.test('GPT Stats names the database union and fallback', () => {
+    for (const machines of ['work-box, build-box', 'this machine alone']) {
+      const { elFor, listener } = usageView('gpt');
+      listener({ data: { type: 'usage', u: { gptWeekPct: 20, gptMonthTok: 10_000_000, gptMonthTokTotal: 88_571_429,
+        gptMonthCost: 17.535, gptMeasuredMachines: machines } } });
+      assert.equal(elFor('ulast').textContent, 'estimates include usage measured on '+machines);
+      assert.equal(elFor('up-mo').textContent, '11%');
+    }
+    });
+    await t.test('account usage freshness appears on both Stats tabs', () => {
+      const stamp = 'Usage received — build-box: 2026-11-04T12:00:00.000Z (stale; unreachable)';
+      for (const tab of ['claude', 'gpt']) {
+        const { elFor, listener } = usageView(tab);
+        listener({ data: { type: 'usage', u: { weekPct: 20, gptWeekPct: 20, usageFreshness: stamp, gptUsageFreshness: stamp } } });
+        assert.equal(elFor('ulast').textContent, stamp);
+      }
+    });
+    // One usage post on the `utab` tab → each row as the reader sees it: [share, display, used, total, cached, countdown].
+    const usageRow = (utab, u) => {
+      const { elFor, listener } = usageView(utab);
       listener({ data: { type: 'usage', u } });
-      assert.deepEqual([elFor('uc1-$').textContent, elFor('uc2-$').textContent], want, `${utab}: the $ row's spent and projected total are both marked estimates`);
+      return (l) => [elFor('up-' + l).textContent, elFor('ul-' + l).parentElement.style.display || '', elFor('uc1-' + l).textContent,
+        elFor('uc2-' + l).textContent, elFor('uc3-' + l).textContent, elFor('ut-' + l).textContent];
+    };
+    // A session that started agents shows its own tokens and the figure with them, each labelled (core.sessionTreeUsage,
+    // the CLI's sessionTreeTokens); one that started none shows its own alone, as before.
+    {
+      assert.ok(scMsgs.some((m) => m.type === 'counts' && 'tt' in m), 'the counts post carries the session with its agents');
+      const { elFor, listener } = usageView('claude');
+      const own = { available: true, total: 1_284_000, input: 1_200_000, output: 84_000, cacheRead: 41_000_000, cacheCreation: 0, hitPct: 97 };
+      const counts = (tt) => listener({ data: { type: 'counts', c: { pending: 0, kept: 0, undone: 0 }, session: 's', sessionTitle: '', t: own, tt, v: null } });
+      counts({ ...own, total: 3_910_000, input: 3_600_000, output: 310_000, cacheRead: 96_000_000, hitPct: 96, agents: 3 });
+      assert.deepEqual([elFor('tk-own-cap').style.display, elFor('tk-in').textContent, elFor('tk-tree').style.display, elFor('tk-tree-cap').textContent,
+        elFor('tk-tin').textContent, elFor('tk-tout').textContent, elFor('tk-tcached').textContent, elFor('tk-tcached-lbl').textContent],
+      ['', '1.2M', '', 'with 3 agents', '3.6M', '310k', '96M', 'cached · 96% hit'], 'own, labelled, then with its agents');
+      counts({ ...own, agents: 0 });
+      assert.deepEqual([elFor('tk-own-cap').style.display, elFor('tk-tree').style.display, elFor('tk-in').textContent], ['none', 'none', '1.2M'], 'no agents: its own alone');
+    }
+    // The `$` row prices the month at list prices and projects it over the whole month: both figures are
+    // estimates, and each carries `~` on either tab (the projected total had none).
+    for (const [utab, u, want, mo] of [
+      ['claude', { monthTokens: 1200000, monthTokensTotal: 4000000, monthCost: 18, monthCostTotal: 40 }, ['~$18.00', '~$40.00']],
+      ['gpt', { gptWeekPct: 30, gptMonthTok: 900000, gptMonthTokTotal: 3000000, gptMonthCost: 12.5, gptMonthCostTotal: 41 }, ['~$12.50', '~$41.00']],
+      // A month measured at 0 (a bill cycle that just rolled over) reads 0% on either tab, as on the status bar, and ~0
+      // against its budget, with no dollar figure; a month never measured has no share (Claude) or no row (GPT).
+      // [share, row display, spent, total]
+      ['claude', { monthTokens: 0, monthTokensTotal: 111423689 }, null, ['0%', '', '~0', '111.4M']],
+      ['claude', { monthTokens: null, monthTokensTotal: 111423689 }, null, ['—', '', '', '111.4M']],
+      ['gpt', { gptWeekPct: 30, gptMonthTok: 0, gptMonthTokTotal: 4428571 }, null, ['0%', '', '~0', '4.4M']],
+      ['gpt', { gptWeekPct: 30, gptMonthTok: null, gptMonthTokTotal: null }, null, ['', 'none']],
+      // With no 5h or weekly share in the cache (rollingLimits false) the month keeps its share, as in JetBrains'
+      // panel, and the $ row shares it; a month never measured shows no figure. [share, row display, spent, total]
+      ['claude', { rollingLimits: false, monthTokens: 0, monthTokensTotal: 111423689 }, null, ['0%', '', '~0', '111.4M']],
+      ['claude', { rollingLimits: false, monthTokens: null, monthTokensTotal: null }, null, ['—', '', '', '']],
+      ['claude', { rollingLimits: false, monthTokens: 1200000, monthTokensTotal: 4000000, monthCost: 18, monthCostTotal: 40 }, ['~$18.00', '~$40.00', '30%'], ['30%', '', '~1.2M', '4M']],
+    ]) {
+      const { elFor, listener } = usageView(utab);
+      listener({ data: { type: 'usage', u } });
+      if (want) assert.deepEqual([elFor('uc1-$').textContent, elFor('uc2-$').textContent, elFor('up-$').textContent].slice(0, want.length), want, `${utab}: the $ row's spent and projected total are both marked estimates`);
+      if (mo) {
+        assert.deepEqual([elFor('up-mo').textContent, elFor('ul-mo').parentElement.style.display || '', elFor('uc1-mo').textContent, elFor('uc2-mo').textContent].slice(0, mo.length), mo, `${utab}: the month row's share, and whether it shows`);
+        if (!want) assert.deepEqual([elFor('uc1-$').textContent, elFor('uc2-$').textContent], ['', ''], `${utab}: no dollar figure rides on the month`);
+      }
+      // With no rolling windows and no spend there is no $ row, as in JetBrains, rather than an earlier post's figures.
+      if (u.rollingLimits === false && u.monthCost == null) assert.equal(elFor('ul-$').parentElement.style.display, 'none', `${utab}: no $ row without a spend`);
+      // Its figures are OAK's, priced from the cycle's tokens: the row says they are an estimate at today's list prices.
+      if (u.rollingLimits === false && u.monthCost != null) assert.match(elFor('ul-$').parentElement.title, /estimated from its tokens at today’s API list prices/, `${utab}: the $ row says it is an estimate`);
+      // The section's stamp: the cache's last refresh, and the saved machine a reading came from.
+      listener({ data: { type: 'usage', u: { ...u, cachedAtMs: Date.now(), machineNote: 'build-box' } } });
+      // GPT's figures are always this machine's own, so its tab's stamp names none.
+      if (utab === 'claude') assert.match(elFor('ulast').textContent, /^updated \S.* · measured on build-box$/, 'claude: the stamp names the saved machine');
+      else assert.match(elFor('ulast').textContent, /^updated \S[^·]*$/, 'gpt: the stamp, naming no machine');
+      // With when that machine measured the reading (two days ago here, so with its date), and with no control,
+      // bidi or zero-width characters from its herdr label.
+      const machineAt = Date.now() - 2 * 86400_000;
+      listener({ data: { type: 'usage', u: { ...u, cachedAtMs: Date.now(), machineNote: 'build\u001b[2J\u202e\u200b\u2066box\u2069\u200e\ufeff\u0007\t', machineAt } } });
+      if (utab === 'claude') assert.equal(elFor('ulast').textContent.replace(/^updated [^·]* · /, ''), `measured on build[2Jbox at ${core.relTime(machineAt)}`,
+        'claude: when the saved machine measured it, and its label as plain text');
+      const family = 'lab \u{1F468}\u200d\u{1F469}\u200d\u{1F467}';
+      listener({ data: { type: 'usage', u: { ...u, cachedAtMs: Date.now(), machineNote: family, machineAt } } });
+      if (utab === 'claude') assert.equal(elFor('ulast').textContent.replace(/^updated [^·]* · /, ''), `measured on ${family} at ${core.relTime(machineAt)}`,
+        'claude: an emoji family in the label keeps its joiners');
+      listener({ data: { type: 'usage', u: { ...u, cachedAtMs: Date.now(), machineNote: '' } } });
+      assert.doesNotMatch(elFor('ulast').textContent, /measured on/, `${utab}: this machine's own reading names none`);
+      // The saved machines whose own usage the estimates add to this machine's are named too, on the claude tab only.
+      listener({ data: { type: 'usage', u: { ...u, cachedAtMs: Date.now(), machineNote: '', machineMeasured: { five: null, week: null, month: null, machines: 'build-box, lab\u202e-box' } } } });
+      if (utab === 'claude') assert.match(elFor('ulast').textContent, /^updated \S.* · estimates include usage measured on build-box, lab-box$/, 'claude: the stamp names the machines the estimates include');
+      else assert.doesNotMatch(elFor('ulast').textContent, /estimates include/, 'gpt: its estimates are this machine\'s own');
+    }
+    // With no rolling windows the month row says whose turns it counts: this machine's, and those of the saved machines
+    // whose bill cycle the month adds up.
+    {
+      const { elFor, listener } = usageView('claude');
+      listener({ data: { type: 'usage', u: { rollingLimits: false, monthTokens: 1200000, monthTokensTotal: null } } });
+      assert.equal(elFor('ul-mo').parentElement.title, 'tokens this bill cycle, measured on this machine');
+      listener({ data: { type: 'usage', u: { rollingLimits: false, monthTokens: 1200000, monthTokensTotal: null,
+        machineMeasured: { five: null, week: null, month: { tok: 1, reads: 0, cost: 0, start: 1, reset: 2, hosts: 'b16b16b16b16' }, machines: 'build-box' } } } });
+      assert.equal(elFor('ul-mo').parentElement.title, 'tokens this bill cycle, measured on this machine and on build-box');
+    }
+    // A window at 0% with a budget reads ~0 against it in the used column, as the status line and the terminal app
+    // read ~0/<budget>; the columns were empty (2026-10-20). One at 0% with no budget leaves them empty, and a share
+    // above 0 keeps its own figures. [share, row display, used, total]
+    {
+      const claude = usageRow('claude', { rollingLimits: true, fiveHourPct: 0, fiveTotal: 6_000_000, weekPct: 0, weekTotal: 30_000_000,
+        fablePct: 0, fableTotal: 2_000_000, fableLabel: 'Fable', monthTokens: 0, monthTokensTotal: 128_500_000 });
+      assert.deepEqual(['5h', 'fable', 'wk', 'mo'].map((l) => claude(l).slice(0, 4)),
+        [['0%', '', '~0', '6M'], ['0%', '', '~0', '2M'], ['0%', '', '~0', '30M'], ['0%', '', '~0', '128.5M']], 'claude: ~0 in every window with a budget');
+      const mixed = usageRow('claude', { rollingLimits: true, fiveHourPct: 0, weekPct: 10, weekTokens: 3_000_000, weekTotal: 30_000_000, fablePct: 0 });
+      assert.deepEqual(['5h', 'fable', 'wk'].map((l) => mixed(l).slice(0, 4)), [['0%', '', '~0', ''], ['0%', '', '~0', ''], ['10%', '', '~3M', '30M']],
+        'no budget: ~0 alone, as the status line reads it; a share above 0 keeps its own');
+      const gpt = usageRow('gpt', { gptWeekPct: 0, gptWeekTotal: 1_000_000, gptMonthTok: 0, gptMonthTokTotal: 4_428_571 });
+      assert.deepEqual(['wk', 'mo'].map((l) => gpt(l).slice(0, 4)), [['0%', '', '~0', '1M'], ['0%', '', '~0', '4.4M']], 'gpt: ~0 too');
     }
     // 0.8.7: the context-per-turn chart is GONE (core no longer emits the series) — and so is its scaffolding.
     assert.ok(!/tk-fill|renderFill|class="spark"/.test(stView.webview.html), 'the context-per-turn chart and its scaffolding are removed');
@@ -1631,13 +1830,13 @@ test('extension: three views, click commands, inline annotations, chat, status s
     // 0.8.7 review: the tab is ALWAYS present (JetBrains parity) — one that vanishes when the CLI can't
     // answer hides the failure. Its badge is running/total, tinted while a shell is still going, and the
     // three states it can be in (nothing read yet · no answer · genuinely none) get three sentences.
-    assert.ok(/defs\.push\(\['processes'/.test(cmView.webview.html) && !/if\(PR\) defs\.push/.test(cmView.webview.html),
+    assert.ok(/defs\.splice\(2, 0, \['processes'/.test(cmView.webview.html) && !/if\(PR\) defs\.push/.test(cmView.webview.html),
       'the Processes tab is always present, so a CLI that cannot answer is reported rather than hidden');
     assert.ok(/psum\? \(psum\.running\+'\/'\+psum\.total\) : ''/.test(cmView.webview.html), 'the Processes tab badge is running/total, and blank when there is no payload to count');
     assert.ok(/\.ov-tn\.hot \{ color: var\(--mt-done\)/.test(cmView.webview.html), 'the running/total badge is tinted with the same green the running row badge uses');
     assert.ok(/Reading this session’s background shells…/.test(cmView.webview.html), 'state 1: nothing has been read yet');
     assert.ok(/No answer for background shells/.test(cmView.webview.html), 'state 2: the CLI returned nothing — stated, not silently blamed on the session');
-    assert.ok(/No background shells — Claude starts one only when it runs a command/.test(cmView.webview.html), 'state 3: this session genuinely started none');
+    assert.ok(/No shells in this session/.test(cmView.webview.html), 'state 3: this session genuinely started none');
     // 0.8.7 review (B21): Tasks + Processes are the ACTIVE session's payloads; selecting a sibling fleet
     // row re-points the change map and the feed but NOT these two, so both panes say so.
     assert.ok(/function offSession/.test(cmView.webview.html) && /function scopeNote/.test(cmView.webview.html), 'the session-scope note exists for the tabs the fleet selection does not re-point');
@@ -1645,7 +1844,7 @@ test('extension: three views, click commands, inline annotations, chat, status s
     // 0.9.0: "ACTIVE" became "REVIEWED" in the Tasks tooltip — the pane follows the session under review,
     // and calling that the active session read as "the one Claude is running in", which is a different
     // thing the moment you pin an older session.
-    assert.ok(/REVIEWED session’s numbered task list/.test(cmView.webview.html) && /background shells the ACTIVE session launched/.test(cmView.webview.html),
+    assert.ok(/REVIEWED session’s numbered task list/.test(cmView.webview.html) && /shells recorded for the reviewed session and its workers/.test(cmView.webview.html),
       'the tab tooltips name the scope too');
     // …and both now say what happens to their BADGE while a sibling is selected, since neither pane can
     // be scoped to one: a count from the reviewed session beside a pane the reader believes they scoped
@@ -1713,8 +1912,8 @@ test('extension: three views, click commands, inline annotations, chat, status s
     // Sessions tab (0.8.8): this workspace's sessions, click to SWITCH the review.
     assert.ok(!/id="ov-pane-requests"/.test(cmView.webview.html) && !/id="ov-pane-prompts"/.test(cmView.webview.html),
       'the Overview has no prompts tab (it is a window)');
-    assert.ok(/var ids=\['sessions','fleet','workflows','tasks','processes'\]/.test(cmView.webview.html),
-      'the Overview’s panes are Sessions · Workers · Workflows · Tasks · Processes — Sessions leads, since which session you are reviewing precedes every other question');
+    assert.ok(/var ids=\['sessions','fleet','processes','tasks','workflows'\]/.test(cmView.webview.html),
+      'the Overview’s panes are Sessions · Workers · Processes · Tasks · Workflows — Sessions leads, since which session you are reviewing precedes every other question');
     assert.ok(/NAV='sessions'/.test(cmView.webview.html), 'and the panel opens on it');
     assert.ok(/id="ov-pane-sessions"/.test(cmView.webview.html) && /function renderSessions/.test(cmView.webview.html),
       'the Sessions tab renders this workspace’s sessions');
@@ -1791,8 +1990,9 @@ test('extension: three views, click commands, inline annotations, chat, status s
     // The Refresh command FORCES (a pane stuck on a failed spawn is recoverable from the UI) AND sweeps a
     // newly-added `.observatoryignore` first — a USER refresh is the safe place to apply it, since adding
     // the file fires no capture hook so the capture-time sweep never runs. Both live
-    // in the one handler now; the sweep (`dropIgnored`) precedes the forced re-read (`refreshAll(true)`).
-    assert.match(bundleSrc, /registerCommand\("claudeObservatory\.refresh", \(\) => \{[\s\S]{0,300}?core\.dropIgnored\(s\)[\s\S]{0,160}?refreshAll\(true\)/,
+    // in the one handler now; the asked sweep precedes the forced re-read (`refreshAll(true)`). Its confirm
+    // is executed at the end of this test.
+    assert.match(bundleSrc, /registerCommand\("claudeObservatory\.refresh", async \(opts\) => \{[\s\S]{0,300}?await sweepIgnoredAsking\(s\)[\s\S]{0,160}?refreshAll\(true\)/,
       'the Refresh command sweeps .observatoryignore then forces a re-read');
     // 0.8.8: the ribbon (and its compaction anchoring) is gone — compactions live in Actions + Stats.
     assert.ok(!/afterChapterId|afterSubtaskId/.test(cmView.webview.html), 'no ribbon compaction anchoring remains (the field shipped as afterChapterId)');
@@ -1820,12 +2020,13 @@ test('extension: three views, click commands, inline annotations, chat, status s
     // listener (the Timeline provider). Asserted by spy: the ref crosses with kind, id AND label.
     {
       const crossed = [];
+      const wired = cmProvider.onFeedSelect;
       cmProvider.onFeedSelect = (ref) => crossed.push(ref);
       cmMsgHandler({ type: 'feed', kind: 'process', id: 'bg123', label: 'test shell' });
       cmMsgHandler({ type: 'feed' }); // the bare form = a session switch cleared the subject
       assert.deepStrictEqual(crossed, [{ kind: 'process', id: 'bg123', label: 'test shell' }, null],
         'a feed pick crosses to the host listener with its label; the bare form crosses as null');
-      cmProvider.onFeedSelect = undefined;
+      cmProvider.onFeedSelect = wired; // what activate() wired, for the blocks below
       assert.equal(cmMsgs.length, 0, 'and the Overview itself spawns and posts nothing for it');
     }
     cmProvider.postError();
@@ -1865,7 +2066,8 @@ test('extension: three views, click commands, inline annotations, chat, status s
       const seen = [];
       const real = commands[cmd];
       commands[cmd] = (id) => { seen.push(id); };
-      cmMsgHandler({ type: msg, taskId: 'chap1' });
+      cmMsgHandler({ type: msg, taskId: 'chap1', machine: '', session: S });
+      cmMsgHandler({ type: msg, taskId: 'stale', machine: 'lab-a', session: S });
       commands[cmd] = real;
       assert.deepEqual(seen, ['chap1'], `a chip ${msg} routes to ${cmd} with the taskId`);
     }
@@ -1873,7 +2075,7 @@ test('extension: three views, click commands, inline annotations, chat, status s
     const ccSeen = [];
     const realCC = commands['claudeObservatory.clearCompletedTasks'];
     commands['claudeObservatory.clearCompletedTasks'] = () => { ccSeen.push(1); };
-    cmMsgHandler({ type: 'clearCompletedTasks' });
+    cmMsgHandler({ type: 'clearCompletedTasks', machine: '', session: S });
     commands['claudeObservatory.clearCompletedTasks'] = realCC;
     assert.equal(ccSeen.length, 1, 'the "clear completed tasks" control routes to its command');
 
@@ -2029,9 +2231,11 @@ test('extension: three views, click commands, inline annotations, chat, status s
         };
         const saved = []; // every vscode.setState — this panel's layout is what it persists
         const posts = []; // every message the page posts to the host — what a click actually asks for
+        // Both are cloned out of the script's realm, as VS Code serializes them, so the strict asserts compare
+        // their contents rather than which realm's Object.prototype they carry.
         const sandbox = {
           window: winStub, document: docStub, console,
-          acquireVsCodeApi: () => ({ postMessage: (m) => posts.push(m), getState: () => persisted || null, setState: (s) => saved.push(s) }),
+          acquireVsCodeApi: () => ({ postMessage: (m) => posts.push(structuredClone(m)), getState: () => persisted || null, setState: (s) => saved.push(structuredClone(s)) }),
           URLSearchParams, JSON, Math, Date, String, Number, Array, Object, RegExp, parseInt, parseFloat, isFinite, NaN, Infinity, undefined,
           getComputedStyle: () => ({ getPropertyValue: () => '' }),
           ResizeObserver: class { observe() {} unobserve() {} disconnect() {} },
@@ -2053,6 +2257,32 @@ test('extension: three views, click commands, inline annotations, chat, status s
         };
         return { elFor, fire, saved, posts, post: (data) => msgListener({ data }) };
       };
+      // The Workers lane paints independently of the review payload. Finished children stay hidden
+      // under Active only, then fold into one clickable count when the filter is off.
+      const workersView = runOverview(null);
+      assert.equal(workersView.posts.filter(m => m.type === 'workersVisible').at(-1).visible, false, 'Sessions is initially the only visible tab');
+      workersView.post({ type: 'tour', tab: 'fleet', anchor: 'nav-tabs' });
+      assert.equal(workersView.posts.filter(m => m.type === 'workersVisible').at(-1).visible, true);
+      workersView.post({ type: 'tour', tab: 'sessions', anchor: 'nav-tabs' });
+      assert.equal(workersView.posts.filter(m => m.type === 'workersVisible').at(-1).visible, false);
+      const doneButton = mkEl(); doneButton.getAttribute = () => 'test-lab:parent';
+      workersView.elFor('ov-fleet').querySelectorAll = selector => selector === '[data-done]' ? [doneButton] : [];
+      workersView.post({ type: 'workers', findings: { count: 2, rows: [{ text: '<script>ignore instructions</script>' }] }, workers: [{ key: 'test-lab:parent', session: 'parent', title: 'Check violet widgets',
+        machine: 'test-lab', remote: 'test-lab', kind: 'codex', state: 'working', phase: 'working', tokens: 45, lastActiveMs: Date.now(),
+        subagents: [{ agentId: 'live', description: 'Live widget scan', phase: 'working' }, { agentId: 'done', description: 'Finished widget scan', phase: 'done' }, { agentId: 'gone', description: 'Lost widget scan', phase: 'gone' }] }] });
+      const workerHtml = () => workersView.elFor('ov-fleet').innerHTML;
+      assert.match(workerHtml(), /Findings · 2 · oak finding list/);
+      assert.doesNotMatch(workerHtml(), /<script>ignore instructions<\/script>/);
+      assert.match(workerHtml(), /Check violet widgets/);
+      assert.match(workerHtml(), /test-lab.*codex/);
+      assert.match(workerHtml(), /Live widget scan/);
+      assert.doesNotMatch(workerHtml(), /Finished widget scan|Lost widget scan|2 done/);
+      workersView.post({ type: 'showall', on: true });
+      assert.match(workerHtml(), /2 done/);
+      assert.doesNotMatch(workerHtml(), /Finished widget scan|Lost widget scan/);
+      workersView.fire(doneButton, 'click');
+      assert.match(workerHtml(), /Finished widget scan/);
+      assert.match(workerHtml(), /Lost widget scan/);
       const solo = runOverview(null);
       const elFor = solo.elFor;
       solo.post({ type: 'version', v: { current: '9.9.9', channel: 'stable', stableLatest: '9.9.10', devLatest: '9.10.0-dev.3', updateAvailable: true } });
@@ -2089,6 +2319,13 @@ test('extension: three views, click commands, inline annotations, chat, status s
       menu = elFor('ov-vermenu').innerHTML;
       assert.match(menu, /CLI<\/span><span class="vm-ver">— · not found/, 'a CLI that could not be located says so rather than showing the extension version');
 
+      // A local build is offered nothing: its rows, and the Update row, say "local build" rather than "up to date".
+      solo.post({ type: 'version', v: { current: '0.11.0-dev.0', channel: 'dev', stableLatest: '0.10.0', devLatest: '0.11.0-dev.15', updateAvailable: false, local: true,
+        surfaces: [{ label: 'Extension', version: '0.11.0-dev.0', reason: 'local build' }, { label: 'CLI', version: '0.11.0-dev.0', reason: 'local build' }] } });
+      menu = elFor('ov-vermenu').innerHTML;
+      assert.match(menu, /Extension<\/span><span class="vm-ver">v0\.11\.0-dev\.0 · local build/);
+      assert.match(menu, /Update now<span class="vm-ver">local build</);
+
       // After an install lands, the running host is still the OLD build. Saying nothing made the
       // update look like it had failed; the row says the new version is in, pending a reload.
       solo.post({ type: 'version', v: { current: '0.9.4', channel: 'stable', stableLatest: '0.9.5', devLatest: null, updateAvailable: false, pendingReload: '0.9.5',
@@ -2123,6 +2360,174 @@ test('extension: three views, click commands, inline annotations, chat, status s
         fs.rmSync(reg, { recursive: true, force: true });
       }
 
+      // ---- Update now hands the CLI everything but this extension's own install -------------------
+      // `update --json --here` names OAK's setup on this machine beside the surfaces; any of them with work
+      // is what the toast says the CLI updated. An editor without our extension, one its marketplace
+      // updates, or a repair left to the user is not work.
+      {
+        const surface = (reason, s = 'cli') => ({ surface: s, label: s, reason });
+        assert.equal(ext.updatePending({ surfaces: [surface('current'), surface('missing', 'vscode'), surface('managed', 'vscode')] }), false, 'nothing for the CLI to do');
+        assert.equal(ext.updatePending({ surfaces: [surface('behind', 'vscode')] }), true, 'another editor, or a Remote-SSH server, behind');
+        assert.equal(ext.updatePending({ surfaces: [surface('current')], components: [{ id: 'hooks', state: 'update' }] }), true, 'hooks short of an event');
+        assert.equal(ext.updatePending({ surfaces: [surface('current')], components: [{ id: 'hooks', state: 'absent' }, { id: 'project-hooks', state: 'manual' }] }), false, 'a repair left to the user');
+        assert.equal(ext.updatePending({ surfaces: [surface('linked')] }), false, 'a CLI linked to a checkout, which its owner updates there');
+        assert.equal(ext.updatePending({ surfaces: [surface('provisioned')] }), false, 'a CLI copied by `oak machine add`, which updates it');
+        assert.equal(ext.updatePending({ surfaces: [surface('local'), surface('local', 'vscode'), surface('local', 'jetbrains')] }), false, 'a local build, which the update leaves alone');
+        // The chip offers no release to a CLI linked to a checkout, or to a local build (dev.0, which no release
+        // carries), and names it; any other CLI is placed on the channel as before.
+        assert.equal(ext.cliChipReason({ current: '0.11.0-dev.0', linked: '/src/oak' }, '0.11.0-dev.15'), 'linked to a checkout');
+        assert.equal(ext.cliChipReason({ current: '0.11.0-dev.0', provisioned: true }, '0.11.0-dev.15'), 'copied by oak machine add');
+        assert.equal(ext.cliChipReason({ current: '0.11.0-dev.0', linked: null }, '0.11.0-dev.15'), 'local build');
+        assert.equal(ext.cliChipReason({ current: '0.11.0-dev.3', linked: null }, '0.11.0-dev.15'), 'update available');
+        assert.equal(ext.cliChipReason(null, '0.11.0-dev.15'), 'not found');
+        // What the toast says the CLI did, from the plans before and after it: this window's own extension (its
+        // row names the folder the install sits in) is the extension's work, never the CLI's.
+        const own = path.join(ws, 'own-extensions');
+        fs.mkdirSync(own, { recursive: true });
+        const row = (label, reason, extensionsDir) => ({ surface: label === 'CLI' ? 'cli' : 'vscode', label, from: '9.9.8', to: '9.9.9', reason, ...(extensionsDir ? { extensionsDir } : {}) });
+        const plan = (rows, components = [{ id: 'hooks', label: 'Claude Code capture hooks', state: 'current' }]) => ({ surfaces: rows, components });
+        assert.equal(ext.cliUpdateNote(plan([row('VS Code', 'behind', own), row('CLI', 'current')]), plan([row('VS Code', 'current', own), row('CLI', 'current')]), own, false),
+          'everything else on this machine already current', 'only this window was behind: the CLI updated nothing');
+        assert.equal(ext.cliUpdateNote(plan([row('VS Code', 'behind', own), row('Cursor', 'behind', '/elsewhere'), row('CLI', 'behind')]),
+          plan([row('VS Code', 'current', own), row('Cursor', 'current', '/elsewhere'), row('CLI', 'current')]), own, false), 'the CLI updated Cursor, itself');
+        assert.equal(ext.cliUpdateNote(plan([row('CLI', 'behind')], [{ id: 'hooks', label: 'Claude Code capture hooks', state: 'after-cli' }]),
+          plan([row('CLI', 'current')], [{ id: 'hooks', label: 'Claude Code capture hooks', state: 'current' }]), own, false), 'the CLI updated itself', 'setup the plan left to the new CLI is not claimed');
+        assert.equal(ext.cliUpdateNote(plan([row('Cursor', 'behind')]), plan([row('Cursor', 'behind')]), own, false), 'the CLI ran the update; still to do: Cursor');
+        assert.equal(ext.cliUpdateNote(plan([row('CLI', 'current')]), plan([row('CLI', 'current')]), own, true), 'the CLI had nothing else to update on this machine');
+        assert.equal(ext.cliUpdateNote(null, plan([row('CLI', 'current')]), own, false), 'the CLI ran the update for the rest of this machine', 'no plan before: nothing named');
+        assert.equal(ext.cliUpdateNote(plan([row('CLI', 'behind')]), null, own, false), 'the CLI ran the update for the rest of this machine', 'no plan after: nothing named');
+      }
+      // The click reads this machine's plan only (`--here`), and always runs `oak update`, the one call that
+      // reaches the saved machines: a current machine here says nothing about them. It then reads the plan
+      // again and names each repair the update leaves to the user. (POSIX: the fake CLI is a shell script.
+      // The release feed is refused, so nothing leaves this machine.)
+      if (process.platform !== 'win32') {
+        const argvLog = path.join(ws, 'update-argv.log');
+        const fakeOak = path.join(ws, 'fake-oak');
+        const hold = path.join(ws, 'update-hold'), ran = path.join(ws, 'update-ran');
+        // `update --json --here` answers `before` until `update` has run and `after` from then on (null: the
+        // read fails, as it does with the release feed down); `update` waits while the hold file exists, then
+        // fails with `err` on stderr when one is given.
+        const answer = (plan) => (plan ? `echo '${JSON.stringify(plan)}'` : 'exit 1');
+        const fake = (before, after = before, err = '') => fs.writeFileSync(fakeOak, `#!/bin/sh\necho "$*" >> ${JSON.stringify(argvLog)}\ncase "$*" in
+  "version --json") echo '{"current":"9.9.9","channel":"stable"}' ;;
+  "update --json --here") if [ -e ${JSON.stringify(ran)} ]; then ${answer(after)}; else ${answer(before)}; fi ;;
+  update) : > ${JSON.stringify(ran)}; while [ -e ${JSON.stringify(hold)} ]; do sleep 0.05; done${err ? `; printf '%s\\n' '${err}' >&2; exit 1` : ''} ;;
+esac\nexit 0\n`, { mode: 0o755 });
+        const surfaces = [{ surface: 'cli', label: 'CLI', from: '9.9.9', to: '9.9.9', reason: 'current' }];
+        const repair = '/w/team/.claude/settings.json is missing Stop — run `oak init --repair` there';
+        const current = { surfaces, components: [{ id: 'hooks', state: 'current' }], upToDate: true };
+        const yours = { surfaces, components: [{ id: 'hooks', state: 'current' }, { id: 'project-hooks', state: 'manual', detail: repair }], upToDate: true };
+        const calls = () => (fs.existsSync(argvLog) ? fs.readFileSync(argvLog, 'utf8').trim().split('\n') : []);
+        const click = async (before, after, err) => {
+          fake(before, after, err);
+          for (const f of [argvLog, ran]) fs.rmSync(f, { force: true });
+          const warnedBefore = warnMessages.length, infoBefore = infoMessages.length;
+          await commands['claudeObservatory.updateNow']();
+          return [...warnMessages.slice(warnedBefore), ...infoMessages.slice(infoBefore)].join('\n');
+        };
+        const https = require('https');
+        const realGet = https.get;
+        https.get = () => { const req = new (require('events'))(); req.setTimeout = () => req; req.destroy = () => {}; process.nextTick(() => req.emit('error', new Error('offline'))); return req; };
+        process.env.CLAUDE_OBSERVATORY_BIN = fakeOak;
+        try {
+          let said = await click(current);
+          assert.deepEqual(calls(), ['update --json --here', 'version --json', 'update', 'update --json --here']);
+          assert.match(said, /everything else on this machine already current/, said);
+          assert.doesNotMatch(said, /saved machines/, 'it speaks for this machine, and cannot tell whether any machine is saved');
+          // A repair the update leaves to the user is named, and this machine is not called current. It is
+          // read after the update: a CLI that was out of date judged none of OAK's setup before it.
+          said = await click({ surfaces, components: [{ id: 'hooks', state: 'after-cli' }], upToDate: false }, yours);
+          assert.ok(said.includes(`left to you: ${repair}`), said);
+          said = await click(current, yours);
+          assert.ok(said.includes(`left to you: ${repair}`), said);
+          assert.doesNotMatch(said, /already current/, said);
+          // …and when that read fails, the plan from before the update names it.
+          said = await click(yours, null);
+          assert.ok(said.includes(`left to you: ${repair}`), said);
+          // No plan to read at all: `oak update` runs anyway, and says for itself what it could not do.
+          said = await click(null);
+          assert.deepEqual(calls(), ['update --json --here', 'version --json', 'update', 'update --json --here'], said);
+          // A failed update's reason is shown whole, however long: the notification wraps it.
+          const reason = `⚠ could not update ${['a', 'b', 'c'].map((m) => `machine ${m} (not reachable over ssh (me@${m}): ssh: connect to host ${m} port 22: No route to host)`).join('; ')} — see the table above.`;
+          said = await click(current, current, reason);
+          assert.ok(reason.length > 300, `control: longer than the 300 characters the reason was once cut to (${reason.length})`);
+          assert.ok(said.includes(`CLI: ${reason}`), said);
+          // One update at a time: a click while one runs, on either button, says so and starts nothing.
+          fake(current);
+          for (const f of [argvLog, ran]) fs.rmSync(f, { force: true });
+          fs.writeFileSync(hold, '');
+          const infoBefore = infoMessages.length, channel = core.getUpdateChannel();
+          const first = commands['claudeObservatory.updateNow']();
+          for (const end = Date.now() + 10000; Date.now() < end && !calls().includes('update');) await new Promise((r) => setTimeout(r, 20));
+          assert.ok(calls().includes('update'), 'the first click is running its update');
+          // Raced against a few seconds, and the hold released either way: a second update would wait on it.
+          const more = Promise.all([commands['claudeObservatory.updateNow'](), commands['claudeObservatory.switchChannel'](channel === 'dev' ? 'stable' : 'dev')]);
+          const answered = await Promise.race([more.then(() => true), new Promise((r) => setTimeout(() => r(false), 5000))]);
+          fs.rmSync(hold);
+          await Promise.all([first, more]);
+          assert.ok(answered, 'the clicks while it runs answer at once');
+          assert.equal(infoMessages.slice(infoBefore).filter((m) => /an update is already running in this window/.test(m)).length, 2, infoMessages.slice(infoBefore).join('\n'));
+          assert.deepEqual(calls().filter((c) => /^update(?! --json)/.test(c)), ['update'], 'one `oak update`, however many clicks');
+          assert.equal(core.getUpdateChannel(), channel, 'the refused switch changed nothing');
+          // The update is over when its work is, not when its Reload Window notification is answered: VS Code
+          // settles that only on a click or a dismissal, and a toast that timed out into the Notification
+          // Center is never either. Here a newer .vsix installs, and the notification is left unanswered.
+          const offline = https.get, realInfo = vscode.window.showInformationMessage, unanswered = [];
+          const vsix = Buffer.from('fake vsix bytes'), digest = 'sha256:' + require('crypto').createHash('sha256').update(vsix).digest('hex');
+          https.get = (url, opts, cb) => {
+            const req = new (require('events'))(); req.setTimeout = () => req; req.destroy = () => {};
+            process.nextTick(() => {
+              const res = new (require('stream').PassThrough)(); res.statusCode = 200; res.headers = {};
+              cb(res);
+              res.end(String(url).includes('api.github.com')
+                ? JSON.stringify([{ tag_name: 'v9.9.10', prerelease: false, assets: [{ name: 'oak-observatory-vscode-v9.9.10.vsix', browser_download_url: 'https://example.invalid/oak.vsix', digest }] }])
+                : vsix);
+            });
+            return req;
+          };
+          vscode.window.showInformationMessage = (m, ...rest) => {
+            infoMessages.push(String(m));
+            if (!actionsOf(rest).length) return Promise.resolve(undefined);
+            unanswered.push(String(m));
+            return new Promise(() => {});
+          };
+          try {
+            fake(current);
+            for (const f of [argvLog, ran]) fs.rmSync(f, { force: true });
+            const first = commands['claudeObservatory.updateNow']();
+            for (const end = Date.now() + 15000; Date.now() < end && !unanswered.length;) await new Promise((r) => setTimeout(r, 20));
+            assert.match(unanswered.join('\n'), /extension → 9\.9\.10/, 'the extension moved, and its Reload Window notification is up');
+            const said = infoMessages.length;
+            await commands['claudeObservatory.updateNow']();
+            assert.deepEqual(infoMessages.slice(said).filter((m) => /already running/.test(m)), [], 'a later click is not refused');
+            assert.deepEqual(calls().filter((c) => /^update(?! --json)/.test(c)), ['update', 'update'], 'it runs an update of its own');
+            assert.equal(await Promise.race([first.then(() => 'settled'), new Promise((r) => setTimeout(() => r('waiting'), 1000))]), 'settled', 'the first click is done');
+          } finally {
+            https.get = offline;
+            vscode.window.showInformationMessage = realInfo;
+          }
+          // An update that throws ends the same way: the next click runs one.
+          const realProgress = vscode.window.withProgress;
+          vscode.window.withProgress = () => Promise.reject(new Error('the progress task failed'));
+          try {
+            await assert.rejects(commands['claudeObservatory.updateNow'](), /the progress task failed/);
+          } finally {
+            vscode.window.withProgress = realProgress;
+          }
+          fake(current);
+          for (const f of [argvLog, ran]) fs.rmSync(f, { force: true });
+          const afterThrow = infoMessages.length;
+          await commands['claudeObservatory.updateNow']();
+          assert.deepEqual(infoMessages.slice(afterThrow).filter((m) => /already running/.test(m)), [], 'a click after an update that threw is not refused');
+          assert.deepEqual(calls().filter((c) => /^update(?! --json)/.test(c)), ['update'], 'it runs an update');
+        } finally {
+          for (const f of [hold, ran]) fs.rmSync(f, { force: true });
+          https.get = realGet;
+          process.env.CLAUDE_OBSERVATORY_BIN = TREE_OAK;
+        }
+      }
+
       // ---- 0.10.0: the grouped left nav, EXECUTED both ways -----------------------------------------
       // Five tabs or two group tabs of side-by-side columns, decided by one persisted value. Asserted by
       // running the shipped script rather than by reading its source: the hazard here is a column whose
@@ -2140,6 +2545,47 @@ test('extension: three views, click commands, inline annotations, chat, status s
         sessions: { active: OVSESS, sessions: [{ id: OVSESS, title: 'the reviewed session', lastActiveMs: Date.now(), current: true, edits: 1, pending: 1, files: 1, added: 3, removed: 1, tokens: 900, durationMs: 5000, model: '', effort: '' }] },
       });
       const shells = { processes: [{ id: 'bash_9', command: 'npm test', description: 'npm test', running: true, runtimeMs: 1000, outputBytes: 12 }], summary: { total: 1, running: 1, failed: 0 } };
+      if (process.platform !== 'win32') {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-dashboard-processes-'));
+        const fx = require('../../../test/fixtures/process-dashboard.cjs').processDashboard(dir);
+        try {
+          for (const machine of ['', 'build-box']) for (const groupedNav of [false, true]) {
+            const ov = runOverview({ groupedNav, activeOnly: false });
+            const host = ov.elFor(groupedNav ? 'ov-g-processes' : 'ov-processes');
+            const read = session => JSON.parse(require('node:child_process').execFileSync(fx.oak,
+              ['views', '--views', 'processes', '--json', '--session', session, ...(machine ? ['--machine', machine] : ['--root', fx.local.work])],
+              { env: { ...fx.env, OAK_MACHINE_TIMEOUT_MS: '45000' }, encoding: 'utf8', timeout: 10000 })).processes;
+            const start = performance.now();
+            const pr = read('parent');
+            ov.post({ ...ovPayload(pr), session: 'parent', machine });
+            const elapsed = performance.now() - start;
+            assert.equal(pr.processes.length, 1000);
+            assert.equal((host.innerHTML.match(/data-proc=/g) || []).length, 1000);
+            assert.ok(elapsed < 5000, `VS Code refresh took ${elapsed} ms`);
+            console.log(`VS Code ${machine || 'local'} ${groupedNav ? 'grouped' : 'tabs'} 1,000-shell read + render: ${elapsed.toFixed(2)} ms`);
+            const tabs = ov.elFor(groupedNav ? 'ov-group-all' : 'ov-navtabs').innerHTML;
+            const order = groupedNav ? [...tabs.matchAll(/id="ov-gc-([^" ]+)"/g)].map(m => m[1]) : [...tabs.matchAll(/data-nav="([^" ]+)"/g)].map(m => m[1]);
+            assert.deepEqual(order, ['sessions', 'fleet', 'processes', 'tasks', 'workflows']);
+            // Wire and click actual rendered process rows, including the finished worker.
+            let nodes = [];
+            host.querySelectorAll = selector => selector === '.mt-proc' ? (nodes = [...host.innerHTML.matchAll(/data-proc="([^" ]+)"/g)].map(m => {
+              const node = mkEl(); node.getAttribute = () => m[1]; return node;
+            })) : [];
+            ov.post({ ...ovPayload(pr), session: 'parent', machine });
+            for (const id of ['shell-0', 'worker:shell-999']) {
+              ov.fire(nodes.find(n => n.getAttribute() === id), 'click');
+              assert.deepEqual(ov.posts.at(-1), { type: 'feed', kind: 'process', id, label: '' });
+            }
+            ov.post({ ...ovPayload(read('empty')), session: 'empty', machine });
+            assert.match(host.innerHTML, /No shells in this session/);
+            const cx = read('codex-shell');
+            ov.post({ ...ovPayload(cx), session: 'codex-shell', machine });
+            assert.match(host.innerHTML, /data-proc="codex-123"/);
+            assert.match(host.innerHTML, new RegExp(`${machine ? 'remote' : 'local'}-codex`));
+          }
+          assert.match(fs.readFileSync(fx.log, 'utf8'), /views/);
+        } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+      }
       // Solo mode is the control: the same payload, five member tabs, no group tab anywhere.
       solo.post(ovPayload(shells));
       const soloTabs = elFor('ov-navtabs').innerHTML;
@@ -2158,19 +2604,47 @@ test('extension: three views, click commands, inline annotations, chat, status s
       };
       solo.post({ type: 'sessions', sessions: workspacePayload });
       const workspaceHtml = elFor('ov-sessions').innerHTML;
-      assert.ok(workspaceHtml.indexOf('~/projects/app · 2 sessions') < workspaceHtml.indexOf('~/projects/tools · 2 sessions'));
+      assert.doesNotMatch(workspaceHtml, /mt-workspace/, 'workspace grouping cannot override recency');
       assert.match(workspaceHtml, /0 edits · 0 tok · 0s/);
       assert.match(workspaceHtml, /Native Codex title/);
-      assert.match(workspaceHtml, /1 older sessions/);
-      assert.match(workspaceHtml, /1 hidden by Active only/);
-      assert.doesNotMatch(workspaceHtml, /data-sess-switch="older-local"|data-sess-switch="quiet-local"|on build-box|mt-machine/);
+      assert.match(workspaceHtml, /data-sess-switch="older-local"/);
+      assert.match(workspaceHtml, /1 hidden by the search\/filter/);
+      assert.doesNotMatch(workspaceHtml, /data-sess-switch="quiet-local"|on build-box|mt-machine/);
       for (const attr of ['data-sess-switch', 'data-conversation', 'data-sess-del'])
         assert.match(workspaceHtml, new RegExp(attr+'="other-local"'), 'row actions survive grouping');
-      assert.match(elFor('ov-navtabs').innerHTML, /2\/4/);
+      assert.match(elFor('ov-navtabs').innerHTML, /3\/4/);
       const allSessions = runOverview({ activeOnly: false });
       allSessions.post({ type: 'sessions', sessions: workspacePayload });
       assert.match(allSessions.elFor('ov-sessions').innerHTML, /data-sess-switch="quiet-local"/);
       assert.doesNotMatch(allSessions.elFor('ov-sessions').innerHTML, /hidden by Active only/);
+      // Every saved machine's sessions after this machine's, each under its label with when it was read, or why it could
+      // not be; the list asks for them as it draws, and a row reviews (or resolves) that session there.
+      {
+        const ov = runOverview({ activeOnly: false });
+        ov.post({ type: 'sessions', sessions: workspacePayload });
+        assert.ok(ov.posts.some((m) => m.type === 'wantSaved'), 'asked for as the list draws');
+        const now = Date.now(), hms = (t) => new Date(t).toTimeString().slice(0, 8);
+        ov.post({ type: 'saved', error: null, machines: [
+          { label: 'lab-a', readAt: now, error: null, reading: true, listing: { fromIndex: false, sessions: [{ id: 'ra-1', title: 'Tidy the remote lexer', lastActiveMs: now, pending: 2, current: true }] } },
+          { label: 'lab-b', readAt: now - 1000, error: 'ssh: connect to host lab-b port 22: Connection refused', reading: false, listing: null },
+          { label: 'lab-c', readAt: null, error: null, reading: true, listing: null },
+          { label: 'lab-d', readAt: now, error: null, reading: false, listing: { fromIndex: true, syncedAt: now - 2000, sessions: [] } }] });
+        const h = ov.elFor('ov-sessions').innerHTML;
+        assert.ok(h.indexOf('data-sess-switch="other-local"') >= 0 && h.indexOf('data-rsid="ra-1"') < h.indexOf('data-sess-switch="other-local"'), 'newest across machines');
+        assert.ok(h.includes(`lab-a · read ${hms(now)} (1) · reading again…<`), 'under its label, with when it was read');
+        assert.match(h, /data-rsid="ra-1" data-rmach="lab-a"/);
+        assert.match(h, /on lab-a<\/span>.*<span class="mt-pend">2 pending/);
+        assert.match(h, /data-rresolve="ra-1" data-rmach="lab-a"/);
+        assert.ok(h.includes(`lab-b · could not list sessions — ssh: connect to host lab-b port 22: Connection refused · last read ${hms(now - 1000)}`), 'why, and when it last was');
+        assert.match(h, /lab-c · has not answered yet/);
+        assert.ok(h.includes(`lab-d · from its records, synced ${hms(now - 2000)} (0)`) && h.includes('no sessions'));
+        // Under review there: its row says so, and the label names the machine.
+        ov.post({ ...ovPayload(shells), session: 'ra-1', sessionTitle: 'Tidy the remote lexer', pinned: '', machine: 'lab-a', sessions: workspacePayload });
+        assert.match(ov.elFor('ov-sessions').innerHTML, /class="mt-trow sel" data-rsid="ra-1"[^>]*· the session you are reviewing/);
+        assert.equal(ov.elFor('ov-sess-label').textContent, '🔬 Tidy the remote lexer · on lab-a');
+        ov.post({ type: 'saved', error: 'herdr could not read its machines', machines: [] });
+        assert.match(ov.elFor('ov-sessions').innerHTML, /could not read the saved machines — herdr could not read its machines/);
+      }
       // Every refresh tick posts a payload, and each one re-rendered the list. A payload that changes
       // nothing must leave the rendered rows alone: a rebuild between a click's press and its release
       // swallowed the click.
@@ -2208,9 +2682,10 @@ test('extension: three views, click commands, inline annotations, chat, status s
           const m = /^\[([\w-]+)\]$/.exec(sel);
           if (!m) return [];
           if (qsHtml !== sessHost.innerHTML) { qsHtml = sessHost.innerHTML; qsCache = {}; }
-          return qsCache[sel] || (qsCache[sel] = [...qsHtml.matchAll(new RegExp(m[1] + '="([^"]*)"', 'g'))].map((hit) => {
+          return qsCache[sel] || (qsCache[sel] = [...qsHtml.matchAll(/<[^>]+>/g)].filter(hit => hit[0].includes(m[1] + '="')).map((hit) => {
+            const attrs = Object.fromEntries([...hit[0].matchAll(/([\w-]+)="([^"]*)"/g)].map(a => [a[1], a[2]]));
             const node = mkEl();
-            node.getAttribute = (k) => (k === m[1] ? hit[1] : null);
+            node.getAttribute = (k) => attrs[k] ?? null;
             return node;
           }));
         };
@@ -2274,6 +2749,54 @@ test('extension: three views, click commands, inline annotations, chat, status s
       }
       solo.post(ovPayload(shells));
 
+      // ---- A session's workers still at it, grouped under its row as the terminal app's Observatory groups them: a
+      // summary counting them by state, closed until a click opens it; open, a group per state, those waiting on a
+      // person first, each worker its title and stats; a click on one reviews its session. A finished worker, which
+      // only an older listing would carry, is never drawn. The Sessions host above answers attribute selectors.
+      {
+        const sessHost = elFor('ov-sessions');
+        const W = 'wkSess01', ago = Date.now() - 3600000;
+        const worker = (agentId, title, phase) => ({ agentId, title, phase, model: 'Opus 5.5', edits: 3, pending: 1, added: 120, removed: 4, tokens: 1200000, lastActiveMs: Date.now() - 60000 });
+        solo.post({ type: 'sessions', sessions: { active: W, sessions: [
+          { id: W, workspace: '~/projects/app', title: 'Fan the review out', lastActiveMs: ago, edits: 9, tokens: 900, activeWorkers: [
+            { ...worker('a1', 'Review brain code', 'awaiting-permission'), phaseConfidence: 'heuristic' }, worker('a2', 'Review spine code', 'working'), worker('a3', 'Assess rendering', 'working'), worker('a9', 'Done already', 'done')] },
+          { id: 'quietOne', workspace: '~/projects/app', title: 'Quiet one', lastActiveMs: ago, activeWorkers: [] },
+        ] } });
+        let html = sessHost.innerHTML;
+        assert.match(html, /▸ 3 workers · <span class="mt-badge sm"[^>]*>2 working<\/span> <span class="mt-badge sm"[^>]*>1 blocked<\/span>/, 'closed: one summary row counting those still at it, in herdr\'s words');
+        assert.doesNotMatch(html, /Review brain code|Done already/, 'no worker row until it opens');
+        assert.match(html, /Fan the review out/, 'Active only keeps a session whose workers are at it, however quiet the session');
+        assert.doesNotMatch(html, /Quiet one/, 'control: a quiet session with none is hidden by Active only');
+        solo.fire(sessHost.querySelectorAll('[data-wk]')[0], 'click');
+        html = sessHost.innerHTML;
+        assert.match(html, /▾ 3 workers/, 'a click opens it');
+        const at = (text) => html.indexOf(text);
+        assert.ok(at('blocked</span> (1)') > 0 && at('blocked</span> (1)') < at('Review brain code') && at('Review brain code') < at('working</span> (2)')
+          && at('working</span> (2)') < at('Review spine code') && at('Review spine code') < at('Assess rendering'), 'those waiting on a person first, then those working');
+        assert.doesNotMatch(html, /Done already/, 'a finished worker is never drawn');
+        assert.match(html, /data-agent-row="a1"[^>]*><span class="mt-tg"><span class="mt-badge sm"[^>]* title="inferred[^"]*">~blocked<\/span>/, 'an inferred wait wears the Workers tab\'s ~');
+        assert.match(html, /data-agent-row="a2"[^>]*><span class="mt-tg"><span class="mt-badge sm" style="[^"]*">working<\/span>/, 'control: a stated phase does not');
+        assert.match(html, /data-sess-switch="wkSess01" data-agent-row="a2"[^>]*>.*?Review spine code.*?Opus 5\.5.*?\+120.*?−4.*?1 pending<\/span> · 3 edits · 1\.2M tok/, 'a worker row: its title, model, lines and counts');
+        const rows = sessHost.querySelectorAll('[data-agent-row]');
+        assert.deepEqual(rows.map((n) => n.getAttribute('data-agent-row')), ['a1', 'a2', 'a3']);
+        solo.posts.length = 0;
+        const reviews = sessHost.querySelectorAll('[data-sess-switch]').filter((n) => n.getAttribute('data-sess-switch') === W);
+        solo.fire(reviews[reviews.length - 1], 'click');
+        assert.deepEqual(solo.posts.filter((m) => m.type === 'feed'), [{ type: 'feed', kind: 'agent', id: 'a3', label: 'Assess rendering', session: W }], 'a worker click opens its own live log with its parent session');
+        assert.equal(solo.posts.filter((m) => m.type === 'switchToSession').length, 0);
+        solo.fire(sessHost.querySelectorAll('[data-wk]')[0], 'click');
+        assert.match(sessHost.innerHTML, /▸ 3 workers/, 'a second click closes it');
+        assert.doesNotMatch(sessHost.innerHTML, /Review brain code/);
+        solo.post({ type: 'sessions', sessions: { sessions: [], machines: [{ label: 'build-box', host: 'bbbbbbbbbbbb', sessions: [
+          { id: W, title: 'Remote parent', activeWorkers: [{ agentId: 'a3', title: 'Remote worker', phase: 'working' }] },
+        ] }] } });
+        solo.fire(sessHost.querySelectorAll('[data-wk]')[0], 'click');
+        solo.posts.length = 0;
+        solo.fire(sessHost.querySelectorAll('[data-sess-switch]')[0], 'click');
+        assert.deepEqual(solo.posts.filter(m => m.type === 'feed'), [{ type: 'feed', kind: 'agent', id: 'a3', label: 'Remote worker', session: W, machine: 'build-box' }]);
+      }
+      solo.post(ovPayload(shells));
+
 
       // The harness DOM mints elements on demand (getElementById never fails here), so the one
       // thing it can NOT catch is a missing container in the real page — which is exactly how
@@ -2282,6 +2805,13 @@ test('extension: three views, click commands, inline annotations, chat, status s
       assert.ok(cmView.webview.html.includes('id="ov-group-all"'), 'the page ships the one-group container the script renders into');
       assert.ok(!cmView.webview.html.includes('id="ov-group-sf"') && !cmView.webview.html.includes('id="ov-group-wtp"'),
         'and the two-group era containers are gone');
+      const visibilityGroup = runOverview({ groupedNav: true });
+      visibilityGroup.post({ type: 'overview', mt: { agents: [] } });
+      assert.equal(visibilityGroup.posts.filter(m => m.type === 'workersVisible').at(-1).visible, true, 'a grouped Workers column is visible');
+      visibilityGroup.fire(visibilityGroup.elFor('ov-cc-fleet'), 'click');
+      assert.equal(visibilityGroup.posts.filter(m => m.type === 'workersVisible').at(-1).visible, false, 'a folded Workers column stops requesting Workers');
+      visibilityGroup.fire(visibilityGroup.elFor('ov-cc-fleet'), 'click');
+      assert.equal(visibilityGroup.posts.filter(m => m.type === 'workersVisible').at(-1).visible, true);
       const grouped = runOverview({ groupedNav: true });
       // pr:null on the FIRST payload — an older CLI, or the answer not back yet. The Processes column must
       // still be there (a tab that vanishes when the CLI cannot answer hides the failure), badge blank.
@@ -2289,10 +2819,10 @@ test('extension: three views, click commands, inline annotations, chat, status s
       const gTabs = grouped.elFor('ov-navtabs').innerHTML;
       // ONE group: every member side by side, never split into two tabs.
       assert.equal((gTabs.match(/class="ov-tab/g) || []).length, 1, 'grouped: exactly one tab');
-      assert.ok(gTabs.includes('>Sessions · Workers · Workflows · Tasks · Processes<'), 'named for all five members');
+      assert.ok(gTabs.includes('>Sessions · Workers · Processes · Tasks · Workflows<'), 'named for all five members');
       const wtp = grouped.elFor('ov-group-all').innerHTML;
       assert.equal((wtp.match(/class="ov-groupcol"/g) || []).length, 5, 'the one group renders FIVE columns');
-      for (const k of ['sessions', 'fleet', 'workflows', 'tasks', 'processes'])
+      for (const k of ['sessions', 'fleet', 'processes', 'tasks', 'workflows'])
         assert.ok(wtp.includes(`id="ov-g-${k}"`), `the ${k} column carries its own list node`);
       assert.equal(grouped.elFor('ov-gb-processes').textContent, '', 'with no shells payload the Processes badge is blank — the column is not');
       // The member lists are RENDERED INTO those columns — one renderer per member, writing wherever the
@@ -2301,6 +2831,30 @@ test('extension: three views, click commands, inline annotations, chat, status s
       assert.match(grouped.elFor('ov-g-tasks').innerHTML, /the planned task/, 'the Tasks column holds the task list');
       assert.match(grouped.elFor('ov-g-sessions').innerHTML, /the reviewed session/, 'the Sessions column holds the session list');
       assert.match(grouped.elFor('ov-g-fleet').innerHTML, /repo/, 'the Fleet column holds the agent list');
+      // The agents OAK started from a brief, above the sessions in Workers: OAK's state, since when, the error a turn
+      // stopped on, its machine and tab, and its workers (multitask's `delegated`).
+      assert.doesNotMatch(grouped.elFor('ov-g-fleet').innerHTML, /Agents started from a brief/, 'none started: nothing drawn');
+      const withDelegated = ovPayload(shells);
+      withDelegated.mt = { ...withDelegated.mt, delegated: [
+        { id: 'fix1', title: 'Fix the parser', kind: 'claude', model: 'Opus 5.5', effort: 'xhigh', machine: null, tab: 't1', state: 'working', since: Date.now(), tokens: 125000, cost: 1.5,
+          workers: [{ id: 'w1', title: 'map the lexer', state: 'working', model: 'Sonnet' }] },
+        { id: 'port2', remoteId: 'port2', title: 'Port the lexer', kind: 'codex', machine: 'build-box', tab: 'rt1', state: 'errored', since: Date.now(),
+          error: 'Selected model is at capacity. Please try a different model.', workers: [] },
+      ] };
+      withDelegated.mt.delegated[1].worktree = { state: { files: 3, added: 120, removed: 8, merged: false } };
+      grouped.post(withDelegated);
+      const fleetHtml = grouped.elFor('ov-g-fleet').innerHTML;
+      assert.match(fleetHtml, /Agents started from a brief · 2/);
+      assert.match(fleetHtml, /3 files · \+120 −8 · not merged/);
+      assert.match(fleetHtml, />working<\/span><span class="mt-st">fix1<span class="mt-sd">Fix the parser<\/span><\/span><span class="mt-meta sm">since \d\d:\d\d:\d\d · claude · Opus 5\.5 xhigh · this machine · tab fix1 · 125k tok · \$1\.50<\/span>/);
+      assert.match(fleetHtml, /└ map the lexer<\/span><span class="mt-meta sm">working · Sonnet/);
+      assert.match(fleetHtml, />errored<\/span>.*on build-box · tab port2.*Selected model is at capacity/);
+      assert.ok(fleetHtml.indexOf('Agents started from a brief') < fleetHtml.indexOf('repo'), 'above the sessions');
+      grouped.post({ ...withDelegated, mt: { ...withDelegated.mt, delegated: [
+        { id: 'q1', title: 'Queued job', kind: 'codex', state: 'queued', since: Date.now(), after: ['fix1', 'port2'], workers: [] },
+      ] } });
+      assert.match(grouped.elFor('ov-g-fleet').innerHTML, />queued<.*waiting on fix1, port2/);
+      grouped.post(ovPayload(shells));
       // …and the badge fills in the moment the payload arrives, without the columns being rebuilt.
       grouped.post(ovPayload(shells));
       assert.equal(grouped.elFor('ov-gb-processes').textContent, '1/1', 'the Processes badge appears once the CLI answers');
@@ -2321,30 +2875,30 @@ test('extension: three views, click commands, inline annotations, chat, status s
       // ---- 0.10.0: the COLUMNS inside a group are the reader's to size and to fold -----------------
       // Equal to start, dragged on the divider between a pair, and never past the floor that keeps a
       // name readable — this product wraps or tooltips, it does not clip.
-      assert.equal(grouped.elFor('ov-gc-workflows').style['--ov-cw'], '1', 'columns start on an equal share');
+      assert.equal(grouped.elFor('ov-gc-fleet').style['--ov-cw'], '1', 'columns start on an equal share');
       const ovDrag = (gutterId, clientX) => {
         const g = grouped.elFor(gutterId);
         grouped.fire(g, 'pointerdown', { preventDefault() {}, pointerId: 1, clientX });
         grouped.fire(g, 'pointermove', { clientX });
         grouped.fire(g, 'pointerup', {});
       };
-      ovDrag('ov-cg-tasks', 100000); // drag the Workflows|Tasks divider as far right as it goes
-      const wW = Number(grouped.elFor('ov-gc-workflows').style['--ov-cw']);
-      const wT = Number(grouped.elFor('ov-gc-tasks').style['--ov-cw']);
+      ovDrag('ov-cg-processes', 100000); // drag the Workflows|Tasks divider as far right as it goes
+      const wW = Number(grouped.elFor('ov-gc-fleet').style['--ov-cw']);
+      const wT = Number(grouped.elFor('ov-gc-processes').style['--ov-cw']);
       assert.ok(wW > 1 && wT < 1, 'the drag moved the split');
       assert.ok(Math.abs(wW + wT - 2) < 1e-9, '…without changing the pair’s combined share');
       // The pair spans 600px in the stub and the floor is 150px, so neither side may end below 150/600
       // of their combined share. A missing clamp puts the shrinking column at zero.
       assert.ok(wT >= 2 * (150 / 600) - 1e-9, 'and the shrinking column stopped at the 150px floor, never at zero');
-      assert.equal(grouped.elFor('ov-gc-processes').style['--ov-cw'], '1', 'the third column is untouched by a drag between the other two');
+      assert.equal(grouped.elFor('ov-gc-tasks').style['--ov-cw'], '1', 'the third column is untouched by a drag between the other two');
       // The trap: the Processes column is ALWAYS present and its badge arrives on a later payload. That
       // payload must not reset a width (or a fold) the reader set seconds earlier.
       grouped.post(ovPayload(shells));
-      assert.equal(Number(grouped.elFor('ov-gc-workflows').style['--ov-cw']), wW, 'a later payload leaves the dragged width alone');
-      assert.equal(Number(grouped.elFor('ov-gc-tasks').style['--ov-cw']), wT, '…on both sides of the divider');
+      assert.equal(Number(grouped.elFor('ov-gc-fleet').style['--ov-cw']), wW, 'a later payload leaves the dragged width alone');
+      assert.equal(Number(grouped.elFor('ov-gc-processes').style['--ov-cw']), wT, '…on both sides of the divider');
       assert.equal(grouped.elFor('ov-gb-processes').textContent, '1/1', 'while the badge it carried still lands');
       assert.deepEqual(grouped.saved[grouped.saved.length - 1].colW.all.map((n) => Math.round(n * 1000)),
-        [1000, 1000, Math.round(wW * 1000), Math.round(wT * 1000), 1000], 'the widths are persisted on pointer-up');
+        [1000, Math.round(wW * 1000), Math.round(wT * 1000), 1000, 1000], 'the widths are persisted on pointer-up');
       // FOLDING a column: a rail that still names itself, and a group that always keeps one open.
       grouped.fire(grouped.elFor('ov-cc-tasks'), 'click');
       const wtpFolded = grouped.elFor('ov-group-all').innerHTML;
@@ -2357,14 +2911,14 @@ test('extension: three views, click commands, inline annotations, chat, status s
       assert.equal((wtpFolded.match(/class="ov-groupcol"/g) || []).length, 4, 'four columns remain expanded');
       grouped.fire(grouped.elFor('ov-cc-processes'), 'click');
       grouped.fire(grouped.elFor('ov-cc-sessions'), 'click');
-      grouped.fire(grouped.elFor('ov-cc-fleet'), 'click');
+      grouped.fire(grouped.elFor('ov-cc-workflows'), 'click');
       assert.equal((grouped.elFor('ov-group-all').innerHTML.match(/class="ov-groupcol"/g) || []).length, 1, 'and then one');
-      assert.ok(!grouped.elFor('ov-group-all').innerHTML.includes('id="ov-cc-workflows"'), 'the last expanded column offers no fold button');
-      grouped.fire(grouped.elFor('ov-cc-workflows'), 'click'); // a click that raced the repaint
+      assert.ok(!grouped.elFor('ov-group-all').innerHTML.includes('id="ov-cc-fleet"'), 'the last expanded column offers no fold button');
+      grouped.fire(grouped.elFor('ov-cc-fleet'), 'click'); // a click that raced the repaint
       assert.equal((grouped.elFor('ov-group-all').innerHTML.match(/class="ov-groupcol"/g) || []).length, 1,
         'and folding it is refused — a group with every column folded is an empty pane');
       assert.ok(grouped.saved[grouped.saved.length - 1].colC.tasks, 'the folded set is persisted');
-      assert.ok(!grouped.saved[grouped.saved.length - 1].colC.workflows, '…and the refused fold is not in it');
+      assert.ok(!grouped.saved[grouped.saved.length - 1].colC.fleet, '…and the refused fold is not in it');
       // A later payload must not un-fold anything either.
       grouped.post(ovPayload(shells));
       assert.equal((grouped.elFor('ov-group-all').innerHTML.match(/class="ov-groupcol"/g) || []).length, 1,
@@ -2374,16 +2928,16 @@ test('extension: three views, click commands, inline annotations, chat, status s
       assert.ok(Math.abs(wT - 1) > 0.01, 'the dragged weight is distinguishable from an equal share');
       grouped.fire(grouped.elFor('ov-cc-tasks'), 'click');
       assert.equal((grouped.elFor('ov-group-all').innerHTML.match(/class="ov-groupcol"/g) || []).length, 2, 'clicking a rail brings the column back');
-      assert.equal(Number(grouped.elFor('ov-gc-tasks').style['--ov-cw']), wT, '…at the width it had before it folded');
+      assert.equal(Number(grouped.elFor('ov-gc-tasks').style['--ov-cw']), 1, '…at the width it had before it folded');
       // Double-click is the way back from a bad drag.
       grouped.fire(grouped.elFor('ov-cg-tasks'), 'dblclick', {});
-      assert.equal(Number(grouped.elFor('ov-gc-workflows').style['--ov-cw']), 1, 'double-click splits that pair evenly again');
-      assert.equal(Number(grouped.elFor('ov-gc-tasks').style['--ov-cw']), 1, '…on both sides');
+      assert.equal(Number(grouped.elFor('ov-gc-fleet').style['--ov-cw']), (wW + 1) / 2, 'double-click splits that pair evenly again');
+      assert.equal(Number(grouped.elFor('ov-gc-tasks').style['--ov-cw']), (wW + 1) / 2, '…on both sides');
       // And a reload comes back on the layout that was persisted.
-      const reloaded = runOverview({ groupedNav: true, colC: { processes: 1 }, colW: { all: [1, 1, 1.7, 0.3, 1] } });
+      const reloaded = runOverview({ groupedNav: true, colC: { processes: 1 }, colW: { all: [1, 1.7, 0.3, 1, 1] } });
       reloaded.post(ovPayload(shells));
       assert.match(reloaded.elFor('ov-group-all').innerHTML, /class="ov-groupcol rail" id="ov-gc-processes"/, 'a reload restores the folded column');
-      assert.equal(reloaded.elFor('ov-gc-workflows').style['--ov-cw'], '1.7', '…and the widths that went with it');
+      assert.equal(reloaded.elFor('ov-gc-fleet').style['--ov-cw'], '1.7', '…and the widths that went with it');
     }
     // 0.10.0: the Group-tabs toggle moved OUT of the top toolbar and onto the tab-strip row — the control
     // that rearranges the tabs belongs beside the tabs, not three rows away in a panel-wide toolbar.
@@ -2396,14 +2950,14 @@ test('extension: three views, click commands, inline annotations, chat, status s
       assert.ok(toolbarEnd > 0 && tabRow > toolbarEnd, 'the tab-strip row is below the toolbar');
       assert.ok(groupnav > tabRow && groupnav < ctl, 'the Group tabs toggle sits on that row, beside the tab strip');
       assert.ok(groupnav > toolbarEnd, '…and no longer inside the top toolbar');
-      assert.ok(html.includes('title="Show every tab side by side in one group (Sessions · Workers · Workflows · Tasks · Processes)"'),
+      assert.ok(html.includes('title="Show every tab side by side in one group (Sessions · Workers · Processes · Tasks · Workflows)"'),
         'with the one-group title');
       assert.match(html, /groupedNav:GROUPNAV/, 'and its persisted state key unchanged');
     }
     // The toggle itself, with the copy the plan fixed on — a title that stops naming what it groups is a
     // control nobody can find.
     assert.ok(cmView.webview.html.includes('id="ov-groupnav"'), 'the Overview toolbar carries the grouping toggle');
-    assert.ok(cmView.webview.html.includes('title="Show every tab side by side in one group (Sessions · Workers · Workflows · Tasks · Processes)"'),
+    assert.ok(cmView.webview.html.includes('title="Show every tab side by side in one group (Sessions · Workers · Processes · Tasks · Workflows)"'),
       'and says exactly what it does');
     assert.ok(/id="ov-groupnav"[^>]*codicon-split-horizontal|codicon-split-horizontal/.test(cmView.webview.html), 'with the split-horizontal codicon');
     assert.match(fs.readFileSync(path.resolve(__dirname, '../src/codicon.ts'), 'utf8'), /codicon-split-horizontal:before/,
@@ -2652,11 +3206,12 @@ test('extension: three views, click commands, inline annotations, chat, status s
     assert.ok(fs.existsSync(path.join(home, '.claude', 'claude-observatory', 'remote-cache', 'session-titles.json.kick')),
       'the status-bar poll claims a Remote Control titles refresh');
 
-    // --- the usage readout: 5h · wk · mo, the PER-MODEL weekly cap in the tooltip only -------------
+    // --- the usage readout: wk · mo, the PER-MODEL weekly cap in the tooltip only -------------------
     // The account's scoped cap (its "Fable" row) is detail, not a window of the bar:
-    // the status bar shows the three windows the TUI's one-line readout shows, and the cap stays named
+    // the status bar shows the two windows the TUI's one-line readout shows, and the cap stays named
     // in the tooltip, after the week it narrows, as it is in the Stats panel. The week keeps its own
-    // countdown whether or not the cap reports the same reset.
+    // countdown whether or not the cap reports the same reset. No bar shows the 5-hour window, in its text
+    // or its tooltip; the Stats panel does.
     {
       const cache = path.join(home, '.claude', 'statusline-last.json');
       const sec = Math.floor(Date.now() / 1000);
@@ -2673,30 +3228,451 @@ test('extension: three views, click commands, inline annotations, chat, status s
           fable_pct: 93, fable_reset: fableReset, fable_label: 'Fable',
         }));
         await commands['claudeObservatory.usageRefresh']();
-        const five = visibleUsage('5h'), wk = visibleUsage('wk'), mo = visibleUsage('mo');
-        assert.ok(five && wk && mo, 'control: the claude windows render from this cache');
+        const wk = visibleUsage('wk'), mo = visibleUsage('mo');
+        assert.ok(wk && mo, 'control: the claude windows render from this cache');
         assert.ok(!statusBarItems.some((i) => i.visible && /Fable|93%/.test(i.text)), 'the per-model cap is not a status-bar window');
+        assert.ok(!statusBarItems.some((i) => i.visible && /^5h/.test(i.text)), 'nor is the 5-hour window, which this cache has (26%)');
         assert.match(wk.text, /^wk: 77% \d+d \d+h$/, 'the week keeps its own countdown');
-        assert.match(five.text, /^5h: 26% \d+/, 'a window with its own reset keeps its countdown');
-        assert.equal(claudeSlots().length, 4, 'the icon and THREE windows, with no slot for the cap');
+        assert.equal(claudeSlots().length, 3, 'the icon and TWO windows, with no slot for the 5h or the cap');
         assert.deepEqual(claudeSlots().filter((i) => i.visible).map((i) => i.text.replace(/:.*$/, '')),
-          ['\u2733', '5h', 'wk', 'mo'], 'left to right: the claude icon, then 5h · wk · mo');
-        for (const item of [five, wk, mo]) {
+          ['\u2733', 'wk', 'mo'], 'left to right: the claude icon, then wk · mo');
+        for (const item of [wk, mo]) {
           assert.match(String(item.tooltip), /\nwk 77% · resets in \d+d \d+h\nFable 93% · resets in \d+d \d+h\nmo 18% /,
             'the tooltip still names the cap and its reset, after the week it narrows');
+          assert.doesNotMatch(String(item.tooltip), /\n5h /, 'and gives no 5h line');
         }
       }
-      // An account that reports no scoped cap: the same three windows, and no cap line in the tooltip.
+      // An account that reports no scoped cap: the same two windows, and no cap line in the tooltip.
       fs.writeFileSync(cache, JSON.stringify({ five_pct: 26, five_reset: sec + 3600, week_pct: 77, week_reset: weekReset, ...month }));
       await commands['claudeObservatory.usageRefresh']();
       assert.match(visibleUsage('wk').text, /^wk: 77% \d+d \d+h$/, 'the week retains its countdown without a cap');
       assert.ok(visibleUsage('mo'), 'control: the month still renders');
       assert.doesNotMatch(String(visibleUsage('wk').tooltip), /Fable/, 'no cap reported, no cap line in the tooltip');
-      // A quota-less plan (Enterprise/API) reports no window at all: the month slot carries the spend.
+      assert.match(visibleUsage('mo').text, /^mo: 18% \d+d \d+h$/, 'no dollar reading: the month ends at its reset, with no figure');
+      assert.doesNotMatch(String(visibleUsage('mo').tooltip), /\$/, 'and the tooltip names no spend');
+      // The month ends with its dollar figure, after the reset (2026-11-03), written as the Claude Code status line writes
+      // it. On a subscription it is the estimate at today's list prices (~), even with a reported spend on record.
+      fs.writeFileSync(cache, JSON.stringify({ week_pct: 77, week_reset: weekReset, ...month, month_cost: 10_040, month_spend: 12.5 }));
+      await commands['claudeObservatory.usageRefresh']();
+      assert.match(visibleUsage('mo').text, /^mo: 18% \d+d \d+h ~\$10\.0k$/, 'a subscription: the estimate, after the reset');
+      assert.match(String(visibleUsage('mo').tooltip), /\nmo ~\$10\.0k spent, estimated at today\u2019s API list prices/,
+        'the tooltip says it is an estimate');
+      // A quota-less plan (Enterprise/API) reports no window at all: the month slot carries the figure. With no spend on
+      // record it is the estimate.
       fs.writeFileSync(cache, JSON.stringify({ month_cost: 42.5 }));
       await commands['claudeObservatory.usageRefresh']();
-      assert.deepEqual(claudeSlots().filter((i) => i.visible).map((i) => i.text), ['\u2733', 'mo: ~$42.5'],
+      assert.deepEqual(claudeSlots().filter((i) => i.visible).map((i) => i.text), ['\u2733', 'mo: ~$42'],
         'the spend takes the month slot and keeps the claude group visible');
+      // With the month's spend as Claude Code reported it, it is that charge, without the ~.
+      fs.writeFileSync(cache, JSON.stringify({ month_cost: 42.5, month_spend: 12.5 }));
+      await commands['claudeObservatory.usageRefresh']();
+      assert.deepEqual(claudeSlots().filter((i) => i.visible).map((i) => i.text), ['\u2733', 'mo: $12'],
+        'a pay-as-you-go plan: the charge Claude Code reported');
+      const apiMo = claudeSlots().filter((i) => i.visible)[1];
+      assert.match(String(apiMo.tooltip), /\nmo \$12 spent, as Claude Code reported it/, 'the tooltip names it a charge');
+      assert.doesNotMatch(String(apiMo.tooltip), /estimated/, 'not an estimate');
+      // Both bill cycles just rolled over with nothing run since: the month refresh wrote the cycle measured
+      // at 0 beside its budget and reset, and GPT's last turn sits in the old cycle, its week still live and
+      // its budget remembered. A measured 0 is a 0% share, so Claude's month alone keeps its group (wk has
+      // nothing here) and GPT keeps its month. A month never measured still hides.
+      {
+        const d = new Date(), start = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1);
+        const rolloutFile = path.join(home, '.codex', 'sessions', 'rollout-month-rollover.jsonl');
+        const budget = path.join(home, '.claude', 'claude-observatory', 'gpt-week-budget.json');
+        const writeRollout = (weekPct) => fs.writeFileSync(rolloutFile, [
+          { type: 'session_meta', payload: { id: 'month-rollover', cwd: path.join(home, 'elsewhere'), model_provider: 'openai' } },
+          { type: 'turn_context', payload: { model: 'gpt-5.2' } },
+          { timestamp: new Date(start - 3600000).toISOString(), type: 'event_msg', payload: { type: 'token_count',
+            info: { total_token_usage: { input_tokens: 50000, output_tokens: 0 } },
+            rate_limits: { secondary: { used_percent: weekPct, window_minutes: 10080, resets_at: sec + 3 * 86400 } } } },
+        ].map((r) => JSON.stringify(r)).join('\n') + '\n');
+        const gptSlots = () => statusBarItems
+          .filter((i) => i.command === 'claudeObservatory.stats.focus' && i.priority < 4.6 && i.priority > 4.3)
+          .sort((a, b) => b.priority - a.priority);
+        const shown = (slots) => slots().filter((i) => i.visible).map((i) => i.text.replace(/%.*$/, '%'));
+        fs.mkdirSync(path.dirname(rolloutFile), { recursive: true });
+        fs.mkdirSync(path.dirname(budget), { recursive: true });
+        writeRollout(30);
+        fs.writeFileSync(budget, JSON.stringify({ weekTotal: 1_000_000, at: Date.now() }));
+        try {
+          fs.writeFileSync(cache, JSON.stringify({ v: 3, month_tok: 0, month_tok_total: 111_423_689,
+            month_reset: Math.floor(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1) / 1000) }));
+          await commands['claudeObservatory.usageRefresh']();
+          assert.deepEqual(shown(claudeSlots), ['\u2733', 'mo: 0%'], 'Claude: its month reads 0% and keeps the group');
+          assert.match(String(claudeSlots()[0].tooltip), /\nmo 0% \u00b7 resets in /, 'the Claude tooltip names the measured 0');
+          assert.deepEqual(shown(gptSlots), ['\u2b21', 'wk: 30%', 'mo: 0%'], 'GPT: its month reads 0%');
+          assert.match(String(gptSlots()[0].tooltip), /\nmo 0 (?:local )?tokens \u00b7 /, 'the GPT tooltip names the measured 0');
+          assert.ok(!gptSlots().some((i) => /\$/.test(i.text) || /\$/.test(String(i.tooltip))), 'no use priced this month: no GPT figure');
+          // Never measured: no Claude month and no GPT budget (no share to derive one from, none remembered).
+          fs.writeFileSync(cache, JSON.stringify({ v: 3 }));
+          fs.rmSync(budget, { force: true });
+          writeRollout(0);
+          await commands['claudeObservatory.usageRefresh']();
+          assert.deepEqual(shown(claudeSlots), [], 'a Claude month never measured shows nothing');
+          assert.deepEqual(shown(gptSlots), ['\u2b21', 'wk: 0%'], 'a GPT month with no budget hides');
+        } finally {
+          fs.rmSync(rolloutFile, { force: true });
+          fs.rmSync(budget, { force: true });
+        }
+      }
+      // GPT's month ends with its figure too. Codex reports no charge, so it is always the estimate at today's list
+      // prices (~): 8M input tokens of gpt-5.2 at $1.75/M.
+      {
+        const rolloutFile = path.join(home, '.codex', 'sessions', 'rollout-month-usd.jsonl');
+        const budget = path.join(home, '.claude', 'claude-observatory', 'gpt-week-budget.json');
+        const gptSlots = () => statusBarItems
+          .filter((i) => i.command === 'claudeObservatory.stats.focus' && i.priority < 4.6 && i.priority > 4.3)
+          .sort((a, b) => b.priority - a.priority);
+        fs.mkdirSync(path.dirname(rolloutFile), { recursive: true });
+        fs.writeFileSync(rolloutFile, [
+          { type: 'session_meta', payload: { id: 'month-usd', cwd: path.join(home, 'elsewhere'), model_provider: 'openai' } },
+          { type: 'turn_context', payload: { model: 'gpt-5.2' } },
+          { timestamp: new Date().toISOString(), type: 'event_msg', payload: { type: 'token_count',
+            info: { total_token_usage: { input_tokens: 8_000_000, output_tokens: 0 } },
+            rate_limits: { secondary: { used_percent: 30, window_minutes: 10080, resets_at: sec + 3 * 86400 } } } },
+        ].map((r) => JSON.stringify(r)).join('\n') + '\n');
+        fs.writeFileSync(budget, JSON.stringify({ weekTotal: 100_000_000, at: Date.now() }));
+        try {
+          await commands['claudeObservatory.usageRefresh']();
+          const mo = gptSlots().find((i) => i.visible && i.text.startsWith('mo: '));
+          assert.ok(mo, 'control: the GPT month renders');
+          assert.match(mo.text, /^mo: \d+% \S+ \S+ ~\$14$/, 'GPT: the estimate, after the reset');
+          assert.match(String(mo.tooltip), /\nmo ~\$14 spent, estimated at today’s API list prices/, 'the tooltip says it is an estimate');
+          await t.test('GPT status bar text and tooltip count the database union', async () => {
+            const remote = { usageRecords: 1, host: 'dddddddddddd', hosts: ['dddddddddddd'], at: Date.now(), cursor: 'bar:1:0', more: false,
+              messages: [{ message_id: 'codex:bar-remote', agent: 'codex', session_id: 'bar-remote', model: 'gpt-5.2', provider: 'openai',
+                ts: Date.now(), input: 8_000_000, output: 0, cache_create: 0, cache_read: 0 }], readings: [], accounts: [], spend: [], purged: [] };
+            assert.ok(core.indexApplyUsageRecords(remote, { label: 'build-box', skewMs: 0 }));
+            try {
+              await commands['claudeObservatory.usageRefresh']();
+              const union = gptSlots().find((i) => i.visible && i.text.startsWith('mo: '));
+              assert.match(union.text, /~\$28$/);
+              assert.match(String(union.tooltip), /estimates include usage measured on .*build-box/);
+              assert.doesNotMatch(String(union.tooltip), /local tokens|calendar month/);
+            } finally {
+              const db = core.openIndex();
+              if (db.ok) { db.db.prepare("DELETE FROM usage_messages WHERE message_id = 'codex:bar-remote'").run(); db.close(); }
+            }
+          });
+        } finally {
+          fs.rmSync(rolloutFile, { force: true });
+          fs.rmSync(budget, { force: true });
+        }
+      }
+      // Plans with a 5-hour limit, Claude's and GPT's: the bar and its tooltips show no 5h window (2026-11-03), and the
+      // Stats panel keeps its row. A window whose reset has passed with no newer one reported is over (2026-10-20): the
+      // Stats panel reads it 0% with no countdown, where Claude's keeps its budget and no cache reads, the ended
+      // window's. A GPT plan with no 5-hour window has no 5h row.
+      {
+        const rolloutFile = path.join(home, '.codex', 'sessions', 'rollout-ended-5h.jsonl');
+        const budget = path.join(home, '.claude', 'claude-observatory', 'gpt-week-budget.json');
+        const writeRollout = (primary) => fs.writeFileSync(rolloutFile, [
+          { type: 'session_meta', payload: { id: 'ended-5h', cwd: path.join(home, 'elsewhere'), model_provider: 'openai' } },
+          { type: 'turn_context', payload: { model: 'gpt-5.2' } },
+          { timestamp: new Date((sec - 7200) * 1000).toISOString(), type: 'event_msg', payload: { type: 'token_count',
+            info: { total_token_usage: { input_tokens: 50000, output_tokens: 0 } },
+            rate_limits: { ...(primary ? { primary } : {}), secondary: { used_percent: 30, window_minutes: 10080, resets_at: sec + 3 * 86400 } } } },
+        ].map((r) => JSON.stringify(r)).join('\n') + '\n');
+        const gptSlots = () => statusBarItems
+          .filter((i) => i.command === 'claudeObservatory.stats.focus' && i.priority < 4.6 && i.priority > 4.3)
+          .sort((a, b) => b.priority - a.priority);
+        const texts = (slots) => slots().filter((i) => i.visible).map((i) => i.text);
+        // What the Stats panel is posted now.
+        const posted = () => {
+          const before = stView.webview.postMessage, got = [];
+          stView.webview.postMessage = (m) => got.push(m);
+          try { stProvider.postUsage(); } finally { stView.webview.postMessage = before; }
+          return got.find((m) => m.type === 'usage').u;
+        };
+        fs.mkdirSync(path.dirname(rolloutFile), { recursive: true });
+        try {
+          fs.writeFileSync(cache, JSON.stringify({ v: 3, five_pct: 95, five_at: sec - 3 * 3600, five_reset: sec - 600, five_reads: 30_000_000,
+            five_total: 6_000_000, week_pct: 22, week_at: sec - 600, week_reset: weekReset }));
+          writeRollout({ used_percent: 40, window_minutes: 300, resets_at: sec - 600 });
+          await commands['claudeObservatory.usageRefresh']();
+          const pcts = (slots) => texts(slots).map((t) => t.replace(/%.*$/, '%'));
+          assert.deepEqual(pcts(claudeSlots).slice(0, 2), ['\u2733', 'wk: 22%'], 'Claude: the bar has no 5h slot');
+          assert.deepEqual(pcts(gptSlots).slice(0, 2), ['\u2b21', 'wk: 30%'], 'nor has GPT');
+          assert.ok(![...texts(claudeSlots), ...texts(gptSlots)].some((t) => t.startsWith('5h')), 'anywhere on the bar');
+          assert.match(String(gptSlots()[0].tooltip), /\nwk 30% \u00b7 resets in /, 'control: the GPT tooltip gives the week');
+          for (const slot of [...claudeSlots(), ...gptSlots()]) assert.doesNotMatch(String(slot.tooltip), /\n5h /, 'and no tooltip a 5h line');
+          const u = posted();
+          assert.deepStrictEqual([u.fiveHourPct, u.fiveReset, u.fiveReads, u.gptFivePct, u.gptFiveReset], [0, null, null, 0, null], 'the Stats post: 0, no reset, no reads');
+          assert.deepEqual(usageRow('claude', u)('5h'), ['0%', '', '~0', '6M', '', ''], 'Claude\'s 5h row: ~0 against its budget, no reads, no countdown');
+          assert.deepEqual(usageRow('gpt', u)('5h'), ['0%', '', '~0', '', '', ''], 'GPT\'s 5h row stays, at 0% (~0) with no countdown');
+          // Older Codex gives the reset as the seconds left (`resets_in_seconds`), counted from the reading, two hours ago.
+          for (const [left, five] of [[600, [0, null]], [4 * 3600, [40, (sec + 7200) * 1000]]]) {
+            writeRollout({ used_percent: 40, window_minutes: 300, resets_in_seconds: left });
+            await commands['claudeObservatory.usageRefresh']();
+            const p = posted();
+            assert.deepStrictEqual([p.gptFivePct, p.gptFiveReset], five, `${left} s left at the reading: the Stats post`);
+            assert.deepEqual(pcts(gptSlots).slice(0, 2), ['\u2b21', 'wk: 30%'], '…and still no 5h slot on the bar');
+            assert.doesNotMatch(String(gptSlots()[0].tooltip), /\n5h /, '…or line in its tooltip');
+          }
+          // A plan with no 5-hour window: no slot, and no row.
+          writeRollout(null);
+          await commands['claudeObservatory.usageRefresh']();
+          assert.match(texts(gptSlots).join(' | '), /^\u2b21 \| wk: 30% \d+d \d+h/, 'the same bar');
+          assert.equal(usageRow('gpt', posted())('5h')[1], 'none', 'and no 5h row');
+        } finally {
+          fs.rmSync(rolloutFile, { force: true });
+          fs.rmSync(budget, { force: true });
+        }
+      }
+      // An account with no five-hour limit (2026-10-30): its newest usage answer carries no 5h window, as a verified
+      // Ultra account's does, and the cache records when (five_none_at). The Stats panel has no 5h row, whatever 5h
+      // share the cache holds (here one measured after that answer), and the bar, which never shows one, keeps its week
+      // and month.
+      {
+        const posted = () => {
+          const before = stView.webview.postMessage, got = [];
+          stView.webview.postMessage = (m) => got.push(m);
+          try { stProvider.postUsage(); } finally { stView.webview.postMessage = before; }
+          return got.find((m) => m.type === 'usage').u;
+        };
+        const shown = () => claudeSlots().filter((i) => i.visible).map((i) => i.text).join(' | ');
+        const kept = { v: 3, five_pct: 26, five_at: sec - 60, five_reset: sec + 3600, week_pct: 22, week_at: sec - 60, week_reset: weekReset, ...month };
+        fs.writeFileSync(cache, JSON.stringify(kept));
+        await commands['claudeObservatory.usageRefresh']();
+        assert.match(shown(), /^\u2733 \| wk: 22% \d+d \d+h \| mo: 18% /, `control: the bar, with no 5h slot \u2014 got ${shown()}`);
+        assert.equal(usageRow('claude', posted())('5h')[1], '', 'control: the 5h row');
+        fs.writeFileSync(cache, JSON.stringify({ ...kept, five_none_at: sec - 300 }));
+        await commands['claudeObservatory.usageRefresh']();
+        assert.match(shown(), /^\u2733 \| wk: 22% \d+d \d+h \| mo: 18% /, `no 5h slot, and the week and month stay \u2014 got ${shown()}`);
+        assert.doesNotMatch(String(claudeSlots()[0].tooltip), /\n5h /, 'nor a 5h line in the tooltip');
+        const u = posted();
+        assert.deepStrictEqual([u.fiveHourPct, u.fiveReset, u.fiveNoneAt], [null, null, (sec - 300) * 1000], 'the Stats post: no share, and when the account said so');
+        const row = usageRow('claude', u);
+        assert.equal(row('5h')[1], 'none', 'no 5h row');
+        assert.deepEqual(row('wk').slice(0, 2), ['22%', ''], 'the week row stays');
+      }
+      // This machine's shares are last week's, and a saved machine of the same account read the account a minute
+      // ago (the cache `oak usage --pull-machines` writes): the bar shows that reading and names the machine.
+      {
+        const store = path.join(home, '.claude', 'claude-observatory', 'remote-cache', 'machine-usage.json');
+        const account = path.join(home, '.claude.json');
+        const tag = require('crypto').createHash('sha256').update('acct-1').digest('hex').slice(0, 12);
+        const old = sec - 10 * 86400;
+        fs.writeFileSync(cache, JSON.stringify({ v: 3, five_pct: 40, five_at: old, five_reset: old + 3600, week_pct: 70, week_at: old, week_reset: old + 86400 }));
+        fs.writeFileSync(account, JSON.stringify({ oauthAccount: { accountUuid: 'acct-1' } }));
+        fs.mkdirSync(path.dirname(store), { recursive: true });
+        // The machine measured its week two days ago and has not answered since; its 5-hour share is an hour old.
+        const weekAt = (sec - 2 * 86400) * 1000;
+        const machines = (label) => JSON.stringify({ version: 1, attemptedAt: 0, machines: [{ label, target: 'me@build-box',
+          brief: { brief: 1, account: tag, at: Date.now(), five: { pct: 1, reset: (sec + 3 * 3600) * 1000, at: (sec - 3600) * 1000, tok: null, total: null },
+            week: { pct: 22, reset: weekReset * 1000, at: weekAt, tok: null, total: null }, fable: null, month: null } }] });
+        fs.writeFileSync(store, machines('build-box'));
+        // The oldest window's time, to the minute and with its date, as the tooltip and the Stats stamp give it.
+        const measured = core.relTime(weekAt).replace(/^(\d\d:\d\d):\d\d$/, '$1');
+        try {
+          await commands['claudeObservatory.usageRefresh']();
+          assert.deepEqual(claudeSlots().filter((i) => i.visible).map((i) => i.text.replace(/%.*$/, '%')), ['✳ (build-box)', 'wk: 22%'],
+            'the saved machine\'s reading, named beside the icon');
+          assert.ok(!/^\d\d:\d\d$/.test(measured), `control: the week was measured on another day (${measured})`);
+          assert.ok(String(visibleUsage('wk').tooltip).includes(`\nmeasured on a saved machine signed in to the same Claude account (build-box) at ${measured}\n`),
+            `the tooltip says when that machine measured the oldest window shown, not this machine's cache time: ${visibleUsage('wk').tooltip}`);
+          // herdr's label is whatever was typed: on the bar `$(name)` would draw an icon, and ESC, BEL and TAB, bidi
+          // controls (which reorder the text around them) and zero-width characters pass through.
+          fs.writeFileSync(store, machines('$(alert)\u001b[2Jbox\u0007\t\u202e\u200b\u2066\u200f\ufeff$(x y)'));
+          await commands['claudeObservatory.usageRefresh']();
+          assert.equal(claudeSlots()[0].text, '✳ (\\$(alert)[2Jbox$(x y))', 'the bar escapes the icon syntax VS Code would draw and drops control, bidi and zero-width characters');
+          const labelTip = String(claudeSlots()[0].tooltip);
+          // eslint-disable-next-line no-control-regex
+          assert.ok(labelTip.includes(`account ($(alert)[2Jbox$(x y)) at ${measured}\n`) && !/[\u0000-\u0009\u000b-\u001f\u007f\u061c\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/.test(labelTip),
+            `the tooltip is plain text: control, bidi and zero-width characters dropped, nothing escaped: ${JSON.stringify(labelTip)}`);
+          // The zero-width joiner an emoji family is built with stays, on the bar and in the tooltip.
+          const family = 'lab \u{1F9D1}\u200d\u{1F4BB}';
+          fs.writeFileSync(store, machines(family));
+          await commands['claudeObservatory.usageRefresh']();
+          assert.equal(claudeSlots()[0].text, `✳ (${family})`, 'the bar keeps the family whole');
+          assert.ok(String(claudeSlots()[0].tooltip).includes(`account (${family}) at ${measured}\n`), 'and so does the tooltip');
+          // The per-model cap alone from the machine, beside this machine's own live week: the bar shows no cap,
+          // so it names no machine, and the tooltip, which shows the cap, names it with its window.
+          const cap = { pct: 9, reset: weekReset * 1000, at: (sec - 60) * 1000, tok: null, total: null, label: 'Fable' };
+          fs.writeFileSync(store, JSON.stringify({ ...JSON.parse(machines('build-box')), machines: [{ ...JSON.parse(machines('build-box')).machines[0],
+            brief: { ...JSON.parse(machines('build-box')).machines[0].brief, five: null, week: null, fable: cap } }] }));
+          fs.writeFileSync(cache, JSON.stringify({ v: 3, five_pct: 9, five_at: sec - 30, five_reset: sec + 3600, week_pct: 30, week_at: sec - 30, week_reset: weekReset }));
+          await commands['claudeObservatory.usageRefresh']();
+          assert.deepEqual(claudeSlots().filter((i) => i.visible).map((i) => i.text.replace(/%.*$/, '%')), ['✳', 'wk: 30%'], 'the bar names no machine');
+          assert.ok(String(visibleUsage('wk').tooltip).includes('\nmeasured on a saved machine signed in to the same Claude account (build-box: fable) at '),
+            `the tooltip names the cap's machine: ${visibleUsage('wk').tooltip}`);
+          // What the machine measured of its own turns in this machine's windows: the estimates add it, so the tooltip
+          // names the machine although the bar shows this machine's own shares.
+          const own = { host: 'b16b16b16b16', at: (sec - 120) * 1000, five: { tok: 3920000, reads: 0, cost: 60, reset: (sec + 3600) * 1000 },
+            week: { tok: 15500000, reads: 0, cost: 400, reset: weekReset * 1000, fable: 0, fableReads: 0 }, month: null };
+          fs.writeFileSync(store, JSON.stringify({ ...JSON.parse(machines('build-box')), machines: [{ ...JSON.parse(machines('build-box')).machines[0],
+            brief: { ...JSON.parse(machines('build-box')).machines[0].brief, five: null, week: null, own } }] }));
+          await commands['claudeObservatory.usageRefresh']();
+          assert.deepEqual(claudeSlots().filter((i) => i.visible).map((i) => i.text.replace(/%.*$/, '%')), ['✳', 'wk: 30%'], 'the bar names no machine');
+          assert.ok(String(visibleUsage('wk').tooltip).includes('\nestimates include usage measured on build-box\n') && !String(visibleUsage('wk').tooltip).includes('measured on a saved machine'),
+            `the tooltip names the machine whose usage the estimates include: ${visibleUsage('wk').tooltip}`);
+          fs.writeFileSync(cache, JSON.stringify({ v: 3, five_pct: 40, five_at: old, five_reset: old + 3600, week_pct: 70, week_at: old, week_reset: old + 86400 }));
+          fs.writeFileSync(store, machines('build-box'));
+          await commands['claudeObservatory.usageRefresh']();
+          // Another account's reading is not this one's: the bar shows this machine's own, whose week has no current share
+          // (and whose 5h window, which the bar would not show, ended ten days ago), so no Claude group.
+          fs.writeFileSync(account, JSON.stringify({ oauthAccount: { accountUuid: 'acct-2' } }));
+          await commands['claudeObservatory.usageRefresh']();
+          assert.deepEqual(claudeSlots().filter((i) => i.visible).map((i) => i.text), [], 'another account: not shown');
+          // No Claude Code login here: nothing to match, so the one account the saved machines name stands in, and the
+          // tooltip says it could not be matched.
+          fs.writeFileSync(account, JSON.stringify({ numStartups: 1 }));
+          await commands['claudeObservatory.usageRefresh']();
+          assert.deepEqual(claudeSlots().filter((i) => i.visible).map((i) => i.text.replace(/%.*$/, '%')), ['✳ (build-box)', 'wk: 22%'],
+            'no login here: the saved machine\'s reading, named');
+          assert.ok(String(visibleUsage('wk').tooltip).includes(`\nmeasured on a saved machine (build-box) at ${measured}; this machine has no Claude Code login to match its account with\n`),
+            String(visibleUsage('wk').tooltip));
+          fs.writeFileSync(account, JSON.stringify({ oauthAccount: { accountUuid: 'acct-1' } }));
+          // The poll kicks the refresh that reads the saved machines: a detached `oak usage --pull-machines --if-due`,
+          // claimed once a minute and only where herdr (and so a saved machine) can be. A fake oak records the run.
+          const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-ext-bin-'));
+          tmpDirs.push(bin);
+          const ran = path.join(bin, 'oak-ran');
+          fs.writeFileSync(path.join(bin, 'herdr'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+          fs.writeFileSync(path.join(bin, 'oak'), `#!/bin/sh\necho "$*" >> '${ran}'\n`, { mode: 0o755 });
+          const was = { PATH: process.env.PATH, bin: process.env.CLAUDE_OBSERVATORY_BIN, bg: process.env.OAK_NO_BACKGROUND };
+          process.env.PATH = bin + path.delimiter + process.env.PATH;
+          process.env.CLAUDE_OBSERVATORY_BIN = path.join(bin, 'oak');
+          delete process.env.OAK_NO_BACKGROUND;
+          // Every spawn the poll makes, with its options: a detached refresh has no console, so on Windows each one it
+          // starts must ask for no window of its own (windowsHide).
+          const childProcess = require('child_process');
+          const spawnOf = childProcess.spawn;
+          const spawned = [];
+          childProcess.spawn = function (file, args, opts) { spawned.push({ file, args, opts }); return spawnOf.apply(this, arguments); };
+          const prefs = path.join(home, '.claude', 'claude-observatory', 'prefs.json');
+          const settle = async (file) => { for (let i = 0; i < 100 && !fs.existsSync(file); i++) await new Promise((r) => setTimeout(r, 50)); };
+          try {
+            await commands['claudeObservatory.usageRefresh']();
+            // The stubs are POSIX scripts, and Windows looks for herdr.exe, so the runs are checked on macOS and Linux.
+            if (process.platform !== 'win32') {
+              await settle(ran);
+              assert.ok(fs.existsSync(ran), 'the status-bar poll starts the saved machines\' refresh');
+              assert.equal(fs.readFileSync(ran, 'utf8'), 'usage --pull-machines --if-due\n', '…as a detached `oak usage --pull-machines --if-due`');
+              const kick = spawned.filter((c) => (c.args || []).includes('--pull-machines'));
+              assert.equal(kick.length, 1, 'one refresh started');
+              assert.deepEqual([kick[0].opts.detached, kick[0].opts.windowsHide], [true, true], '…detached, and with no window on Windows');
+
+              // `"machineUsage": false` in prefs.json: the poll starts no refresh, and no saved machine's reading is shown.
+              fs.writeFileSync(prefs, JSON.stringify({ machineUsage: false }));
+              fs.rmSync(`${store}.kick`, { force: true });
+              fs.rmSync(ran, { force: true });
+              spawned.length = 0;
+              await commands['claudeObservatory.usageRefresh']();
+              await new Promise((r) => setTimeout(r, 500));
+              assert.deepEqual([fs.existsSync(ran), spawned.filter((c) => (c.args || []).includes('--pull-machines')).length], [false, 0], 'off: no refresh is started');
+              assert.deepEqual(claudeSlots().filter((i) => i.visible).map((i) => i.text), [], 'off: the saved machine\'s reading is not shown, and this machine\'s own has no week or month');
+              fs.rmSync(prefs, { force: true });
+              await commands['claudeObservatory.usageRefresh']();
+              assert.equal(claudeSlots()[0].text, '✳ (build-box)', 'control: on again, the reading is back');
+
+              // Windows' `oak.cmd`, run through cmd.exe, would start node in a console window of its own for as long as the
+              // refresh runs, so the poll runs the script the shim names with the editor's own node, as it does a script
+              // that shebangs node. A shim as npm writes it, beside its package (here a script that records how it ran).
+              const shimDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cc-ext-shim-')));
+              tmpDirs.push(shimDir);
+              const script = path.join(shimDir, 'node_modules', 'oak-observatory', 'dist', 'index.js');
+              fs.mkdirSync(path.dirname(script), { recursive: true });
+              const shimRan = path.join(shimDir, 'ran.json');
+              fs.writeFileSync(script, `require('fs').writeFileSync(${JSON.stringify(shimRan)}, JSON.stringify({ args: process.argv.slice(2), node: process.env.ELECTRON_RUN_AS_NODE }));\n`);
+              const shim = path.join(shimDir, 'oak.cmd');
+              fs.writeFileSync(shim, '@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n:start\r\nSETLOCAL\r\nCALL :find_dp0\r\n\r\n' +
+                'IF EXIST "%dp0%\\node.exe" (\r\n  SET "_prog=%dp0%\\node.exe"\r\n) ELSE (\r\n  SET "_prog=node"\r\n  SET PATHEXT=%PATHEXT:;.JS;=;%\r\n)\r\n\r\n' +
+                'endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\\node_modules\\oak-observatory\\dist\\index.js" %*\r\n');
+              assert.equal(ext.shimScript(shim), script, 'the script npm\'s shim runs');
+              process.env.CLAUDE_OBSERVATORY_BIN = shim;
+              fs.rmSync(`${store}.kick`, { force: true });
+              spawned.length = 0;
+              await commands['claudeObservatory.usageRefresh']();
+              await settle(shimRan);
+              assert.ok(fs.existsSync(shimRan), 'the poll ran the script the shim names');
+              assert.deepEqual(JSON.parse(fs.readFileSync(shimRan, 'utf8')), { args: ['usage', '--pull-machines', '--if-due'], node: '1' }, 'the shim\'s script ran on the editor\'s node');
+              const viaShim = spawned.filter((c) => (c.args || []).includes('--pull-machines'));
+              assert.deepEqual(viaShim.map((c) => [c.file, c.args[0], c.opts.detached, c.opts.windowsHide]), [[process.execPath, script, true, true]], 'never through cmd.exe, and with no window');
+              // An older npm's shim names the script with %~dp0; a file that is no shim names none.
+              fs.writeFileSync(shim, '@IF EXIST "%~dp0\\node.exe" (\r\n  "%~dp0\\node.exe"  "%~dp0\\node_modules\\oak-observatory\\dist\\index.js" %*\r\n) ELSE (\r\n  node  "%~dp0\\node_modules\\oak-observatory\\dist\\index.js" %*\r\n)\r\n');
+              assert.equal(ext.shimScript(shim), script);
+              assert.equal(ext.shimScript(path.join(bin, 'oak')), null);
+
+              // oak sync's background run, as the terminal app's and JetBrains' pollers start it: nothing until a run has set
+              // sync up here (its status file), then a detached `oak sync now --quiet --if-due`, at most one a minute across
+              // every poller (the claim in sync/kick), and none while prefs.json turns the background runs off.
+              process.env.CLAUDE_OBSERVATORY_BIN = path.join(bin, 'oak');
+              const syncDir = path.join(core.rootDir(), 'sync');
+              const syncKicks = () => spawned.filter((c) => (c.args || []).join(' ').endsWith('sync now --quiet --if-due'));
+              const poll = async () => {
+                spawned.length = 0;
+                fs.rmSync(ran, { force: true });
+                await commands['claudeObservatory.usageRefresh']();
+              };
+              await poll();
+              assert.deepEqual(syncKicks(), [], 'not set up here: no run is started');
+              fs.mkdirSync(syncDir, { recursive: true });
+              fs.writeFileSync(path.join(syncDir, 'status.json'), JSON.stringify({ at: Date.now() - 10 * 60_000, durationMs: 1, status: 'ok', warnings: [], machines: [] }));
+              await poll();
+              await settle(ran);
+              assert.ok(fs.existsSync(ran), 'set up: the poll starts the background run');
+              assert.match(fs.readFileSync(ran, 'utf8'), /^sync now --quiet --if-due$/m, '…through the CLI');
+              assert.deepEqual(syncKicks().map((c) => [c.opts.detached, c.opts.windowsHide]), [[true, true]], '…one, detached, and with no window on Windows');
+              await poll();
+              assert.deepEqual(syncKicks(), [], 'the claim holds the next poll off');
+              // The claim every poller takes: one the CLI's poll took a moment ago holds this one off too.
+              fs.rmSync(path.join(syncDir, 'kick'), { force: true });
+              const claimed = core.spawnToolSync(process.execPath, ['-e', `require(${JSON.stringify(require.resolve('../../core/dist/index.js'))}).claimSyncKick() || process.exit(3)`], { encoding: 'utf8' });
+              assert.equal(claimed.status, 0, `control: another process claimed the kick: ${claimed.stderr}`);
+              await poll();
+              assert.deepEqual(syncKicks(), [], 'another poller\'s claim holds it off');
+              fs.rmSync(path.join(syncDir, 'kick'), { force: true });
+              fs.writeFileSync(prefs, JSON.stringify({ sync: { auto: false } }));
+              await poll();
+              assert.deepEqual(syncKicks(), [], '"sync": { "auto": false }: none');
+              fs.rmSync(prefs, { force: true });
+              await poll();
+              assert.equal(syncKicks().length, 1, 'control: on again, it starts one');
+              // A sh script that names node after its shebang line is run by sh, as itself: only the shebang line says what
+              // runs a script.
+              const shNamesNode = path.join(bin, 'oak-sh');
+              fs.writeFileSync(shNamesNode, `#!/bin/sh\n# node is not what runs this script\necho "$*" >> '${ran}'\n`, { mode: 0o755 });
+              process.env.CLAUDE_OBSERVATORY_BIN = shNamesNode;
+              fs.rmSync(path.join(syncDir, 'kick'), { force: true });
+              await poll();
+              await settle(ran);
+              assert.ok(fs.existsSync(ran) && /^sync now --quiet --if-due$/m.test(fs.readFileSync(ran, 'utf8')), 'a sh script that names node later runs as itself');
+              // The launcher `oak machine add` writes (~/.local/bin/oak, its exact bytes): a sh script that names node on its
+              // second line, for sh to find. The run lands: the poll runs the bundle it execs on the editor's own node, as
+              // the CLI sees through it, never the sh script as JavaScript, which would end at once with the minute's claim
+              // spent.
+              const bundle = path.join(home, '.local', 'lib', 'oak', 'index.js');
+              const bundleRan = path.join(bin, 'bundle-ran.jsonl');
+              fs.mkdirSync(path.dirname(bundle), { recursive: true });
+              fs.writeFileSync(bundle, `require('fs').appendFileSync(${JSON.stringify(bundleRan)}, JSON.stringify({ args: process.argv.slice(2), node: process.env.ELECTRON_RUN_AS_NODE }) + '\\n');\n`);
+              const launcher = path.join(bin, 'oak-launcher');
+              fs.writeFileSync(launcher, '#!/bin/sh\nexec "$(command -v node 2>/dev/null || echo "$HOME/.local/bin/node")" "$HOME/.local/lib/oak/index.js" "$@"\n', { mode: 0o755 });
+              process.env.CLAUDE_OBSERVATORY_BIN = launcher;
+              fs.rmSync(path.join(syncDir, 'kick'), { force: true });
+              await poll();
+              const landed = async () => { for (let i = 0; i < 300 && !(fs.existsSync(bundleRan) && fs.readFileSync(bundleRan, 'utf8').includes('"sync"')); i++) await new Promise((r) => setTimeout(r, 50)); };
+              await landed();
+              assert.ok(fs.existsSync(bundleRan), 'the launcher\'s run landed');
+              assert.ok(fs.readFileSync(bundleRan, 'utf8').trim().split('\n').map((l) => JSON.parse(l))
+                .some((r) => r.args.join(' ') === 'sync now --quiet --if-due' && r.node === '1'), `…in the bundle it execs, on the editor's node: ${fs.readFileSync(bundleRan, 'utf8')}`);
+              assert.deepEqual(syncKicks().map((c) => [c.file, c.args[0]]), [[process.execPath, fs.realpathSync(bundle)]], 'run as the bundle, not as the sh script');
+              process.env.CLAUDE_OBSERVATORY_BIN = path.join(bin, 'oak');
+              for (const name of ['status.json', 'kick']) fs.rmSync(path.join(syncDir, name), { force: true });
+            }
+          } finally {
+            childProcess.spawn = spawnOf;
+            fs.rmSync(prefs, { force: true });
+            process.env.PATH = was.PATH;
+            process.env.CLAUDE_OBSERVATORY_BIN = was.bin;
+            if (was.bg === undefined) delete process.env.OAK_NO_BACKGROUND; else process.env.OAK_NO_BACKGROUND = was.bg;
+          }
+        } finally {
+          fs.rmSync(store, { force: true });
+          fs.rmSync(`${store}.kick`, { force: true });
+          fs.rmSync(account, { force: true });
+        }
+      }
       fs.rmSync(cache, { force: true });
     }
 
@@ -2829,6 +3805,43 @@ test('extension: three views, click commands, inline annotations, chat, status s
       assert.ok(draftDoc && /edit #1/.test(draftDoc.content), 'Edit first… opens the draft itself as a document');
       assert.deepEqual(offered[1], ['Send to agent'], '…and Send is offered again once it has been edited');
       assert.match(clipboardText, /One more thing: keep the old name\.$/, 'what goes out (and stays on the clipboard) is the EDITED draft');
+    }
+    // A send herdr refuses says herdr's message, as JetBrains and the terminal app do, as a draft kept, never an error: it
+    // said `Prompt failed: HerdrError: …`, the error's class before its message (2026-10-13), as an error. A herdr that
+    // holds this session in a pane refuses the prompt (POSIX only: the stand-in listens on a Unix socket).
+    if (process.platform !== 'win32') {
+      const net = require('net');
+      const socketPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'oak-ext-herdr-')), 'h.sock');
+      tmpDirs.push(path.dirname(socketPath));
+      const server = net.createServer(socket => {
+        socket.setEncoding('utf8');
+        let buffer = '';
+        socket.on('data', chunk => {
+          buffer += chunk;
+          const end = buffer.indexOf('\n');
+          if (end < 0) return;
+          const { id, method } = JSON.parse(buffer.slice(0, end));
+          socket.end(JSON.stringify(method === 'session.snapshot'
+            ? { id, result: { type: 'session_snapshot', snapshot: { protocol: 22, version: '0.9.1', panes: [{ pane_id: 'pane1', agent_session: { value: S }, agent_status: 'idle' }] } } }
+            : { id, error: { code: 'agent_blocked', message: 'a permission dialog is open in pane1' } }) + '\n');
+        });
+      });
+      await new Promise(resolve => server.listen(socketPath, resolve));
+      const realInfo = vscode.window.showInformationMessage, realErr = vscode.window.showErrorMessage, realSocket = process.env.HERDR_SOCKET_PATH;
+      const errors = [], infos = [];
+      vscode.window.showInformationMessage = (m, ...rest) => { infos.push(String(m)); return Promise.resolve(actionsOf(rest).includes('Send to agent') ? 'Send to agent' : undefined); };
+      vscode.window.showErrorMessage = (m) => { errors.push(String(m)); return Promise.resolve(undefined); };
+      process.env.HERDR_SOCKET_PATH = socketPath;
+      try {
+        await commands['claudeObservatory.chatEdit'](1);
+      } finally {
+        vscode.window.showInformationMessage = realInfo;
+        vscode.window.showErrorMessage = realErr;
+        process.env.HERDR_SOCKET_PATH = realSocket;
+        await new Promise(resolve => server.close(resolve));
+      }
+      assert.deepEqual(errors, []);
+      assert.equal(infos.at(-1), 'a permission dialog is open in pane1. Draft kept on the clipboard.');
     }
 
     // openFileAtEdit opens the real file
@@ -3882,7 +4895,7 @@ test('extension: three views, click commands, inline annotations, chat, status s
         };
         const sb = {
           window: win, document: docS, console,
-          acquireVsCodeApi: () => ({ postMessage: (m) => posted.push(m), getState: () => persisted || null, setState: (s) => saved.push(s) }),
+          acquireVsCodeApi: () => ({ postMessage: (m) => posted.push(structuredClone(m)), getState: () => persisted || null, setState: (s) => saved.push(structuredClone(s)) }),
           JSON, Math, Date, String, Number, Array, Object, RegExp, parseInt, parseFloat, isFinite, undefined,
           setTimeout: () => 0, clearTimeout() {}, getComputedStyle: () => ({ getPropertyValue: () => '' }),
         };
@@ -3942,11 +4955,28 @@ test('extension: three views, click commands, inline annotations, chat, status s
       assert.doesNotMatch(el('rq-slist').innerHTML, /data-sid=/, 'with no row to pick');
       // A conversation search that FAILED says so; only a search that ran may say nothing matches.
       solo.fire(el('rq-slist'), 'input', { target: { id: 'rq-sq', value: 'needle' } });
-      solo.post({ type: 'searchResults', q: 'needle', hits: [], error: 'the index could not be read' });
-      assert.match(el('rq-srows').innerHTML, /could not search the conversations — the index could not be read/, 'a failed search names its failure');
+      solo.post({ type: 'searchResults', q: 'needle', hits: [], error: 'the database could not be read' });
+      assert.match(el('rq-srows').innerHTML, /could not search the conversations — the database could not be read/, 'a failed search names its failure');
       assert.doesNotMatch(el('rq-srows').innerHTML, /nothing matches/, '…and never claims an empty result');
       solo.post({ type: 'searchResults', q: 'needle', hits: [] });
       assert.match(el('rq-srows').innerHTML, /nothing matches “needle” in any conversation/, 'control: a search that ran and found nothing says that');
+
+      // oak sync's open conflicts: their own group under the raised hands and above the sessions, each with its two ways
+      // out, which go to the host; with none open, no group.
+      solo.fire(el('rq-slist'), 'input', { target: { id: 'rq-sq', value: '' } });
+      listener({ data: { type: 'sessions', current: LIVE, rows: [{ id: LIVE, title: 'the live conversation', lastActiveMs: Date.now(), active: true }] } });
+      solo.post({ type: 'syncConflicts', rows: [{ id: 'c0ffee000001', family: 'plans', name: 'm.md', from: 'build-box', file: '/home/u/.claude/plans/m.md',
+        copy: '/home/u/.claude/claude-observatory/sync/conflicts/build-box/plans/m.md', resolution: 'edit your file or delete the copy' }] });
+      const conflictHtml = el('rq-slist').innerHTML;
+      assert.match(conflictHtml, /sync conflicts \(1\)<\/div>[\s\S]*plans m\.md[\s\S]*from build-box — edit your file or delete the copy[\s\S]*data-sync="c0ffee000001" data-act="open"[\s\S]*data-sync="c0ffee000001" data-act="delete"[\s\S]*>sessions<\/div>[\s\S]*data-sid="/,
+        'the group, its row and both ways out, above the sessions');
+      assert.match(conflictHtml, /title="plans m\.md from build-box — yours: \/home\/u\/\.claude\/plans\/m\.md · build-box’s copy: \/home\/u\/\.claude\/claude-observatory\/sync\/conflicts\/build-box\/plans\/m\.md"/, 'both copies whole in its tooltip');
+      for (const act of ['open', 'delete']) {
+        solo.fire(el('rq-slist'), 'click', { target: { closest: (sel) => (sel === '[data-sync]' ? { getAttribute: (a) => (a === 'data-sync' ? 'c0ffee000001' : act) } : null) }, stopPropagation() {} });
+        assert.deepEqual(solo.posted.at(-1), { type: 'syncConflict', id: 'c0ffee000001', act }, `${act} goes to the host`);
+      }
+      solo.post({ type: 'syncConflicts', rows: [] });
+      assert.doesNotMatch(el('rq-slist').innerHTML, /sync conflicts|data-sync=/, 'none open: no group');
 
       // The guided tour's ring SURVIVES a repaint, and lands even though the host broadcasts the anchor
       // before it names the tab. Both are real: the host's order is fixed (anchor to every panel, then
@@ -4021,7 +5051,10 @@ test('extension: three views, click commands, inline annotations, chat, status s
       assert.match(actHtml, /▸/, 'a collapsed row shows a closed twisty');
       assert.match(actHtml, /▾/, '…and an expanded one an open twisty');
       assert.match(actHtml, /t-attn/, 'the ThemeColor becomes a tone class');
-      assert.match(actHtml, /7 tool calls/, 'the header counts what the feed holds');
+      // ONE header per pane: the tab names it and counts it, with the unit; the pane under it does not
+      // say "ACTIONS 7 tool calls" a second time.
+      assert.match(el('tl-tabs').innerHTML, /data-tab="actions"[^>]*>Actions<span class="tl-tn">7 tool calls<\/span>/, 'the tab counts what the feed holds, with its unit');
+      assert.doesNotMatch(actHtml, /rq-title|7 tool calls/, '…and the pane does not repeat its name or its count');
       // The DEFAULT-expanded row asked for its children, exactly once.
       const kidReqs = () => posted.filter((m) => m.type === 'children' && m.tab === 'actions' && m.key === 'cgroup').length;
       assert.equal(kidReqs(), 1, 'an open row asks the host for its level — once');
@@ -4050,6 +5083,22 @@ test('extension: three views, click commands, inline annotations, chat, status s
       solo.post({ type: 'rows', tab: 'actions', parent: '', rows: [], err: 'transcript unreadable' });
       assert.match(el('tl-actions').innerHTML, /Could not read this session’s actions/, 'a failed read is stated, not swallowed');
       assert.match(el('tl-actions').innerHTML, /transcript unreadable/, '…with what went wrong');
+      // Prompts the CLI could not list: its OWN reason, never a guess that the CLI is too old to have the verb.
+      // Both host paths carry it — before any good payload ('error') and after one ('prompts' with rq null).
+      for (const msg of [{ type: 'error', why: 'no transcript found for this session under this directory' },
+        { type: 'prompts', rq: null, selected: null, why: 'no transcript found for this session under this directory' }]) {
+        solo.post(msg);
+        assert.match(el('tl-prompts').innerHTML, /the <b>oak<\/b> CLI answered: <b>no transcript found for this session under this directory<\/b>/, `${msg.type}: the CLI's reason is shown`);
+        assert.doesNotMatch(el('tl-prompts').innerHTML, /older than 0\.8\.8/, `${msg.type}: …and not the old-CLI guess`);
+      }
+      solo.post({ type: 'error' });
+      assert.match(el('tl-prompts').innerHTML, /older than 0\.8\.8/, 'control: with no answer at all, the old-CLI hint stays');
+      // A session whose transcript is gone lists what the index kept, and says that is where the list came from.
+      solo.post({ type: 'prompts', selected: null, rq: { fromIndex: true, note: 'the transcript is gone; these asks and answers are what the local database kept of it',
+        prompts: [{ id: 'p1', index: 1, text: 'Teach the zebracorn lexer', ts: 1, endTs: 2, durationMs: 1, edits: 1, pending: 1, kept: 0, undone: 0, files: 1, folders: 1, actions: 0, errors: 0, tokens: 0, tasks: 0 }],
+        summary: { total: 1, withEdits: 1, edits: 1 } } });
+      assert.match(el('tl-prompts').innerHTML, /Teach the zebracorn lexer/, 'the archived ask is listed');
+      assert.match(el('tl-prompts').innerHTML, /the transcript is gone; these asks and answers are what the local database kept of it/, '…under the note that says where it came from');
 
       // ---- grouped mode: four columns, resizable and foldable --------------------------------------
       const grouped = runTimeline({ groupedTabs: true });
@@ -4067,6 +5116,31 @@ test('extension: three views, click commands, inline annotations, chat, status s
         { key: 'gEdits', label: 'Edits', desc: '2', tip: 't', glyph: '✎', tone: '', open: false, act: false, acts: [] } ] });
       assert.match(gEl('tl-g-actions').innerHTML, />Edits</, 'the Actions column holds the Actions rows');
       assert.equal(gEl('tl-actions').innerHTML, '', '…and not the solo pane it is not using');
+      // ONE header per column: "ACTIONS 2 tool calls" in the column head, and no second title inside it.
+      assert.equal(gEl('tl-gb-actions').textContent, '2 tool calls', 'the column head counts with the unit');
+      assert.doesNotMatch(gEl('tl-g-actions').innerHTML, /rq-title|2 tool calls/, '…and the column body does not repeat the title or the count');
+      grouped.post({ type: 'rows', tab: 'observations', parent: '', count: 25, rows: [] });
+      assert.equal(gEl('tl-gb-observations').textContent, '25 edits', 'Observations: "25 edits", once');
+      assert.doesNotMatch(gEl('tl-g-observations').innerHTML, /rq-title|25 edits/, '…not again inside the column');
+      grouped.post({ type: 'prompts', rq: { prompts: [], summary: { total: 3, withEdits: 1, edits: 2 } }, selected: null });
+      assert.equal(gEl('tl-gb-prompts').textContent, '3 asks', 'Prompts: the asks counted in the head');
+      assert.doesNotMatch(gEl('tl-g-prompts').innerHTML, /rq-title|3 asks/, '…not again inside the column');
+      assert.match(gEl('tl-g-prompts').innerHTML, /1 with edits · 2 edits/, 'the column keeps what the head does not say');
+      grouped.post({ type: 'agentFeed', session: 'gS', patches: {}, feed: { mode: 'audit', title: 'gS', lastTs: 1, entries: [{ ts: 1, kind: 'prompt', label: '#1', promptText: 'x' }] } });
+      assert.equal(gEl('tl-gb-feed').textContent, '1 entry', 'Feed: its entries, with the unit');
+
+      // LAYOUT. A label wraps between words, never inside one ("Context", not "Conte" / "xt"); and a row cut at the
+      // Feed's top is the scroll box's edge (nothing is positioned over the list), which a scroll shadow marks.
+      const lbRule = (rqView.webview.html.match(/\.tl-lb \{[^}]*\}/) || [''])[0];
+      assert.ok(/overflow-wrap:break-word/.test(lbRule) && !/min-width:0|overflow-wrap:anywhere/.test(lbRule), `a Timeline label keeps its words whole: ${lbRule}`);
+      const fb = gEl('tlf-body');
+      const fCls = new Set();
+      fb.classList = { contains: (c) => fCls.has(c), toggle: (c, on) => (on ? fCls.add(c) : fCls.delete(c)), add: (c) => fCls.add(c), remove: (c) => fCls.delete(c) };
+      fb.scrollTop = 120; fb.onscroll();
+      assert.ok(fCls.has('scrolled'), 'a scrolled Feed marks its top edge');
+      fb.scrollTop = 0; fb.onscroll();
+      assert.ok(!fCls.has('scrolled'), '…and drops the mark at the top');
+      assert.match(rqView.webview.html, /\.tlf-body\.scrolled::before \{[^}]*position:sticky; top:0;[^}]*margin-bottom:-6px/, 'the mark takes no room in the list');
 
       // WIDTHS. Equal to start, then dragged — and the drag never lets a column past its floor.
       assert.equal(gEl('tl-gc-prompts').style['--tl-cw'], '1', 'columns start on an equal share');
@@ -4133,19 +5207,21 @@ test('extension: three views, click commands, inline annotations, chat, status s
     }
 
     // The selector consumes the built CLI (the file's TREE_OAK pin) on the window's existing refresh.
-    const sessionsPush = async (pin) => {
+    // `read` picks the listing to wait for: by default the first that lands.
+    const sessionsPush = async (pin, read = () => true) => {
       configValues['session'] = pin;
       const posts = [];
       rqView.webview.postMessage = (m) => { posts.push(m); return Promise.resolve(true); };
       rqView.visible = true;
+      const landed = () => posts.find((m) => m.type === 'sessions' && read(m));
       // The window coalesces to one spawn at a time, and a failed spawn releases that gate on a later
       // tick — so wait for it rather than racing it. Twenty tries is ~200ms; the gate opens on the first.
-      for (let i = 0; i < 200 && !posts.some((m) => m.type === 'sessions'); i++) {
+      for (let i = 0; i < 200 && !landed(); i++) {
         rqProvider.refresh(true);
-        if (!posts.some((m) => m.type === 'sessions')) await new Promise((r) => setTimeout(r, 10));
+        if (!landed()) await new Promise((r) => setTimeout(r, 10));
       }
       rqView.visible = false;
-      return posts.find((m) => m.type === 'sessions');
+      return landed() ?? posts.filter((m) => m.type === 'sessions').pop();
     };
     const sp = await sessionsPush(OLDPIN);
     assert.ok(sp, 'the Prompts window is fed the selector rows on its own refresh cadence — no second timer');
@@ -4155,31 +5231,74 @@ test('extension: three views, click commands, inline annotations, chat, status s
     assert.equal(sp.rows[0].active, false, 'and is marked NOT active — the pin is why it is listed, not liveness');
     assert.ok(spIds.includes(LIVE), 'a session still being written is listed');
     assert.equal(sp.rows.find((r) => r.id === LIVE).active, true, 'and marked active');
+    // A session the built CLI finds no transcript for: the window is handed the CLI's own reason to show.
+    {
+      const pinned = configValues['session'];
+      configValues['session'] = 'fixture-no-such-transcript';
+      const posts = [];
+      rqView.webview.postMessage = (m) => { posts.push(m); return Promise.resolve(true); };
+      rqView.visible = true;
+      const answer = () => posts.find((m) => m.type === 'error' || (m.type === 'prompts' && m.rq === null));
+      for (let i = 0; i < 300 && !answer(); i++) {
+        rqProvider.refresh(true);
+        if (!answer()) await new Promise((r) => setTimeout(r, 10));
+      }
+      rqView.visible = false;
+      configValues['session'] = pinned;
+      assert.ok(answer(), 'the window is told the CLI listed nothing');
+      assert.equal(answer().why, 'no transcript found for this session under this directory', '…and why, in the CLI’s words');
+    }
     // FULL listing now: the Timeline selector shows the same population the
     // Overview's Sessions pane does — the active-only cut read as missing sessions. The dropdown's
     // own search/sort/filter bar carries the long list.
     assert.ok(spIds.includes(STALE), 'a quiet old session IS listed — the selector matches the Overview');
+    // A Codex session and one of its Auto-review threads: the selector lists the session, not the review,
+    // unless the review is the one pinned. Removed after, so no later listing sees them.
+    {
+      const rolloutDir = path.join(home, '.codex', 'sessions', '2026', '09', '30');
+      fs.mkdirSync(rolloutDir, { recursive: true });
+      const seedRollout = (id, prompt, meta) => {
+        const file = path.join(rolloutDir, `rollout-2026-09-30T12-00-00-${id}.jsonl`);
+        fs.writeFileSync(file, [{ type: 'session_meta', payload: { id, cwd: ws, ...meta } },
+          { type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: prompt }] } },
+          { type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 100, cached_input_tokens: 0, output_tokens: 10 } } } }]
+          .map((r) => JSON.stringify({ timestamp: '2026-09-30T12:00:00Z', ...r })).join('\n') + '\n');
+        return file;
+      };
+      const PARENT = '0199a000-0000-7000-8000-00000000c0de', REVIEW = '0199a000-0000-7000-8000-00000000a0a0';
+      const files = [seedRollout(PARENT, 'Fix the smoke exporter', {}),
+        seedRollout(REVIEW, 'The following is the Codex agent history whose request action you are assessing.', { thread_source: 'guardian_review', parent_thread_id: PARENT })];
+      try {
+        // A listing asked for before the rollouts were written can still land after them, so the control waits for
+        // one that read them.
+        const listed = (await sessionsPush(OLDPIN, (m) => m.rows.some((r) => r.id === PARENT))).rows.map((r) => r.id);
+        assert.ok(listed.includes(PARENT), 'the Codex session is listed (control: the CLI reads the seeded rollouts)');
+        assert.ok(!listed.includes(REVIEW), 'its Auto-review thread is not');
+        const pinned = (await sessionsPush(REVIEW)).rows;
+        assert.equal(pinned.find((r) => r.id === REVIEW)?.title, 'Auto-review: Fix the smoke exporter', 'a pinned Auto-review thread is listed, under its own title');
+      } finally {
+        for (const file of files) fs.rmSync(file, { force: true });
+      }
+    }
     // Pinned to something this workspace has no row for: synthesized, so the selector can still name it
     // and switch away from it.
     const spGhost = await sessionsPush('ghostSess99');
     assert.ok(!spGhost.rows.some((r) => r.id === 'ghostSess99'),
       'an unavailable pin is named by the chip but never fabricated as a local row');
-    // "Nobody is waiting" is a claim about every session, so it needs a listing that loaded. After one
-    // that failed, the jump says it could not read them instead.
+    // "Nobody is waiting" is a claim about every session, so it needs a listing that loaded. When the
+    // jump's own read fails, it says it could not read them instead.
     {
       const pinWas = configValues['session'];
-      configValues['session'] = OLDPIN; // postSessions keeps only a listing for the session current now
+      configValues['session'] = OLDPIN; // the jump reads the listing for the session current now
       const notExec = path.join(ws, 'not-a-binary-hands');
       fs.writeFileSync(notExec, 'this is not executable\n');
-      process.env.CLAUDE_OBSERVATORY_BIN = notExec;
-      await rqProvider.postSessions(ws, OLDPIN);
-      process.env.CLAUDE_OBSERVATORY_BIN = TREE_OAK;
       const warnedBefore = warnMessages.length, toldBefore = infoMessages.length;
-      rqProvider.jumpToNextHand();
+      process.env.CLAUDE_OBSERVATORY_BIN = notExec;
+      await rqProvider.jumpToNextHand();
+      process.env.CLAUDE_OBSERVATORY_BIN = TREE_OAK;
       assert.match(warnMessages.slice(warnedBefore).join('\n'), /could not read which sessions are waiting/, 'a failed listing is not read as nobody waiting');
       assert.ok(!infoMessages.slice(toldBefore).some((m) => /nobody is waiting/.test(m)), '…and nobody-waiting is not claimed');
-      await rqProvider.postSessions(ws, OLDPIN);
-      rqProvider.jumpToNextHand();
+      await rqProvider.jumpToNextHand();
       assert.ok(infoMessages.slice(toldBefore).some((m) => /nobody is waiting on you/.test(m)), 'control: after a listing that loaded, with no raised hand, it is');
       configValues['session'] = pinWas;
     }
@@ -4189,13 +5308,16 @@ test('extension: three views, click commands, inline annotations, chat, status s
     if (process.platform !== 'win32') {
       const argvLog = path.join(ws, 'oak-argv.log');
       const counter = path.join(ws, 'oak-counter');
-      fs.writeFileSync(counter, `#!/bin/sh\nprintf '%s\\n' "$1" >> ${JSON.stringify(argvLog)}\nexec ${JSON.stringify(TREE_OAK)} "$@"\n`);
+      // `warm` is only counted: the Overview's detached warm-up would outlive the test.
+      fs.writeFileSync(counter, `#!/bin/sh\nprintf '%s\\n' "$1" >> ${JSON.stringify(argvLog)}\n[ "$1" = warm ] && exit 0\nexec ${JSON.stringify(TREE_OAK)} "$@"\n`);
       fs.chmodSync(counter, 0o755);
       const spawned = (verb) => (fs.existsSync(argvLog) ? fs.readFileSync(argvLog, 'utf8').split('\n') : []).filter((v) => v === verb).length;
       const settle = async (cond) => { for (let i = 0; i < 1500 && !cond(); i++) await new Promise((r) => setTimeout(r, 10)); };
       const wasPin = configValues['session'];
       const cmPost = cmView.webview.postMessage;
       const rqPost = rqView.webview.postMessage;
+      const noBackground = process.env.OAK_NO_BACKGROUND;
+      process.env.OAK_NO_BACKGROUND = '1';
       process.env.CLAUDE_OBSERVATORY_BIN = counter;
       configValues['session'] = OLDPIN;
       try {
@@ -4260,7 +5382,16 @@ test('extension: three views, click commands, inline annotations, chat, status s
         await settle(() => posts.some((m) => m.type === 'sessions'));
         assert.equal(spawned('sessions'), 3, 'control: a batch begun after the change is reused');
         await settle(() => !rqProvider.running && !cmProvider.running);
+        // OAK_NO_BACKGROUND=1 (every test run sets it) starts no warm-up after a landed batch; without it, one.
+        assert.equal(spawned('warm'), 0, 'OAK_NO_BACKGROUND=1: no warm-up after any of the batches above');
+        delete process.env.OAK_NO_BACKGROUND;
+        cmProvider.warmedAt = 0; // a run without the switch may have warmed up earlier in this test
+        cmProvider.running = false;
+        cmProvider.refresh(true);
+        await settle(() => !cmProvider.running && spawned('warm') > 0);
+        assert.equal(spawned('warm'), 1, 'control: without it the landed batch starts one warm-up');
       } finally {
+        if (noBackground === undefined) delete process.env.OAK_NO_BACKGROUND; else process.env.OAK_NO_BACKGROUND = noBackground;
         cmView.visible = false;
         rqView.visible = false;
         cmView.webview.postMessage = cmPost;
@@ -4291,6 +5422,448 @@ test('extension: three views, click commands, inline annotations, chat, status s
       commands['claudeObservatory.switchSession'] = realQPCmd;
       commands['claudeObservatory.showSessions'] = realShow;
       assert.deepEqual(qpSeen, [], 'and no longer opens the deprecated session QuickPick');
+    }
+    // Every saved machine's sessions (0.11.0), read as the terminal app reads them: herdr's saved machines (`oak machine
+    // list --json`), each asked `oak sessions --json --machine <label>` in the background, all at once. A fake oak answers
+    // for two saved machines, each after DELAY ms: one lists a session, the other's ssh is refused. Nothing local waits for
+    // them, what the last read gave shows at once, and a session picked there is read and acted on there (`--machine`).
+    {
+      const DELAY = 1500;
+      const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-saved-'));
+      tmpDirs.push(bin);
+      const log = path.join(bin, 'argv.log');
+      const now = Date.now();
+      fs.writeFileSync(path.join(bin, 'a.json'), JSON.stringify({ fromIndex: false, sessions: [
+        { id: 'ra-1', title: 'Tidy the remote lexer', workspace: '~/lab', lastActiveMs: now, edits: 1, pending: 1, tokens: 10, current: true, agent: 'claude', model: 'Opus 4.8' }] }));
+      fs.writeFileSync(path.join(bin, 'workers.json'), JSON.stringify({ ...JSON.parse(fs.readFileSync(path.join(bin, 'a.json'), 'utf8')),
+        workers: [{ key: 'lab-a:ra-1', session: 'ra-1', title: 'Remote worker', kind: 'claude', state: 'working', subagents: [] }] }));
+      fs.writeFileSync(path.join(bin, 'obs.json'), JSON.stringify({ observations: { recap: 'Tidied the lexer there', runs: [
+        { rel: 'src/lexer.ts', count: 1, added: 3, removed: 1, status: 'pending', edits: [{ id: 7, added: 3, removed: 1, status: 'pending', ts: now }] }], nextSteps: [] } }));
+      const remoteUnits = Array.from({ length: 3000 }, (_, i) => ({ id: i + 1, members: [i + 1], file: '/remote/src/f' + i + '.ts', rel: 'src/f' + i + '.ts', tool: 'Edit', status: 'pending', ts: now, added: 3, removed: 1 }));
+      fs.writeFileSync(path.join(bin, 'review.json'), JSON.stringify({ review: { session: 'ra-1', units: remoteUnits, ids: remoteUnits.map(u => u.id), cancelled: [], cancelledIds: [], hiddenIds: [], errors: [], summary: { units: 3000, pending: 3000 } }, timeline: { edits: remoteUnits } }));
+      // The fakes are one node script behind a launcher: a shell script here, a `.cmd` on Windows, where herdr is
+      // looked for as herdr.exe (only found, never run here).
+      const win = process.platform === 'win32';
+      fs.writeFileSync(path.join(bin, win ? 'herdr.exe' : 'herdr'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+      const fakeOak = path.join(bin, 'oak-fake.js');
+      fs.writeFileSync(fakeOak, `const C = ${JSON.stringify({ log, bin, delay: DELAY, cli: path.resolve(__dirname, '../../cli/dist/index.js') })};\n` + String.raw`
+const fs = require('fs'), path = require('path');
+const args = process.argv.slice(2), all = args.join(' ');
+fs.appendFileSync(C.log, Math.round((performance.timeOrigin + performance.now()) * 1e6) + ' ' + all + '\n');
+const cat = (f) => process.stdout.write(fs.readFileSync(path.join(C.bin, f)));
+const fail = (why, code) => { process.stderr.write(why + '\n'); process.exitCode = code; };
+if (all === 'machine list --json' && fs.existsSync(path.join(C.bin, 'labels-fail'))) fail('oak: herdr is not running', 1);
+else if (all === 'machine list --json') console.log('[{"label":"lab-a","target":"fixture@lab-alias","enabled":true},{"label":"lab-b","enabled":true},{"label":"lab-off","enabled":false}]');
+else if (all === 'sessions --json --machine lab-a') setTimeout(() => cat('a.json'), C.delay);
+else if (all === 'sessions --json --workers --machine lab-a') setTimeout(() => cat('workers.json'), C.delay);
+else if (all === 'sessions --json --workers --machine lab-b' || all === 'sessions --json --machine lab-b') setTimeout(() => fail('oak: ssh: connect to host lab-b port 22: Connection refused', 255), C.delay);
+else if (all.includes('--machine lab-a')) {
+  if (args[0] === 'views') { if (all.includes('review')) cat('review.json'); else if (all.includes('observations')) cat('obs.json'); else console.log('{}'); }
+  else console.log({
+    feed: '{"mode":"audit","title":"Remote","lastTs":0,"entries":[]}',
+    keep: '{"kept":1,"ids":[7]}',
+    diff: '{"file":"/remote/src/lexer.ts","before":"old","after":"new","patch":"+new"}',
+    'editor-review': '{"workspace":"/remote","home":"/home/fixture","hostname":"lab-a","user":"fixture","shares":[],"installed":true}',
+    quote: '{"text":"> the remote reply","sent":false}',
+    comment: '{"text":"","ids":[],"files":[]}',
+  }[args[0]] ?? '{}');
+} else process.exitCode = require('child_process').spawnSync(process.execPath, [C.cli, ...args], { stdio: 'inherit' }).status ?? 1;
+`);
+      const fakeBin = path.join(bin, win ? 'oak.cmd' : 'oak');
+      fs.writeFileSync(fakeBin, win ? `@"${process.execPath}" "${fakeOak}" %*\r\n` : `#!/bin/sh\nexec "${process.execPath}" "${fakeOak}" "$@"\n`, { mode: 0o755 });
+      const lines = () => (fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map((l) => ({ at: Number(l.slice(0, l.indexOf(' '))) / 1e6, args: l.slice(l.indexOf(' ') + 1) })) : []);
+      const settleUp = async (cond, ms = 15000) => { const end = Date.now() + ms; while (!cond() && Date.now() < end) await new Promise((r) => setTimeout(r, 10)); return cond(); };
+      const herdrless = process.env.PATH.split(path.delimiter).filter((d) => !fs.existsSync(path.join(d, win ? 'herdr.exe' : 'herdr'))).join(path.delimiter);
+      const was = { path: process.env.PATH, bin: process.env.CLAUDE_OBSERVATORY_BIN, post: rqView.webview.postMessage, cmPost: cmView.webview.postMessage,
+        err: vscode.window.showErrorMessage, cqp: vscode.window.createQuickPick, showing: { ...rqProvider.showing }, session: configValues['session'] ?? '' };
+      const posts = [], cmPosts = [], errors = [], measured = {};
+      // What runs first: this machine's list (posted, or the picker shown), or the spawn that reads the saved machines.
+      const order = [];
+      let machinesAt = null; // when this machine's list was posted: the poll below only notices it on its next tick
+      const cp = require('child_process');
+      const execFile = cp.execFile, spawn = cp.spawn;
+      // Every child the editor starts here, so the block ends only once they have: a read still catching the index up
+      // holds its lease, and the next block's own catch-up would then be refused.
+      const kids = new Set();
+      const track = (c) => { kids.add(c); c.once('close', () => kids.delete(c)); return c; };
+      cp.execFile = function (file, args, ...rest) { if ([file, ...(Array.isArray(args) ? args : [])].join(' ').endsWith(' machine list --json')) order.push('machine list'); return track(execFile.call(this, file, args, ...rest)); };
+      cp.spawn = function (...a) { return track(spawn.apply(this, a)); };
+      rqView.webview.postMessage = (m) => { posts.push(m); if (m.type === 'machines') { order.push('machines'); machinesAt = performance.now(); } return Promise.resolve(true); };
+      cmView.webview.postMessage = (m) => { cmPosts.push(m); return Promise.resolve(true); };
+      vscode.window.showErrorMessage = (m) => { errors.push(String(m)); return Promise.resolve(undefined); };
+      // The picker stays open until the test answers it, so what it shows at first, and how a landing read rebuilds it, are seen.
+      let open = null;
+      vscode.window.createQuickPick = () => {
+        const qp = was.cqp();
+        const show = qp.show;
+        qp.show = () => { order.push('shown'); open = { qp, at: performance.now(), first: qp.items.slice(), answer: (choose) => { createQuickPickChoose = choose; return show(); } }; return Promise.resolve(); };
+        return qp;
+      };
+      const switchSession = async (choose) => {
+        open = null;
+        const t0 = performance.now();
+        const done = commands['claudeObservatory.switchSession']();
+        await settleUp(() => open);
+        const shownMs = open.at - t0;
+        await open.answer(choose);
+        await done;
+        createQuickPickChoose = null;
+        return shownMs;
+      };
+      try {
+        // No herdr: nothing is asked, and nothing is listed for the saved machines.
+        process.env.PATH = herdrless;
+        rqMsgHandler({ type: 'wantMachines' });
+        await settleUp(() => posts.some((m) => m.type === 'machines'));
+        process.env.PATH = bin + path.delimiter + was.path;
+        process.env.CLAUDE_OBSERVATORY_BIN = fakeBin;
+        // The picker opened before any saved machine is known: it shows first, and the saved machines are read behind it.
+        // herdr answers with an error here, which the open picker then shows (and which leaves nothing cached).
+        fs.writeFileSync(path.join(bin, 'labels-fail'), '');
+        order.length = 0;
+        open = null;
+        const first = commands['claudeObservatory.switchSession']();
+        await settleUp(() => open);
+        const labelsWhy = () => open.qp.items.find((i) => /could not read the saved machines/.test(i.label));
+        await settleUp(labelsWhy);
+        await open.answer(() => undefined);
+        await first;
+        assert.deepEqual(order, ['shown', 'machine list'], 'the picker is shown before the saved machines are read');
+        assert.equal(labelsWhy()?.label, '$(warning) could not read the saved machines — herdr is not running', 'and says why none is listed');
+        fs.rmSync(path.join(bin, 'labels-fail'));
+        // Before any saved machine is read: how long this machine's list takes to show (the Timeline's list, the picker).
+        posts.length = 0;
+        order.length = 0;
+        const t0 = performance.now();
+        rqMsgHandler({ type: 'wantMachines' });
+        measured.savedPostMs = posts.some((m) => m.type === 'saved') ? performance.now() - t0 : null;
+        await settleUp(() => posts.some((m) => m.type === 'machines'));
+        measured.listLocalMs = machinesAt - t0;
+        await settleUp(() => order.includes('machine list'));
+        measured.order = order.slice();
+        // The event loop while the two machines are read: a 5 ms probe's worst lateness.
+        let lag = 0, last = performance.now();
+        const probe = setInterval(() => { const t = performance.now(); lag = Math.max(lag, t - last - 5); last = t; }, 5);
+        const landed = () => { const s = posts.filter((m) => m.type === 'saved').at(-1); return s && s.machines.length === 2 && s.machines.every((m) => !m.reading) ? s : null; };
+        await settleUp(landed);
+        clearInterval(probe);
+        measured.bothLandedMs = performance.now() - t0;
+        measured.maxLoopLagMs = lag;
+        const reads = lines().filter((l) => l.args.startsWith('sessions --json --machine '));
+        measured.readStartsMs = reads.map((l) => Math.round(l.at - reads[0].at));
+        measured.pickerShownMs = [];
+        for (let i = 0; i < 5; i++) measured.pickerShownMs.push(await switchSession(() => undefined));
+        if (process.env.OAK_MEASURE_OUT) fs.writeFileSync(process.env.OAK_MEASURE_OUT, JSON.stringify(measured, null, 1));
+        assert.deepEqual(measured.order, ['machines', 'machine list'], 'this machine\'s list is posted before the saved machines are read');
+        // What was asked: the list of saved machines, then each enabled one's sessions, both at once.
+        assert.equal(measured.savedPostMs !== null, true, 'what the last read gave is posted at once, before any machine answers');
+        assert.ok(measured.listLocalMs < DELAY, `this machine's list did not wait for the saved machines (${measured.listLocalMs} ms)`);
+        assert.deepEqual(reads.map((l) => l.args).sort(), ['sessions --json --machine lab-a', 'sessions --json --machine lab-b'], 'each enabled saved machine, once');
+        assert.ok(reads[1].at - reads[0].at < DELAY / 2, `read in parallel: started ${reads[1].at - reads[0].at} ms apart`);
+        assert.ok(measured.bothLandedMs < 2 * DELAY, `both landed by ${measured.bothLandedMs} ms, under two delays`);
+        // The Overview's worker rows consume the same landed cache as the Timeline and picker.
+        const workerWasVisible = cmView.visible;
+        cmView.visible = true;
+        cmProvider.postWorkerMachines([]);
+        assert.deepEqual(cmPosts.filter(m => m.type === 'workerMachines').at(-1).machines.map(m => [m.label, m.sessions[0]?.id]), [['lab-a', 'ra-1']]);
+        cmProvider.postWorkerMachines([]);
+        assert.equal(lines().filter(l => l.args.startsWith('sessions --json --machine ')).length, 2, 'worker and session refreshes share the same two remote calls');
+        cmView.visible = workerWasVisible;
+        const [a, b] = landed().machines;
+        assert.equal(a.label, 'lab-a');
+        assert.deepEqual(a.listing.sessions.map((r) => r.id), ['ra-1']);
+        assert.equal(a.error, null);
+        assert.ok(a.readAt >= now, 'with when it was read');
+        assert.equal(b.label, 'lab-b');
+        assert.equal(b.listing, null);
+        assert.equal(b.error, 'ssh: connect to host lab-b port 22: Connection refused', 'why, in the CLI\'s words');
+        assert.equal(b.readAt, null, 'never read');
+        // Opened again at once: shown from the last read, and no machine is read again within ten seconds.
+        const before = lines().length;
+        posts.length = 0;
+        rqMsgHandler({ type: 'wantMachines' });
+        assert.deepEqual(posts.find((m) => m.type === 'saved').machines.map((m) => [m.label, m.listing?.sessions.length ?? null]), [['lab-a', 1], ['lab-b', null]]);
+        await settleUp(() => posts.some((m) => m.type === 'machines'));
+        await new Promise((r) => setTimeout(r, 100));
+        assert.equal(lines().slice(before).filter((l) => l.args.includes('--machine')).length, 0, 'no machine read again within ten seconds');
+        // Switching to Workers upgrades the fresh Sessions-only answer without waiting ten seconds.
+        cmView.visible = true;
+        cmMsgHandler({ type: 'workersVisible', visible: true });
+        await settleUp(() => cmPosts.some(m => m.type === 'workers' && m.workers.some(w => w.session === 'ra-1')));
+        const workerReads = lines().filter(l => l.args.startsWith('sessions --json --workers '));
+        assert.equal(workerReads.length, 2, 'one Workers upgrade for each saved machine');
+        cmMsgHandler({ type: 'workersVisible', visible: true });
+        cmProvider.postWorkerMachines([]);
+        assert.equal(lines().filter(l => l.args.startsWith('sessions --json --workers ')).length, 2, 'visible consumers share the read');
+        cmMsgHandler({ type: 'workersVisible', visible: false });
+        cmView.visible = workerWasVisible;
+        // The picker: this machine's sessions first, then each saved machine's under its label, with its age or its reason.
+        let items = null;
+        await switchSession((its) => { items = its; return undefined; });
+        const seps = items.filter((i) => i.note).map((i) => i.label);
+        assert.ok(seps.some(s => s.startsWith('lab-a · read ')), seps.join(' | '));
+        assert.ok(seps.some(s => s.startsWith('lab-b · could not list')), seps.join(' | '));
+        const remoteRow = items.find((i) => i.remote === 'lab-a');
+        assert.equal(remoteRow?.id, 'ra-1');
+        assert.match(remoteRow.description, /^on lab-a · Opus 4\.8 · /);
+        const locals = items.filter((i) => i.id && !i.remote && !i.synced && !i.note && i.kind !== vscode.QuickPickItemKind.Separator);
+        assert.ok(locals.length > 0);
+        assert.ok(items.filter(i => i.note).every(i => items.indexOf(i) < items.indexOf(remoteRow)), 'machine states precede rows');
+        const why = items.find((i) => /lab-b · could not list/.test(i.label));
+        assert.equal(why?.label, 'lab-b · could not list sessions — ssh: connect to host lab-b port 22: Connection refused · never read');
+        assert.equal(why.note, true);
+        // A row of a machine's listing only: anything else is not acted on.
+        rqMsgHandler({ type: 'pickRemote', id: 'not-listed', machine: 'lab-a' });
+        rqMsgHandler({ type: 'pickRemote', id: 'ra-1', machine: 'lab-b' });
+        await new Promise((r) => setTimeout(r, 50));
+        assert.ok(!lines().some((l) => l.args.startsWith('feed ')), 'nothing read for a row no listing holds');
+        // Picked: every read of the session runs there (the Timeline and the Overview on screen, as they read only then).
+        const mark = lines().length;
+        rqView.visible = cmView.visible = true;
+        rqMsgHandler({ type: 'view', tab: 'observations', grouped: false, shows: { prompts: true, observations: true, actions: false, feed: true } });
+        await switchSession((its) => its.find((i) => i.remote === 'lab-a' && i.id === 'ra-1'));
+        const obs = () => posts.filter((m) => m.type === 'rows' && m.tab === 'observations' && m.parent === '' && m.note && m.rows.length).at(-1);
+        assert.ok(await settleUp(() => obs()), 'the Observations tab is served from that machine');
+        assert.match(obs().note, /^On lab-a — read there with oak observations --machine lab-a at /, 'and says where it was read');
+        assert.ok(obs().rows.some((r) => r.label === 'src/lexer.ts' && r.acts.some((x) => x.v === 'remoteKeep')), JSON.stringify(obs().rows.map((r) => [r.label, r.acts])));
+        assert.ok(await settleUp(() => lines().slice(mark).some((l) => l.args.startsWith('views --views changemap,multitask,processes --json --session ra-1 --machine lab-a'))), 'the Overview reads it there');
+        // Each read waited for, as each is a process of its own that logs its call once it has started: in no set order.
+        assert.ok(await settleUp(() => lines().slice(mark).some((l) => /^feed --json --machine lab-a --session ra-1 /.test(l.args))), 'the Feed reads it there');
+        assert.ok(await settleUp(() => lines().slice(mark).some((l) => l.args === 'views --views prompts --json --session ra-1 --machine lab-a')), 'the Prompts tab reads it there');
+        const there = lines().slice(mark).map((l) => l.args);
+        // This machine's own list is still read here, for the selector (`--session` only marks which row is current).
+        assert.ok(!there.some((x) => /--session ra-1/.test(x) && !/--machine lab-a/.test(x) && !/^sessions --json --root /.test(x)), `nothing of it is read here: ${there.filter((x) => /ra-1/.test(x)).join(' | ')}`);
+        // Stats counts what awaits review there from its listing row, and Review says where its review runs.
+        const stPost = stView.webview.postMessage, stGot = [];
+        stView.webview.postMessage = (m) => stGot.push(m);
+        try { stProvider.refresh(); } finally { stView.webview.postMessage = stPost; }
+        const rc = stGot.filter((m) => m.type === 'counts').at(-1);
+        assert.deepEqual([rc?.c, rc?.remote], [null, { machine: 'lab-a', edits: 1, pending: 1 }], 'Stats: none of this machine\'s counts');
+        rvMsgs.length = 0;
+        rvOnMsg({ type: 'ready' });
+        assert.ok(await settleUp(() => rvMsgs.some(m => m.type === 'review' && m.data?.units?.length === 3000)), 'remote Review lists all 3000 units');
+        assert.equal(rvMsgs.filter(m => m.data?.units).at(-1).data.pending, 3000);
+        // An edit there: Keep runs there, and its patch opens as that machine's CLI prints it, under a line that says so.
+        const editKey = obs().rows.find((r) => r.label === 'src/lexer.ts').key;
+        rqMsgHandler({ type: 'rowAct', tab: 'observations', key: editKey, verb: 'remoteKeep' });
+        assert.ok(await settleUp(() => lines().some((l) => l.args === 'keep 7 --session ra-1 --json --machine lab-a')), lines().slice(-5).map((l) => l.args).join(' | '));
+        const opened = openFolderCalls.length;
+        rqMsgHandler({ type: 'agentOpenEditFile', id: 7 });
+        assert.ok(await settleUp(() => openFolderCalls.length > opened), 'the remote workspace opens');
+        assert.ok(lines().some(l => l.args.startsWith('editor-review prepare ') && l.args.includes('--edit 7') && l.args.endsWith('--machine lab-a')));
+        assert.equal(openFolderCalls.at(-1)[0].authority, 'ssh-remote+fixture@lab-alias');
+        assert.equal(openFolderCalls.at(-1)[1].forceNewWindow, true);
+        const diffCount = diffCalls.length;
+        await commands['claudeObservatory.remoteDiff']('lab-a', 'ra-1', 7);
+        assert.equal(diffCalls.length, diffCount + 1, 'explicit Diff opens the native viewer');
+        assert.ok(lines().some(l => l.args === 'diff 7 --contents --json --session ra-1 --machine lab-a'));
+        // Quote and review comments: composed there.
+        const note = inputBoxValue;
+        inputBoxValue = undefined;
+        try { await commands['claudeObservatory.quoteLastReply'](); } finally { inputBoxValue = note; }
+        assert.ok(lines().some((l) => l.args === 'quote --session ra-1 --json --machine lab-a'));
+        assert.equal(clipboardText, '> the remote reply', 'the reply quoted there');
+        await commands['claudeObservatory.sendReviewComments']();
+        assert.ok(lines().some((l) => l.args === 'comment compose --session ra-1 --json --machine lab-a'));
+        assert.equal(infoMessages.at(-1), 'OAK: no review comments to send on lab-a.');
+        assert.deepEqual(errors, [], 'nothing failed');
+      } finally {
+        // Back to this machine's session, with no saved machine listed: a run without herdr empties the list.
+        await commands['claudeObservatory.pinSession'](was.session);
+        process.env.PATH = herdrless;
+        posts.length = 0;
+        rqMsgHandler({ type: 'wantMachines' });
+        await settleUp(() => posts.some((m) => m.type === 'machines')); // its post lands here, not in the next block's
+        process.env.PATH = was.path;
+        process.env.CLAUDE_OBSERVATORY_BIN = was.bin;
+        rqMsgHandler({ type: 'view', tab: 'prompts', grouped: false, shows: was.showing });
+        rqView.visible = cmView.visible = false;
+        rqView.webview.postMessage = was.post;
+        cmView.webview.postMessage = was.cmPost;
+        vscode.window.showErrorMessage = was.err;
+        vscode.window.createQuickPick = was.cqp;
+        cp.execFile = execFile;
+        cp.spawn = spawn;
+        createQuickPickChoose = null;
+        assert.ok(await settleUp(() => kids.size === 0, 60000), `what the editor started here has ended: ${[...kids].map((c) => c.spawnargs.join(' ')).join(' | ')}`);
+      }
+    }
+    // Every other machine's sessions (0.11.0). oak sync brought a machine's records here: the Timeline's list asks for
+    // them when it opens (read in-process from the local index), each under its machine with when they arrived, and a
+    // pick says what is known of the session, read-only, with a fetch that brings it here.
+    {
+      const host = 'b0b0b0b0b0b0';
+      const at = Date.now() - 3 * 3600_000;
+      const segment = path.join(core.rootDir(), 'records', host, `${at}-0badf00d.jsonl`);
+      fs.mkdirSync(path.dirname(segment), { recursive: true });
+      fs.writeFileSync(segment, [
+        { t: 'batch', at, v: 1, label: 'build-box', platform: 'linux' },
+        { t: 'sessions', r: { session_id: 'remote-one', agent: 'claude', origin: 'local', review: 0, title: 'Tune the remote parser', workspace: '~/remote',
+          last_active_ms: at, tokens: 120, edits: 2, pending: 1, files: 1, model: 'Opus 4.8' } },
+      ].map((x) => JSON.stringify(x)).join('\n') + '\n');
+      const arrivedFrom = Date.now();
+      const caught = core.useIndex({ budgetMs: Infinity, inlineBytes: Infinity });
+      assert.ok(caught.ok && caught.catchUp.caughtUp, JSON.stringify(caught.ok ? caught.catchUp.problems : caught.reason));
+      caught.close();
+      const arrivedBy = Date.now();
+      const settleUp = async (cond) => { for (let i = 0; i < 1500 && !cond(); i++) await new Promise((r) => setTimeout(r, 10)); };
+      const posts = [];
+      const rqPost = rqView.webview.postMessage;
+      rqView.webview.postMessage = (m) => { posts.push(m); return Promise.resolve(true); };
+      const info = vscode.window.showInformationMessage, err = vscode.window.showErrorMessage;
+      try {
+        rqMsgHandler({ type: 'wantMachines' });
+        await settleUp(() => posts.some((m) => m.type === 'machines'));
+        const listed = posts.find((m) => m.type === 'machines').machines;
+        assert.deepEqual(listed.map((m) => [m.label, m.host, m.sessions.map((x) => [x.id, x.origin, x.machine, x.title])]),
+          [['build-box', host, [['remote-one', 'synced', 'build-box', 'Tune the remote parser']]]], 'by its label');
+        assert.ok(listed[0].syncedAt >= arrivedFrom && listed[0].syncedAt <= arrivedBy, 'with when its records arrived in the index (no oak sync run has named it)');
+        // The webview draws them under the machine, after this machine's rows (editor-fixes.test.js renders it).
+        // A pick: what is known of it, read-only, and a fetch.
+        const shown = [], errors = [];
+        let answer;
+        vscode.window.showInformationMessage = (m, opts, ...items) => { shown.push({ m: String(m), opts, items }); return Promise.resolve(answer); };
+        vscode.window.showErrorMessage = (m) => { errors.push(String(m)); return Promise.resolve(undefined); };
+        rqMsgHandler({ type: 'pickSynced', id: 'remote-one', host });
+        await settleUp(() => shown.length > 0);
+        assert.equal(shown[0].m, 'OAK: “Tune the remote parser” is build-box’s session');
+        assert.equal(shown[0].opts.modal, true);
+        assert.match(shown[0].opts.detail, /build-box · ~\/remote · claude · Opus 4\.8\n.*2 edits \(1 pending\)[\s\S]*on build-box: fetching brings a copy here \(oak sync fetch remote-one\)/);
+        assert.deepEqual(shown[0].items, ['Fetch it here']);
+        // Fetching runs `oak sync fetch`, which here reaches no machine: said, and nothing is pinned.
+        const pinsBefore = configWrites.length;
+        answer = 'Fetch it here';
+        rqMsgHandler({ type: 'pickSynced', id: 'remote-one', host });
+        await settleUp(() => errors.length > 0);
+        assert.match(errors[0], /^OAK: could not fetch “Tune the remote parser” — no machine's inventory lists session remote-one/, 'in the words of `oak sync fetch`');
+        assert.equal(configWrites.length, pinsBefore, 'a fetch that failed pins nothing');
+        // One fetch of a session at a time: a second pick while it runs says so and starts none.
+        shown.length = 0;
+        errors.length = 0;
+        rqMsgHandler({ type: 'pickSynced', id: 'remote-one', host });
+        rqMsgHandler({ type: 'pickSynced', id: 'remote-one', host });
+        await settleUp(() => errors.length > 0);
+        assert.ok(shown.some((x) => x.m === 'OAK: “Tune the remote parser” is being fetched already'), JSON.stringify(shown.map((x) => x.m)));
+        assert.equal(errors.length, 1, 'one fetch ran');
+        // An id or a machine the list did not show is not acted on.
+        shown.length = 0;
+        rqMsgHandler({ type: 'pickSynced', id: 'remote-one', host: 'c0c0c0c0c0c0' });
+        rqMsgHandler({ type: 'pickSynced', id: 'not-listed', host });
+        await new Promise((r) => setTimeout(r, 50));
+        assert.equal(shown.length, 0);
+        // The full picker lists them too, under a separator naming the machine and when its records arrived.
+        answer = undefined;
+        let items = null;
+        createQuickPickChoose = (its) => { items = its; return its.find((i) => i.synced); };
+        await commands['claudeObservatory.switchSession']();
+        createQuickPickChoose = null;
+        const sep = items.find((i) => i.note && i.label.startsWith('build-box'));
+        assert.equal(sep?.label, `build-box · synced ${core.relTime(listed[0].syncedAt)}`);
+        assert.ok(items.findIndex((i) => i.id === S) >= 0 && items.indexOf(sep) < items.findIndex((i) => i.id === S), 'state above all session rows');
+        assert.equal(shown.at(-1)?.m, 'OAK: “Tune the remote parser” is build-box’s session', 'picked: the same read-only view');
+        // With the index off here there is nothing to list, and no CLI is started to learn so.
+        const childProcess = require('child_process');
+        const spawnOf = childProcess.spawn;
+        const asked = [];
+        childProcess.spawn = function (file, args) { asked.push(args || []); return spawnOf.apply(this, arguments); };
+        process.env.OAK_INDEX = 'off';
+        try {
+          posts.length = 0;
+          rqMsgHandler({ type: 'wantMachines' });
+          await settleUp(() => posts.some((m) => m.type === 'machines'));
+          assert.deepEqual(posts.find((m) => m.type === 'machines').machines, []);
+          assert.equal(asked.filter((a) => a.includes('--synced')).length, 0, 'no listing started for it');
+        } finally {
+          delete process.env.OAK_INDEX;
+          childProcess.spawn = spawnOf;
+        }
+      } finally {
+        rqView.webview.postMessage = rqPost;
+        vscode.window.showInformationMessage = info;
+        vscode.window.showErrorMessage = err;
+        fs.rmSync(path.dirname(segment), { recursive: true, force: true });
+      }
+    }
+    // A Codex rollout written anywhere on the machine woke this window for a full refresh. The local index knows each
+    // rollout's session and the folder it ran in: another workspace's rollout refreshes nothing; this workspace's, one
+    // below it, the session under review wherever it ran, and one the index does not hold yet, do.
+    {
+      const settleUp = async (cond) => { for (let i = 0; i < 300 && !cond(); i++) await new Promise((r) => setTimeout(r, 10)); };
+      const codex = fsWatchers.find((w) => String(w.pattern) === '{sessions,archived_sessions}/**/*.jsonl' && !w.disposed);
+      assert.ok(codex && codex.change.length, 'control: the Codex watcher is registered');
+      const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-ext-other-'));
+      tmpDirs.push(elsewhere);
+      const rollout = (id, cwd) => {
+        const f = path.join(core.codexHome(), 'sessions', '2026', '10', '31', `rollout-2026-10-31T10-00-00-${id}.jsonl`);
+        fs.mkdirSync(path.dirname(f), { recursive: true });
+        fs.writeFileSync(f, [{ timestamp: '2026-10-31T10:00:00Z', type: 'session_meta', payload: { id, cwd } },
+          { timestamp: '2026-10-31T10:00:01Z', type: 'event_msg', payload: { type: 'user_message', message: 'Work there' } }].map((x) => JSON.stringify(x)).join('\n') + '\n');
+        return f;
+      };
+      const theirs = rollout('00000000-0000-4000-8000-00000000c0de', elsewhere);
+      const ours = rollout('00000000-0000-4000-8000-00000000c0df', ws);
+      fs.mkdirSync(path.join(ws, 'pkg'), { recursive: true });
+      const below = rollout('00000000-0000-4000-8000-00000000c0e1', path.join(ws, 'pkg'));
+      const reviewed = rollout('00000000-0000-4000-8000-00000000c0e2', elsewhere);
+      const caught = core.useIndex({ budgetMs: Infinity, inlineBytes: Infinity });
+      assert.ok(caught.ok && caught.catchUp.caughtUp);
+      caught.close();
+      let unknown;
+      let refreshed = 0;
+      const realRefresh = cmProvider.refresh.bind(cmProvider);
+      cmProvider.refresh = (...a) => { refreshed++; return realRefresh(...a); };
+      try {
+        const fire = async (file) => { refreshed = 0; codex.change.forEach((f) => f(vscode.Uri.file(file))); await new Promise((r) => setTimeout(r, 1500)); return refreshed; };
+        assert.equal(await fire(theirs), 0, 'another workspace\'s rollout: no refresh');
+        assert.ok(await fire(ours) > 0, 'this workspace\'s rollout: a refresh');
+        assert.ok(await fire(below) > 0, 'one that ran below this workspace: a refresh');
+        assert.equal(await fire(reviewed), 0, 'control: another workspace\'s');
+        configValues.session = '00000000-0000-4000-8000-00000000c0e2';
+        try {
+          assert.ok(await fire(reviewed) > 0, 'the session under review, wherever it ran: a refresh');
+        } finally {
+          delete configValues.session;
+        }
+        // …and one the Timeline shows, connected from the Overview (the window's own session is connected back after).
+        cmMsgHandler({ type: 'feed', kind: 'session', id: '00000000-0000-4000-8000-00000000c0e2', label: 'Elsewhere' });
+        try {
+          assert.ok(await fire(reviewed) > 0, 'a session the Timeline shows, wherever it ran: a refresh');
+        } finally {
+          cmMsgHandler({ type: 'feed', kind: 'session', id: S, label: 'Back' });
+        }
+        // Usage refreshes also catch up the database now; create this after those refreshes.
+        unknown = rollout('00000000-0000-4000-8000-00000000c0e0', elsewhere);
+        assert.ok(await fire(unknown) > 0, 'a rollout the database does not hold yet: a refresh');
+        // Once a catch-up holds it (another process's commit moves PRAGMA data_version), the map is read again.
+        const again = core.useIndex({ budgetMs: Infinity, inlineBytes: Infinity });
+        assert.ok(again.ok && again.catchUp.caughtUp);
+        again.close();
+        assert.equal(await fire(unknown), 0, 'held by the index since, as another workspace\'s: no refresh');
+      } finally {
+        cmProvider.refresh = realRefresh;
+        for (const f of [theirs, ours, below, reviewed, unknown].filter(Boolean)) fs.rmSync(f, { force: true });
+      }
+    }
+    // Accept All scoped to a session checks that the window may act on it against this machine's listing as the local
+    // index composes it, read in-process: a session the index lists is accepted without composing the listing from every
+    // session's files (here, one whose transcript went after the last catch-up, which the files no longer list).
+    {
+      const ID = 'indexListed';
+      core.ensureStore(ID);
+      const g = path.join(ws, 'indexed.ts');
+      fs.writeFileSync(g, 'x\n');
+      core.appendLog(ID, { id: 1, ts: 6000, tool: 'Edit', file: g, status: 'pending', beforeBlob: core.writeBlob(ID, Buffer.from('x\n')), afterBlob: core.writeBlob(ID, Buffer.from('x\nz\n')) });
+      const tx = path.join(proj, ID + '.jsonl');
+      fs.writeFileSync(tx, JSON.stringify({ timestamp: new Date(6000).toISOString(), type: 'user', cwd: ws, message: { role: 'user', content: 'indexed' } }) + '\n');
+      const old = (Date.now() - 3_600_000) / 1000;
+      fs.utimesSync(tx, old, old);
+      const caught = core.useIndex({ budgetMs: Infinity, inlineBytes: Infinity });
+      assert.ok(caught.ok && caught.catchUp.caughtUp);
+      caught.close();
+      fs.rmSync(tx);
+      assert.ok(!core.sessionMeta(ws).sessions.some((r) => r.id === ID), 'control: the files no longer list it');
+      await commands['claudeObservatory.keepAll'](ID);
+      assert.equal(core.readLog(ID).filter((r) => r.status === 'pending').length, 0, 'accepted: the index listed it');
     }
     // showSessions itself: reveal the Overview, then bring its Sessions tab forward — through the tour's
     // OWN path (setTour), so one mechanism moves that tab strip and the two can never disagree.
@@ -4349,7 +5922,7 @@ test('extension: three views, click commands, inline annotations, chat, status s
       let pressedRow = null;
       createQuickPickButton = (items) => {
         pressedRow = items.find((i) => i.id === S) || null;
-        return pressedRow && { item: pressedRow, button: pressedRow.buttons[0] };
+        return pressedRow && { item: pressedRow, button: pressedRow.buttons.find(b => /Reveal.*store/.test(b.tooltip)) };
       };
       createQuickPickChoose = () => undefined; // then dismiss the picker
       openExternalCalls.length = 0;
@@ -4359,7 +5932,7 @@ test('extension: three views, click commands, inline annotations, chat, status s
         createQuickPickButton = null;
         createQuickPickChoose = null;
       }
-      assert.ok(pressedRow && pressedRow.buttons.length === 2, 'control: the seeded session’s row carries the store button');
+      assert.ok(pressedRow && pressedRow.buttons.some(b => /Reveal.*store/.test(b.tooltip)), 'control: the seeded session’s row carries the store button');
       assert.deepEqual(openExternalCalls.map((u) => u.path), [core.storeDir(S)], 'the picker’s folder button opens that row’s store folder');
     }
 
@@ -4642,7 +6215,517 @@ test('extension: three views, click commands, inline annotations, chat, status s
       core.recordOnly(S, [held.id], 'undo');
       assert.equal(core.findRecord(S, held.id).status, 'undone');
     }
+
+    // A sort order that cannot be saved (prefs.json does not parse, so it is left as it is) is not applied, and says so.
+    {
+      const file = core.prefsPath();
+      const was = fs.existsSync(file) ? fs.readFileSync(file) : null;
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, '{"theme": "mono",');
+      try {
+        const said = statusMessages.length;
+        await commands['claudeObservatory.cycleSort']();
+        await commands['claudeObservatory.applySort']('name');
+        assert.deepEqual(statusMessages.slice(said), Array(2).fill('OAK: sort order not saved — prefs.json is not valid JSON, so it was left as it is'));
+        assert.equal(fs.readFileSync(file, 'utf8'), '{"theme": "mono",', 'and the file is as it was');
+      } finally {
+        if (was) fs.writeFileSync(file, was); else fs.rmSync(file, { force: true });
+      }
+    }
+
+    // Store location: the new location is written over prefs.json as it is once the move lands, not over the copy read
+    // before the pick and the folder dialog, and the store watcher follows the store there and back.
+    {
+      const def = core.rootDir();
+      const dest = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'cc-ext-store-')), 'observatory');
+      tmpDirs.push(path.dirname(dest));
+      const edits = core.readLog(S).length;
+      const watching = () => fsWatchers.filter((w) => !w.disposed && String(w.pattern).includes('log.jsonl')).map((w) => w.base && w.base.fsPath);
+      assert.deepEqual(watching(), [Uri.file(def).fsPath], 'control: one store watcher, on the default location');
+      const wasPick = quickPick, wasAnswer = openDialogAnswer;
+      try {
+        quickPick = 1; // "Move it…"
+        openDialogAnswer = () => { core.writePrefs({ ...core.readPrefs(), billDay: 12 }); return [Uri.file(dest)]; };
+        await commands['claudeObservatory.storeLocation']();
+        assert.equal(core.readPrefs().storeDir, dest, 'the move is recorded');
+        assert.equal(core.readPrefs().billDay, 12, 'and the setting made while the dialog was open is kept');
+        assert.equal(core.readLog(S).length, edits, 'the session is read from where it went');
+        assert.deepEqual(watching(), [Uri.file(dest).fsPath], 'the store watcher follows the store');
+        // oak sync's watchers too: its own files move with the store, and prefs.json, beside the config, does not.
+        const syncWatch = (pattern) => fsWatchers.filter((w) => !w.disposed && String(w.pattern) === pattern).map((w) => w.base && w.base.fsPath);
+        assert.deepEqual(syncWatch('sync/{status.json,conflicts.json,now.lock,key}'), [Uri.file(dest).fsPath], 'sync\'s files are watched where the store went');
+        assert.deepEqual(syncWatch('prefs.json'), [Uri.file(path.dirname(core.prefsPath())).fsPath], 'and prefs.json where it stays');
+        quickPick = 2; // "Restore the default location"
+        // An edit an agent made meanwhile that could not wait for the move is said, not only recorded as a capture gap.
+        fs.writeFileSync(path.join(core.storeMoveDir(), 'missed-22222222-2222-2222-2222-222222222222.json'), JSON.stringify({ session: S, file: '/w/m.ts', reason: 'r — edit not captured', ts: 1 }));
+        const warned = warnMessages.length;
+        await commands['claudeObservatory.storeLocation']();
+        assert.equal(core.readPrefs().storeDir, undefined, 'moved back');
+        assert.deepEqual(warnMessages.slice(warned), [`OAK: store moved to ${def} — 1 edit could not wait for the move and was not captured; it is recorded as a capture gap in its session`]);
+        assert.ok(core.readSkips(S).some((k) => k.file === '/w/m.ts'), 'and the gap is in its session');
+        // A move prefs.json cannot record, and that cannot be undone, says so: here the default folder cannot come back
+        // with the new location in it, nor the store go back to it.
+        {
+          const prefsFile = core.prefsPath();
+          const rename = fs.renameSync, err = vscode.window.showErrorMessage, said = [];
+          fs.renameSync = function (a, b, ...r) {
+            if (String(b) === def || String(a) === dest) throw Object.assign(new Error('EBUSY: resource busy or locked'), { code: 'EBUSY' });
+            return rename.call(this, a, b, ...r);
+          };
+          vscode.window.showErrorMessage = (m) => { said.push(String(m)); return Promise.resolve(undefined); };
+          try {
+            quickPick = 1; // "Move it…"
+            openDialogAnswer = () => [Uri.file(dest)];
+            await commands['claudeObservatory.storeLocation']();
+          } finally {
+            fs.renameSync = rename;
+            vscode.window.showErrorMessage = err;
+          }
+          assert.deepEqual(said, [`OAK: the store moved to ${dest}, but prefs.json could not record it, so OAK looks for it where it was — EBUSY: resource busy or locked`]);
+          // Put back as the message says: record where it is, then move it home.
+          fs.mkdirSync(path.dirname(prefsFile), { recursive: true });
+          fs.writeFileSync(prefsFile, JSON.stringify({ storeDir: dest, billDay: 12 }));
+          core.clearRootMemo();
+          assert.ok(core.moveStore(def).moved, 'control: recorded, it moves back');
+        }
+        assert.equal(core.readPrefs().billDay, 12);
+        assert.equal(core.readLog(S).length, edits);
+        assert.deepEqual(watching(), [Uri.file(def).fsPath], 'and the watcher with it');
+        // Moved from outside the window (the terminal app, `oak store --move`): the next refresh follows it.
+        const elsewhere = path.join(path.dirname(dest), 'elsewhere');
+        assert.ok(core.moveStore(elsewhere).moved, 'control: moved from outside the window');
+        core.writePrefs({ ...core.readPrefs(), storeDir: elsewhere });
+        await commands['claudeObservatory.refresh']('noSweep');
+        assert.deepEqual(watching(), [Uri.file(elsewhere).fsPath], 'a move made elsewhere is followed at the next refresh');
+        assert.ok(core.moveStore(def).moved, 'control: moved back from outside');
+        const unmoved = core.readPrefs();
+        delete unmoved.storeDir;
+        core.writePrefs(unmoved);
+        await commands['claudeObservatory.refresh']('noSweep');
+        assert.deepEqual(watching(), [Uri.file(def).fsPath]);
+      } finally {
+        quickPick = wasPick;
+        openDialogAnswer = wasAnswer;
+        const p = core.readPrefs();
+        delete p.billDay;
+        core.writePrefs(p);
+      }
+    }
+
+    // A user Refresh applies a newly-added `.observatoryignore` only after counting (core, in-process) and
+    // asking, as the terminal app does: the sweep cannot be undone. A mutation's own refresh never asks.
+    // The count never goes through the CLI, because an older one ignores `ignore --dry-run` and sweeps.
+    {
+      const IGF = path.join(ws, 'refresh-ignored.log');
+      const IGN = path.join(ws, '.observatoryignore');
+      const seedIgnored = (ts) => core.appendLog(S, { ts, tool: 'Edit', file: IGF, beforeBlob: core.writeBlob(S, Buffer.from('')), afterBlob: core.writeBlob(S, Buffer.from('x\n')), status: 'pending' });
+      const ig = seedIgnored(9995);
+      fs.writeFileSync(IGN, 'refresh-ignored.log\n');
+      const kept = (id = ig.id) => core.readLog(S).some((r) => r.id === id);
+      const asked = [], errors = [];
+      let answer = () => undefined; // Cancel
+      const warn = vscode.window.showWarningMessage, err = vscode.window.showErrorMessage, wasSession = configValues['session'];
+      configValues['session'] = S;
+      vscode.window.showWarningMessage = (m, opts, ...items) => { asked.push({ m: String(m), opts, items }); return Promise.resolve(answer(items)); };
+      vscode.window.showErrorMessage = (m) => { errors.push(String(m)); return Promise.resolve(undefined); };
+      const notABin = path.join(ws, 'not-a-binary-refresh');
+      fs.writeFileSync(notABin, 'this is not executable\n');
+      // A 0.10-style CLI: it answers review protocol 1 and ignores `--dry-run`, so `ignore --dry-run` SWEEPS.
+      const olderLog = path.join(ws, 'older-oak-argv.log');
+      const older = path.join(ws, 'older-oak');
+      fs.writeFileSync(older, `#!/bin/sh\nprintf '%s\\n' "$*" >> ${JSON.stringify(olderLog)}\n[ "$1" = __review-protocol ] && { echo 1; exit 0; }\n` +
+        `for a in "$@"; do shift; [ "$a" = --dry-run ] || set -- "$@" "$a"; done\nexec ${JSON.stringify(TREE_OAK)} "$@"\n`);
+      fs.chmodSync(older, 0o755);
+      try {
+        await commands['claudeObservatory.refresh']();
+        assert.equal(asked.length, 1, 'the Refresh asks before the sweep');
+        assert.equal(asked[0].m, `Drop the 1 recorded edit in ${S.slice(0, 8)} that .observatoryignore covers?`, 'naming the count and the session');
+        assert.equal(asked[0].opts.modal, true, '…in a modal');
+        assert.match(asked[0].opts.detail, /cannot be undone/, '…that says the drop cannot be undone');
+        assert.deepEqual(asked[0].items, ['Drop']);
+        assert.ok(kept(), 'Cancel keeps the now-ignored edit');
+        await commands['claudeObservatory.refresh']('noSweep');
+        assert.equal(asked.length, 1, 'a refresh after a mutation does not ask');
+        // …and every refresh that follows a mutation passes it: the only sweeping call is the Overview's
+        // own Refresh message (the toolbar buttons and the palette invoke the command with no argument).
+        const src = fs.readFileSync(path.join(__dirname, '../src/extension.ts'), 'utf8');
+        const calls = [...src.matchAll(/executeCommand\('claudeObservatory\.refresh'([^)]*)\)/g)];
+        assert.ok(calls.length >= 7, `control: the refresh calls were found (${calls.length})`);
+        const sweeping = calls.filter((m) => m[1] !== ', NO_SWEEP').map((m) => [...src.slice(Math.max(0, m.index - 400), m.index).matchAll(/m\.type === '(\w+)'/g)].pop()?.[1] ?? `line ${src.slice(0, m.index).split('\n').length}`);
+        assert.deepEqual(sweeping, ['refresh'], 'only the Overview\'s Refresh message sweeps');
+        // No CLI, and an older CLI that would sweep on `--dry-run`: the count is core's either way, so the
+        // Refresh still asks with the real count, reports no error, and Cancel keeps the edit.
+        const fakes = process.platform === 'win32' ? [notABin] : [notABin, older];
+        for (const fake of fakes) {
+          process.env.CLAUDE_OBSERVATORY_BIN = fake;
+          const before = asked.length, errs = errors.length;
+          try { await commands['claudeObservatory.refresh'](); } finally { process.env.CLAUDE_OBSERVATORY_BIN = TREE_OAK; }
+          assert.equal(asked.length, before + 1, `${path.basename(fake)}: the Refresh still asks, with core's count`);
+          assert.match(asked[before].m, /^Drop the 1 recorded edit /, `${path.basename(fake)}: …of 1`);
+          assert.deepEqual(errors.slice(errs), [], `${path.basename(fake)}: …and reports no error`);
+          assert.ok(kept(), `${path.basename(fake)}: …and Cancel keeps the edit`);
+        }
+        if (process.platform !== 'win32') {
+          const ran = fs.existsSync(olderLog) ? fs.readFileSync(olderLog, 'utf8') : '';
+          assert.ok(!/^ignore/m.test(ran), `the Refresh never ran the CLI's ignore: ${ran}`);
+          // Control: this fake really does sweep on `ignore --dry-run`, as 0.10 does.
+          const probe = seedIgnored(9996);
+          const r = core.spawnToolSync(older, ['ignore', '--dry-run', '--session', S, '--json'], { encoding: 'utf8', cwd: ws });
+          assert.equal(r.status, 0, `control: the older fake ran: ${r.stderr}`);
+          assert.ok(!kept(probe.id) && !kept(), 'control: the older fake swept on --dry-run');
+          seedIgnored(9997);
+        }
+        const drop = core.readLog(S).filter((r) => r.file === IGF).map((r) => r.id);
+        assert.equal(drop.length, 1, 'control: one now-ignored edit is left to drop');
+        const confirms = asked.length;
+        answer = (items) => items[0];
+        await commands['claudeObservatory.refresh']();
+        assert.equal(asked.length, confirms + 1, 'asked again');
+        assert.ok(!kept(drop[0]), 'confirmed, the now-ignored edit is dropped');
+        await commands['claudeObservatory.refresh']();
+        assert.equal(asked.length, confirms + 1, 'nothing left to drop: no confirm');
+      } finally {
+        vscode.window.showWarningMessage = warn;
+        vscode.window.showErrorMessage = err;
+        configValues['session'] = wasSession;
+        fs.rmSync(IGN, { force: true });
+      }
+    }
+    // ---- oak sync: the status bar item, the Timeline's inbox rows, the OAK: Sync picker and setup, through the CLI ----
+    {
+      const until = async (cond, what) => { for (let i = 0; i < 1500 && !cond(); i++) await new Promise((r) => setTimeout(r, 10)); assert.ok(cond(), what); };
+      const unescape = (md) => md.replace(/\\(.)/g, '$1');
+      const sync = path.join(core.rootDir(), 'sync'); // the store as core finds it: an earlier step may have moved it
+      const plan = path.join(home, '.claude', 'plans', 'm.md');
+      const copy = path.join(sync, 'conflicts', 'build-box', 'plans', 'm.md');
+      // `oak sync` asks herdr for the saved machines: a stub first on PATH answers none, or those in machines.json. ssh is a
+      // stub too, which fails as an unreachable host does and says it ran, so nothing here reaches a real machine.
+      const fakeBin = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-sync-bin-'));
+      tmpDirs.push(fakeBin);
+      const machinesFile = path.join(fakeBin, 'machines.json'), sshLog = path.join(fakeBin, 'ssh.log');
+      fs.writeFileSync(path.join(fakeBin, 'herdr'), `#!/bin/sh\nif [ "$1 $2" = "machine list" ]; then if [ -f '${machinesFile}' ]; then cat '${machinesFile}'; else printf "[]"; fi; fi\nexit 0\n`, { mode: 0o755 });
+      fs.writeFileSync(path.join(fakeBin, 'ssh'), `#!/bin/sh\necho "$*" >> '${sshLog}'\necho "ssh: connect to host build-box.example port 22: Connection refused" >&2\nexit 255\n`, { mode: 0o755 });
+      const was = { path: process.env.PATH, bin: process.env.CLAUDE_OBSERVATORY_BIN, warn: vscode.window.showWarningMessage, input: vscode.window.showInputBox, error: vscode.window.showErrorMessage };
+      process.env.PATH = fakeBin + path.delimiter + was.path;
+      process.env.CLAUDE_OBSERVATORY_BIN = TREE_OAK;
+      // Every error the sync code says, kept: a step that should succeed says none.
+      const errorMessages = [];
+      vscode.window.showErrorMessage = (m) => { errorMessages.push(String(m)); return Promise.resolve(undefined); };
+      try {
+        // A machine that never chose to sync: the item is made, and hidden.
+        const item = statusBarItems.find((it) => it.command === 'claudeObservatory.sync');
+        assert.ok(item, 'the sync item is made');
+        await new Promise((r) => setTimeout(r, 400));
+        assert.equal(item.visible, false, 'sync not in use: nothing shows');
+        // A run 30 s ago that pulled from build-box, and one open conflict on a plan.
+        for (const [f, text] of [[plan, 'one\nleft\n'], [copy, 'one\nright\n']]) { fs.mkdirSync(path.dirname(f), { recursive: true }); fs.writeFileSync(f, text); }
+        // sync names this machine's file by its real path: on Windows the long one, where a temp folder is spelled `RUNNER~1`.
+        const planReal = fs.realpathSync.native(plan);
+        const at = Date.now() - 30_000;
+        fs.writeFileSync(path.join(sync, 'status.json'), JSON.stringify({ at, durationMs: 800, status: 'ok', warnings: [], machines: [{ label: 'build-box', host: 'h1', status: 'ok',
+          pulled: { files: 2, bytes: 2048 }, conflicts: 1, pending: { files: 0, bytes: 0 }, errors: [], lastOkAt: at }] }));
+        fs.writeFileSync(path.join(sync, 'conflicts.json'), JSON.stringify([{ id: 'c0ffee000001', family: 'plans', name: 'm.md', from: 'build-box', host: 'h1', at,
+          peerSha256: null, peerSize: 11, copy, localSha256: null, reason: 'overlap' }]));
+        // The Timeline's inbox is told too.
+        const posts = [];
+        let tlMsg = null;
+        tlProvider.resolveWebviewView({ webview: { options: {}, html: '', postMessage: (m) => { posts.push(m); return Promise.resolve(true); }, onDidReceiveMessage: (cb) => { tlMsg = cb; return { dispose() {} }; } },
+          onDidChangeVisibility: () => ({ dispose() {} }), visible: false });
+        // sync's own files are watched: a change reads its status again, through the CLI.
+        const watcher = fsWatchers.find((w) => String(w.pattern) === 'sync/{status.json,conflicts.json,now.lock,key}' && !w.disposed);
+        assert.ok(watcher, 'sync\'s files are watched');
+        assert.equal(watcher.base.fsPath, toFsPath(core.rootDir()), 'in the store, wherever it is');
+        assert.ok(fsWatchers.some((w) => w.pattern === 'prefs.json' && !w.disposed && w.base.fsPath === toFsPath(path.dirname(core.prefsPath()))), 'and prefs.json where it is, beside the config, not the store');
+        watcher.change.forEach((f) => f());
+        await until(() => item.visible, 'the item shows once sync is in use');
+        assert.equal(item.text, '$(sync) OAK sync: 1 conflict');
+        assert.equal(item.backgroundColor?.id, 'statusBarItem.warningBackground', 'what needs the reader stands out');
+        const tip = unescape(item.tooltip.value);
+        assert.match(tip, /\*\*OAK sync\*\* · last run \d\d:\d\d:\d\d \(ok\) · background on/);
+        assert.ok(tip.includes('build-box: 2 files, 2KB'), 'each machine\'s line, in the CLI\'s words');
+        assert.ok(tip.includes('backup: none: each session stays on the machine that made it'));
+        assert.ok(tip.includes('1 open conflict: the Timeline\'s session list has it'));
+        await until(() => posts.some((m) => m.type === 'syncConflicts' && m.rows.length), 'the inbox rows are posted');
+        assert.deepEqual(posts.findLast((m) => m.type === 'syncConflicts').rows, [{ id: 'c0ffee000001', family: 'plans', name: 'm.md', from: 'build-box', file: planReal, copy,
+          resolution: 'edit your file or delete the copy' }]);
+        // Open both copies: the other machine's on the left, this machine's on the right, as vscode.Uri.file spells them.
+        const diffs = diffCalls.length;
+        tlMsg({ type: 'syncConflict', id: 'c0ffee000001', act: 'open' });
+        await until(() => diffCalls.length > diffs, 'a diff opens');
+        assert.deepEqual(diffCalls.at(-1).map((a) => (a && a.fsPath) || a), [toFsPath(copy), toFsPath(planReal), 'm.md: build-box\'s copy \u2194 yours']);
+        // Delete the copy: asked first, then `oak sync resolve`, whose trash keeps it; this machine's file stands.
+        const asked = [];
+        vscode.window.showWarningMessage = (m, opts, ...items) => { asked.push({ m, opts, items }); return Promise.resolve(items[0]); };
+        tlMsg({ type: 'syncConflict', id: 'c0ffee000001', act: 'delete' });
+        // Once the CLI has answered: the copy is gone, the conflict closed at once, and this machine's file stands.
+        await until(() => infoMessages.some((m) => m === 'OAK sync: build-box\'s copy of m.md is in sync\u2019s trash, and yours stands.'), 'it says what it did');
+        assert.equal(asked[0].m, 'Delete build-box\'s copy of plans m.md?');
+        assert.equal(asked[0].opts.modal, true);
+        assert.equal(asked[0].opts.detail, `It goes to sync's trash, and this machine's file stands: ${planReal}.`);
+        assert.ok(!fs.existsSync(copy), 'the copy goes');
+        assert.deepEqual(JSON.parse(fs.readFileSync(path.join(sync, 'conflicts.json'), 'utf8')), [], 'closed at once');
+        assert.equal(fs.readFileSync(plan, 'utf8'), 'one\nleft\n', 'yours stands');
+        await until(() => /^\$\(sync\) OAK sync \d\d:\d\d:\d\d$/.test(item.text), 'the item follows: no conflict left');
+        assert.equal(item.backgroundColor, undefined);
+        vscode.window.showWarningMessage = was.warn;
+        // The picker's first row runs `oak sync now`, and says what the run did.
+        quickPick = 0;
+        await commands['claudeObservatory.sync']();
+        await until(() => infoMessages.some((m) => /^OAK sync: nothing to pull; warning: there is no saved machine to sync with: `oak machine add <label> <ssh-target>` saves one; /.test(m)),
+          'sync now ran and said what it did, with its warnings');
+        // The last run whole, as `oak sync status` prints it, in a text tab.
+        const realOpen = vscode.workspace.openTextDocument;
+        const docs = [];
+        vscode.workspace.openTextDocument = (arg) => { docs.push(arg); return realOpen(arg); };
+        try {
+          quickPick = (items) => items.find((it) => /The last run/.test(it.label));
+          await commands['claudeObservatory.sync']();
+          await until(() => docs.some((d) => typeof d?.content === 'string'), 'the last run opens');
+          assert.match(docs.find((d) => typeof d?.content === 'string').content, /^oak sync: last run \d\d:\d\d:\d\d \(ok\)/);
+        } finally {
+          vscode.workspace.openTextDocument = realOpen;
+        }
+        // Each open conflict is a row of the picker too, whose own pick offers its two ways out.
+        const plan2 = path.join(home, '.claude', 'plans', 'n.md'), copy2 = path.join(sync, 'conflicts', 'build-box', 'plans', 'n.md');
+        for (const [f, text] of [[plan2, 'a\n'], [copy2, 'b\n']]) { fs.mkdirSync(path.dirname(f), { recursive: true }); fs.writeFileSync(f, text); }
+        const conflict = (id, name, c) => ({ id, family: 'plans', name, from: 'build-box', host: 'h1', at, peerSha256: null, peerSize: 2, copy: c, localSha256: null, reason: 'overlap' });
+        fs.writeFileSync(path.join(sync, 'conflicts.json'), JSON.stringify([conflict('c0ffee000002', 'n.md', copy2)]));
+        const diffsNow = diffCalls.length;
+        quickPick = (items) => items.find((it) => /plans n\.md from build-box/.test(it.label ?? '')) ?? items.find((it) => it === 'Open both copies');
+        await commands['claudeObservatory.sync']();
+        await until(() => diffCalls.length > diffsNow, 'its pick opens both copies');
+        assert.deepEqual(diffCalls.at(-1).map((a) => (a && a.fsPath) || a), [toFsPath(copy2), toFsPath(fs.realpathSync.native(plan2)), 'n.md: build-box\'s copy \u2194 yours']);
+        // A copy deleted by hand since the run is a conflict resolved: said, and nothing opens.
+        fs.rmSync(copy2);
+        tlMsg({ type: 'syncConflict', id: 'c0ffee000002', act: 'open' });
+        await until(() => infoMessages.includes('OAK sync: build-box\'s copy of n.md is gone: the conflict is resolved.'), 'a gone copy is said resolved');
+        assert.equal(diffCalls.length, diffsNow + 1, 'and opens nothing');
+        // A picker asked for while a read is on its way waits for that read: built from what is true now, never the read before.
+        fs.writeFileSync(path.join(sync, 'conflicts.json'), JSON.stringify([conflict('c0ffee000003', 'o.md', copy)]));
+        fs.writeFileSync(copy, 'one\nright\n');
+        const pickers = [];
+        quickPick = (items) => { pickers.push(items.map((it) => it.label ?? it)); return undefined; };
+        const first = commands['claudeObservatory.sync']();
+        await commands['claudeObservatory.sync']();
+        await first;
+        assert.equal(pickers.length, 2);
+        for (const labels of pickers) assert.ok(labels.some((l) => /plans o\.md from build-box/.test(l)), labels.join(' | '));
+        fs.writeFileSync(path.join(sync, 'conflicts.json'), '[]');
+        // Setup with a folder that holds a backup this machine has no key for: it asks where the key comes from (no
+        // machine is saved here, so pasting it) and takes the key on standard input.
+        const other = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-sync-other-'));
+        tmpDirs.push(other);
+        const share = path.join(other, 'share');
+        const otherEnv = { ...process.env, HOME: path.join(other, 'h'), USERPROFILE: path.join(other, 'h') };
+        assert.equal(core.spawnToolSync(TREE_OAK, ['sync', 'backup', '--folder', share], { env: otherEnv, encoding: 'utf8' }).status, 0, 'control: another machine\'s backup');
+        const key = core.spawnToolSync(TREE_OAK, ['sync', 'key', '--show'], { env: otherEnv, encoding: 'utf8' }).stdout.trim();
+        assert.match(key, /^oak-sync-1:/);
+        const keyAsked = [];
+        vscode.window.showWarningMessage = (m, opts, ...items) => { keyAsked.push({ m, opts, items }); return Promise.resolve(items.at(-1)); };
+        vscode.window.showInputBox = (opts) => { keyAsked.push({ input: opts }); return Promise.resolve(key); };
+        quickPick = 2; // A folder…
+        openDialogAnswer = [vscode.Uri.file(share)];
+        await commands['claudeObservatory.syncSetup']();
+        assert.equal(keyAsked[0].m, 'OAK: this folder holds a backup sealed with a key this machine does not have');
+        assert.match(keyAsked[0].opts.detail, /holds a backup sealed under a key this machine does not have/);
+        assert.deepEqual(keyAsked[0].items, ['Paste it…'], 'no saved machine to copy it from: pasting it');
+        assert.equal(keyAsked[1].input.password, true, 'the key is not shown as it is pasted');
+        await until(() => infoMessages.some((m) => m.startsWith(`OAK sync is set up: the backup is the encrypted folder ${share}`)), 'set up with the pasted key');
+        // A notification shows its message alone: what setup did besides is in it, not in a detail it would drop.
+        assert.match(infoMessages.find((m) => m.startsWith('OAK sync is set up')), /\. The backup key \S+ is kept here now\. A first run here would pull nothing\.$/);
+        const prefs = JSON.parse(fs.readFileSync(core.prefsPath(), 'utf8'));
+        assert.deepEqual(prefs.sync.backup, { kind: 'folder', path: share }, 'the CLI wrote it to prefs.json');
+        assert.equal(core.spawnToolSync(TREE_OAK, ['sync', 'key', '--json'], { encoding: 'utf8' }).stdout.includes(core.keyFingerprint(core.parseSyncKey(key))), true, 'the pasted key is kept here');
+        // A folder made under yet another key: brought over the key kept here, it replaces it (`--replace`), as the
+        // question says; without that the CLI refuses, and setup would end there.
+        const other2 = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-sync-other-'));
+        tmpDirs.push(other2);
+        const share2 = path.join(other2, 'share');
+        const otherEnv2 = { ...process.env, HOME: path.join(other2, 'h'), USERPROFILE: path.join(other2, 'h') };
+        assert.equal(core.spawnToolSync(TREE_OAK, ['sync', 'backup', '--folder', share2], { env: otherEnv2, encoding: 'utf8' }).status, 0, 'control: a third machine\'s backup');
+        const key2 = core.spawnToolSync(TREE_OAK, ['sync', 'key', '--show'], { env: otherEnv2, encoding: 'utf8' }).stdout.trim();
+        const replaceAsked = [];
+        vscode.window.showWarningMessage = (m, opts, ...items) => { replaceAsked.push({ m, opts, items }); return Promise.resolve(items.at(-1)); };
+        vscode.window.showInputBox = () => Promise.resolve(key2);
+        quickPick = 2;
+        openDialogAnswer = [vscode.Uri.file(share2)];
+        await commands['claudeObservatory.syncSetup']();
+        assert.match(replaceAsked[0].opts.detail, /This machine keeps another backup key \(\S+\): the folder's replaces it here, and the old one is kept beside it\.$/);
+        await until(() => infoMessages.some((m) => m.startsWith(`OAK sync is set up: the backup is the encrypted folder ${share2}`)), 'set up, the key here replaced');
+        assert.equal(core.spawnToolSync(TREE_OAK, ['sync', 'key', '--json'], { encoding: 'utf8' }).stdout.includes(core.keyFingerprint(core.parseSyncKey(key2))), true, 'the folder\'s key is kept here now');
+        openDialogAnswer = [vscode.Uri.file(share)];
+        // Machines and projects: unticking this project excludes it.
+        quickPick = (items, opts) => (opts?.canPickMany ? [] : items.find((it) => /Machines and projects/.test(it.label)));
+        await commands['claudeObservatory.sync']();
+        await until(() => infoMessages.some((m) => m === 'OAK sync: not syncing this project'), 'excluded');
+        const excluded = JSON.parse(fs.readFileSync(core.prefsPath(), 'utf8')).sync.exclude.projects;
+        assert.deepEqual(excluded, [core.identityKey(ws, { home, shares: core.readMountTable() }).key]);
+        // The delete says what it does with a backup folder set: purged here, and back after an undelete and a run.
+        const delAsked = [];
+        vscode.window.showWarningMessage = (m, opts) => { delAsked.push(opts?.detail ?? ''); return Promise.resolve(undefined); };
+        tlMsg({ type: 'deleteSession', id: S });
+        await until(() => delAsked.length > 0, 'the delete asks');
+        assert.match(delAsked[0], /purges its captured edits here \(the backup folder keeps its copy\)\./);
+        assert.match(delAsked[0], /lists the session again, and the next oak sync now brings back what of its edits the backup folder holds\.$/);
+        // A folder whose record under this machine's name this machine has not written: setup asks whether this machine is
+        // a reinstall, and takes the record over when it is. An OAK that answers as the CLI does, recording what it was asked.
+        const asks = path.join(other, 'asks.log');
+        // Each fake is a node script behind a launcher: a shell script here, a `.cmd` on Windows, which runs no `#!` line.
+        const nodeFake = (name, js) => {
+          const script = path.join(fakeBin, name + '.js'), win = process.platform === 'win32';
+          fs.writeFileSync(script, js);
+          const bin = path.join(fakeBin, win ? name + '.cmd' : name);
+          fs.writeFileSync(bin, win ? `@"${process.execPath}" "${script}" %*\r\n` : `#!/bin/sh\nexec "${process.execPath}" "${script}" "$@"\n`, { mode: 0o755 });
+          return bin;
+        };
+        const fake = nodeFake('oak-setup', `const a = process.argv.slice(2); require('fs').appendFileSync(${JSON.stringify(asks)}, a.join(' ') + '\\n');\n` +
+          `if (a[0] === 'machine') process.stdout.write('[]');\n` +
+          `else if (a[1] === 'setup') process.stdout.write(JSON.stringify({ syncSetup: 1, backup: { kind: 'folder', path: ${JSON.stringify(share)} }, key: null, ` +
+          `record: a.includes('--restore') ? { state: 'unclaimed', lastWrite: 'last written by laptop', claimed: true } : { state: 'unclaimed', lastWrite: 'last written by laptop' }, plan: null }));\n`);
+        process.env.CLAUDE_OBSERVATORY_BIN = fake;
+        // The folder picked goes to the CLI canonical (#43), as every other surface spells it: VS Code's fsPath lower-cases
+        // a drive letter, which a folder named as Windows names it shows on every platform (this fake never reads it).
+        const shareC = process.platform === 'win32' ? share : `C:${share}`;
+        openDialogAnswer = [vscode.Uri.file(shareC)];
+        const restoreAsked = [];
+        vscode.window.showWarningMessage = (m, opts, ...items) => { restoreAsked.push({ m, opts, items }); return Promise.resolve(items[0]); };
+        quickPick = 2;
+        const setUpBefore = infoMessages.filter((m) => m.startsWith('OAK sync is set up')).length;
+        await commands['claudeObservatory.syncSetup']();
+        assert.match(restoreAsked[0].m, /holds a record under this machine’s name \(its host name and home folder\) that this machine has not written/);
+        assert.match(restoreAsked[0].opts.detail, /^last written by laptop\.\n\nIf this machine is a reinstall of that one/);
+        assert.deepEqual(restoreAsked[0].items, ['This machine is a reinstall: restore from it']);
+        assert.deepEqual(fs.readFileSync(asks, 'utf8').trim().split('\n').filter((l) => l.startsWith('sync setup')),
+          [`sync setup --folder ${shareC} --json`, `sync setup --folder ${shareC} --restore --json`], 'asked again with --restore');
+        await until(() => infoMessages.filter((m) => m.startsWith('OAK sync is set up')).length > setUpBefore, 'and says it is set up');
+        assert.ok(infoMessages.filter((m) => m.startsWith('OAK sync is set up')).at(-1).includes('This machine took the folder’s record over: the next run restores its sessions from it.'), 'and that it took the record over');
+        // The CLI's answer when the record is left as it is: a plan made without the backup folder, and why (planError),
+        // which the record's note already says. Setup says it once, with the plan's preview, and nothing of a plan not made.
+        const fakeRefused = nodeFake('oak-setup-refused', `const a = process.argv.slice(2);\nif (a[0] === 'machine') process.stdout.write('[]');\n` +
+          `else if (a[1] === 'setup') process.stdout.write(JSON.stringify({ syncSetup: 1, backup: { kind: 'folder', path: ${JSON.stringify(share)} }, key: null, ` +
+          `record: { state: 'unclaimed', lastWrite: 'last written by laptop' }, plan: { machines: [{ pulls: [] }] }, planError: "the backup folder holds a record under this machine's name" }));\n`);
+        process.env.CLAUDE_OBSERVATORY_BIN = fakeRefused;
+        vscode.window.showWarningMessage = () => Promise.resolve(undefined);
+        quickPick = 2;
+        const setUpRefused = infoMessages.filter((m) => m.startsWith('OAK sync is set up')).length;
+        await commands['claudeObservatory.syncSetup']();
+        await until(() => infoMessages.filter((m) => m.startsWith('OAK sync is set up')).length > setUpRefused, 'set up, the record left as it is');
+        const saidRefused = infoMessages.filter((m) => m.startsWith('OAK sync is set up')).at(-1);
+        assert.match(saidRefused, /until this machine takes it over \(oak sync setup --restore\), nothing is restored from the folder or written to it\. A first run here would pull nothing\.$/);
+        assert.doesNotMatch(saidRefused, /could not be made/);
+        // Another machine's writer, or a copy of this one's (state `other`): the record's note says it is not this machine's,
+        // and the plan's reason, which names what to do in that case, is said with the preview.
+        const fakeOther = nodeFake('oak-setup-other', `const a = process.argv.slice(2);\nif (a[0] === 'machine') process.stdout.write('[]');\n` +
+          `else if (a[1] === 'setup') process.stdout.write(JSON.stringify({ syncSetup: 1, backup: { kind: 'folder', path: ${JSON.stringify(share)} }, key: null, ` +
+          `record: { state: 'other', lastWrite: 'last written by laptop' }, plan: { machines: [{ pulls: [] }] }, planError: "another machine has a copy of this machine's sync state." }));\n`);
+        process.env.CLAUDE_OBSERVATORY_BIN = fakeOther;
+        quickPick = 2;
+        const setUpOther = infoMessages.filter((m) => m.startsWith('OAK sync is set up')).length;
+        await commands['claudeObservatory.syncSetup']();
+        await until(() => infoMessages.filter((m) => m.startsWith('OAK sync is set up')).length > setUpOther, 'set up, another machine\'s record left as it is');
+        assert.match(infoMessages.filter((m) => m.startsWith('OAK sync is set up')).at(-1),
+          /A first run here would pull nothing\. The backup folder cannot be used: another machine has a copy of this machine's sync state\.$/);
+        // A key made here: a modal message, whose detail says how each other machine takes it, with the setup that brings
+        // the key and the folder together (`oak sync key --from` alone is refused where another folder is set).
+        const fakeMade = nodeFake('oak-setup-made', `const a = process.argv.slice(2);\nif (a[0] === 'machine') process.stdout.write('[]');\n` +
+          `else if (a[1] === 'setup') process.stdout.write(JSON.stringify({ syncSetup: 1, backup: { kind: 'folder', path: ${JSON.stringify(share)} }, key: { fingerprint: 'ab12-cd34', made: true, imported: false }, plan: { machines: [{ pulls: [] }] } }));\n`);
+        process.env.CLAUDE_OBSERVATORY_BIN = fakeMade;
+        const modal = [];
+        const realInfo = vscode.window.showInformationMessage;
+        vscode.window.showInformationMessage = (m, ...rest) => { modal.push({ m: String(m), opts: rest[0] }); return Promise.resolve(undefined); };
+        quickPick = 2;
+        try {
+          await commands['claudeObservatory.syncSetup']();
+          await until(() => modal.some((x) => x.m.startsWith('OAK sync is set up')), 'set up with a key made here');
+        } finally {
+          vscode.window.showInformationMessage = realInfo;
+        }
+        const madeSaid = modal.find((x) => x.m.startsWith('OAK sync is set up'));
+        assert.equal(madeSaid.opts?.modal, true, 'a modal message, whose detail shows');
+        assert.match(madeSaid.opts.detail, /On each of your other machines, run oak sync setup --folder <the folder’s path there> --key-from <the label that machine saved this one under> --replace \(a key that machine kept for another folder is kept beside this one\), or set sync up there\./);
+        // A run that refused the folder's record: the picker offers taking it over, which asks first, then runs setup with
+        // --restore on the backup folder (the stub answers as the CLI does).
+        process.env.CLAUDE_OBSERVATORY_BIN = TREE_OAK;
+        const folderNow = JSON.parse(fs.readFileSync(core.prefsPath(), 'utf8')).sync.backup.path;
+        // A refusal a run left for a folder no longer the backup says nothing of this one: no reinstall row.
+        fs.writeFileSync(path.join(sync, 'status.json'), JSON.stringify({ at, durationMs: 800, status: 'partial', warnings: [], machines: [{ label: 'backup (/mnt/old-share)', status: 'failed',
+          detail: 'its record is another machine\'s', record: 'unclaimed', pulled: { files: 0, bytes: 0 }, conflicts: 0, pending: { files: 0, bytes: 0 }, errors: [] }] }));
+        let stale = [];
+        quickPick = (items) => { stale = items.map((it) => it.label); return undefined; };
+        await commands['claudeObservatory.sync']();
+        assert.ok(stale.length && !stale.some((l) => /This machine is a reinstall/.test(l)), stale.join(' | '));
+        fs.writeFileSync(path.join(sync, 'status.json'), JSON.stringify({ at, durationMs: 800, status: 'partial', warnings: [], machines: [{ label: `backup (${folderNow})`, status: 'failed',
+          detail: 'its record is another machine\'s', record: 'unclaimed', pulled: { files: 0, bytes: 0 }, conflicts: 0, pending: { files: 0, bytes: 0 }, errors: [] }] }));
+        watcher.change.forEach((f) => f());
+        await until(() => unescape(item.tooltip.value).includes(`backup (${folderNow}): failed: its record is another machine's`), 'the refusal is read');
+        process.env.CLAUDE_OBSERVATORY_BIN = fake;
+        fs.writeFileSync(asks, '');
+        const takeAsked = [];
+        vscode.window.showWarningMessage = (m, opts, ...items) => { takeAsked.push({ m, opts, items }); return Promise.resolve(items[0]); };
+        quickPick = (items) => items.find((it) => /This machine is a reinstall/.test(it.label));
+        await commands['claudeObservatory.sync']();
+        await until(() => fs.readFileSync(asks, 'utf8').includes('--restore'), 'setup runs with --restore');
+        assert.equal(takeAsked[0].m, 'OAK: the backup folder refused its record under this machine’s name');
+        assert.match(takeAsked[0].opts.detail, /^failed: its record is another machine's\n\nTaking it over says this machine is a reinstall/);
+        assert.deepEqual(fs.readFileSync(asks, 'utf8').trim().split('\n').filter((l) => l.startsWith('sync setup')), [`sync setup --folder ${folderNow} --restore --json`]);
+        vscode.window.showWarningMessage = was.warn;
+        process.env.CLAUDE_OBSERVATORY_BIN = TREE_OAK;
+        assert.deepEqual(errorMessages, [], 'no step before this one said an error');
+        // A saved machine is reached through herdr and ssh, which OAK runs as herdr.exe and ssh.exe on Windows; the stubs are
+        // POSIX scripts and cannot stand in for them there, so the steps with a saved machine are checked on macOS and Linux.
+        if (process.platform !== 'win32') {
+          // A saved machine as the backup, chosen in the picker; the CLI's preview asks it over ssh, which fails.
+          fs.writeFileSync(machinesFile, JSON.stringify([{ id: 'm1', label: 'build-box', target: 'builder@build-box.example', session: 'default', enabled: true, selected: false }]));
+          quickPick = (items) => items.find((it) => it.label === 'A saved machine…') ?? items.find((it) => it === 'build-box');
+          await commands['claudeObservatory.syncSetup']();
+          await until(() => infoMessages.some((m) => m.startsWith('OAK sync is set up: the backup is build-box.')), 'set up with the saved machine');
+          assert.deepEqual(JSON.parse(fs.readFileSync(core.prefsPath(), 'utf8')).sync.backup, { kind: 'machine', label: 'build-box' });
+          // The refusal the last run left for the folder before says nothing of this backup: no reinstall row.
+          let rows = [];
+          quickPick = (items) => { rows = items.map((it) => it.label); return undefined; };
+          await commands['claudeObservatory.sync']();
+          assert.ok(rows.length && !rows.some((l) => /This machine is a reinstall/.test(l)), rows.join(' | '));
+          // A folder whose key this machine lacks, the key copied from that machine: asked of it over ssh (the stub fails, and
+          // the CLI's words say so).
+          const other3 = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-sync-other-'));
+          tmpDirs.push(other3);
+          const share3 = path.join(other3, 'share');
+          assert.equal(core.spawnToolSync(TREE_OAK, ['sync', 'backup', '--folder', share3], { env: { ...process.env, HOME: path.join(other3, 'h'), USERPROFILE: path.join(other3, 'h') }, encoding: 'utf8' }).status, 0);
+          const copyAsked = [];
+          vscode.window.showWarningMessage = (m, opts, ...items) => { copyAsked.push({ m, opts, items }); return Promise.resolve(items[0]); };
+          quickPick = (items) => items.find((it) => it.label === 'A folder…') ?? items.find((it) => it === 'build-box');
+          openDialogAnswer = [vscode.Uri.file(share3)];
+          assert.deepEqual(errorMessages, [], 'no step before this one said an error');
+          await commands['claudeObservatory.syncSetup']();
+          assert.deepEqual(copyAsked[0].items, ['Copy it from a saved machine…', 'Paste it…'], 'a saved machine: the key can come from it');
+          await until(() => errorMessages.length > 0, 'it says why the copy failed');
+          assert.match(errorMessages[0], /^OAK: sync was not set up — .*build-box/);
+          assert.ok(fs.readFileSync(sshLog, 'utf8').includes('builder@build-box.example'), 'the key was asked of the saved machine');
+          vscode.window.showWarningMessage = was.warn;
+        }
+        // Sync no longer in use (no run, no backup, no conflict): the item hides again.
+        assert.equal(core.spawnToolSync(TREE_OAK, ['sync', 'setup', '--none', '--json'], { encoding: 'utf8' }).status, 0);
+        for (const f of ['status.json', 'conflicts.json']) fs.rmSync(path.join(sync, f), { force: true });
+        watcher.change.forEach((f) => f());
+        await until(() => item.visible === false, 'nothing shows once sync is not in use');
+        // The item's and the picker's icons are real codicons (an unknown id draws a blank): every one the sync code names.
+        const codicons = fs.readFileSync(path.resolve(__dirname, '../../../node_modules/@vscode/codicons/dist/codicon.css'), 'utf8');
+        const syncSrc = extSrc.slice(extSrc.indexOf('// oak sync: its last run in the status bar'), extSrc.indexOf('class TimelineViewProvider'));
+        const used = new Set(['sync', ...[...syncSrc.matchAll(/\$\(([a-z-]+)(?:~spin)?\)/g)].map((m) => m[1])]);
+        assert.ok(used.size >= 6, [...used].join(', '));
+        for (const id of used) assert.ok(codicons.includes(`.codicon-${id}:before`), `${id} is a codicon`);
+        assert.match(extSrc, /\$\(sync\$\{v\.running \? '~spin' : ''\}\)/, 'the running item spins the sync icon');
+      } finally {
+        process.env.PATH = was.path;
+        process.env.CLAUDE_OBSERVATORY_BIN = was.bin;
+        vscode.window.showWarningMessage = was.warn;
+        vscode.window.showInputBox = was.input;
+        vscode.window.showErrorMessage = was.error;
+        quickPick = null;
+      }
+    }
   } finally {
+    for (const d of subscriptions) d.dispose();
     Module._load = origLoad;
   }
 });

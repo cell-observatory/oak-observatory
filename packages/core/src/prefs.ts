@@ -9,11 +9,12 @@
  * Every value is validated on read. This file can be hand-edited, can be older than the build reading
  * it, and can be newer — so an unknown colour name or a rebind to a key that no longer exists must
  * degrade to the default rather than break the dashboard on its first paint. `read()` never throws.
+ * A save keeps what this build cannot read, for the build that can (`writePrefs`).
  */
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { claudeConfigDir } from './paths';
+import { claudeConfigDir, claudeJsonPath } from './paths';
 
 export type ColorPref = 'auto' | 'truecolor' | '256' | '16' | 'none';
 export type GlyphPref = 'auto' | 'ascii' | 'safe' | 'block';
@@ -30,15 +31,15 @@ export const REBINDABLE = [
   { action: 'keep', label: 'Keep the selection', fallback: 'a' },
   { action: 'undo', label: 'Undo the selection', fallback: 'u' },
   { action: 'keepAll', label: 'Keep everything listed', fallback: 'A' },
-  { action: 'undoAll', label: 'Undo everything listed', fallback: 'U' },
-  // `redo` is NOT here: it is `^R`, vim's own redo, and lives with the other ctrl chords in app.ts.
-  // It was `R`, one shift away from `r` for refresh — a harmless re-poll and a verb that rewrites
-  // files on disk, a shift key apart, sharing nothing that would let a reader guess which was which.
-  // Ctrl chords are not rebindable for the same reason the structural keys are not: they are a fixed
-  // layer the frame documents, and `keys` here is a map of single characters.
+  // `D` (discard everything listed), because `U` is redo: undo and redo share the letter, as they do
+  // in Helix and Kakoune. Undo-all was `U` until 0.11.0.
+  { action: 'undoAll', label: 'Undo everything listed', fallback: 'D' },
+  // Redo was `^R`, which both agents use for history search; a plain letter beside `u` is also
+  // rebindable, where a ctrl chord was not.
+  { action: 'redo', label: 'Redo the selection', fallback: 'U' },
   { action: 'next', label: 'Next edit', fallback: 'n' },
   { action: 'prev', label: 'Previous edit', fallback: 'p' },
-  { action: 'editor', label: 'Open in $EDITOR', fallback: 'e' },
+  { action: 'editor', label: 'Open in the terminal editor', fallback: 'e' },
   { action: 'copy', label: 'Copy the path, or the diff', fallback: 'y' },
   { action: 'wrap', label: 'Wrap long diff lines, or scroll them', fallback: 'w' },
   // `s` for sort and `b` for the session picker, which is a SWAP: sort was `S` beside session's `s`.
@@ -76,14 +77,31 @@ export const REBINDABLE = [
 
 export type Action = (typeof REBINDABLE)[number]['action'];
 
+/**
+ * Keys no verb may be rebound to, because the frame answers them before the keymap is read.
+ *
+ * Space and the digits are structural (fold, and an edit's id); `:` opens the command palette; `'` and
+ * `` ` `` set and jump to marks. The letters and `|` `-` are the Observatory tab's own keys, and a
+ * Review verb on one of them would give that letter two meanings across the two tabs (`R` resolves a
+ * session there and `X` stops its agent, so neither may mean anything on Review). The options window
+ * refuses them, and a prefs file that names one (hand-edited, or saved by an older build) keeps it out of
+ * the live keymap: `blockedKeys` carries it until the reader chooses another key.
+ */
+export const RESERVED_KEYS: ReadonlySet<string> = new Set([
+  ' ', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', ':', "'", '`',
+  'c', 'd', 'f', 't', 'v', 'B', 'H', 'J', 'K', 'L', 'R', 'W', 'X', '|', '-',
+]);
+
 /** What a session can be waiting on (attention.json's kinds plus the transcript-derived `question`).
  *  Lives here, beside the preference that filters them, so prefs never imports the notifier. */
 export const HAND_KINDS = ['permission', 'question', 'input', 'idle-done'] as const;
 export type HandKind = (typeof HAND_KINDS)[number];
 
 export interface Prefs {
-  /** Overrides `$VISUAL`/`$EDITOR`. Empty means "use the environment". */
+  /** The terminal editor: what `e` runs. Overrides `$VISUAL`/`$EDITOR`. Empty means "use the environment". */
   editor?: string;
+  /** The GUI editor: what W opens a window or a file in. Empty means Auto (resolveGuiEditor). */
+  guiEditor?: string;
   /** Day-of-month the subscription bills on (1-31; Anthropic bills on the signup anniversary and
    *  no payload carries the date, so the user states it once). Absent: calendar months (the 1st).
    *  Days past a month's end clamp to its last day, the way card billing does. */
@@ -91,6 +109,7 @@ export interface Prefs {
   /** Day-of-month the GPT/codex subscription bills on (1-31), separate from `billDay` because the two
    *  accounts renew on different days and no codex payload carries the date. Absent: calendar months. */
   gptBillDay?: number;
+  accountBilling?: import('./account-billing').AccountBilling;
   color?: ColorPref;
   glyphs?: GlyphPref;
   mouse?: boolean;
@@ -142,6 +161,10 @@ export interface Prefs {
   __reject?: string;
   /** action -> the single key that runs it. Only actions in `REBINDABLE` are honoured. */
   keys?: Partial<Record<Action, string>>;
+  /** Rebinds the file holds onto a key now in `RESERVED_KEYS` (an older build allowed them). Never
+   *  live, so the action keeps its default key, but written back as they were read: the file keeps
+   *  the reader's choice until they pick another key in the options window, which names the problem. */
+  blockedKeys?: Partial<Record<Action, string>>;
   /** Desktop notifications for raised hands (2026-09-15). Absent means ON for permission / question /
    *  input, OFF for a finished turn, no sound, a 30-second per-session cooldown. Every field is
    *  optional so the stored file carries only what the reader changed. */
@@ -158,15 +181,107 @@ export interface Prefs {
   /** Read Remote Control session titles from claude.ai so sessions carry the names the Claude app and
    *  claude.ai show (an automatic network read; see SECURITY.md). Absent means ON; `false` turns it off. */
   remoteTitles?: boolean;
+  /** Read the Claude account's usage from saved machines over ssh in the background (machine-usage.ts; see
+   *  SECURITY.md). Absent means ON; `false` turns it off, and the readouts show this machine's readings only. */
+  machineUsage?: boolean;
+  /** oak sync on this machine (sync-engine.ts), each field set by `oak sync …` or by hand. */
+  sync?: SyncPrefs;
+  /** What `oak agent start --brief` starts each CLI with, unless a flag says otherwise (delegated.ts); set by hand. */
+  agents?: { claude?: AgentStartPrefs; codex?: AgentStartPrefs };
+}
+
+/** One CLI's defaults for `oak agent start`: Claude Code's agent type and permission mode, Codex's sandbox, the model
+ *  and effort, and further arguments to pass on. */
+export interface AgentStartPrefs {
+  agentType?: string;
+  permissionMode?: string;
+  model?: string;
+  effort?: string;
+  sandbox?: string;
+  args?: string[];
+  writableRoots?: string[];
+}
+
+/** prefs.json `agents`, each field checked on its own. */
+function parseAgentPrefs(v: unknown): Prefs['agents'] | undefined {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return undefined;
+  const out: NonNullable<Prefs['agents']> = {};
+  for (const kind of ['claude', 'codex'] as const) {
+    const d = (v as Record<string, unknown>)[kind];
+    if (!d || typeof d !== 'object' || Array.isArray(d)) continue;
+    const o: AgentStartPrefs = {};
+    for (const k of ['agentType', 'permissionMode', 'model', 'effort', 'sandbox'] as const) {
+      const x = (d as Record<string, unknown>)[k];
+      if (typeof x === 'string' && x.trim()) o[k] = x.trim();
+    }
+    const args = (d as Record<string, unknown>).args;
+    if (Array.isArray(args) && args.every((x) => typeof x === 'string')) o.args = args as string[];
+    const roots = (d as Record<string, unknown>).writableRoots;
+    if (Array.isArray(roots) && roots.every((x) => typeof x === 'string')) o.writableRoots = roots as string[];
+    if (Object.keys(o).length) out[kind] = o;
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+
+/** Where a sync family's files are kept (sync.ts SyncPlacement). */
+export type SyncPlacementPref = 'everywhere' | 'backup' | 'on-demand' | 'off';
+
+export interface SyncPrefs {
+  /** The backup target: a saved machine by its label here, or a folder by its path on this machine. */
+  backup?: { kind: 'machine'; label: string } | { kind: 'folder'; path: string };
+  /** Placement overrides by family id (`transcripts`, `memory`, …). */
+  families?: Record<string, SyncPlacementPref>;
+  /** Machines (labels) and projects (identity keys) this machine does not pull from or for. */
+  exclude?: { machines?: string[]; projects?: string[] };
+  /** The size of the on-demand cache, in megabytes. */
+  cacheMB?: number;
+  /** `false` stops the background run the capture hooks and the pollers kick. */
+  auto?: boolean;
+  /** When `oak sync setup` last ran here (epoch ms), whatever was chosen: `oak doctor` stops suggesting it. */
+  setupAt?: number;
+}
+
+/** prefs.json `sync`, each field checked on its own: one bad field is dropped, never the rest. */
+function parseSyncPrefs(v: unknown): SyncPrefs | undefined {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return undefined;
+  const d = v as Record<string, unknown>;
+  const out: SyncPrefs = {};
+  const b = d.backup as Record<string, unknown> | undefined;
+  if (b && b.kind === 'machine' && typeof b.label === 'string' && b.label.trim()) out.backup = { kind: 'machine', label: b.label.trim() };
+  else if (b && b.kind === 'folder' && typeof b.path === 'string' && b.path.trim()) out.backup = { kind: 'folder', path: b.path.trim() };
+  if (d.families && typeof d.families === 'object' && !Array.isArray(d.families)) {
+    const f: Record<string, SyncPlacementPref> = {};
+    for (const [k, p] of Object.entries(d.families as Record<string, unknown>)) {
+      if (/^[a-z][a-z0-9-]*$/.test(k) && (['everywhere', 'backup', 'on-demand', 'off'] as unknown[]).includes(p)) f[k] = p as SyncPlacementPref;
+    }
+    if (Object.keys(f).length) out.families = f;
+  }
+  const strings = (x: unknown): string[] => (Array.isArray(x) ? [...new Set(x.filter((s): s is string => typeof s === 'string' && s.trim() !== '').map((s) => s.trim()))] : []);
+  const ex = d.exclude as Record<string, unknown> | undefined;
+  if (ex && typeof ex === 'object') {
+    const machines = strings(ex.machines), projects = strings(ex.projects);
+    if (machines.length || projects.length) out.exclude = { ...(machines.length ? { machines } : {}), ...(projects.length ? { projects } : {}) };
+  }
+  if (typeof d.cacheMB === 'number' && Number.isFinite(d.cacheMB) && d.cacheMB >= 0) out.cacheMB = Math.floor(d.cacheMB);
+  if (typeof d.auto === 'boolean') out.auto = d.auto;
+  if (typeof d.setupAt === 'number' && Number.isFinite(d.setupAt) && d.setupAt > 0) out.setupAt = d.setupAt;
+  return Object.keys(out).length ? out : undefined;
 }
 
 export function prefsPath(dir = claudeConfigDir()): string {
   return path.join(dir, 'claude-observatory', 'prefs.json');
 }
 
-/** Absolute, or `~`-prefixed. See `Prefs.storeDir` for why a relative path is refused. */
+/** The key every prefs.json this build writes carries. An OAK older than 0.11.0 writes back only the settings it knows,
+ *  so a prefs.json without it is one such an OAK rewrote: oak sync's settings and `machineUsage`, which that OAK drops,
+ *  are then read from oak sync's copy of them (sync-state.ts keptPrefs). */
+export const PREFS_FORMAT_KEY = 'prefsFormat';
+export const PREFS_FORMAT = 2;
+
+/** Absolute, or the home (`~`, `~/…`). See `Prefs.storeDir` for why a relative path is refused: `~name/…` is one too,
+ *  since only the home is expanded, so it was kept in each process's working folder, an agent's project among them. */
 export function isAbsoluteStorePath(p: string): boolean {
-  return p.startsWith('~') || path.isAbsolute(p);
+  return p === '~' || p.startsWith('~/') || p.startsWith('~\\') || path.isAbsolute(p);
 }
 
 /** Expand a leading `~` to the home directory. Everything downstream wants a real path. */
@@ -206,6 +321,9 @@ export interface EditorChoice {
  *
  * Nothing is offered unless its binary is present on this machine.
  */
+/** The JetBrains IDE launchers. Each opens a file at a line with `--line N <file>` (IntelliJ's CommandLineProcessor), and
+ *  a saved machine's project through JetBrains Gateway. */
+const JETBRAINS_BINS = ['idea', 'idea64', 'pycharm', 'webstorm', 'goland', 'clion', 'rider', 'phpstorm', 'rubymine', 'rustrover', 'datagrip'];
 const KNOWN_EDITORS: readonly { bin: string; command: string; label: string; kind: 'gui' | 'tty' }[] = [
   { bin: 'nvim', command: 'nvim', label: 'Neovim', kind: 'tty' },
   { bin: 'vim', command: 'vim', label: 'Vim', kind: 'tty' },
@@ -220,6 +338,7 @@ const KNOWN_EDITORS: readonly { bin: string; command: string; label: string; kin
   { bin: 'code-insiders', command: 'code-insiders', label: 'VS Code Insiders', kind: 'gui' },
   { bin: 'cursor', command: 'cursor', label: 'Cursor', kind: 'gui' },
   { bin: 'windsurf', command: 'windsurf', label: 'Windsurf', kind: 'gui' },
+  ...JETBRAINS_BINS.map(bin => ({ bin, command: bin, label: bin, kind: 'gui' as const })),
   { bin: 'zed', command: 'zed', label: 'Zed', kind: 'gui' },
   { bin: 'subl', command: 'subl', label: 'Sublime Text', kind: 'gui' },
   { bin: 'mate', command: 'mate', label: 'TextMate', kind: 'gui' },
@@ -236,12 +355,167 @@ const KNOWN_EDITORS: readonly { bin: string; command: string; label: string; kin
  * screen it needs — a hang with no error.
  */
 export function editorKind(command: string): 'gui' | 'tty' {
+  const base = editorBin(command);
+  return KNOWN_EDITORS.find((e) => e.bin === base)?.kind ?? 'tty';
+}
+
+/** The editor a command names: its first word, path and Windows extension stripped. */
+export function editorBin(command: string): string {
   const first = (command.trim().split(/\s+/)[0] ?? '').replace(/\\/g, '/');
-  const base = first
+  return first
     .slice(first.lastIndexOf('/') + 1)
     .toLowerCase()
     .replace(/\.(exe|cmd|bat|com)$/, '');
-  return KNOWN_EDITORS.find((e) => e.bin === base)?.kind ?? 'tty';
+}
+
+/** Where a non-interactive ssh finds the remote's `oak`, and the programs a remote command runs. Such a
+ *  shell sources no profile, so its PATH is the system's alone: `oak machine add` installs to
+ *  ~/.local/bin, and npm or Homebrew globals land in /opt/homebrew/bin (Apple silicon) or /usr/local/bin. */
+export const MACHINE_PATH = '$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH';
+
+/** The environment for an ssh to a saved machine: an ssh_config SendEnv wildcard must not export this
+ *  machine's store or agent identity, and no ssh asks anything in a dialog. With no terminal to ask on
+ *  (on macOS and Linux, the ssh of `--machine` and `oak update` runs apart from the terminal), ssh asks
+ *  through the desktop's askpass program wherever a display is set, and so does the ssh of a jump host,
+ *  which inherits this environment but none of OAK's options: a dialog on every background read. `never`
+ *  (OpenSSH 8.4 and newer) refuses the question instead, and a question on a terminal is still asked there. */
+export function machineSshEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const out = { ...env };
+  for (const key of Object.keys(out)) {
+    if (key.startsWith('CLAUDE_CODE_') || ['CLAUDECODE', 'CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'CODEX_THREAD_ID',
+      'CLAUDE_OBSERVATORY_SESSION', 'CLAUDE_CHANGES_SESSION', 'HERDR_SOCKET_PATH', 'XDG_CONFIG_HOME'].includes(key)) delete out[key];
+  }
+  out.SSH_ASKPASS_REQUIRE = 'never';
+  return out;
+}
+
+/**
+ * `-o ControlMaster=no` when the person's ssh config would make an ssh to a target the master of a shared
+ * connection that is not kept in the background (ControlMaster on, ControlPersist off), read from what
+ * `ssh -G <target>` printed: the configuration ssh would use, without connecting. OAK stops such an ssh
+ * when its caller gives up (the terminal app's deadlines, an editor's, ctrl+c), and every session sharing
+ * a master ends with it. With ControlPersist the master runs in the background, so stopping the ssh is
+ * safe, and it keeps sharing. When `ssh -G` printed none (it failed, or ran past its 5 s: it runs the
+ * config's `Match exec` commands), the option is added anyway: `ControlMaster=no` still uses a master that
+ * is already open, and otherwise connects directly. Both OAK's own ssh (the CLI) and herdr's for a saved
+ * machine (herdr.ts) are decided here.
+ */
+export function sshMuxOptions(printed: { status: number | null; stdout?: string | null }): string[] {
+  const said = (key: string): string | undefined => new RegExp(`^${key} (\\S+)`, 'm').exec(printed.status === 0 ? String(printed.stdout ?? '') : '')?.[1].toLowerCase();
+  const master = said('controlmaster');
+  return printed.status !== 0 || (master && master !== 'false' && master !== 'no' && (said('controlpersist') ?? 'no') === 'no') ? ['-o', 'ControlMaster=no'] : [];
+}
+
+/** Whether a command names a JetBrains IDE launcher. */
+export function isJetBrainsEditor(command: string): boolean {
+  return JETBRAINS_BINS.includes(editorBin(command));
+}
+
+/** VS Code and its forks, which open a file at a line with `--goto <file>:<line>` (VS Code's CLI: `goto`, "file:line[:character]"). */
+const GOTO_EDITORS = new Set(['code', 'code-insiders', 'cursor', 'windsurf']);
+
+/** The arguments that open `file` at `line` in a GUI editor here, after the editor's own words: `--goto file:line` for VS
+ *  Code and its forks, `--line N file` for a JetBrains IDE, and the file alone for the rest and when there is no line. */
+export function guiEditorFileArgs(editor: string, file: string, line?: number): string[] {
+  if (!line || line < 1) return [file];
+  if (GOTO_EDITORS.has(editorBin(editor))) return ['--goto', `${file}:${line}`];
+  if (isJetBrainsEditor(editor)) return ['--line', String(line), file];
+  return [file];
+}
+
+/** The refusal when W has no GUI editor to run: none resolved, or a terminal editor in the GUI editor setting. */
+export const GUI_EDITOR_REFUSAL = 'W needs a GUI editor — set GUI editor under o (prefs.guiEditor) to code, cursor, a JetBrains IDE or another GUI editor';
+
+/** Where resolveGuiEditor found the editor, as the status row and the options window say it. */
+export type GuiEditorSource = 'setting' | 'editor' | 'VISUAL' | 'EDITOR' | 'terminal' | 'path';
+export const GUI_EDITOR_SOURCE: Readonly<Record<GuiEditorSource, string>> = {
+  setting: 'the GUI editor setting',
+  editor: 'the terminal editor setting',
+  VISUAL: '$VISUAL',
+  EDITOR: '$EDITOR',
+  terminal: "this terminal's editor",
+  path: 'the first GUI editor on PATH',
+};
+
+/**
+ * The GUI editor whose integrated terminal this process runs in, or '' when it is not one (or cannot be told). VS Code
+ * sets TERM_PROGRAM=vscode in every integrated terminal (its workbench hard-codes it, and its forks inherit it). Which
+ * fork: Cursor sets CURSOR_TRACE_ID and Windsurf WINDSURF_TRACE_ID, and VS Code's git extension puts
+ * VSCODE_GIT_ASKPASS_MAIN, a path inside the running app, into the terminal, so a fork's path names it. Claude Code
+ * and syncable-cli tell them apart by the same variables. Any other TERM_PROGRAM (a multiplexer started inside, iTerm)
+ * is not an editor's terminal, whatever leaked into its environment.
+ */
+export function integratedTerminalEditor(env: NodeJS.ProcessEnv = process.env): string {
+  if (env.TERM_PROGRAM !== 'vscode') return '';
+  const askpass = (env.VSCODE_GIT_ASKPASS_MAIN ?? '').toLowerCase();
+  if (env.CURSOR_TRACE_ID || askpass.includes('cursor')) return 'cursor';
+  if (env.WINDSURF_TRACE_ID || askpass.includes('windsurf')) return 'windsurf';
+  return 'code';
+}
+
+/**
+ * What W opens in, first match wins: the GUI editor setting (a terminal editor there is refused, not skipped); then
+ * prefs.editor, $VISUAL and $EDITOR, the first that is a GUI editor; then the GUI editor whose integrated terminal
+ * this is, when its command is on PATH; then the first GUI editor on PATH, in KNOWN_EDITORS order (`detected` is
+ * detectEditors()). Null when none: the caller refuses with GUI_EDITOR_REFUSAL.
+ */
+export function resolveGuiEditor(
+  p: Pick<Prefs, 'editor' | 'guiEditor'>,
+  env: NodeJS.ProcessEnv,
+  detected: readonly EditorChoice[]
+): { command: string; source: GuiEditorSource } | null {
+  const set = p.guiEditor?.trim();
+  if (set) return editorKind(set) === 'gui' ? { command: set, source: 'setting' } : null;
+  for (const [source, value] of [['editor', p.editor], ['VISUAL', env.VISUAL], ['EDITOR', env.EDITOR]] as const) {
+    const command = value?.trim();
+    if (command && editorKind(command) === 'gui') return { command, source };
+  }
+  const own = integratedTerminalEditor(env);
+  if (own && detected.some((e) => e.command === own)) return { command: own, source: 'terminal' };
+  const first = detected.find((e) => editorKind(e.command) === 'gui');
+  return first ? { command: first.command, source: 'path' } : null;
+}
+
+/** The editors that open a file on another machine through VS Code's Remote-SSH authority. */
+const REMOTE_SSH_EDITORS = new Set(['code', 'code-insiders', 'cursor']);
+
+/**
+ * How this machine's editor opens a file that lives on a saved machine (a session reviewed there), or
+ * null when it cannot. A KNOWN terminal editor ('tty') runs on that machine over `ssh -t`; VS Code and
+ * Cursor ('gui') open it from here through their own Remote-SSH. Any other GUI editor, and a command
+ * this table does not know, cannot: running an unknown command over ssh could start a GUI program on a
+ * machine with no display. A terminal editor opens files, not folders.
+ */
+export function remoteEditorKind(editor: string, dir = false): 'gui' | 'tty' | null {
+  const base = editorBin(editor);
+  if (REMOTE_SSH_EDITORS.has(base)) return 'gui';
+  return !dir && KNOWN_EDITORS.find((e) => e.bin === base)?.kind === 'tty' ? 'tty' : null;
+}
+
+/**
+ * The command that opens `file` on the saved machine at ssh `target` (see remoteEditorKind), or null.
+ * The terminal editor runs under the PATH `--machine` gives a remote command, as one string for the
+ * remote shell with each word single-quoted, so a path with spaces or quotes arrives whole. It is named
+ * by its base name (editorBin), since this machine's path to it (`/opt/homebrew/bin/nvim`,
+ * `C:\tools\nvim.exe`) means nothing there. For VS Code
+ * and Cursor, `--goto` makes a path without an extension a file rather than a folder, and a folder
+ * ends in `/`.
+ */
+export function remoteEditorLaunch(
+  editor: string,
+  target: string,
+  file: string,
+  dir = false
+): { command: string; args: string[]; kind: 'gui' | 'tty' } | null {
+  const parts = editor.trim().split(/\s+/).filter(Boolean);
+  const kind = remoteEditorKind(editor, dir);
+  if (!kind || !parts.length || !target || target.startsWith('-')) return null;
+  if (kind === 'gui') {
+    const at = dir ? [file.endsWith('/') ? file : file + '/'] : ['--goto', file];
+    return { command: parts[0], args: [...parts.slice(1), '--remote', `ssh-remote+${target}`, ...at], kind };
+  }
+  const quote = (w: string): string => `'${w.replace(/'/g, `'\\''`)}'`;
+  return { command: 'ssh', args: ['-t', target, `env PATH="${MACHINE_PATH}" ${[editorBin(editor), ...parts.slice(1), file].map(quote).join(' ')}`], kind };
 }
 
 /**
@@ -330,13 +604,20 @@ const GLYPHS: GlyphPref[] = ['auto', 'ascii', 'safe', 'block'];
 export function readPrefs(file = prefsPath()): Prefs {
   let raw: unknown;
   try {
-    raw = JSON.parse(fs.readFileSync(file, 'utf8'));
+    // A byte order mark that an editor put first is not JSON: read past it, or the next write drops every setting.
+    raw = JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, ''));
   } catch {
     return {}; // absent or unparseable — both mean "no preferences", and neither is an error
   }
+  return parsePrefs(raw);
+}
+
+/** The settings in a parsed prefs.json, validated as `readPrefs` describes. */
+export function parsePrefs(raw: unknown): Prefs {
   const d = (raw ?? {}) as Record<string, unknown>;
   const out: Prefs = {};
   if (typeof d.editor === 'string' && d.editor.trim()) out.editor = d.editor.trim();
+  if (typeof d.guiEditor === 'string' && d.guiEditor.trim()) out.guiEditor = d.guiEditor.trim();
   if (typeof d.color === 'string' && (COLORS as string[]).includes(d.color)) out.color = d.color as ColorPref;
   if (typeof d.glyphs === 'string' && (GLYPHS as string[]).includes(d.glyphs)) out.glyphs = d.glyphs as GlyphPref;
   if (typeof d.mouse === 'boolean') out.mouse = d.mouse;
@@ -355,6 +636,11 @@ export function readPrefs(file = prefsPath()): Prefs {
   // needs no stored value — and storing one would break the 'only non-defaults are written' rule.
   if (typeof d.syntax === 'boolean') out.syntax = d.syntax;
   if (typeof d.remoteTitles === 'boolean') out.remoteTitles = d.remoteTitles;
+  if (typeof d.machineUsage === 'boolean') out.machineUsage = d.machineUsage;
+  const sync = parseSyncPrefs(d.sync);
+  if (sync) out.sync = sync;
+  const agents = parseAgentPrefs(d.agents);
+  if (agents) out.agents = agents;
   // Notifications: each field validated on its own, unknown kinds dropped — a kind name from a newer
   // build must not make the whole setting vanish, nor an unknown one reach the announcer.
   if (d.notify && typeof d.notify === 'object' && !Array.isArray(d.notify)) {
@@ -407,6 +693,7 @@ export function readPrefs(file = prefsPath()): Prefs {
   if (typeof d.gptBillDay === 'number' && Number.isFinite(d.gptBillDay) && d.gptBillDay >= 1 && d.gptBillDay <= 31) {
     out.gptBillDay = Math.trunc(d.gptBillDay);
   }
+  if (d.accountBilling) out.accountBilling = parseAccountBilling(d.accountBilling);
   if (typeof d.refreshSeconds === 'number' && Number.isFinite(d.refreshSeconds)) {
     // Floored at one second. A zero or a negative would poll as fast as the loop can spawn, and this
     // dashboard shells out to a child process per refresh.
@@ -414,13 +701,19 @@ export function readPrefs(file = prefsPath()): Prefs {
   }
   if (d.keys && typeof d.keys === 'object') {
     const keys: Partial<Record<Action, string>> = {};
+    const blocked: Partial<Record<Action, string>> = {};
     const known = new Set<string>(REBINDABLE.map((r) => r.action));
     for (const [k, v] of Object.entries(d.keys as Record<string, unknown>)) {
       // One printable character, and an action this build knows. A multi-character "binding" would
       // never match a decoded key, so accepting it would produce a verb that silently stopped working.
-      if (known.has(k) && typeof v === 'string' && [...v].length === 1 && v >= ' ') keys[k as Action] = v;
+      if (!known.has(k) || typeof v !== 'string' || [...v].length !== 1 || v < ' ') continue;
+      // A reserved key is not live, but it is the reader's saved choice: kept aside, not dropped, so the
+      // next write does not delete it before the reader has been told.
+      if (RESERVED_KEYS.has(v)) blocked[k as Action] = v;
+      else keys[k as Action] = v;
     }
     if (Object.keys(keys).length) out.keys = keys;
+    if (Object.keys(blocked).length) out.blockedKeys = blocked;
   }
   return out;
 }
@@ -454,13 +747,31 @@ export function readPrefs(file = prefsPath()): Prefs {
 // 8 (2026-08-18): the blob buttons became ICONS, so the master narrowed to 0.25. A v7 record pins 0.45.
 export const LAYOUT_VERSION = 8;
 
+export function parseAccountBilling(value: unknown): import('./account-billing').AccountBilling {
+  const out: import('./account-billing').AccountBilling = {};
+  for (const agent of ['claude', 'codex'] as const) {
+    const v = (value as import('./account-billing').AccountBilling | undefined)?.[agent];
+    if (v && Number.isInteger(v.day) && v.day >= 0 && v.day <= 31 && Number.isSafeInteger(v.at) && v.at >= 0 &&
+      typeof v.account === 'string' && /^(?:[a-f0-9]{12}|[a-f0-9]{16})?$/.test(v.account)) out[agent] = v;
+  }
+  return out;
+}
+
+let accountBillDayReader: ((agent: 'claude' | 'codex') => number | undefined) | undefined;
+/** Account reads register this after loading the database; capture only needs local preferences. */
+export function setAccountBillDayReader(read: NonNullable<typeof accountBillDayReader>): void { accountBillDayReader = read; }
+
 /** The bill day the month figures anchor to: the user's stated prefs.billDay, else the day of
- *  `oauthAccount.subscriptionCreatedAt` from Claude Code's own ~/.claude.json (anniversary
+ *  `oauthAccount.subscriptionCreatedAt` from Claude Code's own .claude.json (anniversary
  *  billing renews on that day-of-month), else null (callers fall back to calendar months). */
 export function billDay(prefs: Prefs = readPrefs()): number | null {
+  if (arguments.length === 0) {
+    const shared = accountBillDayReader?.('claude');
+    if (shared !== undefined) return shared || null;
+  }
   if (typeof prefs.billDay === 'number' && prefs.billDay >= 1 && prefs.billDay <= 31) return Math.trunc(prefs.billDay);
   try {
-    const cj = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.claude.json'), 'utf8'));
+    const cj = JSON.parse(fs.readFileSync(claudeJsonPath(), 'utf8'));
     const at = Date.parse(cj?.oauthAccount?.subscriptionCreatedAt ?? '');
     if (isFinite(at)) return new Date(at).getUTCDate();
   } catch {
@@ -470,33 +781,71 @@ export function billDay(prefs: Prefs = readPrefs()): number | null {
 }
 
 /** The bill day the GPT/codex month anchors to — `prefs.gptBillDay` only (no codex payload carries
- *  the subscription date, unlike claude's ~/.claude.json), else null (calendar months). */
+ *  the subscription date, unlike claude's .claude.json), else null (calendar months). */
 export function gptBillDay(prefs: Prefs = readPrefs()): number | null {
+  if (arguments.length === 0) {
+    const shared = accountBillDayReader?.('codex');
+    if (shared !== undefined) return shared || null;
+  }
   if (typeof prefs.gptBillDay === 'number' && prefs.gptBillDay >= 1 && prefs.gptBillDay <= 31) return Math.trunc(prefs.gptBillDay);
   return null;
 }
 
+/** The notification kinds an absent `notify.kinds` means (notify.ts DEFAULT_NOTIFY_KINDS), and the fields `notify` has. */
+const DEFAULT_KINDS: readonly HandKind[] = ['permission', 'question', 'input'];
+const NOTIFY_FIELDS: readonly (keyof NonNullable<Prefs['notify']>)[] = ['desktop', 'sound', 'kinds', 'cooldownSeconds'];
+
 export function writePrefs(p: Prefs, file = prefsPath()): void {
+  // The upkeep that restores settings an older OAK dropped uses this same lock through its comparison and rename.
+  (require('./store') as typeof import('./store')).withPrefsMutation(file, () => writePrefsLocked(p, file));
+}
+
+function writePrefsLocked(p: Prefs, file: string): void {
+  // What the file holds now. A file that does not parse (a hand edit half done) is left as it is, and the caller says so:
+  // read as no preferences, it was replaced by the caller's settings alone.
+  let raw: Record<string, unknown> = {};
+  let text: string | undefined;
+  try {
+    text = fs.readFileSync(file, 'utf8');
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e;
+  }
+  if (text !== undefined) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text.replace(/^\uFEFF/, ''));
+    } catch {
+      throw new Error('prefs.json is not valid JSON, so it was left as it is');
+    }
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) raw = parsed as Record<string, unknown>;
+  }
   const clean: Prefs = {};
+  const agents = parseAgentPrefs(p.agents);
+  if (agents) clean.agents = agents;
   if (p.editor && p.editor.trim()) clean.editor = p.editor.trim();
+  if (p.guiEditor && p.guiEditor.trim()) clean.guiEditor = p.guiEditor.trim();
   if (p.color && p.color !== 'auto') clean.color = p.color;
   if (p.glyphs && p.glyphs !== 'auto') clean.glyphs = p.glyphs;
   if (p.mouse === false) clean.mouse = false;
   if (p.refreshSeconds && p.refreshSeconds !== 3) clean.refreshSeconds = p.refreshSeconds;
   if (typeof p.billDay === 'number' && p.billDay >= 1 && p.billDay <= 31) clean.billDay = Math.trunc(p.billDay);
   if (typeof p.gptBillDay === 'number' && p.gptBillDay >= 1 && p.gptBillDay <= 31) clean.gptBillDay = Math.trunc(p.gptBillDay);
+  if (p.accountBilling) clean.accountBilling = parseAccountBilling(p.accountBilling);
   if (p.startFocus && p.startFocus !== 'traces') clean.startFocus = p.startFocus;
   if (p.sort && p.sort !== 'time') clean.sort = p.sort;
   if (p.theme && p.theme !== 'default') clean.theme = p.theme;
   // Only the NON-default is written, and for this setting the non-default is 'off'.
   if (p.syntax === false) clean.syntax = false;
   if (p.remoteTitles === false) clean.remoteTitles = false; // on is the default, so only off is stored
+  if (p.machineUsage === false) clean.machineUsage = false; // likewise
+  const sync = parseSyncPrefs(p.sync);
+  if (sync) clean.sync = sync;
   // Notifications: only what differs from the defaults (on · no sound · the three waits · 30s).
   if (p.notify) {
     const n: NonNullable<Prefs['notify']> = {};
     if (p.notify.desktop === false) n.desktop = false;
     if (p.notify.sound === true) n.sound = true;
-    if (p.notify.kinds && [...p.notify.kinds].sort().join() !== 'input,permission,question') n.kinds = [...p.notify.kinds];
+    if (p.notify.kinds && [...p.notify.kinds].sort().join() !== [...DEFAULT_KINDS].sort().join()) n.kinds = [...p.notify.kinds];
     if (typeof p.notify.cooldownSeconds === 'number' && p.notify.cooldownSeconds !== 30) n.cooldownSeconds = p.notify.cooldownSeconds;
     if (Object.keys(n).length) clean.notify = n;
   }
@@ -511,20 +860,96 @@ export function writePrefs(p: Prefs, file = prefsPath()): void {
   for (const r of REBINDABLE) {
     const v = p.keys?.[r.action];
     if (v && v !== r.fallback) keys[r.action] = v;
+    // A blocked rebind is written back until the reader binds the action again (or resets).
+    else if (!v && p.blockedKeys?.[r.action]) keys[r.action] = p.blockedKeys[r.action];
+  }
+  // A binding this build cannot read (an action a newer build added, a key it does not take) keeps what the file gives
+  // it, unless the caller binds that action.
+  const read = parsePrefs(raw);
+  const fileKeys = raw.keys && typeof raw.keys === 'object' && !Array.isArray(raw.keys) ? (raw.keys as Record<string, unknown>) : {};
+  for (const [action, key] of Object.entries(fileKeys)) {
+    const bound = (by?: Partial<Record<Action, string>>): boolean => by?.[action as Action] !== undefined;
+    if (!bound(read.keys) && !bound(read.blockedKeys) && !bound(p.keys) && !bound(p.blockedKeys)) (keys as Record<string, unknown>)[action] = key;
   }
   if (Object.keys(keys).length) clean.keys = keys;
+  // A setting the caller left as this build reads it is written back as the file has it. Rebuilt from what this build
+  // understands, every save dropped a key a newer build wrote, and a value this build cannot read (a palette it lacks).
+  const same = (a: unknown, b: unknown): boolean => JSON.stringify(a) === JSON.stringify(b);
+  const out: Record<string, unknown> = { [PREFS_FORMAT_KEY]: PREFS_FORMAT, ...clean };
+  for (const [k, v] of Object.entries(raw)) {
+    // `keys` is read into two settings: the live rebinds, and those held on a reserved key.
+    const left = k === 'keys' ? same(p.keys, read.keys) && same(p.blockedKeys, read.blockedKeys) : same(p[k as keyof Prefs], read[k as keyof Prefs]);
+    if (left) out[k] = v;
+  }
+  // `notify` by the same rule, field by field: changing one of its fields dropped a field a newer build added, a value this
+  // build cannot read, and a kind it does not have. A kind it does not have stays beside the kinds the caller chose.
+  const fileNotify = raw.notify && typeof raw.notify === 'object' && !Array.isArray(raw.notify) ? (raw.notify as Record<string, unknown>) : null;
+  if (fileNotify && !same(p.notify, read.notify)) {
+    const n: Record<string, unknown> = { ...clean.notify };
+    for (const [k, v] of Object.entries(fileNotify)) {
+      const field = k as keyof NonNullable<Prefs['notify']>;
+      if (!NOTIFY_FIELDS.includes(field) || same(p.notify?.[field], read.notify?.[field])) n[k] = v;
+      else if (field === 'kinds' && Array.isArray(v)) {
+        const unknown = v.filter((x) => !(HAND_KINDS as readonly unknown[]).includes(x));
+        if (unknown.length) n.kinds = [...(p.notify?.kinds ?? DEFAULT_KINDS), ...unknown];
+      }
+    }
+    if (Object.keys(n).length) out.notify = n;
+    else delete out.notify;
+  }
+  // `sync` by the same rule, field by field, and a level down in `families` and `exclude`: changing one setting with
+  // `oak sync …` dropped a field a newer build added (a backup kind's own fields, a list it keeps) and a placement this
+  // build cannot read. A backup is replaced whole.
+  const rec = (v: unknown): Record<string, unknown> | null => (v && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : null);
+  const fileSync = rec(raw.sync);
+  if (fileSync && !same(p.sync, read.sync)) {
+    const s: Record<string, unknown> = { ...clean.sync };
+    const was = (read.sync ?? {}) as Record<string, unknown>;
+    for (const [k, v] of Object.entries(fileSync)) {
+      if (same(s[k], was[k])) s[k] = v;
+      else if ((k === 'families' || k === 'exclude') && rec(v)) {
+        const inner: Record<string, unknown> = { ...rec(s[k]) };
+        const wasInner = rec(was[k]) ?? {};
+        for (const [k2, v2] of Object.entries(rec(v)!)) if (same(inner[k2], wasInner[k2])) inner[k2] = v2;
+        if (Object.keys(inner).length) s[k] = inner;
+        else delete s[k];
+      }
+    }
+    if (Object.keys(s).length) out.sync = s;
+    else delete out.sync;
+  }
+  // Over a prefs.json an older OAK rewrote (no PREFS_FORMAT_KEY), oak sync's settings and `machineUsage` that it dropped,
+  // and so the caller did not set, are written from oak sync's copy (sync-state.ts keptOverOlder; late-required, as the
+  // store is).
+  let restored: readonly string[] = [];
+  if (file === prefsPath() && text !== undefined && raw[PREFS_FORMAT_KEY] === undefined) {
+    try {
+      restored = (require('./sync-state') as { keptOverOlder(out: Record<string, unknown>): string[] }).keptOverOlder(out);
+    } catch {
+      /* written as the caller asked */
+    }
+  }
 
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const tmp = `${file}.tmp-${process.pid}`;
-  fs.writeFileSync(tmp, JSON.stringify(clean, null, 2) + '\n');
+  fs.writeFileSync(tmp, JSON.stringify(out, null, 2) + '\n');
   fs.renameSync(tmp, file);
-  // `rootDir()` memoizes the store location for the life of the process, so a storeDir written here
-  // has to invalidate it or the options window would save a setting this process keeps ignoring.
+  // `rootDir()` memoizes the store location for a turn of the event loop, so a storeDir written here
+  // has to invalidate it or the options window would save a setting this process ignores until then.
   // Late-required to keep this module free of a store import at load time.
   try {
     (require('./store') as { clearRootMemo(): void }).clearRootMemo();
   } catch {
     /* store not loaded in this process — nothing memoized to clear */
+  }
+  // oak sync keeps a copy of `sync` and `machineUsage` (sync-state.ts keptPrefs), which brings them back when an OAK older
+  // than 0.11.0 rewrites this file without them: it follows every write here.
+  if (file === prefsPath()) {
+    try {
+      (require('./sync-state') as { noteKeptPrefs(out: Record<string, unknown>, restored?: readonly string[]): void }).noteKeptPrefs(out, restored);
+    } catch {
+      /* the copy follows the file at the next read (keptPrefs) */
+    }
   }
 }
 

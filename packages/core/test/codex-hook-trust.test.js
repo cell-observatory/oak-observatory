@@ -4,7 +4,8 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const cp = require('node:child_process');
-const { parse: parseToml } = require('smol-toml');
+// smol-toml 1.9 returns objects with a null prototype; these assertions compare content, so read plain objects.
+const parseToml = (text) => JSON.parse(JSON.stringify(require('smol-toml').parse(text)));
 const { codexHookTrustHash, trustHerdrCodexHook } = require('../dist/codex-hook-trust');
 const { ensureHerdr } = require('../dist/herdr-install');
 
@@ -207,6 +208,18 @@ test('Codex trust: creates a private config if absent, and does nothing if hooks
   assert.deepEqual(backups(b), []);
 });
 
+test('Codex trust: a byte order mark that opens config.toml stays first, once', t => {
+  for (const original of ['\uFEFF[features]\nhooks = true\n', '\uFEFFmodel = "test"\n']) {
+    const b = sandbox(t);
+    fs.copyFileSync(b.payload, path.join(b.codexDir, 'hooks.json'));
+    fs.writeFileSync(b.configFile, original);
+    assert.equal(trustHerdrCodexHook(b.codexDir, 'linux'), 1);
+    const result = fs.readFileSync(b.configFile, 'utf8');
+    assert.ok(result.startsWith(original) && result.lastIndexOf('\uFEFF') === 0, JSON.stringify(result));
+    assert.match(parseToml(result).hooks.state[b.key].trusted_hash, /^sha256:/);
+  }
+});
+
 test('Codex trust: backup must succeed before any config bytes are appended', t => {
   const b = sandbox(t);
   fs.copyFileSync(b.payload, path.join(b.codexDir, 'hooks.json'));
@@ -292,6 +305,40 @@ test('Codex trust: a lock left by a dead repair is reclaimed instead of blocking
   const stale = Date.now() - 60_000;
   fs.utimesSync(lock, stale / 1000, stale / 1000);
   assert.equal(trustHerdrCodexHook(b.codexDir, 'linux'), 1, 'an abandoned lock is reclaimed by age');
+  assert.equal(fs.existsSync(lock), false);
+  assert.match(parseToml(fs.readFileSync(b.configFile, 'utf8')).hooks.state[b.key].trusted_hash, /^sha256:/);
+});
+
+test('Codex trust: a lock just taken on a file system whose clock runs ahead of this one is waited on, not reclaimed', t => {
+  // Read as dated ahead of this clock (a clock stepped back), a live repair's lock was reclaimed, and two repairs
+  // appended the same table. Its file system's own clock dates it now.
+  const b = sandbox(t);
+  fs.copyFileSync(b.payload, path.join(b.codexDir, 'hooks.json'));
+  const lock = b.configFile + '.oak-hook-trust.lock';
+  fs.writeFileSync(lock, '');
+  const realNow = Date.now;
+  let tick = 0;
+  t.mock.method(Date, 'now', () => realNow() - 9000 + 500 * tick++); // nine seconds behind, and running on so the wait ends
+  try {
+    assert.throws(() => trustHerdrCodexHook(b.codexDir, 'linux'), /Another OAK process is repairing herdr hook trust/);
+  } finally {
+    t.mock.restoreAll();
+  }
+  assert.ok(fs.existsSync(lock), 'the live holder keeps its lock');
+});
+
+test('Codex trust: a lock dated in the future (a clock stepped back) is reclaimed, not waited on until the install gives up', t => {
+  // Its age read as negative, never past the timeout, so every install and `oak doctor --fix` waited its ten seconds
+  // and then failed, saying another OAK process was repairing the trust, until the clock caught up.
+  const b = sandbox(t);
+  fs.copyFileSync(b.payload, path.join(b.codexDir, 'hooks.json'));
+  const lock = b.configFile + '.oak-hook-trust.lock';
+  fs.writeFileSync(lock, '');
+  const ahead = (Date.now() + 3600_000) / 1000;
+  fs.utimesSync(lock, ahead, ahead);
+  const started = Date.now();
+  assert.equal(trustHerdrCodexHook(b.codexDir, 'linux'), 1, 'the lock is reclaimed and the trust written');
+  assert.ok(Date.now() - started < 5000, `without waiting the lock's timeout out (${Date.now() - started} ms)`);
   assert.equal(fs.existsSync(lock), false);
   assert.match(parseToml(fs.readFileSync(b.configFile, 'utf8')).hooks.state[b.key].trusted_hash, /^sha256:/);
 });

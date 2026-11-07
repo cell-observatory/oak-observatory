@@ -16,10 +16,10 @@
   },
   "dependencies": {
     "diff": "^9.0.0",
-    "smol-toml": "1.8.0"
+    "smol-toml": "1.9.1"
   },
   "devDependencies": {
-    "@types/node": "^26.1.2"
+    "@types/node": "^26.6.3"
   },
   "license": "Apache-2.0",
   "repository": {

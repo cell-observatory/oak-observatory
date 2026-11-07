@@ -29,6 +29,7 @@ import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.components.Service
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.startup.ProjectActivity
+import com.intellij.openapi.ui.Messages
 import com.intellij.util.concurrency.EdtScheduledExecutorService
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.TimeUnit
@@ -118,8 +119,16 @@ class ObservatoryService(private val project: Project) : Disposable {
             refresh(force = true)
         }
 
+    data class RemotePin(val session: String, val machine: String)
+    @Volatile var remotePin: RemotePin? = null
+    fun currentMachine(): String? = if (demoSessionOverride == null) remotePin?.machine else null
+    fun machineSuffix(): String = currentMachine()?.let { " · on $it" } ?: ""
+    private val savedListener = Runnable { if (!project.isDisposed) notifyListeners() }
+    init { com.cellobservatory.observatory.core.SavedMachines.listeners.add(savedListener) }
+
     fun currentSession(): String? {
         demoSessionOverride?.takeIf { it.isNotBlank() }?.let { return it }
+        remotePin?.let { return it.session }
         // A pinned session (Switch Session / settings) wins over auto-resolution — lets you review a
         // demo session or any past session instead of just the newest for this workspace. But only
         // while it still EXISTS: the pin is persisted and application-wide, so a session deleted
@@ -140,6 +149,10 @@ class ObservatoryService(private val project: Project) : Disposable {
 
     /** Folded log for the current session, cached on the log file's (mtime,size). */
     fun log(): List<EditRecord> {
+        if (currentMachine() != null) {
+            pendingByFile = emptyMap(); pendingFilesCache = emptyList(); cachedKey = ""
+            return emptyList()
+        }
         val session = currentSession() ?: run {
             pendingByFile = emptyMap()
             pendingFilesCache = emptyList()
@@ -168,6 +181,7 @@ class ObservatoryService(private val project: Project) : Disposable {
      * that would answer from the previous session after a switch.
      */
     fun pendingFiles(): List<String> {
+        if (currentMachine() != null) return navigationRecords().filter { it.pending }.map { it.file }.distinct().sorted()
         log()
         return pendingFilesCache
     }
@@ -181,12 +195,13 @@ class ObservatoryService(private val project: Project) : Disposable {
 
     // Review-loop cursor: id of the pending edit last opened, so repeated ←/→ invocations step
     // backward/forward through every pending edit (wrapping at the ends). Shared by the toolbar
-    // buttons, the ⌥⌘N/⌥⌘P actions, the status-bar cluster, and the editor banner.
+    // buttons, the ⌥⌘X N / ⌥⌘X P actions, the status-bar cluster, and the editor banner.
     @Volatile private var reviewCursorId: Int? = null
+    private var reviewCursorKey = ""
 
     /** The pending edit the review cursor is parked on (null when unset or no longer pending) —
      *  the anchor for the editor banner's per-edit Keep/Undo. */
-    fun currentPendingEdit(): EditRecord? = reviewCursorId?.let { id -> log().find { it.id == id && it.pending } }
+    fun currentPendingEdit(): EditRecord? = reviewCursorId?.takeIf { reviewCursorKey == "${currentMachine()}|${currentSession()}|$selectedPromptId" }?.let { id -> navigationRecords().find { it.id == id && it.pending } }
 
     /**
      * Move the review cursor without navigating.
@@ -197,6 +212,7 @@ class ObservatoryService(private val project: Project) : Disposable {
      * callable from a background action `update()`/`actionPerformed` as well as the EDT.
      */
     fun parkReviewCursor(id: Int?) {
+        reviewCursorKey = "${currentMachine()}|${currentSession()}|$selectedPromptId"
         reviewCursorId = id
     }
 
@@ -207,6 +223,8 @@ class ObservatoryService(private val project: Project) : Disposable {
     fun prevPendingEdit(): EditRecord? = stepPendingEdit(-1)
 
     private fun stepPendingEdit(dir: Int): EditRecord? {
+        val key = "${currentMachine()}|${currentSession()}|$selectedPromptId"
+        if (key != reviewCursorKey) { reviewCursorId = null; reviewCursorKey = key }
         // Step review UNITS, not raw records. `tree --json` already carries core's collapse (its edit
         // rows are unit representatives), so filtering the raw walk to ids the tree shows makes this
         // cursor visit each combined change ONCE — the other two front ends already did, and stepping
@@ -214,7 +232,7 @@ class ObservatoryService(private val project: Project) : Disposable {
         // With no tree yet (first refresh, or a CLI too old to answer), the raw walk is the honest
         // fallback: visiting more stops loses nothing, where visiting none would strand the cursor.
         val reps = editTree()?.let { t -> (t.files.flatMap { it.allEdits } + t.folders.flatMap { it.allEdits }).map { it.id }.toSet() }
-        val all = log().filter { it.pending }
+        val all = navigationRecords().filter { it.pending }
         val pending = (if (reps.isNullOrEmpty()) all else all.filter { it.id in reps }.ifEmpty { all }).sortedBy { it.id }
         if (pending.isEmpty()) {
             reviewCursorId = null
@@ -342,14 +360,72 @@ class ObservatoryService(private val project: Project) : Disposable {
         private set
 
     /** True when this record is one of the above — the single test every derived count uses. */
-    fun isHidden(rec: EditRecord): Boolean = hiddenIds.isNotEmpty() && rec.id in hiddenIds
+    fun isHidden(rec: EditRecord): Boolean = if (currentMachine() != null) remoteReview()?.review?.hiddenIds?.contains(rec.id) == true else hiddenIds.isNotEmpty() && rec.id in hiddenIds
+
+    data class RemoteReview(val review: com.cellobservatory.observatory.model.ReviewResult?, val tree: EditTree?,
+        val history: List<EditRecord>, val error: String?, val lastSuccess: Long) {
+        fun note(machine: String): String = if (error != null)
+            "Could not read Review on $machine: $error · last successful read: ${if (lastSuccess == 0L) "never" else java.util.Date(lastSuccess)}"
+        else "Read on $machine at ${java.util.Date(lastSuccess)}"
+    }
+    private val remoteReviewSuccess = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    private val remoteReviewFetch = ThrottledFetch { key ->
+        val session = key.substringBefore('\t')
+        val prompt = key.substringAfter('\t').takeIf { it.isNotBlank() }
+        val machine = ObservatoryCli.currentMachine().orEmpty()
+        val args = listOf("views", "--views", "review,tree,timeline", "--json", "--no-patch", "--session", session) +
+            (prompt?.let { listOf("--prompt", it) } ?: emptyList())
+        val answer = ObservatoryCli.run(args, workspaceRoot)
+        val json = runCatching { com.google.gson.JsonParser.parseString(answer.stdout).asJsonObject }.getOrNull()
+        val review = json?.get("review")?.let { com.cellobservatory.observatory.model.ReviewParser.parse(it.toString()) }
+        val tree = json?.get("tree")?.let { TreeParser.parse(it.toString()) }
+        val history = runCatching { json?.getAsJsonObject("timeline")?.getAsJsonArray("edits")?.map { e ->
+            val r = e.asJsonObject
+            EditRecord(r.get("id").asInt, r.get("ts").asLong, r.get("tool").asString, r.get("file").asString,
+                null, null, r.get("status").asString)
+        } }.getOrNull()
+        val successKey = "$machine|$session"
+        val ok = answer.ok && review != null && tree != null && history != null
+        if (ok) remoteReviewSuccess[successKey] = System.currentTimeMillis()
+        RemoteReview(if (ok) review else null, if (ok) tree else null, if (ok) history.orEmpty() else emptyList(),
+            if (ok) null else json?.getAsJsonObject("__problems")?.entrySet()?.joinToString("; ") { it.value.asString }
+                ?: ObservatoryCli.failureMessage(answer.stdout, answer.stderr, "Invalid review answer; update OAK on $machine"),
+            remoteReviewSuccess[successKey] ?: 0L)
+    }
+    fun remoteReview(): RemoteReview? {
+        if (currentMachine() == null) return null
+        return currentSession()?.let { remoteReviewFetch.get("$it\t${selectedPromptId.orEmpty()}") }
+    }
+    private var remoteReviewSelection: Triple<String, String, String>? = null
+    fun selectedRemoteReviewFile(): String? = remoteReviewSelection?.takeIf { it.first == currentMachine() && it.second == currentSession() }?.third
+    fun selectRemoteReviewFile(file: String) {
+        val machine = currentMachine() ?: return
+        val session = currentSession() ?: return
+        val next = Triple(machine, session, file)
+        if (remoteReviewSelection != next) { remoteReviewSelection = next; notifyListeners() }
+    }
+    fun reviewRecords(): List<EditRecord> = if (currentMachine() == null) log() else remoteReview()?.history.orEmpty()
+
+    fun navigationRecords(): List<EditRecord> {
+        if (currentMachine() == null) return log()
+        val snapshot = remoteReview() ?: return emptyList()
+        fun filesIn(folder: com.cellobservatory.observatory.model.TreeFolderNode): List<com.cellobservatory.observatory.model.TreeFileNode> = folder.files + folder.folders.flatMap(::filesIn)
+        val files = snapshot.tree?.let { it.files + it.folders.flatMap(::filesIn) }.orEmpty().associateBy { it.file }
+        return snapshot.review?.units.orEmpty().filter { u ->
+            val file = files[u.file]
+            matchesFile(u.rel, file?.ext.orEmpty(), file?.category.orEmpty())
+        }.map { u -> EditRecord(u.id, u.ts, u.tool, u.file, null, null, u.status) }
+    }
+
 
     fun editTree(): EditTree? {
+        if (currentMachine() != null) return remoteReview()?.tree
         refreshEditTree()
         return editTreeCache
     }
 
     private fun refreshEditTree() {
+        if (currentMachine() != null) { editTreeCache = null; editTreeKey = ""; return }
         val session = currentSession() ?: run {
             editTreeCache = null
             // No session is not a fetch failure — a flag left over from one would make the empty
@@ -400,7 +476,7 @@ class ObservatoryService(private val project: Project) : Disposable {
     // (multitask now spawns once per window, not twice), and fanned out via the listener ring when it
     // lands — VS Code parity: its Overview webview self-throttles its spawns at 3s.
 
-    private inner class ThrottledFetch<T : Any>(private val fetch: (String) -> T?) {
+    private inner class ThrottledFetch<T : Any>(private val local: Boolean = false, private val fetch: (String) -> T?) {
         @Volatile var value: T? = null
             private set
         /** True once a fetch has COMPLETED at least once, successfully or not. A null [value] means two
@@ -408,6 +484,7 @@ class ObservatoryService(private val project: Project) : Disposable {
          *  panel that blurs them states as fact something it never observed. */
         @Volatile var attempted = false
             private set
+        @Volatile private var fetchedMachine: String? = null
         @Volatile private var fetchedKey = ""
         @Volatile private var fetchedAt = 0L
         @Volatile private var inFlight = false
@@ -433,26 +510,37 @@ class ObservatoryService(private val project: Project) : Disposable {
             // cannot answer usually cannot answer for a reason that will still be true in three seconds
             // (an unbuildable session, a CLI that is not there), and retrying at full cadence turns one
             // broken view into a permanently busy core. Doubles to a minute, and any success clears it.
-            val wait = if (misses == 0) MIN_FETCH_MS else minOf(MIN_FETCH_MS shl minOf(misses, 5), 60_000L)
-            val stale = key != fetchedKey || now - fetchedAt >= wait
+            val floor = if (!local && currentMachine() != null) com.cellobservatory.observatory.core.SavedMachines.READ_MS else MIN_FETCH_MS
+            val wait = if (misses == 0) floor else minOf(floor shl minOf(misses, 5), 60_000L)
+            val machine = if (local) null else currentMachine()
+            val stale = key != fetchedKey || machine != fetchedMachine || now - fetchedAt >= wait
             if (!inFlight && (stale || forced)) spawn(key)
-            return value
+            return value.takeIf { key == fetchedKey && machine == fetchedMachine }
         }
 
         private fun spawn(key: String) {
+            val machine = if (local) null else currentMachine()
             inFlight = true
             forced = false // this spawn answers the pending force…
             ApplicationManager.getApplication().executeOnPooledThread {
                 try {
-                    val v = fetch(key)
+                    val v = ObservatoryCli.onMachine(machine) { fetch(key) }
+                    if (!local && machine != currentMachine()) return@executeOnPooledThread
                     fetchedAt = System.currentTimeMillis() // set on failure too — back off, don't spin
                     if (v != null) {
                         misses = 0
                         value = v
                         fetchedKey = key
+                        fetchedMachine = machine
                         notifyListeners()
                     } else {
                         misses++
+                        if (machine != null) {
+                            value = null
+                            fetchedKey = key
+                            fetchedMachine = machine
+                            notifyListeners()
+                        }
                     }
                 } finally {
                     attempted = true
@@ -470,6 +558,18 @@ class ObservatoryService(private val project: Project) : Disposable {
     // Keyed on the ACTIVE session and pinned with it: `multitask --json` decides its `self` fleet row and
     // its session-scoped sections (actions, tasks) from --session, so a pinned session must be passed or
     // every one of those keeps describing whatever the CLI resolves as newest for the cwd.
+    private val workersFetch = ThrottledFetch(local = true) { session ->
+        val args = mutableListOf("fleet", "--json")
+        workspaceRoot?.let { args.addAll(listOf("--root", it)) }
+        if (session.isNotBlank()) args.addAll(listOf("--session", session))
+        val r = ObservatoryCli.run(args, workspaceRoot, timeoutMs = 15_000)
+        if (r.ok) com.cellobservatory.observatory.model.SessionsParser.parse(r.stdout)
+            ?: com.cellobservatory.observatory.model.SessionsResult(null, emptyList(), workers = emptyList(), workerError = "Could not parse workers")
+        else com.cellobservatory.observatory.model.SessionsResult(null, emptyList(), workers = emptyList(),
+            workerError = ObservatoryCli.failureMessage(r.stdout, r.stderr, "Could not read workers"))
+    }
+    fun localWorkers(): com.cellobservatory.observatory.model.SessionsResult? = workersFetch.get(if (currentMachine() == null) currentSession() ?: "" else "")
+
     private val multitaskFetch = ThrottledFetch { session ->
         ObservatoryCli.multitaskJson(session.takeIf { it.isNotBlank() }, workspaceRoot)?.let { MultitaskParser.parse(it) }
     }
@@ -479,8 +579,10 @@ class ObservatoryService(private val project: Project) : Disposable {
     private val observationsFetch = ThrottledFetch { session ->
         ObservatoryCli.observationsJson(session, workspaceRoot)?.let { ObservationsParser.parse(it) }
     }
+    /** The session whose saved machine's Processes read failed last, and why: the panel says it, as the terminal app does. */
+    @Volatile private var processesFailed: Pair<String, String>? = null
     private val processesFetch = ThrottledFetch { session ->
-        ObservatoryCli.processesJson(session, workspaceRoot)?.let { ProcessesParser.parse(it) }
+        ObservatoryCli.processesJson(session, workspaceRoot) { why -> processesFailed = why?.let { session to it } }?.let { ProcessesParser.parse(it) }
     }
     // The user's own turns (0.8.7) — the Overview's first nav tab AND the Prompt review axis. Rides the
     // same throttled tick as every other view; never a timer of its own.
@@ -494,32 +596,63 @@ class ObservatoryService(private val project: Project) : Disposable {
     private val attnNotified = java.util.concurrent.ConcurrentHashMap<String, Long>()
     /** One DESKTOP hand-off per raised hand (idle-done included — the reader's prefs decide in core). */
     private val attnDesktop = java.util.concurrent.ConcurrentHashMap<String, Long>()
-    private val sessionsFetch = ThrottledFetch { session ->
-        ObservatoryCli.sessionsJson(workspaceRoot, session.takeIf { it.isNotBlank() }, buildBatch = true)?.let { SessionsParser.parse(it) }?.let { r ->
+    private val sessionsFetch = ThrottledFetch(local = true) { session ->
+        val otherRecords = runCatching { ClaudePaths.rootDir().resolve("records").toFile().list()?.count { it.matches(Regex("[0-9a-f]{12}")) } ?: 0 }.getOrDefault(0) > 1
+        val listing = if (otherRecords) ObservatoryCli.syncedSessionsJson(workspaceRoot, session.takeIf { it.isNotBlank() }) else null
+        (listing ?: ObservatoryCli.sessionsJson(workspaceRoot, session.takeIf { it.isNotBlank() }, buildBatch = true))?.let { SessionsParser.parse(it) }?.let { r ->
             // ATTENTION: a session whose agent raised its hand — a question, a
             // permission ask, an input wait — balloons ONCE per raise (keyed by the attention ts).
             // idle-done stays quiet: shown by the panels, never announced.
             for (row in r.sessions) {
                 val a = row.attention ?: continue
+                val pops = a.kind != "idle-done" && (attnNotified[row.id] ?: 0L) < a.ts
+                if (pops) attnNotified[row.id] = a.ts
+                // A permission prompt balloons only once `oak notify` below has sat out its wait and found it
+                // still up, as the terminal app and VS Code pop it; the panels show the hand at once.
+                val waits = pops && a.kind == "permission"
+                val balloon = {
+                    val label = com.cellobservatory.observatory.model.attentionLabel(a.kind)
+                    val name = row.title?.takeIf { it.isNotBlank() } ?: ("session " + row.id.take(8))
+                    com.cellobservatory.observatory.ui.ReviewOps.notify(
+                        project,
+                        "“$name” $label" + (a.message.takeIf { it.isNotBlank() }?.let { " — $it" } ?: ""),
+                        com.intellij.notification.NotificationType.WARNING,
+                    )
+                }
                 // …and the DESKTOP announcement (2026-09-15): core's once-per-machine claim decides,
                 // reached through the CLI, off this fetch thread so a slow notifier never delays the rows.
-                if ((attnDesktop[row.id] ?: 0L) < a.ts) {
-                    attnDesktop[row.id] = a.ts
+                val desktop = (attnDesktop[row.id] ?: 0L) < a.ts
+                if (desktop) attnDesktop[row.id] = a.ts
+                if (desktop || waits) {
                     val wd = workspaceRoot
                     ApplicationManager.getApplication().executeOnPooledThread {
-                        ObservatoryCli.notifyHand(row.id, a.kind, a.ts, row.title, a.message, row.agent, wd)
+                        val sent = ObservatoryCli.notifyHand(row.id, a.kind, a.ts, row.title, a.message, row.agent, wd)
+                        if (waits && ObservatoryCli.handStillUp(sent) && !project.isDisposed) balloon()
                     }
                 }
-                if (a.kind == "idle-done") continue
-                if ((attnNotified[row.id] ?: 0L) >= a.ts) continue
-                attnNotified[row.id] = a.ts
-                val label = com.cellobservatory.observatory.model.attentionLabel(a.kind)
-                val name = row.title?.takeIf { it.isNotBlank() } ?: ("session " + row.id.take(8))
-                com.cellobservatory.observatory.ui.ReviewOps.notify(
-                    project,
-                    "“$name” $label" + (a.message.takeIf { it.isNotBlank() }?.let { " — $it" } ?: ""),
-                    com.intellij.notification.NotificationType.WARNING,
-                )
+                if (pops && !waits) balloon()
+            }
+            // Other machines' hands, as their records brought them: a balloon and the desktop once each, naming the
+            // machine, at once (that machine published it once it stood its wait there). A turn's end, as this machine's
+            // own: no balloon, and the desktop as the reader's notification options say (core decides).
+            for (h in r.syncedHands) {
+                val a = h.attention
+                val key = "${h.id}@${h.host}"
+                if (a.kind != "idle-done" && (attnNotified[key] ?: 0L) < a.ts) {
+                    attnNotified[key] = a.ts
+                    com.cellobservatory.observatory.ui.ReviewOps.notify(
+                        project,
+                        "“${h.displayName}” on ${h.machine} ${com.cellobservatory.observatory.model.attentionLabel(a.kind)}" + (a.message.takeIf { it.isNotBlank() }?.let { " — $it" } ?: ""),
+                        com.intellij.notification.NotificationType.WARNING,
+                    )
+                }
+                if ((attnDesktop[key] ?: 0L) < a.ts) {
+                    attnDesktop[key] = a.ts
+                    val wd = workspaceRoot
+                    ApplicationManager.getApplication().executeOnPooledThread {
+                        ObservatoryCli.notifyHand(h.id, a.kind, a.ts, h.title, a.message, h.agent, wd, h.host, h.machine)
+                    }
+                }
             }
             r
         }
@@ -536,21 +669,42 @@ class ObservatoryService(private val project: Project) : Disposable {
     /** Which feed to tail. Carries the SESSION as well as core's ref, because a fleet row can name a
      *  sibling session rather than this project's active one. [limit] is how deep the tail reads —
      *  part of the key, so the Feed tab's "load more" is a NEW fetch, never a stale cache hit. */
-    data class FeedRef(val session: String, val kind: String, val id: String, val limit: Int = FEED_LIMIT) {
-        internal val key: String get() = listOf(session, kind, id, limit.toString()).joinToString(KEY_SEP)
+    data class FeedRef(val session: String, val kind: String, val id: String, val limit: Int = FEED_LIMIT, val machine: String? = null, val cwd: String? = null) {
+        internal val key: String get() = listOf(session, kind, id, limit.toString(), machine.orEmpty(), cwd.orEmpty()).joinToString(KEY_SEP)
     }
 
     /** One shared slot serves every feed, so the cached tail carries the ref it was fetched FOR — a tail
      *  that landed for a previous selection must never be handed back under the new one. ONE consumer
      *  (the Timeline's FeedPanel, 0.10.0): a second surface asking for a different ref every tick would
      *  key-thrash the slot into a spawn per call. */
-    private val feedFetch = ThrottledFetch { key ->
+    private val remoteFeedNextAt = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    private val workerFeedInputs = java.util.concurrent.ConcurrentHashMap<String, Pair<List<String>, String>>()
+    private fun workerFeedStamp(files: List<String>): String = files.joinToString("|") { file ->
+        try {
+            val a = java.nio.file.Files.readAttributes(java.nio.file.Path.of(file), java.nio.file.attribute.BasicFileAttributes::class.java)
+            "${a.fileKey()}:${a.size()}:${a.lastModifiedTime()}"
+        } catch (_: Exception) { "-" }
+    }
+    private val feedFetch = ThrottledFetch(local = true) { key ->
         val p = key.split(KEY_SEP)
-        ObservatoryCli.feedJson(p[0], p[1], p[2], p[3].toIntOrNull() ?: FEED_LIMIT, workspaceRoot)
+        val inputs = workerFeedInputs[key]?.first
+        val stamp = inputs?.let(::workerFeedStamp)
+        ObservatoryCli.feedJson(p[0], p[1], p[2], p[3].toIntOrNull() ?: FEED_LIMIT, p.getOrNull(5)?.takeIf { it.isNotBlank() && p.getOrNull(4).isNullOrEmpty() } ?: workspaceRoot, p.getOrNull(4)?.takeIf { it.isNotBlank() })
             ?.let { FeedParser.parse(it) }
             // The rows' inline diffs are built HERE, on this pooled thread: a log read plus two blob
             // reads and a line comparison per edit, which the Feed tab used to do on the EDT.
-            ?.let { key to it.copy(previews = com.cellobservatory.observatory.ui.DiffPreviews.forFeed(p[0], it.entries)) }
+            ?.let {
+                if (p.getOrNull(4).isNullOrEmpty() && it.kind == "agent" && it.sources.isNotEmpty()) {
+                    // The first read learns the paths; the next stamps them BEFORE the fetch so an append
+                    // during the fetch always calls for another read.
+                    workerFeedInputs.keys.removeIf { old -> old != key }
+                    workerFeedInputs[key] = it.sources to (stamp ?: "")
+                }
+                if (!p.getOrNull(4).isNullOrEmpty()) {
+                    remoteFeedNextAt[key] = System.currentTimeMillis() + 10_000
+                    key to it.copy(title = "${it.title} · ${p[4]}")
+                } else key to it.copy(previews = com.cellobservatory.observatory.ui.DiffPreviews.forFeed(p[0], it.entries))
+            }
     }
 
     /**
@@ -564,6 +718,7 @@ class ObservatoryService(private val project: Project) : Disposable {
     @Volatile var selectedFeed: FeedSel? = null
         set(value) {
             if (field == value) return
+            stopProcessFeed()
             field = value
             notifyListeners()
         }
@@ -588,13 +743,17 @@ class ObservatoryService(private val project: Project) : Disposable {
     /** True once a `processes --json` fetch has completed — with [processes] null, this separates "still
      *  reading" from "this CLI cannot answer for background shells" (an older one on PATH). */
     val processesAttempted: Boolean get() = processesFetch.attempted
+    fun processesFailure(): String? = processesFailed?.takeIf { it.first == currentSession() }?.second
 
     /** The shared `prompts --json` view (the Overview's Prompts tab + the Prompt review axis). */
     fun prompts(force: Boolean = false): PromptsResult? = currentSession()?.let { promptsFetch.get(it, force) }
 
     /** The shared `sessions --json` view (the Overview's Sessions tab). Keyed on the active session so
      *  switching re-marks which row is live. */
-    fun sessions(force: Boolean = false): SessionsResult? = sessionsFetch.get(currentSession() ?: "", force)
+    fun sessions(force: Boolean = false): SessionsResult? {
+        com.cellobservatory.observatory.core.SavedMachines.refresh()
+        return sessionsFetch.get(if (currentMachine() == null) currentSession() ?: "" else "", force)
+    }
 
     /**
      * The last `sessions --json` answer, or null when none has landed — and it NEVER spawns.
@@ -647,12 +806,54 @@ class ObservatoryService(private val project: Project) : Disposable {
      * its feed on its existing refresh tick, no extra timer.
      *
      * An 'audit' feed is a RECORD of something that already finished, so it is fetched once and then
-     * left alone: re-polling a completed run would spend a CLI spawn per tick to re-read a file that
-     * can no longer change. `force` (the Refresh button) still refetches.
+     * left alone. Workers can resume: local inputs are stat-ed before another fetch, and a remote
+     * worker is read at most every ten seconds. `force` (the Refresh button) still refetches.
      */
+    @Volatile private var processFeedKey: String? = null
+    @Volatile private var processFeed: Feed? = null
+    private var processCancel = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    fun stopProcessFeed() {
+        processCancel.set(true)
+        processFeedKey = null
+        processFeed = null
+    }
+
+    private fun processFeed(ref: FeedRef): Feed? {
+        if (processFeedKey == ref.key) return processFeed
+        stopProcessFeed()
+        processFeedKey = ref.key
+        val cancelled = java.util.concurrent.atomic.AtomicBoolean(false)
+        processCancel = cancelled
+        com.intellij.openapi.application.ApplicationManager.getApplication().executeOnPooledThread {
+            val result = ObservatoryCli.followProcessOutput(ref.session, ref.id, ref.cwd ?: workspaceRoot, ref.machine, { cancelled.get() || project.isDisposed }) { json ->
+                if (!cancelled.get() && processFeedKey == ref.key) {
+                    processFeed = FeedParser.parse(json)
+                    notifyListeners()
+                }
+            }
+            if (!cancelled.get() && processFeedKey == ref.key && !result.ok) {
+                processFeed = FeedParser.parse(com.google.gson.Gson().toJson(mapOf("ref" to mapOf("kind" to "process", "id" to ref.id),
+                    "title" to ref.id, "mode" to "audit", "entries" to emptyList<Any>(), "note" to result.stderr.ifBlank { "Process output unavailable" })))
+                notifyListeners()
+            }
+        }
+        return null
+    }
+
     fun feed(ref: FeedRef, force: Boolean = false): Feed? {
+        if (ref.machine == null && ref.cwd == null && currentMachine() != null) return feed(ref.copy(machine = currentMachine()), force)
+        if (ref.kind == "process") return processFeed(ref)
+        stopProcessFeed()
         val loaded = feedFetch.value?.takeIf { it.first == ref.key }?.second
-        if (!force && loaded != null && !loaded.live) return loaded
+        if (!force && loaded != null) {
+            if (ref.machine != null) {
+                if (System.currentTimeMillis() < (remoteFeedNextAt[ref.key] ?: 0L)) return loaded
+            } else if (ref.kind == "agent") {
+                val inputs = workerFeedInputs[ref.key]
+                if (inputs != null && inputs.second == workerFeedStamp(inputs.first)) return loaded
+            } else if (!loaded.live) return loaded
+        }
         return feedFetch.get(ref.key, force)?.takeIf { it.first == ref.key }?.second
     }
 
@@ -682,6 +883,7 @@ class ObservatoryService(private val project: Project) : Disposable {
      * throttled: they fire on every transcript byte.
      */
     fun refresh(force: Boolean = false) {
+        if (force && currentMachine() != null) com.cellobservatory.observatory.ui.RemoteEditorReview.refreshMounted(project)
         cachedKey = "" // force re-read
         checkedPin = null // …and re-validate a pin (a re-pinned or re-created session must not stay condemned)
         if (force) {
@@ -690,6 +892,7 @@ class ObservatoryService(private val project: Project) : Disposable {
             // the store directly — already showed the new ones: the two panels disagreeing on screen.
             ObservatoryCli.invalidateViewBatch()
             sharedViews.forEach { it.forceNext() }
+            remoteReviewFetch.forceNext()
             // …and the tree's failure backoff yields to it: "must never be swallowed" includes the
             // user's own Refresh right after installing the CLI this backoff is waiting out.
             failedTreeAt = 0L
@@ -699,21 +902,67 @@ class ObservatoryService(private val project: Project) : Disposable {
         warmRecentSessions()
     }
 
+    /** The Refresh drop question's buttons, and its default: Cancel, the one that drops nothing. */
+    internal val SWEEP_OPTIONS = arrayOf("Drop", "Cancel")
+    internal val SWEEP_DEFAULT = SWEEP_OPTIONS.indexOf("Cancel")
+
+    /** The drop question's modal, `Messages.showDialog`: swappable, so a test sees what the real call passes. */
+    @Volatile internal var sweepDialog: (Project, String, String, String?, Array<String>, Int, Int, javax.swing.Icon?) -> Int = Messages::showDialog
+
     /**
      * A USER Refresh: sweep a newly-added `.observatoryignore` for the reviewed session, THEN run [then]
      * (the panel's own refresh). Adding the ignore file fires no capture hook, so the capture-time sweep
      * never runs and a plain refresh — a read — leaves the now-ignored records in the store.
-     * The sweep is `dropIgnored` (self-gating, a no-op when nothing matches) via the CLI, on a
-     * background thread; [then] runs on the EDT once it finishes. NEVER wire this to the file-watch tick —
-     * only to a button — since it rewrites the store and must not race the auto readers.
+     * The sweep cannot be undone, so it counts first (`ignore --dry-run --json`, off the EDT, only from a
+     * CLI whose review protocol is at least 2, since an older one ignores `--dry-run` and sweeps) and asks
+     * with a modal when it would drop anything, as the terminal app does. No count is an error, never 0:
+     * it is reported and nothing is dropped. [then] runs on the EDT whatever the answer. NEVER wire this
+     * to the file-watch tick — only to a button — since it rewrites the store and must not race the auto
+     * readers.
      */
     fun sweepIgnoredThen(then: () -> Unit) {
+        val machine = currentMachine()
         val session = currentSession()
         if (session == null) { then(); return }
-        com.intellij.util.concurrency.AppExecutorUtil.getAppExecutorService().submit {
-            ObservatoryCli.ignoreSweep(project.basePath, session)
-            com.intellij.openapi.application.ApplicationManager.getApplication().invokeLater {
-                if (!project.isDisposed) then()
+        val app = ApplicationManager.getApplication()
+        val pool = com.intellij.util.concurrency.AppExecutorUtil.getAppExecutorService()
+        val done = { app.invokeLater { if (!project.isDisposed) then() } }
+        pool.submit {
+            val would = ObservatoryCli.onMachine(machine) { ObservatoryCli.ignoreWouldDrop(project.basePath, session) }
+            app.invokeLater {
+                if (project.isDisposed) return@invokeLater
+                val n = (would as? ObservatoryCli.IgnoreCount.Would)?.n
+                when {
+                    n == null -> {
+                        com.cellobservatory.observatory.ui.ReviewOps.notify(
+                            project,
+                            if (would == ObservatoryCli.IgnoreCount.OlderCli)
+                                "Could not count what .observatoryignore covers in ${session.take(8)}, so nothing was dropped: update the OAK CLI to count before dropping."
+                            else
+                                "Could not count what .observatoryignore covers in ${session.take(8)}, so nothing was dropped. Is the oak CLI installed and current?",
+                            com.intellij.notification.NotificationType.ERROR,
+                        )
+                        then()
+                    }
+                    n == 0 -> then()
+                    // Cancel is the default and focused button: the question opens only once the count is
+                    // back, and a key typed into the editor meanwhile (Enter, Space) must never drop anything.
+                    sweepDialog(
+                        project,
+                        "Drop the $n recorded edit${if (n == 1) "" else "s"} in ${session.take(8)}${machine?.let { " on $it" } ?: ""} that .observatoryignore covers?\n\nThis cannot be undone. Cancel keeps them.",
+                        "OAK",
+                        null,
+                        SWEEP_OPTIONS,
+                        SWEEP_DEFAULT,
+                        SWEEP_DEFAULT,
+                        Messages.getWarningIcon(),
+                    ) != SWEEP_OPTIONS.indexOf("Drop") -> then()
+                    else -> pool.submit {
+                        if (!ObservatoryCli.onMachine(machine) { ObservatoryCli.ignoreSweep(project.basePath, session) })
+                            com.cellobservatory.observatory.ui.ReviewOps.notify(project, "Could not apply .observatoryignore. Is the oak CLI installed?", com.intellij.notification.NotificationType.ERROR)
+                        done()
+                    }
+                }
             }
         }
     }
@@ -728,6 +977,7 @@ class ObservatoryService(private val project: Project) : Disposable {
      * used to cost, not to add a background job that competes with the refresh that just ran.
      */
     private fun warmRecentSessions() {
+        if (currentMachine() != null) return
         val now = System.currentTimeMillis()
         if (now - warmedAt < 10 * 60_000L) return
         warmedAt = now
@@ -774,6 +1024,8 @@ class ObservatoryService(private val project: Project) : Disposable {
         )
 
     override fun dispose() {
+        stopProcessFeed()
+        com.cellobservatory.observatory.core.SavedMachines.listeners.remove(savedListener)
         StoreWatcher.instance.removeListener(watchListener)
         TranscriptWatcher.getInstance(project).removeListener(watchListener)
     }
@@ -876,6 +1128,7 @@ class ObservatoryStartup : ProjectActivity {
     }
 
     override suspend fun execute(project: Project) {
+        com.cellobservatory.observatory.ui.RemoteEditorReview.start(project)
         ObservatoryService.getInstance(project)
         com.intellij.openapi.application.ApplicationManager.getApplication().invokeLater {
             if (!project.isDisposed) {

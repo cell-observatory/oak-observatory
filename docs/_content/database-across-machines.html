@@ -1,0 +1,103 @@
+<p>OAK builds a local database on each machine and exchanges session records with your other machines. If you run Claude Code or Codex across machines, this page explains how those databases, Secure Shell (SSH) connections and a shared backup folder fit together.</p>
+<p>A <strong>session</strong> is an agent conversation. Its <strong>transcript</strong> records the conversation; the observatory’s <strong>store</strong> holds captured edits and file snapshots. Each machine derives a <strong>local database</strong> from those sources. The shared storage server holds an encrypted backup; each machine keeps and queries its own database.</p>
+<p><a href="database-and-sync.html">Database &amp; sync</a> is the reference for commands, settings, file families and database tables. <a href="agents-across-machines.html">Multi-agent work across machines</a> follows the workflow from starting agents to reviewing their changes. <a href="agents-across-machines.html#sharing-knowledge">How agents share what they know</a> covers findings, messages, dependencies and the edit-time heads-up.</p>
+
+<h2>The parts and their connections</h2>
+<p>Consider two synthetic machines, <code>laptop</code> and <code>build-box</code>. Each publishes the facts it derives into a <strong>record log</strong>, a sequence of changes that another machine can apply to its own database.</p>
+<figure>
+<pre aria-label="Each machine builds its own SQLite database from local sources and record logs. The machines pull logs over SSH in separate runs. Each writes encrypted files to the shared backup folder and reads backups when needed."><code>laptop                                  build-box
+┌────────────────────────────┐          ┌────────────────────────────┐
+│ Transcripts + store        │          │ Transcripts + store        │
+│             ↓ derive       │          │             ↓ derive       │
+│ Local SQLite database      │          │ Local SQLite database      │
+│             ↓ publish own  │          │             ↓ publish own  │
+│ Record logs                │ ←─────── │ Record logs                │
+│ (own + received)           │ ───────→ │ (own + received)           │
+│             ↓ replay       │ SSH pulls│             ↓ replay       │
+│ Local SQLite database      │          │ Local SQLite database      │
+└────────────────────────────┘          └────────────────────────────┘
+       │ write   ↑ read                       │ write   ↑ read
+       │         │                            │         │
+       └─────────┴────────────┬───────────────┴─────────┘
+                              │ mounted folder
+                 ┌──────────────────────────────┐
+                 │ Shared storage server        │
+                 │ /mnt/team-share/oak-backup   │
+                 │ Encrypted files + manifests  │
+                 │ No SQLite database or key    │
+                 └──────────────────────────────┘</code></pre>
+<figcaption>Each box contains one database, shown at derivation and replay. Each SSH arrow represents a pull by its receiving machine. Backup writes are encrypted on the sending machine; backup reads are decrypted on the receiving machine.</figcaption>
+</figure>
+
+<h2>The database on each machine</h2>
+<p>The database holds session titles, workspaces, prompts and answers, edit metadata, tool-call metadata, workers, review comments and usage. It also holds plans, memories, skills and raised hands: recorded requests for permission, an answer or input. Rows retain the identity of the machine that published them.</p>
+<p>The database contains searchable conversation text, but it does not contain tool output or the contents of captured file snapshots. Those remain in transcripts and the store. Reading a remote session’s title or searching its answers therefore does not require fetching its transcript.</p>
+
+<h3>Its location</h3>
+<p>The default database folder is <code>~/.claude/claude-observatory-index/</code>. With <code>CLAUDE_CONFIG_DIR</code> set, that folder sits under the configured directory instead. The file is <code>index-v1-&lt;hash&gt;.sqlite</code>, where the hash identifies the store’s path. <code>oak query --status</code> reports its location.</p>
+<p>The database sits beside the default store, outside the store itself. Moving the store changes the database’s filename without moving its folder onto the store’s destination. Keep the configuration directory on local storage; setting <code>CLAUDE_CONFIG_DIR</code> to a mounted share also puts the database there.</p>
+
+<h3>Its construction and recovery</h3>
+<p>A listing, search or query brings the database up to date with local sources and the record logs already on disk. The observatory tracks changed files and transcript read positions. A bounded catch-up can leave work for a background build; a query reports how current its answer is.</p>
+<p>Deleting only the database leaves the transcripts, captured snapshots, record logs and backup key intact. The next catch-up rebuilds the database from the remaining sources and replays the logs, including this machine’s own log.</p>
+<p>The <strong>archive</strong> consists of records in the database whose source files are gone. Its recovery depends on the record logs retaining those facts. If both the sources and all copies of their logs are lost, rebuilding cannot recover them. Deleting the database is therefore neither a backup procedure nor a way to forget a session everywhere. See <a href="database-and-sync.html#the-archive">the archive and deliberate deletion</a>.</p>
+
+<h3>Queries across machines</h3>
+<p><code>oak query sessions</code> lists sessions in the database; <code>oak query search --text retry</code> searches prompts and answers. <code>oak query sql</code> accepts a read-only SQL statement. These commands read the local database, including records previously received from other machines.</p>
+<p>The following command ran against isolated synthetic homes for <code>laptop</code> and <code>build-box</code>. The build box’s record log was copied into the laptop’s store as a stand-in for transport; its transcript was absent there.</p>
+<pre><code>$ oak query sql "SELECT m.label AS machine, s.title FROM sessions s JOIN machines m USING (machine_id) WHERE s.archived_ms IS NULL ORDER BY m.label, s.title" --table
+machine  build-box
+title    Check the retry test
+
+machine  this machine
+title    Document the retry policy
+
+2 rows · 196 ms · the database is current</code></pre>
+<p>A remote record describes the last published state. A raised hand in that record does not provide a live connection to its agent. Check the source freshness in the query response or <code>oak query sync</code>, and use the agent’s native session to answer it.</p>
+
+<h2>The exchange between machines</h2>
+<p>A <strong>saved machine</strong> is a machine registered with <code>oak machine add</code>. On a sync run, this machine asks each enabled, included saved machine for its inventory, a list of files it can supply. It then pulls the files its placement settings require over SSH. Save the machines on each other for exchange in both directions. Sync requires the same user name on both ends.</p>
+<p>The record logs live at <code>records/&lt;machine-id&gt;/</code> inside the store. Each machine appends changes to its own log; other machines copy those segments and replay them. A peer can supply logs it received from another machine. Compaction replaces complete segments with a base containing current records and deliberate deletions.</p>
+<p>By default, record logs, edit logs, comments and agent records travel to every machine. Memories, plans, skills, agent definitions and commands also travel between machines. Full transcripts, Codex rollouts, snapshots and hook events stay on their origin and the configured backup until another machine fetches them. The reference describes <a href="database-and-sync.html#what-each-machine-keeps">placement overrides and exclusions</a>.</p>
+
+<h3>When records travel</h3>
+<p><code>oak sync now</code> runs one exchange. A peer asked for an inventory first catches up its database and publishes its own records within a bounded budget. A later run brings work that was not ready. Queries and listings also publish local changes; after sync has run, capture hooks can trigger background publication.</p>
+<p>The first sync run with a usable configuration enables activity-triggered background runs, unless automatic sync is disabled. Hooks and pollers start throttled runs that pull and exit; failures delay subsequent background attempts. There is no continuously running sync daemon or additional listening port. SSH still requires access to each peer’s SSH service.</p>
+
+<h3>An offline machine</h3>
+<p>Previously received records remain queryable when their origin is offline. Another reachable peer can supply copies of its logs, but no peer can supply changes that never left the offline machine. A disconnected machine catches up on later runs.</p>
+<p><code>oak sync fetch &lt;session&gt;</code> retrieves a session’s content, trying its origin, the configured backup, then other available holders. A fetch requires a reachable copy. Later runs maintain fetched copies, subject to cache limits; a record in the database alone cannot reconstruct a missing snapshot.</p>
+
+<h3>A new machine</h3>
+<p>Install the observatory and save the peers it should read. Run <code>oak sync now</code> to receive their record logs, then query the new machine’s local database. Full session content remains subject to placement and explicit fetching.</p>
+<p>To use the shared backup, mount its folder and obtain its existing key from a trusted machine. Each machine configures the folder’s path as mounted there. Merely mounting the folder does not populate a new machine with all other machines’ files: ordinary backup reads restore its own files and update copies already present.</p>
+
+<h3>A reinstalled machine</h3>
+<p>The observatory identifies a machine from its host name and home path. A reinstall using both again finds the old backup record, but it must explicitly take ownership before restoring or writing it. Recover the key first, then use <code>oak sync setup --folder /mnt/team-share/oak-backup --restore</code> and <code>oak sync now</code>.</p>
+<p>The restore brings back eligible files belonging to that machine, including its record logs; its local database then rebuilds. Retention, exclusions and previous cleanup affect what returns. A different host name or home path creates a different identity, so <code>--restore</code> is not a selector for an arbitrary old machine. See <a href="database-and-sync.html#the-backup">backup setup and recovery</a>.</p>
+
+<h2>The shared storage server</h2>
+<p>A backup target can be a saved machine or a folder. A saved backup machine pulls content over SSH. A backup folder can be a mounted network share such as <code>/mnt/team-share/oak-backup</code>; each client reads and writes that folder through the filesystem. The folder needs no observatory process or database service on its server.</p>
+
+<h3>Files and encryption</h3>
+<p>With the default placements, the folder receives transcripts and their session files, rollouts, captured snapshots and events, edit logs, comments, record logs and shared instruction files. The client splits content into objects and writes encrypted manifests describing how to reconstruct each file. Families set to <code>off</code> and files refused by sync’s credential guards are omitted.</p>
+<p>The client encrypts objects and manifests with AES-256-GCM, the Advanced Encryption Standard in Galois/Counter Mode. Keyed hashes name machines and objects; original file paths are inside encrypted manifests. The folder also contains a format marker with an encrypted key check. Its structure and file sizes remain visible to the storage server.</p>
+<p>The client verifies authentication and content hashes when reading. A wrong key or altered content produces an error. Removed content can remain encrypted in stored objects: the backup folder does not reclaim those objects when a session is deleted. See <a href="database-and-sync.html#what-the-backup-folder-holds">what the backup folder holds</a>.</p>
+
+<h3>The backup key</h3>
+<p>The key lives at <code>sync/key</code> inside each participating machine’s store. The observatory creates it for a new backup folder and restricts its file permissions to the owner. It refuses a backup folder that would contain the key.</p>
+<p>Another machine obtains that same key with <code>oak sync key --from laptop</code>, using its saved label for the machine that has it. This transfer uses SSH. Alternatively, <code>oak sync key --import</code> reads a saved key from standard input. Keep a separate copy through <code>oak sync key --show</code>; losing every copy makes the encrypted backup unreadable.</p>
+<p>The key stays outside the backup folder, but it follows the store if you move the store. Keep the store on storage you control, apart from the shared backup. Backup encryption protects stored copies; machines with the key can decrypt the shared record.</p>
+
+<h3>Reads and exclusions</h3>
+<p>During a sync run, the client reads encrypted manifests and the objects needed to restore its own files or update copies it already holds. An explicit fetch can retrieve another machine’s session from the folder while its origin is offline. Decryption and database updates happen on the client.</p>
+<p>Sync excludes the SQLite database, backup keys and credential files, including agent login credentials and SSH keys. It does not back up your entire working tree or configuration directory. Session text and instruction files can themselves contain sensitive information; encryption does not remove that text.</p>
+
+<h2>Why the database stays local</h2>
+<ul>
+  <li><strong>Database coordination stays on one machine.</strong> The database opens SQLite in write-ahead logging mode, with journal and shared-memory files beside it. Its location deliberately stays outside a store that can move to a network share.</li>
+  <li><strong>Each machine tracks its own sources.</strong> The database records local paths, file identities and read positions. Record logs exchange the derived facts that another machine can apply to its own database.</li>
+  <li><strong>Received records remain available offline.</strong> A query can read the local database without reaching the origin or mounting the backup. Its answer remains limited to records already received.</li>
+  <li><strong>Recovery uses files and logs.</strong> Sync explicitly excludes the database directory. The backup supplies encrypted source files and record logs, from which the client rebuilds a database instead of opening a shared database.</li>
+</ul>
+<p>For setup, keep each configuration directory local, save trusted peers, and configure the same backup folder and key on participating machines. Use <a href="database-and-sync.html">Database &amp; sync</a> for the exact commands and settings.</p>

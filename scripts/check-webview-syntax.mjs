@@ -43,12 +43,11 @@ for (const n of names) {
   // called that script healthy and it shipped broken — the exact failure this gate exists to catch.
   let js;
   try {
-    // BACKSLASHES FIRST, then backticks and `${`. Escaping only the backtick is incomplete: a source
-    // ending in `\` would have its escape consumed by the backtick that follows, so the literal this
-    // builds terminates early and the gate evaluates something other than the file it is checking —
-    // the exact class of silent wrong-answer this script exists to prevent.
-    const literal = neutral.replace(/\\/g, '\\\\').replace(/`/g, '\\`').replace(/\$\{/g, '\\${');
-    js = new Function('return `' + literal + '`')();
+    // The body is the source text between the backticks, escapes intact, so it goes back between backticks
+    // unchanged: the engine then resolves exactly the escapes the extension's own build resolves. Escaping
+    // its backslashes first would turn each escape back into literal text, and the gate would parse the
+    // source rather than what ships (a planted `'it\'s'` passed).
+    js = new Function('return `' + neutral + '`')();
   } catch (e) {
     fails.push(`${n}: its template literal does not even evaluate: ${e.message}`);
     continue;

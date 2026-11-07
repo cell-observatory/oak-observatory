@@ -154,7 +154,8 @@ object StoreReader {
 
     /**
      * Whether [sessionId] is still reviewable ANYWHERE on this machine: its store directory exists,
-     * or some project's transcript does. The transcript half scans every <config>/projects/<dir> —
+     * some project's transcript does, or a Codex rollout (the local index's answer). The transcript half scans every
+     * <config>/projects/<dir> —
      * the session pin is application-wide, so the session may belong to a different project than the
      * one asking — one readdir plus a stat per project dir; callers memoize per pin value. On an
      * UNREADABLE layout this answers true: the caller heals state off a proven absence, and an IO
@@ -164,11 +165,11 @@ object StoreReader {
         if (sessionId.isBlank()) return false
         return try {
             if (ClaudePaths.storeDir(sessionId).exists()) return true
-            if (codexSessions(includeArchived = true).any { it.first == sessionId }) return true
             val projects = ClaudePaths.configDir().resolve("projects")
-            projects.exists() && projects.listDirectoryEntries().any { dir ->
-                Files.isDirectory(dir) && dir.resolve("$sessionId.jsonl").exists()
-            }
+            if (projects.exists() && projects.listDirectoryEntries().any { dir -> Files.isDirectory(dir) && dir.resolve("$sessionId.jsonl").exists() }) return true
+            // A Codex session with no store here: the local index holds its rollout (0.11.0, through `oak query --serve`);
+            // only where it cannot say is the head of every rollout read for it, as before.
+            QueryServe.sessionKnown(sessionId) ?: codexSessions(includeArchived = true).any { it.first == sessionId }
         } catch (_: java.nio.file.InvalidPathException) {
             // An id no path can spell (a legacy "!host" synthetic pin on Windows) is PROVEN unable
             // to exist on disk — treating it as an IO hiccup would keep it pinned forever.

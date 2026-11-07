@@ -76,7 +76,7 @@ const one = (method, params = {}) => new Promise((res) => {
     const h = spawnSync('sh', [hook, 'session'], { input, env: { ...env, HERDR_ENV: '1', HERDR_PANE_ID: pane }, encoding: 'utf8' });
     check('installed claude hook ran', h.status === 0, (h.stderr || '').slice(0, 80));
   } else {
-    const r = await one('pane.report_agent_session', { pane_id: pane, source: 'oak-probe', agent: 'claude', agent_session_id: 'oak-probe-session', agent_session_path: '/tmp/oak-probe.jsonl' });
+    const r = await one('pane.report_agent_session', { pane_id: pane, source: 'herdr:claude', agent: 'claude', agent_session_id: 'oak-probe-session', agent_session_path: '/tmp/oak-probe.jsonl' });
     check('pane.report_agent_session accepted (hook not installed — synthesized its request)', r.result && r.result.type === 'ok');
   }
   const pg = await one('pane.get', { pane_id: pane });

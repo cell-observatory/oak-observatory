@@ -3,7 +3,6 @@ package com.cellobservatory.observatory.platform
 import com.intellij.openapi.actionSystem.ActionToolbar
 import com.intellij.openapi.actionSystem.AnAction
 import com.intellij.openapi.actionSystem.impl.ActionToolbarImpl
-import com.intellij.testFramework.fixtures.BasePlatformTestCase
 import java.awt.Container
 import javax.swing.JComponent
 
@@ -17,7 +16,7 @@ import javax.swing.JComponent
  * selected — Sessions is the default — every button on that panel silently did nothing. It compiled, the
  * unit tests passed, CI was green, and the only evidence was a line in the IDE's own log.
  */
-class ToolbarContractTest : BasePlatformTestCase() {
+class ToolbarContractTest : ObservatoryPlatformTestCase() {
 
     private fun toolbarsIn(root: Container): List<ActionToolbarImpl> {
         val out = mutableListOf<ActionToolbarImpl>()
@@ -63,8 +62,8 @@ class ToolbarContractTest : BasePlatformTestCase() {
      * No toolbar action may declare `ActionUpdateThread.EDT`.
      *
      * The platform expands a toolbar on a background thread; an EDT-bound action makes it hop back, once
-     * per action, queued behind whatever the EDT is already doing. The user's own IDE log measured the
-     * result: 1297 complaints, and single toolbars taking 4.8–6.8 SECONDS to expand — six of them on
+     * per action, queued behind whatever the EDT is already doing. An IDE's own log showed the result:
+     * over a thousand complaints, and single toolbars taking SECONDS to expand — several of them on
      * every refresh tick. Nothing in a build or a unit test can see that; only this can.
      */
     fun testNoToolbarActionForcesAHopToTheEventDispatchThread() {
@@ -87,6 +86,24 @@ class ToolbarContractTest : BasePlatformTestCase() {
             }
         }
         assertEquals("these actions drag toolbar expansion onto the EDT: $offenders", 0, offenders.size)
+    }
+
+    /**
+     * Find Action titles the session-wide verbs as the Review panel's buttons title them (and VS Code's
+     * Accept All / Reject All): they had been retitled Keep All Edits and Undo All Edits, unannounced, so
+     * the same action read as two. The file-level actions say Keep and Undo, as the keys do.
+     */
+    fun testSessionWideActionsAreTitledAsTheReviewPanelButtons() {
+        val panel = com.cellobservatory.observatory.ui.EditsTreePanel(project, com.cellobservatory.observatory.ui.EditsTreePanel.Mode.DIFFS)
+        fun all(g: com.intellij.openapi.actionSystem.ActionGroup): List<AnAction> =
+            g.getChildren(null).flatMap { if (it is com.intellij.openapi.actionSystem.ActionGroup) listOf(it) + all(it) else listOf(it) }
+        val buttons = toolbarsIn(panel).flatMap { all(it.actionGroup) }.mapNotNull { it.templatePresentation.text }
+        assertTrue("control: the panel has its Accept All button: $buttons", "Accept All Edits" in buttons)
+        val am = com.intellij.openapi.actionSystem.ActionManager.getInstance()
+        for (id in listOf("ClaudeObservatory.AcceptAll", "ClaudeObservatory.RevertAll")) {
+            val title = am.getAction(id)!!.templatePresentation.text.orEmpty()
+            assertTrue("$id is titled \"$title\", which names no button of the Review panel: $buttons", title.removePrefix("OAK: ") in buttons)
+        }
     }
 
     /**

@@ -2,6 +2,7 @@ package com.cellobservatory.observatory.ui.stats
 
 import com.cellobservatory.observatory.core.ObservatoryCli
 import com.cellobservatory.observatory.services.ObservatoryService
+import com.cellobservatory.observatory.ui.plainLabel
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 import com.intellij.ide.util.PropertiesComponent
@@ -89,16 +90,32 @@ private data class Usage(
     /** Whose tokens the measured figures are: "here", "2 machines", "2 machines (1 unreachable)". */
     val usageScope: String?,
     val statuslineCache: Boolean, val cachedAtMs: Long?, val staleMs: Long,
+    /** The saved machine(s) the claude figures came from (core's machineNote); null for this machine. */
+    val machineNote: String? = null,
+    /** When the oldest of those windows was measured there (epoch ms; core's machineAt). */
+    val machineAt: Long? = null,
+    /** A window shown is this machine's own (its fiveMachine, weekMachine or fableMachine is null). */
+    val localShown: Boolean = false,
+    /** The saved machines whose own usage the estimates add to this machine's (core's machineMeasured); null when the
+     *  estimates are this machine's alone. */
+    val measuredMachines: String? = null,
+    val gptMeasuredMachines: String? = null,
+    val usageFreshness: String? = null, val gptUsageFreshness: String? = null,
     /** null = nothing has reported yet; false = this plan has no rolling windows (Enterprise / API). */
     val rollingLimits: Boolean?, val localWindows: List<Pair<String, Double>>,
     val sessionTokens: SessionTokens?,
     val vitals: SessionVitals?,
+    /** When the account's newest reading said it has no five-hour limit (core's fiveNoneAt, epoch ms): no 5h row then. */
+    val fiveNoneAt: Long? = null,
+    /** The session with every agent it started, from `usage --json`'s `sessionTreeTokens` (core.sessionTreeUsage). */
+    val sessionTreeTokens: SessionTokens? = null,
 )
 
-/** The session's cumulative token split from `usage --json`'s `sessionTokens` (core.sessionUsage). */
+/** The session's cumulative token split from `usage --json`'s `sessionTokens` (core.sessionUsage), or its
+ *  `sessionTreeTokens`, where [agents] counts the agents it started. */
 private data class SessionTokens(
     val input: Double, val output: Double, val cacheRead: Double, val cacheCreation: Double,
-    val hitPct: Double?,
+    val hitPct: Double?, val agents: Int = 0,
 )
 
 /** What the session is running on and what has happened to its context, from `usage --json`'s `vitals`
@@ -146,8 +163,8 @@ private fun until(ms: Long?): String {
 }
 
 /** The exact refresh time (2026-08-31: durations became wall-clock everywhere) — relTime, minus the
- *  seconds: a cache stamp does not need them. */
-private fun atTime(ts: Long): String {
+ *  seconds: a cache stamp does not need them. The status-bar widget's tooltip uses it too. */
+internal fun atTime(ts: Long): String {
     val full = com.cellobservatory.observatory.model.relTime(ts)
     // Same-day form carries seconds ("14:32:05") — trim to the minute for this stamp.
     return if (Regex("^\\d\\d:\\d\\d:\\d\\d$").matches(full)) full.substring(0, 5) else full
@@ -201,19 +218,41 @@ private fun estPair(measured: Double?, total: Double?, tok: Double?, pct: Double
     // the terminal for the same window. The derived form is only the fallback when the cache has
     // no estimate yet. No scope text on the rows, ever. Split spent/total, for the columns.
     val used = if (tok != null && tok > 0 && total != null && total > 0) tok else (measured?.takeIf { it > 0 } ?: tok?.takeIf { it > 0 })
-    if (used == null) return "" to ""
+    if (used == null) return if (pct == 0.0) "~0" to (total?.takeIf { it > 0 }?.let { humanTok(it) } ?: "") else "" to ""
     val p = pct ?: 0.0
     val budget = if (tok != null && tok > 0 && total != null && total > 0) total
         else if (p >= 1.0) used / p * 100 else null
     return "~${humanTok(used)}" to (budget?.let { humanTok(it) } ?: "")
 }
 
+/** The spent column: a window at 0% reads `~0`, against its budget where it has one, as the status line and the
+ *  terminal app read `~0/<budget>`, and `~0` alone where it has none; it was left empty. */
+private fun spent(tok: Double?, pct: Double?): String = when {
+    tok != null && tok > 0 -> "~${humanTok(tok)}"
+    pct == 0.0 -> "~0"
+    else -> ""
+}
+
+/** The usage section's note: the cache's last refresh, and, on the claude tab, the saved machine a reading came
+ *  from when this machine had none current, with when that machine measured it, and the saved machines whose own
+ *  usage the estimates add to this machine's (GPT names the machines its database totals include). */
+private fun usageStamp(u: Usage?, tab: String): String =
+    listOfNotNull(
+        u?.cachedAtMs?.let { "updated " + atTime(it) },
+        if (tab == "gpt") u?.gptUsageFreshness else u?.usageFreshness,
+        u?.machineNote?.takeIf { tab != "gpt" }?.let { "measured on ${plainLabel(it)}" + (u.machineAt?.let { at -> " at ${atTime(at)}" } ?: "") },
+        u?.measuredMachines?.takeIf { tab != "gpt" }?.let { "estimates include usage measured on ${plainLabel(it)}" },
+        u?.gptMeasuredMachines?.takeIf { tab == "gpt" }?.let { "estimates include usage measured on ${plainLabel(it)}" },
+    ).joinToString(" · ")
+
 /** Stale stamp + credit note, drawn as one footnote line under the rows — they used to ride the
- *  row detail text, where they broke the column alignment. */
+ *  row detail text, where they broke the column alignment. Windows shown from a saved machine are as old as
+ *  that machine's reading, which it keeps when it stops answering, whatever this machine's cache time says. */
 private fun footNote(u: Usage?): String {
     if (u == null) return ""
-    val age = if (u.statuslineCache && u.cachedAtMs != null) System.currentTimeMillis() - u.cachedAtMs else null
-    val stale = if (age != null && age > u.staleMs) "as of ${atTime(u.cachedAtMs ?: 0L)}" else ""
+    // Beside a saved machine's windows, this machine's own are as old as its cache: the older of the two dates them.
+    val at = listOfNotNull(u.machineAt, u.cachedAtMs?.takeIf { u.statuslineCache && (u.machineAt == null || u.localShown) }).minOrNull()
+    val stale = if (at != null && System.currentTimeMillis() - at > u.staleMs) "as of ${atTime(at)}" else ""
     return listOf(stale, creditNote(u).removePrefix(" · ")).filter { it.isNotBlank() }.joinToString(" · ")
 }
 
@@ -259,6 +298,7 @@ class StatsPanel(private val project: Project) : JPanel(BorderLayout()), com.int
         return c
     }
 
+    private var historySection: FoldSection? = null
     private var series: Map<String, List<Bucket>> = emptyMap()
     private var usage: Usage? = null
     private var range = "week"
@@ -334,7 +374,7 @@ class StatsPanel(private val project: Project) : JPanel(BorderLayout()), com.int
     private val usageTabClaude = com.intellij.ui.components.ActionLink("claude") { setUsageTab("claude") }.apply { font = JBUI.Fonts.miniFont() }
     private val usageTabGpt = com.intellij.ui.components.ActionLink("gpt") { setUsageTab("gpt") }.apply { font = JBUI.Fonts.miniFont(); isVisible = false }
     private val secUsage = FoldSection(
-        "usage", "USAGE", listOf(usageBars, hint),
+        "usage", "ACCOUNT USAGE · LOCAL CONTEXT", listOf(usageBars, hint),
         JPanel().apply {
             layout = BoxLayout(this, BoxLayout.X_AXIS)
             isOpaque = false
@@ -350,6 +390,7 @@ class StatsPanel(private val project: Project) : JPanel(BorderLayout()), com.int
         PropertiesComponent.getInstance().setValue("oak.stats.usage.tab", t, "claude")
         usageBars.tab = t
         syncUsageTabLinks()
+        secUsage.setNote(usageStamp(usage, t))
         usage?.let { usageBars.update(it) } ?: usageBars.repaint()
     }
 
@@ -394,7 +435,8 @@ class StatsPanel(private val project: Project) : JPanel(BorderLayout()), com.int
             }
         })
 
-        val secChart = FoldSection("chart", "TOKENS", listOf(ranges, gathering, tokensChart))
+        val secChart = FoldSection("chart", "ACCOUNT HISTORY", listOf(ranges, gathering, tokensChart))
+        historySection = secChart
         val stack = ScrollableStack().apply {
             border = JBUI.Borders.empty(4, 8)
             add(secTokens)
@@ -451,21 +493,37 @@ class StatsPanel(private val project: Project) : JPanel(BorderLayout()), com.int
     private fun reviewFirst() {
         val service = ObservatoryService.getInstance(project)
         val session = service.currentSession() ?: return
+        if (service.currentMachine() != null) return
         // Same set the review walk uses: off the raw log this jumped to a chain the walk skips, so the
         // scoreboard and "review next" disagreed about where reviewing starts.
         val first = service.log().filter { it.pending && !service.isHidden(it) }.minByOrNull { it.id } ?: return
         com.cellobservatory.observatory.ui.Navigate.openFileAtEdit(project, session, first)
     }
 
+    private var usageTarget: Pair<String?, String?>? = null
+    private var usageRequest = 0
+
     fun refresh(forceUsage: Boolean = false) {
-        val session = ObservatoryService.getInstance(project).currentSession()
-        // Show the human-readable session NAME (title / first prompt) — reuses the change-map summary the
-        // service already caches (no extra CLI spawn); the raw id stays in the tooltip. VS Code parity.
-        val title = ObservatoryService.getInstance(project).changemap()?.summary?.title?.takeIf { it.isNotBlank() }
-        sessionLabel.text = "🔬 " + (title ?: session?.take(8) ?: "—")
-        sessionLabel.toolTipText = session?.let { (title?.let { t -> "$t — " } ?: "") + "Active session: $it" } ?: "No active Claude Code session"
-        // Live review scoreboard from the in-memory folded log (cheap; cached on the log's mtime/size).
-        scoreboard.update(ObservatoryService.getInstance(project).counts())
+        val service = ObservatoryService.getInstance(project)
+        val session = service.currentSession()
+        val machine = service.currentMachine()
+        val target = session to machine
+        if (usageTarget != target) {
+            usageTarget = target
+            usageRequest++
+            usageRunning = false
+            lastUsageRun = 0
+            usage = usage?.copy(sessionTokens = null, sessionTreeTokens = null, vitals = null)
+            tokenStrip.update(null, null)
+            updateVitals(null)
+        }
+        val title = if (machine == null) service.changemap()?.summary?.title?.takeIf { it.isNotBlank() } else null
+        sessionLabel.text = "🔬 " + (title ?: session?.take(8) ?: "—") + (machine?.let { " · on $it" } ?: "")
+        sessionLabel.toolTipText = session?.let { "Active session: $it" + (machine?.let { m -> " on $m" } ?: "") } ?: "No active Claude Code session"
+        scoreboard.isVisible = machine == null
+        if (machine == null) scoreboard.update(service.counts())
+        secEdits.setNote(machine?.let { "Review on $it in the Overview or Timeline" } ?: "")
+        secTokens.setNote(machine?.let { "on $it" } ?: "on this machine")
         fetchUsage(forceUsage)
         fetchStats()
     }
@@ -478,9 +536,9 @@ class StatsPanel(private val project: Project) : JPanel(BorderLayout()), com.int
         if (statsRunning || now - lastStatsRun < 20_000) return
         statsRunning = true
         lastStatsRun = now
-        val session = ObservatoryService.getInstance(project).currentSession()
+        // Account history comes from the database, independent of the selected remote session.
         AppExecutorUtil.getAppExecutorService().submit {
-            val json = ObservatoryCli.statsJson(session, project.basePath)
+            val json = ObservatoryCli.onMachine(null) { ObservatoryCli.statsJson(null, project.basePath) }
             val parsed = json?.let { parseStats(it) }
             ApplicationManager.getApplication().invokeLater {
                 statsRunning = false
@@ -493,6 +551,8 @@ class StatsPanel(private val project: Project) : JPanel(BorderLayout()), com.int
                 } else {
                     statsEverLoaded = true
                     gathering.isVisible = false
+                    val database = try { JsonParser.parseString(json).asJsonObject.get("usageSource")?.asString == "database" } catch (_: Exception) { false }
+                    historySection?.setNote(if (database) "across machines in the database" else "this machine alone")
                     series = parsed
                     repaintCharts()
                 }
@@ -510,24 +570,35 @@ class StatsPanel(private val project: Project) : JPanel(BorderLayout()), com.int
         if (usageRunning || (!force && now - lastUsageRun < 20_000)) return
         usageRunning = true
         lastUsageRun = now
-        val session = ObservatoryService.getInstance(project).currentSession()
+        val service = ObservatoryService.getInstance(project)
+        val session = service.currentSession()
+        val machine = service.currentMachine()
+        val request = ++usageRequest
         AppExecutorUtil.getAppExecutorService().submit {
-            val u = ObservatoryCli.usageJson(session, project.basePath)?.let { parseUsage(it) }
+            val account = ObservatoryCli.onMachine(null) {
+                ObservatoryCli.usageJson(if (machine == null) session else null, project.basePath)?.let { parseUsage(it) }
+            }
+            val remote = if (machine != null && session != null) ObservatoryCli.onMachine(machine) {
+                ObservatoryCli.usageJson(session, project.basePath)?.let { parseUsage(it) }
+            } else null
             ApplicationManager.getApplication().invokeLater {
+                if (project.isDisposed || request != usageRequest || service.currentSession() != session || service.currentMachine() != machine) return@invokeLater
                 usageRunning = false
-                if (project.isDisposed) return@invokeLater
-                usage = u ?: usage
+                val local = account ?: usage ?: parseUsage("{}")
+                usage = if (machine == null) local else local?.copy(
+                    sessionTokens = remote?.sessionTokens, sessionTreeTokens = remote?.sessionTreeTokens, vitals = remote?.vitals)
+                secTokens.setNote(machine?.let { "on $it" + (if (remote?.sessionTokens == null) " · unavailable" else "") } ?: "on this machine")
                 usageBars.tab = PropertiesComponent.getInstance().getValue("oak.stats.usage.tab", "claude")
                 usageTabGpt.isVisible = usage?.gptFivePct != null || usage?.gptWeekPct != null || usage?.gptCtxPct != null || usage?.gptMonthTok != null
                 if (!usageTabGpt.isVisible && usageBars.tab == "gpt") usageBars.tab = "claude"
                 syncUsageTabLinks()
                 usageBars.update(usage)
-                secUsage.setNote(usage?.cachedAtMs?.let { "updated " + atTime(it) } ?: "")
+                secUsage.setNote(usageStamp(usage, usageBars.tab))
                 spinTimer?.stop()
                 spinTimer = null
                 usageBars.busy = false
                 usageRefreshLink.text = "↻"
-                tokenStrip.update(usage?.sessionTokens)
+                tokenStrip.update(usage?.sessionTokens, usage?.sessionTreeTokens)
                 updateVitals(usage?.vitals)
                 updateHint()
             }
@@ -632,6 +703,17 @@ class StatsPanel(private val project: Project) : JPanel(BorderLayout()), com.int
             el?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isNumber }?.asDouble
         fun lng(el: com.google.gson.JsonElement?): Long? =
             el?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isNumber }?.asLong
+        fun tokens(key: String): SessionTokens? =
+            o.get(key)?.takeIf { it.isJsonObject && it.asJsonObject.get("available")?.takeIf { v -> v.isJsonPrimitive }?.asBoolean != false }?.asJsonObject?.let { st ->
+                SessionTokens(
+                    input = num(st.get("input")) ?: 0.0,
+                    output = num(st.get("output")) ?: 0.0,
+                    cacheRead = num(st.get("cacheRead")) ?: 0.0,
+                    cacheCreation = num(st.get("cacheCreation")) ?: 0.0,
+                    hitPct = num(st.get("hitPct")),
+                    agents = num(st.get("agents"))?.toInt() ?: 0,
+                )
+            }
         Usage(
             ctxPct = num(ctx?.get("pct")), ctxTokens = num(ctx?.get("tokens")), ctxSize = num(ctx?.get("size")),
             // ACCOUNT keys first (claude*): the unprefixed twins are session-scoped and, for a codex
@@ -653,6 +735,9 @@ class StatsPanel(private val project: Project) : JPanel(BorderLayout()), com.int
             gptWeekPct = num(o.get("gptWeekPct")), gptWeekReset = lng(o.get("gptWeekReset")),
             gptCtxPct = num(o.get("gptCtxPct")), gptCtxTokens = num(o.get("gptCtxTokens")), gptCtxSize = num(o.get("gptCtxSize")),
             gptWeekTok = num(o.get("gptWeekTok")), gptWeekTotal = num(o.get("gptWeekTotal")),
+            gptMeasuredMachines = o.get("gptMeasuredMachines")?.takeIf { it.isJsonPrimitive }?.asString,
+            usageFreshness = account.get("usageFreshness")?.takeIf { it.isJsonPrimitive }?.asString,
+            gptUsageFreshness = o.get("gptUsageFreshness")?.takeIf { it.isJsonPrimitive }?.asString,
             gptMonthReset = lng(o.get("gptMonthReset")),
             gptMonthTok = num(o.get("gptMonthTok")), gptMonthTokTotal = num(o.get("gptMonthTokTotal")), gptMonthReads = num(o.get("gptMonthReads")),
             gptMonthCost = num(o.get("gptMonthCost")), gptMonthCostTotal = num(o.get("gptMonthCostTotal")),
@@ -664,22 +749,23 @@ class StatsPanel(private val project: Project) : JPanel(BorderLayout()), com.int
             creditsUnlimited = account.get("creditsUnlimited")?.takeIf { it.isJsonPrimitive }?.asBoolean ?: false,
             usageScope = account.get("usageScope")?.takeIf { it.isJsonPrimitive }?.asString,
             rollingLimits = account.get("rollingLimits")?.takeIf { !it.isJsonNull }?.asBoolean,
+            fiveNoneAt = lng(account.get("fiveNoneAt")),
             localWindows = o.get("localWindows")?.takeIf { !it.isJsonNull }?.asJsonArray
                 ?.map { it.asJsonObject }
                 ?.mapNotNull { w -> (num(w.get("tokens")))?.let { t -> w.get("label").asString to t } }
                 ?: emptyList(),
             statuslineCache = account.get("statuslineCache")?.asBoolean ?: false,
             cachedAtMs = lng(account.get("cachedAtMs")),
-            staleMs = lng(o.get("staleMs")) ?: 300_000L,
-            sessionTokens = o.get("sessionTokens")?.takeIf { it.isJsonObject && it.asJsonObject.get("available")?.takeIf { v -> v.isJsonPrimitive }?.asBoolean != false }?.asJsonObject?.let { st ->
-                SessionTokens(
-                    input = num(st.get("input")) ?: 0.0,
-                    output = num(st.get("output")) ?: 0.0,
-                    cacheRead = num(st.get("cacheRead")) ?: 0.0,
-                    cacheCreation = num(st.get("cacheCreation")) ?: 0.0,
-                    hitPct = num(st.get("hitPct")),
-                )
+            machineNote = account.get("machineNote")?.takeIf { it.isJsonPrimitive }?.asString?.takeIf { it.isNotBlank() },
+            machineAt = lng(account.get("machineAt")),
+            localShown = listOf("five" to "fiveHourPct", "week" to "weekPct", "fable" to "fablePct").any { (w, pct) ->
+                num(account.get(pct)) != null && account.get("${w}Machine")?.takeIf { it.isJsonPrimitive } == null
             },
+            measuredMachines = account.get("machineMeasured")?.takeIf { it.isJsonObject }?.asJsonObject?.get("machines")
+                ?.takeIf { it.isJsonPrimitive }?.asString?.takeIf { it.isNotBlank() },
+            staleMs = lng(o.get("staleMs")) ?: 300_000L,
+            sessionTokens = tokens("sessionTokens"),
+            sessionTreeTokens = tokens("sessionTreeTokens"),
             vitals = o.get("vitals")?.takeIf { it.isJsonObject }?.asJsonObject?.let { v ->
                 val m = v.get("model")?.takeIf { it.isJsonObject }?.asJsonObject
                 val eff = v.get("effort")?.takeIf { it.isJsonObject }?.asJsonObject
@@ -744,15 +830,26 @@ private class FoldSection(key: String, private val title: String, body: List<JCo
         isOpaque = false
         alignmentX = LEFT_ALIGNMENT
     }
-    /** A dim note beside the title (the usage section shows its last-updated time here). */
-    private val noteLabel = JBLabel().apply {
+    /** A dim note under the title (the usage section shows its last-updated time here, and the saved machines its
+     *  figures come from or include). It WRAPS at the section's width: as a label beside the title, the default dock
+     *  cut the machines' names off its end. */
+    private val noteLabel = com.intellij.ui.components.JBTextArea().apply {
+        isEditable = false
+        isFocusable = false
+        isOpaque = false
+        lineWrap = true
+        wrapStyleWord = true
+        border = JBUI.Borders.emptyBottom(2)
         font = JBUI.Fonts.miniFont()
         foreground = UIUtil.getContextHelpForeground()
+        alignmentX = LEFT_ALIGNMENT
+        isVisible = false
     }
     private var folded = PropertiesComponent.getInstance().getBoolean(propKey, false)
 
     fun setNote(text: String) {
         noteLabel.text = text
+        noteLabel.isVisible = text.isNotEmpty()
     }
 
     init {
@@ -763,18 +860,17 @@ private class FoldSection(key: String, private val title: String, body: List<JCo
             c.alignmentX = LEFT_ALIGNMENT
             bodyPane.add(c)
         }
-        // Header row: title · note … [extra pinned RIGHT].
+        // Header row: title … [extra pinned RIGHT], then the note, wrapped under it.
         add(JPanel().apply {
             layout = BoxLayout(this, BoxLayout.X_AXIS)
             isOpaque = false
             alignmentX = LEFT_ALIGNMENT
             add(header)
-            add(Box.createHorizontalStrut(JBUI.scale(6)))
-            add(noteLabel)
             add(Box.createHorizontalGlue())
             if (headerExtra != null) add(headerExtra)
             maximumSize = Dimension(Int.MAX_VALUE, JBUI.scale(20))
         })
+        add(noteLabel)
         add(bodyPane)
         header.addMouseListener(object : MouseAdapter() {
             override fun mouseClicked(e: MouseEvent) {
@@ -810,16 +906,40 @@ private class FoldSection(key: String, private val title: String, body: List<JCo
  *  plan-limit bars). VS Code parity. */
 private class TokenStrip : JComponent() {
     private var t: SessionTokens? = null
+    /** The session with every agent it started, when it started any: a second row, and both rows captioned, so its own
+     *  figure never reads as the task's. */
+    private var tree: SessionTokens? = null
 
     init {
-        preferredSize = Dimension(JBUI.scale(200), JBUI.scale(50))
-        minimumSize = Dimension(JBUI.scale(110), JBUI.scale(50))
-        maximumSize = Dimension(Int.MAX_VALUE, JBUI.scale(54))
+        fit(JBUI.scale(50))
     }
 
-    fun update(tokens: SessionTokens?) {
+    private fun fit(h: Int) {
+        preferredSize = Dimension(JBUI.scale(200), h)
+        minimumSize = Dimension(JBUI.scale(110), h)
+        maximumSize = Dimension(Int.MAX_VALUE, h + JBUI.scale(4))
+    }
+
+    fun update(tokens: SessionTokens?, withAgents: SessionTokens?) {
         t = tokens
+        val had = tree != null
+        tree = withAgents?.takeIf { it.agents > 0 }
+        if (had != (tree != null)) {
+            fit(if (tree == null) JBUI.scale(50) else 2 * JBUI.scale(62))
+            revalidate()
+        }
         repaint()
+    }
+
+    /** Each row the strip paints: its caption (none when the session started no agents) and its cells. */
+    fun rows(): List<Pair<String?, List<Triple<String, String, Color>>>> {
+        fun cells(tok: SessionTokens?) = listOf(
+            Triple("INPUT", tok?.input?.let(::human) ?: "—", C_INPUT),
+            Triple("OUTPUT", tok?.output?.let(::human) ?: "—", C_TOTAL),
+            Triple("CACHED" + (tok?.hitPct?.let { " · ${Math.round(it)}% HIT" } ?: ""), tok?.cacheRead?.let(::human) ?: "—", C_KEPT),
+        )
+        val tr = tree ?: return listOf(null to cells(t))
+        return listOf("OWN" to cells(t), "WITH ${tr.agents} AGENT${if (tr.agents == 1) "" else "S"}" to cells(tr))
     }
 
     override fun paintComponent(g: Graphics) {
@@ -829,32 +949,38 @@ private class TokenStrip : JComponent() {
         g2.color = grey
         g2.font = JBUI.Fonts.miniFont()
         val tok = t
-        val cachedLabel = "CACHED" + (tok?.hitPct?.let { " · ${Math.round(it)}% HIT" } ?: "")
-        val cells: List<Triple<String, String, Color>> = listOf(
-            Triple("INPUT", tok?.input?.let(::human) ?: "—", C_INPUT),
-            Triple("OUTPUT", tok?.output?.let(::human) ?: "—", C_TOTAL),
-            Triple(cachedLabel, tok?.cacheRead?.let(::human) ?: "—", C_KEPT),
-        )
         val gap = JBUI.scale(6)
-        val top = JBUI.scale(2)
         val cellW = (width - 2 * gap) / 3
         val cellH = JBUI.scale(42)
-        var x = 0
-        for ((label, value, color) in cells) {
-            g2.color = JBColor.border()
-            g2.drawRoundRect(x, top, cellW - 1, cellH, JBUI.scale(6), JBUI.scale(6))
-            g2.color = color
-            g2.font = JBUI.Fonts.label(14f).asBold()
-            g2.drawString(value, x + (cellW - g2.fontMetrics.stringWidth(value)) / 2, top + JBUI.scale(22))
-            g2.color = grey
-            g2.font = JBUI.Fonts.miniFont()
-            g2.drawString(label, x + (cellW - g2.fontMetrics.stringWidth(label)) / 2, top + JBUI.scale(36))
-            x += cellW + gap
+        var y = 0
+        for ((caption, cells) in rows()) {
+            if (caption != null) {
+                g2.color = grey
+                g2.font = JBUI.Fonts.miniFont()
+                g2.drawString(caption, 0, y + JBUI.scale(10))
+                y += JBUI.scale(12)
+            }
+            val top = y + JBUI.scale(2)
+            var x = 0
+            for ((label, value, color) in cells) {
+                g2.color = JBColor.border()
+                g2.drawRoundRect(x, top, cellW - 1, cellH, JBUI.scale(6), JBUI.scale(6))
+                g2.color = color
+                g2.font = JBUI.Fonts.label(14f).asBold()
+                g2.drawString(value, x + (cellW - g2.fontMetrics.stringWidth(value)) / 2, top + JBUI.scale(22))
+                g2.color = grey
+                g2.font = JBUI.Fonts.miniFont()
+                g2.drawString(label, x + (cellW - g2.fontMetrics.stringWidth(label)) / 2, top + JBUI.scale(36))
+                x += cellW + gap
+            }
+            y = top + cellH + gap
         }
         toolTipText = tok?.let {
             "This session's cumulative tokens, as billed — input ${human(it.input)} (uncached) · output ${human(it.output)}" +
                 " · cache reads ${human(it.cacheRead)} · cache writes ${human(it.cacheCreation)}" +
-                (it.hitPct?.let { p -> " · hit rate ${Math.round(p)}% (reads ÷ all context sent)" } ?: "")
+                (it.hitPct?.let { p -> " · hit rate ${Math.round(p)}% (reads ÷ all context sent)" } ?: "") +
+                (tree?.let { w -> ". With the ${w.agents} agent${if (w.agents == 1) "" else "s"} it started: input ${human(w.input)} · output ${human(w.output)}" +
+                    " · cache reads ${human(w.cacheRead)} · cache writes ${human(w.cacheCreation)}" } ?: "")
         } ?: "This session's cumulative token split — fills in once the session has assistant turns"
     }
 }
@@ -1070,9 +1196,9 @@ private class UsageBars : JComponent() {
         val n = when {
             usage == null -> 3
             gptTab -> 1 + (if (usage.gptCtxPct != null) 1 else 0) + (if (usage.gptFivePct != null) 1 else 0) +
-                (if ((usage.gptMonthTok ?: 0.0) > 0) 1 else 0) + (if ((usage.gptMonthCost ?: 0.0) > 0) 1 else 0)
-            usage.rollingLimits == false -> if (usage.monthCost != null) 3 else 2
-            else -> if (usage.fablePct != null) 6 else 5
+                (if (usage.gptMonthTok != null) 1 else 0) + (if ((usage.gptMonthCost ?: 0.0) > 0) 1 else 0)
+            usage.rollingLimits == false -> 2 + (if (usage.monthCost != null) 1 else 0) + (if (usage.fablePct != null) 1 else 0)
+            else -> (if (usage.fablePct != null) 6 else 5) - (if (usage.fiveNoneAt != null) 1 else 0)
         }
         val rowsH = n * JBUI.scale(22)
         val h = JBUI.scale(2) + JBUI.scale(12) + rowsH +
@@ -1102,20 +1228,21 @@ private class UsageBars : JComponent() {
         listOf(UsageRow("ctx", null), UsageRow("5h", null), UsageRow("wk", null))
     } else if (gptTab) {
         // Same grammar throughout: ctx = codex's last-turn context vs its model window; wk
-        // reported quota + measured local tokens; mo/$ calendar-summed and list-priced. 5h only
+        // reported quota + database tokens; mo/$ bill-cycle totals and list-priced. 5h only
         // when codex still reports one (current builds persist the weekly alone). A row codex
         // gives no data for stays absent rather than fabricated.
         val gmp = if (usage.gptMonthTok != null && usage.gptMonthTokTotal != null && usage.gptMonthTokTotal > 0)
             minOf(100.0, usage.gptMonthTok / usage.gptMonthTokTotal * 100) else null
         listOfNotNull(
             usage.gptCtxPct?.let { UsageRow("ctx", it, usage.gptCtxTokens?.let { v -> human(v) } ?: "", usage.gptCtxSize?.let { v -> human(v) } ?: "") },
-            usage.gptFivePct?.let { UsageRow("5h", it, time = until(usage.gptFiveReset).ifBlank { null }) },
+            usage.gptFivePct?.let { UsageRow("5h", it, spent(null, it), time = until(usage.gptFiveReset).ifBlank { null }) },
             UsageRow("wk", usage.gptWeekPct,
-                usage.gptWeekTok?.takeIf { it > 0 }?.let { "~${humanTok(it)}" } ?: "",
+                spent(usage.gptWeekTok, usage.gptWeekPct),
                 usage.gptWeekTotal?.takeIf { it > 0 }?.let { humanTok(it) } ?: "",
                 "", until(usage.gptWeekReset).ifBlank { null }),
-            usage.gptMonthTok?.takeIf { it > 0 }?.let {
-                UsageRow("mo", gmp, "~${humanTok(it)}",
+            // A month measured at 0 (a new cycle) reads 0%, as on the status bar; only an unmeasured one is absent.
+            usage.gptMonthTok?.let {
+                UsageRow("mo", gmp, spent(it, gmp),
                     usage.gptMonthTokTotal?.takeIf { t -> t > 0 }?.let { t -> humanTok(t) } ?: "",
                     usage.gptMonthReads?.takeIf { r -> r > 0 }?.let { r -> "+${humanTok(r)}↺" } ?: "",
                     until(usage.gptMonthReset).ifBlank { null })
@@ -1132,7 +1259,7 @@ private class UsageBars : JComponent() {
         val dPct = if (usage.monthCost != null && moPct != null) moPct else null
         // humanTok on the quota rows — the statusline's truncating humaniser, so the columns
         // read byte-for-byte like the terminal (the old subs mixed in the rounding human()).
-        val moSpent = usage.monthTok?.takeIf { it > 0 }?.let { "~${humanTok(it)}" } ?: ""
+        val moSpent = spent(usage.monthTok, moPct)
         val moTotal = usage.monthTokTotal?.let { humanTok(it) } ?: ""
         val moCached = usage.monthReads?.takeIf { it > 0 }?.let { "+${humanTok(it)}↺" } ?: ""
         val dSpent = usage.monthCost?.let { "~${usdStr(it)}" } ?: ""
@@ -1146,8 +1273,18 @@ private class UsageBars : JComponent() {
         // readout — the 5h/wk slots say nothing such a plan can use. (A
         // second rollingLimits==false branch above used to shadow this one, so Enterprise
         // rendered the OLD layout with ledger-summed 5h spend — dead code.)
+        // The per-model weekly cap, whenever the account reports one — on a plan with no 5h/wk rows too,
+        // as VS Code's panel and the shell status line show it.
+        val fableRow = usage.fablePct?.let {
+            UsageRow((usage.fableLabel ?: "fable").lowercase(), it,
+                spent(usage.fableTok, it),
+                usage.fableTokTotal?.takeIf { v -> v > 0 }?.let { v -> humanTok(v) } ?: "",
+                usage.fableReads?.takeIf { v -> v > 0 }?.let { v -> "+${humanTok(v)}↺" } ?: "",
+                until(usage.fableReset).ifBlank { null })
+        }
         if (usage.rollingLimits == false) listOfNotNull(
             ctxRow,
+            fableRow,
             UsageRow("mo", moPct, moSpent, moTotal, moCached),
             if (usage.monthCost != null) UsageRow("$", dPct, dSpent, dTotal) else null,
         )
@@ -1156,16 +1293,12 @@ private class UsageBars : JComponent() {
             val p7 = estPair(usage.weekAll, usage.weekTotal, usage.weekTok, usage.weekPct)
             listOfNotNull(
                 ctxRow,
-                UsageRow("5h", usage.fivePct, p5.first, p5.second, usage.fiveReads?.takeIf { it > 0 }?.let { "+${humanTok(it)}↺" } ?: "", until(usage.fiveReset).ifBlank { null }),
+                // An account with no five-hour limit (its newest usage answer carries no 5h window) has no 5h row.
+                if (usage.fiveNoneAt != null) null
+                else UsageRow("5h", usage.fivePct, p5.first, p5.second, usage.fiveReads?.takeIf { it > 0 }?.let { "+${humanTok(it)}↺" } ?: "", until(usage.fiveReset).ifBlank { null }),
                 // The per-model weekly cap (the account API's "Fable" row), BEFORE the
                 // whole-week row it narrows — union-measured ~est/total + reads, same canon.
-                usage.fablePct?.let {
-                    UsageRow((usage.fableLabel ?: "fable").lowercase(), it,
-                        usage.fableTok?.takeIf { v -> v > 0 }?.let { v -> "~${humanTok(v)}" } ?: "",
-                        usage.fableTokTotal?.takeIf { v -> v > 0 }?.let { v -> humanTok(v) } ?: "",
-                        usage.fableReads?.takeIf { v -> v > 0 }?.let { v -> "+${humanTok(v)}↺" } ?: "",
-                        until(usage.fableReset).ifBlank { null })
-                },
+                fableRow,
                 UsageRow("wk", usage.weekPct, p7.first, p7.second, usage.weekReads?.takeIf { it > 0 }?.let { "+${humanTok(it)}↺" } ?: "", until(usage.weekReset).ifBlank { null }),
                 UsageRow("mo", moPct, moSpent, moTotal, moCached, until(usage.monthReset).ifBlank { null }),
                 UsageRow("$", dPct, dSpent, dTotal),
@@ -1266,6 +1399,9 @@ private class UsageBars : JComponent() {
                 "when Claude Code credentials are readable; without them (or offline), keep a claude terminal " +
                 "open — its status line refreshes the same cache. ctx stays live from the transcript."
         }
-        toolTipText = if (freshTip != null) "<html>${rowsTip}<br><br>${freshTip}</html>" else rowsTip
+        // The `$` figures are OAK's, priced from the tokens: the hover says they are an estimate at today's list prices.
+        val usdTip = if (rows.any { it.label == "$" && it.spent.isNotEmpty() }) "\$ is estimated from the tokens at today’s API list prices — not a bill." else null
+        val tips = listOfNotNull(usdTip, freshTip)
+        toolTipText = if (tips.isNotEmpty()) "<html>${rowsTip}<br><br>${tips.joinToString("<br><br>")}</html>" else rowsTip
     }
 }

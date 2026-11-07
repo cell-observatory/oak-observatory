@@ -4,6 +4,7 @@ import com.cellobservatory.observatory.core.ObservatoryCli
 import com.cellobservatory.observatory.core.StoreReader
 import com.cellobservatory.observatory.model.EditRecord
 import com.cellobservatory.observatory.model.ReviewParser
+import com.cellobservatory.observatory.model.graphemeHead
 import com.cellobservatory.observatory.services.ObserveCache
 import com.cellobservatory.observatory.services.ObservatoryService
 import com.cellobservatory.observatory.settings.ObservatorySettings
@@ -26,6 +27,34 @@ import java.io.File
 
 /** Before ⟷ after viewer for one edit, from the store's content-addressed blobs. */
 object Diffs {
+
+    fun remoteRequest(project: Project, machine: String, id: Int, json: String): SimpleDiffRequest? {
+        val d = com.google.gson.JsonParser.parseString(json).asJsonObject
+        val before = d.get("before")?.takeUnless { it.isJsonNull }?.asString ?: return null
+        val after = d.get("after")?.takeUnless { it.isJsonNull }?.asString ?: return null
+        val factory = DiffContentFactory.getInstance()
+        val type = FileTypeManager.getInstance().getFileTypeByFileName(d.get("file")?.asString ?: "edit.txt")
+        return SimpleDiffRequest("Edit #$id · on $machine", factory.create(project, before, type), factory.create(project, after, type), "Before", "After").preferUnified()
+    }
+    fun showRemote(project: Project, machine: String, session: String, id: Int) {
+        ApplicationManager.getApplication().executeOnPooledThread {
+            val r = ObservatoryCli.run(listOf("diff", id.toString(), "--contents", "--json", "--session", session, "--machine", machine), project.basePath)
+            ApplicationManager.getApplication().invokeLater {
+                if (project.isDisposed) return@invokeLater
+                if (!r.ok) {
+                    ReviewOps.notify(project, "Could not read Diff on $machine — ${ObservatoryCli.failureMessage(r.stdout, r.stderr, "no answer")}", NotificationType.ERROR)
+                    return@invokeLater
+                }
+                val request = runCatching { remoteRequest(project, machine, id, r.stdout) }.getOrNull()
+                if (request != null) DiffManager.getInstance().showDiff(project, request)
+                else {
+                    val patch = runCatching { com.google.gson.JsonParser.parseString(r.stdout).asJsonObject.get("patch").asString }.getOrDefault(r.stdout)
+                    val vf = com.intellij.testFramework.LightVirtualFile("Edit $id on $machine.diff", patch)
+                    FileEditorManager.getInstance(project).openFile(vf, true)
+                }
+            }
+        }
+    }
 
     /** Default to the unified (inline) viewer — the red/green single-column look — unless the user has
      *  opted back to side-by-side. Parity with the VS Code inline-diff toggle. */
@@ -52,6 +81,11 @@ object Diffs {
     }
 
     fun show(project: Project, session: String, rec: EditRecord) {
+        ObservatoryService.getInstance(project).currentMachine()?.let { machine ->
+            ObservatoryService.getInstance(project).selectRemoteReviewFile(rec.file)
+            Diffs.showRemote(project, machine, session, rec.id)
+            return
+        }
         val app = ApplicationManager.getApplication()
         // Read the (potentially large) before/after blobs OFF the EDT — this is invoked from
         // double-click / menu handlers on the UI thread. Build the diff prompt + show on the EDT.
@@ -66,7 +100,7 @@ object Diffs {
                 val name = File(rec.file).name
                 val type = FileTypeManager.getInstance().getFileTypeByFileName(name) // syntax highlighting per side
                 val factory = DiffContentFactory.getInstance()
-                val title = if (reason != null) "#${rec.id} · ${if (reason.length > 80) reason.take(79) + "…" else reason}"
+                val title = if (reason != null) "#${rec.id} · ${if (reason.length > 80) graphemeHead(reason, 79) + "…" else reason}"
                 else "$name — edit #${rec.id}"
                 val prompt = SimpleDiffRequest(
                     title,
@@ -98,7 +132,7 @@ object Diffs {
      *  page off the EDT — the eager build measurably froze the IDE at 2,922 units), so opening here
      *  just hands it the SPECS. Re-opening replaces the previous "Agent changes" tab: the tab is a
      *  snapshot, and stacking stale snapshots with live buttons multiplies wrong targets. */
-    fun showAll(project: Project, session: String, recs: List<Triple<EditRecord, String, Int>>, title: String? = null) {
+    fun showAll(project: Project, session: String, recs: List<Triple<EditRecord, String, Int>>, title: String? = null, machine: String? = null) {
         if (recs.isEmpty()) {
             // The button only renders over a non-empty list, so an empty call means the log moved
             // between paint and click — say so rather than doing nothing.
@@ -110,8 +144,16 @@ object Diffs {
             val fem = FileEditorManager.getInstance(project)
             fem.openFiles.filterIsInstance<ReviewAllVirtualFile>().forEach { fem.closeFile(it) }
             val specs = recs.map { (rec, rel, delta) -> ReviewAllSpec(rec, rel, delta) }
-            fem.openFile(ReviewAllVirtualFile(session, specs, title ?: "Agent changes (${specs.size})"), true)
+            fem.openFile(ReviewAllVirtualFile(session, specs, title ?: "${specs.size} change(s) · stacked", machine), true)
         }
+    }
+
+    fun showRemoteAll(project: Project, machine: String, session: String, review: com.cellobservatory.observatory.model.ReviewResult) {
+        val hidden = review.hiddenIds.toSet()
+        val recs = review.units.filter { it.pending && it.id !in hidden }.map { u ->
+            Triple(EditRecord(u.id, u.ts, u.tool, u.file, null, null, u.status, u.partial), u.rel, u.added + u.removed)
+        }
+        showAll(project, session, recs, "${review.prompt?.let { "prompt #${it.index}" } ?: "session"} — ${recs.size} change(s) · stacked · on $machine", machine)
     }
 
     /** The feed's edit-item opener: one FILE's changes as the stacked editor — every unit of that file, decided ones

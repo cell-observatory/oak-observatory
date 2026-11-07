@@ -5,6 +5,8 @@ import com.cellobservatory.observatory.core.ClaudePaths
 import com.cellobservatory.observatory.model.EditRecord
 import com.cellobservatory.observatory.model.SessionPrompt
 import com.cellobservatory.observatory.model.folderLabelOf
+import com.cellobservatory.observatory.model.graphemeHead
+import com.cellobservatory.observatory.model.graphemeTail
 import com.cellobservatory.observatory.model.relTime
 import com.cellobservatory.observatory.services.ObservatoryService
 import com.cellobservatory.observatory.ui.inline.InlineOverlay
@@ -174,18 +176,18 @@ class ReviewNavBar(private val project: Project, private val onNavChange: () -> 
 
     fun acceptFileAction(showText: Boolean = true): AnAction =
         labelAct(showText, "Accept File", "Accept every pending edit in this file", NavTint.ACCEPT_FILE, ::activeHasPending) {
-            activeFilePath()?.let { f -> withSession { s -> ReviewOps.keepAll(project, s, service.log().filter { it.file == ClaudePaths.storeKey(f) }, File(f).name) } }
+            activeFilePath()?.let { f -> withSession { s -> ReviewOps.keepAll(project, s, service.navigationRecords().filter { it.file == fileKey(f) }, File(f).name) } }
         }
 
     fun rejectFileAction(showText: Boolean = true): AnAction =
         labelAct(showText, "Reject File", "Reject (revert) every pending edit in this file", NavTint.REJECT, ::activeHasPending) {
-            activeFilePath()?.let { f -> withSession { s -> ReviewOps.undoAll(project, s, service.log().filter { it.file == ClaudePaths.storeKey(f) }, File(f).name, f) } }
+            activeFilePath()?.let { f -> withSession { s -> ReviewOps.undoAll(project, s, service.navigationRecords().filter { it.file == fileKey(f) }, File(f).name, f) } }
         }
 
     fun clearResolvedAction(showText: Boolean = true): AnAction =
         labelAct(showText, "Clear Resolved", "Clear Resolved Edits", NavTint.CLEAR, ::sessionHasPending) {
             withSession { s ->
-                val resolved = service.log().count { !it.pending }
+                val resolved = service.navigationRecords().count { !it.pending }
                 if (resolved > 0) ReviewOps.clearResolved(project, s, resolved) else ReviewOps.notify(project, "No resolved edits to clear")
             }
         }
@@ -202,15 +204,16 @@ class ReviewNavBar(private val project: Project, private val onNavChange: () -> 
     // the platform runs on a background thread, and reaching for the manager there is what forced every
     // one of these actions onto the EDT. See ActiveFileTracker.
     private fun activeFilePath(): String? =
-        com.cellobservatory.observatory.services.ActiveFileTracker.getInstance(project).activePath()
-    private fun sessionHasPending(): Boolean = service.counts().pending > 0
+        if (service.currentMachine() != null) service.selectedRemoteReviewFile() else com.cellobservatory.observatory.services.ActiveFileTracker.getInstance(project).activePath()
+    private fun fileKey(file: String): String = if (service.currentMachine() != null) file else ClaudePaths.storeKey(file)
+    private fun sessionHasPending(): Boolean = service.navigationRecords().any { it.pending }
     private fun pendingFiles(): List<String> = service.pendingFiles()
     private fun pendingInActiveFile(): List<EditRecord> {
         val f = activeFilePath() ?: return emptyList()
-        val key = ClaudePaths.storeKey(f) // hoisted: this runs per toolbar tick over every record
+        val key = fileKey(f) // hoisted: this runs per toolbar tick over every record
         // …and never a cancelled-out chain: the Review tree hides those rows, so an axis that stepped
         // them would park on a diff nothing else in the IDE admits exists.
-        return service.log().filter { it.pending && !service.isHidden(it) && it.file == key }.sortedBy { it.id }
+        return service.navigationRecords().filter { it.pending && !service.isHidden(it) && it.file == key }.sortedBy { it.id }
     }
     private fun activeHasPending(): Boolean = pendingInActiveFile().isNotEmpty()
 
@@ -239,7 +242,7 @@ class ReviewNavBar(private val project: Project, private val onNavChange: () -> 
         val files = pendingFiles()
         if (files.isEmpty()) return null
         val active = activeFilePath()
-        val idx = active?.let { files.indexOf(ClaudePaths.storeKey(it)) } ?: -1
+        val idx = active?.let { files.indexOf(fileKey(it)) } ?: -1
         val base = "File ${if (idx >= 0) idx + 1 else "–"}/${files.size}"
         if (!richCounters || idx < 0 || active == null) return base
         val edits = pendingInActiveFile().size
@@ -256,12 +259,12 @@ class ReviewNavBar(private val project: Project, private val onNavChange: () -> 
         onNavChange()
     }
 
-    private fun navFile(dir: Int) {
+    internal fun navFile(dir: Int) {
         val files = pendingFiles()
         if (files.isEmpty()) return
-        val idx = activeFilePath()?.let { files.indexOf(ClaudePaths.storeKey(it)) } ?: -1
-        val target = files[((if (idx < 0) 0 else idx) + dir + files.size) % files.size]
-        val first = service.log().filter { it.pending && !service.isHidden(it) && it.file == target }.minByOrNull { it.id } ?: return
+        val idx = activeFilePath()?.let { files.indexOf(fileKey(it)) } ?: -1
+        val target = files[((if (idx < 0) (if (dir > 0) -1 else 0) else idx) + dir + files.size) % files.size]
+        val first = service.navigationRecords().filter { it.pending && !service.isHidden(it) && it.file == target }.minByOrNull { it.id } ?: return
         navEditId = first.id
         session()?.let { Navigate.openFileAtEdit(project, it, first) }
         onNavChange()
@@ -288,7 +291,7 @@ class ReviewNavBar(private val project: Project, private val onNavChange: () -> 
     private fun iconAct(text: String, icon: Icon, visible: () -> Boolean, run: () -> Unit): AnAction =
         object : AnAction(text, text, icon), DumbAware {
             override fun getActionUpdateThread() = ActionUpdateThread.BGT // nothing here touches the EDT
-            override fun update(e: AnActionEvent) { e.presentation.isVisible = visible() }
+            override fun update(e: AnActionEvent) { e.presentation.isVisible = visible(); e.presentation.description = text + service.machineSuffix() }
             override fun actionPerformed(e: AnActionEvent) = run()
         }
 
@@ -299,7 +302,7 @@ class ReviewNavBar(private val project: Project, private val onNavChange: () -> 
             override fun getActionUpdateThread() = ActionUpdateThread.BGT // nothing here touches the EDT
             @Suppress("OVERRIDE_DEPRECATION") // displayTextInToolbar: still honored; renders the short label
             override fun displayTextInToolbar() = showText
-            override fun update(e: AnActionEvent) { e.presentation.isVisible = visible() }
+            override fun update(e: AnActionEvent) { e.presentation.isVisible = visible(); e.presentation.description = description + service.machineSuffix() }
             override fun actionPerformed(e: AnActionEvent) = run()
         }
 
@@ -327,9 +330,9 @@ class ReviewNavBar(private val project: Project, private val onNavChange: () -> 
     private fun root(): String? = project.basePath
     private fun folderOf(file: String): String = folderLabelOf(file, root())
     private fun pendingFolders(): List<String> =
-        service.log().filter { it.pending && !service.isHidden(it) }.map { folderOf(it.file) }.distinct().sorted()
+        service.navigationRecords().filter { it.pending && !service.isHidden(it) }.map { folderOf(it.file) }.distinct().sorted()
     private fun pendingInFolder(folder: String): List<EditRecord> =
-        service.log().filter { it.pending && !service.isHidden(it) && folderOf(it.file) == folder }.sortedBy { it.id }
+        service.navigationRecords().filter { it.pending && !service.isHidden(it) && folderOf(it.file) == folder }.sortedBy { it.id }
     private fun currentFolder(): String? = activeFilePath()?.let { folderOf(it) }
     private fun activeInPendingFolder(): Boolean = currentFolder()?.let { pendingFolders().contains(it) } ?: false
 
@@ -361,7 +364,7 @@ class ReviewNavBar(private val project: Project, private val onNavChange: () -> 
         val inFolder = pendingInFolder(cur)
         val files = inFolder.map { it.file }.distinct().size
         var name = cur
-        if (name.length > 24) name = "…" + name.takeLast(23)
+        if (name.length > 24) name = "…" + graphemeTail(name, 23)
         val bits = mutableListOf<String>()
         if (files > 0) bits.add("$files file${if (files == 1) "" else "s"}")
         if (inFolder.isNotEmpty()) bits.add("${inFolder.size} edit${if (inFolder.size == 1) "" else "s"}")
@@ -399,7 +402,7 @@ class ReviewNavBar(private val project: Project, private val onNavChange: () -> 
 
     /** Prompts with something still pending, in the order they were asked. */
     private fun pendingPrompts(): List<SessionPrompt> {
-        val pending = service.log().filter { it.pending && !service.isHidden(it) }.map { it.id }.toHashSet()
+        val pending = service.navigationRecords().filter { it.pending && !service.isHidden(it) }.map { it.id }.toHashSet()
         if (pending.isEmpty()) return emptyList()
         return promptsProvider().filter { r -> r.editIds.any { it in pending } }.sortedBy { it.index }
     }
@@ -427,12 +430,12 @@ class ReviewNavBar(private val project: Project, private val onNavChange: () -> 
     private fun promptLabel(r: SessionPrompt): String =
         "#${r.index}" + r.title.takeIf { it.isNotBlank() }?.let { " “${clipAsk(it)}”" }.orEmpty()
 
-    private fun clipAsk(s: String): String = if (s.length <= 48) s else s.take(47) + "…"
+    private fun clipAsk(s: String): String = if (s.length <= 48) s else graphemeHead(s, 47) + "…"
 
     /** The edits this prompt produced that are still in the store (its review scope). */
     private fun editsOfPrompt(r: SessionPrompt): List<EditRecord> {
         val ids = r.editIds.toHashSet()
-        return service.log().filter { it.id in ids }.sortedBy { it.id }
+        return service.reviewRecords().filter { it.id in ids }.sortedBy { it.id }
     }
 
     fun promptAxis(): List<AnAction> = listOf(
@@ -480,7 +483,7 @@ class ReviewNavBar(private val project: Project, private val onNavChange: () -> 
         val idx = if (cur != null) reqs.indexOf(cur) else -1
         val base = "Prompt ${if (idx >= 0) idx + 1 else "–"}/${reqs.size}"
         if (cur == null) return base
-        val log = service.log()
+        val log = service.navigationRecords()
         val files = cur.editIds.mapNotNull { id -> log.find { it.id == id }?.file }
         val nFiles = files.distinct().size
         val bits = mutableListOf<String>()
@@ -513,7 +516,7 @@ class ReviewNavBar(private val project: Project, private val onNavChange: () -> 
      *  cursor to a resolved edit would silently change what every other axis is scoped to. */
     fun revealPrompt(promptId: String) {
         val r = promptsProvider().firstOrNull { it.id == promptId } ?: return
-        val log = service.log()
+        val log = service.navigationRecords()
         val firstId = r.editIds.firstOrNull { id -> log.any { it.id == id && it.pending && !service.isHidden(it) } } ?: return
         val rec = log.find { it.id == firstId } ?: return
         navEditId = firstId

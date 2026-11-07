@@ -13,3 +13,5 @@ oak agent start --kind codex</code></pre>
 <h2>Conversation and usage</h2>
 <p>Observatory’s conversation detail and the editors’ Feed tab read the selected transcript. Explicit replies and review comments target a live herdr pane; unavailable or blocked targets preserve the draft. Permission prompts stay in the agent terminal.</p>
 <p>Selected-session usage comes from that conversation. Account usage is measured on each machine for itself (<a href="https://github.com/cell-observatory/oak-observatory/blob/main/SECURITY.md">SECURITY.md</a> lists the account reads); missing quota or pricing remains unavailable. See <a href="https://github.com/cell-observatory/oak-observatory/blob/main/docs/CODEX-SUPPORT.md">Codex support</a> for capture limits and historical validation evidence.</p>
+
+<p>Database derivation version 4 defers a rollout that changes while it is being read. OAK retries it on a later catch-up, so a session still being written is not published with partial derived facts.</p>

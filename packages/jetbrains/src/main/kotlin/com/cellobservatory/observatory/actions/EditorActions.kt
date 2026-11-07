@@ -20,7 +20,7 @@ import com.intellij.openapi.ui.Messages
 import com.intellij.openapi.wm.ToolWindowManager
 import java.awt.datatransfer.StringSelection
 
-/** ⌥⌘N — step to the next pending edit, cycling through all of them (the keyboard review loop). */
+/** ⌥⌘X N — step to the next pending edit, cycling through all of them (the keyboard review loop). */
 class ReviewNextAction : AnAction(), DumbAware {
     override fun getActionUpdateThread() = ActionUpdateThread.BGT
     override fun update(e: AnActionEvent) {
@@ -38,7 +38,7 @@ class ReviewNextAction : AnAction(), DumbAware {
     }
 }
 
-/** ⌥⌘P — step to the previous pending edit, cycling through all of them (the keyboard review loop). */
+/** ⌥⌘X P — step to the previous pending edit, cycling through all of them (the keyboard review loop). */
 class ReviewPrevAction : AnAction(), DumbAware {
     override fun getActionUpdateThread() = ActionUpdateThread.BGT
     override fun update(e: AnActionEvent) {
@@ -56,7 +56,7 @@ class ReviewPrevAction : AnAction(), DumbAware {
     }
 }
 
-/** ⌥⌘Y — keep the pending edit under the cursor. */
+/** ⌥⌘X A — keep the pending edit under the cursor. */
 class KeepAtCursorAction : AnAction(), DumbAware {
     override fun getActionUpdateThread() = ActionUpdateThread.BGT
     override fun update(e: AnActionEvent) {
@@ -77,7 +77,7 @@ class KeepAtCursorAction : AnAction(), DumbAware {
     }
 }
 
-/** ⌥⌘U — surgically undo the pending edit under the cursor. */
+/** ⌥⌘X U — surgically undo the pending edit under the cursor. */
 class UndoAtCursorAction : AnAction(), DumbAware {
     override fun getActionUpdateThread() = ActionUpdateThread.BGT
     override fun update(e: AnActionEvent) {
@@ -98,7 +98,7 @@ class UndoAtCursorAction : AnAction(), DumbAware {
     }
 }
 
-/** ⌥⌘[ — diff the current file against the state the previous agent edit produced. */
+/** ⌥⌘X [ — diff the current file against the state the previous agent edit produced. */
 class DiffPrevRevisionAction : AnAction(), DumbAware {
     override fun getActionUpdateThread() = ActionUpdateThread.BGT
     override fun update(e: AnActionEvent) {
@@ -112,7 +112,7 @@ class DiffPrevRevisionAction : AnAction(), DumbAware {
     }
 }
 
-/** ⌥⌘] — diff the current file against the state the next agent edit produced. */
+/** ⌥⌘X ] — diff the current file against the state the next agent edit produced. */
 class DiffNextRevisionAction : AnAction(), DumbAware {
     override fun getActionUpdateThread() = ActionUpdateThread.BGT
     override fun update(e: AnActionEvent) {
@@ -126,7 +126,7 @@ class DiffNextRevisionAction : AnAction(), DumbAware {
     }
 }
 
-/** ⌃⌥K / ⌘⌥K — accept every pending edit in the active file (parity: VS Code keepOpenFile). */
+/** ⌃⌥X ⇧A / ⌥⌘X ⇧A — keep every pending edit in the active file (parity: VS Code keepOpenFile). */
 class KeepOpenFileAction : AnAction(), DumbAware {
     override fun getActionUpdateThread() = ActionUpdateThread.BGT
     override fun update(e: AnActionEvent) {
@@ -143,7 +143,7 @@ class KeepOpenFileAction : AnAction(), DumbAware {
     }
 }
 
-/** ⌃⌥R / ⌘⌥R — revert every pending edit in the active file (parity: VS Code undoOpenFile). */
+/** ⌃⌥X ⇧D / ⌥⌘X ⇧D — undo every pending edit in the active file (parity: VS Code undoOpenFile). */
 class UndoOpenFileAction : AnAction(), DumbAware {
     override fun getActionUpdateThread() = ActionUpdateThread.BGT
     override fun update(e: AnActionEvent) {
@@ -217,14 +217,15 @@ class SendReviewCommentsAction : AnAction(), DumbAware {
         val project = e.project ?: return
         val session = ObservatoryService.getInstance(project).currentSession()
             ?: return ReviewOps.notify(project, "No active Claude Code session for this project", NotificationType.WARNING)
+        val machine = ObservatoryService.getInstance(project).currentMachine()
         ApplicationManager.getApplication().executeOnPooledThread {
-            val draft = ObservatoryCli.commentCompose(session, project.basePath)
+            val draft = ObservatoryCli.onMachine(machine) { ObservatoryCli.commentCompose(session, project.basePath) }
             ApplicationManager.getApplication().invokeLater {
                 if (draft == null) {
                     ReviewOps.notify(project, "No review comments to send — add some with “Add Review Comment” on a changed line")
                     return@invokeLater
                 }
-                ReviewOps.deliverPrompt(project, session, draft.text, "Review comments", draft.ids)
+                ReviewOps.deliverPrompt(project, session, draft.text, "Review comments", draft.ids, machine = machine)
             }
         }
     }
@@ -244,15 +245,25 @@ class QuoteLastReplyAction : AnAction(), DumbAware {
         val project = e.project ?: return
         val session = ObservatoryService.getInstance(project).currentSession()
             ?: return ReviewOps.notify(project, "No active Claude Code session for this project", NotificationType.WARNING)
+        val machine = ObservatoryService.getInstance(project).currentMachine()
         ApplicationManager.getApplication().executeOnPooledThread {
-            val quote = ObservatoryCli.quoteLastReply(session, project.basePath)
+            val quote = ObservatoryCli.onMachine(machine) { ObservatoryCli.quoteLastReply(session, project.basePath) }
             ApplicationManager.getApplication().invokeLater {
                 if (quote.isNullOrBlank()) {
                     ReviewOps.notify(project, "The agent has not replied yet in this session — nothing to quote")
                     return@invokeLater
                 }
-                ReviewOps.deliverPrompt(project, session, quote, "Quote last reply")
+                ReviewOps.deliverPrompt(project, session, quote, "Quote last reply", machine = machine)
             }
         }
     }
+}
+
+class ReviewNextFileAction : AnAction(), DumbAware {
+    override fun getActionUpdateThread() = ActionUpdateThread.BGT
+    override fun actionPerformed(e: AnActionEvent) { e.project?.let { com.cellobservatory.observatory.ui.ReviewNavBar(it).navFile(1) } }
+}
+class ReviewPrevFileAction : AnAction(), DumbAware {
+    override fun getActionUpdateThread() = ActionUpdateThread.BGT
+    override fun actionPerformed(e: AnActionEvent) { e.project?.let { com.cellobservatory.observatory.ui.ReviewNavBar(it).navFile(-1) } }
 }

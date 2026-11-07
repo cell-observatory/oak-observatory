@@ -2,7 +2,6 @@ package com.cellobservatory.observatory.platform
 
 import com.cellobservatory.observatory.core.ClaudePaths
 import com.cellobservatory.observatory.core.ObservatoryCli
-import com.intellij.testFramework.fixtures.BasePlatformTestCase
 import java.io.File
 import java.nio.file.Paths
 
@@ -12,7 +11,7 @@ import java.nio.file.Paths
  * installed CLI, one gradle run wrote change-map caches into the real store for a live session and read
  * every real transcript. Removing the sandbox fails here, by name, instead of quietly doing that again.
  */
-class TestSandboxTest : BasePlatformTestCase() {
+class TestSandboxTest : ObservatoryPlatformTestCase() {
 
     fun testTheSuiteRunsAgainstAThrowawayHomeAndThisTreesCli() {
         val home = System.getenv("HOME")

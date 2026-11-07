@@ -37,10 +37,10 @@ class ObservatoryEditorBanner : EditorNotificationProvider, DumbAware {
         val service = ObservatoryService.getInstance(project)
         service.currentSession() ?: return null
         // Cheap: cached folded log + path filter, no `locate` subprocess — safe on the provider's BGT.
-        val key = ClaudePaths.storeKey(file.path) // hoisted: the provider runs per open file per refresh
+        val key = com.cellobservatory.observatory.ui.RemoteEditorReview.fileKey(project, file.path) // hoisted: the provider runs per open file per refresh
         // Not the cancelled-out chains: a banner reading "2 pending" over a file the Review tree
         // shows nothing for, whose Prev/Next then have nowhere to go.
-        val pendingInFile = service.log().count { it.pending && !service.isHidden(it) && it.file == key }
+        val pendingInFile = service.reviewRecords().count { it.pending && !service.isHidden(it) && it.file == key }
         if (pendingInFile == 0) return null // null ⇒ no banner on files Claude hasn't touched
         return Function { fileEditor -> banner(project, service, file, pendingInFile, fileEditor) }
     }
@@ -125,7 +125,7 @@ class ObservatoryEditorBanner : EditorNotificationProvider, DumbAware {
         // These act on THIS file only — the banner is per-file, so session-wide would be misleading.
         panel.createActionLabel("Accept File") {
             service.currentSession()?.let { s ->
-                ReviewOps.keepAll(project, s, service.log().filter { it.file == ClaudePaths.storeKey(file.path) }, file.name)
+                ReviewOps.keepAll(project, s, service.reviewRecords().filter { it.file == com.cellobservatory.observatory.ui.RemoteEditorReview.fileKey(project, file.path) }, file.name)
             }
         }.apply {
             setUseIconAsLink(true)
@@ -134,7 +134,7 @@ class ObservatoryEditorBanner : EditorNotificationProvider, DumbAware {
         }
         panel.createActionLabel("Reject File") {
             service.currentSession()?.let { s ->
-                ReviewOps.undoAll(project, s, service.log().filter { it.file == ClaudePaths.storeKey(file.path) }, file.name, file.path)
+                ReviewOps.undoAll(project, s, service.reviewRecords().filter { it.file == com.cellobservatory.observatory.ui.RemoteEditorReview.fileKey(project, file.path) }, file.name, file.path)
             }
         }.apply {
             setUseIconAsLink(true)
@@ -145,7 +145,7 @@ class ObservatoryEditorBanner : EditorNotificationProvider, DumbAware {
         // spells out "Clear Resolved" (user rule: a bare "Clear" is ambiguous about what it drops).
         panel.createActionLabel("Clear Resolved") {
             service.currentSession()?.let { s ->
-                val resolved = service.log().count { !it.pending }
+                val resolved = service.reviewRecords().count { !it.pending }
                 if (resolved > 0) ReviewOps.clearResolved(project, s, resolved) else ReviewOps.notify(project, "No resolved edits to clear")
             }
         }.apply {
@@ -172,7 +172,7 @@ class ObservatoryEditorBanner : EditorNotificationProvider, DumbAware {
         if (files.isEmpty()) return
         val idx = files.indexOf(ClaudePaths.storeKey(current))
         val target = files[((if (idx < 0) 0 else idx) + dir + files.size) % files.size]
-        val first = service.log().filter { it.pending && !service.isHidden(it) && it.file == target }.minByOrNull { it.id } ?: return
+        val first = service.reviewRecords().filter { it.pending && !service.isHidden(it) && it.file == target }.minByOrNull { it.id } ?: return
         Navigate.openFileAtEdit(project, s, first)
     }
 }

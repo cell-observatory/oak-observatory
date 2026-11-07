@@ -2,6 +2,7 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
+const { gitDir: makeGitDir } = require('../../../test/fixtures/git.cjs');
 const os = require('node:os');
 const cp = require('node:child_process');
 const crypto = require('node:crypto');
@@ -21,7 +22,7 @@ function fixture(t) {
   process.env.CODEX_HOME = path.join(base, 'codex');
   const cwd = path.join(base, 'workspace'), session = 'facts-session';
   fs.mkdirSync(cwd, { recursive: true });
-  fs.mkdirSync(path.join(cwd, '.git'));
+  makeGitDir(path.join(cwd, '.git'));
   fs.mkdirSync(core.projectDir(cwd), { recursive: true });
   core.ensureStore(session); fs.writeFileSync(core.logPath(session), '');
   const file = path.join(core.projectDir(cwd), session + '.jsonl');
@@ -189,6 +190,24 @@ test('derived facts: fresh-process hit reads guards, and append reads only new b
   assert.equal(appended.actions[0].isError, true);
   assert.equal(appended.actions[1].reasoning, 'reasoning crosses the cursor');
   cache.clearTranscriptFactsMemory(); assert.deepEqual(f.facts(), f.full());
+});
+
+test('derived facts: a path whose stat names another device than its open file\'s still saves and reuses its facts (Windows, Node 22.16)', t => {
+  // libuv 1.49–1.50 (Node 22.16.0, 24.0–24.1) on Windows 11 24H2 and Server 2025 reads a path's st_dev from a misordered
+  // FILE_STAT_BASIC_INFORMATION and an open file's from its volume serial, so fs.statSync and fs.fstatSync never agree on dev.
+  const f = fixture(t); largePrefix(f);
+  const statSync = fs.statSync;
+  fs.statSync = function (...args) { const st = statSync.apply(this, args); if (st) st.dev = typeof st.dev === 'bigint' ? st.dev + 1n : st.dev + 1; return st; };
+  try {
+    f.facts();
+    assert.equal(f.factsFiles().length, 1, 'the first read saved its facts');
+    const warm = countReads(f.file, f.facts);
+    assert.equal(warm.bytes, 0, 'a second read in the same process reuses the facts it remembered');
+    cache.clearTranscriptFactsMemory();
+    const fresh = countReads(f.file, f.facts);
+    assert.ok(fresh.bytes <= 512, `a read with nothing remembered loaded the saved facts, and read ${fresh.bytes} bytes`);
+    assert.deepEqual(fresh.value, f.full());
+  } finally { fs.statSync = statSync; }
 });
 
 test('derived facts: delayed task results, renames, deletion and todos cross the cursor', t => {
@@ -532,7 +551,7 @@ test('derived facts: persisted relative edit paths resolve in the consuming proc
 
 // The schema version is part of the cache FILE NAME, so the
 // generation a bump supersedes is addressed by nothing — it used to survive every `oak clean`
-// forever, one dead file per transcript per bump (471 files / 47.6 MB measured on a real store).
+// forever, one dead file per transcript per bump (hundreds of files on a real store).
 test('derived facts: a schema bump leaves no stale generation behind after a prune', t => {
   const f = fixture(t);
   fs.writeFileSync(f.file, f.jsonl([f.call(0, 'read-one', 'Read', { file_path: 'a.ts' })]));

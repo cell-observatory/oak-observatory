@@ -87,6 +87,8 @@ class ReviewPanel(private val project: Project) : JPanel(BorderLayout()) {
         override fun getActionUpdateThread() = ActionUpdateThread.EDT // reads the tree's selection
         override fun update(e: AnActionEvent) {
             e.presentation.isEnabled = tree.selectedEdit()?.let(applies) == true
+            e.presentation.description = text + service().machineSuffix()
+            e.presentation.text = if (text == "Open") service().currentMachine()?.let { "Open on $it" } ?: text else text
         }
         override fun actionPerformed(e: AnActionEvent) {
             val rec = tree.selectedEdit() ?: return
@@ -121,9 +123,19 @@ class ReviewPanel(private val project: Project) : JPanel(BorderLayout()) {
         // the same row's context-menu Keep/Undo/Redo — one gesture, one outcome, whichever way the
         // reader reaches it.
         val selGroup = DefaultActionGroup(
+            selAction("Open", AllIcons.Actions.MenuOpen, { true }) { s, rec -> Navigate.openFileAtEdit(project, s, rec) },
             selAction("Keep", NavTint.KEEP, { it.pending }) { s, rec -> ReviewOps.keep(project, s, rec.id) },
             selAction("Undo", NavTint.UNDO, { !it.undone }) { s, rec -> ReviewOps.undoOrRedo(project, s, rec, redo = false) },
             selAction("Redo", NavTint.REDO, { it.undone }) { s, rec -> ReviewOps.undoOrRedo(project, s, rec, redo = true) },
+            selAction("Resolve", NavTint.CLEAR, { service().currentMachine() != null }) { s, rec -> ReviewOps.resolveIds(project, s, listOf(rec.id)) },
+            object : AnAction("Resolve session", "Accept and clear this session's review records", NavTint.CLEAR), DumbAware {
+                override fun getActionUpdateThread() = ActionUpdateThread.EDT
+                override fun update(e: AnActionEvent) {
+                    e.presentation.isEnabledAndVisible = service().currentMachine() != null
+                    e.presentation.description = "Resolve session" + service().machineSuffix()
+                }
+                override fun actionPerformed(e: AnActionEvent) { service().currentSession()?.let { ReviewOps.remoteVerb(project, it, "resolve", emptyList()) } }
+            },
             selAction("Chat", NavTint.CHAT, { true }) { s, rec -> ReviewOps.chatAbout(project, s, rec.id) },
             selAction("Diff", AllIcons.Actions.Diff, { true }) { s, rec -> Diffs.show(project, s, rec) },
         )
@@ -138,6 +150,9 @@ class ReviewPanel(private val project: Project) : JPanel(BorderLayout()) {
             add(tree, BorderLayout.CENTER)
             add(footer, BorderLayout.SOUTH)
         }, BorderLayout.CENTER)
+        val remoteTick = javax.swing.Timer(10_000) { if (isShowing && service().currentMachine() != null) refresh() }
+        remoteTick.start()
+        com.intellij.openapi.util.Disposer.register(project, com.intellij.openapi.Disposable { remoteTick.stop() })
         service().addListener(Runnable { refresh() })
         refresh()
     }
@@ -148,6 +163,25 @@ class ReviewPanel(private val project: Project) : JPanel(BorderLayout()) {
      *  the open-all specs. */
     fun refresh() {
         val session = service().currentSession()
+        service().currentMachine()?.let { machine ->
+            shownKey = "remote:$machine:$session"
+            val snapshot = service().remoteReview()
+            val result = snapshot?.review
+            if (session != null && result != null) {
+                tree.idFilter = if (service().selectedPromptId != null) result.ids.toSet() else null
+                tree.hiddenIds = result.hiddenIds.toSet()
+                tree.reviewOnlyIds = result.units.filter { it.partial }.flatMap { it.members }.toSet()
+                tree.captureById = result.units.flatMap { u -> u.members.map { it to u.capture } }.toMap()
+                renderHead(session, result)
+            } else renderError()
+            head.text = "<html>Open uses a matching mount first, then an SSH window. Diff stays here.<br>" +
+                escape(snapshot?.note(machine) ?: "Reading Review on $machine…") +
+                (result?.let { "<br>${it.unitCount} unit(s) · ${it.pending} pending · +${it.added} −${it.removed}" } ?: "") + "</html>"
+            tree.rebuild()
+            openAll.text = "Open all in editor on $machine"
+            for (button in listOf(keepAll, undoAll, clearBtn, cancelBtn)) button.toolTipText = "${button.text} on $machine"
+            return
+        }
         val promptId = service().selectedPromptId
         if (session == null) {
             if (shownKey != "empty") {
@@ -240,13 +274,15 @@ class ReviewPanel(private val project: Project) : JPanel(BorderLayout()) {
         for (l in keepAll.actionListeners) keepAll.removeActionListener(l)
         for (l in undoAll.actionListeners) undoAll.removeActionListener(l)
         for (l in clearBtn.actionListeners) clearBtn.removeActionListener(l)
+        openAll.text = "Open all in editor"
         openAll.addActionListener {
+            service().currentMachine()?.let { Diffs.showRemoteAll(project, it, session, r); return@addActionListener }
             Diffs.showAll(project, session, r.units.filter { it.pending }.mapNotNull { u -> netRecord(u)?.let { Triple(it, u.rel, u.added + u.removed) } })
         }
         // Keep all / Undo all — the scope's whole mutation set, RAW and group-expanded (r.ids),
         // through the same id-set verbs every other bulk path uses.
         val idSet = r.ids.toSet()
-        val targets = service().log().filter { it.id in idSet }
+        val targets = service().reviewRecords().filter { it.id in idSet }
         val scopeLabel = r.prompt?.let { "prompt #${it.index}" } ?: "this session"
         keepAll.addActionListener { ReviewOps.keepAll(project, session, targets, scopeLabel) }
         undoAll.addActionListener {
@@ -264,7 +300,7 @@ class ReviewPanel(private val project: Project) : JPanel(BorderLayout()) {
             "created then deleted, or put back: nothing to review</small></html>"
         for (l in cancelBtn.actionListeners) cancelBtn.removeActionListener(l)
         cancelBtn.addActionListener {
-            ReviewOps.keepAll(project, session, service().log().filter { it.id in r.cancelledIds.toSet() }, "cancelled-out chains")
+            ReviewOps.keepAll(project, session, service().reviewRecords().filter { it.id in r.cancelledIds.toSet() }, "cancelled-out chains")
         }
     }
 

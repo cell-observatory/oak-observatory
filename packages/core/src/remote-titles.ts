@@ -18,12 +18,14 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { rootDir } from './store';
+import { fileWithinLast, withinLast } from './stamp';
 import { readPrefs, prefsPath } from './prefs';
 import { claudeAccessToken } from './accountUsage';
-import { spawnTool } from './spawn';
+import { spawnTool, noBackgroundChildren } from './spawn';
 import { oakCliEntry } from './cli-entry';
 import { relTime } from './format';
 import type { Check } from './diagnose';
+import { graphemeHead } from './graphemes';
 
 const LIST_URL = 'https://api.anthropic.com/v1/code/sessions';
 /** A refresh runs at most this often. Titles change when a session is renamed or re-titled — rarely. */
@@ -126,16 +128,17 @@ function writeCache(cache: RemoteTitlesCache): void {
 }
 
 /** A refresher holds the lock: a live pid, or a lock too young to carry one yet. A lock older than a
- *  whole refresh is stale whoever holds it — an in-host refresher's pid outlives its refresh. (File
- *  ages are wall-clock facts, so this reads the real clock, never an injected one.) */
+ *  whole refresh is stale whoever holds it — an in-host refresher's pid outlives its refresh — and so is
+ *  one dated after now (withinLast). (File ages are wall-clock facts, so this reads the real clock, never
+ *  an injected one.) */
 function refreshRunning(): boolean {
-  let age = Infinity;
+  let at: number;
   try {
-    age = Date.now() - fs.statSync(lockPath()).mtimeMs;
+    at = fs.statSync(lockPath()).mtimeMs;
   } catch {
     return false;
   }
-  if (age > remoteTitlesDeadlineMs()) return false;
+  if (!fileWithinLast(lockPath(), at, remoteTitlesDeadlineMs())) return false;
   try {
     const { pid } = JSON.parse(fs.readFileSync(lockPath(), 'utf8'));
     if (!Number.isInteger(pid) || pid <= 0) return false;
@@ -146,7 +149,7 @@ function refreshRunning(): boolean {
       return (error as NodeJS.ErrnoException).code === 'EPERM';
     }
   } catch {
-    return age < 5_000; // the owner may be between creating the lock and writing its pid
+    return Date.now() - at < 5_000; // the owner may be between creating the lock and writing its pid
   }
 }
 
@@ -176,16 +179,17 @@ export function remoteTitlesDeadlineMs(): number {
 }
 
 /** Due, and claimed for this caller: on, not refreshed within the throttle, nobody refreshing, and no
- *  other poller kicked one in the last minute. The claim is what keeps many pollers to one refresh. */
+ *  other poller kicked one in the last minute. The claim is what keeps many pollers to one refresh. A
+ *  claim or attempt dated after now (a clock stepped back since) holds nothing (withinLast). */
 export function claimRemoteTitlesRefresh(now = Date.now()): boolean {
   try {
     try {
-      if (Date.now() - fs.statSync(claimPath()).mtimeMs < CLAIM_MS) return false; // the cheapest refusal first
+      if (fileWithinLast(claimPath(), fs.statSync(claimPath()).mtimeMs, CLAIM_MS)) return false; // the cheapest refusal first
     } catch {
       /* no claim standing */
     }
     if (!remoteTitlesEnabled()) return false;
-    if (now - readRemoteTitles().attemptedAt < REMOTE_TITLES_REFRESH_MS || refreshRunning()) return false;
+    if (withinLast(readRemoteTitles().attemptedAt, REMOTE_TITLES_REFRESH_MS, now) || refreshRunning()) return false;
     fs.mkdirSync(path.dirname(claimPath()), { recursive: true, mode: 0o700 });
     fs.writeFileSync(claimPath(), String(process.pid), { mode: 0o600 });
     return true;
@@ -199,7 +203,7 @@ export function claimRemoteTitlesRefresh(now = Date.now()): boolean {
  *  registered starts nothing. Never blocks, never throws. */
 export function kickRemoteTitles(cli: string | undefined = oakCliEntry()): void {
   try {
-    if (!cli || !claimRemoteTitlesRefresh()) return;
+    if (!cli || noBackgroundChildren() || !claimRemoteTitlesRefresh()) return;
     const child = spawnTool(process.execPath, [cli, 'titles', '--refresh', '--if-due'], { detached: true, stdio: 'ignore' });
     child.on('error', () => {
       /* the titles stay as cached until the next poll */
@@ -235,8 +239,8 @@ export async function refreshRemoteTitles(opts: RemoteTitlesRefreshOptions = {})
   try {
     const cache = readRemoteTitles();
     // Recheck under the lock: two pollers can both have read an overdue stamp.
-    if (!opts.force && now() - cache.attemptedAt < REMOTE_TITLES_REFRESH_MS) return null;
-    const deep = !cache.deepAt || now() - cache.deepAt >= DEEP_PASS_MS;
+    if (!opts.force && withinLast(cache.attemptedAt, REMOTE_TITLES_REFRESH_MS, now())) return null;
+    const deep = !cache.deepAt || !withinLast(cache.deepAt, DEEP_PASS_MS, now());
     const got: Record<string, string> = {};
     let status: RemoteTitlesStatus = 'ok';
     let error: string | undefined;
@@ -285,7 +289,7 @@ export async function refreshRemoteTitles(opts: RemoteTitlesRefreshOptions = {})
           }
         } catch (e) {
           status = 'error';
-          error = String((e as Error)?.name === 'TimeoutError' ? 'timed out' : (e as Error)?.message || e).slice(0, 120);
+          error = graphemeHead(String((e as Error)?.name === 'TimeoutError' ? 'timed out' : (e as Error)?.message || e), 120);
           break;
         }
       }

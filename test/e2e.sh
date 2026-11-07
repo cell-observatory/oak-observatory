@@ -18,6 +18,10 @@ TMP="$(cd "$(mktemp -d)" && pwd -P)"   # canonical path (macOS /var -> /private/
 # it outlives the run by its idle timeout.
 trap 'node "$CLI" server stop >/dev/null 2>&1; rm -rf "$TMP"' EXIT
 export HOME="$TMP/home"
+# No detached children (a background index build a hook or a read starts, a sync run, a titles refresh) outlive the run
+# into the folder the trap removes, or race its checks, as the node tests' bootstrap holds them off; a step that tests
+# one clears it for itself.
+export OAK_NO_BACKGROUND=1
 unset CLAUDE_CONFIG_DIR   # isolation: stats/usage read transcripts from here if set
 # …and codex's own home, for the same reason and with more at stake:  writes hooks.json,
 # appends trust state to config.toml and can WIRE A MODEL there. Leaving CODEX_HOME set pointed all
@@ -129,10 +133,14 @@ ok "clean spares the cache directory"         "[ -d \"$STORE/changemap-cache\" ]
 ok "…and the cached map inside it"            "[ -n \"$CACHED\" ] && [ -e \"$STORE/changemap-cache/$CACHED\" ]"
 
 echo "════════ E2E 9: init installs hooks, status reports them, uninstall removes them ════════"
-out=$(cc init 2>&1)
+# Never with codex: where it is on PATH, init's codex leg asks ollama at 127.0.0.1:11434 for a model to wire.
+out=$(cc init --no-codex 2>&1)
 ok "init installs capture hooks"          "echo \"\$out\" | grep -qi 'installed capture hooks'"
 ok "settings.json now carries our hook"   "grep -q 'oak-observatory-hook' '$HOME/.claude/settings.json'"
-out2=$(cc init 2>&1)
+# The second run takes the codex leg on a PATH with no codex, where that leg asks nothing.
+NOCODEX_PATH=$(node -e 'const fs = require("fs"), p = require("path"); process.stdout.write(process.env.PATH.split(p.delimiter).filter((d) => !fs.existsSync(p.join(d, "codex"))).join(p.delimiter))')
+NODE_BIN=$(command -v node)
+out2=$( cd "$WS" && PATH="$NOCODEX_PATH" "$NODE_BIN" "$CLI" init 2>&1 )
 ok "init is idempotent (2nd run no-op)"   "echo \"\$out2\" | grep -qi 'already installed'"
 ok "…and the 2nd run still reaches the codex leg" "echo \"\$out2\" | grep -qiE 'codex:? (hooks|capture|is not|not on this machine)'"
 ok "status reports hooks installed"       "cc status | grep -qE 'hooks:[[:space:]]+installed'"
@@ -260,6 +268,10 @@ ok "changemap churn is conserved from files up to modules" "printf '%s' \"\$CM\"
 ok "changemap files are ranked churn-desc"                "printf '%s' \"\$CM\" | jq -e '[.files[].churn] == ([.files[].churn]|sort|reverse)' >/dev/null"
 # usage: no statusline cache in this HOME -> statuslineCache false + shared staleness threshold
 ok "usage reports cache-missing + staleMs"   "cc usage | jq -e '.statuslineCache == false and .staleMs == 300000' >/dev/null"
+# no saved machine's reading cached: the Claude figures name no machine
+ok "usage names no saved machine"            "cc usage | jq -e '.claudeMachineNote == \"\" and .claudeAccount.fiveMachine == null' >/dev/null"
+# what a saved machine's refresh reads from this one: this machine's own Claude reading, in its versioned shape
+ok "usage --brief prints this machine's own reading" "cc usage --brief --json | jq -e '.brief == 1 and .account == null and .five == null and (.at|type) == \"number\"' >/dev/null"
 
 echo "════════ E2E 15: bundled statusline installs with no network ════════"
 cc statusline >/dev/null 2>&1; rc=$?
@@ -318,9 +330,9 @@ ok "accepted pkgC/k.txt is still status=kept"              "cc list --json | jq 
 ok "undo --all --json emits {undone,conflicts,total}"      "cc undo --all --json | jq -e 'has(\"undone\") and has(\"conflicts\") and has(\"total\")' >/dev/null"
 
 echo "════════ E2E 17: 0.8.0 multi-agent (multitask / tasklog / siblings --repo / changemap agents / chat-context / task-keep|undo) ════════"
-# A plain .git DIRECTORY makes commonDir resolve (git-free — no git binary), so listRepoSiblings can
+# A valid .git DIRECTORY makes commonDir resolve (git-free — no git binary), so listRepoSiblings can
 # group worktree-siblings by repo. Two sessions launched from $WS share this repo key.
-mkdir -p "$WS/.git"
+node -e 'require(process.argv[1]).gitDir(process.argv[2])' "$REPO/test/fixtures/git.cjs" "$WS/.git"
 MTA=mtAgent; MTB=mtBgent
 CONTENT="implement shared feature"
 # Transcripts: a first user line carrying cwd+gitBranch (so firstCwdLine/listRepoSiblings resolve the
@@ -443,7 +455,7 @@ CM2=$(cc changemap --session "$MTA" 2>/dev/null)
 ok "changemap still carries summary/edits/files/modules" "printf '%s' \"\$CM2\" | jq -e 'has(\"summary\") and has(\"edits\") and has(\"files\") and has(\"modules\")' >/dev/null"
 ok "changemap adds rollupByAgent/agents/unassigned"     "printf '%s' \"\$CM2\" | jq -e 'has(\"rollupByAgent\") and has(\"agents\") and has(\"unassigned\")' >/dev/null"
 ok "changemap agents[] is a per-sibling change-map build (both worktrees)" "printf '%s' \"\$CM2\" | jq -e '[.agents[] | select(has(\"summary\") and has(\"rollupByTask\"))]|length>=2' >/dev/null"
-# 0.8.7: the per-sibling edit LIST is projected out of agents[] (1.95 MB of a 3.30 MB payload that no
+# 0.8.7: the per-sibling edit LIST is projected out of agents[] (most of the payload, which no
 # renderer read); the session's own top-level edits are untouched.
 ok "changemap agents[] carries no per-sibling edit list"  "printf '%s' \"\$CM2\" | jq -e '[.agents[] | select(has(\"edits\"))]|length==0' >/dev/null"
 ok "changemap per-edit carries taskId (strict spans)"   "printf '%s' \"\$CM2\" | jq -e '.edits[0] | has(\"taskId\")' >/dev/null"
@@ -608,7 +620,8 @@ echo "════════ E2E 19: demo simulator + guided tour (real pipeli
 # + folder — then every surface is asserted against it, including the ones that can ONLY show an empty
 # state unless the scenario produces their data (deletions, failed calls, outside writes, processes).
 # Finally the lifecycle (accept-all auto-clear, --clean) must leave zero residue, across both sessions.
-DEMOWS="$WS/demo-e2e"; mkdir -p "$DEMOWS/.git"
+DEMOWS="$WS/demo-e2e"
+node -e 'require(process.argv[1]).gitDir(process.argv[2])' "$REPO/test/fixtures/git.cjs" "$DEMOWS/.git"
 DEMOJ=$( ( cd "$DEMOWS" && node "$CLI" demo --fast --json ) )
 DSESS=$(printf '%s' "$DEMOJ" | jq -r '.session')
 DSIB=$(printf '%s' "$DEMOJ" | jq -r '.sibling')
@@ -854,8 +867,8 @@ ok "tui --once holds the column budget"                "printf '%s\n' \"\$DASH\"
 # Checked against the BAR ROW, not the whole frame. Grepping the frame passed against a bar that had
 # dropped every chip, because the same words appear in the blocked-size status line underneath: the
 # check reported healthy for precisely the failure it existed to catch.
-BAR=$( printf '%s\n' "$DASH" | grep -E 'F2.+Prompts' )
-ok "review names its four panes even when they cannot all fit" "printf '%s' \"\$BAR\" | grep -qE 'F2 .Prompts.*F3 .Traces.*F4 .Map.*F5 .Diff'"
+BAR=$( printf '%s\n' "$DASH" | grep -E 'F4.+Prompts' )
+ok "review names its four panes even when they cannot all fit" "printf '%s' \"\$BAR\" | grep -qE 'F4 .Prompts.*F5 .Traces.*F6 .Map.*F7 .Diff'"
 
 ok "and says what a window it cannot open would cost"  "printf '%s' \"\$DASH\" | grep -qE 'needs [0-9]+ (cols|body rows)'"
 # The keys row must not advertise a key the runtime does not answer. `j`/`k` are gone; arrows moved in.
@@ -879,7 +892,7 @@ ok "…and plain diff still prints the trailer for a human" "cc diff 1 --session
 # what earlier `usage` calls left so the claim this checks can only be the paint's.
 RT="$HOME/.claude/claude-observatory/remote-cache/session-titles.json"
 rm -f "$RT" "$RT.kick"
-ok "the interactive path boots and paints"       "cd \"$WS\" && node \"$REPO/test/tty-boot.js\" \"$REPO/packages/cli/dist/index.js\""
+ok "the interactive path boots and paints"       "cd \"$WS\" && OAK_NO_BACKGROUND= node \"$REPO/test/tty-boot.js\" \"$REPO/packages/cli/dist/index.js\""
 ok "…and its first poll claims a Remote Control titles refresh" "[ -f \"$RT.kick\" ]"
 # …and then it is DRIVEN. `--once` never installs a key handler and tty-boot only proves frame one
 # does not throw, so neither presses a key — which is how five separate keys shipped bound to a string
@@ -1154,6 +1167,111 @@ node -e 'require(process.argv[1]).appendScopeOverride(process.argv[2], [1], "p_b
 ok "a stale override is said, not swallowed"            "as prompts --json | jq -e '(.assignErrors|length) == 1 and (.assignErrors[0] | test(\"p_bogus\"))' >/dev/null"
 ok "…and the edit stays in its temporal window"         "as prompts --json | jq -e '.prompts[0].editIds == [1]' >/dev/null"
 rm -rf "$ASW"
+
+echo "════════ E2E 33: a Codex session's running turn rides the session listing (turnOpen) ════════"
+CXW="$(cd "$(mktemp -d)" && pwd -P)"; CXS="019a0000-0000-7000-8000-00000000e2e3"
+CXR="$HOME/.codex/sessions/2026/10/23/rollout-2026-10-23T10-00-00-$CXS.jsonl"
+mkdir -p "$(dirname "$CXR")"
+printf '%s\n' "{\"timestamp\":\"2026-10-23T10:00:00.000Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"$CXS\",\"cwd\":\"$CXW\"}}" \
+  '{"timestamp":"2026-10-23T10:00:01.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"e2e-turn"}}' \
+  '{"timestamp":"2026-10-23T10:00:02.000Z","type":"event_msg","payload":{"type":"user_message","message":"Assess the processing step"}}' > "$CXR"
+cx(){ ( cd "$CXW" && node "$CLI" sessions --json ) | jq -e "[.sessions[] | select(.id==\"$CXS\")] | length == 1 and (.[0] | $1)" >/dev/null; }
+ok "a Codex turn still running lists turnOpen: true"      "cx '.turnOpen == true and .agent == \"codex\"'"
+printf '%s\n' '{"timestamp":"2026-10-23T10:05:00.000Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"e2e-turn"}}' >> "$CXR"
+ok "…and false once it has ended"                         "cx '.turnOpen == false'"
+ok "a Claude session carries no turnOpen"                 "cc sessions --json | jq -e '[.sessions[] | select(.agent == \"claude\")] | length > 0 and (map(has(\"turnOpen\")) | any | not)' >/dev/null"
+rm -rf "${CXW:?}"; rm -f "${CXR:?}"
+
+echo "════════ E2E 34: the local index — parity with the files, oak query's contract, the archive ════════"
+IXW="$(cd "$(mktemp -d)" && pwd -P)"; IXS="ix-0000000000000001"; IXT="ix-0000000000000002"
+IXP="$HOME/.claude/projects/$(printf '%s' "$IXW" | sed 's/[^a-zA-Z0-9]/-/g')"; mkdir -p "$IXP"
+ixl(){ printf '{"type":"user","cwd":"%s","sessionId":"%s","timestamp":"2026-10-01T10:00:0%sZ","message":{"role":"user","content":"%s"}}\n' "$IXW" "$1" "$2" "$3"; }
+ixa(){ printf '{"type":"assistant","cwd":"%s","sessionId":"%s","timestamp":"2026-10-01T10:00:0%sZ","message":{"id":"%s","role":"assistant","model":"claude-opus-4-8","content":[{"type":"%s","%s":"%s"}],"usage":{"input_tokens":10,"output_tokens":5}}}\n' "$IXW" "$1" "$2" "$3" "$4" "$5" "$6"; }
+{ ixl "$IXS" 1 "Teach the zebracorn parser"; ixa "$IXS" 2 m1 thinking thinking "plan"; ixa "$IXS" 3 m1 text text "The parser now splits zebracorn tokens."; } > "$IXP/$IXS.jsonl"
+{ ixl "$IXT" 4 "Write the release notes"; ixa "$IXT" 5 m2 text text "Notes drafted."; } > "$IXP/$IXT.jsonl"
+node -e 'const core=require(process.argv[1]),path=require("path");const S=process.argv[3],W=process.argv[2];core.ensureStore(S);core.appendLog(S,{ts:Date.now()-1000,tool:"Edit",file:path.join(W,"a.ts"),beforeBlob:core.writeBlob(S,Buffer.from("a\n")),afterBlob:core.writeBlob(S,Buffer.from("b\n")),status:"pending"});' "$CORE" "$IXW" "$IXS"
+ix(){ ( cd "$IXW" && node "$CLI" "$@" ); }
+ixoff(){ ( cd "$IXW" && OAK_INDEX=off node "$CLI" "$@" ); }
+ok "sessions --json: the index lists what the files list"   "[ \"\$(ix sessions --json)\" = \"\$(ixoff sessions --json)\" ]"
+ok "search: the same hits, a reply after a thinking block"  "[ \"\$(ix search zebracorn --json | jq -c 'del(.ms,.indexed)')\" = \"\$(ixoff search zebracorn --json | jq -c 'del(.ms,.indexed)')\" ] && ix search tokens --json | jq -e '.hits[0].where == \"response\"' >/dev/null"
+ok "inbox: the same hands"                                  "[ \"\$(ix inbox --json | jq -c 'del(.generatedAt)')\" = \"\$(ixoff inbox --json | jq -c 'del(.generatedAt)')\" ]"
+ok "query sessions answers the v1 contract"                 "ix query sessions | jq -e '.v == 1 and ([.rows[].id | select(startswith(\"ix-\"))] | length) == 2 and .freshness.caughtUp == true and (.columns | index(\"archived\")) != null' >/dev/null"
+ok "query edits carries line counts from the blobs"         "ix query edits | jq -e '.rows[0].added == 1 and .rows[0].removed == 1' >/dev/null"
+ok "query search ranks asks over answers (bm25)"            "ix query search --text zebracorn | jq -e '.rowCount == 1 and (.rows[0].snippet | test(\"zebracorn\"))' >/dev/null"
+ix query nope >/dev/null 2>&1; rc=$?
+ok "a query that cannot run exits 2"                        "[ $rc -eq 2 ]"
+ixoff query sessions >/dev/null 2>&1; rc=$?
+ok "no index exits 3"                                       "[ $rc -eq 3 ]"
+ix query sql "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c) SELECT count(*) FROM c" --timeout 500 >/dev/null 2>&1; rc=$?
+ok "raw SQL past its deadline is killed, exit 124"          "[ $rc -eq 124 ]"
+ix query sql "ATTACH DATABASE '$IXW/x.db' AS x" >/dev/null 2>&1; rc=$?
+ok "ATTACH is refused (exit 2) and writes nothing"          "[ $rc -eq 2 ] && [ ! -e '$IXW/x.db' ]"
+ix query sql "VACUUM INTO '$IXW/copy.db'" >/dev/null 2>&1; rc=$?
+ok "VACUUM INTO is refused (exit 2) and writes nothing"     "[ $rc -eq 2 ] && [ ! -e '$IXW/copy.db' ]"
+ok "a read runs"                                            "ix query sql \"SELECT count(*) AS n FROM prompts WHERE session_id LIKE 'ix-%'\" | jq -e '.rows[0].n == 2' >/dev/null"
+ok "the index lives beside the config, 0600"                "f=\$(ls \"$HOME/.claude/claude-observatory-index\"/index-v1-*.sqlite) && [ \"\$(stat -c %a \"\$f\" 2>/dev/null || stat -f %Lp \"\$f\")\" = 600 ]"
+ix clean --drop "$IXS" >/dev/null; rm -f "$IXP/$IXS.jsonl"
+ok "a cleaned session leaves the listing"                   "ix sessions --json | jq -e '[.sessions[].id | select(startswith(\"ix-\"))] == [\"$IXT\"]' >/dev/null"
+ok "…and stays in the index, archived as cleaned"           "ix query sessions --archived | jq -e '[.rows[] | select(.id == \"$IXS\")][0] | .archived == 1 and .archived_reason == \"cleaned\"' >/dev/null"
+ok "…its answers searchable only when asked"                "ix query search --text zebracorn | jq -e '.rowCount == 0' >/dev/null && ix query search --text zebracorn --all | jq -e '.rowCount == 1' >/dev/null"
+ix sessions --delete "$IXT" --force >/dev/null
+ok "a deliberate delete forgets the session"                "ix query sessions --all | jq -e '[.rows[].id] | index(\"$IXT\") == null' >/dev/null && ix query search --text notes --all | jq -e '.rowCount == 0' >/dev/null"
+# Shadow mode serves the files' listing and records where the index differs: none here; then a planted difference.
+rm -f "$HOME/.claude/claude-observatory-index/shadow.jsonl"
+{ ixl "$IXS-3" 6 "A third session"; ixa "$IXS-3" 7 m3 text text "ok"; } > "$IXP/$IXS-3.jsonl"
+ok "shadow mode lists the files' answer"                    "[ \"\$( cd \"$IXW\" && OAK_INDEX=shadow node \"$CLI\" sessions --json)\" = \"\$(ixoff sessions --json)\" ] && [ ! -e \"$HOME/.claude/claude-observatory-index/shadow.jsonl\" ]"
+node -e 'const s=require("node:sqlite");const f=require("fs").readdirSync(process.argv[1]).find(n=>/^index-v1-.*\.sqlite$/.test(n));const db=new s.DatabaseSync(process.argv[1]+"/"+f);db.prepare("UPDATE sessions SET facts = json_set(facts, ?, 999999) WHERE session_id = ?").run("$.tokens",process.argv[2]);db.close();' "$HOME/.claude/claude-observatory-index" "$IXS-3"
+ok "…and records a difference it finds"                     "( cd \"$IXW\" && OAK_INDEX=shadow node \"$CLI\" sessions --json >/dev/null ) && grep -q 'tokens' \"$HOME/.claude/claude-observatory-index/shadow.jsonl\""
+ok "…while it still lists the files' answer"                "[ \"\$( cd \"$IXW\" && OAK_INDEX=shadow node \"$CLI\" sessions --json)\" = \"\$(ixoff sessions --json)\" ]"
+rm -rf "$HOME/.claude/claude-observatory-index"
+( cd "$IXW" && OAK_NO_BACKGROUND=1 node "$CLI" __index-build )
+ok "oak __index-build builds the index with no reader waiting"  "f=\$(ls \"$HOME/.claude/claude-observatory-index\"/index-v1-*.sqlite) && node -e 'const s=require(\"node:sqlite\");const db=new s.DatabaseSync(process.argv[1],{readOnly:true});process.exit(db.prepare(\"SELECT count(*) AS n FROM sessions WHERE session_id = ?\").get(process.argv[2]).n === 1 ? 0 : 1)' \"\$f\" \"$IXS-3\" 2>/dev/null"
+# Usage in the index and the record log (0.11.0): each message once (the cleaned session's kept, the deleted one's gone).
+ok "usage --window: each message once, by session"         "ix usage --window all --by session --json | jq -e '.query == \"usage\" and ([.rows[] | select(.session | startswith(\"ix-\")) | .tokens] | add) == 30' >/dev/null"
+ok "usage --json carries the account's windows"            "ix usage --json | jq -e '.usageTotals | type == \"object\" and has(\"five\") and has(\"week\") and has(\"month\")' >/dev/null"
+ok "__usage-records: this machine's usage, as records"     "ix __usage-records --json | jq -e '.usageRecords == 1 and ([.messages[].message_id] | index(\"m3\")) != null and all(.messages[]; has(\"machine_id\") | not)' >/dev/null"
+ok "the record log is in the store, and never a session"   "ls \"$HOME/.claude/claude-observatory/records\"/*/*.jsonl >/dev/null 2>&1 && ix sessions --json | jq -e '[.sessions[].id] | index(\"records\") == null' >/dev/null"
+rm -rf "${IXW:?}"
+
+echo "════════ E2E 35: what the surfaces read from the index — the CLI's answer, the editors' in-process one, and the files' ════════"
+PW="$(cd "$(mktemp -d)" && pwd -P)"; PS="px-0000000000000001"; PC="00000000-0000-4000-8000-00000000c0de"; PH="b0b0b0b0b0b0"
+PP="$HOME/.claude/projects/$(printf '%s' "$PW" | sed 's/[^a-zA-Z0-9]/-/g')"; mkdir -p "$PP/$PS/subagents"
+pxl(){ printf '{"type":"%s","cwd":"%s","sessionId":"%s","timestamp":"%s","message":%s}\n' "$1" "$PW" "$PS" "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" "$2"; }
+{ pxl user '{"role":"user","content":"Split the parser work"}'
+  pxl assistant '{"id":"p1","role":"assistant","model":"claude-opus-4-8","content":[{"type":"tool_use","id":"spawn-1","name":"Agent","input":{"description":"The running one"}}],"usage":{"input_tokens":10,"output_tokens":5}}'; } > "$PP/$PS.jsonl"
+# A worker still running (its last call has no result yet) and one finished; a raised hand and a native tab's link.
+printf '%s\n' '{"type":"assistant","isSidechain":true,"message":{"role":"assistant","model":"claude-opus-4-8","content":[{"type":"tool_use","id":"r1","name":"Bash","input":{"command":"make"}}]}}' > "$PP/$PS/subagents/agent-run.jsonl"
+printf '%s\n' '{"type":"assistant","isSidechain":true,"message":{"role":"assistant","model":"claude-opus-4-8","stop_reason":"end_turn","content":[{"type":"text","text":"Done."}]}}' > "$PP/$PS/subagents/agent-done.jsonl"
+node -e 'const core=require(process.argv[1]),fs=require("fs"),path=require("path");const S=process.argv[3],W=process.argv[2];core.ensureStore(S);core.appendLog(S,{ts:Date.now()-1000,tool:"Edit",file:path.join(W,"a.ts"),beforeBlob:core.writeBlob(S,Buffer.from("a\n")),afterBlob:core.writeBlob(S,Buffer.from("b\n")),status:"pending"});fs.writeFileSync(path.join(core.storeDir(S),"attention.json"),JSON.stringify({kind:"input",message:"Waiting on you",ts:Date.now()-500}));fs.writeFileSync(path.join(core.storeDir(S),"tab.json"),JSON.stringify({tab:"tab-1@42",at:1}));' "$CORE" "$PW" "$PS"
+# A Codex session that ran in the workspace, and another machine's record log as oak sync lands it.
+mkdir -p "$HOME/.codex/sessions/2026/10/31" "$HOME/.claude/claude-observatory/records/$PH"
+printf '%s\n' "{\"timestamp\":\"2026-10-31T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"$PC\",\"cwd\":\"$PW\"}}" \
+  '{"timestamp":"2026-10-31T10:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"Tidy the notes"}}' > "$HOME/.codex/sessions/2026/10/31/rollout-2026-10-31T10-00-00-$PC.jsonl"
+pat=$(( $(date +%s) * 1000 - 10800000 ))
+printf '%s\n' "{\"t\":\"batch\",\"at\":$pat,\"v\":1,\"label\":\"build-box\",\"platform\":\"linux\"}" \
+  "{\"t\":\"sessions\",\"r\":{\"session_id\":\"remote-one\",\"agent\":\"claude\",\"origin\":\"local\",\"review\":0,\"title\":\"Tune the remote parser\",\"workspace\":\"~/remote\",\"last_active_ms\":$pat,\"tokens\":120,\"edits\":2,\"pending\":1,\"files\":1,\"model\":\"Opus 4.8\"}}" \
+  > "$HOME/.claude/claude-observatory/records/$PH/$pat-0badf00d.jsonl"
+px(){ ( cd "$PW" && node "$CLI" "$@" ); }
+pxoff(){ ( cd "$PW" && OAK_INDEX=off node "$CLI" "$@" ); }
+pxin(){ ( cd "$PW" && node -e "const core=require(process.argv[1]);process.stdout.write(JSON.stringify($1))" "$CORE" ); }
+ok "sessions --json: the index lists what the files list, with its raised hand, tab and running worker" \
+  "[ \"\$(px sessions --json)\" = \"\$(pxoff sessions --json)\" ] && px sessions --json | jq -e '[.sessions[] | select(.id == \"$PS\")][0] | .attention.message == \"Waiting on you\" and .tab == \"tab-1@42\" and ([.activeWorkers[].agentId] == [\"run\"])' >/dev/null"
+ok "inbox --json: the same hands from the index as from the files"  "[ \"\$(px inbox --json | jq -c 'del(.generatedAt) | .hands |= map(del(.waitingMs, .waitedTodayMs))')\" = \"\$(pxoff inbox --json | jq -c 'del(.generatedAt) | .hands |= map(del(.waitingMs, .waitedTodayMs))')\" ]"
+ok "an editor's in-process listing is the CLI's, byte for byte"  "[ \"\$(px sessions --json)\" = \"\$(pxin 'core.readIndexedListing(process.cwd())')\" ]"
+ok "sessions --synced: this machine's listing unchanged, then every other machine's by its label" \
+  "[ \"\$(px sessions --json --synced | jq -c '{active, sessions}')\" = \"\$(px sessions --json | jq -c '{active, sessions}')\" ] && px sessions --json --synced | jq -e '.machines == [.machines[0]] and .machines[0].label == \"build-box\" and .machines[0].host == \"$PH\" and (.machines[0].sessions | map([.id, .origin, .machine]) == [[\"remote-one\", \"synced\", \"build-box\"]])' >/dev/null"
+ok "…and an editor's in-process reading of them is the CLI's, byte for byte"  "[ \"\$(px sessions --json --synced | jq -c .machines)\" = \"\$(pxin 'core.readMachineListings()' | jq -c .)\" ]"
+ok "…none with the index off"                                "pxoff sessions --json --synced | jq -e '.machines == []' >/dev/null"
+# Each named query a surface asks (JetBrains' pin check and Codex signal, through one long-lived `oak query --serve`):
+# the serve's answer is the CLI's, field for field, but for how long it took.
+nq(){ jq -c 'del(.elapsedMs)'; }
+for spec in "{\"id\":\"$PC\",\"all\":true,\"limit\":10}|--id $PC --all --limit 10" "{\"agent\":\"codex\",\"limit\":50}|--agent codex --limit 50"; do
+  params="${spec%%|*}"; flags="${spec#*|}"
+  cli="$(px query sessions $flags | nq)"
+  served="$(printf '{"id":7,"query":"sessions","params":%s}\n' "$params" | px query --serve | jq -c 'del(.id)' | nq)"
+  ok "query sessions $flags: the serve answers what the CLI does" "[ -n '$cli' ] && [ '$cli' = '$served' ] && echo '$cli' | jq -e '.freshness.caughtUp and ([.rows[] | select(.id == \"$PC\") | .cwd] == [\"$PW\"])' >/dev/null"
+done
+rm -rf "${PW:?}" "${PP:?}" "$HOME/.claude/claude-observatory/records/$PH" "$HOME/.codex/sessions/2026/10/31/rollout-2026-10-31T10-00-00-$PC.jsonl"
 
 echo "════════════════════════════════════════════════════════"
 echo "E2E RESULT: $pass passed, $fail failed"

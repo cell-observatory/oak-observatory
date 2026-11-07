@@ -102,7 +102,8 @@ export interface SessionTokens {
 
 /**
  * Session-total usage summed across the session's main-chain assistant messages (deduped by message
- * id, the same formula Stats/Workflows use, so a multi-block message isn't multiplied); `durationMs` =
+ * id, each at its largest snapshot, the same rule Stats/Workflows and the status line use, so a
+ * multi-block message isn't multiplied); `durationMs` =
  * wall-clock span of the transcript (last − first timestamp over every timestamped line). Zeros when
  * the transcript is absent/unreadable. Zero token, no model calls.
  *
@@ -130,6 +131,63 @@ export function sessionUsage(cwd: string, sessionId: string, at?: string): Sessi
   return snap;
 }
 
+/** A session's usage with every agent it started, at any depth: its own turns (sessionUsage) plus each worker transcript
+ *  beside it (`<project>/<id>/subagents/`, workflow runs' agents included), the files the index counts under the session
+ *  too. A worker's lines are all sidechain, which sessionUsage leaves out, so each file keeps a cursor of its own that
+ *  counts them. `agents`: how many of those files reported usage (0: the session's figure is its own). */
+export function sessionTreeUsage(cwd: string, sessionId: string, at?: string): SessionTokens & { agents: number } {
+  const transcript = at ?? findTranscript(cwd, sessionId);
+  const own = transcript ? sessionUsage(cwd, sessionId, transcript) : emptyUsage();
+  const out = { available: own.available, total: own.total, input: own.input, output: own.output, cacheRead: own.cacheRead,
+    cacheCreation: own.cacheCreation, hitPct: own.hitPct, agents: 0 };
+  if (!transcript) return out;
+  for (const file of workerTranscripts(path.join(path.dirname(transcript), sessionId, 'subagents'), 3)) {
+    const adv = advanceCursor(file, true);
+    if (!adv) continue;
+    const w = usageSnapshot(adv.cur);
+    if (adv.cur.offset < adv.st.size && adv.st.size - adv.cur.offset <= TAIL_PEEK_MAX) peekTail(file, adv.cur, adv.st.size, w, true);
+    if (!w.available) continue;
+    out.agents++;
+    countUsage(out, [w.input, w.output, w.cacheRead, w.cacheCreation]);
+  }
+  out.available = own.available || out.agents > 0;
+  out.total = out.input + out.output + out.cacheCreation; // see SessionTokens.total
+  const ctxSent = out.input + out.cacheRead + out.cacheCreation;
+  out.hitPct = ctxSent > 0 ? (out.cacheRead / ctxSent) * 100 : null;
+  return out;
+}
+
+/** The `.jsonl` files under `dir`, `depth` folders down (the index's walk of a session's workers, ingest.ts). */
+function workerTranscripts(dir: string, depth: number, out: string[] = []): string[] {
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return out;
+  }
+  for (const e of entries) {
+    const full = path.join(dir, e.name);
+    if (e.isFile() && e.name.endsWith('.jsonl')) out.push(full);
+    else if (e.isDirectory() && depth > 0) workerTranscripts(full, depth - 1, out);
+  }
+  return out;
+}
+
+/** The usage a message was counted at: input, output, cache read, cache creation. */
+type UsageSnap = [number, number, number, number];
+
+/** What a message's usage snapshots are ranked by: input + output + cache creation, the tokens `total` counts (the
+ *  status line ranks them the same way). */
+const snapUnit = (s: UsageSnap): number => s[0] + s[1] + s[3];
+
+/** Add `snap` to the running totals `t`, less `prev`, the snapshot of the same message counted before it. */
+function countUsage(t: { input: number; output: number; cacheRead: number; cacheCreation: number }, snap: UsageSnap, prev?: UsageSnap): void {
+  t.input += snap[0] - (prev ? prev[0] : 0);
+  t.output += snap[1] - (prev ? prev[1] : 0);
+  t.cacheRead += snap[2] - (prev ? prev[2] : 0);
+  t.cacheCreation += snap[3] - (prev ? prev[3] : 0);
+}
+
 /** Running per-transcript accumulator: totals for [0, offset) plus the message ids already counted.
  *  It also carries the session's "vitals" (model, effort, compactions, context-fill series) so those
  *  ride the SAME delta-parse — reading them costs no extra pass over the transcript. */
@@ -137,7 +195,8 @@ interface UsageCursor {
   mtimeMs: number;
   size: number;
   offset: number; // bytes consumed, always ending on a '\n' (a trailing partial line stays pending)
-  seen: Set<string>;
+  /** Each message id counted, with the snapshot it is counted at (a later, larger one replaces it). */
+  seen: Map<string, UsageSnap>;
   input: number;
   output: number;
   cacheRead: number;
@@ -164,7 +223,7 @@ function newCursor(): UsageCursor {
     mtimeMs: 0,
     size: 0,
     offset: 0,
-    seen: new Set(),
+    seen: new Map(),
     input: 0,
     output: 0,
     cacheRead: 0,
@@ -182,37 +241,43 @@ function newCursor(): UsageCursor {
 /** Advance (or create) this transcript's cursor to the file's current size, then hand it back with the
  *  stat that drove it. The shared step behind sessionUsage and sessionVitals: both read different facts
  *  out of the one delta-parse, so asking for vitals right after usage costs a single stat(). */
-function advanceCursor(transcript: string): { cur: UsageCursor; st: fs.Stats } | null {
+function advanceCursor(transcript: string, side = false): { cur: UsageCursor; st: fs.Stats } | null {
   let st: fs.Stats;
   try {
     st = fs.statSync(transcript);
   } catch {
     return null;
   }
-  let cur = usageCursors.get(transcript);
+  // `side`: a worker's transcript, whose sidechain lines count (sessionTreeUsage); its cursor is kept apart.
+  const key = side ? `${transcript}\0side` : transcript;
+  let cur = usageCursors.get(key);
   // Nothing in memory yet — this is a one-shot CLI process (the status line runs one per prompt, the
   // JetBrains stats poll one per tick), where an in-memory cursor never survives to help. Pick up the
   // cursor the last process left on disk so a 50MB transcript is delta-parsed instead of re-read.
-  if (!cur) cur = loadCursor(transcript);
+  if (!cur) cur = loadCursor(transcript, side);
   const startOffset = cur ? cur.offset : 0;
   if (!(cur && cur.mtimeMs === st.mtimeMs && cur.size === st.size)) {
     // Reuse the cursor only while the file has strictly grown — a shrink means the transcript was
     // replaced, so start over. (A same-size mtime touch keeps the totals; there are no new bytes.)
     if (!cur || st.size < cur.offset) cur = newCursor();
-    if (st.size > cur.offset) consumeDelta(transcript, cur, st.size);
+    if (st.size > cur.offset) consumeDelta(transcript, cur, st.size, side);
     cur.mtimeMs = st.mtimeMs;
     cur.size = st.size;
   }
-  touchCursor(transcript, cur);
-  if (cur.offset !== startOffset) saveCursor(transcript, cur); // only when this call actually consumed bytes
+  touchCursor(key, cur);
+  if (cur.offset !== startOffset) saveCursor(transcript, cur, side); // only when this call actually consumed bytes
   return { cur, st };
 }
 
 /** Where this transcript's persisted cursor lives — one file per transcript (they reach ~tens of KB on
- *  a long session, so a single shared map would grow unbounded across every session on the machine). */
-function cursorPath(transcript: string): string {
+ *  a long session, so a single shared map would grow unbounded across every session on the machine).
+ *  The version is in the NAME: an older build still running beside this one (an editor window not yet
+ *  reloaded) keeps its own file. Kept in one file, each build discarded the other's cursor as another
+ *  version's and parsed the whole transcript again, at every read, for as long as the old window stayed
+ *  open: every `oak sessions` and every status line usage read. */
+function cursorPath(transcript: string, side = false): string {
   const key = crypto.createHash('sha256').update(path.resolve(transcript)).digest('hex').slice(0, 16);
-  return path.join(rootDir(), 'usage-cursors', `${key}.json`);
+  return path.join(rootDir(), 'usage-cursors', `${key}${side ? '.side' : ''}.v${CURSOR_VERSION}.json`);
 }
 
 /**
@@ -233,11 +298,16 @@ export function removeUsageCursor(transcript: string): void {
  *
  *  Cursors are keyed by a HASH of the transcript path, so they are unreachable from a session id —
  *  `removeSession` cannot delete them, and they leaked forever. New cursors record their transcript
- *  (see StoredCursor.transcript); one whose recorded transcript is gone is dead weight. Old-format
- *  cursors carry no path at all, so the only honest signal left is age: reaped after 30 quiet days,
- *  which for a LIVE transcript merely costs one incremental re-scan on the next usage read. */
-export function reapUsageCursors(now: number = Date.now()): { removed: number; bytes: number } {
-  const out = { removed: 0, bytes: 0 };
+ *  (see StoredCursor.transcript); one whose recorded transcript is gone is dead weight. One that records
+ *  no path has only its age to go by: reaped after 30 quiet days, which for a LIVE transcript merely
+ *  costs one incremental re-scan on the next usage read.
+ *
+ *  A cursor of an OLDER version (`<key>.v<N>.json` below CURSOR_VERSION, or `<key>.json`, the name
+ *  before versions were in it) is read by nothing in this build, so it goes whatever its transcript or
+ *  age, counted apart as `superseded`. An older build still running writes its own again, and the next
+ *  sweep takes it again. One of a newer version is a newer build's, and is left alone. */
+export function reapUsageCursors(now: number = Date.now()): { removed: number; bytes: number; superseded: number } {
+  const out = { removed: 0, bytes: 0, superseded: 0 };
   const dir = path.join(rootDir(), 'usage-cursors');
   let entries: string[];
   try {
@@ -247,20 +317,27 @@ export function reapUsageCursors(now: number = Date.now()): { removed: number; b
   }
   for (const f of entries) {
     if (!f.endsWith('.json')) continue;
+    const named = /\.v(\d+)\.json$/.exec(f);
+    const version = named ? Number(named[1]) : 0; // no version in the name: written before there was one
+    if (version > CURSOR_VERSION) continue;
+    const superseded = version < CURSOR_VERSION;
     const p = path.join(dir, f);
-    let dead = false;
-    try {
-      const raw = JSON.parse(fs.readFileSync(p, 'utf8')) as StoredCursor;
-      if (typeof raw.transcript === 'string') dead = !fs.existsSync(raw.transcript);
-      else dead = now - fs.statSync(p).mtimeMs > 30 * 24 * 3600_000; // path-less legacy: age is all there is
-    } catch {
-      dead = true; // unreadable is unusable — a cursor that cannot load only costs a re-scan anyway
+    let dead = superseded;
+    if (!dead) {
+      try {
+        const raw = JSON.parse(fs.readFileSync(p, 'utf8')) as StoredCursor;
+        if (typeof raw.transcript === 'string') dead = !fs.existsSync(raw.transcript);
+        else dead = now - fs.statSync(p).mtimeMs > 30 * 24 * 3600_000; // path-less legacy: age is all there is
+      } catch {
+        dead = true; // unreadable is unusable — a cursor that cannot load only costs a re-scan anyway
+      }
     }
     if (!dead) continue;
     try {
       out.bytes += fs.statSync(p).size;
       fs.rmSync(p, { force: true });
-      out.removed++;
+      if (superseded) out.superseded++;
+      else out.removed++;
     } catch {
       /* best effort */
     }
@@ -270,7 +347,8 @@ export function reapUsageCursors(now: number = Date.now()): { removed: number; b
 
 /** Cursor state as written to disk. `seen` must be persisted in FULL: duplicate message ids recur
  *  hundreds of lines apart in real transcripts (a resumed session re-emits earlier turns), so a
- *  last-id or fixed-window dedup would silently double-count those turns' tokens. */
+ *  last-id or fixed-window dedup would silently double-count those turns' tokens. Each id carries the
+ *  snapshot it was counted at, so a later, larger one adds only the difference. */
 interface StoredCursor {
   v: number;
   /** The transcript this cursor belongs to. The FILENAME is a one-way hash of this path, so without it
@@ -281,7 +359,7 @@ interface StoredCursor {
   mtimeMs: number;
   size: number;
   offset: number;
-  seen: string[];
+  seen: [string, ...UsageSnap][];
   input: number;
   output: number;
   cacheRead: number;
@@ -299,12 +377,15 @@ interface StoredCursor {
 // the persisted cursors carry a running `total`, so without this bump every existing install would
 // keep restoring the old blended figure from disk and never recompute it. The stale value is
 // indistinguishable from a correct one, which is exactly what this counter exists to prevent.
-const CURSOR_VERSION = 2;
+// 3: each message counts at its largest snapshot, not its first, and `seen` carries the snapshot: the
+// totals a cursor of 2 restores are short by what later lines of a message added. Cursors of 3 are the
+// first named by their version (cursorPath).
+const CURSOR_VERSION = 4;
 
-function loadCursor(transcript: string): UsageCursor | undefined {
+function loadCursor(transcript: string, side = false): UsageCursor | undefined {
   let raw: StoredCursor;
   try {
-    raw = JSON.parse(fs.readFileSync(cursorPath(transcript), 'utf8')) as StoredCursor;
+    raw = JSON.parse(fs.readFileSync(cursorPath(transcript, side), 'utf8')) as StoredCursor;
   } catch {
     return undefined; // absent or unreadable — a full parse rebuilds it
   }
@@ -313,7 +394,7 @@ function loadCursor(transcript: string): UsageCursor | undefined {
     mtimeMs: raw.mtimeMs,
     size: raw.size,
     offset: raw.offset,
-    seen: new Set(raw.seen),
+    seen: new Map(raw.seen.filter(Array.isArray).map(([id, ...s]): [string, UsageSnap] => [String(id), [num(s[0]), num(s[1]), num(s[2]), num(s[3])]])),
     input: raw.input,
     output: raw.output,
     cacheRead: raw.cacheRead,
@@ -329,15 +410,15 @@ function loadCursor(transcript: string): UsageCursor | undefined {
 }
 
 /** Best-effort persist — a failure here costs a re-parse next time, never a wrong answer. */
-function saveCursor(transcript: string, cur: UsageCursor): void {
-  const p = cursorPath(transcript);
+function saveCursor(transcript: string, cur: UsageCursor, side = false): void {
+  const p = cursorPath(transcript, side);
   const stored: StoredCursor = {
     v: CURSOR_VERSION,
     transcript: path.resolve(transcript),
     mtimeMs: cur.mtimeMs,
     size: cur.size,
     offset: cur.offset,
-    seen: [...cur.seen],
+    seen: [...cur.seen].map(([id, s]): [string, ...UsageSnap] => [id, ...s]),
     input: cur.input,
     output: cur.output,
     cacheRead: cur.cacheRead,
@@ -392,7 +473,7 @@ function usageSnapshot(cur: UsageCursor): SessionTokens & { durationMs: number }
 /** Parse [cur.offset, end) and fold every COMPLETE line into the cursor. Bytes after the delta's last
  *  '\n' are left unconsumed (offset doesn't advance past them) — they re-read with the next append.
  *  A read failure consumes nothing; the next call retries the same range. */
-function consumeDelta(transcript: string, cur: UsageCursor, end: number): void {
+function consumeDelta(transcript: string, cur: UsageCursor, end: number, side = false): void {
   let buf: Buffer;
   try {
     const fd = fs.openSync(transcript, 'r');
@@ -419,19 +500,20 @@ function consumeDelta(transcript: string, cur: UsageCursor, end: number): void {
     } catch {
       continue;
     }
+    if (o?.type === 'api-request-blob') continue;
     const ts = toMs(o.timestamp ?? o.ts);
     if (ts > 0) {
       if (!cur.firstTs || ts < cur.firstTs) cur.firstTs = ts;
       if (ts > cur.lastTs) cur.lastTs = ts;
     }
     // Compaction boundaries carry no `message` — read them before the message gate below.
-    const ce = o.isSidechain === true ? null : parseCompactLine(o);
+    const ce = o.isSidechain === true && !side ? null : parseCompactLine(o);
     if (ce) {
       cur.compactions.push(ce);
       continue;
     }
     const m = o.message;
-    if (!m || o.isSidechain === true) continue;
+    if (!m || (o.isSidechain === true && !side)) continue;
     if (m.role !== 'assistant') {
       // `/effort` writes its confirmation into the transcript as a command stub — the only record of
       // the session's effort level on builds older than the structural `effort` field below.
@@ -441,10 +523,22 @@ function consumeDelta(transcript: string, cur: UsageCursor, end: number): void {
       }
       continue;
     }
-    // One assistant message is split across lines sharing message.id + identical usage — count each id once.
+    // One assistant message is split across lines sharing message.id, each with the message's usage as it stood when
+    // that line was written: a later line can carry more output than the first (76 of 8,978 such messages on real
+    // transcripts; none carried less). Each id counts once, at its LARGEST snapshot (snapUnit, the status line's rule):
+    // a larger one replaces the one counted, and only the turn's first line counts its model and effort.
     const id = typeof m.id === 'string' ? m.id : null;
-    if (id !== null && cur.seen.has(id)) continue;
-    if (id !== null) cur.seen.add(id);
+    const u = m.usage || {};
+    const usage: UsageSnap = [num(u.input_tokens), num(u.output_tokens), num(u.cache_read_input_tokens), num(u.cache_creation_input_tokens)];
+    const prev = id === null ? undefined : cur.seen.get(id);
+    if (prev) {
+      if (snapUnit(usage) > snapUnit(prev)) {
+        countUsage(cur, usage, prev);
+        cur.seen.set(id as string, usage);
+      }
+      continue;
+    }
+    if (id !== null) cur.seen.set(id, usage);
     // Which model actually served this turn, and at what effort. Both are per-record: a session that
     // switched models (or effort) mid-flight reports the LATEST, with the full set kept for the chip.
     const model = typeof m.model === 'string' ? m.model : '';
@@ -453,11 +547,7 @@ function consumeDelta(transcript: string, cur: UsageCursor, end: number): void {
       cur.lastModel = model;
     }
     if (typeof o.effort === 'string' && o.effort) cur.effortRecord = o.effort;
-    const u = m.usage || {};
-    cur.input += num(u.input_tokens);
-    cur.output += num(u.output_tokens);
-    cur.cacheRead += num(u.cache_read_input_tokens);
-    cur.cacheCreation += num(u.cache_creation_input_tokens);
+    countUsage(cur, usage);
   }
 }
 
@@ -475,8 +565,9 @@ function effortFromStub(content: unknown): string {
 }
 
 /** Fold the pending (newline-less) tail line into ONE snapshot — never into the cursor, and never
- *  into `seen`, so it can't double-count when its '\n' finally lands and consumeDelta re-reads it. */
-function peekTail(transcript: string, cur: UsageCursor, end: number, snap: SessionTokens & { durationMs: number }): void {
+ *  into `seen`, so it can't double-count when its '\n' finally lands and consumeDelta re-reads it.
+ *  A later line of a message already counted adds what it carries beyond the snapshot counted. */
+function peekTail(transcript: string, cur: UsageCursor, end: number, snap: SessionTokens & { durationMs: number }, side = false): void {
   let text: string;
   try {
     const fd = fs.openSync(transcript, 'r');
@@ -498,6 +589,7 @@ function peekTail(transcript: string, cur: UsageCursor, end: number, snap: Sessi
   } catch {
     return; // genuinely partial (mid-write) — not countable yet
   }
+  if (o?.type === 'api-request-blob') return;
   const ts = toMs(o.timestamp ?? o.ts);
   if (ts > 0) {
     const first = cur.firstTs > 0 ? Math.min(cur.firstTs, ts) : ts;
@@ -505,15 +597,14 @@ function peekTail(transcript: string, cur: UsageCursor, end: number, snap: Sessi
     snap.durationMs = Math.max(0, last - first);
   }
   const m = o.message;
-  if (!m || m.role !== 'assistant' || o.isSidechain === true) return;
+  if (!m || m.role !== 'assistant' || (o.isSidechain === true && !side)) return;
   const id = typeof m.id === 'string' ? m.id : null;
-  if (id !== null && cur.seen.has(id)) return;
+  const prev = id === null ? undefined : cur.seen.get(id);
   const u = m.usage || {};
+  const usage: UsageSnap = [num(u.input_tokens), num(u.output_tokens), num(u.cache_read_input_tokens), num(u.cache_creation_input_tokens)];
+  if (prev && snapUnit(usage) <= snapUnit(prev)) return;
   snap.available = true;
-  snap.input += num(u.input_tokens);
-  snap.output += num(u.output_tokens);
-  snap.cacheRead += num(u.cache_read_input_tokens);
-  snap.cacheCreation += num(u.cache_creation_input_tokens);
+  countUsage(snap, usage, prev);
   snap.total = snap.input + snap.output + snap.cacheCreation; // see SessionTokens.total
   const ctxSent = snap.input + snap.cacheRead + snap.cacheCreation;
   snap.hitPct = ctxSent > 0 ? (snap.cacheRead / ctxSent) * 100 : null;
@@ -593,6 +684,7 @@ function toolLatenciesUncached(transcriptPath: string): number[] {
     }
     const msg = o.message;
     if (!msg || !Array.isArray(msg.content)) continue;
+    if (o?.type === 'api-request-blob') continue;
     const ts = toMs(o.timestamp ?? o.ts);
     for (const b of msg.content) {
       if (b && b.type === 'tool_use' && typeof b.id === 'string' && ts > 0) useTs.set(b.id, ts);

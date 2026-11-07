@@ -3,8 +3,8 @@
  *
  * A `views` read that BEGAN before a write lands AFTER it, carrying the store as it was — so the
  * rows the reader just kept reappear, then vanish again when the next read finishes. On a small
- * fixture both halves take ~120 ms and the window never opens; on a real 16 MB session the read is
- * ~11 s and the write ~90 ms, so it opens every time. This test opens it on purpose.
+ * fixture both halves take ~120 ms and the window never opens; on a real session of many megabytes the
+ * read takes seconds and the write a fraction of one, so it opens every time. This test opens it on purpose.
  *
  * Usage: node test/stale-read-race.js <cli-dist-index.js>
  *
@@ -29,6 +29,26 @@ if (CHILD) {
     // is the asymmetry that opens the window on a real session.
     process.argv = [process.argv[0], CLI, ...process.argv.slice(2)];
     require(CLI);
+  } else if (process.argv.includes('--serve')) {
+    // The dashboard's reads go through one warm `views --serve` worker, a JSON line in and a payload line
+    // out. The real worker answers each request as soon as it arrives, against the store as it is then, and
+    // only the answer is held back. Running the worker to completion before answering, as the one-shot
+    // branch below does, never read anything: its stdin was already closed, so it exited at once, the
+    // dashboard fell back to a one-shot read that began after the accept, and no answer predated the write.
+    // The check then passed with the re-application removed.
+    const cp = require('child_process');
+    const worker = cp.spawn(process.execPath, [CLI, ...process.argv.slice(2)], { stdio: ['pipe', 'pipe', 'inherit'] });
+    process.stdin.pipe(worker.stdin);
+    let pending = '';
+    worker.stdout.on('data', (d) => {
+      pending += d;
+      for (let nl = pending.indexOf('\n'); nl >= 0; nl = pending.indexOf('\n')) {
+        const line = pending.slice(0, nl + 1);
+        pending = pending.slice(nl + 1);
+        setTimeout(() => process.stdout.write(line), SLOW_MS);
+      }
+    });
+    worker.on('exit', (code) => { process.exitCode = code ?? 0; });
   } else {
     // The read genuinely runs against the store as it is NOW; only its answer is held back. That is
     // exactly the state a pre-write answer carries, which makes this a faithful stand-in for a slow
@@ -126,12 +146,12 @@ const pendingShown = () => {
   const before = pendingShown();
   if (before <= 0) { say(`SKIP: the map never showed pending edits (${before})`); process.exit(1); }
 
-  // ZOOM the Map first (F4 focuses it, F4 again fills the frame): in the review tab's default
+  // ZOOM the Map first (F6 focuses it, F6 again fills the frame): in the review tab's default
   // four-pane split the Map column is too narrow for the heading toolbar, so the keep-all button
   // this race is armed by never renders un-zoomed — the same drill-in a reader would use.
-  send('\x1bOS');
+  send('\x1b[17~');
   await sleep(120);
-  send('\x1bOS');
+  send('\x1b[17~');
   for (let i = 0; i < 40 && !frame().some((l) => /\[ [✓+] \d+ \]/.test(l)); i++) await sleep(150);
   const barRow = frame().findIndex((l) => /\[ [✓+] \d+ \]/.test(l)); // the keep-all ICON button (words moved to the footer keymap)
   if (barRow < 0) { say('SKIP: no map toolbar even zoomed'); say(JSON.stringify(frame().filter((l)=>/CHANGE MAP|\[/.test(l)).slice(0,4))); process.exit(1); }

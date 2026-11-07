@@ -1,7 +1,7 @@
 {
   "name": "oak-observatory-vscode",
   "displayName": "OAK",
-  "description": "A running list of every file change Claude Code makes, each with its own Keep / Undo (surgical, git-free) \u2014 built for established and mission-critical codebases.",
+  "description": "A running list of every file change Claude Code and Codex make, each with its own Keep / Undo (surgical, git-free) \u2014 built for established and mission-critical codebases.",
   "version": "0.11.0-dev.0",
   "publisher": "cell-observatory",
   "private": true,
@@ -12,7 +12,7 @@
     "SCM Providers",
     "Other"
   ],
-  "activationEvents": [],
+  "activationEvents": ["onStartupFinished"],
   "main": "./dist/extension.js",
   "extensionKind": [
     "workspace"
@@ -71,6 +71,7 @@
         {
           "id": "claudeObservatory.timeline",
           "name": "Observatory Timeline",
+          "contextualTitle": "OAK",
           "type": "webview",
           "initialSize": 2
         }
@@ -552,7 +553,7 @@
       },
       {
         "command": "claudeObservatory.updateNow",
-        "title": "Update now (CLI + both editor plugins)",
+        "title": "Update now (everything OAK installed, here and on saved machines)",
         "category": "OAK",
         "icon": "$(cloud-download)"
       },
@@ -675,6 +676,24 @@
         "icon": "$(database)"
       },
       {
+        "command": "claudeObservatory.sync",
+        "title": "Sync: the last run, conflicts, the backup and the machines synced (oak sync)",
+        "category": "OAK",
+        "icon": "$(sync)"
+      },
+      {
+        "command": "claudeObservatory.syncNow",
+        "title": "Sync now: pull from the saved machines (oak sync now)",
+        "category": "OAK",
+        "icon": "$(sync)"
+      },
+      {
+        "command": "claudeObservatory.syncSetup",
+        "title": "Sync setup: choose or change where sessions are backed up (oak sync setup)",
+        "category": "OAK",
+        "icon": "$(gear)"
+      },
+      {
         "command": "claudeObservatory.diffOpenFull",
         "title": "Open the full diff",
         "category": "OAK",
@@ -686,53 +705,67 @@
       }
     ],
     "keybindings": [
+      { "command": "claudeObservatory.navFilePrev", "key": "ctrl+alt+x left", "mac": "cmd+alt+x left", "when": "!terminalFocus" },
+      { "command": "claudeObservatory.navFileNext", "key": "ctrl+alt+x right", "mac": "cmd+alt+x right", "when": "!terminalFocus" },
       {
         "command": "claudeObservatory.reviewNext",
-        "key": "ctrl+alt+n",
-        "mac": "alt+cmd+n",
+        "key": "ctrl+alt+x n",
+        "mac": "cmd+alt+x n",
         "when": "!terminalFocus"
       },
       {
         "command": "claudeObservatory.reviewPrev",
-        "key": "ctrl+alt+p",
-        "mac": "alt+cmd+p",
+        "key": "ctrl+alt+x p",
+        "mac": "cmd+alt+x p",
         "when": "!terminalFocus"
       },
       {
         "command": "claudeObservatory.keepAtCursor",
-        "key": "ctrl+alt+y",
-        "mac": "alt+cmd+y",
+        "key": "ctrl+alt+x a",
+        "mac": "cmd+alt+x a",
         "when": "editorTextFocus"
       },
       {
         "command": "claudeObservatory.undoAtCursor",
-        "key": "ctrl+alt+u",
-        "mac": "alt+cmd+u",
+        "key": "ctrl+alt+x u",
+        "mac": "cmd+alt+x u",
         "when": "editorTextFocus"
       },
       {
         "command": "claudeObservatory.keepOpenFile",
-        "key": "ctrl+alt+k",
-        "mac": "alt+cmd+k",
+        "key": "ctrl+alt+x shift+a",
+        "mac": "cmd+alt+x shift+a",
         "when": "editorTextFocus"
       },
       {
         "command": "claudeObservatory.undoOpenFile",
-        "key": "ctrl+alt+r",
-        "mac": "alt+cmd+r",
+        "key": "ctrl+alt+x shift+d",
+        "mac": "cmd+alt+x shift+d",
         "when": "editorTextFocus"
       },
       {
         "command": "claudeObservatory.diffPrevRevision",
-        "key": "ctrl+alt+-",
-        "mac": "alt+cmd+-",
+        "key": "ctrl+alt+x [",
+        "mac": "cmd+alt+x [",
         "when": "editorTextFocus"
       },
       {
         "command": "claudeObservatory.diffNextRevision",
-        "key": "ctrl+alt+=",
-        "mac": "alt+cmd+=",
+        "key": "ctrl+alt+x ]",
+        "mac": "cmd+alt+x ]",
         "when": "editorTextFocus"
+      },
+      {
+        "command": "workbench.action.addComment",
+        "key": "ctrl+alt+x c",
+        "mac": "cmd+alt+x c",
+        "when": "editorTextFocus && activeCursorHasCommentingRange"
+      },
+      {
+        "command": "claudeObservatory.nextAttention",
+        "key": "ctrl+alt+x h",
+        "mac": "cmd+alt+x h",
+        "when": "!terminalFocus"
       }
     ],
     "menus": {
@@ -1456,11 +1489,11 @@
   },
   "devDependencies": {
     "@oak-observatory/core": "0.11.0-dev.0",
-    "@types/node": "^26.1.2",
+    "@types/node": "^26.6.3",
     "@types/vscode": "^1.85.0",
     "@vscode/codicons": "^0.0.45",
-    "@vscode/vsce": "^3.0.0",
-    "esbuild": "^0.28.1",
+    "@vscode/vsce": "^4.0.0",
+    "esbuild": "^0.28.2",
     "typescript": "^5.9.3",
     "vscode-oniguruma": "^2.0.1",
     "vscode-textmate": "^9.3.2"

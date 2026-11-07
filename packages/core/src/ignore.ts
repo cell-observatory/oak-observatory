@@ -186,7 +186,9 @@ export function parseIgnoreFile(text: string, source: string, anywhere = false):
     // reads as the ordinary comment git has always treated it as.
     if (/^\s*#/.test(raw)) continue;
     // Trailing whitespace is not part of a pattern unless escaped; leading whitespace never is.
-    let line = raw.replace(/^\s+/, '').replace(/(?<!\\)\s+$/, '');
+    let line = raw.trimStart();
+    const end = line.trimEnd().length; // not a regex: `(?<!\\)\s+$` was quadratic on a long blank run
+    if (end < line.length) line = line.slice(0, line[end - 1] === '\\' ? end + 1 : end);
     if (!line) continue;
     const negated = line.startsWith('!');
     if (negated) line = line.slice(1);

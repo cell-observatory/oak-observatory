@@ -2,7 +2,6 @@ package com.cellobservatory.observatory.platform
 
 import com.cellobservatory.observatory.services.OldPluginRetirement
 import com.cellobservatory.observatory.services.OldPluginRetirement.Outcome
-import com.intellij.testFramework.fixtures.BasePlatformTestCase
 import java.io.File
 
 /**
@@ -11,7 +10,7 @@ import java.io.File
  * startup skips this in unit-test runs, so the retirement is driven here with the platform calls swapped
  * for a fake old plugin the test can watch.
  */
-class OldPluginRetirementTest : BasePlatformTestCase() {
+class OldPluginRetirementTest : ObservatoryPlatformTestCase() {
 
     private val real = Triple(OldPluginRetirement.installed, OldPluginRetirement.disabled, OldPluginRetirement.disable)
 

@@ -20,13 +20,24 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 24 is here for one reason: DEP0190 is not a runtime warning on 20 or 22, so without a
-        # lane that emits it, "the update no longer prints a deprecation warning" (#45) is a claim
-        # CI cannot check. The reporter was on 24.18.
-        node: [20, 22, 24]
-    runs-on: ubuntu-latest
+        # OAK supports Node 24 and later (core INDEX_NODES). DEP0190 is a runtime warning on 24, so this lane
+        # also checks that "the update no longer prints a deprecation warning" (#45); the reporter was on 24.18.
+        node: [24]
+    # The organization's self-hosted Linux runners (the labels every one of them carries). The job runs in a fresh
+    # container: a clean filesystem, PATH and home, as on a GitHub-hosted runner, and nothing of the machine's own
+    # accounts. It runs as uid 1000, the runner accounts' own on every runner machine, so what it writes stays theirs
+    # to clean up, and the tests run as an ordinary user, as on a hosted runner. The workflows that publish (release,
+    # dev-release, pages) stay on GitHub-hosted runners.
+    runs-on: [self-hosted, Linux, X64]
+    # The dev-container Node image: Debian with git, python3, make and g++ (node-pty compiles from source on Linux), jq
+    # in /usr/bin (the status-line tests run with only the system folders on PATH), a C.UTF-8 locale, and user 1000.
+    container:
+      image: mcr.microsoft.com/devcontainers/javascript-node:24-bookworm
+      # --init: the runner starts the container on `tail -f /dev/null`, which never collects an ended process, so a test
+      # that stops a child would see it linger as a zombie; docker's init is process 1 instead and collects them.
+      options: --user 1000:1000 --init
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node }}
@@ -44,7 +55,7 @@ jobs:
       # Output is teed to a file and uploaded on failure, so failures are diagnosable from the artifact.
       - run: npm test 2>&1 | tee test-output.txt
         shell: bash
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: failure()
         with:
           name: test-output-linux-node${{ matrix.node }}

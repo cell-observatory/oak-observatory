@@ -20,12 +20,57 @@ import { isSafeSessionId, logPath, rootDir } from './store';
  * system reminders, the synthesized summary after a compaction, and the harness's own queue records.
  * Counting any of them would invent turns the person never took.
  */
-export function userPrompt(o: any): string | null {
-  if (!o || o.isSidechain === true || o.isCompactSummary === true || o.isMeta === true) return null;
+export function userPrompt(o: any, collapseWhitespace = true): string | null {
+  if (!o || o.type === 'api-request-blob' || o.isSidechain === true || o.isCompactSummary === true || o.isMeta === true) return null;
+  const a = o.type === 'attachment' ? o.attachment : null;
+  if (a?.type === 'queued_command') {
+    if (a.isMeta === true || a.commandMode !== 'prompt' || a.origin?.kind === 'peer' ||
+      a.origin?.kind === 'task-notification' || (a.origin?.kind !== 'human' && a.humanTurn !== true)) return null;
+    const text = typeof a.prompt === 'string' ? a.prompt.trim() : '';
+    return text ? (collapseWhitespace ? text.replace(/\s+/g, ' ') : text) : null;
+  }
   const msg = o.message;
   if (!msg || msg.role !== 'user') return null;
   const clean = personPromptOf(msg);
-  return clean === null ? null : clean.replace(/\s+/g, ' ');
+  return clean === null ? null : collapseWhitespace ? clean.replace(/\s+/g, ' ') : clean;
+}
+
+/** Delivery identities survive append cursors; words and times are never deduplication keys. */
+export interface PromptReaderState { links: [string, string][]; seen: string[] }
+export class PromptReader {
+  private links: Map<string, string>;
+  private seen: Set<string>;
+  constructor(state?: PromptReaderState) {
+    this.links = new Map(state?.links);
+    this.seen = new Set(state?.seen);
+  }
+  state(): PromptReaderState { return { links: [...this.links], seen: [...this.seen] }; }
+  private root(id: string): string {
+    const next = this.links.get(id);
+    if (!next || next === id) return id;
+    const root = this.root(next);
+    this.links.set(id, root);
+    return root;
+  }
+  read(o: any): string | null {
+    if (!o || o.type === 'api-request-blob' || o.isSidechain === true) return null;
+    const text = userPrompt(o);
+    const removal = o.type === 'queue-operation' && o.operation === 'remove';
+    if (text === null && !removal) return null;
+    const a = o.attachment;
+    const ids = (removal ? [o.commandUuid, o.deliveryId]
+      : o.runtime === 'codex' ? [o.message?.id]
+      : a?.type === 'queued_command' ? [a.source_uuid, a.delivery_id, o.uuid]
+      : [o.uuid, o.promptId]).filter((id): id is string => typeof id === 'string' && !!id);
+    const roots = ids.map(id => this.root(id));
+    const duplicate = roots.some(id => this.seen.has(id));
+    const root = roots[0];
+    if (root) {
+      for (const id of roots) { this.links.set(id, root); this.seen.delete(id); }
+      if (duplicate || text !== null) this.seen.add(root);
+    }
+    return duplicate ? null : text;
+  }
 }
 
 /**
@@ -67,13 +112,47 @@ export function personPromptText(text: string): string | null {
   return clean ? clean : null;
 }
 
-/** The wrapper around pasted text removed, its contents kept in place. Attribute runs are bounded
- *  so a record full of unclosed openers cannot make the match quadratic. */
+/** The wrapper around pasted text removed, its contents kept in place. The same result as replacing
+ *  `/<pasted_content\b([^>]{0,256})>([\s\S]*?)<\/pasted_content\1>/g` with `$2`, found by a scan: that
+ *  regex rescanned the rest of the text for each unclosed opener, quadratic in a record full of them. */
 export function unwrapPastedContent(text: string): string {
-  if (!text.includes('<pasted_content')) return text;
+  const OPEN = '<pasted_content', CLOSE = '</pasted_content';
+  if (!text.includes(OPEN)) return text;
   // The closing tag repeats the opener's attributes (`</pasted_content id="358a">`); requiring the same
-  // ones keeps a paste that merely CONTAINS the literal `</pasted_content>` intact.
-  return text.replace(/<pasted_content\b([^>]{0,256})>([\s\S]*?)<\/pasted_content\1>/g, '$2');
+  // ones keeps a paste that merely CONTAINS the literal `</pasted_content>` intact. Every closer is
+  // indexed once by its attributes, so each opener finds its own in one lookup.
+  // The first `>` after a tag name is remembered while it still lies ahead: a run of tags with no `>`
+  // between them would otherwise search the same stretch once per tag.
+  let gt = -1;
+  const closers = new Map<string, number[]>();
+  for (let at = text.indexOf(CLOSE); at >= 0; at = text.indexOf(CLOSE, at + 1)) {
+    if (gt < at + CLOSE.length) gt = text.indexOf('>', at + CLOSE.length);
+    if (gt < 0) break;
+    if (gt - at - CLOSE.length > 256) continue; // longer than any opener's attributes can be
+    const attrs = text.slice(at + CLOSE.length, gt);
+    const list = closers.get(attrs);
+    if (list) list.push(at); else closers.set(attrs, [at]);
+  }
+  const next = new Map<string, number>(); // per attribute run, the first closer not yet passed
+  let out = '';
+  let done = 0;
+  gt = -1;
+  for (let at = text.indexOf(OPEN); at >= 0; at = text.indexOf(OPEN, at + 1)) {
+    if (at < done || /\w/.test(text[at + OPEN.length] ?? '')) continue; // `\b`: `<pasted_contents` is not one
+    if (gt < at + OPEN.length) gt = text.indexOf('>', at + OPEN.length);
+    if (gt < 0) break;
+    if (gt - at - OPEN.length > 256) continue;
+    const attrs = text.slice(at + OPEN.length, gt);
+    const list = closers.get(attrs);
+    if (!list) continue;
+    let i = next.get(attrs) ?? 0;
+    while (i < list.length && list[i] <= gt) i++;
+    next.set(attrs, i);
+    if (i === list.length) continue;
+    out += text.slice(done, at) + text.slice(gt + 1, list[i]);
+    done = list[i] + CLOSE.length + attrs.length + 1;
+  }
+  return done ? out + text.slice(done) : text;
 }
 
 /** A finite number, or 0 — for token-usage fields that may be absent/malformed. */
@@ -95,7 +174,7 @@ export function toMs(v: unknown): number {
  *  TRANSCRIPT alone. Everything else the prompt views derive is keyed on the log too, so before this
  *  split a keep click (a log-only change) re-read and re-parsed the whole transcript to recover facts
  *  that had not moved: ~60ms per click at 10MB, growing linearly with the conversation. */
-type Ask = { ts: number; text: string; id?: string };
+type Ask = { ts: number; text: string; id?: string; nativeTurnId?: string };
 type TokenAt = { ts: number; tokens: number };
 
 export function askScan(transcript: string): { asks: Ask[]; tokenAt: TokenAt[] } {
@@ -114,8 +193,11 @@ export function askScan(transcript: string): { asks: Ask[]; tokenAt: TokenAt[] }
  * appended is never half-parsed into the persisted state.
  */
 // 2: pasted prompts (`<pasted_content>`) became asks (2026-09-22); a cursor that already passed one
-// would never scan it again. 3: a paste whose contents open with `<` counts too.
-const ASKS_CACHE_VERSION = 3;
+// would never scan it again. 3: a paste whose contents open with `<` counts too. 4: a message's tokens
+// are its largest snapshot's, and `seen` carries what each id counted and where. In the file NAME too, so `oak clean`
+// removes the names of the versions before (changemap.ts, pruneSupersededCaches).
+// Human queued deliveries are asks; replay blobs and meta notes are not.
+export const ASKS_CACHE_VERSION = 5;
 const HEAD_BYTES = 64;
 interface AskCache {
   version: number;
@@ -124,8 +206,13 @@ interface AskCache {
   head: string;
   asks: Ask[];
   tokenAt: TokenAt[];
-  seen: string[];
+  /** Each message id counted: [its tokens as counted, the index of its tokenAt entry, or -1 for none]. */
+  seen: [string, number, number][];
+  prompts: PromptReaderState;
 }
+
+/** What scanChunk keeps per message id counted: its tokens as counted, and its tokenAt entry (-1: none). */
+type SeenMsg = Map<string, [number, number]>;
 
 function asksCachePath(transcript: string): { file: string; sid: string } | null {
   const sid = path.basename(transcript).replace(/\.jsonl$/, '');
@@ -138,9 +225,11 @@ function asksCachePath(transcript: string): { file: string; sid: string } | null
 
 /** One chunk of transcript lines into the running result. The asks themselves — and, in the SAME
  *  pass, the assistant token usage per moment (the bytes are already in hand, so tokens cost no extra
- *  IO). One assistant message can span several lines that share a message.id and repeat the usage;
- *  count each id once, exactly as the Stats cursor does. */
-function scanChunk(text: string, asks: Ask[], tokenAt: TokenAt[], seenMsg: Set<string>): void {
+ *  IO). One assistant message can span several lines that share a message.id, each with the usage as
+ *  it stood when the line was written (a later one can carry more output, never less); count each id
+ *  once, at its largest snapshot, exactly as the Stats cursor does: a larger one replaces the tokens
+ *  of the moment the message was counted at. */
+function scanChunk(text: string, asks: Ask[], tokenAt: TokenAt[], seenMsg: SeenMsg, prompts: PromptReader): void {
   for (const line of text.split('\n')) {
     const t = line.trim();
     if (!t) continue;
@@ -150,9 +239,9 @@ function scanChunk(text: string, asks: Ask[], tokenAt: TokenAt[], seenMsg: Set<s
     } catch {
       continue;
     }
-    const msg = o.message;
-    if (msg && msg.role === 'assistant' && o.isSidechain !== true && msg.usage && typeof msg.id === 'string' && !seenMsg.has(msg.id)) {
-      seenMsg.add(msg.id);
+    if (o?.type === 'api-request-blob') continue;
+    const msg = o?.message;
+    if (msg && msg.role === 'assistant' && o.isSidechain !== true && msg.usage && typeof msg.id === 'string') {
       const u = msg.usage;
       // NEW tokens only. Adding the cache counters made the same context count once per turn,
       // so this row reported millions where Claude Code's own view reported ~128k for the very
@@ -160,14 +249,21 @@ function scanChunk(text: string, asks: Ask[], tokenAt: TokenAt[], seenMsg: Set<s
       // slightly off — the reader cannot tell which to trust. Cache traffic is surfaced
       // separately (SessionTokens.cacheRead/cacheCreation), never folded in here.
       const tk = num(u.input_tokens) + num(u.output_tokens) + num(u.cache_creation_input_tokens);
-      const ts = toMs(o.timestamp ?? o.ts);
-      if (ts && tk) tokenAt.push({ ts, tokens: tk });
+      const prev = seenMsg.get(msg.id);
+      if (!prev || tk > prev[0]) {
+        let at = prev ? prev[1] : -1;
+        const ts = toMs(o.timestamp ?? o.ts);
+        // A new object, never the counted one changed in place: the unterminated tail is scanned into a copy.
+        if (at >= 0) tokenAt[at] = { ...tokenAt[at], tokens: tk };
+        else if (ts && tk) at = tokenAt.push({ ts, tokens: tk }) - 1;
+        seenMsg.set(msg.id, [tk, at]);
+      }
     }
-    const text2 = userPrompt(o);
+    const text2 = prompts.read(o);
     if (text2 === null) continue;
     const ts = toMs(o.timestamp ?? o.ts);
     if (!ts) continue; // an undated ask cannot own a window
-    asks.push({ ts, text: text2, ...(o.runtime === 'codex' && o.nativeTurnId ? { id: o.nativeTurnId } : {}) });
+    asks.push({ ts, text: text2, ...(o.runtime === 'codex' && o.nativeTurnId ? { id: o.promptId || o.nativeTurnId, nativeTurnId: o.nativeTurnId } : {}) });
   }
 }
 
@@ -213,17 +309,19 @@ function scanTranscript(transcript: string): { asks: Ask[]; tokenAt: TokenAt[] }
     }
     const lastNl = got > 0 ? buf.lastIndexOf(0x0a, got - 1) : -1;
     const completeEnd = lastNl >= 0 ? lastNl + 1 : 0;
-    const seen = new Set<string>(cache ? cache.seen : []);
     const asks = cache ? cache.asks.slice() : [];
     const tokenAt = cache ? cache.tokenAt.slice() : [];
-    if (completeEnd > 0) scanChunk(buf.subarray(0, completeEnd).toString('utf8'), asks, tokenAt, seen);
+    const seen: SeenMsg = new Map((cache ? cache.seen : []).filter(Array.isArray)
+      .map(([id, tk, at]): [string, [number, number]] => [String(id), [num(tk), Number.isInteger(at) && at >= 0 && at < tokenAt.length ? at : -1]]));
+    const prompts = new PromptReader(cache?.prompts);
+    if (completeEnd > 0) scanChunk(buf.subarray(0, completeEnd).toString('utf8'), asks, tokenAt, seen, prompts);
     // Persist the complete-line prefix — beside a store that exists (a dropped session is never
     // resurrected, the rule every derived file follows), and only when something moved.
     if (where && (cache === null || completeEnd > 0) && fs.existsSync(logPath(where.sid))) {
       try {
         fs.mkdirSync(path.dirname(where.file), { recursive: true, mode: 0o700 });
         const tmp = `${where.file}.${process.pid}.tmp`;
-        const rec: AskCache = { version: ASKS_CACHE_VERSION, transcript, cursor: from + completeEnd, head, asks, tokenAt, seen: [...seen] };
+        const rec: AskCache = { version: ASKS_CACHE_VERSION, transcript, cursor: from + completeEnd, head, asks, tokenAt, prompts: prompts.state(), seen: [...seen].map(([id, [tk, at]]): [string, number, number] => [id, tk, at]) };
         fs.writeFileSync(tmp, JSON.stringify(rec), { mode: 0o600 });
         fs.renameSync(tmp, where.file);
       } catch {
@@ -233,7 +331,7 @@ function scanTranscript(transcript: string): { asks: Ask[]; tokenAt: TokenAt[] }
     // The unterminated tail: part of THIS answer, never of the persisted state.
     const outAsks = asks.slice();
     const outTok = tokenAt.slice();
-    if (got > completeEnd) scanChunk(buf.subarray(completeEnd, got).toString('utf8'), outAsks, outTok, new Set(seen));
+    if (got > completeEnd) scanChunk(buf.subarray(completeEnd, got).toString('utf8'), outAsks, outTok, new Map(seen), new PromptReader(prompts.state()));
     outAsks.sort((a, b) => a.ts - b.ts);
     return { asks: outAsks, tokenAt: outTok };
   } finally {

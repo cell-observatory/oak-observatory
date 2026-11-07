@@ -51,8 +51,10 @@ export interface Backend {
   check(): Promise<string>;
   /** Run one CLI verb and hand back its plain output — command mode's door. The caller passes an
    *  ALLOW-LISTED argv, never a user string: this spawns a process, and a text field that reaches a
-   *  process is how a prompt becomes a shell. */
-  run(args: readonly string[], machine?: string): Promise<string>;
+   *  process is how a prompt becomes a shell. `timeoutMs` ends a run that takes longer, and its answer
+   *  then names the deadline it missed; `signal` ends it when aborted. Either stops the child, which
+   *  stops the ssh a `--machine` run started. */
+  run(args: readonly string[], machine?: string, opts?: { timeoutMs?: number; signal?: AbortSignal }): Promise<string>;
   watcherMode(): string;
   close(): void;
 }
@@ -106,8 +108,9 @@ export function createBackend(opts: {
    * takes the direct path — no shell, no quoting, no PATH lookup, and a genuine ENOENT if it is wrong.
    * It also guarantees the child is the same build as the parent.
    */
-  const spawnSelf = (args: string[]): Promise<{ out: string; err: string; code: number | null }> =>
+  const spawnSelf = (args: string[], timeoutMs?: number, signal?: AbortSignal): Promise<{ out: string; err: string; code: number | null }> =>
     new Promise((resolve) => {
+      if (signal?.aborted) return resolve({ out: '', err: 'cancelled', code: null });
       const child = core.spawnTool(process.execPath, [selfPath, ...args], {
         cwd: opts.cwd,
         // stdin 'ignore': with 'inherit' the child competes for the parent's raw-mode stdin and eats
@@ -120,10 +123,24 @@ export function createBackend(opts: {
       const errChunks: Buffer[] = [];
       child.stdout?.on('data', (d: Buffer) => outChunks.push(d));
       child.stderr?.on('data', (d: Buffer) => errChunks.push(d));
-      child.on('error', (e: Error) => resolve({ out: '', err: String(e.message || e), code: null }));
-      child.on('close', (code: number | null) =>
-        resolve({ out: Buffer.concat(outChunks).toString('utf8'), err: Buffer.concat(errChunks).toString('utf8').trim(), code })
-      );
+      // The deadline answers at once; the child is told to stop, and its own late close resolves nothing.
+      const timer = timeoutMs ? setTimeout(() => {
+        resolve({ out: '', err: `no answer within ${Math.round(timeoutMs / 1000)} s`, code: null });
+        child.kill();
+      }, timeoutMs) : undefined;
+      timer?.unref?.();
+      const cancel = (): void => {
+        clearTimeout(timer);
+        resolve({ out: '', err: 'cancelled', code: null });
+        child.kill();
+      };
+      signal?.addEventListener('abort', cancel, { once: true });
+      child.on('error', (e: Error) => { clearTimeout(timer); signal?.removeEventListener('abort', cancel); resolve({ out: '', err: String(e.message || e), code: null }); });
+      child.on('close', (code: number | null) => {
+        clearTimeout(timer);
+        signal?.removeEventListener('abort', cancel);
+        resolve({ out: Buffer.concat(outChunks).toString('utf8'), err: Buffer.concat(errChunks).toString('utf8').trim(), code });
+      });
     });
 
   const emit = (p: Record<string, unknown> | null, e: string | null, startedAt: number, session: string, machine?: string) => {
@@ -374,8 +391,8 @@ export function createBackend(opts: {
     updateSkew() {
       return bootStamp !== '' && stampSelf() !== bootStamp;
     },
-    async run(args, machine) {
-      const { out, err, code } = await spawnSelf([...args, ...on(machine)]);
+    async run(args, machine, opts) {
+      const { out, err, code } = await spawnSelf([...args, ...on(machine)], opts?.timeoutMs, opts?.signal);
       return code === 0 ? out : (err || out || `exited ${code}`);
     },
     watcherMode() {
@@ -583,12 +600,18 @@ export function createServeWorker(core: Core, cwd: string, selfPath: string, rec
  * reads go through one warm `views --serve` child; another machine's, and anything the worker cannot
  * answer, run as a child of their own. Closing a tab/runtime discards answers without blocking input. */
 export interface ConversationReader {
+  processes?(session: string, root: string, selected: string | undefined, previews: string[], machine?: string): Promise<ReturnType<Core['processView']>>;
+  workerFleet?(session: string, root: string): Promise<unknown>;
+  feed?(session: string, root: string, id: string, machine?: string): Promise<import('@oak-observatory/core').FeedResult>;
   read(session: string, root: string, cursor?: number, machine?: string, source?: string): Promise<import('@oak-observatory/core').ConversationResult>;
   diff(session: string, id: number, machine?: string): Promise<string>;
+  /** A saved machine's patches for many edits in one read, keyed by id, with the reason each one it could not read
+   *  failed; undefined when the OAK there is from before that read, and each must be asked with `diff`. */
+  diffs?(session: string, ids: number[], machine: string): Promise<{ patches: Record<number, string>; errors: Record<number, string> } | undefined>;
   fleet(session: string, root: string, machine?: string): Promise<Record<string, unknown>>;
   /** The `sessions` view for one session — the master rows' facts — computed in the child, not on the
    *  paint thread (`core.sessionMeta` is ~200 ms on a 300-session store; measured 2026-09-19). */
-  sessions(session: string, root: string, machine?: string): Promise<unknown>;
+  sessions(session: string, root: string, machine?: string, workers?: boolean): Promise<unknown>;
   /** Records review comments as sent on the saved machine that holds them: a reply delivered to its
    *  pane through herdr leaves that machine's ledger untouched otherwise, and the same comments
    *  would be drafted again. Rejects with the CLI's reason. */
@@ -661,28 +684,65 @@ export function createConversationReader(core: Core, cwd: string): ConversationR
       const warmPatch = machine ? undefined : await view('diff', [String(id), '--session', session]) as { patch?: unknown } | undefined;
       return typeof warmPatch?.patch === 'string' ? `${warmPatch.patch}\n` : run(['diff', String(id), '--patch', '--session', session], machine);
     },
+    async diffs(session, ids, machine) {
+      let result: { patches?: unknown; errors?: unknown };
+      try { result = JSON.parse(await run(['diff', '--ids', ids.join(','), '--patch', '--session', session], machine)); }
+      catch (error) {
+        // An OAK from before this read refuses more than ten ids, or `--ids` itself.
+        if (/diff --ids accepts|expected an edit id/.test(error instanceof Error ? error.message : String(error))) return undefined;
+        throw error;
+      }
+      // …and with ten or fewer, answers its review page instead.
+      if (!result?.patches || typeof result.patches !== 'object') return undefined;
+      return { patches: result.patches as Record<number, string>, errors: (result.errors ?? {}) as Record<number, string> };
+    },
+    async processes(session, root, selected, previews, machine) {
+      const args = ['--session', session, ...(machine ? [] : ['--root', root]), '--process-previews', previews.join(','), ...(selected ? ['--process-selected', selected] : [])];
+      const result = (machine ? undefined : await view('processes', args) as ReturnType<Core['processView']> | undefined)
+        ?? JSON.parse(await run(['processes', '--json', ...args], machine));
+      if (!result || !Array.isArray(result.processes)) throw new Error(result?.error || 'Process list returned invalid JSON');
+      return result;
+    },
+    async feed(session, root, id, machine) {
+      const args = ['--session', session, '--root', root, '--kind', 'agent', '--id', id, '--limit', '200'];
+      return (machine ? undefined : await view('feed', args) as import('@oak-observatory/core').FeedResult | undefined)
+        ?? JSON.parse(await run(['feed', '--json', ...args], machine));
+    },
     async fleet(session, root, machine) {
-      const result = (machine ? undefined : await view('multitask', ['--session', session, '--root', root]) as { agents?: { session: string }[] } | undefined)
-        ?? JSON.parse(await run(['multitask', '--json', '--session', session, '--root', root], machine));
+      // Only this session's row: the whole fleet's is the slowest read a pinned session made, most of all over ssh.
+      const args = ['--only-session', '--session', session, '--root', root];
+      const result = (machine ? undefined : await view('multitask', args) as { agents?: { session: string }[] } | undefined)
+        ?? JSON.parse(await run(['multitask', '--json', ...args], machine));
       const agent = result.agents?.find((row: { session: string }) => row.session === session);
-      // An uncaptured session can be absent from the fleet; its subagents are still discoverable.
+      // A session the root does not lead to, or an OAK from before `--only-session`, gets the whole fleet, which lists
+      // only a repository's sessions. One absent from it still has subagents to discover.
       if (agent) return { subagents: agent.subagents, todos: agent.todos };
       const workers = JSON.parse(await run(['subagents', '--json', '--session', session, '--root', root], machine));
       return { subagents: workers.subagents ?? [], todos: [] };
     },
-    async sessions(session, root, machine) {
+    async workerFleet(session, root) {
+      const args = ['--root', root, ...(session ? ['--session', session] : [])];
+      return await view('fleet', args) ?? JSON.parse(await run(['fleet', '--json', ...args]));
+    },
+    async sessions(session, root, machine, workers = false) {
       if (machine) {
-        const result = JSON.parse(await run(['sessions', '--json', ...(session ? ['--session', session] : []), '--root', root], machine));
+        const result = JSON.parse(await run(['sessions', '--json', ...(workers ? ['--workers'] : []), ...(session ? ['--session', session] : []), '--root', root], machine));
         if (!Array.isArray(result?.sessions)) throw new Error(`${machine} sessions read returned invalid JSON`);
         return result;
       }
-      const listed = await view('sessions', ['--session', session, '--root', root]);
+      // No session to name (a first run, or a workspace with none of its own) lists every session: `--session ''`
+      // is refused, and this read answered none.
+      const named = session ? ['--session', session] : [];
+      const listed = await view('sessions', [...named, '--root', root]);
       if (listed !== undefined) return listed;
-      const result = JSON.parse(await run(['views', '--views', 'sessions', '--json', '--session', session, '--root', root], machine));
+      const result = JSON.parse(await run(['views', '--views', 'sessions', '--json', ...named, '--root', root], machine));
       if (!result || typeof result !== 'object' || !('sessions' in result)) throw new Error('Sessions read returned invalid JSON');
       return result.sessions;
     },
-    mirror: async (session, root) => JSON.parse(await run(['conversation', '--source-info', '--json', '--session', session, '--root', root])),
+    // Whether a copy of another machine's transcript is here: a stat and a provenance read, which the warm worker answers
+    // (a cold process each time, every failed read of a saved machine that is down, before).
+    mirror: async (session, root) => (await view('conversation', ['--source-info', '--session', session, '--root', root]) as { mirrored: boolean; syncedAt?: number } | undefined)
+      ?? JSON.parse(await run(['conversation', '--source-info', '--json', '--session', session, '--root', root])),
     async markCommentsSent(session, ids, machine) {
       const result = JSON.parse(await run(['comment', 'mark-sent', '--session', session, '--ids', ids.join(','), '--json'], machine));
       if (typeof result?.marked !== 'number') throw new Error('mark-sent returned invalid JSON');

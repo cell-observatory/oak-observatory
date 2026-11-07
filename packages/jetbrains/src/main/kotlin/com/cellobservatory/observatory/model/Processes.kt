@@ -70,7 +70,7 @@ object ProcessesParser {
     private fun long(o: JsonObject, k: String): Long = o.get(k)?.takeIf { !it.isJsonNull }?.asLong ?: 0L
 
     private fun process(o: JsonObject) = BackgroundProcess(
-        id = str(o, "id") ?: "",
+        id = (str(o, "workerId")?.let { "$it:" } ?: "") + (str(o, "id") ?: ""),
         toolUseId = str(o, "toolUseId"),
         command = str(o, "command") ?: "",
         description = str(o, "description"),

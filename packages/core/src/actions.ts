@@ -11,7 +11,7 @@
  */
 import * as fs from 'fs';
 import * as path from 'path';
-import { readLog, readBlob, findRecord, EditRecord , minOf, maxOf, sidecarMemo } from './store';
+import { readLog, readBlob, findRecord, EditRecord , minOf, maxOf, sidecarMemo, storeDir, isSafeSessionId } from './store';
 import { findTranscript } from './observe';
 import { findSubagentsDir } from './subagents';
 import { scoreCommand, CommandRisk } from './risk';
@@ -19,6 +19,7 @@ import { readLines } from './fscache';
 import { taskId } from './changemap';
 import { transcriptFacts } from './derived-transcript';
 import { derivedInventory } from './derived';
+import { graphemeHead } from './graphemes';
 
 /** Coarse action kind, drives the timeline's icon + grouping + which rows the UI can dim/filter. */
 export type ActionCategory =
@@ -200,7 +201,7 @@ export function categoryOf(tool: string): ActionCategory {
 /** Collapse to a single trimmed line so a multi-line command/target renders in one row. */
 function oneLine(s: string, max = 300): string {
   const line = s.replace(/\s+/g, ' ').trim();
-  return line.length > max ? line.slice(0, max - 1) + '…' : line;
+  return line.length > max ? graphemeHead(line, max - 1) + '…' : line;
 }
 
 /** Best human-readable "what did this call act on" for a tool_use, plus optional secondary detail. */
@@ -222,7 +223,7 @@ export function targetOf(tool: string, input: any): { target: string; detail?: s
     const MAX_LINES = 24;
     const MAX_CHARS = 2000;
     let kept = lines.slice(0, MAX_LINES).join('\n');
-    if (kept.length > MAX_CHARS) kept = kept.slice(0, MAX_CHARS - 1) + '…';
+    if (kept.length > MAX_CHARS) kept = graphemeHead(kept, MAX_CHARS - 1) + '…';
     const hidden = lines.length - Math.min(lines.length, MAX_LINES);
     const body = hidden > 0 ? `${kept}\n… +${hidden} more line${hidden === 1 ? '' : 's'} (the transcript has it whole)` : kept;
     return { target: head, detail: desc, cmd: body };
@@ -347,6 +348,7 @@ export function readTranscriptProse(transcriptPath: string, index: ProseIndex[])
 
 /** Fold one record; pending calls and reasoning survive complete-line cursor boundaries. */
 export function foldActionFacts(state: ActionFacts, o: any, includeSidechain: boolean, offset: number, length: number): void {
+  if (o?.type === 'api-request-blob') return;
   const { actions, resultErr, byId } = state;
   let { lastReasoning, lastReasoningKind } = state;
   // A compaction is a harness event, not a tool call: its record carries no `message` at all, so it
@@ -695,17 +697,21 @@ export function summarizeActions(actions: ActionRecord[]): ActionSummary {
 // the transcript's TAIL (never the whole 20-34MB file) — it inspects just the trailing tool_use /
 // tool_result / end_turn. Boundary-tolerant by construction: starting mid-file, it drops its first
 // (partial) line, and a tool_result whose tool_use precedes the window is a harmless no-op delete.
-// Some states have no structural marker (a harness permission prompt writes NOTHING to the transcript;
-// there is no session-end record) and are inferred from staleness — surfaced via `confidence` as a
-// labeled heuristic, never asserted as certain.
+// A permission prompt writes NOTHING to the transcript: the session's own raised hand says it where OAK's hooks record it
+// (sessionHand). Claude Code writes no session-end record (Codex marks each turn's end). A state nothing records is
+// inferred from staleness — surfaced via `confidence` as a labeled heuristic, never asserted as certain.
 
-/** The live states a watcher surfaces. `awaiting-permission`/`idle`/`done` are staleness heuristics. */
+/** The live states a watcher surfaces. `idle` is a staleness heuristic; so is `awaiting-permission` where no hooks record
+ *  the session's hand, `done` but where Codex marked the turn's end, and `working` where only a child agent wrote, 30
+ *  seconds to 5 minutes ago. */
 export type Phase = 'working' | 'awaiting-input' | 'awaiting-permission' | 'idle' | 'errored' | 'done';
 export type PhaseConfidence = 'high' | 'heuristic';
 export interface PhaseResult {
   phase: Phase;
-  /** 'high' = structural (pending AskUserQuestion, an error result, an active tool_use); 'heuristic' =
-   *  staleness-derived (awaiting-permission / idle / done have no structural marker — inferred by mtime). */
+  /** 'high' = structural (pending AskUserQuestion, an error result, an active tool_use, the session's raised hand as its
+   *  hooks record it, a turn end Codex marks); 'heuristic' = staleness-derived, inferred by mtime where nothing records the
+   *  state (idle; awaiting-permission without hooks; done without a turn end Codex marks; working while only a child agent
+   *  wrote, 30 seconds to 5 minutes ago). */
   confidence: PhaseConfidence;
 }
 
@@ -713,7 +719,8 @@ export interface PhaseResult {
 const INPUT_TOOLS = new Set(['AskUserQuestion', 'ExitPlanMode']);
 /** How many trailing bytes to read for the classification (the trailing records are tiny). */
 const PHASE_TAIL_BYTES = 64 * 1024;
-/** A tool_use awaiting its result with no append for this long reads as a (heuristic) permission block. */
+/** A tool_use awaiting its result with no append for this long reads as a (heuristic) permission block, in a session
+ *  whose hooks OAK does not see (sessionHand): where they record it, its raised hand says so instead. */
 const PERMISSION_STALE_MS = 10_000;
 /** A completed turn with no append for this long reads as `done` (vs a recently-`idle` pause). */
 const DONE_STALE_MS = 5 * 60_000;
@@ -757,11 +764,40 @@ function newestChildActivityMs(transcriptPath: string): number {
   return newest;
 }
 
+/** Whether the agent of a transcript waits on a person, as the capture hooks keep its session's raised hand (a worker's,
+ *  `<id>/subagents/agent-<agent>.jsonl`, is its parent session's, which names the agent that asked): `permission` while
+ *  one of its own permission prompts is up, `input` while the session waits for input under a call still running (an MCP
+ *  server asking the person, which the hooks record as an input wait: the main agent's), `ended` once the main agent's
+ *  turn or session ended (its hand lowered to idle-done: a Stop, or Codex's SessionEnd or Interrupt; a worker runs on
+ *  past its parent's turn), `other` for none of these, or null where no hook records that session (it has no OAK store),
+ *  and nothing but the transcript can say. A main transcript is the session `sessionId` names, else the one its file is
+ *  named for (a Codex session's is OAK's derivation of its rollout, named for neither, so its listing names it). A hand
+ *  raised before `since`, when the newest call still without a result was made, is not about that call: its prompt was
+ *  answered and the agent went on (a call whose result no hook reports leaves the hand up), or its turn did. */
+function sessionHand(transcriptPath: string, sessionId?: string, since?: number): 'permission' | 'input' | 'ended' | 'other' | null {
+  const parts = transcriptPath.split(path.sep);
+  const at = parts.lastIndexOf('subagents');
+  const id = at > 0 ? parts[at - 1] : sessionId ?? path.basename(transcriptPath, '.jsonl');
+  const agent = at > 0 ? path.basename(transcriptPath, '.jsonl').replace(/^agent-/, '') : '';
+  try {
+    if (!isSafeSessionId(id) || !fs.existsSync(storeDir(id))) return null;
+    const capture = require('./capture') as typeof import('./capture');
+    const hand = capture.readAttention(id);
+    if (!hand || (since !== undefined && hand.ts < since)) return 'other';
+    if (hand.kind === 'permission') return capture.permissionAskers(id)?.has(agent) ? 'permission' : 'other';
+    if (agent) return 'other';
+    return hand.kind === 'input' ? 'input' : hand.kind === 'idle-done' ? 'ended' : 'other';
+  } catch {
+    return null;
+  }
+}
+
 /**
  * What is the agent in this transcript doing right now? Structural + zero-token — see the section note.
  * `agentPhase` returns just the label; `agentPhaseDetail` also reports whether it's a staleness heuristic.
+ * `sessionId` names the session of a main transcript whose file is not named for it (sessionHand).
  */
-export function agentPhaseDetail(transcriptPath: string): PhaseResult {
+export function agentPhaseDetail(transcriptPath: string, sessionId?: string): PhaseResult {
   const idle: PhaseResult = { phase: 'idle', confidence: 'heuristic' }; // neutral fallback (no transcript)
   let mtimeMs: number;
   try {
@@ -784,7 +820,8 @@ export function agentPhaseDetail(transcriptPath: string): PhaseResult {
       const t = line.trim();
       if (!t) continue;
       try {
-        objs.push(JSON.parse(t));
+        const o = JSON.parse(t);
+        if (o?.type !== 'api-request-blob') objs.push(o);
       } catch {
         // tolerate partial/non-JSON lines (schema evolves)
       }
@@ -797,14 +834,15 @@ export function agentPhaseDetail(transcriptPath: string): PhaseResult {
 
   // Walk the tail in order: track tool_uses still awaiting a result, and the kind of the trailing event.
   const pending = new Map<string, string>(); // tool_use_id -> tool name (no tool_result seen after it)
+  const pendingAt = new Map<string, number>(); // tool_use_id -> when its record was written (NaN where it has no time)
   let lastKind: 'result' | 'assistant_end' | 'none' = 'none';
   let lastResultErr = false;
   let nativeTurn: 'working' | 'done' | null = null;
   for (const o of objs) {
     if (o?.runtime === 'codex' && o.type === 'system') {
-      if (o.subtype === 'task_started') { nativeTurn = 'working'; pending.clear(); lastKind = 'none'; }
+      if (o.subtype === 'task_started') { nativeTurn = 'working'; pending.clear(); pendingAt.clear(); lastKind = 'none'; }
       if (o.subtype === 'task_complete' || o.subtype === 'turn_aborted') {
-        nativeTurn = 'done'; pending.clear(); lastKind = 'none';
+        nativeTurn = 'done'; pending.clear(); pendingAt.clear(); lastKind = 'none';
       }
       continue;
     }
@@ -816,7 +854,7 @@ export function agentPhaseDetail(transcriptPath: string): PhaseResult {
       for (const b of msg.content) {
         if (b && b.type === 'tool_use' && typeof b.name === 'string') {
           hadToolUse = true;
-          if (typeof b.id === 'string') pending.set(b.id, b.name);
+          if (typeof b.id === 'string') { pending.set(b.id, b.name); pendingAt.set(b.id, Date.parse(o.timestamp)); }
         }
       }
       if (!hadToolUse) lastKind = 'assistant_end'; // spoke and stopped (no tool call) => turn complete
@@ -824,6 +862,7 @@ export function agentPhaseDetail(transcriptPath: string): PhaseResult {
       for (const b of msg.content) {
         if (b && b.type === 'tool_result' && typeof b.tool_use_id === 'string') {
           pending.delete(b.tool_use_id); // a tool_use before the window just no-ops (boundary-tolerant)
+          pendingAt.delete(b.tool_use_id);
           lastKind = 'result';
           lastResultErr = !!b.is_error;
         }
@@ -845,24 +884,37 @@ export function agentPhaseDetail(transcriptPath: string): PhaseResult {
     if (INPUT_TOOLS.has(name)) return { phase: 'awaiting-input', confidence: 'high' };
   }
   // 2. A pending (non-blocking) tool_use => the tool is running, OR the agent is blocked on a harness
-  //    permission prompt (which writes NO transcript record) — disambiguated only by staleness (heuristic).
+  //    permission prompt (which writes NO transcript record). The session's own hand says which, where the hooks
+  //    record it: a command that runs long is working, however long. Only where nothing records it does staleness
+  //    decide (heuristic). A call left without a result when the turn or the session ended runs no more: c. below.
+  let ended = false;
   if (pending.size > 0) {
-    return age > PERMISSION_STALE_MS
-      ? { phase: 'awaiting-permission', confidence: 'heuristic' }
-      : { phase: 'working', confidence: 'high' };
+    let since: number | undefined; // when the newest call still without a result was made, where its record says
+    for (const t of pendingAt.values()) if (Number.isFinite(t) && (since === undefined || t > since)) since = t;
+    const hand = sessionHand(transcriptPath, sessionId, since);
+    if (hand === 'permission') return { phase: 'awaiting-permission', confidence: 'high' };
+    if (hand === 'input') return { phase: 'awaiting-input', confidence: 'high' };
+    if (hand === 'other') return { phase: 'working', confidence: 'high' };
+    if (hand === null) {
+      return age > PERMISSION_STALE_MS
+        ? { phase: 'awaiting-permission', confidence: 'heuristic' }
+        : { phase: 'working', confidence: 'high' };
+    }
+    ended = true;
   }
   // 3. No pending tool_use.
   //    a. A trailing error result => errored (structural).
-  if (lastKind === 'result' && lastResultErr) return { phase: 'errored', confidence: 'high' };
-  if (nativeTurn === 'working') return { phase: 'working', confidence: 'high' };
+  if (!ended && lastKind === 'result' && lastResultErr) return { phase: 'errored', confidence: 'high' };
+  if (!ended && nativeTurn === 'working') return { phase: 'working', confidence: 'high' };
   //    b. A trailing (non-error) tool_result means the turn is UNFINISHED — a conversation can't end on a
   //       tool_result; it always obligates an assistant follow-up. So the agent is mid-turn (generating the
   //       next step), NOT idle. Fresh => working (structural, same as an active tool_use); long-stale =>
   //       the turn was abandoned mid-flight (crash/kill/interrupt) => done. This is what keeps the live
   //       session reading "working" between tool calls instead of flickering to idle after each result.
-  if (lastKind === 'result') return age > DONE_STALE_MS ? { phase: 'done', confidence: 'heuristic' } : { phase: 'working', confidence: 'high' };
-  //    c. The turn is COMPLETE (assistant spoke and stopped, or nothing in view) — but child agents
-  //       still writing mean the session is working THROUGH its delegated agents, not resting.
+  if (!ended && lastKind === 'result') return age > DONE_STALE_MS ? { phase: 'done', confidence: 'heuristic' } : { phase: 'working', confidence: 'high' };
+  //    c. The turn is COMPLETE (assistant spoke and stopped, or nothing in view, or its hooks say it ended with a call
+  //       left without a result) — but child agents still writing mean the session is working THROUGH its delegated
+  //       agents, not resting.
   if (childAge < DONE_STALE_MS) {
     return { phase: 'working', confidence: childAge < CHILD_ACTIVE_MS ? 'high' : 'heuristic' };
   }
@@ -903,6 +955,7 @@ function toolResultText(transcriptPath: string, toolUseId: string): string | nul
     } catch {
       continue;
     }
+    if (o?.type === 'api-request-blob') continue;
     const msg = o.message;
     if (!msg || msg.role !== 'user' || !Array.isArray(msg.content)) continue;
     for (const b of msg.content) {
@@ -914,7 +967,7 @@ function toolResultText(transcriptPath: string, toolUseId: string): string | nul
               ? b.content.map((c: any) => (c && typeof c.text === 'string' ? c.text : '')).join('')
               : '';
         const trimmed = text.trim();
-        return trimmed.length > RESULT_CONTEXT_MAX ? trimmed.slice(0, RESULT_CONTEXT_MAX) + '\n…(truncated)' : trimmed;
+        return trimmed.length > RESULT_CONTEXT_MAX ? graphemeHead(trimmed, RESULT_CONTEXT_MAX) + '\n…(truncated)' : trimmed;
       }
     }
   }
@@ -939,6 +992,7 @@ function taskContentFor(transcriptPath: string, wantTaskId: string): string | nu
     } catch {
       continue;
     }
+    if (o?.type === 'api-request-blob') continue;
     const msg = o.message;
     if (!msg || msg.role !== 'assistant' || !Array.isArray(msg.content)) continue;
     for (const b of msg.content) {

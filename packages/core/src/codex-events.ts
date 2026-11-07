@@ -6,15 +6,17 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { createHash } from 'crypto';
 import { rootDir } from './store';
-import { cachedByFiles, readLines } from './fscache';
+import { fileWithinLast } from './stamp';
+import { cachedByFiles, clearFsCache, readLines } from './fscache';
 import type { UsageSplit } from './pricing';
 
-const VERSION = 6;
+const VERSION = 7;
 const CHUNK = 1024 * 1024;
 const MAX_LINE = 4 * CHUNK;
 const digest = (s: string | Buffer): string => createHash('sha256').update(s).digest('hex');
 const num = (v: unknown): number => typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : 0;
 interface Cursor {
+  userCopies: { key: string; kind: string }[];
   preview?: Cursor;
   title: string; firstPrompt: string;
   version: number; source: string; ino: number; offset: number; sourceSize: number; mtime: number;
@@ -23,9 +25,11 @@ interface Cursor {
   seenUsage: string[]; seenMessages: string[]; unsupported: number; malformed: number;
   firstTs: number; lastTs: number; modelWindow: number | null; discarding: boolean;
   rateLimits: Record<string, unknown> | null; quotaTs: number | null; contextTokens: number | null;
+  /** Whether the last turn this pass read has started and not ended (absent: no turn bound read since this was kept). */
+  turnOpen?: boolean;
 }
 function initial(source: string, ino: number): Cursor {
-  return { title: '', firstPrompt: '', version: VERSION, source, ino, offset: 0, sourceSize: 0, mtime: 0, outputBytes: 0, anchor: '',
+  return { userCopies: [], title: '', firstPrompt: '', version: VERSION, source, ino, offset: 0, sourceSize: 0, mtime: 0, outputBytes: 0, anchor: '',
     sessionId: '', cwd: '', originator: '', model: '', provider: '', effort: '', turnId: '', tokens: null,
     seenUsage: [], seenMessages: [], unsupported: 0, malformed: 0, firstTs: 0, lastTs: 0, modelWindow: null, discarding: false, rateLimits: null, quotaTs: null, contextTokens: null };
 }
@@ -88,6 +92,7 @@ function normalize(rec: any, c: Cursor, position: number): Record<string, unknow
   if (typeof (settings.model_reasoning_effort ?? settings.effort ?? settings.reasoning_effort) === 'string')
     c.effort = settings.model_reasoning_effort ?? settings.effort ?? settings.reasoning_effort;
   if (typeof (p.turn_id ?? p.turnId) === 'string') c.turnId = p.turn_id ?? p.turnId;
+  if (rec.type === 'event_msg' && (kind === 'task_started' || kind === 'task_complete' || kind === 'turn_aborted')) c.turnOpen = kind === 'task_started';
   const window = num(p.model_context_window ?? p.info?.model_context_window);
   if (window) c.modelWindow = window;
   if (Object.prototype.hasOwnProperty.call(p, 'rate_limits')) {
@@ -109,8 +114,20 @@ function normalize(rec: any, c: Cursor, position: number): Record<string, unknow
     const role = kind === 'user_message' ? 'user' : kind === 'agent_message' ? 'assistant' : p.role;
     if (!text) return [];
     if (role === 'user' && !c.firstPrompt) c.firstPrompt = codexPromptText(text) || '';
-    // Codex may expose the same message in response_item and event_msg; fold only a matching
-    // native turn + role + text. Identical prompts in distinct turns remain distinct.
+    if (role === 'user') {
+      // A user_message and its response_item are two representations of one delivery. Consume
+      // each pair once; a second message of the same kind is another ask, even within this turn.
+      const mirror = digest(`${c.turnId || ts}:${text}`);
+      const copy = c.userCopies.findIndex(x => x.key === mirror && x.kind !== rec.type);
+      if (copy >= 0) { c.userCopies.splice(copy, 1); return []; }
+      const client = typeof p.client_id === 'string' && p.client_id ? p.client_id : null;
+      if (client && !remember(c.seenMessages, `user-client:${client}`)) return [];
+      c.userCopies.push({ key: mirror, kind: rec.type });
+      if (c.userCopies.length > 64) c.userCopies.shift();
+      const first = remember(c.seenMessages, `user-turn:${c.turnId || ts}`);
+      const promptId = c.turnId && first ? c.turnId : `codex-user-${client || position}`;
+      return [{ ...message(role, [{ type: 'text', text }], `codex-user-${position}`), promptId }];
+    }
     const key = digest(`${c.turnId || ts}:${role}:${text}`);
     if (!remember(c.seenMessages, key)) return [];
     return [message(role, [{ type: 'text', text }], `codex-message-${key}`)];
@@ -178,6 +195,23 @@ export function isCodexTranscriptFile(file: string): boolean {
   return path.dirname(path.dirname(path.resolve(file))) === path.resolve(derivedRoot());
 }
 
+/** What each rollout's derivation last knew of its turn (`Cursor.turnOpen`), by rollout: a listing derives every
+ *  rollout before it asks, so `codexDerivedTurnOpen` reads no file, in a new process too. */
+const derivedTurns = new Map<string, boolean | undefined>();
+const keepTurn = (source: string, c: Cursor): void => {
+  if (derivedTurns.size >= 65536) derivedTurns.clear();
+  derivedTurns.set(path.resolve(source), (c.preview ?? c).turnOpen);
+};
+/** Whether the rollout's last turn is still running, as its derivation last read it; undefined when this process has
+ *  not derived it, or its derivation has read no turn bound since it began keeping them. */
+export function codexDerivedTurnOpen(source: string): boolean | undefined {
+  return derivedTurns.get(path.resolve(source));
+}
+
+/** Reads that used a converter's unfinished output. Catch-up compares this before and after deriving facts, including
+ *  an Auto-review title's parent: a best-effort read must never become a persistent, settled index row. */
+export let codexUnsettledReads = 0;
+
 /** Returns a derived transcript, never the raw rollout with an incompatible message schema. */
 export function codexTranscriptFile(source: string): string | null {
   let st: fs.Stats; try { st = fs.statSync(source); } catch { return null; }
@@ -185,14 +219,21 @@ export function codexTranscriptFile(source: string): string | null {
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   const output = path.join(dir, 'events.jsonl'), statePath = path.join(dir, 'cursor.json'), lock = path.join(dir, '.lock');
   let c = loadCursor(statePath, source, st.ino);
-  if (c.version === VERSION && c.source === source && c.ino === st.ino && c.sourceSize === st.size && c.mtime === st.mtimeMs && fs.existsSync(output)) return output;
+  keepTurn(source, c);
+  if (c.version === VERSION && c.source === source && c.ino === st.ino && c.sourceSize === st.size && c.mtime === st.mtimeMs && fs.existsSync(output) && !fs.existsSync(lock)) return output;
   let owner: number;
   try { owner = fs.openSync(lock, 'wx', 0o600); fs.writeSync(owner, String(process.pid)); }
   catch {
     try { const pid = Number(fs.readFileSync(lock, 'utf8'));
-      if (!Number.isSafeInteger(pid) || pid <= 0) { if (Date.now() - fs.statSync(lock).mtimeMs > 30000) fs.unlinkSync(lock); }
+      // A lock with no owner yet is one caught between its create and its pid's write: a moment old, it is that
+      // converter's; older, or dated ahead of this clock (stepped back since), a crash left it.
+      if (!Number.isSafeInteger(pid) || pid <= 0) { if (!fileWithinLast(lock, fs.statSync(lock).mtimeMs, 30000)) fs.unlinkSync(lock); }
       else process.kill(pid, 0); }
     catch (e) { if ((e as NodeJS.ErrnoException).code === 'ESRCH') { try { fs.unlinkSync(lock); } catch {} } }
+    codexUnsettledReads++;
+    // Outer cachedByFiles computations must not retain this fallback under the raw rollout's completed stamp. Clearing
+    // also detaches their in-flight cache maps, so a long-lived reader retries after the converter releases its lock.
+    clearFsCache();
     return fs.existsSync(output) ? output : null;
   }
   let fd: number | undefined;
@@ -240,6 +281,7 @@ export function codexTranscriptFile(source: string): string | null {
     }
     c.sourceSize = st.size; c.mtime = st.mtimeMs; c.anchor = anchor(fd, c.offset);
     safeAtomic(statePath, JSON.stringify(c));
+    keepTurn(source, c);
     // Derived refresh timestamps track source activity, never the time an idle view was opened.
     fs.utimesSync(output, st.atime, st.mtime);
     return output;

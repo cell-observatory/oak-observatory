@@ -3,14 +3,16 @@
  * the session transcript, plus cheap heuristic change-summaries, issue-flags, and next-step
  * suggestions. No model calls — the transcript already contains Claude's words.
  */
-import { personPromptOf, transcriptForSession } from './asks';
+import { userPrompt, transcriptForSession } from './asks';
+import { workspaceDirectoryExists } from './workspace-window';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { diffArrays } from 'diff';
-import { EditRecord, EditStatus, readLog, blobText as storeBlobText, logPath, maxOf, listSessions, SessionInfo, allStoreSessionIds, rootDir, isSafeSessionId, hasInflightCapture, hasBlob, storeBytes, storeDir, hiddenSessions, hideSession, removeSession, withFileMutation, FileBusyError } from './store';
+import { EditRecord, EditStatus, readLog, blobText as storeBlobText, logPath, maxOf, listSessions, SessionInfo, allStoreSessionIds, rootDir, isSafeSessionId, hasInflightCapture, hasBlob, storeBytes, storeDir, hiddenSessions, hideSession, removeSession, withFileMutation, FileBusyError, outsideStoreMoves, isReservedStoreDir, storeIndexHooks, earlierGenerationOf } from './store';
 import { lineDelta, plainTitle } from './format';
 import { spawnToolSync } from './spawn';
+import { graphemeHead } from './graphemes';
 import { contentGet, contentNote, flushPairDeltas, pairDelta, pairKeyOf, derivedInventory } from './derived';
 import { projectDir, resolveSessionId, listWorkspaces, isBridgePointer, isMirroredTranscript, workspaceLabel, SESSION_BUSY_MS } from './session';
 import { readAttention, readTabLink, captureMutex } from './capture';
@@ -20,14 +22,15 @@ import { cachedAnalysis } from './analyze';
 import { cachedByFiles, readLines } from './fscache';
 import { transcriptFacts } from './derived-transcript';
 import { reviewEdits, visibleEdits } from './groups';
+import { activeWorkers, ActiveWorker } from './subagents';
 // NOTE: metrics.ts imports `findTranscript` from this module, so this pair is CIRCULAR. It is safe only
 // because both directions are used at CALL time, never at module-init time — nothing here runs during
 // load. `test/core.test.js` requires each module first in a child process to keep that true.
 import { sessionUsage, sessionVitals } from './metrics';
 import { captureEventsPath, readCaptureEvents } from './capture-events';
-import { findCodexRollout, readCodexAgentMeta, readCodexRollout, codexSessionTitle } from './codex';
-import { codexSessionSources } from './codex';
-import { codexTranscriptFile, codexPromptText, isCodexTranscriptFile } from './codex-events';
+import { findCodexRollout, readCodexAgentMeta, readCodexRollout, codexSessionTitle, codexTurnOpen, codexTitleInputs } from './codex';
+import { codexSessionSources, type CodexSessionSource } from './codex';
+import { codexTranscriptFile, codexPromptText, isCodexTranscriptFile, codexDerivedTurnOpen } from './codex-events';
 import { remoteSessionTitle } from './remote-titles';
 import { pidAlive } from './daemon';
 
@@ -107,6 +110,7 @@ export interface ReasoningFacts { lastReasoning: string; uses: ToolUse[] }
 
 /** Unlike the main action timeline, historical reasoning includes legacy inlined sidechains. */
 export function foldReasoningFacts(facts: ReasoningFacts, o: any): void {
+  if (o?.type === 'api-request-blob') return;
   const msg = o.message;
   if (!msg || msg.role !== 'assistant' || !Array.isArray(msg.content)) return;
   // NOTE: sidechain (subagent) messages are deliberately NOT skipped here. The capture hooks fire
@@ -328,13 +332,14 @@ export function sessionViewTitle(cwd: string, session: string, insights?: Transc
 }
 
 /** Keep list rows SHORT but informative: ai-titles already are, but the first-PROMPT fallback can be a
- *  whole pasted brief — take its first sentence, then hard-cap at 64. Hover surfaces show it uncapped. */
+ *  whole pasted brief — take its first sentence, then hard-cap at 64, cut where a character ends (a cut
+ *  inside a family emoji showed `👨‍👩‍�…`). Hover surfaces show it uncapped. */
 export function normalizeSessionTitle(raw: string): string | null {
   let title = plainTitle(raw);
   if (!title) return null;
   const sentence = /^(.*?[.?!])(?:\s|$)/.exec(title);
   if (sentence && sentence[1].length >= 12) title = sentence[1]; // a bare "Hi." is no title
-  if (title.length > 64) title = title.slice(0, 63).trimEnd() + '…';
+  if (title.length > 64) title = graphemeHead(title, 63).trimEnd() + '…';
   return title;
 }
 
@@ -439,9 +444,13 @@ export interface SessionMetaRow {
    *  are offered, so the row has to SAY which one — the previous listing mixed ancestor-directory
    *  sessions in with this repo's and named none of them. */
   workspace: string;
-  /** Where the conversation lives: a real transcript on this machine. Mirrored copies and bridge
-   *  pointers are not listed at all. */
-  origin: 'local';
+  /** Absolute cwd, separate from the display label; availability checked on this machine. */
+  workspacePath?: string;
+  workspaceExists?: boolean;
+  /** Where the conversation lives: `local`, a real transcript on this machine (mirrored copies and bridge pointers are
+   *  not listed at all); `synced`, another machine's session as its records hold it, in the listing of every machine
+   *  (`oak sessions --json --synced`). */
+  origin: 'local' | 'synced';
   /** WHICH MACHINE this session lives on, ready to render: [THIS_MACHINE]. Present on every row, in its
    *  own field, so no picker has to infer it and none of them can disagree about the answer. */
   machine: string;
@@ -526,26 +535,55 @@ export interface SessionMetaRow {
   /** How confident `phase` is: 'high' when a structural marker said so, 'heuristic' when it was
    *  inferred from staleness. A renderer dims the guess rather than presenting it as a fact. */
   phaseConfidence?: string;
+  /**
+   * The workers this session spawned that are still at it (`activeWorkers`): working, or waiting on a person,
+   * each with its title, phase, model, edits, tokens and last write. Empty when none is, and for a session whose
+   * agent keeps no subagent transcripts (Codex). A finished worker is left out; the Workers list keeps it.
+   */
+  activeWorkers: ActiveWorker[];
+  /** A Codex session's last turn is still running: its rollout's last `task_started` has no `task_complete`
+   *  or `turn_aborted` after it (`codexDerivedTurnOpen`, else `codexTurnOpen`). Asked when `phase` is; absent
+   *  for a Claude session and when the rollout cannot say. `paneAgentState` reads it, with `lastActiveMs`, the
+   *  rollout's mtime. */
+  turnOpen?: boolean;
 }
 
 /** How long a session stays worth asking about. Past this it is idle by definition, and reading its
  *  transcript to be told so is work nobody can act on. */
 const PHASE_WINDOW_MS = 2 * 60 * 60 * 1000;
 
-function phaseOf(transcript: string, lastActiveMs: number): { phase?: string; phaseConfidence?: string } {
+function phaseOf(transcript: string, lastActiveMs: number, id: string): { phase?: string; phaseConfidence?: string } {
   if (!transcript || Date.now() - lastActiveMs > PHASE_WINDOW_MS) return {};
   try {
-    const d = agentPhaseDetail(transcript);
+    const d = agentPhaseDetail(transcript, id);
     return { phase: d.phase, phaseConfidence: d.confidence };
   } catch {
     return {}; // a torn transcript is not a phase — absent, never guessed
   }
 }
 
+/** `turnOpen` for a Codex row, on `phaseOf`'s terms: what the rollout's derivation, which this listing has just run,
+ *  read of its turn; else read back from the rollout's end (a derivation from before it kept the turn). */
+function turnOf(rollout: string | undefined, lastActiveMs: number): { turnOpen?: boolean } {
+  if (!rollout || Date.now() - lastActiveMs > PHASE_WINDOW_MS) return {};
+  const open = codexDerivedTurnOpen(rollout) ?? codexTurnOpen(rollout);
+  return open === null ? {} : { turnOpen: open };
+}
+
+/** A listed session's running workers, asking only the ones the local index did not find finished (`live`), and none
+ *  where no folder of workers is beside its transcript. */
+function workersOf(transcript: string, id: string, live: ListingLive): ActiveWorker[] {
+  const known = live.workers(id);
+  return known === null ? [] : activeWorkers(transcript, id, Date.now(), known);
+}
+
 export interface SessionMeta {
   active: string | null;
   /** This machine's sessions grouped by workspace, editor root first; newest in each group. */
   sessions: SessionMetaRow[];
+  /** Other machines' raised hands as their record logs brought them (`oak sessions --json`, from the local index; absent
+   *  when there are none): every surface lists them, labelled with their machine, and announces them. */
+  syncedHands?: import('./notify').InboxRow[];
 }
 
 /**
@@ -664,12 +702,13 @@ function pendingQuestionInTail(transcript: string): PendingQuestion | null {
   const answered = new Set<string>();
   for (const line of tail.split('\n')) {
     if (!line.includes('AskUserQuestion') && !line.includes('tool_result')) continue;
-    let o: { message?: { content?: unknown } } | undefined;
+    let o: { type?: string; message?: { content?: unknown } } | undefined;
     try {
       o = JSON.parse(line) as typeof o;
     } catch {
       continue;
     }
+    if (o?.type === 'api-request-blob') continue;
     const content = o?.message?.content;
     if (!Array.isArray(content)) continue;
     for (const c of content as { type?: string; name?: string; id?: string; tool_use_id?: string; input?: { questions?: unknown[] } }[]) {
@@ -701,10 +740,17 @@ export function pendingQuestion(cwd: string, sessionId: string): PendingQuestion
 
 /** The row's attention state: the hook-recorded wait, upgraded to `question` when the tail holds
  *  an unanswered AskUserQuestion (only probed while a wait is actually recorded — the tail read
- *  is bounded but not free, and a session with no hand raised needs no scan). */
-function attentionOf(id: string, transcript: string | null): SessionMetaRow['attention'] {
-  const a = readAttention(id);
-  if (!a) return null;
+ *  is bounded but not free, and a session with no hand raised needs no scan). `live`: the wait as the local index
+ *  read it when it caught up, in place of the file. */
+function attentionOf(id: string, transcript: string | null, live?: ListingLive): SessionMetaRow['attention'] {
+  const a = live ? live.attention(id) : readAttention(id);
+  return a ? withPendingQuestion(a, transcript) : null;
+}
+
+/** A recorded wait as the surfaces read it: an input or permission wait whose transcript's tail holds an unanswered
+ *  AskUserQuestion is that `question`, named by its header or its text. The index publishes it so (ingest.ts
+ *  ingestAttention), and another machine reads it as this one does. */
+export function withPendingQuestion(a: NonNullable<SessionMetaRow['attention']>, transcript: string | null): NonNullable<SessionMetaRow['attention']> {
   if ((a.kind === 'input' || a.kind === 'permission') && transcript) {
     const q = pendingQuestionInTail(transcript);
     if (q) return { kind: 'question', message: q.header || q.question, ts: a.ts };
@@ -748,7 +794,9 @@ function hasModelTurn(transcript: string): boolean {
     return readLines(transcript).some((line) => {
       if (!line.includes('"assistant"')) return false;
       try {
-        const m = JSON.parse(line)?.message;
+        const o = JSON.parse(line);
+        if (o?.type === 'api-request-blob') return false;
+        const m = o?.message;
         return m?.role === 'assistant' && m.model !== '<synthetic>';
       } catch {
         return false;
@@ -760,43 +808,56 @@ function hasModelTurn(transcript: string): boolean {
 }
 
 /**
- * This machine's sessions, grouped by workspace. A session in which nothing happened is left out unless
- * it may still be running (the rule is spelled out where it is applied); `includeEmpty` keeps those
- * too, for the reaper, to which they are the most finished sessions of all.
+ * What the session listing reads of a transcript's or a rollout's head, asked through one seam. The listing reads the
+ * files (each answer has its own sidecar); the local index answers from what it recorded at the same file stamp, so a
+ * listing it serves reads none of them again (index/ingest.ts).
  */
-export function sessionMeta(cwd: string, reviewing?: string | null, opts: { includeEmpty?: boolean } = {}): SessionMeta {
-  const active = (() => {
-    try {
-      return resolveSessionId(cwd);
-    } catch {
-      return null;
-    }
-  })();
-  const rows: SessionMetaRow[] = [];
-  const seen = new Set<string>();
-  const hidden = hiddenSessions();
-  const workspaceOf = (dir: string | null | undefined): string => (dir ? workspaceLabel(dir) : '') || UNKNOWN_WORKSPACE;
-  // A session in which NOTHING HAPPENED is not listed: no captured edit, no tokens, and no turn the
-  // model produced — Claude Code opened and closed at the prompt, a `/model` or `/login` and nothing
-  // more, a prompt answered only by an API error, a Codex launch with no prompt. Such rows were 30 of
-  // one machine's 128 (2026-09-24), most of them "New Claude session · 0 tok". A session that
-  // may still be RUNNING stays, so a new one shows before its first reply: the current or pinned one,
-  // one Claude Code lists as running, a raised hand, a Codex turn in flight, or activity within
-  // SESSION_BUSY_MS.
-  const running = runningClaudeSessions();
-  const now = Date.now();
-  const listed = (row: SessionMetaRow, transcript: string | null): boolean =>
-    opts.includeEmpty === true || row.edits > 0 || row.tokens > 0 || row.cached > 0 ||
-    row.current || row.id === reviewing || running.has(row.id) ||
-    (row.attention !== null && row.attention.kind !== 'idle-done') || row.phase === 'working' ||
-    now - Math.max(row.lastActiveMs, row.liveMs) <= SESSION_BUSY_MS ||
-    (transcript !== null && hasModelTurn(transcript));
-  // Every workspace's transcripts, indexed by id, so a row can name where it came from. The listing
-  // used to gate on `findTranscript`, which WALKS UP the tree — so sessions belonging to `~` and other
-  // ancestors were offered as if they were this repo's, 13 of 63 on the repo that found this, with
-  // nothing on the row to say otherwise. Provenance is now shown rather than guessed at.
-  const byId = new Map<string, { file: string; workspace: string; cwd?: string; source?: string }>();
-  const excluded = new Set<string>();
+export interface ListingProbe {
+  /** `isMirroredTranscript`. */
+  mirrored(file: string): { mirrored: boolean; recordedCwd?: string };
+  /** `isBridgePointer`. */
+  bridge(file: string): boolean;
+  /** `codexSessionSources`. */
+  codexSources(): CodexSessionSource[];
+}
+
+export const LIVE_LISTING_PROBE: ListingProbe = {
+  mirrored: isMirroredTranscript,
+  bridge: isBridgePointer,
+  codexSources: () => codexSessionSources(),
+};
+
+/** A Claude transcript the listing considers: its session id, its file, and the label of the project folder it is in. */
+export interface ListingTranscript {
+  id: string;
+  file: string;
+  label: string;
+}
+
+/** Where a session's conversation was found: its transcript (a Codex session's derived one), the workspace and working
+ *  directory it recorded, and for a Codex session its rollout and whether it is an Auto-review thread. */
+export interface ListingFound {
+  file: string;
+  workspace: string;
+  cwd?: string;
+  source?: string;
+  review?: boolean;
+}
+
+export interface ListingDiscovery {
+  byId: Map<string, ListingFound>;
+  /** Ids whose every transcript here is a mirrored copy or a bridge pointer. */
+  excluded: Set<string>;
+}
+
+/** A workspace label for a recorded directory, or UNKNOWN_WORKSPACE when none is recorded: never blank. */
+export function listingWorkspace(dir: string | null | undefined): string {
+  return (dir ? workspaceLabel(dir) : '') || UNKNOWN_WORKSPACE;
+}
+
+/** Every Claude transcript, in the listing's order: project folders by label, then each folder's names. */
+export function listingTranscripts(): ListingTranscript[] {
+  const out: ListingTranscript[] = [];
   for (const w of listWorkspaces()) {
     let names: string[] = [];
     try {
@@ -807,221 +868,434 @@ export function sessionMeta(cwd: string, reviewing?: string | null, opts: { incl
     for (const n of names) {
       if (!n.endsWith('.jsonl')) continue;
       const id = n.slice(0, -6);
-      if (!isSafeSessionId(id) || byId.has(id)) continue;
-      const file = path.join(w.dir, n);
-      const provenance = isMirroredTranscript(file);
-      if (provenance.mirrored || isBridgePointer(file)) { excluded.add(id); continue; }
-      const sessionCwd = provenance.recordedCwd;
-      byId.set(id, { file, workspace: sessionCwd ? workspaceLabel(sessionCwd) : w.label, cwd: sessionCwd });
+      if (isSafeSessionId(id)) out.push({ id, file: path.join(w.dir, n), label: w.label });
     }
   }
+  return out;
+}
+
+/**
+ * Which conversation each session id names. Every workspace's transcripts are indexed by id, so a row can name where it
+ * came from: the listing used to gate on `findTranscript`, which WALKS UP the tree, so sessions belonging to `~` and
+ * other ancestors were offered as if they were this repo's, 13 of 63 on the repo that found this, with nothing on the
+ * row to say otherwise. The first project folder (by label) whose copy is neither mirrored nor a bridge pointer wins; an
+ * id whose every copy is one is excluded. Codex's rollouts follow, newest first, so an archived copy loses.
+ */
+export function discoverListing(transcripts: Iterable<ListingTranscript>, codex: Iterable<CodexSessionSource>, probe: ListingProbe = LIVE_LISTING_PROBE): ListingDiscovery {
+  const byId = new Map<string, ListingFound>();
+  const excluded = new Set<string>();
+  for (const t of transcripts) {
+    if (byId.has(t.id)) continue;
+    const provenance = probe.mirrored(t.file);
+    if (provenance.mirrored || probe.bridge(t.file)) { excluded.add(t.id); continue; }
+    const sessionCwd = provenance.recordedCwd;
+    byId.set(t.id, { file: t.file, workspace: sessionCwd ? workspaceLabel(sessionCwd) : t.label, cwd: sessionCwd });
+  }
   const codexIds = new Set<string>();
-  for (const source of codexSessionSources()) {
+  for (const source of codex) {
     if (codexIds.has(source.id)) continue; // newest rollout wins when an archived copy also exists
     const file = codexTranscriptFile(source.file); if (!file) continue;
     codexIds.add(source.id);
-    byId.set(source.id, { file, workspace: workspaceOf(source.cwd), cwd: source.cwd, source: source.file });
+    byId.set(source.id, { file, workspace: listingWorkspace(source.cwd), cwd: source.cwd, source: source.file, review: source.review });
   }
+  return { byId, excluded };
+}
+
+/**
+ * What the listing derives for one session from its files on disk, before anything about this moment is added (its
+ * attention, tab, phase and workers, whether it is current, pinned or running, whether it was deleted). These are the
+ * facts the local index keeps per session and serves the listing from while the files they came from are unchanged.
+ */
+export interface SessionListingFacts {
+  id: string;
+  /** `transcript`: a conversation file is here (a Claude transcript, or a Codex rollout's derived one). `meta`: only the
+   *  Codex hook metadata names the session. */
+  shape: 'transcript' | 'meta';
+  agent: 'claude' | 'codex';
+  workspace: string;
+  /** The working directory it recorded, which decides whether its workspace group is the caller's. */
+  cwd?: string;
+  transcript: string | null;
+  /** The rollout the listing found it by (`ListingFound.source`). */
+  source?: string;
+  /** Its rollout, however found: a Codex row is titled from it. */
+  rollout?: string;
+  review: boolean;
+  /** A Claude row's title parts (`sessionTitleParts`). The Remote Control title they may name is looked up when the row
+   *  is listed, as `fastSessionTitle` does, never kept. */
+  titleParts?: SessionTitleParts | null;
+  /** A Codex row's title, null when it has none. */
+  title?: string | null;
+  /** The files that title was read from besides the rollout and Codex's thread names (`codexTitleInputs`). */
+  titleInputs?: string[];
+  lastActiveMs: number;
+  /** `lastTurnMs`'s answer; null when it cannot say. */
+  lastTurn: number | null;
+  /** capture-events.jsonl's modification time, 0 without one: the activity clock a hook moves mid-turn. */
+  captureMs: number;
+  counts: SessionCounts;
+  tokens: number;
+  cached: number;
+  durationMs: number;
+  storeBytes: number;
+  model: string;
+  effort: string;
+  /** Whether the model produced a turn (`hasModelTurn`): asked only of a session with no edits, tokens or cache traffic,
+   *  the one the listing would otherwise leave out. */
+  modelTurn: boolean;
+}
+
+/** A listed row's title from its facts: the rollout's for a Codex session, else the transcript's parts in
+ *  `preferredSessionTitle`'s order (as `fastSessionTitle` reads them), else the agent's placeholder. */
+function factsTitle(f: SessionListingFacts): string {
+  if (f.shape === 'meta' || f.rollout) return f.title || UNTITLED_SESSION_TITLES.codex;
+  const p = f.titleParts;
+  const title = p ? normalizeSessionTitle(preferredSessionTitle({ customTitle: p.rename, bridgeSessionId: p.bridge, title: p.aiTitle, firstUserPrompt: p.prompt }) ?? '') : null;
+  return title || UNTITLED_SESSION_TITLES.claude;
+}
+
+/**
+ * One session's listing facts, or null when the listing never shows it: every transcript of it is a mirrored copy or a
+ * bridge pointer, its rollout is a mirrored copy, nothing on disk holds its conversation and no Codex hook named it, it
+ * is a throwaway Codex run whose temp workspace and rollout are gone, or no file dates it. `cwd` only locates a
+ * transcript a walk up from it would find, which every workspace's index already holds.
+ */
+export function listingFacts(id: string, disc: ListingDiscovery, cwd: string = os.homedir()): SessionListingFacts | null {
+  const found = disc.byId.get(id);
+  if (!found && disc.excluded.has(id)) return null;
+  const rawCodex = found?.source ?? findCodexRollout(id);
+  const rolloutOrigin = rawCodex ? isMirroredTranscript(rawCodex) : null;
+  if (rolloutOrigin?.mirrored) return null;
+  const review = found?.review === true;
+  const transcript = found?.file ?? findTranscript(cwd, id);
+  const titleInputs = new Set<string>();
+  const titled = (read: () => string | null): string | null => {
+    const t = codexTitleInputs(read);
+    for (const f of t.files) titleInputs.add(f);
+    return t.value;
+  };
+  // The earlier history of a session whose store folder was made anew (oak sync, sync-store.ts), listed as that: from its
+  // own store alone (a Codex session's agent record names its workspace), so the local index, which reads each session
+  // from its own files, lists it as this listing does.
+  const of = transcript ? null : earlierGenerationOf(id);
+  if (of && fs.existsSync(logPath(id))) {
+    const meta = readCodexAgentMeta(id);
+    let lastActiveMs = 0;
+    try {
+      lastActiveMs = fs.statSync(logPath(id)).mtimeMs;
+    } catch {
+      return null;
+    }
+    return {
+      id, shape: 'meta', agent: meta ? 'codex' : 'claude', workspace: listingWorkspace(meta?.cwd), ...(meta?.cwd ? { cwd: meta.cwd } : {}), transcript: null,
+      review: false, title: `earlier history of session ${of}`, lastActiveMs, lastTurn: null, captureMs: 0, counts: sessionCounts(id), tokens: 0, cached: 0,
+      durationMs: 0, storeBytes: storeBytes(id), model: meta?.model ?? '', effort: '', modelTurn: false,
+    };
+  }
+  if (!transcript) {
+    // Codex hook metadata keeps a captured session discoverable before its rollout is available.
+    const codexMeta = readCodexAgentMeta(id);
+    if (!codexMeta) return null; // truly nothing to open
+    // Drop a dead throwaway codex session: one whose recorded workspace is a temp dir AND whose
+    // raw rollout is gone (a scratch `codex exec` from a probe/review — no conversation to resume).
+    // Scoped to temp roots so a real project is never hidden, and only when the rollout is truly
+    // gone: a real codex session run in /tmp keeps its rollout (findCodexRollout finds it) and stays.
+    if (typeof codexMeta.cwd === 'string' && codexMeta.cwd) {
+      const cw = path.resolve(codexMeta.cwd);
+      const tmp = [os.tmpdir(), '/tmp', '/private/tmp', '/var/folders'].some((r) => cw.startsWith(path.resolve(r) + path.sep));
+      if (tmp && !findCodexRollout(id)) return null;
+    }
+    let title: string | null = null;
+    let lastActiveMs = 0;
+    try {
+      const events = readCaptureEvents(id, ['turn_start']);
+      for (const event of events) {
+        const prompt = (event.payload as { prompt?: string })?.prompt;
+        if (typeof prompt === 'string') { title = plainTitle(codexPromptText(prompt) ?? '') || null; if (title) break; }
+      }
+      title = titled(() => codexSessionTitle(rawCodex || '', id)) || title;
+      lastActiveMs = fs.statSync(captureEventsPath(id)).mtimeMs;
+    } catch {
+      /* a torn sidecar still identifies the session */
+    }
+    try {
+      lastActiveMs = Math.max(lastActiveMs, fs.statSync(logPath(id)).mtimeMs);
+    } catch {
+      /* no log — an editless drive; the sidecar mtime stands */
+    }
+    let workspace = listingWorkspace(codexMeta.cwd);
+    let lastTurn: number | null = null;
+    let tokens = 0;
+    let cached = 0;
+    let model = codexMeta.model ?? '';
+    let effort = '';
+    let rollout: string | null = null;
+    // The agent-meta cwd is the fallback workspace when the rollout can't be resolved (describeSession
+    // uses it too); without it a codex session row shows a blank workspace chip on every surface.
+    if (!workspace && codexMeta.cwd) workspace = workspaceLabel(codexMeta.cwd);
+    try {
+      rollout = findCodexRollout(id);
+      if (rollout) {
+        lastTurn = lastTurnMs(rollout, 'codex');
+        const r = readCodexRollout(rollout);
+        model = r.model || model;
+        effort = r.effort || '';
+        if (!workspace && r.cwd) workspace = workspaceLabel(r.cwd);
+        title = titled(() => codexSessionTitle(rollout!, id)) || title;
+        if (r.tokens) {
+          // Same field semantics the Claude rows hold: `tokens` is NEW work (uncached input +
+          // output), cache traffic counts separately and never impersonates it.
+          tokens = Math.max(0, r.tokens.input - r.tokens.cacheRead) + r.tokens.output;
+          cached = r.tokens.cacheRead + r.tokens.cacheWrite;
+        }
+        lastActiveMs = Math.max(lastActiveMs, (() => { try { return fs.statSync(rollout!).mtimeMs; } catch { return 0; } })());
+      }
+    } catch {
+      /* a rollout is enrichment; the session lists without it */
+    }
+    if (!lastActiveMs) return null;
+    const counts = sessionCounts(id);
+    return {
+      id, shape: 'meta', agent: 'codex', workspace, cwd: codexMeta.cwd, transcript: null, ...(rollout ? { rollout } : {}), review,
+      title, ...(titleInputs.size ? { titleInputs: [...titleInputs] } : {}), lastActiveMs, lastTurn, captureMs: 0, counts, tokens, cached,
+      durationMs: 0, storeBytes: storeBytes(id), model, effort, modelTurn: false,
+    };
+  }
+  // A rollout the source scan passed over (a launch with no prompt, a temp workspace since removed)
+  // still records its workspace in its session_meta.
+  const workspace = found?.workspace ?? listingWorkspace(rolloutOrigin?.recordedCwd ?? readCodexAgentMeta(id)?.cwd);
+  let lastActiveMs = 0;
+  try {
+    lastActiveMs = fs.statSync(found?.source ?? transcript).mtimeMs;
+  } catch {
+    try {
+      lastActiveMs = fs.statSync(logPath(id)).mtimeMs;
+    } catch {
+      /* neither file — skip the row below */
+    }
+  }
+  if (!lastActiveMs) return null;
+  // TWO clocks, on purpose. `lastActiveMs` is the CONVERSATION clock (transcript mtime) — the
+  // reaper and the fold rule key on it, and folding the log in would make reviewing a dead
+  // session look like reviving it (the reapableSessions rule). `liveMs` is the ACTIVITY clock:
+  // a driven session's freshest evidence is its sidecar (appended per streamed chunk) or its
+  // store log (hook captures land mid-turn) — transcript-only liveness flapped working agents
+  // inactive between message boundaries, and the ● marks, ambient status,
+  // and the head re-arm read this one.
+  // Sidecar only — NOT the log file's mtime: keep/undo rewrites the log, so counting it made
+  // REVIEWING a session read as the agent working.
+  // Mid-turn hook captures still register through the transcript itself here.
+  let captureMs = 0;
+  try {
+    captureMs = fs.statSync(captureEventsPath(id)).mtimeMs;
+  } catch {
+    /* no sidecar — the conversation clock stands */
+  }
+  // Tokens/duration and model/effort share ONE incremental cursor over the transcript, so asking for
+  // both costs a single delta parse — and nothing at all for a session whose transcript has not moved.
+  let tokens = 0;
+  let durationMs = 0;
+  let cached = 0;
+  let model = '';
+  let effort = '';
+  try {
+    // Cost this session from ITS OWN transcript, not from a lookup rooted at the caller's cwd —
+    // `transcript` above is the exact file, found by scanning every workspace.
+    const u = sessionUsage(cwd, id, transcript);
+    tokens = u.total;
+    // Cache traffic is COUNTED SEPARATELY, never folded into the headline. The two reconcile by
+    // construction — `tokens + cached` is exactly the old blended figure — so nothing is hidden,
+    // it is just no longer the case that 98.8% of "tokens" is the same context restated.
+    cached = u.cacheRead + u.cacheCreation;
+    durationMs = u.durationMs;
+    const v = sessionVitals(cwd, id, transcript);
+    model = v.model?.label ?? ''; // the display label ('Opus 4.8'), so renderers stay thin
+    effort = v.effort?.level ?? '';
+  } catch {
+    /* an unreadable transcript still identifies a session — report the row without its vitals */
+  }
+  const counts = sessionCounts(id);
+  const codex = !!rawCodex;
+  return {
+    id,
+    shape: 'transcript',
+    // A rollout makes it Codex's, as it already does for the title: a Codex session driven over ACP
+    // has a rollout and a store but no hook metadata, and was listed as `claude`.
+    agent: rawCodex || readCodexAgentMeta(id) ? 'codex' : 'claude',
+    workspace,
+    cwd: found?.cwd ?? readCodexAgentMeta(id)?.cwd,
+    transcript,
+    ...(found?.source ? { source: found.source } : {}),
+    ...(rawCodex ? { rollout: rawCodex } : {}),
+    review,
+    ...(codex ? { title: titled(() => codexSessionTitle(rawCodex, id)), ...(titleInputs.size ? { titleInputs: [...titleInputs] } : {}) } : { titleParts: sessionTitleParts(transcript, id) }),
+    lastActiveMs,
+    lastTurn: lastTurnMs(rawCodex ?? transcript, rawCodex ? 'codex' : 'claude'),
+    captureMs,
+    counts,
+    tokens,
+    cached,
+    durationMs,
+    storeBytes: storeBytes(id),
+    model,
+    effort,
+    modelTurn: counts.edits > 0 || tokens > 0 || cached > 0 || hasModelTurn(transcript),
+  };
+}
+
+/**
+ * This machine's sessions, grouped by workspace. A session in which nothing happened is left out unless
+ * it may still be running (the rule is spelled out where it is applied); `includeEmpty` keeps those
+ * too, for the reaper, to which they are the most finished sessions of all. A Codex Auto-review thread
+ * is left out unless it is `reviewing` (named with `--session`); `includeReviews` keeps them all.
+ */
+export function sessionMeta(cwd: string, reviewing?: string | null, opts: { includeEmpty?: boolean; includeReviews?: boolean } = {}): SessionMeta {
+  const disc = discoverListing(listingTranscripts(), codexSessionSources());
+  // The store first, then every session with a TRANSCRIPT here. A store directory appears the first time the capture
+  // hook fires, so a conversation that only asked, read and ran things has none — and listing the store alone hid it
+  // completely. This used to be patched for exactly two ids, the active one and the pinned one, which is the same hole
+  // with two exceptions cut in it. An Auto-review thread that will not be listed costs nothing to leave out.
+  return composeSessionMeta(cwd, reviewing, opts, [...allStoreSessionIds(), ...disc.byId.keys()], (id) =>
+    disc.byId.get(id)?.review && !opts.includeReviews && id !== reviewing ? null : listingFacts(id, disc, cwd));
+}
+
+/**
+ * What the local index read of a session's store and its workers when it last caught up (index/listing.ts), which a
+ * listing it serves reads instead of the files: the raised hand and the native tab's link as they stood then, and the
+ * workers found finished then, which only a write to their own transcript (one the catch-up sees) can bring back.
+ */
+export interface ListingLive {
+  attention(id: string): { kind: 'permission' | 'input' | 'question' | 'idle-done'; message: string; ts: number } | null;
+  tab(id: string): string | null;
+  /** Each worker found finished, by its transcript's name, with the stamp (mtime:size) it was judged at; null where no
+   *  folder of workers is beside the session's transcript; undefined where the index has not read them yet. */
+  workers(id: string): ReadonlyMap<string, string> | null | undefined;
+}
+
+/**
+ * The listing composed from each session's facts (`listingFacts`, or the local index's copy of them) and what is true of
+ * it right now: deleted from the pickers, its attention, herdr tab, phase and workers, whether it is this workspace's
+ * current session, the one being reviewed, or one Claude Code lists as running. `ids` is every candidate; the current
+ * and the reviewed session are asked for as well. `live` is what the local index read of the sessions' stores and
+ * workers: with it, only a worker that may be running is asked anything.
+ */
+export function composeSessionMeta(
+  cwd: string,
+  reviewing: string | null | undefined,
+  opts: { includeEmpty?: boolean; includeReviews?: boolean },
+  ids: Iterable<string>,
+  factsOf: (id: string) => SessionListingFacts | null,
+  live?: ListingLive,
+): SessionMeta {
+  const active = (() => {
+    try {
+      return resolveSessionId(cwd);
+    } catch {
+      return null;
+    }
+  })();
+  const rows: SessionMetaRow[] = [];
+  const seen = new Set<string>();
+  const hidden = hiddenSessions();
+  // A session in which NOTHING HAPPENED is not listed: no captured edit, no tokens, and no turn the
+  // model produced — Claude Code opened and closed at the prompt, a `/model` or `/login` and nothing
+  // more, a prompt answered only by an API error, a Codex launch with no prompt. Listed, such rows buried
+  // the sessions worth reviewing under titles like "New Claude session · 0 tok". A session that
+  // may still be RUNNING stays, so a new one shows before its first reply: the current or pinned one,
+  // one Claude Code lists as running, a raised hand, a Codex turn in flight, or activity within
+  // SESSION_BUSY_MS.
+  const running = runningClaudeSessions();
+  const now = Date.now();
+  const listed = (row: SessionMetaRow, f: SessionListingFacts): boolean =>
+    opts.includeEmpty === true || row.edits > 0 || row.tokens > 0 || row.cached > 0 ||
+    row.current || row.id === reviewing || running.has(row.id) ||
+    (row.attention !== null && row.attention.kind !== 'idle-done') || row.phase === 'working' ||
+    now - Math.max(row.lastActiveMs, row.liveMs) <= SESSION_BUSY_MS ||
+    (f.transcript !== null && f.modelTurn);
+  const cwds = new Map<string, string | undefined>();
+  const workspaceDirectories = new Map<string, boolean | undefined>();
   const push = (id: string): void => {
     if (seen.has(id)) return;
     seen.add(id);
     if (hidden.has(id)) return; // the user deleted this session — keep it out of every picker
-    const found = byId.get(id);
-    if (!found && excluded.has(id)) return;
-    const rawCodex = found?.source ?? findCodexRollout(id);
-    const rolloutOrigin = rawCodex ? isMirroredTranscript(rawCodex) : null;
-    if (rolloutOrigin?.mirrored) return;
-    const transcript = found?.file ?? findTranscript(cwd, id);
-    if (!transcript) {
-      // Codex hook metadata keeps a captured session discoverable before its rollout is available.
-      const codexMeta = readCodexAgentMeta(id);
-      if (!codexMeta) return; // truly nothing to open
-      // Drop a dead throwaway codex session: one whose recorded workspace is a temp dir AND whose
-      // raw rollout is gone (a scratch `codex exec` from a probe/review — no conversation to resume).
-      // Scoped to temp roots so a real project is never hidden, and only when the rollout is truly
-      // gone: a real codex session run in /tmp keeps its rollout (findCodexRollout finds it) and stays.
-      if (codexMeta && typeof codexMeta.cwd === 'string' && codexMeta.cwd) {
-        const cw = path.resolve(codexMeta.cwd);
-        const tmp = [os.tmpdir(), '/tmp', '/private/tmp', '/var/folders'].some((r) => cw.startsWith(path.resolve(r) + path.sep));
-        if (tmp && !findCodexRollout(id)) return;
-      }
-      let title: string | null = null;
-      let lastActiveMs = 0;
-      try {
-        const events = readCaptureEvents(id, ['turn_start']);
-        for (const event of events) {
-          const prompt = (event.payload as { prompt?: string })?.prompt;
-          if (typeof prompt === 'string') { title = plainTitle(codexPromptText(prompt) ?? '') || null; if (title) break; }
-        }
-        title = codexSessionTitle(rawCodex || '', id) || title;
-        lastActiveMs = fs.statSync(captureEventsPath(id)).mtimeMs;
-      } catch {
-        /* a torn sidecar still identifies the session */
-      }
-      try {
-        lastActiveMs = Math.max(lastActiveMs, fs.statSync(logPath(id)).mtimeMs);
-      } catch {
-        /* no log — an editless drive; the sidecar mtime stands */
-      }
-      let workspace = workspaceOf(codexMeta.cwd);
-      let lastTurn: number | null = null;
-      let tokens = 0;
-      let cached = 0;
-      let model = '';
-      let effort = '';
-      if (codexMeta) {
-        model = codexMeta.model ?? '';
-        // The agent-meta cwd is the fallback workspace when the rollout can't be resolved (describeSession
-        // uses it too); without it a codex session row shows a blank workspace chip on every surface.
-        if (!workspace && codexMeta.cwd) workspace = workspaceLabel(codexMeta.cwd);
-        try {
-          const rollout = findCodexRollout(id);
-          if (rollout) {
-            lastTurn = lastTurnMs(rollout, 'codex');
-            const r = readCodexRollout(rollout);
-            model = r.model || model;
-            effort = r.effort || '';
-            if (!workspace && r.cwd) workspace = workspaceLabel(r.cwd);
-            title = codexSessionTitle(rollout, id) || title;
-            if (r.tokens) {
-              // Same field semantics the Claude rows hold: `tokens` is NEW work (uncached input +
-              // output), cache traffic counts separately and never impersonates it.
-              tokens = Math.max(0, r.tokens.input - r.tokens.cacheRead) + r.tokens.output;
-              cached = r.tokens.cacheRead + r.tokens.cacheWrite;
-            }
-            lastActiveMs = Math.max(lastActiveMs, (() => { try { return fs.statSync(rollout).mtimeMs; } catch { return 0; } })());
-          }
-        } catch {
-          /* a rollout is enrichment; the session lists without it */
-        }
-      }
-      if (!lastActiveMs) return;
-      const row: SessionMetaRow = {
-        id,
-        workspace,
-        origin: 'local',
-        machine: THIS_MACHINE,
-        title: title || UNTITLED_SESSION_TITLES.codex,
-        lastActiveMs,
-        ...(lastTurn === null ? {} : { lastTurnMs: lastTurn || null }),
-        liveMs: lastActiveMs,
-        attention: attentionOf(id, null),
-        tab: readTabLink(id),
-        current: id === active,
-        ...sessionCounts(id),
-        tokens,
-        cached,
-        durationMs: 0,
-        storeBytes: storeBytes(id),
-        storePath: storeDir(id),
-        model,
-        effort,
-        agent: 'codex',
-      };
-      if (listed(row, null)) rows.push(row);
-      return;
-    }
-    // A rollout the source scan passed over (a launch with no prompt, a temp workspace since removed)
-    // still records its workspace in its session_meta.
-    const workspace = found?.workspace ?? workspaceOf(rolloutOrigin?.recordedCwd ?? readCodexAgentMeta(id)?.cwd);
-    let lastActiveMs = 0;
-    try {
-      lastActiveMs = fs.statSync(found?.source ?? transcript).mtimeMs;
-    } catch {
-      try {
-        lastActiveMs = fs.statSync(logPath(id)).mtimeMs;
-      } catch {
-        /* neither file — skip the row below */
-      }
-    }
-    if (!lastActiveMs) return;
-    const lastTurn = lastTurnMs(rawCodex ?? transcript, rawCodex ? 'codex' : 'claude');
-    // TWO clocks, on purpose. `lastActiveMs` is the CONVERSATION clock (transcript mtime) — the
-    // reaper and the fold rule key on it, and folding the log in would make reviewing a dead
-    // session look like reviving it (the reapableSessions rule). `liveMs` is the ACTIVITY clock:
-    // a driven session's freshest evidence is its sidecar (appended per streamed chunk) or its
-    // store log (hook captures land mid-turn) — transcript-only liveness flapped working agents
-    // inactive between message boundaries, and the ● marks, ambient status,
-    // and the head re-arm read this one.
-    // Sidecar only — NOT the log file's mtime: keep/undo rewrites the log, so counting it made
-    // REVIEWING a session read as the agent working.
-    // Mid-turn hook captures still register through the transcript itself here.
-    let liveMs = lastActiveMs;
-    try {
-      liveMs = Math.max(liveMs, fs.statSync(captureEventsPath(id)).mtimeMs);
-    } catch {
-      /* no sidecar — the conversation clock stands */
-    }
-    // Tokens/duration and model/effort share ONE incremental cursor over the transcript, so asking for
-    // both costs a single delta parse — and nothing at all for a session whose transcript has not moved.
-    let tokens = 0;
-    let durationMs = 0;
-    let cached = 0;
-    let model = '';
-    let effort = '';
-    try {
-      // Cost this session from ITS OWN transcript, not from a lookup rooted at the caller's cwd —
-      // `transcript` above is the exact file, found by scanning every workspace.
-      const u = sessionUsage(cwd, id, transcript);
-      tokens = u.total;
-      // Cache traffic is COUNTED SEPARATELY, never folded into the headline. The two reconcile by
-      // construction — `tokens + cached` is exactly the old blended figure — so nothing is hidden,
-      // it is just no longer the case that 98.8% of "tokens" is the same context restated.
-      cached = u.cacheRead + u.cacheCreation;
-      durationMs = u.durationMs;
-      const v = sessionVitals(cwd, id, transcript);
-      model = v.model?.label ?? ''; // the display label ('Opus 4.8'), so renderers stay thin
-      effort = v.effort?.level ?? '';
-    } catch {
-      /* an unreadable transcript still identifies a session — report the row without its vitals */
-    }
-    const row: SessionMetaRow = {
+    const f = factsOf(id);
+    if (!f) return;
+    // Auto-review runs each approval as a thread of its own, titled after the session it reviews, so on a
+    // machine that uses it they can outnumber the sessions they review and push them out of view.
+    if (f.review && !opts.includeReviews && id !== reviewing) return;
+    const row: SessionMetaRow = f.shape === 'meta' ? {
       id,
-      workspace,
+      workspace: f.workspace,
       origin: 'local',
       machine: THIS_MACHINE,
-      title: rawCodex ? codexSessionTitle(rawCodex, id) || UNTITLED_SESSION_TITLES.codex : fastSessionTitle(transcript, id) || UNTITLED_SESSION_TITLES.claude,
-      lastActiveMs,
-      ...(lastTurn === null ? {} : { lastTurnMs: lastTurn || null }),
-      liveMs,
-      attention: attentionOf(id, transcript),
-      tab: readTabLink(id),
+      title: factsTitle(f),
+      lastActiveMs: f.lastActiveMs,
+      ...(f.lastTurn === null ? {} : { lastTurnMs: f.lastTurn || null }),
+      liveMs: f.lastActiveMs,
+      attention: attentionOf(id, null, live),
+      tab: live ? live.tab(id) : readTabLink(id),
       current: id === active,
-      ...sessionCounts(id),
-      tokens,
-      cached,
-      durationMs,
-      storeBytes: storeBytes(id),
+      ...f.counts,
+      tokens: f.tokens,
+      cached: f.cached,
+      durationMs: 0,
+      storeBytes: f.storeBytes,
       storePath: storeDir(id),
-      model,
-      effort,
-      // A rollout makes it Codex's, as it already does for the title: a Codex session driven over ACP
-      // has a rollout and a store but no hook metadata, and was listed as `claude`.
-      agent: rawCodex || readCodexAgentMeta(id) ? 'codex' : 'claude',
-      ...phaseOf(transcript, lastActiveMs),
+      model: f.model,
+      effort: f.effort,
+      agent: f.agent,
+      activeWorkers: [],
+    } : {
+      id,
+      workspace: f.workspace,
+      origin: 'local',
+      machine: THIS_MACHINE,
+      title: factsTitle(f),
+      lastActiveMs: f.lastActiveMs,
+      ...(f.lastTurn === null ? {} : { lastTurnMs: f.lastTurn || null }),
+      liveMs: Math.max(f.lastActiveMs, f.captureMs),
+      attention: attentionOf(id, f.transcript, live),
+      tab: live ? live.tab(id) : readTabLink(id),
+      current: id === active,
+      ...f.counts,
+      tokens: f.tokens,
+      cached: f.cached,
+      durationMs: f.durationMs,
+      storeBytes: f.storeBytes,
+      storePath: storeDir(id),
+      model: f.model,
+      effort: f.effort,
+      agent: f.agent,
+      ...phaseOf(f.transcript!, f.lastActiveMs, id),
+      activeWorkers: live ? workersOf(f.transcript!, id, live) : activeWorkers(f.transcript!, id),
+      // The rollout the listing found, whose mtime `lastActiveMs` is.
+      ...turnOf(f.source, f.lastActiveMs),
     };
-    if (listed(row, transcript)) rows.push(row);
+    if (listed(row, f)) {
+      row.workspacePath = f.cwd;
+      if (f.cwd && !workspaceDirectories.has(f.cwd)) workspaceDirectories.set(f.cwd, workspaceDirectoryExists(f.cwd));
+      row.workspaceExists = f.cwd ? workspaceDirectories.get(f.cwd) : undefined;
+      rows.push(row);
+      cwds.set(id, f.cwd);
+    }
   };
-  for (const id of allStoreSessionIds()) push(id);
-  // …and every session with a TRANSCRIPT here. A store directory appears the first time the capture
-  // hook fires, so a conversation that only asked, read and ran things has none — and listing the
-  // store alone hid it completely. This used to be patched for exactly two ids, the active one and
-  // the pinned one, which is the same hole with two exceptions cut in it. Provenance is still decided
-  // by `push`, which drops anything whose transcript does not resolve under this cwd.
-  for (const id of byId.keys()) push(id);
+  for (const id of ids) push(id);
   if (active) push(active);
   if (reviewing) push(reviewing);
   // Order once in core. Both editors and the CLI render these workspace groups verbatim.
   const groups = new Map<string, { current: boolean; last: number }>();
   for (const row of rows) {
-    const sessionCwd = byId.get(row.id)?.cwd ?? readCodexAgentMeta(row.id)?.cwd;
+    const sessionCwd = cwds.get(row.id);
     const current = row.current || (!!sessionCwd && canonPath(sessionCwd) === canonPath(path.resolve(cwd)));
     const group = groups.get(row.workspace);
     groups.set(row.workspace, { current: current || !!group?.current, last: Math.max(row.lastActiveMs, group?.last ?? 0) });
   }
+  // The id settles a tie in time, so the order is the same however the candidates were enumerated (a directory's
+  // own order, or the local index's).
   rows.sort((a, b) => {
     const ag = groups.get(a.workspace)!, bg = groups.get(b.workspace)!;
-    return Number(bg.current) - Number(ag.current) || bg.last - ag.last || a.workspace.localeCompare(b.workspace) || b.lastActiveMs - a.lastActiveMs;
+    return Number(bg.current) - Number(ag.current) || bg.last - ag.last || a.workspace.localeCompare(b.workspace) || b.lastActiveMs - a.lastActiveMs ||
+      (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
   });
   return { active, sessions: rows };
 }
@@ -1058,7 +1332,7 @@ export interface SessionCounts {
 // (a file created then deleted is not an edit to review); 5: counts are over DISPLAY units (same-code
 // collapsed), matching the change map; 4: line deltas moved to the per-blob-pair cache (deltaCache);
 // 2: added `files`.
-const COUNTS_SIDECAR_VERSION = 7;
+const COUNTS_SIDECAR_VERSION = 8;
 
 /**
  * A session's captured-edit counts, cached in the same sidecar the title uses and keyed to the LOG's
@@ -1138,6 +1412,53 @@ export function sessionCounts(sessionId: string): SessionCounts {
   return counts;
 }
 
+/** A share of a session's captured edits: review units, how many of them still await review, and their lines. */
+export interface UnitTotals {
+  edits: number;
+  pending: number;
+  added: number;
+  removed: number;
+}
+
+const callUnits = new Map<string, { stamp: string; units: Map<string, UnitTotals> }>();
+
+/**
+ * The session's review units (the ones sessionCounts counts) summed by the tool call that made each one's latest
+ * edit, which the capture hook records as the record's `toolCallId`, so a worker's own calls find its share of the
+ * session's edits. A unit recorded without a call id is nobody's. Remembered against the log's stamp for the life
+ * of the process, once every unit's lines could be counted.
+ */
+export function unitsByCall(sessionId: string): Map<string, UnitTotals> {
+  let stamp: string;
+  try {
+    const st = fs.statSync(logPath(sessionId));
+    stamp = `${st.mtimeMs}:${st.size}`;
+  } catch {
+    return new Map(); // no store: the session captured nothing
+  }
+  const key = `${rootDir()}\u0000${sessionId}`;
+  const hit = callUnits.get(key);
+  if (hit?.stamp === stamp) return hit.units;
+  const units = new Map<string, UnitTotals>();
+  const deltas = deltaCache(sessionId);
+  for (const r of visibleEdits(sessionId)) {
+    if (!r.toolCallId) continue;
+    let u = units.get(r.toolCallId);
+    if (!u) units.set(r.toolCallId, (u = { edits: 0, pending: 0, added: 0, removed: 0 }));
+    const d = deltas.get(r);
+    u.edits++;
+    if (r.status === 'pending') u.pending++;
+    u.added += d.added;
+    u.removed += d.removed;
+  }
+  deltas.flush();
+  if (deltas.complete()) {
+    if (callUnits.size >= 64) callUnits.clear();
+    callUnits.set(key, { stamp, units });
+  }
+  return units;
+}
+
 /**
  * How long a delete waits for a capture in progress. VS Code's extension host and the terminal app call
  * deleteSession on their own thread, so a capture that holds the mutex longer is a refusal to retry, not a
@@ -1150,9 +1471,10 @@ const DELETE_WAIT_MS = 500;
  * The agent's own transcript or rollout is left untouched (deleting Claude Code's or Codex's files
  * is not ours to do); the hidden list is what keeps the session out of the listings regardless.
  *
- * The purge is for good: `unhideSession` (`oak sessions --undelete`) puts the session back in the
- * pickers, never its edits. An edit still pending review loses its before-snapshot with it, so the
- * agent's change on disk can no longer be undone. A session that holds any is therefore refused
+ * The purge is for good, unless oak sync's backup folder keeps a copy of the session's store (deleteWords):
+ * `unhideSession` (`oak sessions --undelete`) puts the session back in the pickers, never its edits, which only
+ * the next `oak sync now` brings back from that folder. An edit still pending review loses its before-snapshot
+ * with it, so the agent's change on disk can no longer be undone here. A session that holds any is therefore refused
  * unless the caller's confirmation named them: `confirmedPending` is the count it showed (the CLI's
  * `--force` passes Infinity), and a delete that finds more pending than that is refused.
  * The count is of review units, as the dialog's is, so an edit that rewrites a change the
@@ -1163,10 +1485,14 @@ const DELETE_WAIT_MS = 500;
  * alone. The checks and the purge hold the session's capture mutex, so no capture lands between them.
  */
 export function deleteSession(sessionId: string, opts: { confirmedPending?: number; seenThrough?: number } = {}): void {
+  // A folder the store keeps for itself (oak sync's) is no session: hiding it would send its delete to every machine.
+  if (isReservedStoreDir(sessionId)) throw new Error(`${sessionId} is no session but a folder OAK's store keeps for itself, so it was not deleted`);
   const confirmed = typeof opts.confirmedPending === 'number' && opts.confirmedPending >= 0 ? opts.confirmedPending : 0;
   const seenThrough = typeof opts.seenThrough === 'number' && Number.isFinite(opts.seenThrough) ? opts.seenThrough : Infinity;
   try {
-    withFileMutation(captureMutex(sessionId), () => deleteSessionLocked(sessionId, confirmed, seenThrough), DELETE_WAIT_MS);
+    // The capture mutex is named for the store once any move is over: named before the wait, a delete that waited out a
+    // move locked the session where the store had been, beside a capture locking it where the store went.
+    outsideStoreMoves(() => withFileMutation(captureMutex(sessionId), () => deleteSessionLocked(sessionId, confirmed, seenThrough), DELETE_WAIT_MS));
   } catch (e) {
     if (e instanceof FileBusyError) throw new Error(`${sessionId} is recording an edit right now, so it was not deleted; try again in a moment`);
     throw e;
@@ -1182,13 +1508,18 @@ function deleteSessionLocked(sessionId: string, confirmed: number, seenThrough: 
     const edits = `${pending} edit${pending === 1 ? '' : 's'} pending review`;
     throw new Error(confirmed
       ? `${sessionId} has ${edits}, more than the ${confirmed} this delete confirmed; deleting the session would purge the rest unseen, so it was not deleted`
-      : `${sessionId} has ${edits}; deleting the session would purge ${pending === 1 ? 'it' : 'them'} for good, so it was not deleted`);
+      : `${sessionId} has ${edits}; deleting the session would purge ${pending === 1 ? 'it' : 'them'} ${(require('./sync-engine') as typeof import('./sync-engine')).deleteWords().purged}, so it was not deleted`);
   }
   const unseen = log.filter((r) => r.status === 'pending' && r.id > seenThrough).length;
   if (unseen)
     throw new Error(`${sessionId} captured ${unseen === 1 ? 'an edit' : `${unseen} edits`} after the listing this delete was confirmed from, still pending review; deleting the session would purge ${unseen === 1 ? 'it' : 'them'} unseen, so it was not deleted`);
   hideSession(sessionId);
-  try { removeSession(sessionId); } catch { /* no store dir (a transcript-only session) — hiding is enough */ }
+  // A deliberate delete, which oak sync carries as one (a tombstone), not a cleanup: an undelete can bring it back.
+  try { removeSession(sessionId, { evict: false }); } catch { /* no store dir (a transcript-only session) — hiding is enough */ }
+  // Forgotten in the local index at once, its full-text entries with it, and in this machine's record log, from whichever
+  // surface deleted it (the terminal app and VS Code delete in place). Nothing happens where the index is unavailable:
+  // the next catch-up by a CLI purges it.
+  try { storeIndexHooks()?.forget(sessionId); } catch { /* the next catch-up purges it */ }
 }
 
 /** Bump when the stored shape changes. */
@@ -1266,7 +1597,8 @@ function deltaCache(sessionId: string): { get(r: EditRecord): { added: number; r
 //    Remote Control title between them is looked up at read time, never cached here (2026-09-24).
 // 5: a prompt title loses its markdown heading markers on EVERY line, which only a rescan can do: a
 //    v4 part has its lines already joined (2026-09-24).
-const TITLE_SIDECAR_VERSION = 5;
+// 6: a prompt title cut at 64 ends where a character does; a v5 part could end inside an emoji (2026-10-17).
+const TITLE_SIDECAR_VERSION = 7;
 const TITLE_TAIL_SCAN = 4 * 1024 * 1024; // title records ride near the end; latest wins
 const TITLE_HEAD_SCAN = 256 * 1024; // the first user prompt sits near the top
 
@@ -1394,9 +1726,7 @@ function scanTitleParts(transcriptPath: string): SessionTitleParts | null {
       } catch {
         continue; // the last line may be cut by the byte budget
       }
-      const msg = o.message;
-      if (!msg || msg.role !== 'user' || o.isSidechain === true || o.isCompactSummary === true) continue;
-      const clean = personPromptOf(msg);
+      const clean = userPrompt(o, false);
       if (clean) {
         parts.prompt = normalizeSessionTitle(clean);
         break;
@@ -1447,6 +1777,7 @@ export function newInsightFacts(): TranscriptInsights {
 }
 
 export function foldInsightFacts(facts: TranscriptInsights, o: any): void {
+  if (o?.type === 'api-request-blob') return;
   // Claude Code writes an `ai-title` entry whenever it (re)titles the session — keep the latest.
   if (o.type === 'ai-title' && typeof o.aiTitle === 'string' && o.aiTitle.trim()) {
     facts.title = o.aiTitle.trim();
@@ -1471,8 +1802,8 @@ export function foldInsightFacts(facts: TranscriptInsights, o: any): void {
   // A compaction summary is likewise excluded: it's a synthesized user turn ("This session is being
   // continued from a previous conversation…"), so on a compacted session it would otherwise become
   // the session title and the session picker's label.
-  if (facts.firstUserPrompt === null && msg && msg.role === 'user' && o.isSidechain !== true && o.isCompactSummary !== true) {
-    const clean = personPromptOf(msg);
+  if (facts.firstUserPrompt === null) {
+    const clean = userPrompt(o, false);
     if (clean) facts.firstUserPrompt = clean;
   }
   if (!msg || msg.role !== 'assistant' || !Array.isArray(msg.content)) return;
@@ -1620,6 +1951,7 @@ function contextSourcesUncached(transcriptPath: string): ContextSource[] {
       });
       continue;
     }
+    if (o?.type === 'api-request-blob') continue;
     const msg = o.message;
     if (!msg || msg.role !== 'assistant' || !Array.isArray(msg.content)) continue;
     for (const b of msg.content) {
@@ -2041,6 +2373,16 @@ export interface UsageLine {
    */
   rollingLimits: boolean | null;
   /**
+   * When this Claude account last answered that it has no five-hour limit (epoch ms), while that answer is the newest:
+   * an account usage answer that carries the weekly window and no 5h window (`five_hour` null or missing, or its
+   * utilization null), as a verified Ultra account gives, at least as new as the newest answer that carried a 5h window,
+   * on this machine or another machine of the same account (its brief, or its readings in the local index). Only these
+   * answers decide it, never a share. While it is set, every surface hides the 5h readout, and fiveHourPct, fiveReset and
+   * the 5h token and dollar figures are null.
+   * Null while the newest answer carried a 5h window, or none has said otherwise.
+   */
+  fiveNoneAt: number | null;
+  /**
    * The rest of what the SHIPPED statusline draws (0.10.0). The dashboard renders that statusline
    * verbatim, so it needs the same inputs — and the statusline is the only thing that HAS them:
    * they arrive in Claude Code's per-turn payload, which reaches no other surface. It persists
@@ -2054,6 +2396,9 @@ export interface UsageLine {
   tokensIn: number | null; // ↑ input
   tokensOut: number | null; // ↓ output
   tokensCacheRead: number | null; // ↺ cache reads
+  /** The rendered session with every agent it started (`oak usage`'s sessionTreeTokens, as the status line last drew
+   *  it); null when it started none. */
+  tokensTree: { agents: number; input: number; output: number; cacheRead: number } | null;
   /** The projected 100% budgets behind the ~est/total suffixes. Computed inside the statusline's
    *  own self-calibrating scan and previously thrown away — persisted now so the dashboard can
    *  print the same denominator instead of a bare estimate. */
@@ -2062,8 +2407,7 @@ export interface UsageLine {
   /**
    * MEASURED tokens for the rolling windows, summed across the machines this account works on.
    *
-   * Provider percentages are account-wide; these token measurements come only from transcripts
-   * on this machine. Field names remain stable for editor consumers; usageScope is always "here".
+   * The database supplies the union; without it these retain the status line's measurements.
    */
   fiveMeasuredAll: number | null;
   weekMeasuredAll: number | null;
@@ -2082,10 +2426,11 @@ export interface UsageLine {
    *  older than 0.10.0 is installed: it writes a cache without the token split, the branch, the
    *  think state, the plan totals or the spend ledger — and nothing else could tell you that. */
   statuslineVersion?: number | null;
-  /** True when these numbers came from CODEX's own reporting rather than Claude Code's statusline.
-   *  Said out loud because the two clients measure different accounts, and a reader with both wants
-   *  to know whose quota the bar is drawing. */
+  /** Provider of the unprefixed windows: the active or requested session's, defaulting to Claude.
+   *  Both accounts are also available under the CLI's claude* and gpt* fields. */
   usageFrom?: 'claude' | 'codex';
+  /** When other machines' usage arrived, for the account estimates' tooltip. */
+  usageFreshness?: string;
   /** Credit left on a codex account that reports one, and whether the plan is uncapped. `unlimited`
    *  is a different fact from a zero balance and never renders as `$0`. */
   creditBalance?: number | null;
@@ -2114,6 +2459,9 @@ export interface UsageLine {
    *  surface shows; for enterprise the total is absent (no quota to project from). */
   monthCost: number | null;
   monthCostTotal: number | null;
+  /** The month's spend as Claude Code reported it, session by session (the status line's ledger), on a plan with no
+   *  rolling windows (pay-as-you-go API, Enterprise): a charge, where `monthCost` is an estimate. Null otherwise. */
+  monthSpend: number | null;
   /** ~30-day token pair: account-wide used and the projected budget (four weekly cycles). */
   monthTokens: number | null;
   monthTokensTotal: number | null;
@@ -2127,6 +2475,48 @@ export interface UsageLine {
   /** The live plan-limit promotion the statusline knows about: label + date span, e.g.
    *  {label:"+50%", dates:"5/13-9/13"}. The budgets shown already INCLUDE its extra tokens. */
   promo: { label: string; dates: string } | null;
+  /** The saved machine whose reading of the same Claude account a window shows (machine-usage.ts), by its
+   *  herdr label; null when the window is this machine's own reading. */
+  fiveMachine: string | null;
+  weekMachine: string | null;
+  fableMachine: string | null;
+  monthMachine: string | null;
+  /** What the readouts print to name them: '' when every window shown is this machine's own, the machine's
+   *  label when every one came from it, else each machine with its windows (`build-box: 5h wk`). The Stats
+   *  panels print this one: they show every window. */
+  machineNote: string;
+  /** machineNote over the windows the status bars show (wk, mo), which leave the per-model cap to their
+   *  tooltips: a bar names no window it does not show, so a cap alone from a saved machine names none there. */
+  machineBarNote: string;
+  /** machineNote over the windows the status bars' tooltips show (wk, the per-model cap, mo): no bar shows the
+   *  5-hour window, in its text or its tooltip. */
+  machineTipNote: string;
+  /** True when a saved machine's reading is shown although this machine has no Claude Code login to match its
+   *  account against: it stands for the one account the saved machines name, and the tooltips say so. */
+  machineUnmatched: boolean;
+  /** When the oldest window shown from a saved machine was measured there (epoch ms, read by this machine's
+   *  clock: that machine's stamp less its clock's difference from this one); null when every window shown is
+   *  this machine's own. A machine that stops answering keeps its last reading, so this, not this machine's
+   *  cache time, says how old a reading named by machineNote is. */
+  machineAt: number | null;
+  /** machineAt over the windows machineTipNote names. */
+  machineTipAt: number | null;
+  /**
+   * What the saved machines of this account measured of their own turns, which the status line adds to this machine's
+   * own when it calibrates the token and dollar estimates and sums the month (fillFromMachines). The shares are the
+   * account's, so a machine that calibrated on its own transcripts alone credited every other machine's usage to its
+   * own few turns. Per window: the tokens, cache reads and spend of each machine whose figures count (the same account,
+   * this machine's window, fresh; the week with the per-model cap's family), that window (`reset`, epoch ms; the month
+   * by its bill cycle, `start` to `reset`), and which machines it holds (`hosts`, their sorted host hashes: the status
+   * line starts its smoothing over when they number more than any calibration held). `machines` names them for the
+   * readouts (`build-box, lab-box`). Null when none counts.
+   */
+  machineMeasured: {
+    five: { tok: number; reads: number; cost: number; reset: number; hosts: string } | null;
+    week: { tok: number; reads: number; cost: number; fable: number; fableReads: number; reset: number; hosts: string } | null;
+    month: { tok: number; reads: number; cost: number; start: number; reset: number; hosts: string } | null;
+    machines: string;
+  } | null;
 }
 
 /** Statusline cache older than this ⇒ the UI should surface its age and the terminal remedy. */
@@ -2137,10 +2527,13 @@ export const USAGE_STALE_MS = 5 * 60 * 1000;
 const USAGE_TAIL_BYTES = 2 * 1024 * 1024;
 
 /** Claude Code sends `resets_at` as either epoch seconds (a number) or an ISO string → epoch ms. */
-/** Claude Code 2.1.263 stopped sending resets_at (the percentages still arrive), so a cached or
- *  remote reset anchor can be PAST — roll it forward by whole periods at read time, like the
- *  statusline script does: exact for the periodic weekly window, the client's own one-period
- *  estimate for 5h. Writers keep the original anchor, so the estimate never compounds. */
+/** Claude Code 2.1.263 stopped sending resets_at (the percentages still arrive; current versions send
+ *  it again, and this stays the fallback for the versions that do not), so a cached or remote reset
+ *  anchor can be PAST — roll it forward by whole periods at read time, like the
+ *  statusline script does: exact for the periodic weekly windows. A 5-hour window starts only with
+ *  the first message after the last one ended, so a passed 5-hour anchor is rolled only for a share
+ *  measured after it with no reset of its own (usageReading). Writers keep the original anchor, so
+ *  the estimate never compounds. */
 function rollFwd(ms: number | null, periodMs: number): number | null {
   if (ms === null) return null;
   const now = Date.now();
@@ -2171,12 +2564,102 @@ function toEpochMs(v: unknown): number | null {
   return null;
 }
 
+/** When this machine's shares were measured (epoch seconds; absent for a cache written before the stamps),
+ *  and whether the bill cycle its month figures were measured in has ended. */
+interface UsageStamps {
+  five?: number;
+  week?: number;
+  fable?: number;
+  monthEnded: boolean;
+  /** What this machine's status line last measured of its own turns, with when and in which windows (the brief sends
+   *  it for the saved machines to add up); absent from a cache that records no such measurement. */
+  own?: Omit<import('./machine-usage').MachineUsageOwn, 'host'>;
+  /** When this machine's account read last answered with no 5h window, and last answered with one (five_none_at and
+   *  five_seen_at in the cache), which noFiveHourLimitIfNewest weighs. */
+  fiveNone?: number;
+  fiveSeen?: number;
+}
+
 /** The status line's usage row (its last line): context fill + 5h/week plan usage. Source of truth is
  *  the exact per-turn values claude-statusline persisted to `statusline-last.json`; if that's absent we
- *  fall back to a context estimate from the session transcript's latest usage (5h/week stay null). */
+ *  fall back to a context estimate from the session transcript's latest usage (5h/week stay null). Where this
+ *  machine has no current share of the Claude account, a saved machine's reading of it fills in
+ *  (fillFromMachines). */
 export function usageLine(cwd: string, sessionId: string): UsageLine {
+  const { out, at } = usageReading(cwd, sessionId);
+  if (out.usageFrom !== 'codex') {
+    fillFromMachines(out, at);
+    fillAccountTotals(out);
+  }
+  return out;
+}
+
+/** Account estimates use the same measured union and sample on every machine. A database without
+ *  any usage yet leaves the existing status line reading in place while its first build runs. */
+function fillAccountTotals(out: UsageLine): void {
+  if (process.env.OAK_INDEX === 'off') return;
+  const ix = require('./index/api') as typeof import('./index/api');
+  const database = ix.openIndexReadOnly();
+  if (!database.ok) return;
+  let t: ReturnType<typeof ix.indexedUsageTotals>;
+  let previousWeek: number | null = null;
+  {
+    try {
+      out.usageFreshness = ix.usageFreshness(database.db);
+      if (!database.db.prepare("SELECT 1 FROM usage_messages WHERE agent = 'claude' LIMIT 1").get()) return;
+      const account = ix.countedAccount(database.db).account;
+      for (const kind of ['week'] as const) {
+        const row = database.db.prepare(`SELECT pct, reset_ms, label FROM usage_readings
+          WHERE agent = 'claude' AND kind = ? AND (? IS NULL OR account = ?) AND measured_ms <= ?
+          AND reset_ms > ? AND pct IS NOT NULL ORDER BY measured_ms DESC, machine_id DESC LIMIT 1`)
+          .get(kind, account, account, Date.now(), Date.now()) as { pct: number; reset_ms: number; label: string } | undefined;
+        if (!row) continue;
+        out.weekPct = row.pct; out.weekReset = row.reset_ms;
+      }
+      if (!out.weekPct) {
+        const last = database.db.prepare(`SELECT pct, reset_ms, measured_ms FROM usage_readings WHERE agent = 'claude' AND kind = 'week'
+          AND (? IS NULL OR account = ?) AND pct > 0 AND reset_ms IS NOT NULL AND measured_ms BETWEEN ? AND ?
+          ORDER BY measured_ms DESC, machine_id DESC LIMIT 1`).get(account, account, Date.now() - 35 * 86400_000, Date.now()) as
+          { pct: number; reset_ms: number; measured_ms: number } | undefined;
+        if (last) {
+          const old = ix.windowTotals(database.db, 'claude', { start: last.reset_ms - 7 * 86400_000,
+            end: Math.min(last.measured_ms + 1, last.reset_ms), reset: last.reset_ms }, account, ix.selfIds(database.db));
+          if (old.tokens > 0) previousWeek = Math.round(old.tokens * 100 / last.pct);
+        }
+      }
+    } finally { database.close(); }
+  }
+  t = ix.indexedUsageTotals({ fiveReset: out.fiveReset, weekReset: out.weekReset });
+  if (!t) return;
+  const budget = (tokens: number, pct: number | null): number | null => pct !== null && pct > 0 && tokens > 0 ? Math.round(tokens * 100 / pct) : null;
+  out.fiveTokens = out.fiveMeasuredAll = t.five.tokens; out.fiveReads = t.five.cacheRead; out.fiveCost = t.five.spend;
+  out.weekTokens = out.weekMeasuredAll = t.week.tokens; out.weekReads = t.week.cacheRead; out.weekCost = t.week.spend;
+  out.cost = { session: out.cost?.session ?? null, five: t.five.spend || null, week: t.week.spend || null };
+  out.fiveTotal = budget(t.five.tokens, out.fiveHourPct);
+  out.weekTotal = budget(t.week.tokens, out.weekPct) ?? previousWeek;
+  out.fiveCostTotal = out.fiveHourPct && t.five.spend ? t.five.spend * 100 / out.fiveHourPct : null;
+  out.weekCostTotal = out.weekPct && t.week.spend ? t.week.spend * 100 / out.weekPct : null;
+  out.fableTokens = t.week.topTier.tokens; out.fableReads = t.week.topTier.cacheRead;
+  out.fableTotal = budget(t.week.topTier.tokens, out.fablePct);
+  const weeks = (t.month.end - t.month.start) / (7 * 86400_000);
+  out.monthTokens = t.month.tokens; out.monthReads = t.month.cacheRead; out.monthCost = t.month.cost;
+  out.monthSpend = t.month.spend; out.monthReset = t.month.end;
+  out.monthTokensTotal = out.weekTotal === null ? null : Math.round(out.weekTotal * weeks);
+  out.monthCostTotal = out.monthTokensTotal && t.month.tokens > 0 ? t.month.cost * out.monthTokensTotal / t.month.tokens : null;
+  out.machineMeasured = ix.othersMeasured(t);
+  out.usageScope = 'account database';
+  if (out.fiveNoneAt !== null) {
+    out.fiveTokens = out.fiveMeasuredAll = out.fiveReads = out.fiveTotal = out.fiveCost = out.fiveCostTotal = null;
+    out.cost.five = null;
+  }
+}
+
+/** usageLine from this machine's own readings alone, with when its shares were measured. `judged` false keeps a
+ *  share measured before its window (machineUsageBrief: the machine reading it judges that by its own clock). */
+function usageReading(cwd: string, sessionId: string, judged = true): { out: UsageLine; at: UsageStamps } {
   const out: UsageLine = {
     ctx: null,
+    usageFrom: 'claude',
     fiveHourPct: null,
     weekPct: null,
     fiveReset: null,
@@ -2192,6 +2675,7 @@ export function usageLine(cwd: string, sessionId: string): UsageLine {
     statuslineCache: false,
     cachedAtMs: null,
     rollingLimits: null,
+    fiveNoneAt: null,
     localWindows: null,
     cost: null,
     fiveCost: null,
@@ -2200,6 +2684,7 @@ export function usageLine(cwd: string, sessionId: string): UsageLine {
     weekCostTotal: null,
     monthCost: null,
     monthCostTotal: null,
+    monthSpend: null,
     monthTokens: null,
     monthTokensTotal: null,
     monthReset: null,
@@ -2213,11 +2698,23 @@ export function usageLine(cwd: string, sessionId: string): UsageLine {
     tokensIn: null,
     tokensOut: null,
     tokensCacheRead: null,
+    tokensTree: null,
     fiveTotal: null,
     weekTotal: null,
     fiveMeasuredAll: null,
     weekMeasuredAll: null,
     usageScope: 'here',
+    fiveMachine: null,
+    weekMachine: null,
+    fableMachine: null,
+    monthMachine: null,
+    machineNote: '',
+    machineBarNote: '',
+    machineTipNote: '',
+    machineUnmatched: false,
+    machineAt: null,
+    machineTipAt: null,
+    machineMeasured: null,
   };
   // Choose the runtime before loading any account cache; fallback after filling Claude fields
   // cannot undo cross-provider contamination. Tokens and context use this session's exact source.
@@ -2226,7 +2723,7 @@ export function usageLine(cwd: string, sessionId: string): UsageLine {
   const isCodex = !!rawCodex || !!cx.readCodexAgentMeta(sessionId);
   if (isCodex) {
     out.usageFrom = 'codex';
-    if (!rawCodex) return out;
+    if (!rawCodex) return { out, at: { monthEnded: false } };
     const cu = cx.codexUsageLive(rawCodex);
     out.cachedAtMs = cu.snapshotMs;
     out.fiveHourPct = cu.fivePct; out.weekPct = cu.weekPct;
@@ -2239,6 +2736,7 @@ export function usageLine(cwd: string, sessionId: string): UsageLine {
     if (cu.tokens) { out.tokensIn = cu.tokens.input; out.tokensOut = cu.tokens.output; out.tokensCacheRead = cu.tokens.cacheRead; }
     const g = cx.gptUsagePanel(sessionId);
     if (g) {
+      out.usageFreshness = g.usageFreshness;
       out.weekTokens = g.weekTok;
       out.monthTokens = g.monthTok; out.monthReads = g.monthReads;
       out.monthCost = g.monthCost; out.monthReset = g.monthReset;
@@ -2249,7 +2747,7 @@ export function usageLine(cwd: string, sessionId: string): UsageLine {
         out.rollingLimits = g.fivePct !== null || g.weekPct !== null;
       }
     }
-    return out;
+    return { out, at: { monthEnded: false } };
   }
   const fin = (v: unknown): v is number => typeof v === 'number' && isFinite(v); // reject NaN from a corrupt cache
   const cachePath = path.join(claudeConfigDir(), 'statusline-last.json');
@@ -2257,9 +2755,13 @@ export function usageLine(cwd: string, sessionId: string): UsageLine {
   // week_at and fable_at when a fresh share arrives. A cache written before fable_at existed dates its
   // Fable share by its last pull, which is never earlier than the share.
   let measuredAt: { five?: number; week?: number; fable?: number } = {};
+  let own: UsageStamps['own'];
+  // When the account last answered with no 5h window, and with one (epoch seconds; noFiveHourLimitIfNewest).
+  let answers: Pick<UsageStamps, 'fiveNone' | 'fiveSeen'> = {};
   try {
     const last = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
     measuredAt = { five: fin(last.five_at) ? last.five_at : undefined, week: fin(last.week_at) ? last.week_at : undefined, fable: fin(last.fable_at) ? last.fable_at : fin(last.api_ts) ? last.api_ts : undefined };
+    answers = { ...(fin(last.five_none_at) ? { fiveNone: last.five_none_at } : {}), ...(fin(last.five_seen_at) ? { fiveSeen: last.five_seen_at } : {}) };
     out.statuslineCache = true; // the cache exists and parsed — statusline is installed & writing
     out.cachedAtMs = fs.statSync(cachePath).mtimeMs;
     if (fin(last.ctx_pct)) {
@@ -2294,6 +2796,9 @@ export function usageLine(cwd: string, sessionId: string): UsageLine {
     if (fin(last.tok_in) && last.tok_in > 0) out.tokensIn = last.tok_in;
     if (fin(last.tok_out) && last.tok_out > 0) out.tokensOut = last.tok_out;
     if (fin(last.tok_cache) && last.tok_cache > 0) out.tokensCacheRead = last.tok_cache;
+    const tree = last.tok_tree;
+    if (tree && typeof tree === 'object' && fin(tree.agents) && tree.agents > 0)
+      out.tokensTree = { agents: tree.agents, input: fin(tree.input) ? tree.input : 0, output: fin(tree.output) ? tree.output : 0, cacheRead: fin(tree.cacheRead) ? tree.cacheRead : 0 };
     if (fin(last.five_total) && last.five_total > 0) out.fiveTotal = last.five_total;
 
     // but only from a v3 statusline, and only when the reading was taken INSIDE the current
@@ -2301,6 +2806,27 @@ export function usageLine(cwd: string, sessionId: string): UsageLine {
     // (2.5-3x high, measured, and double-counting the moment machines are added up), and a
     // measurement from before the window opened counts tokens that have already rolled out.
     const measV3 = typeof last.v === 'number' && last.v >= 3;
+    // What the status line's last scan measured of this machine's own turns, with when it ran and the windows it counted
+    // them in (seconds in the cache): what the saved machines add to their own (machineUsageBrief). Only from a scan that
+    // recorded both: figures that cannot be placed in a window are added to none.
+    const sec = (v: unknown): number | null => (fin(v) && v > 0 ? v * 1000 : null);
+    const ownAt = measV3 ? sec(last.meas_at) : null;
+    if (ownAt !== null) {
+      const n = (v: unknown): number | null => (fin(v) && v >= 0 ? v : null);
+      const win = (tok: unknown, reads: unknown, cost: unknown, reset: number | null): { tok: number; reads: number | null; cost: number | null; reset: number } | null => {
+        const t = n(tok);
+        return t !== null && reset !== null ? { tok: t, reads: n(reads), cost: n(cost), reset } : null;
+      };
+      const week = win(last.week_meas, last.week_reads_own, last.week_cost_own, sec(last.week_meas_reset));
+      const month = win(last.month_meas, last.month_reads_own, last.month_cost_own, sec(last.month_meas_end));
+      const start = sec(last.month_meas_start);
+      own = {
+        at: ownAt,
+        five: win(last.five_meas, last.five_reads_own, last.five_cost_own, sec(last.five_meas_reset)),
+        week: week && { ...week, fable: n(last.fable_meas), fableReads: n(last.fable_reads_own) },
+        month: month && start !== null && start < month.reset ? { ...month, start } : null,
+      };
+    }
     const takenInside = (resetMs: number | null, windowMs: number): boolean =>
       out.cachedAtMs !== null &&
       out.cachedAtMs >= (resetMs !== null ? rollFwd(resetMs, windowMs)! - windowMs : Date.now() - windowMs);
@@ -2310,7 +2836,11 @@ export function usageLine(cwd: string, sessionId: string): UsageLine {
     if (fin(last.week_cost_total) && last.week_cost_total > 0) out.weekCostTotal = last.week_cost_total;
     if (fin(last.month_cost) && last.month_cost > 0) out.monthCost = last.month_cost;
     if (fin(last.month_cost_total) && last.month_cost_total > 0) out.monthCostTotal = last.month_cost_total;
-    if (fin(last.month_tok) && last.month_tok > 0) out.monthTokens = last.month_tok;
+    // A month the statusline MEASURED at zero (a v3 cache that wrote the cycle's budget and reset beside
+    // it: a new bill cycle with no turns yet) is 0, which reads 0%; read as "no data", it hid the month.
+    // A cache that never measured the month leaves it unknown.
+    const monthMeasured = measV3 && fin(last.month_tok_total) && last.month_tok_total > 0 && fin(last.month_reset) && last.month_reset > 0;
+    if (fin(last.month_tok) && (last.month_tok > 0 || (last.month_tok === 0 && monthMeasured))) out.monthTokens = last.month_tok;
     if (fin(last.month_tok_total) && last.month_tok_total > 0) out.monthTokensTotal = last.month_tok_total;
     if (fin(last.month_reset) && last.month_reset > 0) out.monthReset = toEpochMs(last.month_reset);
     if (fin(last.month_reads) && last.month_reads > 0) out.monthReads = last.month_reads;
@@ -2343,6 +2873,7 @@ export function usageLine(cwd: string, sessionId: string): UsageLine {
       if (measV3 && fin(last.five_meas) && last.five_meas > 0) w.push({ label: '5h', tokens: last.five_meas });
       if (measV3 && fin(last.week_meas) && last.week_meas > 0) w.push({ label: 'wk', tokens: last.week_meas }); // "wk", as the status line itself prints it
       if (w.length) out.localWindows = w;
+      if (fin(last.month_spend) && last.month_spend > 0) out.monthSpend = last.month_spend;
       // SPEND, as the client that computes it reported it. `cost.total_cost_usd` is Claude Code's
       // own per-session estimate; the statusline records each session's latest figure with the
       // moment it arrived, so a window total is a sum of REPORTED numbers rather than a second
@@ -2429,7 +2960,7 @@ export function usageLine(cwd: string, sessionId: string): UsageLine {
           } catch {
             continue;
           }
-          if (o?.isSidechain === true) continue; // a subagent's usage is not the main-chain context
+          if (o?.type === 'api-request-blob' || o?.isSidechain === true) continue; // a subagent's usage is not the main-chain context
           const u = o?.message?.usage;
           if (u && (u.input_tokens != null || u.cache_read_input_tokens != null)) latest = u;
         }
@@ -2446,33 +2977,363 @@ export function usageLine(cwd: string, sessionId: string): UsageLine {
       }
     }
   }
-  out.fiveReset = rollFwd(out.fiveReset, 5 * 3600_000);
+  // AN ENDED 5-HOUR WINDOW IS OVER. A 5-hour window starts only with the first message after the last one ended, so a
+  // passed 5-hour reset rolled forward by whole periods named a window that may not exist: after a night with no use,
+  // a countdown of 48 minutes for a window that had begun a minute before and ran five hours. Once the reset has passed
+  // and nothing reports a newer window, the share is 0 and there is no reset. Its token estimate, measured tokens and
+  // cache reads were the ended window's, so they go too. One share still rolls the anchor forward: a share above 0
+  // measured after it, whose own reset is unknown (from a Claude Code that sends no resets_at, as 2.1.263 did). So does
+  // a cache without the stamp (an older status line), as before. A brief is judged by the machine that reads it, by its
+  // own clock, so a share measured before a reset that passed less than USAGE_STALE_MS ago is left to it: by a clock
+  // running fast here, its window may still run. The weekly windows are a fixed schedule and always roll.
+  const now = Date.now();
+  if (out.fiveReset !== null && out.fiveReset <= now) {
+    const at5 = measuredAt.five;
+    if (at5 === undefined || (out.fiveHourPct !== null && out.fiveHourPct > 0
+      && (at5 * 1000 > out.fiveReset || (!judged && now - out.fiveReset < USAGE_STALE_MS)))) {
+      out.fiveReset = rollFwd(out.fiveReset, 5 * 3600_000);
+    } else {
+      out.fiveReset = null;
+      if (out.rollingLimits) { out.fiveHourPct = 0; out.fiveTokens = null; out.fiveMeasuredAll = null; out.fiveReads = null; }
+    }
+  }
   out.weekReset = rollFwd(out.weekReset, 7 * 86400_000);
   out.fableReset = rollFwd(out.fableReset, 7 * 86400_000);
+  const monthEnded = out.monthReset !== null && out.monthReset <= Date.now(); // before it rolls to the next cycle's end
   out.monthReset = rollFwdMonth(out.monthReset);
   // A share measured before its window began is the last window's: after a reset, until a session or the
   // account pull brings a fresh one, the window has no share rather than last week's (a cache kept the old
   // week's share for hours after the reset). Its token estimate restates the share, so it goes too. A cache
   // without the stamp (an older status line) keeps its share.
   const before = (at: number | undefined, reset: number | null, periodMs: number): boolean =>
-    at !== undefined && reset !== null && at * 1000 < reset - periodMs;
+    judged && at !== undefined && reset !== null && at * 1000 < reset - periodMs;
   if (before(measuredAt.five, out.fiveReset, 5 * 3600_000)) { out.fiveHourPct = null; out.fiveTokens = null; }
   if (before(measuredAt.week, out.weekReset, 7 * 86400_000)) { out.weekPct = null; out.weekTokens = null; }
   if (before(measuredAt.fable, out.fableReset, 7 * 86400_000)) { out.fablePct = null; out.fableTokens = null; }
-  return out;
+  return { out, at: { ...measuredAt, monthEnded, ...(own ? { own } : {}), ...answers } };
+}
+
+/**
+ * NO FIVE-HOUR LIMIT (UsageLine.fiveNoneAt). Only the account's usage answers decide it, never a share: a session's
+ * share can come from before the answer, and a response can carry 5h figures whatever the account. The newest answer
+ * with no 5h window (five_none_at, which OAK's account pull and the status line's own pull record) is weighed against the
+ * newest that carried one (five_seen_at): this machine's, and each other machine's of the same account in `machines`
+ * (its brief's fiveNoneAt and fiveSeenAt, which for a machine the local index reads are its newest `limit` readings,
+ * index/usage.ts machineReadingEntries; read less that machine's clock difference, and set aside when more than
+ * USAGE_STALE_MS ahead of this clock, as its shares are). While the newest no-limit answer is at least as new, the 5h
+ * readout is hidden, whatever share there is, and this returns true.
+ */
+function noFiveHourLimitIfNewest(out: UsageLine, at: UsageStamps, machines: import('./machine-usage').MachineUsageEntry[], account: () => string | null, now: number): boolean {
+  let none = at.fiveNone !== undefined ? at.fiveNone * 1000 : null;
+  let seen = at.fiveSeen !== undefined ? at.fiveSeen * 1000 : null;
+  const newer = (t: number | null, than: number | null): boolean => t !== null && (than === null || t > than);
+  for (const e of machines) {
+    const read = (v: number | null | undefined): number | null => (typeof v === 'number' && v - e.skewMs <= now + USAGE_STALE_MS ? v - e.skewMs : null);
+    const n = read(e.brief.fiveNoneAt), s = read(e.brief.fiveSeenAt);
+    // This machine's account last, as pick() reads it: only for an answer that would move either time.
+    if (!newer(n, none) && !newer(s, seen)) continue;
+    if (e.brief.account === null || e.brief.account !== account()) continue;
+    if (newer(n, none)) none = n;
+    if (newer(s, seen)) seen = s;
+  }
+  if (none === null || newer(seen, none)) return false;
+  out.fiveNoneAt = none;
+  out.fiveHourPct = null; out.fiveReset = null; out.fiveTokens = null; out.fiveTotal = null; out.fiveMeasuredAll = null; out.fiveReads = null;
+  out.fiveCost = null; out.fiveCostTotal = null;
+  return true;
+}
+
+/**
+ * Fill this machine's Claude readout from saved machines' readings of the same account (machine-usage.ts), or,
+ * where this machine has no Claude Code login to match, of the one account the saved machines name.
+ *
+ * The 5-hour, weekly and per-model weekly shares are the account's, so each window takes the freshest share
+ * measured inside its current window: this machine's own while it is live (measured within USAGE_STALE_MS),
+ * otherwise the newest of its own and every same-account machine's. A live share here is never displaced by a
+ * fresher one of the same window, so two machines that both measure do not trade the readout back and forth
+ * between them. Not the largest share: a share can drop within a window (a plan upgrade, an early reset, a
+ * promotion that raises the limit), and the larger one would then stand for the rest of the window. The latest
+ * week comes first, though: a share of a later weekly window replaces this machine's, live or not (two weekly resets
+ * name the same week when they are less than half a week apart), and this machine's 5-hour window once it has ended
+ * (usageReading) is no window, below any running one. The 5-hour windows are not ranked by their resets, which can be
+ * estimates (usageReading). Another machine's share needs the time it was measured and
+ * its window's reset, without which it cannot be shown to belong to this window. That time is its machine's
+ * clock's, so it is read less that clock's difference from this one (MachineUsageEntry.skewMs): a clock minutes
+ * fast hid a fresh share as undated, and one minutes off either way placed a share measured near a reset in the
+ * wrong window. Its token estimate and budget come with it, since they restate it.
+ *
+ * The month a machine shows is its status line's sum of each machine's own turns in the bill cycle
+ * (measuredFromMachines), and its budget is projected from that machine's weekly figures, so two machines' months
+ * are never added here: it is taken whole from the machine whose weekly share is shown.
+ */
+function fillFromMachines(out: UsageLine, at: UsageStamps): void {
+  const mu = require('./machine-usage') as typeof import('./machine-usage');
+  const cached = mu.readMachineUsage().machines;
+  const ix = require('./index/api') as typeof import('./index/api');
+  // The common case, decided by one stat and one listing: no saved machine's reading cached, and no other machine's
+  // record log here. Then the switch.
+  const shared = (cached.length > 0 || ix.recordHosts().some((h) => h !== mu.machineHostTag())) && mu.machineUsageEnabled();
+  // The other machines' readings and usage: from the local index, which holds every machine's records (oak sync's, and
+  // the usage pulls'), and, where this process has no index (an editor whose Node has no node:sqlite), from the saved
+  // machines' readings their cache file keeps. A machine the index knows is read from the index.
+  const view = shared ? ix.indexedUsageView({ fiveReset: out.fiveReset, weekReset: out.weekReset }) : null;
+  // A machine the last refresh no longer lists (taken off herdr's list, or turned off) lends no reading, as before the
+  // index; one whose record log oak sync keeps here does.
+  const listed = new Set(shared ? [...cached.map((e) => e.host).filter((h): h is string => !!h), ...ix.recordHosts()] : []);
+  const fromIndex = view ? view.entries.filter((e) => e.host && listed.has(e.host)) : [];
+  const machines = shared ? [...fromIndex, ...cached.filter((e) => !fromIndex.some((x) => (e.host ? x.host === e.host : x.label === e.label)))] : [];
+  // This machine's account, read only when another machine's share could stand in (the file can be megabytes).
+  // With no Claude Code login here there is nothing to match, so the readings stand for the one account the saved
+  // machines name, and for none when they name two: which of two accounts is this person's cannot be told here,
+  // and taking each window from the freshest machine would mix the two accounts in one readout. A `.claude.json`
+  // that could not be read is not a missing login: this machine may well be signed in to another account.
+  let me: string | null | undefined;
+  let unmatched = false;
+  const account = (): string | null => {
+    if (me !== undefined) return me;
+    me = mu.claudeAccountTag();
+    if (me === null && mu.claudeSignedOut()) {
+      const named = new Set(machines.map((e) => e.brief.account).filter((a): a is string => a !== null));
+      if (named.size === 1) {
+        me = [...named][0];
+        unmatched = true;
+      }
+    }
+    return me;
+  };
+  const now = Date.now();
+  // Whether the account has a five-hour limit comes first, from its answers here and on the other machines (their briefs,
+  // and the readings the index holds of the machines it reads), and with none of them too: while it has none, no
+  // machine's 5h share stands in.
+  const noLimit = noFiveHourLimitIfNewest(out, at, machines, account, now);
+  if (!shared) return;
+  // Its reset, which that machine rolled forward by its own clock, as the next one here: never more than a period
+  // away, since the window it ends began at most a period ago. A clock running fast there rolled it a period early.
+  const next = (ms: number, periodMs: number): number => {
+    const r = rollFwd(ms, periodMs)!;
+    return r - (Math.ceil((r - now) / periodMs) - 1) * periodMs;
+  };
+  type Pick = { e: import('./machine-usage').MachineUsageEntry; w: import('./machine-usage').MachineUsageWindow; at: number; r: number };
+  // `r` ends a later window than `than`: half a period or more after it. Only the weekly windows are ranked so: they run
+  // on a fixed schedule, so a weekly reset rolled forward is exact, where a 5-hour reset rolled forward for a share with no
+  // reset of its own is an estimate (usageReading), up to a period off: ranked as a later window, a saved machine's
+  // estimate replaced this machine's live share. A share with no reset names no window to rank.
+  const later = (r: number | null, than: number | null, periodMs: number): boolean =>
+    periodMs === 7 * 86400_000 && r !== null && than !== null && r - than >= periodMs / 2;
+  const pick = (key: 'five' | 'week' | 'fable', periodMs: number, pct: number | null, stamp: number | undefined, reset: number | null): Pick | null => {
+    // This machine's share, dated by its stamp, or by the cache's own time for a cache written before the stamps, in
+    // the window its reset names. Its 5-hour window once it has ended (usageReading: a share of 0 with no reset) is no
+    // window, below any running one. Any other share with no reset (a status line that has never known one) is of a
+    // window this machine cannot place: it is ranked by when it was measured, as before the windows were ranked.
+    const here = pct === null || (key === 'five' && pct === 0 && reset === null) ? null : stamp !== undefined ? stamp * 1000 : out.cachedAtMs;
+    const live = here !== null && now - here <= USAGE_STALE_MS;
+    let best: Pick | null = null;
+    for (const e of machines) {
+      const w = e.brief[key];
+      if (!w || w.at === null || w.reset === null) continue; // undated: no time it was measured, or no window to place it in
+      const at = w.at - (e.firstSkew?.[key] ?? e.skewMs); // by this machine's clock, as the refresh that first brought it read it
+      if (at > now + USAGE_STALE_MS) continue; // still ahead: its clock has moved since it answered
+      const r = next(w.reset, periodMs);
+      if (at < r - periodMs) continue; // measured before its current window
+      // The latest week, then the freshest share in it: over this machine's (live, only a later week), then the rest.
+      if (here !== null && !later(r, reset, periodMs) && (later(reset, r, periodMs) || live || at <= here)) continue;
+      if (best && !later(r, best.r, periodMs) && (later(best.r, r, periodMs) || at <= best.at)) continue;
+      if (e.brief.account === null || e.brief.account !== account()) continue; // another account's, or one it cannot name, or one of two
+      best = { e, w, at, r };
+    }
+    return best;
+  };
+  // What the saved machines measured of their own turns, for this machine's own windows: the status line scans those,
+  // whatever a saved machine's share below replaces in the readout.
+  // What the other machines measured: the index's totals where it holds their usage (records, each message once, and the
+  // own figures of a machine that answers only with its readings), else what their briefs say they measured of their own
+  // turns (no index here, or no other machine's usage in it). While the account has no five-hour limit there is no
+  // 5-hour window to measure in: the index placed its totals by the reset this machine held before the answers were weighed.
+  const measured = view?.totals ? ix.othersMeasured(view.totals) : measuredFromMachines(machines, account, at.own?.month ?? null, out.fiveReset, out.weekReset, now);
+  out.machineMeasured = noLimit && measured?.five ? (measured.week || measured.month ? { ...measured, five: null } : null) : measured;
+  const five = noLimit ? null : pick('five', 5 * 3600_000, out.fiveHourPct, at.five, out.fiveReset);
+  if (five) {
+    out.fiveHourPct = Math.min(100, five.w.pct); out.fiveReset = next(five.w.reset!, 5 * 3600_000);
+    out.fiveTokens = five.w.est ? five.w.est.tok : five.w.tok; out.fiveTotal = five.w.total; out.fiveMachine = five.e.label;
+  }
+  const week = pick('week', 7 * 86400_000, out.weekPct, at.week, out.weekReset);
+  if (week) {
+    out.weekPct = Math.min(100, week.w.pct); out.weekReset = next(week.w.reset!, 7 * 86400_000);
+    out.weekTokens = week.w.est ? week.w.est.tok : week.w.tok; out.weekTotal = week.w.total; out.weekMachine = week.e.label;
+    const m = week.e.brief.month;
+    // A month whose bill cycle has ended since that machine measured it is the last cycle's: its answer may be
+    // days old (a machine that does not answer keeps its last one), so the cycle is checked here as well as there.
+    if (m && !(m.reset !== null && m.reset <= now)) {
+      out.monthTokens = m.tok; out.monthTokensTotal = m.total; out.monthReset = rollFwdMonth(m.reset);
+      out.monthReads = m.reads; out.monthCost = m.cost; out.monthCostTotal = m.costTotal; out.monthMachine = week.e.label;
+    }
+  }
+  const fable = pick('fable', 7 * 86400_000, out.fablePct, at.fable, out.fableReset);
+  if (fable) {
+    out.fablePct = Math.min(100, fable.w.pct); out.fableReset = next(fable.w.reset!, 7 * 86400_000);
+    out.fableLabel = fable.w.label ?? out.fableLabel; out.fableTokens = fable.w.est ? fable.w.est.tok : fable.w.tok; out.fableTotal = fable.w.total;
+    out.fableMachine = fable.e.label;
+  }
+  if (five || week || fable) out.rollingLimits = true; // the account reports rolling windows
+  // Each window shown, with the machine it came from (null: this one's) and whether the status bars show it. No bar
+  // shows the 5-hour window, nor its tooltip; the Stats panels do.
+  const shown: [string, string | null, boolean][] = [];
+  if (out.fiveHourPct !== null) shown.push(['5h', out.fiveMachine, false]);
+  if (out.weekPct !== null) shown.push(['wk', out.weekMachine, true]);
+  if (out.fablePct !== null) shown.push([(out.fableLabel || 'fable').toLowerCase(), out.fableMachine, false]);
+  if (out.monthTokens !== null) shown.push(['mo', out.monthMachine, true]);
+  if (!shown.some((s) => s[1] !== null)) return;
+  out.machineUnmatched = unmatched;
+  out.machineAt = Math.min(...[five, week, fable].filter((p): p is Pick => p !== null).map((p) => p.at));
+  const tipAt = [week, fable].filter((p): p is Pick => p !== null).map((p) => p.at);
+  out.machineTipAt = tipAt.length ? Math.min(...tipAt) : null;
+  const note = (windows: typeof shown): string => {
+    const from = windows.filter((s) => s[1] !== null);
+    const by = new Map<string, string[]>();
+    for (const [label, machine] of from) by.set(machine!, [...(by.get(machine!) ?? []), label]);
+    return by.size === 1 && from.length === windows.length ? from[0][1]!
+      : [...by].map(([machine, labels]) => `${machine}: ${labels.join(' ')}`).join('; ');
+  };
+  out.machineNote = note(shown);
+  out.machineBarNote = note(shown.filter((s) => s[2]));
+  out.machineTipNote = note(shown.filter((s) => s[0] !== '5h'));
+}
+
+/**
+ * THE ACCOUNT ACROSS ITS MACHINES (2026-10-27): what the saved machines of this account measured of their own turns,
+ * per window, which the status line adds to this machine's own when it calibrates the token and dollar estimates
+ * against the account's shares and sums the month (UsageLine.machineMeasured). A machine's figures count for a window
+ * when they are of the same account (`account`, fillFromMachines' rule), of the window this machine is in (the 5-hour and
+ * weekly by a reset under half a period from this machine's, the month by the same bill cycle, start and end), and fresh:
+ * measured inside that window, by this machine's clock (the stamp less that machine's clock difference) and not more
+ * than USAGE_STALE_MS ahead of it. Each machine counts once, by its host hash, from the freshest of its entries, and
+ * this machine never (saved as one of its own). An older OAK's brief carries no figures and adds nothing (`oak doctor`
+ * says so). Each machine's figures are the turns that ran under its own home directory, so the sum counts a synced
+ * transcript once, apart from turns that ran outside any home directory or under a home path two machines share, which
+ * each machine holding them counts (the status line's own()). `cycle` is the bill cycle this machine measures (epoch
+ * ms). The local index adds the figures of the machines that answer it only with their readings the same way
+ * (index/usage.ts usageTotals).
+ */
+export function measuredFromMachines(
+  machines: import('./machine-usage').MachineUsageEntry[],
+  account: () => string | null,
+  cycle: { start: number; reset: number } | null,
+  fiveReset: number | null,
+  weekReset: number | null,
+  now: number
+): UsageLine['machineMeasured'] {
+  const mu = require('./machine-usage') as typeof import('./machine-usage');
+  const counted = new Set<string>([mu.machineHostTag()]);
+  const used = new Set<import('./machine-usage').MachineUsageEntry>();
+  const five = { tok: 0, reads: 0, cost: 0, hosts: [] as string[] };
+  const week = { tok: 0, reads: 0, cost: 0, fable: 0, fableReads: 0, hosts: [] as string[] };
+  const month = { tok: 0, reads: 0, cost: 0, hosts: [] as string[] };
+  // The freshest entry first, so a machine saved under two targets counts by its latest figures.
+  for (const e of [...machines].sort((a, b) => (b.brief.own?.at ?? 0) - (a.brief.own?.at ?? 0))) {
+    const o = e.brief.own;
+    if (!o || counted.has(o.host) || e.brief.account === null) continue;
+    const at = o.at - e.skewMs;
+    if (at > now + USAGE_STALE_MS) continue;
+    const inside = (w: { reset: number } | null, reset: number | null, periodMs: number): boolean =>
+      !!w && reset !== null && Math.abs(w.reset - reset) < periodMs / 2 && at >= reset - periodMs;
+    const f = inside(o.five, fiveReset, 5 * 3600_000) ? o.five : null;
+    const w = inside(o.week, weekReset, 7 * 86400_000) ? o.week : null;
+    const m = o.month && cycle && o.month.start === cycle.start && o.month.reset === cycle.reset && at >= cycle.start ? o.month : null;
+    // This machine's account last, as pick() reads it: it is read from a file that can be megabytes, on every call of a
+    // process the status line starts each render, and figures that count for none of these windows (an idle machine's,
+    // from before them) need no read of it.
+    if ((!f && !w && !m) || e.brief.account !== account()) continue;
+    counted.add(o.host);
+    used.add(e);
+    if (f) { five.tok += f.tok; five.reads += f.reads ?? 0; five.cost += f.cost ?? 0; five.hosts.push(o.host); }
+    if (w) {
+      week.tok += w.tok; week.reads += w.reads ?? 0; week.cost += w.cost ?? 0;
+      week.fable += w.fable ?? 0; week.fableReads += w.fableReads ?? 0; week.hosts.push(o.host);
+    }
+    if (m) { month.tok += m.tok; month.reads += m.reads ?? 0; month.cost += m.cost ?? 0; month.hosts.push(o.host); }
+  }
+  if (!used.size) return null;
+  const hosts = (h: string[]): string => [...h].sort().join(',');
+  return {
+    five: five.hosts.length && fiveReset !== null ? { ...five, reset: fiveReset, hosts: hosts(five.hosts) } : null,
+    week: week.hosts.length && weekReset !== null ? { ...week, reset: weekReset, hosts: hosts(week.hosts) } : null,
+    month: month.hosts.length && cycle ? { ...month, start: cycle.start, reset: cycle.reset, hosts: hosts(month.hosts) } : null,
+    machines: machines.filter((e) => used.has(e)).map((e) => e.label).join(', '),
+  };
+}
+
+/** What `oak usage --brief --json` prints for another machine to read (machine-usage.ts): this machine's own
+ *  Claude shares with when each was measured, and its month while the cycle it was measured in runs. Never a
+ *  reading taken from a saved machine, so no reading is relayed onward. Whether a share was measured inside its
+ *  window is left to the machine that reads it, which dates the stamps by its own clock: judged by a clock
+ *  minutes slow here, a share measured just after a reset was dropped as the last window's. A 5-hour window that
+ *  has ended here goes as a share of 0 with no reset (usageReading), which that machine places in no window. It also
+ *  sends what this machine measured of its own turns (`own`, null when its status line has measured none), which that
+ *  machine adds to its own only for the windows they share, and when this machine's account read last answered with no
+ *  5h window and with one, which that machine weighs with its own (noFiveHourLimitIfNewest); while this machine's own
+ *  answers say the account has no five-hour limit, it sends no 5h share. */
+export function machineUsageBrief(cwd: string): import('./machine-usage').MachineUsageBrief {
+  const { out: u, at } = usageReading(cwd, '', false);
+  const ms = (s: number | undefined): number | null => (s !== undefined ? Math.round(s * 1000) : null);
+  const mu = require('./machine-usage') as typeof import('./machine-usage');
+  noFiveHourLimitIfNewest(u, at, [], () => null, Date.now());
+  // A window's `tok` is the tokens the status line counted in it on this machine, where it counted them inside the
+  // window; the share times the estimated allowance moves whenever that estimate does, so it is never the headline.
+  // It goes as `est`, beside the allowance it was derived from, and stands in `tok` only where nothing was counted
+  // (`measured` false), for the readers before 0.11.0.
+  const win = (meas: number | null, est: number | null, total: number | null) =>
+    ({ tok: meas ?? est, total, measured: meas !== null, est: { tok: est, total } });
+  return {
+    brief: 1,
+    account: mu.claudeAccountTag(),
+    at: Date.now(),
+    five: u.fiveHourPct !== null ? { pct: u.fiveHourPct, reset: u.fiveReset, at: ms(at.five), ...win(u.fiveMeasuredAll, u.fiveTokens, u.fiveTotal) } : null,
+    fiveNoneAt: ms(at.fiveNone),
+    fiveSeenAt: ms(at.fiveSeen),
+    week: u.weekPct !== null ? { pct: u.weekPct, reset: u.weekReset, at: ms(at.week), ...win(u.weekMeasuredAll, u.weekTokens, u.weekTotal) } : null,
+    fable: u.fablePct !== null ? { pct: u.fablePct, reset: u.fableReset, at: ms(at.fable), ...win(null, u.fableTokens, u.fableTotal), label: u.fableLabel } : null,
+    month: u.monthTokens !== null && !at.monthEnded
+      ? { tok: u.monthTokens, total: u.monthTokensTotal, reset: u.monthReset, reads: u.monthReads, cost: u.monthCost, costTotal: u.monthCostTotal } : null,
+    own: at.own ? { host: mu.machineHostTag(), ...at.own } : null,
+  };
+}
+
+/** A dollar figure as the Claude Code status line writes it (its `money`): $1.2k, $123, $12, $1.2. That line
+ *  formats with C's printf, which truncates for %d and rounds an exact half to the even digit, where toFixed
+ *  rounds it up; this does as printf does, so a bar and the status line never show two figures for one sum. */
+export function usdText(v: number): string {
+  const fix = (x: number, d: number): string => {
+    const s = x.toFixed(d);
+    const tie = /^50*$/.test(x.toFixed(100).split('.')[1].slice(d));
+    return tie && /[13579]$/.test(s) ? (Number(s) - 10 ** -d).toFixed(d) : s;
+  };
+  if (v >= 1000) return `$${fix(v / 1000, 1)}k`;
+  if (v >= 100) return `$${Math.trunc(v)}`;
+  return `$${fix(v, v >= 10 ? 0 : 1)}`;
+}
+
+/** The month's dollar figure the status bars show after the month's reset, as the status line shows it: the
+ *  charge Claude Code reported on a plan with no rolling windows, else the list-price estimate with `~`.
+ *  Null with no reading, so a bar leaves the figure out rather than show a stale or zero one. */
+export function monthUsd(u: { monthCost?: number | null; monthSpend?: number | null; rollingLimits?: boolean | null }): string | null {
+  if (u.rollingLimits === false && u.monthSpend != null && u.monthSpend > 0) return usdText(u.monthSpend);
+  return u.monthCost != null && u.monthCost > 0 ? `~${usdText(u.monthCost)}` : null;
 }
 
 /** One usage window for the compact per-provider readout: a share (null when not measured), its reset
- *  instant, and — for a token-only window like gpt's month — a raw token count instead of a share. */
+ *  instant, and — for a token-only window like gpt's month — a raw token count instead of a share.
+ *  A month carries its dollar figure (`monthUsd`) as well. */
 export interface BriefWindow {
   pct: number | null;
   resetMs: number | null;
   tok?: number | null;
+  usd?: string | null;
 }
 export interface UsageBrief {
-  claude: { five: BriefWindow; week: BriefWindow; month: BriefWindow };
+  /** `machine` names the saved machine(s) these windows came from, as UsageLine.machineBarNote; '' for this one. */
+  claude: { five: BriefWindow; week: BriefWindow; month: BriefWindow; machine: string; usageFreshness?: string };
   /** Absent when this machine has no codex/gpt usage at all. */
-  gpt: { five: BriefWindow; week: BriefWindow; month: BriefWindow } | null;
+  gpt: { five: BriefWindow; week: BriefWindow; month: BriefWindow; measuredMachines?: string; usageSource?: string; usageFreshness?: string } | null;
 }
 
 /** BOTH providers' 5h / week / month windows at once, for the terminal app's status readout (which
@@ -2496,12 +3357,14 @@ export function usageBrief(cwd: string): UsageBrief {
     claude: {
       five: { pct: u.fiveHourPct, resetMs: u.fiveReset },
       week: { pct: u.weekPct, resetMs: u.weekReset },
-      month: { pct: claudeMonthPct, resetMs: u.monthReset ?? null, tok: u.monthTokens ?? null },
+      month: { pct: claudeMonthPct, resetMs: u.monthReset ?? null, tok: u.monthTokens ?? null, usd: monthUsd(u) },
+      machine: u.machineBarNote, usageFreshness: u.usageFreshness,
     },
     gpt: g ? {
       five: { pct: g.fivePct, resetMs: g.fiveReset },
       week: { pct: g.weekPct, resetMs: g.weekReset },
-      month: { pct: gptMonthPct, resetMs: g.monthReset ?? null, tok: g.monthTok },
+      month: { pct: gptMonthPct, resetMs: g.monthReset ?? null, tok: g.monthTok, usd: monthUsd(g) },
+      measuredMachines: g.measuredMachines, usageSource: g.usageSource, usageFreshness: g.usageFreshness,
     } : null,
   };
 }

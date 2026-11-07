@@ -6,12 +6,12 @@
 <figure><img src="media/overview-workflows.png" loading="lazy" alt="The Workflows tab: one row per multi-agent run with an informative name, a running or done badge, phase progress with tokens and elapsed time, and an activity sparkline, unfolding to per-phase groups and their agents"><figcaption>Workflow runs, with their phases and the agents inside them.</figcaption></figure>
 
 <h2>The fleet</h2>
-<p>The <strong>fleet</strong> is every running agent across the repository's <a href="worktrees.html">worktrees</a>, unified into one board. Each row carries a live phase, worktree and branch, an activity sparkline, line deltas, tokens and time, and risk. Tracking is read-only and path-only: file names cross between agents, file contents never do.</p>
+<p>The <strong>Workers</strong> board lists Claude Code and Codex agents from herdr on this machine and each saved machine, agents OAK started, and recent sessions across the repository’s <a href="worktrees.html">worktrees</a>. The reviewed session and its subagents are included, with the reviewed machine first. Rows lead with the tab or session title, then show machine, kind, OAK state, tokens and last activity.</p>
 
-<figure><img src="media/multitasking.png" loading="lazy" alt="The Workers tab: per-agent rows across the repository's git worktrees, each with a live phase badge, worktree and branch, an activity sparkline, line deltas, tokens and time, and risk; subagents nest under their parent"><figcaption>The fleet. A phase inferred from inactivity carries a tilde.</figcaption></figure>
+<figure><img src="media/multitasking.png" loading="lazy" alt="Workers named by task, with machine, kind, state, tokens and activity; finished subagents fold into one count"><figcaption>Workers across machines. Finished subagents expand from one count.</figcaption></figure>
 
-<h2>Phase</h2>
-<p>A <strong>phase</strong> is a fleet row's live state: working, awaiting input, awaiting permission, idle, or done. A phase inferred rather than reported (from inactivity, or from a background agent’s completion notice not having arrived yet) is marked with <code>~</code> and presented as a heuristic, never asserted.</p>
+<h2 id="phase">Worker state</h2>
+<p>OAK derives <strong>starting, working, waiting, blocked, errored, done or gone</strong> from process evidence, native status, raised hands and the conversation. An unfinished tool call whose agent process disappeared reads <strong>gone</strong>. Active only keeps working, waiting and blocked workers and subagents. With it off, each parent’s finished subagents fold into one “N done” row that opens with a click.</p>
 
 <h2>Process</h2>
 <p>A <strong>process</strong> is a background shell the session launched with <code>run_in_background</code>. Its identity is the harness's own shell id — a transcript records no operating-system process id, and the agent may be running over SSH or in a container, so inferring one from local processes would be wrong. A process with no recorded end reports its runtime up to the last moment the session is known to have existed.</p>

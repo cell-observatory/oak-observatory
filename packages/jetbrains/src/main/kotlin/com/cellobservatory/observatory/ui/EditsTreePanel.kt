@@ -62,6 +62,8 @@ class EditsTreePanel(private val project: Project, private val mode: Mode) :
     private val tree = Tree(model).apply {
         isRootVisible = false
         showsRootHandles = true
+        rowHeight = com.intellij.util.ui.JBUI.scale(22)
+        isLargeModel = true
         selectionModel.selectionMode = TreeSelectionModel.SINGLE_TREE_SELECTION
         emptyText.text = "No tracked agent edits yet"
         emptyText.appendLine("Run `oak init`, then let Claude Code edit.")
@@ -119,6 +121,9 @@ class EditsTreePanel(private val project: Project, private val mode: Mode) :
                 }
             }
         })
+        tree.addTreeSelectionListener {
+            (selectedEdit()?.file ?: selectedFile()?.file)?.let { service().selectRemoteReviewFile(it) }
+        }
         PopupHandler.installPopupMenu(tree, buildPopupGroup(), "ClaudeObservatoryTreePopup")
         ObservatoryService.getInstance(project).addListener(refreshListener)
         rebuild()
@@ -128,6 +133,7 @@ class EditsTreePanel(private val project: Project, private val mode: Mode) :
 
     private fun activate(rec: EditRecord) {
         val session = service().currentSession() ?: return
+        service().currentMachine()?.let { RemoteEditorReview.open(project, it, session, edit = rec.id); return }
         when (mode) {
             Mode.EDITS -> Navigate.openFileAtEdit(project, session, rec)
             Mode.DIFFS -> Diffs.show(project, session, rec)
@@ -199,6 +205,9 @@ class EditsTreePanel(private val project: Project, private val mode: Mode) :
         val q = service().filterQuery
         tree.emptyText.clear()
         when {
+            service().currentMachine() != null && vm0 == null -> {
+                tree.emptyText.appendLine(service().remoteReview()?.note(service().currentMachine()!!) ?: "Reading remote Review…")
+            }
             // The fetch FAILED — an empty tree must say so, not claim "no edits in this session yet":
             // this plugin renders the CLI's answer, and a missing/older CLI otherwise presents as a
             // convincing, silent blank (reported as exactly that from PyCharm, 2026-08-20).
@@ -277,7 +286,7 @@ class EditsTreePanel(private val project: Project, private val mode: Mode) :
         // — refreshed here, where the tree already rebuilds on every store tick.
         run {
             val s = service().currentSession()
-            val sz = s?.let { storeSizeText(it) }
+            val sz = if (service().currentMachine() == null) s?.let { storeSizeText(it) } else null
             storeAction.templatePresentation.text = if (sz != null) "Open Store Folder ($sz)" else "Open Store Folder"
         }
         model.reload()
@@ -406,20 +415,20 @@ class EditsTreePanel(private val project: Project, private val mode: Mode) :
                 withSession { s -> ReviewOps.keepAll(project, s) }
             },
             action("Reject All Edits", NavTint.REVERT_ALL) {
-                withSession { s -> ReviewOps.undoAll(project, s, service().log(), "this session") }
+                withSession { s -> ReviewOps.undoAll(project, s, service().reviewRecords(), "this session") }
             },
             action("Redo All Edits", NavTint.REDO) {
-                withSession { s -> ReviewOps.redoAll(project, s, service().log(), "this session") }
+                withSession { s -> ReviewOps.redoAll(project, s, service().reviewRecords(), "this session") }
             },
             fileScopedAction("Accept All Edits in Current File", NavTint.ACCEPT_FILE) { s, vf ->
-                ReviewOps.keepAll(project, s, service().log().filter { it.file == ClaudePaths.storeKey(vf.path) }, vf.name)
+                ReviewOps.keepAll(project, s, service().reviewRecords().filter { it.file == ClaudePaths.storeKey(vf.path) }, vf.name)
             },
             fileScopedAction("Reject All Edits in Current File", NavTint.REJECT) { s, vf ->
-                ReviewOps.undoAll(project, s, service().log().filter { it.file == ClaudePaths.storeKey(vf.path) }, vf.name, vf.path)
+                ReviewOps.undoAll(project, s, service().reviewRecords().filter { it.file == ClaudePaths.storeKey(vf.path) }, vf.name, vf.path)
             },
             action("Clear Resolved Edits", NavTint.CLEAR) {
                 withSession { s ->
-                    val resolved = service().log().count { !it.pending }
+                    val resolved = service().reviewRecords().count { !it.pending }
                     if (resolved > 0) ReviewOps.clearResolved(project, s, resolved)
                     else ReviewOps.notify(project, "No resolved edits to clear")
                 }
@@ -483,6 +492,11 @@ class EditsTreePanel(private val project: Project, private val mode: Mode) :
         },
         action("Open File", AllIcons.Actions.MenuOpen) {
             val file = selectedEdit()?.file ?: selectedFile()?.file
+            if (file != null && service().currentMachine() != null) {
+                service().selectRemoteReviewFile(file)
+                withSession { s -> RemoteEditorReview.open(project, service().currentMachine()!!, s, file = file) }
+                return@action
+            }
             file?.let {
                 LocalFileSystem.getInstance().refreshAndFindFileByPath(it)?.let { vf ->
                     FileEditorManager.getInstance(project).openTextEditor(OpenFileDescriptor(project, vf), true)
@@ -497,6 +511,9 @@ class EditsTreePanel(private val project: Project, private val mode: Mode) :
         },
         action("Redo All in File", NavTint.REDO) {
             selectedFile()?.let { f -> withSession { s -> ReviewOps.redoAll(project, s, f.edits, File(f.file).name, f.file) } }
+        },
+        action("Resolve File", NavTint.CLEAR) {
+            selectedFile()?.let { f -> withSession { s -> ReviewOps.resolveIds(project, s, f.edits.map { it.id }) } }
         },
         action("Clear Resolved in File", NavTint.CLEAR) {
             selectedFile()?.let { f ->
@@ -567,7 +584,12 @@ class EditsTreePanel(private val project: Project, private val mode: Mode) :
     }
 
     private fun action(text: String, icon: javax.swing.Icon, run: () -> Unit): AnAction =
-        object : AnAction(text, null, icon), DumbAware {
+        object : AnAction(text, text, icon), DumbAware {
+            override fun getActionUpdateThread() = ActionUpdateThread.EDT
+            override fun update(e: AnActionEvent) {
+                e.presentation.description = text + service().machineSuffix()
+                if (text == "Resolve File") e.presentation.isEnabledAndVisible = service().currentMachine() != null
+            }
             override fun actionPerformed(e: AnActionEvent) = run()
         }
 
@@ -623,13 +645,13 @@ class EditsTreePanel(private val project: Project, private val mode: Mode) :
      *  when that path is still what is in front. Disagreement cancels rather than guesses: silently
      *  accepting a file the user was not looking at is unrecoverable. */
     private fun fileScopedAction(text: String, icon: javax.swing.Icon, run: (String, VirtualFile) -> Unit): AnAction =
-        object : AnAction(text, null, icon), DumbAware {
+        object : AnAction(text, text, icon), DumbAware {
             override fun getActionUpdateThread() = ActionUpdateThread.BGT
             override fun update(e: AnActionEvent) {
                 val path = activeFilePath()
                 // `hiddenIds` too: a file whose only pending records sit in a cancelled-out chain shows
                 // no rows in this tree, so offering a verb for it promises work that is not there.
-                e.presentation.isEnabledAndVisible = path != null &&
+                e.presentation.isEnabledAndVisible = service().currentMachine() == null && path != null &&
                     service().log().any { it.pending && it.file == ClaudePaths.storeKey(path) && it.id !in hiddenIds }
             }
 

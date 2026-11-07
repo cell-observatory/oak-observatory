@@ -153,6 +153,12 @@ export interface NativeSession {
    *  caret (Claude Code's prompt) had no cursor at all inside OAK (2026-09-23). */
   cursor?(): { x: number; y: number; visible: boolean };
   onUpdate(fn: () => void): void;
+  /** A parsed BEL, never an OSC terminator. The host forwards it only while this screen is visible. */
+  onBell?(fn: () => void): void;
+  /** Each text the program writes to the clipboard (OSC 52). herdr writes its copies this way when it has no clipboard
+   *  tool to run, or runs over ssh, in VS Code's terminal or in WSL: its own selection's, and those a program in its
+   *  pane writes, which it passes on. A request to read the clipboard (`?`) is never passed on, and never answered. */
+  onClipboard?(fn: (text: string) => void): void;
   onExit(fn: (code: number) => void): void;
   /** Mirror input modes only while this tab owns the host. The exit path supplies a sync writer. */
   setHostActive?(active: boolean, ownedModes?: readonly number[], write?: (data: string) => void): void;
@@ -289,7 +295,22 @@ export function spawnNative(command: string, args: string[], cols: number, rows:
   let ended = false;
   const hostModes = mirrorHostModes(term, data => { if (!ended) { try { proc.write(data); } catch { /* exited */ } } });
   let updateFn: (() => void) | null = null;
+  let bellFn: (() => void) | null = null;
   let exitFn: ((code: number) => void) | null = null;
+  let clipboardFn: ((text: string) => void) | null = null;
+  term.onBell(() => { if (!ended) bellFn?.(); });
+  // OSC 52 is `<selections>;<base64>`. The emulator has no clipboard of its own, so a copy written this way went
+  // nowhere. A write to the clipboard (`c`, or no selection named) goes on; a read (`?`) and anything that is not
+  // base64 are dropped here, as herdr drops them.
+  term.parser.registerOscHandler(52, (data: string) => {
+    const at = data.indexOf(';');
+    const payload = at < 0 ? '' : data.slice(at + 1);
+    if (at >= 0 && (at === 0 || data.slice(0, at).includes('c')) && /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(payload)) {
+      const text = Buffer.from(payload, 'base64').toString('utf8');
+      if (text) clipboardFn?.(text);
+    }
+    return true;
+  });
   const dec = new StringDecoder('utf8'); // buffers a partial multibyte char across raw stdin chunks
   let dirty = true;
   let cache: string[] | null = null;
@@ -371,6 +392,12 @@ export function spawnNative(command: string, args: string[], cols: number, rows:
     },
     onUpdate(fn: () => void) {
       updateFn = fn;
+    },
+    onBell(fn: () => void) {
+      bellFn = fn;
+    },
+    onClipboard(fn: (text: string) => void) {
+      clipboardFn = fn;
     },
     onExit(fn: (code: number) => void) {
       exitFn = fn;

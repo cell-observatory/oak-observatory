@@ -15,7 +15,7 @@ import com.intellij.openapi.project.DumbAware
 import com.intellij.openapi.wm.ToolWindowManager
 
 /**
- * ⌃⌥I — jump to the next session waiting on you: permission prompts first,
+ * ⌥⌘X H — jump to the next session waiting on you: permission prompts first,
  * then questions, then input waits, oldest first. The ranking is core's, asked of the CLI
  * (`oak inbox --next --after <current>`) so this plugin carries no copy of the rule. Pins the session
  * and brings the Feed tab forward — the same landing the raised-hand balloon leads to.
@@ -33,6 +33,7 @@ class NextAttentionAction : AnAction(), DumbAware {
         ApplicationManager.getApplication().executeOnPooledThread {
             val r = ObservatoryCli.inboxNext(current, workDir)
             val hand = if (r.ok) InboxNextParser.parse(r.stdout) else null
+            val elsewhere = if (r.ok) InboxNextParser.elsewhere(r.stdout) else 0
             ApplicationManager.getApplication().invokeLater {
                 if (project.isDisposed) return@invokeLater
                 // A read that failed or timed out learned nothing about who is waiting.
@@ -42,7 +43,7 @@ class NextAttentionAction : AnAction(), DumbAware {
                     return@invokeLater
                 }
                 if (hand == null) {
-                    ReviewOps.notify(project, "Nobody is waiting on you")
+                    ReviewOps.notify(project, com.cellobservatory.observatory.model.nobodyWaitingHere(elsewhere, "the Sessions tab").replaceFirstChar { it.uppercase() })
                     return@invokeLater
                 }
                 ReviewOps.applySessionChoice(project, hand.id)

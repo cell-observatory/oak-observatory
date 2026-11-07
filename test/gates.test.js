@@ -133,6 +133,51 @@ test('installers: a failed or missing oak at the hooks prompt does not end the s
   }
 });
 
+test('install.sh and bootstrap.sh stop on a Node.js older than 24, before they install anything', { skip: process.platform === 'win32' && 'POSIX bash' }, t => {
+  // OAK supports Node.js 24 and later (core INDEX_NODES, which these checks agree with); 22.16 runs the index too, but is
+  // not supported. Each script's npm here logs each call and fails, so a run ends at its first one; bootstrap.sh's curl
+  // does the same.
+  const box = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-install-node-'));
+  t.after(() => fs.rmSync(box, { recursive: true, force: true }));
+  fs.copyFileSync(path.join(root, 'install.sh'), path.join(box, 'install.sh'));
+  fs.copyFileSync(path.join(root, 'scripts', 'bootstrap.sh'), path.join(box, 'bootstrap.sh'));
+  const bin = path.join(box, 'bin'), log = path.join(box, 'npm.log');
+  fs.mkdirSync(bin);
+  for (const tool of ['dirname', 'mktemp', 'rm', 'uname']) fs.symlinkSync(realTool(tool), path.join(bin, tool));
+  fs.writeFileSync(path.join(bin, 'npm'), `#!/bin/sh\necho "npm $*" >> '${log}'\nexit 1\n`, { mode: 0o755 });
+  fs.writeFileSync(path.join(bin, 'curl'), `#!/bin/sh\necho "curl $*" >> '${log}'\nexit 1\n`, { mode: 0o755 });
+  const run = (script, version) => {
+    fs.writeFileSync(path.join(bin, 'node'), `#!/bin/sh\n[ "$1" = -v ] && echo ${version}\n`, { mode: 0o755 });
+    fs.rmSync(log, { force: true });
+    const r = cp.spawnSync(realTool('bash'), [path.join(box, script)], { cwd: box, encoding: 'utf8', env: { PATH: bin } });
+    return { status: r.status, out: r.stdout + r.stderr, log: fs.existsSync(log) ? fs.readFileSync(log, 'utf8') : '' };
+  };
+  const core = require(path.join(root, 'packages/core/dist/index.js'));
+  const refused = ['v22.16.0', 'v22.23.4', 'v22.15.0', 'v20.19.0', 'v18.20.4', 'v23.0.0', 'v23.11.1'];
+  const taken = ['v24.0.0', 'v24.18.0', 'v26.13.0'];
+  for (const version of [...refused, ...taken]) assert.equal(core.nodeRunsIndex(version), taken.includes(version), `the index's own rule: ${version}`);
+  // `engines`, which npm checks with this same semver, as npm calls it (npm-install-checks: includePrerelease), takes
+  // exactly those. (semver is no dependency of this repository's own: npm hoists it from the toolchain's, and the require
+  // fails loudly if it goes.)
+  const engines = JSON.parse(read('packages/cli/package.json')).engines.node;
+  for (const version of [...refused, ...taken]) assert.equal(require('semver').satisfies(version, engines, { includePrerelease: true }), taken.includes(version), `engines ${engines}: ${version}`);
+  // install.ps1, which no run here executes (nor does CI), holds the same rule and words.
+  assert.match(read('install.ps1'), /if \(\[int\]\(\$nodeParts\[0\]\) -lt 24\) \{/);
+  assert.ok(read('install.ps1').includes('OAK needs Node.js 24 or newer, and this is Node.js $nodeVersion.'));
+  for (const script of ['install.sh', 'bootstrap.sh']) {
+    for (const version of refused) {
+      const r = run(script, version);
+      assert.equal(r.status, 1, `${script} ${version}: ${r.out}`);
+      assert.ok(r.out.includes('needs Node.js 24 or newer') && r.out.includes(`this is Node.js ${version}.`), `${script} ${version}: ${r.out}`);
+      assert.equal(r.log, '', `${script} ${version}: nothing is installed`);
+    }
+  }
+  for (const version of taken) {
+    assert.equal(run('install.sh', version).log, 'npm install --silent\n', `${version}: the install goes on`);
+    assert.match(run('bootstrap.sh', version).log, /^curl /, `${version}: the bootstrap goes on to download the release`);
+  }
+});
+
 test('release.sh tells recipients to install the tarball with --allow-scripts=node-pty, which npm 12 needs to build it', () => {
   const installs = read('scripts/release.sh').split('\n').filter((line) => /npm i(?:nstall)? -g/.test(line));
   assert.ok(installs.length > 0, 'release.sh names the install command');
@@ -238,8 +283,8 @@ function stepRun(file, name) {
   }
   return body.join('\n');
 }
-// Runs a step the way GitHub does (bash -eo pipefail) with a fake gh first on PATH.
-function runStep(t, block, env) {
+// Runs a step the way GitHub does (bash -eo pipefail) with a fake gh first on PATH, in the checkout or in [cwd].
+function runStep(t, block, env, cwd = root) {
   const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-gh-'));
   t.after(() => fs.rmSync(bin, { recursive: true, force: true }));
   fs.writeFileSync(path.join(bin, 'gh'), `#!/bin/sh
@@ -252,7 +297,7 @@ case "$*" in
 esac
 `, { mode: 0o755 });
   const r = cp.spawnSync(realTool('bash'), ['--noprofile', '--norc', '-eo', 'pipefail', '-c', block], {
-    cwd: root, encoding: 'utf8', env: { ...process.env, PATH: bin + path.delimiter + process.env.PATH, ...env } });
+    cwd, encoding: 'utf8', env: { ...process.env, PATH: bin + path.delimiter + process.env.PATH, ...env } });
   return { status: r.status, out: r.stdout + r.stderr };
 }
 const DEV = '.github/workflows/dev-release.yml';
@@ -279,6 +324,30 @@ test('dev-release: the rolling version must outrank the published pre-release AN
   assert.equal(run('0.10.0-dev.1', '', '').status, 0, 'nothing published yet');
 });
 
+test('release: a tag at a local build\'s version (-dev.0) is refused before anything is built or published', { skip: process.platform === 'win32' && 'POSIX bash' }, t => {
+  // Every `dev` checkout carries X.Y.Z-dev.0, which OAK reads as a local build that no release carries: a
+  // release at it would never be offered an update, so the tag check that passes it must refuse it.
+  const name = 'Verify the tag matches the committed version';
+  const gate = stepRun('.github/workflows/release.yml', name);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-tag-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const tagged = (version, tag) => {
+    fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ version }));
+    return runStep(t, gate, { GITHUB_REF_NAME: tag }, dir);
+  };
+  const local = tagged('0.11.0-dev.0', 'v0.11.0-dev.0');
+  assert.equal(local.status, 1, local.out);
+  assert.match(local.out, /names a local build's version/);
+  assert.equal(tagged('0.11.0', 'v0.11.0-dev.0').status, 1);
+  for (const [version, tag] of [['0.11.0', 'v0.11.0'], ['0.11.0-dev.10', 'v0.11.0-dev.10']]) {
+    const r = tagged(version, tag);
+    assert.equal(r.status, 0, `${tag}: ${r.out}`);
+  }
+  assert.equal(tagged('0.11.0', 'v0.12.0').status, 1, 'a tag that is not the committed version');
+  const src = read('.github/workflows/release.yml');
+  for (const later of ['- run: npm ci', '- name: Create GitHub Release with artifacts']) assert.ok(src.indexOf(`- name: ${name}`) < src.indexOf(later), `the check runs before ${later}`);
+});
+
 test('dev-release: fails when a pre-rename asset is still attached after the upload', { skip: process.platform === 'win32' && 'POSIX bash' }, t => {
   const name = 'No pre-rename asset is left on the rolling release';
   const check = stepRun(DEV, name);
@@ -291,7 +360,20 @@ test('workflows: every setup-node step is the current major, and Pages builds on
   for (const file of fs.readdirSync(path.join(root, '.github/workflows'))) {
     for (const m of read(`.github/workflows/${file}`).matchAll(/actions\/setup-node@(v\d+)/g)) assert.equal(m[1], 'v7', file);
   }
-  assert.match(read('.github/workflows/pages.yml'), /setup-node@v7\n\s+with:\n\s+node-version: 22\n/);
+  assert.match(read('.github/workflows/pages.yml'), /setup-node@v7\n\s+with:\n\s+node-version: 24\n/);
+});
+
+test('workflows: Gradle and the JDK are set up before release.sh builds the JetBrains plugin, and packaging runs on Node 24', () => {
+  // Set up after `npm run release`, the wrapper downloaded Gradle uncached and with no retry. @vscode/vsce 4 and
+  // its @azure dependencies need Node 22 or newer; OAK supports 24. vscode.yml runs on a self-hosted runner, which has no default JDK.
+  assert.match(read('scripts/release.sh'), /gradlew buildPlugin/, 'release.sh builds the plugin itself');
+  for (const [file, steps] of [['release.yml', ['actions/setup-java@', 'gradle/actions/setup-gradle@']],
+    ['dev-release.yml', ['actions/setup-java@', 'gradle/actions/setup-gradle@']], ['vscode.yml', ['actions/setup-java@', 'gradle/actions/setup-gradle@']]]) {
+    const src = read(`.github/workflows/${file}`), release = src.indexOf('- run: npm run release');
+    assert.ok(release > 0, `${file} runs npm run release`);
+    for (const step of steps) assert.ok(src.includes(step) && src.indexOf(step) < release, `${file}: ${step} comes before npm run release`);
+    assert.match(src, /node-version: 24\n/, `${file} packages the VS Code extension on Node 24`);
+  }
 });
 
 test('CLI package: ships oak, oak-observatory and the deprecated claude-observatory, and no generic command name', () => {
@@ -300,6 +382,64 @@ test('CLI package: ships oak, oak-observatory and the deprecated claude-observat
   const want = { oak: 'dist/index.js', 'oak-observatory': 'dist/index.js', 'claude-observatory': 'dist/index.js' };
   assert.deepEqual(JSON.parse(read('packages/cli/package.json')).bin, want);
   assert.deepEqual(JSON.parse(read('package-lock.json')).packages['packages/cli'].bin, want);
+});
+
+// Every `oak` and every capture hook starts through the launcher (dist/index.js), which keeps Node's compile cache of the
+// two bundles in this user's cache folder: a start after the first compiles neither again. Node checks each entry
+// against its file's content, so a bundle an update replaced, of the same size and time, runs as it is now.
+test('CLI launcher: Node\'s compile cache in this user\'s cache folder; a bundle an update replaced runs as it is, never from the cache', { skip: !require('node:module').enableCompileCache && 'no compile cache in this Node' }, (t) => {
+  const launcher = path.join(root, 'packages/cli/dist/index.js');
+  assert.ok(fs.statSync(launcher).size < 1000, `the launcher stays under 1,000 bytes (${fs.statSync(launcher).size})`);
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'oak-launcher-')));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(dir, 'dist'));
+  fs.copyFileSync(launcher, path.join(dir, 'dist', 'index.js'));
+  const bundle = path.join(dir, 'dist', 'cli.js');
+  const code = (word) => `process.stdout.write(${JSON.stringify(word)} + ' ' + require('node:module').getCompileCacheDir());\n`;
+  fs.writeFileSync(bundle, code('older'));
+  const env = { ...process.env, XDG_CACHE_HOME: path.join(dir, 'cache') };
+  delete env.NODE_COMPILE_CACHE;
+  delete env.NODE_DISABLE_COMPILE_CACHE;
+  const run = () => cp.spawnSync(process.execPath, [path.join(dir, 'dist', 'index.js'), '--version'], { encoding: 'utf8', env });
+  const first = run();
+  assert.equal(first.status, 0, first.stderr);
+  const [word, cacheDir] = first.stdout.split(' ');
+  assert.equal(word, 'older');
+  assert.equal(path.dirname(cacheDir), path.join(dir, 'cache', 'oak', 'compile-cache'), 'in the cache folder of this user, never the store or a shared /tmp');
+  assert.ok(fs.readdirSync(cacheDir).length > 0, 'an entry for the bundle, written at its exit');
+  assert.equal(run().stdout.split(' ')[0], 'older', 'control: run again, from the cache');
+  // An update: the same size and modification time, other code.
+  const st = fs.statSync(bundle);
+  fs.writeFileSync(bundle, code('newer'));
+  fs.utimesSync(bundle, st.atime, st.mtime);
+  assert.equal(fs.statSync(bundle).size, st.size, 'control: the same size');
+  assert.equal(run().stdout.split(' ')[0], 'newer', 'the bundle as it is now, never the cached older one');
+  // A relative XDG_CACHE_HOME names no cache folder (the XDG spec has it ignored): the home's, never the folder a command or a
+  // hook runs in.
+  const home = path.join(dir, 'home');
+  fs.mkdirSync(home);
+  const rel = cp.spawnSync(process.execPath, [path.join(dir, 'dist', 'index.js'), '--version'], { encoding: 'utf8', cwd: dir, env: { ...env, XDG_CACHE_HOME: 'rel-cache', HOME: home, USERPROFILE: home } });
+  assert.equal(rel.status, 0, rel.stderr);
+  assert.equal(path.dirname(rel.stdout.split(' ')[1]), path.join(home, '.cache', 'oak', 'compile-cache'));
+  assert.equal(fs.existsSync(path.join(dir, 'rel-cache')), false, 'nothing in the folder it ran in');
+  // Nor is an empty HOME a home: no cache, and nothing in the folder it ran in.
+  const bare = cp.spawnSync(process.execPath, [path.join(dir, 'dist', 'index.js'), '--version'], { encoding: 'utf8', cwd: dir, env: { ...env, XDG_CACHE_HOME: '', HOME: '', USERPROFILE: '' } });
+  assert.equal(bare.status, 0, bare.stderr);
+  assert.equal(bare.stdout, 'newer undefined', 'no compile cache');
+  assert.equal(fs.existsSync(path.join(dir, '.cache')), false, 'nothing in the folder it ran in');
+  // A home Node cannot tell (os.homedir throws: no HOME, and no account entry for the user): no cache, and the start goes on.
+  const homeless = path.join(dir, 'no-homedir.cjs');
+  fs.writeFileSync(homeless, "require('os').homedir = () => { throw Object.assign(new Error('no home'), { code: 'ERR_SYSTEM_ERROR' }); };\n");
+  const thrown = cp.spawnSync(process.execPath, ['--require', homeless, path.join(dir, 'dist', 'index.js'), '--version'], { encoding: 'utf8', env: { ...env, XDG_CACHE_HOME: '' } });
+  assert.equal(thrown.status, 0, thrown.stderr);
+  assert.equal(thrown.stdout, 'newer undefined', 'no compile cache');
+  // A cache folder Node's recursive mkdir would never return under (a folder that answers ENOENT to a mkdir): no cache,
+  // and the start goes on.
+  if (process.platform === 'linux') {
+    const proc = cp.spawnSync(process.execPath, [path.join(dir, 'dist', 'index.js'), '--version'], { encoding: 'utf8', env: { ...env, XDG_CACHE_HOME: '/proc/oak-no-cache-here' }, timeout: 15_000 });
+    assert.equal(proc.status, 0, `it starts: ${proc.error?.message ?? proc.stderr}`);
+    assert.equal(proc.stdout, 'newer undefined', 'no compile cache');
+  }
 });
 
 test('installers: install.ps1 is ASCII, so Windows PowerShell 5.1 can parse it when it runs the file', () => {
@@ -342,6 +482,29 @@ test('a checkout\'s install makes node-pty\'s spawn-helper executable, which its
   fs.rmSync(path.join(tree, 'node_modules'), { recursive: true });
   r = install();
   assert.equal(r.status, 0, r.stderr);
+});
+
+test('the editors give `oak update` longer than its saved machines can take, with most of it left for this machine', () => {
+  // The deadlines the CLI holds saved machines to: herdr's machine list, then each plan, then each update.
+  const value = (src, name) => {
+    const m = new RegExp(`\\b${name} = ([\\d_ *]+)`).exec(src);
+    assert.ok(m, `${name} is declared`);
+    return m[1].split('*').reduce((n, factor) => n * Number(factor.trim().replace(/_/g, '')), 1);
+  };
+  const cli = read('packages/cli/src/index.ts');
+  const list = Number(/timeoutMs: (\d+)/.exec(cli.slice(cli.indexOf('async function planMachines')))[1]);
+  const deadlines = [list, value(cli, 'MACHINE_PLAN_TIMEOUT_MS'), value(cli, 'MACHINE_APPLY_TIMEOUT_MS')];
+  assert.ok(deadlines.every((ms) => Number.isInteger(ms) && ms >= 1000), `each deadline is read: ${deadlines}`);
+  const machines = deadlines.reduce((a, b) => a + b);
+  for (const [editor, file, call] of [
+    ['VS Code', 'packages/vscode/src/extension.ts', /runCli\(target \? \['update', '--channel', target\] : \['update'\], UPDATE_TIMEOUT_MS\)/],
+    ['JetBrains', 'packages/jetbrains/src/main/kotlin/com/cellobservatory/observatory/core/ObservatoryCli.kt', /fun update\([^]*?run\(args, workDir, timeoutMs = UPDATE_TIMEOUT_MS\)/],
+  ]) {
+    const src = read(file);
+    const budget = value(src, 'UPDATE_TIMEOUT_MS');
+    assert.ok(budget - machines >= 10 * 60_000, `${editor} leaves this machine's own installs ${(budget - machines) / 1000} s of its ${budget / 1000} s`);
+    assert.match(src, call, `${editor} gives that budget to the update call`);
+  }
 });
 
 test('CI installs the pinned herdr before the suite, so the real-binary herdr tests run there', () => {
@@ -465,6 +628,234 @@ test('TUI media scratch stays under /tmp/obs-demo, the one temp path the privacy
   assert.match(read('scripts/check-docs-privacy.mjs'), /\(\?!obs-demo\\b/, 'the gate still admits /tmp/obs-demo');
 });
 
+test('every headless Chrome the scripts, sources and tests start runs with its extensions off, through runChrome or capturePng', () => {
+  // A system package can register an extension that Chrome installs into every new profile, and each
+  // headless run starts with a new one: KDE's Plasma Integration does (from
+  // /usr/share/google-chrome/extensions), and its native host aborts at once, so every launch left a crash
+  // report on the desktop. --disable-extensions keeps it out. scripts/chrome.mjs's runChrome and capturePng
+  // give Chrome a home of its own, with no bus, display or keyring: a launch of its own reads the person's.
+  const code = /\.[cm]?[jt]s$/, shell = /\.(?:sh|ps1)$/;
+  const files = [];
+  const walk = (dir) => {
+    for (const e of fs.readdirSync(path.join(root, dir), { withFileTypes: true })) {
+      const rel = path.join(dir, e.name);
+      if (e.isDirectory()) { if (e.name !== 'node_modules') walk(rel); } else if (code.test(e.name) || shell.test(e.name)) files.push(rel);
+    }
+  };
+  for (const dir of ['scripts', 'test', ...fs.readdirSync(path.join(root, 'packages')).flatMap((p) => ['src', 'test'].map((d) => path.join('packages', p, d)))])
+    if (fs.existsSync(path.join(root, dir))) walk(dir);
+  // Each launch in one file, whether it turns the extensions off, and whether it goes through runChrome or
+  // capturePng. A flag that is a string of its own is read with the argument list it is in, from the unclosed
+  // `[` before it to the `]` that closes it, which is handed to one of them or named by a variable that is; one
+  // inside a longer string, a command a shell runs, with its line. A line that is a comment starts nothing.
+  const launches = (file, text) => {
+    if (!code.test(file)) return shell.test(file) && text.includes('--headless') ? [{ at: file, off: false, elsewhere: true }] : [];
+    const found = [];
+    for (const m of text.matchAll(/--headless\b/g)) {
+      const from = text.lastIndexOf('\n', m.index) + 1, to = text.indexOf('\n', m.index);
+      const line = text.slice(from, to < 0 ? text.length : to);
+      if (/^\s*(?:\/\/|\/?\*)/.test(line)) continue;
+      const q = text[m.index - 1];
+      let args = null, via = false;
+      if (/['"`]/.test(q) && new RegExp(`^--headless(?:=\\w+)?${q}`).test(text.slice(m.index))) {
+        let open = m.index, close = m.index, depth = 0;
+        while (open > 0) { const ch = text[--open]; if (ch === ']') depth++; else if (ch === '[' && !depth--) break; }
+        depth = 0;
+        while (close < text.length) { const ch = text[close++]; if (ch === '[') depth++; else if (ch === ']' && !depth--) break; }
+        if (text[open] === '[') {
+          args = text.slice(open, close);
+          const before = text.slice(0, open), helper = '\\b(?:runChrome|capturePng)\\(\\s*[^,()]+,\\s*';
+          const name = /\b(?:const|let|var)\s+(\w+)\s*=\s*$/.exec(before)?.[1];
+          via = new RegExp(`${helper}$`).test(before) || (!!name && new RegExp(`${helper}${name}\\b`).test(text));
+        }
+      }
+      found.push({ at: `${file}:${text.slice(0, m.index).split('\n').length}`, off: args ? /(['"`])--disable-extensions\1/.test(args) : /--disable-extensions\b/.test(line), via });
+    }
+    return found;
+  };
+  // The reader, tried before it is trusted: each of these starts Chrome with its extensions on.
+  for (const [file, text] of [
+    ['x.mts', "spawnSync(chrome, ['--headless', '--screenshot', 'page.html']);"],
+    ['x.cts', "spawnSync(chrome, ['--headless=new', '--dump-dom', 'page.html']);"],
+    ['x.mjs', 'execSync(`${chrome} --headless --screenshot=x.png page.html`);'],
+    ['x.ts', "execSync(chrome + ' --headless --dump-dom page.html');"],
+    ['x.sh', 'chrome --headless --disable-extensions page.html'],
+  ]) assert.deepEqual(launches(file, text).map((l) => l.off), [false], `${file}: ${text}`);
+  // …and each of these with its extensions off, through the helpers or not.
+  for (const [text, via] of [
+    ["capturePng(CHROME, ['--headless', '--disable-extensions', 'page.html']);", true],
+    ["const dom = runChrome(chrome, [\n  '--headless', '--disable-extensions', '--dump-dom', 'page.html',\n], { timeout: 1 });", true],
+    ["const shot = ['--headless', '--disable-extensions', 'page.html'];\ncapturePng('/fixture/browser', shot);", true],
+    ["execFileSync(chrome, ['--headless', '--disable-extensions', 'page.html']);", false],
+    ["const shot = ['--headless', '--disable-extensions', 'page.html'];\nexecFileSync(chrome, shot);", false],
+    ["execSync(`${chrome} --headless --disable-extensions page.html`);", false],
+  ]) assert.deepEqual(launches('x.mjs', text).map((l) => [l.off, l.via]), [[true, via]], text);
+  assert.ok(files.includes(path.join('packages', 'core', 'src', 'spawn.ts')), 'the packages\' sources are read');
+  const self = path.join('test', 'gates.test.js');
+  const all = files.filter((f) => f !== self).flatMap((f) => launches(f, read(f)));
+  assert.ok(all.length >= 5, `the launches were found: ${all.map((l) => l.at).join(', ')}`);
+  assert.deepEqual(all.filter((l) => !l.off && !l.elsewhere).map((l) => l.at), [], 'these start Chrome with the extensions a system package registers');
+  assert.deepEqual(all.filter((l) => !l.via && !l.elsewhere).map((l) => l.at), [], 'these start Chrome themselves: hand the arguments to runChrome or capturePng (scripts/chrome.mjs)');
+  assert.deepEqual(all.filter((l) => l.elsewhere).map((l) => l.at), [], 'a launch outside JavaScript: give it --disable-extensions, then teach this test to read it');
+});
+
+// A text cut at a UTF-16 index ends inside a character as easily as anywhere else: a session title cut at 64 units showed
+// `👨‍👩‍�…` in the terminal app's session picker, half a family and half of a surrogate pair. Every cut that ends in an
+// ellipsis ends where a character does, through core's graphemeHead and graphemeTail or the JetBrains plugin's own.
+test('no text is cut with an ellipsis at a UTF-16 index: each cut goes through graphemeHead or graphemeTail', () => {
+  const cut = [
+    /\.slice\(0, ?[^)]+\)(?:\.\w+\(\))*\s*\+\s*['"]…/, // s.slice(0, n) + '…'
+    /\$\{[^}]*\.slice\(0, ?[^)]+\)(?:\.\w+\(\))*\}\s?…/, // `${s.slice(0, n)}…`
+    /\.substring\(0, ?[^)]+\)\s*\+\s*['"]…/,
+    /['"]…['"]\s*\+\s*[\w.]+\.slice\(-/, // '…' + s.slice(-n)
+    /\.take\([^)]*\)\s*\+\s*"…"/, // Kotlin: s.take(n) + "…"
+    /"…"\s*\+\s*[\w.]+\.takeLast\(/, // Kotlin: "…" + s.takeLast(n)
+  ];
+  // The forms the cuts had: each is seen.
+  for (const old of ["title.slice(0, 63).trimEnd() + '…'", '`${one.slice(0, THOUGHT_LIMIT)}…`', "fon='…'+fon.slice(-23)", 's.take(47) + "…"', '"…" + name.takeLast(23)'])
+    assert.ok(cut.some((re) => re.test(old)), `the gate sees ${old}`);
+  const walk = (dir, ext) => fs.readdirSync(path.join(root, dir), { withFileTypes: true }).flatMap((e) =>
+    e.isDirectory() ? walk(path.join(dir, e.name), ext) : e.name.endsWith(ext) && !e.name.endsWith('.d.ts') ? [path.join(dir, e.name)] : []);
+  const files = [...['packages/core/src', 'packages/tui/src', 'packages/cli/src', 'packages/vscode/src'].flatMap((d) => walk(d, '.ts')),
+    ...walk('packages/jetbrains/src/main/kotlin', '.kt')];
+  assert.ok(files.length > 100, `the gate reads every source (${files.length})`);
+  const found = files.flatMap((f) => read(f).split('\n').map((l, i) => [f, i + 1, l]).filter(([, , l]) => cut.some((re) => re.test(l))))
+    .map(([f, n, l]) => `${f}:${n}: ${l.trim()}`);
+  assert.deepEqual(found, []);
+});
+
+// A cut at a fixed size with no ellipsis ends inside a character as easily: ^V's paste cap and the conversation search's
+// index held the first half of an emoji's surrogate pair when their cap fell inside one, and `oak actions` printed it.
+// Every string cut at a fixed size, from its head (`s.slice(0, N)`, `substring`, `substr`) or its tail (`s.slice(-N)`),
+// goes through graphemeHead or graphemeTail, except where the text cannot hold such a character: a hash's hex digits, a
+// date's ISO form, an id, a slug, or the text a hash is made of, whose cut must not move. The TypeScript checker says
+// which receivers are strings, so an array's `slice(0, 40)` is not one; an id is known by its name, or listed below
+// where its name does not say so. accountUsage.ts holds five cuts of an error message, left as they are by the change
+// that added this check, and they are counted so that none is added there.
+test('no text is cut at a fixed size at a UTF-16 index: each cut goes through graphemeHead or graphemeTail', () => {
+  const ts = require('typescript');
+  const fixedSize = (n) => ts.isNumericLiteral(n) || (ts.isIdentifier(n) && /^[A-Z][A-Z0-9_]*$/.test(n.text))
+    || (ts.isParenthesizedExpression(n) && fixedSize(n.expression)) || (ts.isBinaryExpression(n) && fixedSize(n.left) && fixedSize(n.right));
+  const ascii = (recv) => /\.digest\(|\.to(?:ISO|Time)String\(\)/.test(recv) || /\b(?:id|session|sess|sid|slug)\b|[a-z](?:Id|Ses|Session)\b|_session\b/.test(recv);
+  const hashed = (n) => { for (let p = n.parent; p; p = p.parent) if (ts.isCallExpression(p) && ts.isPropertyAccessExpression(p.expression) && p.expression.name.text === 'update') return true; return false; };
+  // Ids by another name: the session the terminal app's `--once` frame reviews.
+  const ids = new Set(['packages/tui/src/app.ts: target.slice(0, 8)']);
+  /** Each fixed-size string cut in `program`'s files under `dir`, as `file:line: cut`, with whether it may stay. */
+  const cutsIn = (program, dir) => {
+    const checker = program.getTypeChecker(), out = [];
+    for (const sf of program.getSourceFiles()) {
+      if (!path.resolve(sf.fileName).startsWith(dir + path.sep)) continue;
+      (function visit(n) {
+        if (ts.isCallExpression(n) && ts.isPropertyAccessExpression(n.expression) && ['slice', 'substring', 'substr'].includes(n.expression.name.text)) {
+          const a = n.arguments, recv = n.expression.expression;
+          const head = a.length === 2 && ts.isNumericLiteral(a[0]) && a[0].text === '0' && fixedSize(a[1]);
+          const tail = a.length === 1 && n.expression.name.text === 'slice' && ts.isPrefixUnaryExpression(a[0]) && a[0].operator === ts.SyntaxKind.MinusToken && fixedSize(a[0].operand);
+          if ((head || tail) && checker.getTypeAtLocation(recv).flags & ts.TypeFlags.StringLike) {
+            const file = path.relative(root, path.resolve(sf.fileName)).split(path.sep).join('/'), cut = n.getText(sf).replace(/\s+/g, ' ');
+            const at = `${file}:${sf.getLineAndCharacterOfPosition(n.getStart(sf)).line + 1}: ${cut}`;
+            out.push({ at, stays: ascii(recv.getText(sf).replace(/\s+/g, ' ')) || hashed(n) || ids.has(`${file}: ${cut}`) });
+          }
+        }
+        ts.forEachChild(n, visit);
+      })(sf);
+    }
+    return out;
+  };
+  // The rule, on the forms the cuts had and the ones that may stay.
+  const dir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'oak-cuts-'));
+  try {
+    const sample = path.join(dir, 'sample.ts');
+    fs.writeFileSync(sample, [
+      'declare const text: string, ask: string, err: string, id: string, slug: string, lines: string[], hash: { update(s: string): { digest(e: string): string } };',
+      'const PASTE_MAX = 512, SLUG_MAX = 200;',
+      'export const cut = [text.slice(0, PASTE_MAX), ask.length > 8192 ? ask.slice(0, 8192) : ask, err.slice(-16000), text.substring(0, 40), (text || "").slice(0, 80)];',
+      'export const kept = [id.slice(0, 8), slug.slice(0, SLUG_MAX + 1), hash.update(text.slice(0, 200)).digest("hex").slice(0, 16), new Date().toISOString().slice(0, 10)];',
+      'export const notCuts = [lines.slice(0, 40), text.slice(0, text.indexOf(":")), text.slice(0, -6)];',
+    ].join('\n'));
+    const seen = cutsIn(ts.createProgram([sample], { strict: true, noEmit: true, target: ts.ScriptTarget.ES2022, lib: ['lib.es2022.d.ts'] }), dir);
+    assert.deepEqual(seen.map((c) => [c.at.replace(/^.*?: /, ''), c.stays]), [
+      ['text.slice(0, PASTE_MAX)', false], ['ask.slice(0, 8192)', false], ['err.slice(-16000)', false], ['text.substring(0, 40)', false], ['(text || "").slice(0, 80)', false],
+      ['id.slice(0, 8)', true], ['slug.slice(0, SLUG_MAX + 1)', true], ['hash.update(text.slice(0, 200)).digest("hex").slice(0, 16)', true], ['text.slice(0, 200)', true], ['new Date().toISOString().slice(0, 10)', true],
+    ]);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+  // Each package as it is built, with the types of the packages it imports.
+  const all = ['core', 'tui', 'cli', 'vscode'].flatMap((pkg) => {
+    const cfg = ts.getParsedCommandLineOfConfigFile(path.join(root, 'packages', pkg, 'tsconfig.json'), {}, { ...ts.sys, onUnRecoverableConfigFileDiagnostic: (d) => assert.fail(ts.flattenDiagnosticMessageText(d.messageText, '\n')) });
+    return cutsIn(ts.createProgram({ rootNames: cfg.fileNames, options: { ...cfg.options, noEmit: true } }), path.join(root, 'packages', pkg, 'src'));
+  });
+  // The checker typed what it read: an id the CLI takes from core's types, and a slug core makes itself.
+  for (const known of [/^packages\/cli\/src\/index\.ts:\d+: h\.session\.slice\(0, 8\)$/, /^packages\/core\/src\/session\.ts:\d+: slug\.slice\(0, SLUG_MAX\)$/])
+    assert.ok(all.some((c) => known.test(c.at.split(path.sep).join('/')) && c.stays), `the scan sees ${known}`);
+  const left = all.filter((c) => !c.stays).map((c) => c.at.split(path.sep).join('/'));
+  assert.equal(left.filter((at) => at.startsWith('packages/core/src/accountUsage.ts:')).length, 5, left.join('\n'));
+  assert.deepEqual(left.filter((at) => !at.startsWith('packages/core/src/accountUsage.ts:')), []);
+  // The JetBrains plugin, which the checker does not read: a fixed-size take of a command's output or of text shown.
+  const receiver = (line, at) => {
+    let i = at, depth = 0;
+    for (; i > 0; i--) {
+      const ch = line[i - 1];
+      if (')]}'.includes(ch)) depth++;
+      else if ('([{'.includes(ch)) { if (!depth) break; depth--; }
+      else if (!depth && !/[\w.?!]/.test(ch)) break;
+    }
+    return line.slice(i, at);
+  };
+  const ktCuts = (source) => source.split('\n').flatMap((line, n) => [...line.matchAll(/\.(?:take|takeLast)\((?:\d+|[A-Z][A-Z0-9_]*)\)|\.substring\(0, ?(?:\d+|[A-Z][A-Z0-9_]*)\)/g)]
+    .map((m) => [n + 1, receiver(line, m.index)])
+    .filter(([, r]) => /\b(?:stderr|stdout|message|text|title|label|reason|detail|snippet|prompt|summary)\b|joinToString\(/.test(r) && !/(?:lines|lineSequence|split)\([^()]*\)$/.test(r)));
+  assert.deepEqual(ktCuts('notify(project, "Clean failed — ${r.stderr.take(160)}")\nval tail = (r.stdout.trim().lines().takeLast(6).joinToString("\\n")).take(600)\nval ids = row.id.take(8)')
+    .map(([n]) => n), [1, 2], 'the plugin\'s rule sees the cuts it had, and not an id or a list of lines');
+  const walk = (d) => fs.readdirSync(path.join(root, d), { withFileTypes: true }).flatMap((e) => e.isDirectory() ? walk(path.join(d, e.name)) : e.name.endsWith('.kt') ? [path.join(d, e.name)] : []);
+  assert.deepEqual(walk('packages/jetbrains/src/main/kotlin').flatMap((f) => ktCuts(read(f)).map(([n, r]) => `${f}:${n}: ${r}`)), []);
+});
+
+test('SECURITY.md names what npm downloads when it installs the CLI', () => {
+  // `oak update`, here and on each saved machine, runs `npm i -g` on the release's tarball, and npm fetches
+  // the dependencies the CLI declares from the registry, and theirs: a network path of its own. One with an
+  // install script is built where it ships no binary, and node-gyp fetches Node's headers to build it.
+  const pkg = JSON.parse(read('packages/cli/package.json'));
+  const declared = Object.keys({ ...pkg.dependencies, ...pkg.optionalDependencies, ...pkg.peerDependencies });
+  assert.ok(declared.length, 'the CLI declares what npm installs with it');
+  const locked = JSON.parse(read('package-lock.json')).packages;
+  // Each as the CLI's workspace resolves it: nested under packages/cli when the workspace locks another version
+  // there, otherwise at the root. One found nowhere would skip the checks below, so it must be found.
+  const lockOf = (name) => {
+    const entry = locked[`packages/cli/node_modules/${name}`] ?? locked[`node_modules/${name}`];
+    assert.ok(entry, `package-lock.json locks ${name}, which the CLI declares`);
+    return entry;
+  };
+  const theirs = declared.flatMap((name) => Object.keys(lockOf(name).dependencies ?? {}));
+  const sentence = read('SECURITY.md').split(/(?<=\.)\s+/).find((s) => /npm registry/.test(s)) ?? '';
+  assert.match(sentence, /npm i -g[\s\S]*here and on each saved machine/, sentence);
+  for (const name of [...declared, ...theirs]) assert.ok(sentence.includes(name), `SECURITY.md says npm downloads ${name}: ${sentence}`);
+  if (declared.some((name) => lockOf(name).hasInstallScript)) assert.match(sentence, /node-gyp downloads the Node\.js headers\s+from nodejs\.org/, sentence);
+  // install.sh first installs its checkout's own dependencies, the tree package-lock.json locks.
+  assert.match(read('install.sh'), /^npm install\b/m);
+  const own = read('SECURITY.md').split(/(?<=\.)\s+/).find((s) => /`install\.sh` builds/.test(s)) ?? '';
+  assert.match(own, /`npm install`[\s\S]*`package-lock\.json`[\s\S]*npm registry[\s\S]*node-gyp/, own);
+});
+
+test('SECURITY.md names what `./install.sh --jetbrains` downloads, and install.sh does not say nothing is', () => {
+  // `--jetbrains` builds the plugin with the Gradle wrapper, which downloads Gradle (services.gradle.org sends that
+  // download to GitHub's gradle-distributions), and Gradle then the build's plugins, the IntelliJ Platform, the
+  // other dependencies and, on a machine with none, a JDK 21 that the foojay resolver looks up at foojay.io.
+  assert.match(read('install.sh'), /^\s*if bash scripts\/install-jetbrains\.sh --build-only/m);
+  assert.match(read('scripts/install-jetbrains.sh'), /\.\/gradlew buildPlugin/);
+  assert.match(read('packages/jetbrains/settings.gradle.kts'), /id\("org\.gradle\.toolchains\.foojay-resolver-convention"\)/);
+  const gradle = /^distributionUrl=https\\?:\/\/([^/]+)\//m.exec(read('packages/jetbrains/gradle/wrapper/gradle-wrapper.properties'))?.[1];
+  const sentence = read('SECURITY.md').split(/(?<=\.)\s+/).find((s) => s.includes('`--jetbrains`')) ?? '';
+  for (const named of [gradle, 'github.com/gradle/gradle-distributions', 'Gradle Plugin Portal', 'IntelliJ Platform', 'Maven Central', 'JDK 21', 'foojay.io']) {
+    assert.ok(named && sentence.includes(named), `SECURITY.md names ${named}: ${sentence}`);
+  }
+  const installer = read('install.sh'), end = installer.indexOf('\nset -euo pipefail');
+  assert.ok(end > 0, 'install.sh opens with its header comment, then set -euo pipefail');
+  const header = installer.slice(0, end);
+  assert.doesNotMatch(header, /nothing is downloaded/i, header);
+  for (const named of ['npm', 'herdr', 'Gradle']) assert.match(header, new RegExp(named), header);
+});
+
 test('a release stamp turns [Unreleased] into the section release.yml publishes', { skip: process.platform === 'win32' && 'runs release.yml\'s awk' }, t => {
   const dir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'oak-stamp-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
@@ -508,6 +899,51 @@ test('a release stamp turns [Unreleased] into the section release.yml publishes'
     const dated = new RegExp(`^## \\[${version.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\] — (\\S+)$`, 'm').exec(fs.readFileSync(path.join(dir, 'CHANGELOG.md'), 'utf8'))?.[1];
     assert.ok([before, day(TZ)].includes(dated), `TZ=${TZ}: stamped ${dated}, where the date is ${before}`);
   }
+});
+
+test('release.yml publishes notes GitHub accepts: past its limit, whole entries and where the rest is', { skip: process.platform === 'win32' && 'runs release.yml\'s bash' }, t => {
+  // GitHub refuses a release body over 125,000 characters ("body is too long"), and a refused `gh release create`
+  // leaves the tag with no release and no assets. The step runs whole, with a gh that keeps the notes it is handed.
+  const LIMIT = 125000;
+  const step = stepRun('.github/workflows/release.yml', 'Create GitHub Release with artifacts');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-notes-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  for (const f of ['release/oak-observatory.vsix', 'release/oak-observatory-9.9.0.tgz', 'packages/jetbrains/build/distributions/p.zip']) {
+    fs.mkdirSync(path.dirname(path.join(dir, f)), { recursive: true });
+    fs.writeFileSync(path.join(dir, f), '');
+  }
+  // The fake gh, first on PATH and executable before anything runs: the real one would publish a release.
+  const gh = path.join(dir, 'bin', 'gh');
+  fs.mkdirSync(path.dirname(gh));
+  fs.writeFileSync(gh, '#!/bin/sh\nwhile [ $# -gt 0 ]; do [ "$1" = --notes-file ] && cp "$2" "$KEPT"; shift; done\n');
+  fs.chmodSync(gh, 0o755);
+  const kept = path.join(dir, 'published.md');
+  const publish = (notes) => {
+    fs.writeFileSync(path.join(dir, 'CHANGELOG.md'), `# Changelog\n\n## [Unreleased]\n\n## [9.9.0] — 2026-01-01\n${notes}## [9.8.0] — 2025-12-01\n\n- An older entry.\n`);
+    fs.rmSync(kept, { force: true });
+    const r = cp.spawnSync(realTool('bash'), ['--noprofile', '--norc', '-eo', 'pipefail', '-c', step], { cwd: dir, encoding: 'utf8',
+      env: { ...process.env, PATH: path.dirname(gh) + path.delimiter + process.env.PATH, GITHUB_REF_NAME: 'v9.9.0', GITHUB_REPOSITORY: 'o/r', KEPT: kept } });
+    assert.equal(r.status, 0, r.stderr);
+    return fs.readFileSync(kept, 'utf8');
+  };
+  const pointer = '\nGitHub keeps a release\'s notes to 125,000 characters: the rest of these notes are in [CHANGELOG.md](https://github.com/o/r/blob/v9.9.0/CHANGELOG.md).\n';
+  // What is cut: a prefix of the notes that ends where an entry or heading begins, then the pointer.
+  const cutWhole = (notes, out) => {
+    assert.ok([...out].length <= LIMIT, `${[...out].length} characters published`);
+    assert.ok(out.endsWith(pointer), 'the rest is named');
+    const head = out.slice(0, -pointer.length);
+    assert.ok(notes.startsWith(head), 'a prefix of the notes');
+    assert.match(notes.slice(head.length), /^(?:- |#+ )/, 'cut before an entry or heading, never inside one');
+  };
+  assert.equal(publish('\n### Added\n\n- A new thing.\n\n'), '\n### Added\n\n- A new thing.\n\n', 'short notes go out as written');
+  // 400 entries of two lines, with characters of two bytes: past the limit in characters as in bytes.
+  const many = `\n### Fixed\n\n${Array.from({ length: 400 }, (_, i) => `- Entry ${i}: ${'é'.repeat(180)}\n  ${'x'.repeat(200)}\n`).join('')}\n`;
+  cutWhole(many, publish(many));
+  // The next release's notes as they stand.
+  const next = /^## \[Unreleased\][^\n]*\n([\s\S]*?)(?=^## \[)/m.exec(read('CHANGELOG.md'))[1];
+  const out = publish(next);
+  if (Buffer.byteLength(next) > 120000) cutWhole(next, out);
+  else assert.equal(out, next);
 });
 
 test('Cutting a release: steps 1 and 2 commit what the next step needs, and step 5 finds dev\'s new entries however the PR was merged', { skip: process.platform === 'win32' && 'POSIX sh' }, t => {
@@ -559,15 +995,63 @@ function checkPages(source) {
 }
 
 test('Pages gate generates docs and rejects stale committed pages before upload', () => checkPages(read('.github/workflows/pages.yml')));
+test('the database explainer is included in generated navigation, search and related guides', () => {
+  const slug = 'database-across-machines';
+  const titles = { 'database-across-machines': 'The database across machines', 'database-and-sync': 'Database & sync' };
+  const nav = [...read('scripts/build-docs.mjs').matchAll(/slug: '([^']+)'/g)].map(m => m[1]);
+  for (const name of Object.keys(titles)) {
+    assert.ok(nav.includes(name));
+    const old = name.replace('database-', 'index-');
+    for (const dir of ['docs', 'docs/_content']) assert.ok(!fs.existsSync(path.join(root, dir, `${old}.html`)), `${dir}: unpublished page has no redirect`);
+  }
+  for (const page of ['showcase', ...nav]) {
+    const html = read(`docs/${page}.html`);
+    const index = JSON.parse(html.match(/window\.__DOCS_INDEX__=(\[[\s\S]*?\]);/)[1]);
+    assert.deepEqual(index.map(p => p.s), nav, `${page}: search covers every page`);
+    for (const [name, title] of Object.entries(titles)) assert.equal(index.find(p => p.s === name)?.t, title, `${page}: search names ${name}`);
+    assert.doesNotMatch(html, /index-(?:across-machines|and-sync)\.html|the-local-index|why-the-index-stays-local|index-versions-and-usage-display/);
+    if (page !== 'showcase') assert.ok(html.includes(`href="${slug}.html"`), `${page}: navigation includes the explainer`);
+  }
+  for (const page of ['database-and-sync', 'agents-across-machines']) {
+    assert.ok(read(`docs/_content/${page}.html`).includes(`href="${slug}.html"`), `${page}: body links to the explainer`);
+    assert.ok(read(`docs/_content/${slug}.html`).includes(`href="${page}.html"`), `explainer links back to ${page}`);
+  }
+  const guide = read('docs/database-and-sync.html');
+  assert.match(guide, /<h1>Database &amp; sync<\/h1>/);
+  assert.match(guide, /id="the-local-database"/);
+  assert.match(guide, /id="database-versions-and-usage-display"/);
+  assert.match(guide, /database: \/tmp\/obs-demo\/laptop\/\.claude\/claude-observatory-index\/index-v1-/);
+  for (const name of Object.keys(titles)) {
+    const html = read(`docs/${name}.html`);
+    assert.match(html, /rows? · \d+ ms · the database is current/);
+    assert.doesNotMatch(html, /the index is current/);
+  }
+  assert.match(read(`docs/${slug}.html`), /<h1>The database across machines<\/h1>/);
+  assert.match(read(`docs/${slug}.html`), /id="why-the-database-stays-local"/);
+});
 test('Pages gate detects removal of the freshness command from a copy', () => {
   const source = read('.github/workflows/pages.yml');
   checkPages(source);
   assert.throws(() => checkPages(source.replace('git diff --exit-code -- docs', 'true')), /generate and verify/);
 });
+test('the editor demo embed is what its generator makes from the homepage, as the Pages gate requires', t => {
+  // The Pages gate also regenerates docs/embed-editor-demo.html, which copies the homepage's whole <style>
+  // block, and fails the deploy when it differs; build-docs alone does not see it.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-embed-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  for (const file of ['scripts/build-editor-demo-embed.mjs', 'docs/showcase.html']) {
+    fs.mkdirSync(path.join(dir, path.dirname(file)), { recursive: true });
+    fs.copyFileSync(path.join(root, file), path.join(dir, file));
+  }
+  const run = cp.spawnSync(process.execPath, [path.join(dir, 'scripts/build-editor-demo-embed.mjs')], { encoding: 'utf8' });
+  assert.equal(run.status, 0, run.stderr);
+  assert.ok(fs.readFileSync(path.join(dir, 'docs/embed-editor-demo.html'), 'utf8') === read('docs/embed-editor-demo.html'),
+    'docs/embed-editor-demo.html is stale; run node scripts/build-editor-demo-embed.mjs');
+});
 
 test('Feed docs and media describe four chronological Timeline tabs and actual consumers', () => {
   const media = read('scripts/render-media.mjs');
-  assert.ok(media.includes("${tlTab('Feed', 0, false)}${tlTab('Prompts', 3, true)}${tlTab('Observations', 9, false)}${tlTab('Actions', 39, false)}"));
+  assert.ok(media.includes("${tlTab('Feed', 0, false)}${tlTab('Prompts', '3 asks', true)}${tlTab('Observations', '9 edits', false)}${tlTab('Actions', '39 tool calls', false)}"));
   assert.ok(!media.includes("tlTab('Conversation'"));
   assert.match(media, /feed: '868,590'/);
   for (const name of ['feed', 'layout', 'sessions']) {
@@ -597,16 +1081,19 @@ test('Feed docs and media describe four chronological Timeline tabs and actual c
   assert.match(read('docs/CODEX-SUPPORT.md'), /conversation-codex\.jsonl/);
   for (const file of ['packages/vscode/README.md', 'packages/jetbrains/README.md'])
     assert.doesNotMatch(read(file), /Existing saved Agent- and Conversation-tab layouts|three-column mode/);
-  const changelog = read('CHANGELOG.md').split('### Changed')[0];
+  // The 0.10.0 notes, before their own Changed section: an [Unreleased] Changed section comes first.
+  const changelog = read('CHANGELOG.md').split('## [0.10.0]')[1].split('### Changed')[0];
   assert.match(changelog, /Timeline gains a \*\*Feed\*\* tab/);
   assert.match(changelog, /session, agent, workflow and task/);
 });
 
 test('machine and Feed documentation matches shipped behavior', () => {
   const overview = read('docs/_content/editors-overview.html');
-  assert.match(overview, /sessions grouped by workspace/);
+  assert.match(overview, /sessions from every machine in one list/);
   assert.match(overview, /Selecting a local session/);
-  assert.match(overview, /do not gather other machines/);
+  assert.match(overview, /VS Code and JetBrains also list the sessions of each machine saved in herdr/);
+  assert.doesNotMatch(overview, /JetBrains does not read saved machines/);
+  assert.match(overview, /session selectors, Sessions and Workers share each machine’s listing/);
   assert.match(overview, /to read that session's conversation/);
   for (const file of ['README.md', 'SECURITY.md']) {
     assert.match(read(file), /Saved herdr machines \(automatic\)/);
@@ -624,13 +1111,13 @@ test('machine and Feed documentation matches shipped behavior', () => {
   assert.match(demo, /task was in progress, along with the agent's replies/);
   assert.match(read('docs/_content/feed.html'), /thinking · N words/);
   for (const file of ['packages/vscode/README.md', 'packages/jetbrains/README.md', 'docs/_content/sessions-agents.html']) {
-    assert.match(read(file), /group(?:s|ed) .*by workspace/);
+    assert.match(read(file), /sessions from every machine in one list/);
     assert.match(read(file), /[Ss]electing a local/);
   }
   const arch = read('docs/ARCHITECTURE.md');
   assert.doesNotMatch(arch, /machineSessionMeta|machine-sessions.json/);
   assert.match(arch, /workspace first|editor root first/);
-  assert.match(read('packages/core/src/tour.ts'), /Sessions are grouped by workspace/);
+  assert.match(read('packages/core/src/tour.ts'), /Sessions from every machine share one list/);
   for (const file of ['packages/cli/README.md', 'docs/_content/cli.html']) {
     assert.doesNotMatch(read(file), /--machines|--gather-machines/);
   }
@@ -641,19 +1128,111 @@ test('machine and Feed documentation matches shipped behavior', () => {
   assert.match(read('docs/_content/tui-herdr.html'), /sets gruvbox as the default/);
   const media = read('scripts/render-media.mjs');
   assert.match(media, /layout: '1808,910'/);
-  assert.match(media.slice(media.indexOf("'sessions': scene")), /~\/projects\/training · 3 sessions/);
+  assert.doesNotMatch(media.slice(media.indexOf("'sessions': scene"), media.indexOf("'feed': scene")), /grouped by workspace|~\/projects\/[^<]+ · \d+ sessions?/);
 });
 
-test('the Observations and Sessions mocks draw the rows both editors draw', () => {
-  // Both editors give a ×N run its status icon and a plain tooltip, and list the Auto row above every workspace.
+test('the sync and database documentation says what a purge, the status line, a kept draft and the record log do', () => {
+  const cli = read('packages/cli/src/index.ts');
+  const flat = file => read(file).replace(/\s+/g, ' ');
+  // `oak uninstall --purge-store` keeps sync/evicted.jsonl while sync has other state, so this machine's inventory lists
+  // the purged sessions as cleaned up and the other machines let their copies go, as after any cleanup.
+  assert.match(cli, /keep \$\{path\.join\(syncState, 'evicted\.jsonl'\)\} while oak sync runs on another of your machines/);
+  for (const file of ['docs/_content/database-and-sync.html', 'SECURITY.md', 'docs/ARCHITECTURE.md', 'CHANGELOG.md']) {
+    assert.doesNotMatch(flat(file), /keep oak sync.s copies of (?:those|the) stores/, file);
+    assert.match(flat(file), /lets? (?:its|their) copies of (?:the|those) stores go, as after any cleanup/, file);
+  }
+  // A purge applied from another machine's record log, or a base without the session, is forgotten as a delete here is:
+  // in every index file in the folder, then a checkpoint (ingest.ts noteForgotten).
+  const ingest = read('packages/core/src/index/ingest.ts');
+  const purgeApplied = ingest.slice(ingest.indexOf("if (t === 'purge'"), ingest.indexOf("if (typeof t !== 'string' || !Object.hasOwn(RECORD_TABLES, t))"));
+  assert.ok(purgeApplied.includes('DELETE FROM') && purgeApplied.includes('noteForgotten(r, host, [rec.s])'), 'a purge applied from a record log is noted to be forgotten everywhere');
+  assert.match(ingest, /forgetInLog\(db\);\s+for \(const \[host, ids\] of r\.forgotten\) if \(ids\.size\) forgetElsewhere\(\[\.\.\.ids\], undefined, host\);/);
+  assert.match(flat('docs/ARCHITECTURE.md'), /is applied as a delete here is: the session's rows of that machine go from every database file in the folder \(the one applying it keeps their usage, without the session\), and the write-ahead log is checkpointed\./);
+  // The status line's `oak usage` opens the index, and so publishes, only on the renders that ask for its totals: once a
+  // scan interval, and every render while a scan's file map waits for whole totals.
+  assert.match(cli, /const STATUSLINE_SCAN_MS = 600_000;/);
+  assert.match(cli, /Object\.keys\(s\.fc\)\.length > 0/);
+  assert.match(flat('docs/_content/agents-across-machines.html'), /<code>oak usage<\/code> call, on the renders that ask for the database’s totals \(every render until those totals are whole, then about every ten minutes\)/);
+  assert.match(flat('docs/_content/database-and-sync.html'), /status line’s <code>oak usage<\/code> call, on each render that asks for the database’s totals \(about every ten minutes once those totals are whole\);/);
+  // A kept draft exits 75 in every output mode, as the scripted-send reference says.
+  assert.match(cli, /const DRAFT_KEPT_EXIT = 75;/);
+  assert.match(flat('docs/REMOTE.md'), /`sent: false` in JSON and exit status 75 in every output mode/);
+  // A reader passes over a record table, or a column, it does not know and reads on past it: a schema step reads again.
+  assert.match(ingest, /!Object\.hasOwn\(RECORD_TABLES, t\)\) return;/);
+  assert.match(flat('CONTRIBUTING.md'), /the schema step that adds a table, or a column the rows already read must have, also reads the other machines' record logs again from their start/);
+  // The listing's rows carry lastEdit (observe.ts SessionCounts), as DEMO.md quotes them.
+  assert.match(read('packages/core/src/observe.ts'), /lastEdit: number;/);
+  assert.match(read('docs/DEMO.md'), /"removed":10,"lastEdit":9,"tokens":9280,/);
+  // A worker's call with no result reads working unless its own permission prompt is up (actions.ts sessionHand).
+  assert.match(read('packages/core/src/actions.ts'), /if \(hand === 'other'\) return \{ phase: 'working', confidence: 'high' \};/);
+  assert.doesNotMatch(flat('docs/_content/tui-observatory.html'), /unless it stopped on a tool call or a question, which reads as waiting/);
+  assert.match(flat('CHANGELOG.md'), /a long command\) in a session whose hooks OAK does not record, is marked `~`/);
+  // A query's own --machine filter takes the machine id, `self` or a saved machine's label, and refuses any other name
+  // (query.ts machineIds).
+  assert.match(read('packages/core/src/index/query.ts'), /description: 'only this machine \(its id, "self", or the label a saved machine has here\)'/);
+  assert.match(read('packages/core/src/index/query.ts'), /SELECT machine_id FROM machines WHERE saved_label = \?/);
+  assert.match(cli, /id \(machine, which a query's --machine takes, as it takes self and the label a saved\\n/);
+  assert.match(cli, /machine has here; any other name is refused\) and by this machine's\\n/);
+  assert.match(flat('docs/_content/cli.html'), /which a query’s own <code>--machine<\/code> takes, as it takes <code>self<\/code> and the label a saved machine has here/);
+  assert.match(flat('docs/_content/database-and-sync.html'), /A query’s own <code>--machine<\/code> takes the id, <code>self<\/code>, or the label you saved a machine under, and refuses any other name with <code>bad_param<\/code>\./);
+  assert.match(flat('docs/_content/agents-across-machines.html'), /A query’s own <code>--machine<\/code> filter takes the id, <code>self<\/code>, or the label you saved the machine under/);
+  // `oak notify --watch` announces every session's hand on this machine (sessionMeta lists them all, by workspace).
+  for (const text of [cli, flat('docs/_content/cli.html')]) assert.doesNotMatch(text, /every hand this workspace raises/);
+});
+
+test('the docs say where a file, a machine, a hand and a phase come from, as the code does', () => {
+  const flat = file => read(file).replace(/\s+/g, ' ');
+  const agents = flat('docs/_content/agents-across-machines.html'), guide = flat('docs/_content/database-and-sync.html');
+  const arch = flat('docs/ARCHITECTURE.md'), readme = flat('README.md'), changelog = flat('CHANGELOG.md');
+  // `files` groups by the repository's part of the project key and the path from the repository's root.
+  assert.match(read('packages/core/src/index/query.ts'), /GROUP BY CASE WHEN e\.project_key IS NOT NULL AND e\.rel_path IS NOT NULL THEN \$\{REPO_KEY\('e\.project_key'\)\}/);
+  assert.match(arch, /`files` is one row per git repository \(the repository's part of the project key\) and path from the repository's root/);
+  assert.match(guide, /A file in a git repository is its repository and its path from the repository’s root/);
+  assert.match(agents, /groups edits the same way, by repository and path from the repository’s root/);
+  // A hook that moved a hand starts the catch-up at once, whatever the once-a-minute claim says.
+  assert.match(read('packages/cli/src/capture.ts'), /kickIndexBuild\(undefined, \{ hook: true, now: handMovedHere\(\) \}\);/);
+  assert.match(readme, /at most once a minute and at once when a hook raised, changed or lowered a hand/);
+  assert.match(guide, /at most once a minute and at once when it raised, changed or lowered a hand/);
+  assert.match(changelog, /at most once a minute and at once when it moved a hand/);
+  // Other machines' hands are read from the index as it stands, whichever way this machine's own were read.
+  assert.match(read('packages/cli/src/index.ts'), /const synced = core\.readSyncedHands\(Date\.now\(\), includeDone\);/);
+  assert.match(readme, /are read from it as it stands, caught up or not/);
+  assert.match(guide, /read from it as it stands, caught up or not/);
+  // `oak machine add` installs OAK only where it supports the Node: 24 and up.
+  assert.match(read('packages/core/src/index/location.ts'), /return major >= 24;/);
+  assert.doesNotMatch(agents, /Where the target has Node\.js 22\.16 or newer,/);
+  // machine_label: the saved label, else the machine's own name; a query's --machine takes the id, self and a saved label
+  // (query.ts machineIds), and refuses any other name.
+  assert.match(read('packages/core/src/index/query.ts'), /SELECT machine_id FROM machines WHERE saved_label = \?/);
+  assert.match(agents, /<code>coalesce\(m\.saved_label, m\.label\)<\/code> gives the name in <code>machine_label<\/code>/);
+  assert.match(agents, /A query’s own <code>--machine<\/code> filter takes the id, <code>self<\/code>, or the label you saved the machine under, and refuses any other name/);
+  assert.match(guide, /A query’s own <code>--machine<\/code> takes the id, <code>self<\/code>, or the label you saved a machine under, and refuses any other name with <code>bad_param<\/code>/);
+  assert.match(flat('packages/cli/README.md'), /query's --machine takes, as it takes self and a saved machine's label, and refuses any other # name\) and by name \(machine_label: a saved machine's label/);
+  assert.match(changelog, /id, which a query's own `--machine` takes, as it takes `self` and the label a saved machine has here \(any other name is refused with `bad_param`\), and by the name this machine knows it by/);
+  // A machine's sessions come from the index only while no wait raised there in the last day is still open (api.ts).
+  assert.match(read('packages/core/src/index/api.ts'), /w\.end_ms IS NULL\s+AND w\.start_ms >= \?/);
+  assert.match(flat('packages/cli/src/index.ts'), /no hand raised in the last day still up\) \(fromIndex/);
+  assert.match(arch, /none of which has a hand raised in the last day still up, is listed from the local database/);
+  assert.match(agents, /as its records and the files the last run saw there say, and no hand raised there in the last day is still up/);
+  // The demo cleanup and an uninstall's purge forget their sessions too; the demo's JSON lists its scratch dirs.
+  assert.match(readme, /Only a deliberate delete forgets a session: `oak sessions --delete`, and `oak demo --clean` and `oak uninstall --purge-store`/);
+  assert.match(read('packages/core/src/demo.ts'), /scratch: string\[\];/);
+  assert.match(arch, /`--clean` → `\{ sessions\[\], workspaces\[\], scratch\[\] \}`/);
+  // A call with no result under an input wait reads awaiting input (actions.ts).
+  assert.match(read('packages/core/src/actions.ts'), /if \(hand === 'input'\) return \{ phase: 'awaiting-input', confidence: 'high' \};/);
+  assert.match(agents, /as awaiting input while the hand is an input wait, and as working otherwise/);
+});
+
+test('Observations mocks match the rows and Sessions keeps Auto above session rows', () => {
+  // Both editors give a ×N run its status icon and a plain tooltip. Auto precedes session rows, after machine state.
   const vscode = read('packages/vscode/src/extension.ts');
   const jb = 'packages/jetbrains/src/main/kotlin/com/cellobservatory/observatory/ui/';
   const run = vscode.slice(vscode.indexOf("if (node.kind === 'tlrun') {"));
   assert.match(run.slice(0, run.indexOf('return item;')), /item\.iconPath = aggregateIcon\(node\.edits\);/);
   assert.match(read(jb + 'ObservationsPanel.kt'), /val ob = if \(node\.count == 1\) .* else null/);
-  assert.match(vscode, /var h=auto,/);
+  assert.match(vscode, /var h=sv\+auto,/, 'machine state precedes Auto and all session rows');
   const repaint = read(jb + 'ChangeMapPanel.kt').split('private fun repaintSessions(')[1];
-  assert.ok(repaint.indexOf('addElement(AutoSessionRow)') < repaint.indexOf('overviewSessionGroups('));
+  assert.ok(repaint.indexOf('addElement(AutoSessionRow)') < repaint.indexOf('val merged = sessionOrder.rows('));
   const media = read('scripts/render-media.mjs');
   const col = media.slice(media.indexOf('const observationsCol'));
   const rows = col.slice(0, col.indexOf('`;')).split('\n').filter((l) => l.includes('class="obsrow"'));
@@ -663,15 +1242,40 @@ test('the Observations and Sessions mocks draw the rows both editors draw', () =
   assert.ok(observations.indexOf('${observationsCol}') < observations.indexOf('class="hovercard"'));
   assert.match(rows.at(-1), /⚠/, 'the hover card hangs under the ⚠ row');
   assert.doesNotMatch(rows.at(-1), /×\d/, 'which is a single edit');
-  const sessions = media.slice(media.indexOf("'sessions': scene"));
-  assert.ok(sessions.indexOf('Auto — newest session') < sessions.indexOf('~/projects/training · 3 sessions'), 'Auto leads the list');
+  const sessions = require('node:vm').runInNewContext(media.slice(media.indexOf('const CSS ='), media.indexOf('// per-scene capture box')) + '\nscenes.sessions;');
+  const states = [...sessions.matchAll(/<div class="mt-scope"[^>]*>([^<]+)<\/div>/g)];
+  assert.equal(states.length, 2, 'one state line for each remote machine');
+  assert.match(states[0][1], /^laptop · read /);
+  assert.match(states[1][1], /^build-box · from its records, synced /);
+  const auto = sessions.indexOf('Auto — newest session');
+  assert.ok(states.every(s => s.index < auto), 'machine state precedes Auto');
+  const sessionRows = [...sessions.matchAll(/<div class="mt-trow[^"]*"[^>]*>([\s\S]*?)<\/div>/g)].slice(1);
+  assert.equal(sessionRows.length, 6);
+  assert.ok(auto < sessionRows[0].index, 'Auto precedes all session rows');
+  const times = sessionRows.map(r => /(?:Sep \d+ )?\d\d:\d\d(?::\d\d)?/.exec(r[1])[0]);
+  assert.deepEqual(times, ['14:43:10', '14:38:22', '14:20:05', '13:10:44', '12:41:07', 'Sep 25 16:05'], 'one newest-first order across workspaces and machines');
+  assert.deepEqual(sessionRows.map(r => /on (laptop|build-box)/.exec(r[1])?.[1] || 'local'),
+    ['local', 'build-box', 'local', 'laptop', 'local', 'local'], 'remote rows carry badges in the merged list');
+  assert.doesNotMatch(sessions, /grouped by workspace|~\/projects\/[^<]+ · \d+ sessions?/);
+  assert.match(sessionRows[1][1], /~\/projects\/training/);
+  assert.doesNotMatch(sessionRows[1][1], /conversation|resolve|🗑/, 'indexed rows offer no local actions');
+  assert.match(sessionRows[3][1], /~\/projects\/data-tools/);
+  assert.match(sessionRows[3][1], /resolve/);
+  assert.doesNotMatch(sessionRows[3][1], /conversation|🗑/, 'saved-machine rows offer no local actions');
+  for (const file of ['docs/_content/sessions-agents.html', 'docs/sessions-agents.html', 'docs/showcase.html', 'docs/DEMO.md']) {
+    const figure = read(file).split('\n').find(line => line.includes('media/sessions.png'));
+    assert.match(figure, /one list.*newest.*machine.*badge/i);
+    assert.doesNotMatch(figure, /earlier Sessions view|workspace headers|grouped by workspace/);
+  }
 });
 
 test('review pickers use local rows and stale comments and replay helper stay removed', () => {
   const jb = 'packages/jetbrains/src/main/kotlin/com/cellobservatory/observatory/';
-  // Local rows only: the listing parser is the one guard (it drops any non-local row), and both pickers
-  // read what it parsed.
-  assert.match(read(jb + 'model/Sessions.kt'), /rows\.filter \{ \(it\.get\("origin"\)\?\.asString \?: "local"\) == "local" \}/);
+  // Local listings exclude mirrored rows by default. Only a read explicitly addressed to a saved
+  // machine accepts that machine’s indexed rows; both local pickers retain the default.
+  assert.match(read(jb + 'model/Sessions.kt'), /localOnly: Boolean = true/);
+  assert.match(read(jb + 'model/Sessions.kt'), /rows\.filter \{ !localOnly \|\| \(it\.get\("origin"\)\?\.asString \?: "local"\) == "local" \}/);
+  assert.match(read(jb + 'core/SavedMachines.kt'), /SessionsParser\.parse\(r.stdout, localOnly = false\)/);
   for (const file of ['ui/TimelineSessionAction.kt', 'ui/ReviewOps.kt']) assert.match(read(jb + file), /SessionsParser\.parse\(/);
   assert.match(read(jb + 'ui/ChangeMapPanel.kt'), /WorkspaceHeaderRow/);
   assert.doesNotMatch(read(jb + 'ui/ChangeMapPanel.kt'), /MachineHeaderRow/);
@@ -683,4 +1287,90 @@ test('review pickers use local rows and stale comments and replay helper stay re
   assert.doesNotMatch(read('packages/core/src/notify.ts'), /the Agent tab/);
   assert.doesNotMatch(read('packages/vscode/src/extension.ts'), /whether the three sit side by side/);
   assert.doesNotMatch(read('packages/core/src/feed.ts'), /note\?: string;\n\n}/);
+});
+
+test('check:webview parses the script as it ships, after the template literal resolves its escapes: a planted \\\' fails it', t => {
+  // `'it\'s'` in the source is a valid template escape that reaches the browser as `'it's'`, a syntax error.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-webview-gate-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(dir, 'packages/vscode/src'), { recursive: true });
+  const gate = source => {
+    fs.writeFileSync(path.join(dir, 'packages/vscode/src/extension.ts'), source);
+    return cp.spawnSync(process.execPath, [path.join(root, 'scripts/check-webview-syntax.mjs')], { cwd: dir, encoding: 'utf8' });
+  };
+  const baseline = read('packages/vscode/src/extension.ts');
+  const clean = gate(baseline);
+  assert.equal(clean.status, 0, clean.stdout);
+  assert.match(clean.stdout, /parsed: 5 {3}failed: 0/, 'control: the unchanged source parses');
+  const opening = 'const TIMELINE_SCRIPT = `';
+  assert.equal(baseline.split(opening).length, 2, 'one TIMELINE_SCRIPT literal to plant into');
+  const planted = gate(baseline.replace(opening, opening + "\nvar planted = 'it\\'s';"));
+  assert.equal(planted.status, 1, planted.stdout);
+  assert.match(planted.stdout, /FAIL TIMELINE_SCRIPT/);
+  // A backslash that survives the escape (`\\'` in the source ships as `\'`) is still valid, so it passes.
+  const doubled = gate(baseline.replace(opening, opening + "\nvar planted = 'it\\\\'s';"));
+  assert.equal(doubled.status, 0, doubled.stdout);
+});
+
+test('THIRD_PARTY_NOTICES names the version the lockfile installs for each npm package it lists, and exactly the bundles that hold it', () => {
+  const lock = JSON.parse(read('package-lock.json')).packages;
+  // The bundles OAK ships, and the packages each holds: esbuild keeps each bundled module's path in a comment
+  // (`// ../../node_modules/diff/lib/index.js`). `npm test` builds them first; a missing one fails, never skips.
+  const holds = new Map(['packages/cli/dist/cli.js', 'packages/cli/dist/capture.js', 'packages/vscode/dist/extension.js'].map((file) => {
+    assert.ok(fs.existsSync(path.join(root, file)), `${file} is not built: run npm run build and npm run build:vscode first`);
+    return [file, new Set([...read(file).matchAll(/^\/\/ \S*node_modules\/((?:@[^/\s]+\/)?[^/\s]+)\//gm)].map(([, name]) => name))];
+  }));
+  const listed = new Set();
+  let compared = 0;
+  for (const section of read('THIRD_PARTY_NOTICES.md').split(/^## /m).slice(1)) {
+    const name = section.split('\n')[0].trim();
+    listed.add(name);
+    const stated = /^- Version: ([^;\s]+);/m.exec(section)?.[1];
+    if (name === 'herdr') { assert.equal(stated, undefined, 'herdr.lock pins herdr, which npm never installs'); continue; }
+    // Every copy the lockfile installs, nested ones included: a notice for one it does not install fails too.
+    const installed = [...new Set(Object.entries(lock).filter(([at]) => at === `node_modules/${name}` || at.endsWith(`/node_modules/${name}`)).map(([, entry]) => entry.version))];
+    assert.deepEqual(installed, [stated], `THIRD_PARTY_NOTICES.md lists ${name} ${stated}; the lockfile installs ${installed.join(', ') || 'no copy of it'}`);
+    // The bundles named here are exactly the shipped ones that hold the package, in both directions.
+    const named = [...(/^- Bundled into ([\s\S]*?)(?=\n\n|\n- )/m.exec(section)?.[1] ?? '').matchAll(/`(packages\/[^`]+\.js)`/g)].map(([, file]) => file);
+    for (const file of named) assert.ok(holds.has(file), `THIRD_PARTY_NOTICES.md says ${file} bundles ${name}; that is not a bundle OAK ships`);
+    for (const [file, names] of holds) {
+      assert.equal(named.includes(file), names.has(name), `THIRD_PARTY_NOTICES.md ${named.includes(file) ? 'says' : 'does not say'} ${file} bundles ${name}, which it ${names.has(name) ? 'does' : 'does not'}`);
+    }
+    compared++;
+  }
+  assert.ok(compared >= 7, `only ${compared} notices were compared with the lockfile`);
+  // And every package a bundle holds has a notice.
+  for (const [file, names] of holds) for (const name of names) assert.ok(listed.has(name), `${file} bundles ${name}, which THIRD_PARTY_NOTICES.md does not list`);
+});
+
+
+const docFlat = file => read(file).replace(/\s+/g, ' ');
+test('final 0.11 docs: delegated walkthrough includes wait, worker log and integration', () => {
+  const guide = docFlat('docs/_content/agents-across-machines.html');
+  assert.match(guide, /oak agent wait docs login dates/);
+  assert.match(guide, /oak feed --kind agent --id check-login/);
+  assert.match(guide, /OAK does not merge/);
+});
+test('final 0.11 docs: database schema and derivation versions are current', () => {
+  assert.match(docFlat('docs/ARCHITECTURE.md'), /Schema\*\* \(version 9/);
+  assert.match(docFlat('docs/ARCHITECTURE.md'), /INGEST_VERSION.*5/);
+  assert.match(docFlat('docs/_content/database-and-sync.html'), /CLI refuses unsupported Node.js/);
+});
+test('final 0.11 docs: saved-machine editor review is available', () => {
+  const readme = docFlat('packages/vscode/README.md');
+  assert.doesNotMatch(readme, /remote review runs only in the terminal|review requires the files and capture store on the editor backend/);
+  assert.match(readme, /review actions run on that machine/);
+});
+test('final 0.11 docs: status bars distinguish window and dollar displays', () => {
+  for (const file of ['docs/_content/stats-spotlight.html', 'packages/cli/README.md']) {
+    assert.match(docFlat(file), /status bars omit the five-hour window/);
+    assert.match(docFlat(file), /mo.*reset.*dollar/);
+  }
+  for (const file of ['scripts/render-media.mjs', 'docs/media/pyc-layout.src.html'])
+    assert.match(read(file), /claude wk:.*mo:.*~\$18/);
+});
+test('final 0.11 docs: help names delegated and the backup undelete exception', () => {
+  const cli = read('packages/cli/src/index.ts').slice(read('packages/cli/src/index.ts').indexOf('function usage('));
+  assert.match(cli, /workers, delegated, findings, sync, notes/);
+  assert.match(cli, /backup folder.*edits/);
 });

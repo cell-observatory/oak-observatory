@@ -3,7 +3,6 @@ package com.cellobservatory.observatory.ui
 import com.cellobservatory.observatory.core.ObservatoryCli
 import com.cellobservatory.observatory.model.SessionRow
 import com.cellobservatory.observatory.model.SessionsParser
-import com.cellobservatory.observatory.model.activeSessionRows
 import com.cellobservatory.observatory.model.compactBytes
 import com.cellobservatory.observatory.model.isSessionActive
 import com.cellobservatory.observatory.model.relTime
@@ -20,7 +19,7 @@ import javax.swing.JComponent
 
 /**
  * The Timeline window's session selector — the chip on its title bar naming which conversation the
- * observatory is reviewing, and a short list of the ones still live in this workspace.
+ * observatory is reviewing, and one list of sessions across machines, newest activity first.
  *
  * It switches the WHOLE observatory, not just this window: the Timeline is where a person watches a
  * session happen, so "which session" is a question they ask here, but every other panel is already showing
@@ -28,8 +27,7 @@ import javax.swing.JComponent
  * route through the one place a session choice is applied, which is also what keeps demo mode's in-memory
  * override from being overwritten with a persisted pin.
  *
- * Live sessions only. The FULL browser is the Overview's Sessions tab, and the last row here falls through
- * to the existing all-sessions chooser rather than growing into a second one.
+ * Machine state precedes the rows. Search spans the whole list, and remote rows keep their machine.
  */
 class TimelineSessionAction(private val project: Project) : AnAction(), DumbAware {
 
@@ -57,14 +55,15 @@ class TimelineSessionAction(private val project: Project) : AnAction(), DumbAwar
             e.presentation.description = "No Claude Code session for this workspace yet"
             return
         }
-        val row = service.peekSessions()?.sessions?.firstOrNull { it.id == current }
+        val row = if (service.currentMachine() == null) service.peekSessions()?.sessions?.firstOrNull { it.id == current }
+            else com.cellobservatory.observatory.core.SavedMachines.snapshot().machines.firstOrNull { it.label == service.currentMachine() }?.listing?.sessions?.firstOrNull { it.id == current }
         val live = row != null && isSessionActive(maxOf(row.lastActiveMs, row.liveMs), System.currentTimeMillis())
         val name = row?.displayName ?: "session ${current.take(8)}"
-        e.presentation.text = (if (live) "● " else "○ ") + name
+        e.presentation.text = (if (live) "● " else "○ ") + name + service.machineSuffix()
         e.presentation.description =
             "Reviewing $name (${current.take(8)})" +
                 (if (row != null && row.lastActiveMs > 0) " · last active ${relTime(row.lastActiveMs)}" else "") +
-                " — click to switch to another live session"
+                " — click to switch session"
     }
 
     override fun actionPerformed(e: AnActionEvent) {
@@ -76,24 +75,23 @@ class TimelineSessionAction(private val project: Project) : AnAction(), DumbAwar
             // than opening a popup that lists nothing. Batch-peeking (not batch-building) is deliberate:
             // the Switch-Session picker takes the same route for the same reason.
             val payload = service.sessions()
-                ?: ObservatoryCli.sessionsJson(project.basePath, service.currentSession())?.let { SessionsParser.parse(it) }
+                ?: (ObservatoryCli.syncedSessionsJson(project.basePath, service.currentSession())
+                    ?: ObservatoryCli.sessionsJson(project.basePath, service.currentSession()))?.let { SessionsParser.parse(it) }
             val current = service.currentSession()
             val now = System.currentTimeMillis()
-            // Every locally reviewable session, current first, matching VS Code's selector.
-            // The CLI scopes the listing to this machine. The popup's own
-            // speed search covers the long list.
-            var rows = payload?.let { p2 -> p2.sessions.let { local ->
-                listOfNotNull(local.firstOrNull { it.id == current }) + local.filter { it.id != current }
-            } } ?: emptyList()
+            val rows = payload?.sessions.orEmpty()
             ApplicationManager.getApplication().invokeLater {
                 if (project.isDisposed) return@invokeLater
-                showChooser(rows, current, now, anchor)
+                val popup = sessionPopup(rows, current, now, anchor, payload?.machines.orEmpty())
+                if (anchor != null && anchor.isShowing) popup.showUnderneathOf(anchor)
+                else popup.showCenteredInCurrentWindow(project)
             }
         }
     }
 
-    private fun showChooser(rows: List<SessionRow>, current: String?, now: Long, anchor: JComponent?) {
+    internal fun sessionPopup(rows: List<SessionRow>, current: String?, now: Long, anchor: JComponent?, machines: List<com.cellobservatory.observatory.model.MachineListing> = emptyList()): com.intellij.openapi.ui.popup.JBPopup {
         val labelToId = LinkedHashMap<String, String?>()
+        val localRows = LinkedHashMap<String, SessionRow>()
         for (r in rows) {
             val waiting = r.attention != null && r.attention.kind != "idle-done"
             val mark = if (waiting) "⚠ " else if (isSessionActive(maxOf(r.lastActiveMs, r.liveMs), now)) "● " else "○ "
@@ -112,6 +110,7 @@ class TimelineSessionAction(private val project: Project) : AnAction(), DumbAwar
                 (if (r.lastActiveMs > 0) " · ${relTime(r.lastActiveMs, now)}" else "") +
                 (if (r.id == current) " · reviewing" else "")
             labelToId[label] = r.id
+            localRows[label] = r
         }
         labelToId[ALL_SESSIONS] = null
         if (rows.isNotEmpty()) labelToId[ReviewOps.DELETE_SESSION] = null
@@ -123,19 +122,27 @@ class TimelineSessionAction(private val project: Project) : AnAction(), DumbAwar
         // …and where the data itself lives. "Where does this thing keep my files" had no answer in
         // any of the three front ends until now.
         labelToId[STORE] = null
+        val remote = LinkedHashMap<String, Pair<String, SessionRow>>()
+        val synced = LinkedHashMap<String, Pair<com.cellobservatory.observatory.model.MachineListing, SessionRow>>()
+        for (m in machines) for (r in m.sessions) synced["↗ ${r.displayName} — ${r.id.take(8)} · on ${m.label} · ${r.workspace} · ${relTime(r.lastActiveMs)}"] = m to r
+
         val popup = JBPopupFactory.getInstance()
             .createPopupChooserBuilder(labelToId.keys.toList())
-            .setTitle(if (rows.size > 1) "Which live session?" else "Which session?")
+            .setTitle(if (rows.size > 1) "Which session?" else "Which session?")
             .setItemChosenCallback { chosen ->
-                if (chosen == STORE_FOLDER) ReviewOps.revealStoreFolder(project, reviewedStore)
+                val saved = remote[chosen]
+                val indexed = synced[chosen]
+                if (saved != null) ReviewOps.applyRemoteSessionChoice(project, saved.first, saved.second.id)
+                else if (indexed != null) ReviewOps.openSyncedSession(project, indexed.first, indexed.second)
+                else if (chosen == STORE_FOLDER) ReviewOps.revealStoreFolder(project, reviewedStore)
                 else if (chosen == STORE) ReviewOps.storeLocation(project, anchor)
                 else if (chosen == ALL_SESSIONS) ReviewOps.chooseSession(project, anchor)
                 else if (chosen == ReviewOps.DELETE_SESSION) ReviewOps.chooseSessionToDelete(project, rows, anchor)
                 else labelToId[chosen]?.let { ReviewOps.applySessionChoice(project, it) }
             }
             .createPopup()
-        if (anchor != null && anchor.isShowing) popup.showUnderneathOf(anchor)
-        else popup.showCenteredInCurrentWindow(project)
+        ReviewOps.attachSavedSessions(project, popup, labelToId.keys.toList(), localRows, remote, synced)
+        return popup
     }
 
     companion object {

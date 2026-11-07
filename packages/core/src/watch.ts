@@ -135,7 +135,7 @@ export function observatoryRoots(opts: { cwd: string; session: string }): WatchR
     kind: 'store',
     // Only the append-only logs matter. Everything else under the store root is noise, and three of
     // them are the READ path's own writes — changemap-cache, session-meta, usage-cursors and
-    // stats-cache.json are all rewritten by the very views a refresh renders, so accepting them would
+    // the Stats caches are all rewritten by the very views a refresh renders, so accepting them would
     // have a live surface refreshing because it refreshed.
     relevant: (reported) => reported !== null && (path.basename(reported) === 'log.jsonl' || path.basename(reported) === 'capture-events.jsonl' || ['attention.json', 'agent.json'].includes(path.basename(reported))),
     fanout: (dir) => [dir, ...allStoreSessionIds().map((id) => storeDir(id))],
@@ -284,6 +284,14 @@ export function createWatcher(o: WatcherOptions): { close(): void; stats(): Watc
     }
   };
 
+  const inodeOf = (dir: string): number | null => {
+    try {
+      return fs.statSync(dir).ino;
+    } catch {
+      return null;
+    }
+  };
+
   const watchDir = (a: ArmedRoot, dirIn: string, recursive: boolean): boolean => {
     const dir = nativeDir(dirIn);
     const key = path.resolve(dir);
@@ -296,16 +304,29 @@ export function createWatcher(o: WatcherOptions): { close(): void; stats(): Watc
     try {
       w = fs.watch(dir, recursive ? { recursive: true } : undefined);
     } catch (e) {
-      // Synchronous throw: a missing root on a fresh machine (the store dir is created by capture,
-      // not by us), or a filesystem that cannot watch at all.
+      // A folder that is not there yet is waited for, not reported: the projects folder before an agent first runs on
+      // this machine, a workspace's project folder before one runs in it, the store before the first capture. A fanout
+      // re-evaluates its folders on every event and every REARM_MS, and a native root is retried on that tick, so each
+      // is watched once it appears. Reported, it degraded the whole root to polling and said ENOENT on the status row.
+      if ((e as NodeJS.ErrnoException)?.code === 'ENOENT') return false;
+      // A filesystem that cannot watch at all.
       toPoll(a, (e as NodeJS.ErrnoException)?.code ?? String(e));
       return false;
     }
     // An 'error' with no listener is an uncaught exception that takes the whole process down, and
     // Windows raises EPERM here whenever a watched directory is deleted.
     w.on('error', (e) => toPoll(a, (e as NodeJS.ErrnoException)?.code ?? String(e)));
-    w.on('change', (_event, filename) => {
+    const ino = inodeOf(dir);
+    w.on('change', (event, filename) => {
       const name = filename === null || filename === undefined ? null : String(filename);
+      // A folder's own watcher stays on the folder it was given (Linux): deleted or renamed away, it reports a rename of
+      // its own name and nothing after, and the folder made again at that path (a session's, the store moved away and
+      // back) was never watched again, since the path still had a watcher. Dropped, it is watched again by the fanout
+      // below, or by the next REARM_MS tick once the folder is back.
+      if (a.mode === 'fanout' && event === 'rename' && name === path.basename(dir) && inodeOf(dir) !== ino) {
+        try { w.close(); } catch { /* already gone */ }
+        if (a.watchers.get(key) === w) a.watchers.delete(key);
+      }
       // In fanout mode a newly created session directory needs its own watcher, and it needs it NOW:
       // the writes that matter land inside it within milliseconds, long before any debounce expires.
       if (a.mode === 'fanout' && a.root.fanout) {
@@ -323,7 +344,14 @@ export function createWatcher(o: WatcherOptions): { close(): void; stats(): Watc
     armed.push(a);
     if (nativeRecursive()) {
       a.mode = 'native';
-      watchDir(a, root.dir, true);
+      if (!watchDir(a, root.dir, true) && a.mode === 'native') {
+        a.rearm = setInterval(() => {
+          if (closed || a.mode !== 'native' || !watchDir(a, root.dir, true)) return;
+          clearInterval(a.rearm!);
+          a.rearm = null;
+        }, REARM_MS);
+        a.rearm.unref?.();
+      }
     } else {
       a.mode = 'fanout';
       const dirs = root.fanout ? root.fanout(root.dir) : [root.dir];

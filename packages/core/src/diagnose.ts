@@ -13,6 +13,7 @@ import { settingsPath, hooksInstalled, installedHookCommand, missingHookEvents, 
 import { resolveSessionId, hasAssistantRecord } from './session';
 import { findTranscript } from './observe';
 import { readLog, rootDir } from './store';
+import { HIDDEN_SOURCE } from './hidden';
 
 export type CheckLevel = 'ok' | 'warn' | 'fail';
 
@@ -37,7 +38,7 @@ function settingsJsonValid(): boolean | null {
   const p = settingsPath();
   if (!fs.existsSync(p)) return null; // no file yet is not "invalid"
   try {
-    JSON.parse(fs.readFileSync(p, 'utf8'));
+    JSON.parse(fs.readFileSync(p, 'utf8').replace(/^\uFEFF/, '')); // a byte order mark first is no error (install.ts)
     return true;
   } catch {
     return false;
@@ -60,13 +61,71 @@ function writable(dir: string): boolean {
   }
 }
 
+/** The characters hidden.ts names, dropped from a line of the report. */
+const HIDDEN = new RegExp(HIDDEN_SOURCE, 'gu');
+
+/**
+ * One line of a check (its label, its detail or its fix) as Markdown that shows it as it was written. A check carries
+ * text from outside OAK: what ssh printed before it logged in (a server's banner), a saved machine's answer, herdr's
+ * errors, a remote's message, a login shell's output. Put in as it was, an image there (`![](https://…)` or `<img>`)
+ * loaded when either editor showed the report, a link was one click from wherever it pointed, and a line break and a
+ * heading after it made rows that read as OAK's own. A code span stays one, OAK's own (`oak init`) or one in the text:
+ * both editors' Markdown shows its text as it is, so it is formatting only, and loads and links nothing. Everything
+ * else that would be read as Markdown is escaped: emphasis and strikethrough, links and images, HTML and entities,
+ * math, a heading, quote, list or heading underline at the start of the line, and the `//`, `www.` and `@` a bare link
+ * is found by (VS Code's preview links a bare `//host/path`). Left as they are, because they cannot be read as any of
+ * it: a `_` within a word, a `#` that neither opens nor closes a heading (`PR #42`), and the `~` that begins a path in
+ * a home folder after a blank (`~/.ssh/config`). The line stays one line, without the characters hidden.ts names,
+ * which reorder or hide what is around it; the zero-width joiner and non-joiner an emoji or a Persian word is written
+ * with stay.
+ */
+export function markdownLine(s: string): string {
+  const text = String(s ?? '').replace(/[\u0000-\u001f\u007f-\u009f]+/g, ' ').replace(HIDDEN, '').trim();
+  const word = (ch: string | undefined): boolean => !!ch && /[\p{L}\p{N}]/u.test(ch);
+  const prose = (t: string, atStart: boolean): string => {
+    let out = t.replace(/[\\`*[\]<>&$#_~]|\/(?=\/)|(?<=\bwww)\.|@(?=[\w-]+\.[\w.-]*[A-Za-z])/gu, (ch: string, at: number) => {
+      const before = at > 0 ? t[at - 1] : (atStart ? undefined : '`'); // a segment after a code span follows its backtick
+      if (ch === '_' && word(before) && word(t[at + 1])) return ch; // within a word it opens and closes nothing
+      // A heading opens with `#`s at the start of the line, and a run of them after a blank closes one at its end.
+      if (ch === '#' && !(before === undefined ? /^#{1,6}(?:\s|$)/.test(t.slice(at)) : /\s/.test(before) && /^#+\s*$/.test(t.slice(at)))) return ch;
+      if (ch === '~' && t[at + 1] === '/' && (before === undefined || /\s/.test(before))) return ch; // `~/`: a home path
+      return `\\${ch}`;
+    });
+    // A list item or a rule at the start of the line: `- `, `+ `, `1. `, `1) `, `---`; and a line of `=` or `-` alone, which
+    // the JetBrains IDEs' Markdown reads as the underline of a heading made of OAK's heading above it.
+    if (atStart) out = out.replace(/^([-+])(?=\s|$)|^-(?=(?:\s*-){2,}\s*$)/, '\\$&').replace(/^(\d{1,9})([.)])(?=\s|$)/, '$1\\$2').replace(/^([=-])(?=\1*\s*$)/, '\\$1');
+    return out;
+  };
+  // Backtick runs pair as CommonMark pairs them: a run opens a code span closed by the next run of the same length,
+  // and a run that nothing closes is backticks (escaped, as prose). Each run's next of its length is found in one pass
+  // from the end: looked for from each run in a copy of the runs after it, a 50,000-character line of short code spans
+  // took half a second, and one twice as long nearly three.
+  let out = '';
+  let from = 0;
+  const runs = [...text.matchAll(/`+/g)];
+  const next = new Array<number>(runs.length);
+  const nearest = new Map<number, number>();
+  for (let i = runs.length - 1; i >= 0; i--) {
+    next[i] = nearest.get(runs[i][0].length) ?? -1;
+    nearest.set(runs[i][0].length, i);
+  }
+  for (let i = 0; i < runs.length; i++) {
+    if (next[i] < 0) continue;
+    const open = runs[i], close = runs[next[i]];
+    out += prose(text.slice(from, open.index), from === 0) + text.slice(open.index, close.index! + close[0].length);
+    from = close.index! + close[0].length;
+    i = next[i];
+  }
+  return out + prose(text.slice(from), from === 0);
+}
+
 /** Render checks as portable markdown (shown in an editor tab by both front-ends). */
 export function diagnoseMarkdown(checks: Check[]): string {
   const icon = (l: CheckLevel) => (l === 'ok' ? '✅' : l === 'warn' ? '⚠️' : '❌');
   const lines: string[] = ['# OAK — setup check', ''];
   for (const c of checks) {
-    lines.push(`### ${icon(c.level)} ${c.label}`, c.detail);
-    if (c.fix) lines.push('', `**Fix:** ${c.fix}`);
+    lines.push(`### ${icon(c.level)} ${markdownLine(c.label)}`, markdownLine(c.detail));
+    if (c.fix) lines.push('', `**Fix:** ${markdownLine(c.fix)}`);
     lines.push('');
   }
   const fails = checks.filter((c) => c.level === 'fail').length;
@@ -85,7 +144,8 @@ export function diagnoseMarkdown(checks: Check[]): string {
 
 /** Run every setup check and return them in report order (most foundational first). */
 export function diagnose(input: DiagnoseInput): Check[] {
-  const checks: Check[] = [];
+  const checks: Check[] = [(require('./agent-setup') as typeof import('./agent-setup')).diagnoseAgentSetup(input.cwd),
+    (require('./agent-worktree') as typeof import('./agent-worktree')).diagnoseAgentWorktrees(input.cwd)];
   const cfg = claudeConfigDir();
   const usingOverride = Boolean(process.env.CLAUDE_CONFIG_DIR);
 
@@ -286,7 +346,7 @@ export function diagnose(input: DiagnoseInput): Check[] {
     const cx = codexHooksStatus(isOurCommand);
     const hooks = checks.findIndex((c) => c.id === 'hooks');
     if (hooks >= 0) checks[hooks] = { id: 'hooks', label: 'Codex capture hooks', level: cx.trust === 'trusted' ? 'ok' : 'warn',
-      detail: `${cx.installed ? 'configured' : 'not configured'}; trust configuration: ${cx.trust}. Configuration does not prove lifecycle or edit capture.`,
+      detail: `${cx.installed ? 'configured' : 'not configured'}; trust configuration: ${cx.trust}.${cx.userDisabled.length ? ` Turned off in Codex: ${cx.userDisabled.join(', ')}.` : ''} Configuration does not prove lifecycle or edit capture.`,
       ...(cx.trust === 'trusted' ? {} : { fix: 'oak init --codex' }) };
     const activity = checks.findIndex(c => c.id === 'session');
     const edits = readLog(session).length;

@@ -12,6 +12,7 @@ data class SearchHit(
     val snippet: String,
     /** `prompt` when the excerpt is from the ask itself, `response` when from the answer. */
     val where: String,
+    val machine: String? = null,
 )
 
 /** Reads `{hits:[…]}`; garbage or an empty answer reads as no hits — never a crash on a keypress. */
