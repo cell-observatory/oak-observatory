@@ -413,7 +413,9 @@ const ROWS_TABLE = [
   { id: 'ctrl+q twice quits', keys: [K.ctrl('q'), K.ctrl('q')], help: 'ctrl+q twice', wait: 600, check: (r) => assert.ok(r.exited) },
   { id: 'ctrl+q once arms it', keys: [K.ctrl('q')], mentions: 'repeat within two seconds to confirm', check: status(/press ctrl\+q again to exit/) },
   // ---- Tabs ----
-  { id: 'Tab goes to the next tab', keys: [K.tab], help: 'Tab / shift+Tab', check: (r) => assert.match(r.text, /FAKE HERDR/) },
+  // The herdr tab's first paint asks herdr its version, synchronously, and its client starts after: on a slow runner the
+  // app writes nothing for over a second, so quiet after the key is still the Review frame. The row waits for the client.
+  { id: 'Tab goes to the next tab', keys: [K.tab], help: 'Tab / shift+Tab', done: /FAKE HERDR/, check: (r) => assert.match(r.text, /FAKE HERDR/) },
   { id: 'shift+Tab goes to the previous tab', keys: [K.btab], mentions: 'Tab / shift+Tab', check: (r) => assert.match(r.keysRow, /↵ pin/) },
   { id: 'ctrl+n / ctrl+p switch tabs', keys: [K.ctrl('p')], mentions: 'ctrl+n / ctrl+p', check: (r) => assert.match(r.keysRow, /↵ pin/) },
   { id: 'alt+digit picks a tab', keys: [K.alt('2')], mentions: 'alt+1-3 too', check: (r) => assert.match(r.keysRow, /↵ pin/) },
@@ -815,7 +817,9 @@ fs.writeFileSync(${JSON.stringify(fx.edLog)}, JSON.stringify([requests.length ? 
   (() => {
     let sw;
     return { id: 'Observatory: sync\'s last run shows under this machine; i lists its conflict, and Enter, ↓, Enter, y deletes the copy through oak sync resolve',
-      tab: 'observatory', ready: /backup · none/, prep: (fx) => { sw = syncWorld(fx); }, mentions: 'then oak sync\'s open conflicts', wait: 1200,
+      // The check reads the screen taken before the keys, and the machine's [W window] is drawn from the same session list
+      // as the session's `ws` row: on a slow runner sync's rows paint seconds before it, so the row waits for both.
+      tab: 'observatory', ready: /^(?=[\s\S]*backup · none)(?=[\s\S]*^ {7}ws +│)/m, prep: (fx) => { sw = syncWorld(fx); }, mentions: 'then oak sync\'s open conflicts', wait: 1200,
       before: ({ screen }) => screen.join('\n'), keys: ['i', K.enter, K.down, K.enter, 'y'],
       check: (r) => {
         // The master's column alone, its wrapped rows joined: the conversation pane is beside it.

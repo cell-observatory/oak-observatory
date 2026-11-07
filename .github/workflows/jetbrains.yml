@@ -49,10 +49,29 @@ jobs:
       # The headless-IDE tests drive the REAL CLI, so put it on PATH.
       - run: npm ci && npm run build && npm link -w oak-observatory
       - run: oak --version
-      - run: ./gradlew test buildPlugin --console=plain
+      # The IDEs both steps build and verify against come from JetBrains' CDN on every run, and twice on 2026-11-07 the
+      # runner could not reach it for a while: the step failed with "Network is unreachable" before any test ran. Each
+      # step runs again after a pause, only when Gradle could not fetch a dependency over the network; a test or build
+      # failure ends it at once.
+      - name: Test and build the plugin
+        shell: bash
+        run: |
+          for pause in 60 120 -; do
+            ./gradlew test buildPlugin --console=plain 2>&1 | tee "$RUNNER_TEMP/gradle.log" && exit 0
+            [ "$pause" != - ] && grep -qE 'Could not (resolve|GET|HEAD|download)' "$RUNNER_TEMP/gradle.log" &&
+              grep -qE 'Network is unreachable|Connection (timed out|reset|refused)|UnknownHostException|status code 5[0-9][0-9]' "$RUNNER_TEMP/gradle.log" || exit 1
+            echo "::warning::Gradle could not reach a dependency's server; trying again in ${pause}s"; sleep "$pause"
+          done
         working-directory: packages/jetbrains
       - name: Plugin Verifier (binary compatibility across IDE versions)
-        run: ./gradlew verifyPlugin --console=plain
+        shell: bash
+        run: |
+          for pause in 60 120 -; do
+            ./gradlew verifyPlugin --console=plain 2>&1 | tee "$RUNNER_TEMP/gradle.log" && exit 0
+            [ "$pause" != - ] && grep -qE 'Could not (resolve|GET|HEAD|download)' "$RUNNER_TEMP/gradle.log" &&
+              grep -qE 'Network is unreachable|Connection (timed out|reset|refused)|UnknownHostException|status code 5[0-9][0-9]' "$RUNNER_TEMP/gradle.log" || exit 1
+            echo "::warning::Gradle could not reach a dependency's server; trying again in ${pause}s"; sleep "$pause"
+          done
         working-directory: packages/jetbrains
       - if: always()
         uses: actions/upload-artifact@v7

@@ -29,14 +29,15 @@ function fixture(t) {
   return { home, env };
 }
 
-// Regular files work even where the sandbox denies Node's pipe socketpair.
+// Regular files work even where the sandbox denies Node's pipe socketpair. A command gets two minutes, which only a hang
+// uses up: a stalled macOS runner held `oak usage --session=`, a tenth of a second of work, past the 15 s it had.
 function run(b, file, args, options = {}) {
   const stdout = path.join(b.home, 'stdout');
   const stderr = path.join(b.home, 'stderr');
   const out = fs.openSync(stdout, 'w');
   const err = fs.openSync(stderr, 'w');
   let result;
-  try { result = cp.spawnSync(file, args, { cwd: b.home, env: b.env, timeout: 15000, ...options, stdio: ['ignore', out, err] }); }
+  try { result = cp.spawnSync(file, args, { cwd: b.home, env: b.env, timeout: 120000, ...options, stdio: ['ignore', out, err] }); }
   finally { fs.closeSync(out); fs.closeSync(err); }
   assert.equal(result.error, undefined);
   return { ...result, stdout: fs.readFileSync(stdout, 'utf8'), stderr: fs.readFileSync(stderr, 'utf8') };

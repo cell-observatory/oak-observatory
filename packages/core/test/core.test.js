@@ -18088,14 +18088,17 @@ test('store: a move waits for a capture that is already running, and takes its e
   const p = { session_id: S, cwd, tool_name: 'Edit', tool_input: { file_path: F }, tool_use_id: 'tu-slow' };
   assert.equal(cp.spawnSync(process.execPath, [CLI, 'capture'], { env, input: JSON.stringify({ ...p, hook_event_name: 'PreToolUse' }) }).status, 0);
   fs.writeFileSync(F, 'v2\n');
-  const preload = path.join(tmpDir('mv-slow-hook-'), 'slow-append.js');
-  fs.writeFileSync(preload, "const fs = require('fs'), path = require('path'); const append = fs.appendFileSync; fs.appendFileSync = function (f, ...r) { if (path.basename(String(f)) === 'log.jsonl') Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1500); return append.call(this, f, ...r); };\n");
+  // The hook says when it is held (`held`), and it is held only past the move-lock check its registration comes before:
+  // a move started between the two is one the capture rightly waits for instead, which a slow runner hit. It stays held
+  // until the move holds the lock, and a second more, so a move that waits for it waits that second however slow the run.
+  const slow = tmpDir('mv-slow-hook-'), preload = path.join(slow, 'slow-append.js'), held = path.join(slow, 'held');
+  fs.writeFileSync(preload, `const fs = require('fs'), path = require('path'); const append = fs.appendFileSync; let once = false; fs.appendFileSync = function (f, ...r) { if (!once && path.basename(String(f)) === 'log.jsonl') { once = true; fs.writeFileSync(${JSON.stringify(held)}, ''); const nap = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); for (const end = Date.now() + 30000; !fs.existsSync(${JSON.stringify(path.join(core.storeMoveDir(), 'lock'))}) && Date.now() < end;) nap(10); nap(1000); } return append.call(this, f, ...r); };\n`);
   const hook = cp.spawn(process.execPath, ['--require', preload, CLI, 'capture'], { env, stdio: ['pipe', 'ignore', 'ignore'] });
   hook.stdin.end(JSON.stringify({ ...p, hook_event_name: 'PostToolUse' }));
   const hooked = new Promise((resolve) => hook.on('close', resolve));
   const registered = () => { try { return fs.readdirSync(core.storeMoveDir()).some((n) => n.startsWith('writer-')); } catch { return false; } };
-  for (const end = Date.now() + 10000; !registered() && Date.now() < end;) await new Promise((r) => setTimeout(r, 10));
-  assert.ok(registered(), 'control: the hook is running');
+  for (const end = Date.now() + 10000; !fs.existsSync(held) && Date.now() < end;) await new Promise((r) => setTimeout(r, 10));
+  assert.ok(fs.existsSync(held) && registered(), 'control: the hook is running');
   const from = core.rootDir();
   const dest = path.join(tmpDir('store-running-'), 'observatory');
   const t0 = Date.now();
@@ -23501,18 +23504,41 @@ test('statusline: two renders started together each keep what the other recorded
   const idle = f.session('idle', 7200, 12, 40, 1.25); // its reply is older than the cached share, so it draws that share
   // eslint-disable-next-line no-control-regex
   const vis = (s) => s.replace(/\x1b\[[0-9;]*m/g, '');
+  // A render that waits past its patience for the other's lock writes nothing, by design (the test below this one), and the
+  // cache then holds only the other's reading and spend. A slow runner gets there: with the two renders starved of CPU on
+  // Linux, the first held the lock for about a second and the second gave up after two, and the cache lost a reading or a
+  // spend, as it did on a Windows runner. So each render notes whether it still held the lock once its write was done, and
+  // a pair in which one did not is rendered again, up to ten times as many pairs as the runs ask for, in all: starved so,
+  // the 12 runs rendered 2 to 17 pairs again, one of them ten times in a row. What a pair left in the cache is checked once
+  // both wrote.
+  const script = path.join(rig.cdir, 'statusline.sh');
+  const src = fs.readFileSync(script, 'utf8');
+  assert.equal(src.split('\n_unlock\n').length, 2, 'control: the render releases the lock here, once, after its write');
+  fs.writeFileSync(script, src.replace('\n_unlock\n', '\n[ -n "$_lt" ] && [ -d "$_LAST.lock/$_lt" ] && echo held > "$OAK_TEST_HELD"\n_unlock\n'));
+  const held = (input) => path.join(rig.home, `held-${input.session_id}`);
+  let again = 0;
   const together = async (bash, runs) => {
+    const allowed = again + 10 * runs;
     for (let i = 1; i <= runs; i++) {
-      f.reset();
-      const renders = await Promise.all((i % 2 ? [active, idle] : [idle, active]).map((input) => startRender(rig, input, {}, bash)));
-      for (const r of renders) {
-        assert.equal(r.code, 0, `run ${i}`);
-        assert.match(vis(r.out.split('\n')[2] || ''), /^5h /, `run ${i}: each render draws its quota line`);
+      for (;;) {
+        f.reset();
+        const pair = i % 2 ? [active, idle] : [idle, active];
+        for (const input of pair) fs.rmSync(held(input), { force: true });
+        const renders = await Promise.all(pair.map((input) => startRender(rig, input, { OAK_TEST_HELD: held(input) }, bash)));
+        for (const r of renders) {
+          assert.equal(r.code, 0, `run ${i}`);
+          assert.match(vis(r.out.split('\n')[2] || ''), /^5h /, `run ${i}: each render draws its quota line`);
+        }
+        const both = pair.every((input) => fs.existsSync(held(input)));
+        if (both) {
+          const after = f.read();
+          assert.deepEqual([after.five_pct, after.five_at, after.week_pct, after.week_at], [25, f.now - 10, 50, f.now - 10], `run ${i}: the newer reading stands`);
+          assert.deepEqual([after.costs.active?.usd, after.costs.idle?.usd, after.costs.kept?.usd], [2.5, 1.25, 9], `run ${i}: and every session's spend`);
+        }
+        assert.deepEqual(fs.readdirSync(rig.cdir).filter((n) => /\.(tmp|lock)/.test(n)), [], `run ${i}: no lock or temporary file is left`);
+        if (both) break;
+        assert.ok(++again <= allowed, `run ${i}: ${10 * runs} pairs were rendered again, the most ${runs} runs allow, each because one render ended without the lock and wrote nothing`);
       }
-      const after = f.read();
-      assert.deepEqual([after.five_pct, after.five_at, after.week_pct, after.week_at], [25, f.now - 10, 50, f.now - 10], `run ${i}: the newer reading stands`);
-      assert.deepEqual([after.costs.active?.usd, after.costs.idle?.usd, after.costs.kept?.usd], [2.5, 1.25, 9], `run ${i}: and every session's spend`);
-      assert.deepEqual(fs.readdirSync(rig.cdir).filter((n) => /\.(tmp|lock)/.test(n)), [], `run ${i}: no lock or temporary file is left`);
     }
   };
   await together('bash', process.platform === 'win32' ? 4 : 12);
@@ -23523,6 +23549,7 @@ test('statusline: two renders started together each keep what the other recorded
     await together(b32, 6);
     t.diagnostic(`bash ${v}: 6 pairs of renders`);
   }
+  t.diagnostic(`${again} pairs rendered again, a render in each having ended without the lock`);
 });
 
 test('statusline: a render waits about a second for a held cache lock, then writes nothing and still draws its line (2026-10-20)', async (t) => {

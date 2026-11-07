@@ -70,9 +70,9 @@ test('PTY output: a paint writes only the rows that changed, and the screen stay
     }, 'a quiet screen');
     await applied;
   };
-  /** What the newest rendered frame shows, painted whole into a fresh alternate screen the old way: every row. */
-  const fullRepaint = async () => {
-    const frames = read('frames.jsonl'), last = frames.at(-1), spans = read('spans.jsonl').filter(s => s.n === last.n);
+  /** What the newest of `frames` shows, painted whole into a fresh alternate screen the old way: every row. */
+  const fullRepaint = async frames => {
+    const last = frames.at(-1), spans = read('spans.jsonl').filter(s => s.n === last.n);
     const lines = [...last.lines];
     for (let r = 0, s = 0; r < lines.length && s < spans.length; r++) if (lines[r] === spans[s].line) lines[r] = spans[s++].out;
     const ref = new Terminal({ cols: last.cols, rows: last.rows, allowProposedApi: true }), refCursor = track(ref);
@@ -81,14 +81,19 @@ test('PTY output: a paint writes only the rows that changed, and the screen stay
     ref.dispose();
     return cells;
   };
-  /** The screen equals a full repaint of the newest frame. Compared only while nothing new arrived in between. */
+  /** The screen equals a full repaint of the newest frame. The app logs a frame before it writes the frame's bytes, so the
+   *  frames are read first and the screen right after, with nothing awaited between: the screen then holds no frame newer
+   *  than the newest read. A difference counts only while nothing new arrived in between: a frame read before its bytes
+   *  arrived differs from the screen through no fault of the paint. A match counts whatever arrived after it was read: on
+   *  a slow runner the comparison outlasts the gap to the next spinner frame (150 ms) or herdr pane redraw (300 ms). */
   const sameAsFullRepaint = async (label, cursorAt = 'hidden', quiet = 250) => {
     for (let attempt = 0; ; attempt++) {
       await settle(quiet);
-      const n = rendered(), length = raw.length;
-      const got = cellsOf(term, cursor), want = await fullRepaint();
-      if (rendered() !== n || raw.length !== length) { assert.ok(attempt < 10, `${label}: the screen never stayed still`); continue; }
+      const frames = read('frames.jsonl'), n = frames.length, length = raw.length;
+      const got = cellsOf(term, cursor), want = await fullRepaint(frames);
       const off = got.rows.map((row, y) => row === want.rows[y] ? null : `row ${y + 1}: ${JSON.stringify(row.split('\n')[0])} for ${JSON.stringify(want.rows[y]?.split('\n')[0])}`).filter(Boolean);
+      const same = !off.length && JSON.stringify(got.cursor) === JSON.stringify(cursorAt);
+      if (!same && (rendered() !== n || raw.length !== length)) { assert.ok(attempt < 10, `${label}: the screen never stayed still`); continue; }
       if (off.length) fs.writeFileSync(path.join(dir, `mismatch-${label.replace(/\W+/g, '-')}.json`), JSON.stringify({ got, want }));
       assert.deepEqual(off, [], `${label}: the screen is not the full frame`);
       assert.deepEqual(got.cursor, cursorAt, `${label}: cursor`);
