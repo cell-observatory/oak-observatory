@@ -102,21 +102,40 @@ test('test bootstrap: OAK_NO_BACKGROUND stops every detached child OAK starts on
     for (const key of ['CLAUDE_OBSERVATORY_NO_UPDATE_CHECK', 'OAK_NO_SERVER', 'OAK_STATUSLINE']) delete env[key];
     fs.mkdirSync(env.CLAUDE_CONFIG_DIR, { recursive: true });
     fs.writeFileSync(path.join(env.CLAUDE_CONFIG_DIR, 'statusline.sh'), '#!/bin/sh\n');
+    // The log is read while the run writes it, so a line still being written is left for the next read.
+    const recorded = () => {
+      const calls = fs.existsSync(log) ? fs.readFileSync(log, 'utf8').split('\n').slice(0, -1).map((line) => JSON.parse(line)) : [];
+      // On Windows the launcher runs bash through cmd.exe, so the recorded file is the whole command line.
+      return calls.filter((c) => c.detached).map((c) => (/^bash(?:\s|$)/.test(c.file) ? 'month refresh' : c.args.slice(1).join(' ')));
+    };
     if (entry.pty) {
-      // The update check needs a terminal on stderr, and the terminal app runs until it is stopped.
+      // The update check needs a terminal on stderr, and the terminal app runs until it is stopped. Neither run is stopped
+      // on a clock from its start: on a starved runner the app can take more than 3 s to come up, and a run stopped 3 s
+      // after its start then records none of its kicks without the switch, and none under it only because nothing that
+      // kicks has run yet. A verb runs until it exits. The app, which draws frames, has decided every kick by the end of
+      // its first whole frame (the server's at startup, the rest in that first paint): under the switch it runs on for 3 s
+      // past that frame, and without it until every kick expected of it is recorded, and never less than the 3 s from its
+      // start it always had, so an extra kick in that time still shows.
+      const started = Date.now();
       const child = pty.spawn(process.execPath, ['--require', recorder, entry.cli ?? cli, ...entry.args], { cols: 100, rows: 30, cwd: home, env });
-      child.onData(() => {});
-      const exited = new Promise((resolve) => child.onExit(resolve));
-      const stop = setTimeout(() => child.kill(), 3000);
+      let output = '', drawnAt = 0, gone = false;
+      child.onData((data) => {
+        if (drawnAt) return;
+        output += data;
+        if (output.includes('\x1b[?2026l')) drawnAt = Date.now(); // the end of a whole frame
+      });
+      const exited = new Promise((resolve) => child.onExit(() => { gone = true; resolve(); }));
+      const settled = () => gone || (drawnAt > 0 && (switchValue === '1' ? Date.now() - drawnAt >= 3000 : recorded().length >= entry.kicks.length && Date.now() - started >= 3000));
+      for (const deadline = Date.now() + 60000; !settled() && Date.now() < deadline;) await new Promise((resolve) => setTimeout(resolve, 50));
+      const ran = gone || drawnAt > 0;
+      if (!gone) child.kill();
       await exited;
-      clearTimeout(stop);
+      assert.ok(ran, 'the run got as far as its kicks: it exited, or it drew a frame');
     } else {
       const r = cp.spawnSync(process.execPath, ['--require', recorder, ...entry.args], { cwd: home, env, encoding: 'utf8', timeout: 20000 });
       assert.equal(r.status, 0, r.stderr);
     }
-    const calls = fs.existsSync(log) ? fs.readFileSync(log, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line)) : [];
-    // On Windows the launcher runs bash through cmd.exe, so the recorded file is the whole command line.
-    return calls.filter((c) => c.detached).map((c) => (/^bash(?:\s|$)/.test(c.file) ? 'month refresh' : c.args.slice(1).join(' ')));
+    return recorded();
   };
   // The saved machines' usage refresh is kicked only where herdr is, since OAK's saved machines are herdr's.
   const machines = core.findHerdrBin({ env: { PATH: process.env.PATH } }) ? ['usage --pull-machines --if-due'] : [];
