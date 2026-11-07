@@ -2201,7 +2201,9 @@ test('CLI --machine: only ignore --stdin hands its stdin on, byte for byte; any 
   fs.writeFileSync(file, 'src/a.txt\n'.repeat(50000));
   fs.rmSync(got, { force: true });
   // OAK's own exit status: the shell's is the next command's.
-  const r = cp.spawnSync('/bin/sh', ['-c', `{ "$0" "$1" search --json --query quokka --machine build-box; echo "$?" > '${status}'; cat > '${rest}'; } < '${file}'`, process.execPath, cli],
+  const script = path.join(f.b.home, 'search.sh');
+  fs.writeFileSync(script, `{ "$1" "$2" search --json --query quokka --machine build-box; echo "$?" > '${status}'; cat > '${rest}'; } < '${file}'\n`);
+  const r = cp.spawnSync('/bin/sh', [script, process.execPath, cli],
     { cwd: f.b.home, env: f.b.env, encoding: 'utf8', timeout: 15000 });
   assert.deepEqual([fs.readFileSync(status, 'utf8'), r.stdout, r.stderr], ['0\n', '{}\n', ''], 'the command answered at once');
   assert.equal(fs.readFileSync(got, 'utf8'), '', 'the remote command\'s stdin ended at once, with nothing on it');
@@ -3194,11 +3196,16 @@ esac
     }
     assert.fail(`no ${what} for box started`);
   };
-  /** herdr's whole process group, herdr and the sleep it runs, is gone within 3 s. */
+  /** '' once herdr's whole process group, herdr and the sleep it runs, is gone within 3 s; otherwise what is left of
+   *  it, as `ps` lists it (pid, parent, state, command), so a failure on a CI runner says what outlived the stop. */
   const stopped = async (pid) => {
-    const gone = () => { try { process.kill(-pid, 0); return false; } catch (error) { return error.code === 'ESRCH'; } };
+    let why = '';
+    const gone = () => { try { process.kill(-pid, 0); why = 'alive'; return false; } catch (error) { why = error.code; return error.code === 'ESRCH'; } };
     for (const end = Date.now() + 3000; Date.now() < end && !gone();) await wait(20);
-    return gone();
+    if (gone()) return '';
+    const ps = cp.spawnSync('ps', ['-A', '-o', 'pid=,pgid=,ppid=,stat=,command='], { encoding: 'utf8' }).stdout || '';
+    const left = ps.split('\n').filter((line) => line.trim().split(/\s+/)[1] === String(pid));
+    return `process group ${pid} (kill -0: ${why}): ${left.join(' | ') || 'no process of it listed'}`;
   };
   const within = (promise, ms, late) => Promise.race([promise, wait(ms).then(() => late)]);
   return { b, runs, started, stopped, within, wait };
@@ -3216,7 +3223,7 @@ test('CLI prompt: ctrl+c while a saved machine\'s herdr delivers the prompt stop
   const at = Date.now();
   process.kill(-child.pid, 'SIGINT');
   assert.deepEqual(await h.within(exited, 10000, 'still running'), { status: null, sig: 'SIGINT' }, 'it ends by ctrl+c, so a shell loop around it stops');
-  assert.ok(await h.stopped(herdr), 'herdr stopped, with its whole process group');
+  assert.equal(await h.stopped(herdr), '', 'herdr stopped, with its whole process group');
   await h.wait(Math.max(0, at + 3500 - Date.now())); // past the moment the prompt would have arrived
   assert.deepEqual(h.runs().map(([, what]) => what), ['snapshot', 'prompt'], 'the prompt was not delivered');
 });
@@ -3238,7 +3245,7 @@ test('terminal app: quitting it, a hangup, or ctrl+c or a deadline on a one-shot
       const sig = how.startsWith('ctrl+c') ? 'SIGINT' : 'SIGTERM';
       process.kill(sig === 'SIGINT' ? -child.pid : child.pid, sig);
       assert.deepEqual(await h.within(exited, 10000, 'still running'), { status: null, sig }, `the frame ends by ${sig}`);
-      assert.ok(await h.stopped(herdr), 'the read stopped with it');
+      assert.equal(await h.stopped(herdr), '', 'the read stopped with it');
       return;
     }
     const term = pty.spawn(process.execPath, [cli, 'tui', '--tab', 'observatory'], { cols: 120, rows: 36, cwd: h.b.home, env: h.b.env });
@@ -3249,7 +3256,7 @@ test('terminal app: quitting it, a hangup, or ctrl+c or a deadline on a one-shot
     if (how === 'a hangup') term.kill('SIGHUP');
     else { term.write('\x11'); await h.wait(200); term.write('\x11'); }
     assert.equal((await h.within(exited, 10000, { exitCode: 'still running' })).exitCode, 0, 'the app exited');
-    assert.ok(await h.stopped(herdr), 'the read stopped with it');
+    assert.equal(await h.stopped(herdr), '', 'the read stopped with it');
   });
 });
 
@@ -3285,7 +3292,7 @@ test('terminal app: a reply already sending to a saved machine arrives after the
     else { term.write('\x11'); await h.wait(150); term.write('\x11'); }
     const { exitCode, signal } = await h.within(exited, 10000, { exitCode: 'still running' });
     assert.deepEqual([exitCode, signal], [0, 0], 'the app exited with status 0, not by a signal');
-    assert.ok(await h.stopped(read), 'the read stopped with it');
+    assert.equal(await h.stopped(read), '', 'the read stopped with it');
     for (const end = Date.now() + 10000; Date.now() < end && !h.runs().some(([, what]) => what === 'delivered'); await h.wait(50));
     assert.deepEqual(h.runs().filter(([, what]) => what === 'prompt' || what === 'delivered'), [[String(send), 'prompt'], [String(send), 'delivered']], 'the reply arrived after the app had gone');
   });
@@ -3551,9 +3558,9 @@ test('CLI --json through a slow pipe: the whole answer arrives, with the verb\'s
   b.env.CLAUDE_OBSERVATORY_NO_UPDATE_CHECK = '1';
   const paths = path.join(b.home, 'paths');
   fs.writeFileSync(paths, Array.from({ length: 3000 }, (_, i) => `src/some/deep/dir/file-${i}.ts\n`).join(''));
-  const out = path.join(b.home, 'piped.json');
-  const piped = run(b, '/bin/sh', ['-c', `{ "$0" "$1" ignore --stdin --json < "$2"; echo $? > "$3.status"; } | (sleep 1; cat > "$3")`,
-    process.execPath, cli, paths, out]);
+  const out = path.join(b.home, 'piped.json'), pipeline = path.join(b.home, 'pipeline.sh');
+  fs.writeFileSync(pipeline, '{ "$1" "$2" ignore --stdin --json < "$3"; echo $? > "$4.status"; } | (sleep 1; cat > "$4")\n');
+  const piped = run(b, '/bin/sh', [pipeline, process.execPath, cli, paths, out]);
   assert.equal(piped.status, 0, piped.stderr);
   const text = fs.readFileSync(out, 'utf8');
   assert.ok(text.length > 128 * 1024, `the answer is larger than any pipe buffer (${text.length} bytes)`);
@@ -3567,9 +3574,9 @@ test('CLI ignore --check text answers through a slow pipe: -v and the multi-path
   const paths = path.join(b.home, 'paths');
   fs.writeFileSync(paths, Array.from({ length: 4000 }, (_, i) => `src/some/deep/directory/of/the/workspace/file-${i}.ts\n`).join(''));
   for (const flags of [['-v', '-n'], ['-n']]) {
-    const out = path.join(b.home, 'piped' + flags.join(''));
-    const piped = run(b, '/bin/sh', ['-c', `{ "$0" "$1" ignore --stdin ${flags.join(' ')} < "$2"; echo $? > "$3.status"; } | (sleep 1; cat > "$3")`,
-      process.execPath, cli, paths, out]);
+    const out = path.join(b.home, 'piped' + flags.join('')), pipeline = path.join(b.home, 'pipeline.sh');
+    fs.writeFileSync(pipeline, `{ "$1" "$2" ignore --stdin ${flags.join(' ')} < "$3"; echo $? > "$4.status"; } | (sleep 1; cat > "$4")\n`);
+    const piped = run(b, '/bin/sh', [pipeline, process.execPath, cli, paths, out]);
     assert.equal(piped.status, 0, piped.stderr);
     const text = fs.readFileSync(out, 'utf8');
     assert.ok(text.length > 128 * 1024, `${flags}: the answer is larger than any pipe buffer (${text.length} bytes)`);
@@ -3708,7 +3715,7 @@ function updateFixture(t) {
         { name: `oak-observatory-vscode-v${target}.vsix`, browser_download_url: `${base}/a/oak.vsix`, digest: sha(path.join(assets, 'oak.vsix')) },
         { name: `oak-observatory-jetbrains-v${target}.zip`, browser_download_url: `${base}/a/jb.zip`, digest: sha(path.join(assets, 'jb.zip')) },
       ] }]));
-    } else if (req.url.startsWith('/a/')) res.end(fs.readFileSync(path.join(assets, req.url.slice(3))));
+    } else if (['/a/oak.tgz', '/a/oak.vsix', '/a/jb.zip'].includes(req.url)) res.end(fs.readFileSync(path.join(assets, req.url.slice(3))));
     else { res.statusCode = 404; res.end(); }
   });
   t.after(() => srv.close());
@@ -3814,7 +3821,7 @@ exit 0
 test('CLI update: one plan for this machine and every saved machine, then each surface updated once', { skip: process.platform === 'win32' && 'POSIX fakes' }, async t => {
   const f = updateFixture(t);
   const { b, target } = f;
-  const row = (out, label) => (out.match(new RegExp(`^  ${label.replace(/[()]/g, '\\$&')}\\s{2,}(.*)$`, 'm')) ?? [])[1];
+  const row = (out, label) => (out.match(new RegExp(`^  ${label.replace(/[\\()]/g, '\\$&')}\\s{2,}(.*)$`, 'm')) ?? [])[1];
   const result = (out) => out.slice(out.indexOf('\nResult\n')); // the rows after the update, not the plan's
 
   // The plan, before anything is touched. The machine that never answers is a timeout row, not a hang.
@@ -3882,7 +3889,7 @@ test('CLI update: one plan for this machine and every saved machine, then each s
   const before = { here: f.editorLog(), there: f.editorLog(f.remote('stale')), script: fs.readFileSync(f.script, 'utf8') };
   const run2 = await f.oak([]);
   assert.equal(run2.status, 0, run2.stderr);
-  assert.match(run2.stdout, new RegExp(`everything is up to date \\(${target.replace(/\./g, '\\.')}\\)`));
+  assert.match(run2.stdout, new RegExp(`everything is up to date \\(${target.replace(/[\\.]/g, '\\$&')}\\)`));
   assert.deepEqual({ here: f.editorLog(), there: f.editorLog(f.remote('stale')), script: fs.readFileSync(f.script, 'utf8') }, before, 'idempotent: no install runs twice');
   for (const label of ['VS Code', 'Cursor server', 'JetBrains (PyCharm2026.1)', 'machine stale', 'machine current'])
     assert.match(row(result(run2.stdout), label), /^current \(/, label);
@@ -4120,7 +4127,7 @@ test('CLI update: saved machines that share an ssh target are asked and updated 
   assert.equal(r.status, 0, r.stderr);
   assert.equal(updates(), 1, 'and it is updated once');
   const result = r.stdout.slice(r.stdout.indexOf('\nResult\n'));
-  for (const label of ['a', 'b']) assert.match(result, new RegExp(`^ {2}machine ${label}\\s+updated to ${f.target.replace(/\./g, '\\.')}$`, 'm'), label);
+  for (const label of ['a', 'b']) assert.match(result, new RegExp(`^ {2}machine ${label}\\s+updated to ${f.target.replace(/[\\.]/g, '\\$&')}$`, 'm'), label);
   assert.ok(f.sshArgv('stale').every((argv) => argv.join(' ').includes('-o ControlMaster=no')), 'no ssh of the update becomes that master');
   assert.deepEqual(fs.readFileSync(f.b.env.SSH_G_LOG, 'utf8').trim().split('\n'), ['me@stale', 'me@stale'], 'ssh -G once per target in each run: the plan read, then the update');
   const asks = fs.readFileSync(f.b.env.SSH_ASKPASS_LOG, 'utf8').trim().split('\n');
@@ -4159,7 +4166,7 @@ test('CLI update --force: a saved machine reinstalls, then reads the plan it is 
   const r = await f.oak(['--force', '--channel', 'stable']);
   assert.equal(r.status, 0, r.stderr);
   assert.match(fs.readFileSync(path.join(f.remote('current'), 'npm.log'), 'utf8'), /^npm i -g /m, 'the machine reinstalled its CLI: --force reached it');
-  assert.match(r.stdout.slice(r.stdout.indexOf('\nResult\n')), new RegExp(`^ {2}machine current\\s+updated to ${f.target.replace(/\./g, '\\.')}$`, 'm'), 'nothing reads as still to do');
+  assert.match(r.stdout.slice(r.stdout.indexOf('\nResult\n')), new RegExp(`^ {2}machine current\\s+updated to ${f.target.replace(/[\\.]/g, '\\$&')}$`, 'm'), 'nothing reads as still to do');
   const [sent] = f.sshTo('current').filter((c) => c.includes('; s=$?;'));
   // The script travels inside `sh -c '…'`, where each quote of its own reads '\''.
   assert.match(sent.replace(/'\\''/g, "'"), /oak update --here '--channel' 'stable' '--force' >&2; s=\$\?; oak update --here --json '--channel' 'stable'; \(exit "\$s"\)/, 'the read after it carries the channel and nothing else');
@@ -4374,7 +4381,7 @@ test('CLI update: a local build (dev.0, which no release carries) is offered not
   const oak = (entry, args) => new Promise((resolve) => cp.execFile(process.execPath, [entry, ...args], { env, cwd: b.home, encoding: 'utf8', timeout: 60000 },
     (err, stdout, stderr) => resolve({ status: err ? (err.code ?? 1) : 0, stdout, stderr })));
   const npmLog = () => (fs.existsSync(path.join(b.home, 'npm.log')) ? fs.readFileSync(path.join(b.home, 'npm.log'), 'utf8') : '');
-  const row = (out, label) => (out.slice(out.indexOf('\nResult\n')).match(new RegExp(`^ {2}${label.replace(/[()]/g, '\\$&')}\\s{2,}(.*)$`, 'm')) ?? [])[1];
+  const row = (out, label) => (out.slice(out.indexOf('\nResult\n')).match(new RegExp(`^ {2}${label.replace(/[\\()]/g, '\\$&')}\\s{2,}(.*)$`, 'm')) ?? [])[1];
   const said = '9.9.9-dev.0 · a local build, which no release carries: `oak update` leaves it alone, and `--force` or `--channel` replaces it';
   const channel = (c) => {
     fs.mkdirSync(path.join(env.CLAUDE_CONFIG_DIR, 'claude-observatory'), { recursive: true });

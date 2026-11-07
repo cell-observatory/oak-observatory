@@ -45,7 +45,12 @@ const NETWORK_TYPES = new Set(['cifs', 'smb3', 'smbfs', 'nfs', 'nfs4']);
  * GitHub tell `App` from `app`.
  */
 export function normalizeGitUrl(raw: string): string | null {
-  const url = raw.trim().replace(/[?#].*$/, '');
+  // A query or fragment runs from the first `?` or `#` after the last line break. Found by search, since a pattern
+  // for it backtracked quadratically on a long run of `#`.
+  const text = raw.trim();
+  const lastLine = Math.max(text.lastIndexOf('\n'), text.lastIndexOf('\r'), text.lastIndexOf('\u2028'), text.lastIndexOf('\u2029')) + 1;
+  const query = text.slice(lastLine).search(/[?#]/);
+  const url = query < 0 ? text : text.slice(0, lastLine + query);
   if (!url) return null;
   let host: string;
   let rest: string;
@@ -86,7 +91,9 @@ export function originUrlFromConfig(text: string): string | null {
       continue;
     }
     if (!inOrigin) continue;
-    const kv = /^([A-Za-z][A-Za-z0-9-]*)\s*=\s*(.*)$/.exec(line);
+    // After `=`, white space is the gap and the value starts at its first other character: a value that could
+    // start inside the gap backtracked quadratically on a long run of tabs.
+    const kv = /^([A-Za-z][A-Za-z0-9-]*)\s*=\s*(\S.*|)$/.exec(line);
     if (!kv || kv[1].toLowerCase() !== 'url') continue;
     let value = '';
     let quoted = false;
@@ -226,14 +233,17 @@ export function parseMountTable(text: string, format: 'linux' | 'mac'): SyncShar
       if (f.length < 3) continue;
       [source, mount, type] = [unescapeMount(f[0]), unescapeMount(f[1]), f[2]];
     } else {
-      const m = /^(.+?) on (.+) \(([A-Za-z0-9]+)[,)]/.exec(line.trim());
+      // The source runs to the first ` on ` after its first character. A source that could also run to a later one
+      // backtracked quadratically on a line with many.
+      const m = /^(.(?:(?! on ).)*) on (.+) \(([A-Za-z0-9]+)[,)]/.exec(line.trim());
       if (!m) continue;
       [source, mount, type] = [m[1], m[2], m[3]];
     }
     type = type.toLowerCase();
     if (!NETWORK_TYPES.has(type)) continue;
     const s = shareOf(source, type);
-    if (s && mount.startsWith('/')) out.push({ ...s, mount: mount.length > 1 ? mount.replace(/\/+$/, '') : mount, type });
+    // A trailing separator is dropped. The look-behind lets the match start only at the first of a run, which keeps it linear.
+    if (s && mount.startsWith('/')) out.push({ ...s, mount: mount.length > 1 ? mount.replace(/(?<!\/)\/+$/, '') : mount, type });
   }
   return out;
 }
@@ -266,7 +276,8 @@ export function identityKey(cwd: string, ctx: { home: string; shares: readonly S
   const sep = ctx.sep ?? path.sep;
   const git = gitIdentity(cwd);
   if (git) return { key: `git:${git.url}${git.sub ? `//${git.sub}` : ''}`, root: git.root };
-  const home = ctx.home.length > 1 ? ctx.home.replace(/[\\/]+$/, '') : ctx.home;
+  // A trailing separator is dropped. The look-behind lets the match start only at the first of a run, which keeps it linear.
+  const home = ctx.home.length > 1 ? ctx.home.replace(/(?<![\\/])[\\/]+$/, '') : ctx.home;
   if (home && within(cwd, home, sep)) {
     const rel = cwd.slice(home.length).split(sep).filter(Boolean).join('/');
     return { key: `home:${rel || '.'}` };

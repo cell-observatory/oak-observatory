@@ -2480,7 +2480,7 @@ esac\nexit 0\n`, { mode: 0o755 });
             process.nextTick(() => {
               const res = new (require('stream').PassThrough)(); res.statusCode = 200; res.headers = {};
               cb(res);
-              res.end(String(url).includes('api.github.com')
+              res.end(new URL(String(url)).host === 'api.github.com'
                 ? JSON.stringify([{ tag_name: 'v9.9.10', prerelease: false, assets: [{ name: 'oak-observatory-vscode-v9.9.10.vsix', browser_download_url: 'https://example.invalid/oak.vsix', digest }] }])
                 : vsix);
             });
@@ -3451,7 +3451,7 @@ esac\nexit 0\n`, { mode: 0o755 });
       {
         const store = path.join(home, '.claude', 'claude-observatory', 'remote-cache', 'machine-usage.json');
         const account = path.join(home, '.claude.json');
-        const tag = require('crypto').createHash('sha256').update('acct-1').digest('hex').slice(0, 12);
+        const tag = require('crypto').scryptSync('acct-1', 'oak-claude-account', 6).toString('hex');
         const old = sec - 10 * 86400;
         fs.writeFileSync(cache, JSON.stringify({ v: 3, five_pct: 40, five_at: old, five_reset: old + 3600, week_pct: 70, week_at: old, week_reset: old + 86400 }));
         fs.writeFileSync(account, JSON.stringify({ oauthAccount: { accountUuid: 'acct-1' } }));

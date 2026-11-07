@@ -150,7 +150,7 @@ connection and permissions. OAK’s network paths are:
   hash of its host name and home directory
   (the first 12 hexadecimal digits of their SHA-256), so that no machine is counted
   twice, and the account each row was billed to by a hash of its Claude account id (the
-  first 12 hexadecimal digits of the SHA-256 of `oauthAccount.accountUuid` in Claude
+  first 12 hexadecimal digits of the scrypt hash of `oauthAccount.accountUuid` in Claude
   Code's `.claude.json`). An OAK there from before this command, or one whose local
   database does not open, is asked for its readings instead, as is every saved machine
   where this machine's own database does not open (`oak __usage-brief --json`, what `oak

@@ -348,7 +348,7 @@ test('TUI usage: the bar names a saved machine only for the windows it shows, by
     // This machine's 5-hour and weekly shares are live, its month too; the per-model cap comes from the saved machine.
     put(path.join(home, '.claude', 'statusline-last.json'), { v: 3, five_pct: 9, five_at: nowS - 30, five_reset: nowS + 3600, week_pct: 30, week_at: nowS - 30, week_reset: nowS + 86400,
       month_tok: 1000000, month_tok_total: 50000000, month_reset: nowS + 5 * 86400 });
-    const machine = (label, brief) => ({ label, target: 'me@build-box', brief: { brief: 1, account: crypto.createHash('sha256').update('acct-1').digest('hex').slice(0, 12), at: now,
+    const machine = (label, brief) => ({ label, target: 'me@build-box', brief: { brief: 1, account: crypto.scryptSync('acct-1', 'oak-claude-account', 6).toString('hex'), at: now,
       five: null, week: null, fable: { pct: 9, reset: now + 2 * 86400000, at: now - 60000, tok: null, total: null, label: 'Fable' }, month: null, ...brief } });
     put(core.machineUsageCachePath(), { version: 1, attemptedAt: now, machines: [machine('build-box', {})] });
     const row = () => usageRow({ ...usageFixture(), now, usageBoth: core.usageBrief(home) })[0].trimEnd();

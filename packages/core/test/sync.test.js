@@ -73,6 +73,19 @@ test('sync identity: mount tables, Linux and macOS, name each network share by s
   ]);
 });
 
+// Each of these backtracked quadratically on a long run (CodeQL's js/polynomial-redos inputs); the timeout stops a
+// regression instead of hanging the run.
+test('sync identity: origin URLs, git config, mount tables and the home stay fast on long runs', () => {
+  const quick = (f) => require('node:vm').runInNewContext('f()', { f }, { timeout: 2000 });
+  assert.equal(quick(() => core.normalizeGitUrl('#'.repeat(200_000) + '\nx')), null);
+  assert.equal(quick(() => core.originUrlFromConfig('[remote "origin"]\nurl=' + '\t'.repeat(200_000) + 'x\ry')), null);
+  assert.deepEqual(quick(() => core.parseMountTable('a on ' + 'a on a'.repeat(100_000), 'mac')), []);
+  const mount = '/' + '/'.repeat(200_000) + 'x';
+  assert.deepEqual(quick(() => core.parseMountTable(`//srv/share ${mount} cifs rw 0 0`, 'linux')), [{ server: 'srv', share: 'share', mount, type: 'cifs' }]);
+  const cwd = path.join(os.tmpdir(), 'oak-no-such-dir', 'x');
+  assert.deepEqual(quick(() => core.identityKey(cwd, { home: '/'.repeat(200_000) + 'x', shares: [] })), { key: `path:${cwd}` });
+});
+
 test('sync identity: git before home before share before path, git only for a directory that exists', (t) => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-sync-id-'));
   t.after(() => fs.rmSync(home, { recursive: true, force: true }));
@@ -928,6 +941,13 @@ test('sync names: the fetch command refuses a name Windows cannot hold, though t
   const statuses = [];
   new core.SyncFrameReader({ header: (h) => statuses.push(h.status), body: () => {}, end: () => {} }).push(Buffer.concat(out));
   assert.deepEqual(statuses, ['refused', 'refused', 'whole']);
+});
+
+// A long run of `=` backtracked quadratically while the padding was dropped (CodeQL's js/polynomial-redos input); the
+// timeout stops a regression instead of hanging the run.
+test('sync crypto: a key with a long run of `=` is refused quickly', () => {
+  const parse = () => core.parseSyncKey('='.repeat(200_000) + 'x');
+  assert.throws(() => require('node:vm').runInNewContext('parse()', { parse }, { timeout: 2000 }), core.SyncKeyError);
 });
 
 test('sync crypto: a key is 32 bytes written one way; a sealed unit opens only with its key and what it was sealed as, and any altered byte refuses it', () => {

@@ -3406,7 +3406,7 @@ function machineUsageHome(account = 'acct-1') {
     fs.writeFileSync(`${file}.tmp`, JSON.stringify(value));
     fs.renameSync(`${file}.tmp`, file);
   };
-  const tag = (id) => require('crypto').createHash('sha256').update(id).digest('hex').slice(0, 12);
+  const tag = (id) => require('crypto').scryptSync(id, 'oak-claude-account', 6).toString('hex');
   const now = Date.now();
   const nowS = Math.floor(now / 1000);
   const login = (id) => replace(path.join(os.homedir(), '.claude.json'), id ? { oauthAccount: { accountUuid: id } } : { numStartups: 3 });
@@ -17814,6 +17814,15 @@ test('statusline: _rate prices every model id as core modelRate does', () => {
   assert.ok(Number(memo.stdout) >= 1, memo.stdout);
 });
 
+// The context-tag strip and the GPT version read backtracked quadratically on these ids (CodeQL's js/polynomial-redos
+// inputs); the timeout stops a regression instead of hanging the run.
+test('pricing: modelRate stays fast on a long run of `[` or of version digits', () => {
+  for (const id of ['['.repeat(200_000), 'gpt-0' + '0'.repeat(200_000) + '\nx']) {
+    const rate = () => core.modelRate(id);
+    require('node:vm').runInNewContext('rate()', { rate }, { timeout: 2000 });
+  }
+});
+
 test('pricing: gpt-oss, an open-weight model usually run locally, has no price outside a provider\'s table (2026-10-07)', () => {
   // It took GPT-5's rate as an approximation, while the docs say a local model shows no dollars.
   const M = { input: 1_000_000, output: 1_000_000, cacheWrite: 0, cacheRead: 0 };
@@ -19078,7 +19087,7 @@ test('prefs: the bill day falls back to the .claude.json Claude Code keeps, whic
   const login = (dir, at) => fs.writeFileSync(path.join(dir, '.claude.json'), JSON.stringify({ oauthAccount: { subscriptionCreatedAt: at, accountUuid: `acct-${at.slice(8, 10)}` } }));
   login(home, '2026-07-05T10:00:00Z');
   login(relocated, '2026-07-14T16:59:21Z');
-  const tag = (id) => require('crypto').createHash('sha256').update(id).digest('hex').slice(0, 12);
+  const tag = (id) => require('crypto').scryptSync(id, 'oak-claude-account', 6).toString('hex');
   try {
     assert.equal(core.billDay({}), 5, 'the home\'s, with no CLAUDE_CONFIG_DIR');
     process.env.CLAUDE_CONFIG_DIR = relocated;
@@ -25213,7 +25222,7 @@ test('statusline: a saved machine adds to the estimates only for the same accoun
   const old = { ...bb };
   delete old.own;
   assert.deepStrictEqual(shownFigures(next(old)), shownFigures(alone), 'an older OAK\'s brief, with no figures of its own, adds nothing');
-  const tag = require('crypto').createHash('sha256').update('acct-other').digest('hex').slice(0, 12);
+  const tag = require('crypto').scryptSync('acct-other', 'oak-claude-account', 6).toString('hex');
   assert.deepStrictEqual(shownFigures(next({ ...bb, account: tag })), shownFigures(alone), 'another account\'s figures are never added');
   // A stale reading: the build machine's last scan was before this 5h window began. Its week and month still count.
   const stale = next({ ...bb, own: { ...bb.own, at: (two.r5 - 5 * 3600 - 600) * 1000 } });
