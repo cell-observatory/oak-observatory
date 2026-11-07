@@ -774,6 +774,10 @@ cp $r "$srcs" "$dest"
     fs.mkdirSync(path.join(remote, '.local', 'bin'), { recursive: true });
     fs.mkdirSync(path.join(remote, 'node-bin'));
     fs.symlinkSync(process.execPath, path.join(remote, 'node-bin', 'node'));
+    // Its Node in ~/.local/bin as well, where a user-local Node lives: the installed oak runs on MACHINE_PATH,
+    // whose /usr/local/bin comes before the PATH above, and on GitHub's ubuntu-latest runner that holds an
+    // older Node than OAK accepts.
+    fs.symlinkSync(process.execPath, path.join(remote, '.local', 'bin', 'node'));
     fs.writeFileSync(path.join(remote, '.local', 'bin', 'herdr'), `#!/bin/sh\necho "herdr ${pin}"\n`, { mode: 0o755 });
   };
   const add = () => run(b, process.execPath, [cli, 'machine', 'add', 'box', 'me@box'], { timeout: 60000 });
