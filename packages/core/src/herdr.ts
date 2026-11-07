@@ -669,9 +669,84 @@ export function paneScreenDecides(pane: AgentPane, session?: AgentRow, now = Dat
  *  that makes the interrupt hint optional): a timer row such as `Working (5m 2s • esc to interrupt) · Running hook`,
  *  maybe after a `•` or `◦`, followed to the end of the text only by lines that are no response, interruption or
  *  prompt (queued inputs, a question waiting, a `›` line whose space a sparkle replaced), and blank lines. herdr's Rust
- *  pattern, with `(?m)^` as a lookbehind for the start or a newline and `\z` as `$`, which this pattern (no `m` flag)
- *  matches only at the end of the text; `u` matches by code point, as Rust does. */
-const CODEX_WORKING_ROW = /(?<![^\n])(?:[•◦][ \t]+)?[^\s›•◦■✗✓─][^\r\n]* \((?:[0-9]+[hm] )*[0-9]+s(?: • [^\r\n]+? to interrupt)?\)(?: · [^\r\n]*)?(?:\r?\n(?:[^•◦›■✗✓─\r\n][^\r\n]*|•[ \t]+(?:Queued\s+follow-up\s+inputs|Messages\s+to\s+be\s+submitted\s+after\s+next\s+tool\s+call(?:\s+\(press\s+[^\r\n]+?\s+to\s+interrupt\s+and\s+send\s+immediately\))?|Messages\s+to\s+be\s+submitted\s+at\s+end\s+of\s+turn)|›[⠁⠂⠄⠈⠐⠠⡀⢀][^\r\n]*)?)*\s*$/u;
+ *  pattern, with `(?m)^` as a lookbehind for the start or a newline and `\z` as `$`, which a pattern with no `m` flag
+ *  matches only at the end of the text, reads in JavaScript as
+ *  `/(?<![^\n])(?:[•◦][ \t]+)?[^\s›•◦■✗✓─][^\r\n]* \((?:[0-9]+[hm] )*[0-9]+s(?: • [^\r\n]+? to interrupt)?\)(?: · [^\r\n]*)?(?:\r?\n(?:[^•◦›■✗✓─\r\n][^\r\n]*|•[ \t]+(?:Queued\s+follow-up\s+inputs|Messages\s+to\s+be\s+submitted\s+after\s+next\s+tool\s+call(?:\s+\(press\s+[^\r\n]+?\s+to\s+interrupt\s+and\s+send\s+immediately\))?|Messages\s+to\s+be\s+submitted\s+at\s+end\s+of\s+turn)|›[⠁⠂⠄⠈⠐⠠⡀⢀][^\r\n]*)?)*\s*$/u`.
+ *  Rust's engine runs it in linear time; JavaScript's backtracks, and the `\s+` of a queued line can also take the
+ *  line breaks between such lines, which makes it exponential. This function decides that pattern in linear time,
+ *  with JavaScript's `\s` and `u`'s code points. It visits the line starts from the last up and records for each
+ *  whether the text from there is lines the pattern's loop accepts and then whitespace (`rest`); a timer row then
+ *  matches when its line's end has `rest` true. */
+function codexWorkingRow(text: string): boolean {
+  const n = text.length, blank = text.trimEnd().length; // `\s*$` matches from `blank` on.
+  const space = (i: number): boolean => i < n && /\s/.test(text[i]);
+  const skipSpace = (i: number): number => { while (space(i)) i++; return i; };
+  const lineEnd = (i: number): number => { while (i < n && text[i] !== '\r' && text[i] !== '\n') i++; return i; };
+  // Where `list`, its words joined by `\s+`, ends when it starts at i, or -1.
+  const words = (i: number, ...list: string[]): number => {
+    for (const [k, word] of list.entries()) {
+      const at = k ? skipSpace(i) : i;
+      if (k && at === i || !text.startsWith(word, at)) return -1;
+      i = at + word.length;
+    }
+    return i;
+  };
+  const ok = new Uint8Array(n + 1); // At a line start after `\n`: the loop's optional line, then `rest`, match there.
+  const rest = (i: number): boolean => i >= blank || text[i] === '\n' && ok[i + 1] === 1 || text.startsWith('\r\n', i) && ok[i + 2] === 1;
+  // `\s+\(press\s+[^\r\n]+?\s+to\s+interrupt\s+and\s+send\s+immediately\)`, then `rest`, from i. The `\s+[^\r\n]+?\s+`
+  // before `to` lies inside the whitespace after `(press`, which then holds a character other than CR or LF before its
+  // last, or runs from that whitespace to whitespace that starts on the same line.
+  const press = (i: number): boolean => {
+    const at = skipSpace(i), q = at + 6, w = skipSpace(q);
+    if (at === i || !text.startsWith('(press', at) || w === q) return false;
+    const send = (t: number): boolean => { const c = words(t, 'to', 'interrupt', 'and', 'send', 'immediately)'); return c >= 0 && rest(c); };
+    for (let k = q + 1; k < w - 1; k++) if (text[k] !== '\r' && text[k] !== '\n') { if (send(w)) return true; break; }
+    for (let s = w + 1, stop = lineEnd(w); s <= stop; s++) if (space(s) && !space(s - 1) && send(skipSpace(s))) return true;
+    return false;
+  };
+  // The loop's queued line at a line start j: `•[ \t]+` and one of the queued-input phrases, then `rest`.
+  const queued = (j: number): boolean => {
+    let a = j + 1;
+    while (text[a] === ' ' || text[a] === '\t') a++;
+    if (text[j] !== '•' || a === j + 1) return false;
+    const inputs = words(a, 'Queued', 'follow-up', 'inputs'), call = words(a, 'Messages', 'to', 'be', 'submitted', 'after', 'next', 'tool', 'call');
+    const turn = words(a, 'Messages', 'to', 'be', 'submitted', 'at', 'end', 'of', 'turn');
+    return inputs >= 0 && rest(inputs) || call >= 0 && (rest(call) || press(call)) || turn >= 0 && rest(turn);
+  };
+  // The timer row from the line start p to its line's end.
+  const row = (p: number, end: number): boolean => {
+    let f = p;
+    if (text[p] === '•' || text[p] === '◦') {
+      do f++; while (text[f] === ' ' || text[f] === '\t');
+      if (f === p + 1) return false;
+    }
+    if (f >= end || space(f) || '›•◦■✗✓─'.includes(text[f])) return false;
+    const after = (c: number): boolean => c === end || c >= blank || text.startsWith(' · ', c); // `(?: · [^\r\n]*)?`
+    let hint = -1; // The last ` to interrupt)` on the line that `after` accepts.
+    for (let v = end - 14; v > f && hint < 0; v--) if (text.startsWith(' to interrupt)', v) && after(v + 14)) hint = v;
+    for (let h = f + 1; h < end; h++) {
+      if (text[h] !== ' ' || text[h + 1] !== '(') continue;
+      let u = h + 2, timer = false; // `(?:[0-9]+[hm] )*[0-9]+s`
+      for (;;) {
+        const d = u;
+        while (text[u] >= '0' && text[u] <= '9') u++;
+        if (u === d) break;
+        if (text[u] === 's') { u++; timer = true; break; }
+        if (text[u] !== 'h' && text[u] !== 'm' || text[u + 1] !== ' ') break;
+        u += 2;
+      }
+      if (timer && (text[u] === ')' ? after(u + 1) : text.startsWith(' • ', u) && hint >= u + 4)) return true;
+    }
+    return false;
+  };
+  for (let p = n; p >= 0; p--) {
+    if (p > 0 && text[p - 1] !== '\n') continue;
+    const end = lineEnd(p), tail = rest(end);
+    if (p > 0) ok[p] = rest(p) || tail && p < end && (!'•◦›■✗✓─'.includes(text[p]) || text[p] === '›' && '⠁⠂⠄⠈⠐⠠⡀⢀'.includes(text[p + 1])) || queued(p) ? 1 : 0;
+    if (tail && row(p, end)) return true;
+  }
+  return false;
+}
 /** The row Codex shows when it lost its connection, which reads as a timer row too: the same rule's `not`. */
 const CODEX_RECONNECT_ROW = /^(?:[•◦][ \t]+)?Reconnect failed — check the endpoint, then relaunch \([0-9hms ]+\)$/u;
 
@@ -690,11 +765,11 @@ function aboveCodexPrompt(screen: string): string | undefined {
 }
 
 /** Whether a Codex pane's screen (herdr's `pane.read`, as text) shows Codex at work: its live status row above its
- *  current prompt (CODEX_WORKING_ROW), with no Reconnect failed row there. herdr's own rule, which herdr 0.9.1 ranks
+ *  current prompt (codexWorkingRow), with no Reconnect failed row there. herdr's own rule, which herdr 0.9.1 ranks
  *  below the "Action Required" title that a question waiting gives the pane. */
 export function codexScreenWorking(screen: string): boolean {
   const above = aboveCodexPrompt(screen);
-  return above !== undefined && (above.includes(' to interrupt)') || above.includes('s)')) && CODEX_WORKING_ROW.test(above)
+  return above !== undefined && (above.includes(' to interrupt)') || above.includes('s)')) && codexWorkingRow(above)
     && !above.split('\n').some(line => CODEX_RECONNECT_ROW.test(line.replace(/\r$/, '')));
 }
 

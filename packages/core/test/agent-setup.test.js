@@ -78,6 +78,22 @@ test('agent setup: doctor suggests setup and the terminal suggestion appears onc
   assert.equal(core.takeAgentSetupNotice(), null);
 });
 
+// An agent kind that names an Object.prototype member reached a shared object: `__proto__` wrote into Object.prototype,
+// and `constructor` deleted from the global Object.
+test('agent setup: a plan never writes into or deletes from shared objects', (t) => {
+  indexFixture(t, core);
+  Object.oakProbe = 'kept';
+  t.after(() => { delete Object.prototype.oakPolluted; delete Object.oakProbe; });
+  const plan = core.agentSetupPlan({ defaults: JSON.parse('{"__proto__":{"oakPolluted":true}}') });
+  assert.throws(() => core.applyAgentSetup(plan), /__proto__\.oakPolluted is not an agent setting/);
+  assert.equal({}.oakPolluted, undefined);
+  fs.mkdirSync(path.dirname(core.prefsPath()), { recursive: true });
+  fs.writeFileSync(core.prefsPath(), '{"agents":{}}');
+  const remove = { path: core.prefsPath(), part: 'constructor.oakProbe', value: null, before: null, created: false, observed: '"kept"', state: 'outdated' };
+  assert.throws(() => core.applyAgentSetup({ manifest: plan.manifest, remove: false, items: [remove] }), /constructor\.oakProbe is not an agent setting/);
+  assert.equal(Object.oakProbe, 'kept');
+});
+
 test('agent start: Codex receives all writable roots and always its output folder', () => {
   const args = core.delegatedArgs('codex', { cwd: '/repo', out: '/output', writableRoots: ['/cache', '/cache', '/build'] });
   assert.ok(args.includes(`sandbox_workspace_write.writable_roots=${JSON.stringify(['/cache', '/build', '/output'].map(p => path.resolve(p)))}`));

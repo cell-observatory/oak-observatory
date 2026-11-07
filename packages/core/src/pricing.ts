@@ -137,10 +137,13 @@ function claudeVersion(norm: string): { family: string; v: Ver | null } | null {
   const f = CLAUDE_FAMILY.exec(norm);
   return f ? { family: f[1], v: f[2] ? [+f[2], +(f[3] ?? 0)] : null } : null;
 }
-// `gpt-5.4-mini` reads as version 5.4 with the suffix `-mini`.
+// `gpt-5.4-mini` reads as version 5.4 with the suffix `-mini`. The suffix is the rest of the id, which must stay on
+// one line; a single pattern that also matched the suffix backtracked quadratically on a long version.
 function gptVersion(m: string): { v: Ver; suffix: string } | null {
-  const g = /^gpt-(\d+)(?:\.(\d+))?(.*)$/.exec(m.replace(/-\d{4}-\d{2}-\d{2}$/, ''));
-  return g ? { v: [+g[1], +(g[2] ?? 0)], suffix: g[3] } : null;
+  const s = m.replace(/-\d{4}-\d{2}-\d{2}$/, '');
+  const g = /^gpt-(\d+)(?:\.(\d+))?/.exec(s);
+  const suffix = g ? s.slice(g[0].length) : '';
+  return g && !/[\n\r\u2028\u2029]/.test(suffix) ? { v: [+g[1], +(g[2] ?? 0)], suffix } : null;
 }
 // Each family's rows, newest first.
 const CLAUDE_ROWS = CLAUDE_RATES.map(([id, rate]) => ({ ...claudeVersion(id)!, rate })).sort((a, b) => cmpVer(b.v!, a.v!));
@@ -152,8 +155,11 @@ const exact = (table: [string, ModelRate][], m: string) =>
  *  at or below that version (or its oldest, for an older one) and flagged approx: a newer model never reads as an
  *  exact price of an older one. */
 export function modelRate(model: string): ModelRate {
-  // A context tag (`claude-opus-4-8[1m]`) names the same model.
-  const m = (model || '').toLowerCase().trim().replace(/\[[^\]]*\]$/, '');
+  // A context tag (`claude-opus-4-8[1m]`) names the same model. It runs from the first `[` after any earlier `]` to the
+  // final `]`; found by search, since a pattern for it backtracked quadratically on a long run of `[`.
+  const t = (model || '').toLowerCase().trim();
+  const tag = t.endsWith(']') ? t.indexOf('[', t.lastIndexOf(']', t.length - 2) + 1) : -1;
+  const m = tag < 0 ? t : t.slice(0, tag);
   const via = /^provider:([^/]+)\/(.+)$/.exec(m);
   const hosted = via && Object.hasOwn(PROVIDER_RATES, via[1]) ? PROVIDER_RATES[via[1]].find(([id]) => id === via[2]) : undefined;
   if (hosted) return hosted[1];

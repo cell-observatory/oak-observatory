@@ -123,7 +123,7 @@ test('test bootstrap: OAK_NO_BACKGROUND stops every detached child OAK starts on
   const entries = [
     // …and the local index's catch-up of what `oak usage` itself does not read (the session it reports, this machine's usage).
     { name: 'oak usage', args: [cli, 'usage', '--json'], kicks: ['usage --pull-account --json', 'titles --refresh --if-due', 'month refresh', '__index-build', ...machines] },
-    { name: 'a capture hook inside herdr', args: ['-e', `require(${JSON.stringify(path.join(root, 'packages/core/dist/herdr-context'))}).herdrPaneContextSync = () => ({ nested: true }); require(${JSON.stringify(path.join(root, 'packages/core/dist'))}).kickTabSync('s1', '/fixture/oak.js')`],
+    { name: 'a capture hook inside herdr', args: ['-e', "require(process.argv[1]).herdrPaneContextSync = () => ({ nested: true }); require(process.argv[2]).kickTabSync('s1', '/fixture/oak.js')", path.join(root, 'packages/core/dist/herdr-context'), path.join(root, 'packages/core/dist')],
       env: { HERDR_PANE_ID: 'p1' }, kicks: ['__tab-sync s1'] },
     { name: 'any verb in a terminal', args: ['sessions'], pty: true, cli: installed, kicks: ['__update-check'] },
     // On the Review tab: the herdr tab would start a real herdr, which writes its session under this HOME on the way out.

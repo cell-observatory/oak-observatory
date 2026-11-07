@@ -201,6 +201,9 @@ function writeValue(e: Owned, value: string | null): void {
     } else { obj.permissions ??= {}; obj.permissions.allow = [...allow.filter(x => x !== AGENT_PERMISSION), AGENT_PERMISSION]; }
   } else {
     const [kind, key] = e.part.split('.');
+    // A kind names an agent. One that names an Object.prototype member would reach a shared object instead: `__proto__` is
+    // Object.prototype itself and `constructor` is the global Object. The explicit `__proto__` test is the form CodeQL recognises.
+    if (kind === '__proto__' || kind in Object.prototype) throw new Error(`${e.path}: ${e.part} is not an agent setting; left unchanged`);
     if (value === null) {
       if (obj.agents?.[kind]) {
         delete obj.agents[kind][key];

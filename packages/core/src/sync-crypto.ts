@@ -42,7 +42,8 @@ export function formatSyncKey(key: Buffer): string {
 /** A key as `--show` prints it, or its 32 bytes in base64 or base64url; throws for anything else. */
 export function parseSyncKey(text: string): Buffer {
   const t = String(text ?? '').trim();
-  const body = (t.startsWith(KEY_PREFIX) ? t.slice(KEY_PREFIX.length) : t).replace(/=+$/, '');
+  // Padding is dropped. The look-behind lets the match start only at the first `=` of the run, which keeps it linear.
+  const body = (t.startsWith(KEY_PREFIX) ? t.slice(KEY_PREFIX.length) : t).replace(/(?<!=)=+$/, '');
   if (!/^[A-Za-z0-9_+/-]{43}$/.test(body)) throw new SyncKeyError('that is not an oak sync key: it is 32 bytes, as `oak sync key --show` prints them (oak-sync-1:…)');
   const key = Buffer.from(body.replace(/\+/g, '-').replace(/\//g, '_'), 'base64url');
   if (key.length !== SYNC_KEY_BYTES || key.toString('base64url') !== body.replace(/\+/g, '-').replace(/\//g, '_')) throw new SyncKeyError('that is not an oak sync key: it does not decode to 32 bytes');
