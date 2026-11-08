@@ -2007,6 +2007,19 @@ test('sql: rows past the byte cap are cut and say so; a value past SQLite\'s len
   else assert.equal(big.ok, true, `this Node (${process.version}) cannot set the limit`);
 });
 
+/** What a child test run says of the tests that failed: each `not ok` line of its TAP with the diagnostics under it, else
+ *  the end of its output. The end alone (its last 4000 characters) named none of them when a Windows run failed one. */
+function failedTap(stdout) {
+  const lines = stdout.split('\n');
+  const out = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (!/^\s*not ok \d/.test(lines[i])) continue;
+    out.push(lines[i]);
+    for (let j = i + 1; j < lines.length && !/^\s*(not ok|ok) \d|^\s*# Subtest/.test(lines[j]); j++) out.push(lines[j]);
+  }
+  return out.length ? out.join('\n').slice(0, 12000) : stdout.slice(-4000);
+}
+
 /** A test run of its own, not a part of this one: without the test runner's context, it reports on stdout. */
 function childTestEnv(extra = {}) {
   const env = { ...process.env, ...extra };
@@ -2019,7 +2032,7 @@ test('parity: every session-listing test holds with the listing and the search s
   const r = cp.spawnSync(process.execPath, ['--require', path.resolve(__dirname, '../../../test/bootstrap.cjs'), '--test', '--test-reporter=tap', path.join(__dirname, 'session-listing.test.js')], {
     env: childTestEnv({ OAK_LISTING_TEST_DIST: shim }), encoding: 'utf8', timeout: 300_000,
   });
-  assert.equal(r.status, 0, r.stdout.slice(-4000) + r.stderr.slice(-2000));
+  assert.equal(r.status, 0, failedTap(r.stdout) + r.stderr.slice(-2000));
   assert.match(r.stdout, /# pass [1-9]\d*/);
   assert.match(r.stdout, /# fail 0/);
 });
@@ -2030,7 +2043,7 @@ test('parity: the core tests that list, search or rank sessions hold with the in
   const r = cp.spawnSync(process.execPath, ['--require', path.resolve(__dirname, '../../../test/bootstrap.cjs'), '--require', preload, '--test', '--test-reporter=tap', '--test-name-pattern', pattern, path.join(__dirname, 'core.test.js')], {
     env: childTestEnv(), encoding: 'utf8', timeout: 300_000,
   });
-  assert.equal(r.status, 0, r.stdout.slice(-4000) + r.stderr.slice(-2000));
+  assert.equal(r.status, 0, failedTap(r.stdout) + r.stderr.slice(-2000));
   const pass = Number(/# pass (\d+)/.exec(r.stdout)?.[1] ?? 0);
   assert.ok(pass >= 15, `${pass} tests ran through the index`);
 });
