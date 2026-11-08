@@ -19,7 +19,11 @@ jobs:
     # accounts. It runs as uid 1000, the runner accounts' own on every runner machine, so what it writes stays theirs
     # to clean up, and the tests run as an ordinary user, as on a hosted runner. The workflows that publish (release,
     # dev-release, pages) stay on GitHub-hosted runners.
-    runs-on: [self-hosted, Linux, X64]
+    # Only the docker-runners group, which has one runner on each machine: two OAK test jobs on one machine made each
+    # other's timing-bound tests fail. GitHub gives each job a free machine, and the next one waits for one.
+    runs-on:
+      group: docker-runners
+      labels: [self-hosted, Linux, X64]
     # The dev-container Node image: Debian with git, python3, make and g++ (node-pty compiles from source on Linux), jq
     # in /usr/bin (the status-line tests run with only the system folders on PATH), a C.UTF-8 locale, and user 1000.
     container:
