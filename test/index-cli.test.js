@@ -15,7 +15,9 @@ const skip = !core.indexRuntime().ok && `no node:sqlite with FTS5 in ${process.v
 
 function fixture(t) {
   const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'oak-index-cli-')));
-  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  // Windows refuses to remove a folder while a handle in it is still open (EPERM), as it did once on the Windows runner
+  // right after this file's `oak doctor`; the retries wait that out, 2.75 s at most, and a holder that outlasts them fails.
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }));
   const env = {
     ...process.env, HOME: dir, USERPROFILE: dir, CLAUDE_CONFIG_DIR: path.join(dir, 'claude'), CODEX_HOME: path.join(dir, 'codex'),
     XDG_CONFIG_HOME: path.join(dir, 'xdg'), HERDR_BIN: path.join(dir, 'absent-herdr'), HERDR_SOCKET_PATH: path.join(dir, 'no-socket'), OAK_NO_BACKGROUND: '1',

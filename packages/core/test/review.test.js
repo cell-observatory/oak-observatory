@@ -496,21 +496,34 @@ test('review: a delete confirmed for N pending edits refuses when more are pendi
   assert.ok(C.isSessionHidden('del-late') && !fs.existsSync(C.storeDir('del-late')), 'no more than named: deleted');
   // A capture holds the session's capture mutex while its edit lands. A delete asked meanwhile waits for it
   // and counts that edit too, so it is refused rather than purging it between the count and the purge.
-  C.ensureStore('del-racing'); pend('del-racing');
-  const held = path.join(cwd, 'held');
-  const capture = cp.spawn(process.execPath, ['-e', `const C = require(${JSON.stringify(require.resolve('../dist'))}), fs = require('fs'), s = 'del-racing';
+  // The delete waits 500 ms (DELETE_WAIT_MS) and refuses as busy a capture that holds the mutex longer, by design;
+  // on a slow Windows runner this capture's few writes outlasted it. Such a run says nothing about the count, so the
+  // race runs again on a session of its own. Each run must keep the edit.
+  const race = async (s) => {
+    C.ensureStore(s); pend(s);
+    const held = path.join(cwd, `held-${s}`);
+    const capture = cp.spawn(process.execPath, ['-e', `const C = require(${JSON.stringify(require.resolve('../dist'))}), fs = require('fs'), s = ${JSON.stringify(s)};
 C.withFileMutation(C.captureMutex(s), () => {
   fs.writeFileSync(${JSON.stringify(held)}, '');
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 150); // well inside the delete's short wait
   C.appendLog(s, { id: C.nextId(s), ts: Date.now(), tool: 'Edit', file: ${JSON.stringify(path.join(cwd, 'captured.txt'))}, status: 'pending',
     beforeBlob: C.writeBlob(s, Buffer.from('before\\n')), afterBlob: C.writeBlob(s, Buffer.from('captured\\n')) });
 });`], { env: process.env, stdio: 'inherit' });
-  const exited = new Promise((resolve) => capture.on('exit', resolve));
-  for (let i = 0; i < 500 && !fs.existsSync(held); i++) await new Promise((r) => setTimeout(r, 10));
-  assert.ok(fs.existsSync(held), 'control: the capture holds the mutex');
-  assert.throws(() => C.deleteSession('del-racing', { confirmedPending: 1 }), /del-racing has 2 edits pending review, more than the 1/);
-  assert.equal(await exited, 0, 'the capture finished');
-  assert.ok(!C.isSessionHidden('del-racing') && C.sessionCounts('del-racing').pending === 2, 'the edit it captured is kept, and the session with it');
+    const exited = new Promise((resolve) => capture.on('exit', resolve));
+    for (let i = 0; i < 500 && !fs.existsSync(held); i++) await new Promise((r) => setTimeout(r, 10));
+    assert.ok(fs.existsSync(held), 'control: the capture holds the mutex');
+    let refusal = 'not refused';
+    try { C.deleteSession(s, { confirmedPending: 1 }); } catch (e) { refusal = String(e); }
+    assert.equal(await exited, 0, 'the capture finished');
+    assert.ok(!C.isSessionHidden(s) && C.sessionCounts(s).pending === 2, 'the edit it captured is kept, and the session with it');
+    return refusal;
+  };
+  let refusal;
+  for (let run = 1; run <= 5; run++) {
+    refusal = await race(`del-racing-${run}`);
+    if (!/is recording an edit right now/.test(refusal)) break;
+  }
+  assert.match(refusal, /^Error: del-racing-\d has 2 edits pending review, more than the 1/);
 });
 
 // The confirm counts review units. An edit that rewrites the lines of a change it already counted, in the
