@@ -106,8 +106,20 @@ export async function rewriteStatuslineCache(
     if (!next) return 'unchanged';
     pending = true;
     fs.writeFileSync(tmp, JSON.stringify(next), { mode: 0o600 });
-    if (!isDir(tok)) return 'lost';
-    fs.renameSync(tmp, cachePath);
+    // The line's `_commit`: on Windows a rename onto a file another program has open fails with EPERM, and a render reads
+    // the cache with jq or python outside the lock, so the rename is tried again 20 ms apart, for about a second, while
+    // the token is still there.
+    for (let i = 0; ; i++) {
+      if (!isDir(tok)) return 'lost';
+      try {
+        fs.renameSync(tmp, cachePath);
+        break;
+      } catch (e) {
+        const code = (e as NodeJS.ErrnoException).code;
+        if (i >= 49 || (code !== 'EPERM' && code !== 'EACCES' && code !== 'EBUSY')) throw e;
+      }
+      await new Promise((r) => setTimeout(r, 20));
+    }
     pending = false;
     return 'written';
   } finally {

@@ -1438,6 +1438,14 @@ _lock() { local l="$_LAST.lock" s=$SECONDS b i e p t
 _aside() { local x="$_LAST.lock.$$.$RANDOM"; mv "$_LAST.lock" "$x" 2>/dev/null && rm -rf "$x" 2>/dev/null; }
 # Releases the lock this render holds: its token, then the lock if that leaves it empty.
 _unlock() { [ -n "$_lt" ] && rmdir "$_LAST.lock/$_lt" "$_LAST.lock" 2>/dev/null; _lt=""; }
+# Renames this render's write into place, only while its token is still in the lock (2026-11-08). On Windows a rename
+# onto a file another program has open fails (Git Bash's mv, and Node's rename with EPERM), and a render reads the cache
+# with jq or python outside the lock: the write a render made while another read the cache was dropped, and the next
+# render wrote over it from the cache before it. The rename is tried again 20 ms apart, for about a second at most.
+_commit() { local s=$SECONDS i
+  for (( i = 0; i < 50 && SECONDS - s < 2; i++ )); do [ -d "$_LAST.lock/$_lt" ] || return 1
+    mv "$_LAST.tmp.$$" "$_LAST" 2>/dev/null && return 0; sleep 0.02 2>/dev/null || sleep 1; done
+  return 1; }
 # THE SWEEP (2026-10-21). SIGKILL runs no trap: a render killed inside its write leaves its temporary file beside the
 # cache, and _aside leaves a stale lock it renamed but could not remove (another user's), or was killed before removing.
 # Nothing removed either. The render that takes the lock removes those more than two minutes from when it started, either
@@ -1594,7 +1602,7 @@ _we5=${est5:-}; _wt5=${tot5:-}; _we7=${est7:-}; _wt7=${tot7:-}
     (($old.costs // {}) + { ((.session_id // "?")): { usd: (.cost.total_cost_usd // 0), at: now } })
     | with_entries(select((.value.at // 0) > (now - 2764800)))
   )
-}' > "$_LAST.tmp.$$" 2>/dev/null && [ -d "$_LAST.lock/$_lt" ] && mv "$_LAST.tmp.$$" "$_LAST" 2>/dev/null || true
+}' > "$_LAST.tmp.$$" 2>/dev/null && _commit || true
 _unlock
 
 # A SAVED MACHINE'S READING (2026-10-22). Where this machine has no current share of a window, OAK's own readouts show a
