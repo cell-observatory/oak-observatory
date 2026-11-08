@@ -106,10 +106,21 @@ test('PTY output: hidden panes, drawn text and periodic frames', { skip, timeout
   await t.test('the visible native pane preserves real bells', () => {
     assert.ok(result.events.filter(e => e.kind === 'bell' && e.phase === 'F1').length >= 2, 'F1 forwards its visible pane bells');
     assert.ok(result.events.some(e => e.kind === 'bell' && e.phase === 'F1-return'), 'returning to F1 restores bell delivery');
+    // Every bell the pane's emulator raised is a real one: the fake herdr logs the shell's BEL bytes before it passes
+    // them on, so by each raised bell at least as many have been logged. A BEL that ends a split OSC title or sits in a
+    // DCS payload, taken for a bell, would outrun them.
+    const raised = sources.filter(s => s.kind === 'pane-bell');
+    const real = paneBells.map(b => ({ at: b.at, count: Buffer.from(b.hex, 'hex').filter(x => x === 7).length }));
+    raised.forEach((s, k) => assert.ok(real.filter(b => b.at <= s.at).reduce((n, b) => n + b.count, 0) > k,
+      `split OSC terminators and DCS payloads do not add bells: bell ${k + 1} was raised after fewer real ones`));
+    // Each bell raised while F1 showed the pane reached the outer terminal once. The app forwards by its own active tab,
+    // so that is the count to compare with. The bells rung before the test saw F2 drawn also hold those rung after the
+    // app had hidden the pane, and a switch longer than two of the shell's 200 ms rings counted two too many.
+    // One raised just before F1 began may still arrive after it.
     const i = phases.findIndex(p => p.name === 'F1');
-    const emitted = paneBells.filter(b => b.at >= phases[i].at && b.at < phases[i + 1].at).length;
+    const shown = raised.filter(s => s.tab === 'herdr' && s.at >= phases[i].at && s.at < phases[i + 1].at).length;
     const received = result.events.filter(e => e.kind === 'bell' && e.phase === 'F1').length;
-    assert.ok(Math.abs(received - emitted) <= 1, 'split OSC terminators and DCS payloads do not add bells (one boundary event allowed)');
+    assert.ok(received >= shown && received <= shown + 1, `each bell raised while F1 showed reached the terminal once: ${received} received, ${shown} raised`);
   });
   await t.test('drawn text never carries a raw BEL or erase', () => {
     assert.match(screens.F2, /CONVERSATION TEXT/);

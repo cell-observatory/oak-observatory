@@ -305,8 +305,9 @@ socketTest('herdr: rejected and unacknowledged subscriptions surface errors and 
     if (fake.requests.length === 1) socket.end(JSON.stringify({ id, error: { code: 'invalid_request', message: 'pane_id required' } }) + '\n');
   });
   const errors = [];
+  // The rejection has 500 ms to arrive: with 30 ms, a loaded runner's late answer read as the second attempt's timeout.
   const sub = core.herdrSubscribe([{ type: 'pane.created' }], () => assert.fail('no events expected'), {
-    ...box, timeoutMs: 30, reconnectDelayMs: 10, onError: e => errors.push(e),
+    ...box, timeoutMs: 500, reconnectDelayMs: 10, onError: e => errors.push(e),
   });
   box.cleanups.push(() => sub.close());
   await eventually(() => errors.length >= 2, 'subscription errors');

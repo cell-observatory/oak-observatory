@@ -39,7 +39,12 @@ for (const scenario of ['valid', 'stale', 'foreign', 'wrong-tty', 'unreachable',
       core.kickTabSync('fixture-session', '/fixture/oak.js');
       core.reportHerdrSessionSync('fixture-session', 'codex', { paneId: process.env.HERDR_PANE_ID, socketPath: process.env.HERDR_SOCKET_PATH, at: 1 });
       process.stdout.write(JSON.stringify({ link: core.readHerdrPaneLink('fixture-session'), kicked: require('fs').existsSync(require('path').join(core.storeDir('fixture-session'), 'herdr-tab.kick')) }));
-    `], { env: { ...b.env, HERDR_BIN_PATH: binary, PANE_REPORT_LOG: report, OAK_NO_BACKGROUND: '' }, encoding: 'utf8', timeout: 3000 });
+    `], {
+      // OAK_HERDR_CHECK_MS: on a loaded runner the check's 400 ms probe did not reach the server at all. A server that
+      // never answers holds the probe for all of it, so that scenario gets enough to reach the server, and no more.
+      env: { ...b.env, HERDR_BIN_PATH: binary, PANE_REPORT_LOG: report, OAK_NO_BACKGROUND: '', OAK_HERDR_CHECK_MS: scenario === 'timeout' ? '2000' : '10000' },
+      encoding: 'utf8', timeout: 20000,
+    });
     assert.equal(result.status, 0, result.stderr);
     const value = JSON.parse(result.stdout);
     assert.equal(!!value.link, scenario === 'valid', 'only an owned pane can become a prompt destination');

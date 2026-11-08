@@ -234,7 +234,9 @@ test('Codex capture wire request through the real herdr CLI and a fake socket', 
   }
   t.after(() => new Promise(resolve => server.close(resolve)));
   const script = `require(${JSON.stringify(path.resolve(__dirname, '../dist/codex'))}).runCodexCapture(); process.exit(0);`;
-  const child = cp.spawn(process.execPath, ['-e', script], { env: process.env, stdio: ['pipe', 'pipe', 'pipe'] });
+  // OAK_HERDR_CHECK_MS: the report follows the pane check, and on a loaded runner the check's 400 ms probe did not reach
+  // the server, so no report was sent.
+  const child = cp.spawn(process.execPath, ['-e', script], { env: { ...process.env, OAK_HERDR_CHECK_MS: '10000' }, stdio: ['pipe', 'pipe', 'pipe'] });
   child.stdin.end(JSON.stringify(b.payload));
   let stdout = '', stderr = '';
   child.stdout.on('data', d => stdout += d); child.stderr.on('data', d => stderr += d);
