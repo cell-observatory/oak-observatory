@@ -28835,13 +28835,15 @@ test('notify: a permission prompt is posted only if it still stands after its gr
   cp.spawn = (file, args) => { calls.push({ file, args }); const { EventEmitter } = require('events'); const c = new EventEmitter(); c.unref = () => {}; return c; };
   t.after(() => { Object.defineProperty(process, 'platform', real); cp.spawn = spawn; process.env.PATH = savedPath; fs.rmSync(bin, { recursive: true, force: true }); });
   freshHome();
-  const young = Date.now() - core.PERMISSION_GRACE_MS + 200;
+  // The announces read the clock the prompts' ts came from, so 200 ms of grace are left however long the writes take.
+  const now = Date.now();
+  const young = now - core.PERMISSION_GRACE_MS + 200;
   const row = (id, title) => ({ id, title, agent: 'codex', attention: core.readAttention(id) });
   core.writeAttention('grace-approved', { kind: 'permission', message: 'apply_patch', ts: young });
   core.writeAttention('grace-standing', { kind: 'permission', message: 'apply_patch', ts: young });
   const later = [];
-  assert.equal(core.announceAttention(row('grace-approved', 'Approved'), Date.now(), (sent) => later.push(['approved', sent])), false, 'not at once');
-  assert.equal(core.announceAttention(row('grace-standing', 'Standing'), Date.now(), (sent) => later.push(['standing', sent])), false, 'not at once');
+  assert.equal(core.announceAttention(row('grace-approved', 'Approved'), now, (sent) => later.push(['approved', sent])), false, 'not at once');
+  assert.equal(core.announceAttention(row('grace-standing', 'Standing'), now, (sent) => later.push(['standing', sent])), false, 'not at once');
   assert.equal(calls.length, 0);
   core.clearAttention('grace-approved'); // the hook of the call Auto-review approved lowers the hand
   await new Promise((r) => setTimeout(r, 500));
@@ -29235,11 +29237,13 @@ test('notify: a permission prompt under Codex Auto-review waits AUTO_REVIEW_WAIT
   assert.equal(core.announceAttention(row('review-claude')), true, 'control: the person\'s prompt of the same age posts');
   core.clearAttention('review-past-grace'); // the approved call's result lowers it, so its timer posts nothing
   // Near the end of the wait: posted if it still stands (the reviewer handed it on), not if it came down.
-  const nearly = Date.now() - core.AUTO_REVIEW_WAIT_MS + 300;
+  // Announced on the clock `nearly` came from, so 300 ms of the wait are left however long the writes take.
+  const near = Date.now();
+  const nearly = near - core.AUTO_REVIEW_WAIT_MS + 300;
   core.writeAttention('review-due', { kind: 'permission', message: 'Bash', ts: nearly });
   core.writeAttention('review-answered', { kind: 'permission', message: 'Bash', ts: nearly });
-  assert.equal(core.announceAttention(row('review-due'), Date.now(), (sent) => later.push(['due', sent])), false);
-  assert.equal(core.announceAttention(row('review-answered'), Date.now(), (sent) => later.push(['answered', sent])), false);
+  assert.equal(core.announceAttention(row('review-due'), near, (sent) => later.push(['due', sent])), false);
+  assert.equal(core.announceAttention(row('review-answered'), near, (sent) => later.push(['answered', sent])), false);
   core.clearAttention('review-answered');
   await new Promise((r) => setTimeout(r, 700));
   assert.deepEqual(later.sort(), [['answered', false], ['due', true]]);
@@ -29260,14 +29264,16 @@ test('notify: the grace timer posts only the hand it was armed for (ts and kind)
   cp.spawn = (file, args) => { calls.push({ file, args }); const { EventEmitter } = require('events'); const c = new EventEmitter(); c.unref = () => {}; return c; };
   t.after(() => { Object.defineProperty(process, 'platform', real); cp.spawn = spawn; process.env.PATH = savedPath; fs.rmSync(bin, { recursive: true, force: true }); });
   freshHome();
-  const ts = Date.now() - core.PERMISSION_GRACE_MS + 300;
+  // The announces read the clock `ts` came from, so 300 ms of grace are left however long the writes take.
+  const now = Date.now();
+  const ts = now - core.PERMISSION_GRACE_MS + 300;
   const armed = { kind: 'permission', message: 'Bash', ts };
   core.writeAttention('still-newer', armed);
   core.writeAttention('still-kind', armed);
   assert.equal(core.handStillUp('still-newer', armed), true, 'control: the hand as armed');
   const later = [];
-  core.announceAttention({ id: 'still-newer', title: 'Newer', agent: 'claude', attention: armed }, Date.now(), (sent) => later.push(['newer', sent]));
-  core.announceAttention({ id: 'still-kind', title: 'Kind', agent: 'claude', attention: armed }, Date.now(), (sent) => later.push(['kind', sent]));
+  core.announceAttention({ id: 'still-newer', title: 'Newer', agent: 'claude', attention: armed }, now, (sent) => later.push(['newer', sent]));
+  core.announceAttention({ id: 'still-kind', title: 'Kind', agent: 'claude', attention: armed }, now, (sent) => later.push(['kind', sent]));
   core.clearAttention('still-newer');
   core.writeAttention('still-newer', { kind: 'permission', message: 'Bash', ts: ts + 1 }); // the next prompt, a moment later
   core.clearAttention('still-kind');
