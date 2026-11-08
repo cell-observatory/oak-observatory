@@ -187,7 +187,16 @@ const detachedGroups = new Set<number>();
  *  calls it, at exit or otherwise: VS Code runs core inside its extension host, where closing a window must
  *  not stop a prompt still being sent. */
 export function stopDetachedChildren(): void {
-  for (const pid of detachedGroups) {
+  const groups = [...detachedGroups];
+  if (!groups.length) return;
+  for (const pid of groups) {
+    try { process.kill(-pid, 'SIGTERM'); } catch { /* the group has ended */ }
+  }
+  // On macOS a process a group's leader starts while that signal is being delivered can miss it, and runs on once the
+  // leader has ended: a herdr script's `sleep 30` outlived it on a CI run. Each group is signalled again 20 ms on, when it
+  // holds every process its leader started.
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+  for (const pid of groups) {
     try { process.kill(-pid, 'SIGTERM'); } catch { /* the group has ended */ }
   }
 }
