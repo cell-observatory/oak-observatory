@@ -852,7 +852,8 @@ test('herdr tab sync: the capture bundle itself starts the sync and returns at o
   fs.writeFileSync(path.join(codexHome, 'session_index.jsonl'), rec({ id: X, thread_name: 'Bundle thread', updated_at: '2026-01-01' }));
   herdr.snapshot = homeSnap([tab(1, '1'), tab(2, '2')], [pane(1, 1), pane(2, 2)], [agent(1, S, 'w1', 'claude'), agent(2, X, 'w1', 'codex')]);
   // OAK_NO_BACKGROUND cleared: the detached sync is what this test runs, and it waits for each one to finish.
-  const env = pane => ({ ...process.env, CODEX_HOME: codexHome, HERDR_PANE_ID: pane, HERDR_SOCKET_PATH: herdr.socketPath, HERDR_BIN_PATH: herdr.binary, OAK_NO_BACKGROUND: '' });
+  // OAK_HERDR_CHECK_MS: the hook's pane check must succeed here, and on a loaded runner its 400 ms probe did not start in time.
+  const env = pane => ({ ...process.env, CODEX_HOME: codexHome, HERDR_PANE_ID: pane, HERDR_SOCKET_PATH: herdr.socketPath, HERDR_BIN_PATH: herdr.binary, OAK_NO_BACKGROUND: '', OAK_HERDR_CHECK_MS: '10000' });
   // Keep this server's event loop free for the hook's bounded membership check.
   const hook = async (args, pane, payload) => {
     hookClosed = Promise.withResolvers();
@@ -921,7 +922,9 @@ function codexPane(t, herdr, threads) {
     fs.writeFileSync(rollouts[id], rec({ type: 'session_meta', timestamp: '2026-01-01T00:00:00Z', payload: { id, cwd: codexHome, source: 'cli' } }));
     fs.appendFileSync(path.join(codexHome, 'session_index.jsonl'), rec({ id, thread_name: name, updated_at: '2026-01-01' }));
   }
-  const env = { ...process.env, CODEX_HOME: codexHome, HERDR_PANE_ID: 'w1:p3', HERDR_SOCKET_PATH: herdr.socketPath, HERDR_BIN_PATH: herdr.binary, OAK_NO_BACKGROUND: '' };
+  // OAK_HERDR_CHECK_MS: these hooks' pane checks and identity reports must succeed (on a loaded runner their 400 ms
+  // probe and 500 ms report did not always).
+  const env = { ...process.env, CODEX_HOME: codexHome, HERDR_PANE_ID: 'w1:p3', HERDR_SOCKET_PATH: herdr.socketPath, HERDR_BIN_PATH: herdr.binary, OAK_NO_BACKGROUND: '', OAK_HERDR_CHECK_MS: '10000' };
   delete env.CODEX_THREAD_ID;
   // Asynchronously: the hook's identity report waits for the scripted herdr, which answers from this process.
   const hook = payload => {

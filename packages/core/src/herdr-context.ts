@@ -7,7 +7,13 @@ import type { Check } from './diagnose';
  *  never cached, so the next check decides. */
 export interface HerdrPaneContext { nested: boolean; stale: boolean; unknown?: boolean; paneId?: string; socketPath?: string }
 const outside: HerdrPaneContext = { nested: false, stale: false };
-const budget = 400;
+/** The pane check's bounds, and a Codex hook's identity report's (herdr-link.ts), are short: a capture hook waits on
+ *  them. OAK_HERDR_CHECK_MS replaces each of them, for the test suite on a loaded machine, where the probe's own Node
+ *  start can outlast 400 ms and a test that needs the check to succeed would fail. */
+export function herdrCheckMs(ms: number): number {
+  const set = Number(process.env.OAK_HERDR_CHECK_MS);
+  return set > 0 ? set : ms;
+}
 const decisions = new Map<string, HerdrPaneContext>();
 const pending = new Map<string, Promise<HerdrPaneContext>>();
 const keyFor = (pane: string, socket: string): string => JSON.stringify([pane, socket]);
@@ -64,9 +70,9 @@ export function herdrPaneContext(env: NodeJS.ProcessEnv = process.env): Promise<
   if (cached) return Promise.resolve(cached);
   const running = pending.get(key);
   if (running) return running;
-  const request = herdrRequest('pane.process_info', { pane_id: pane }, { socketPath: socket, timeoutMs: budget })
+  const request = herdrRequest('pane.process_info', { pane_id: pane }, { socketPath: socket, timeoutMs: herdrCheckMs(400) })
     // Off the first paint, so the process-table read can take a loaded machine's second.
-    .then(result => answer(pane, socket, result, 1000)).catch(failed).then(result => {
+    .then(result => answer(pane, socket, result, herdrCheckMs(1000))).catch(failed).then(result => {
       // A synchronous hook may have had to settle the same context while this request was pending.
       if (!decisions.has(key) && !result.unknown) decisions.set(key, result);
       pending.delete(key);
@@ -101,11 +107,11 @@ export function herdrPaneContextSync(env: NodeJS.ProcessEnv = process.env): Herd
   let result = outside;
   try {
     const child = spawnToolSync(process.execPath, ['-e', probe, herdrConnectPath(env), pane], {
-      encoding: 'utf8', timeout: budget, killSignal: 'SIGKILL', maxBuffer: 1024 * 1024, direct: true,
+      encoding: 'utf8', timeout: herdrCheckMs(400), killSignal: 'SIGKILL', maxBuffer: 1024 * 1024, direct: true,
     });
     if (child.status === 0 && !child.error) {
       const reply = JSON.parse(String(child.stdout));
-      if (reply.id === 'oak-pane') result = reply.error ? failed(reply.error) : answer(pane, socket, reply.result, 100);
+      if (reply.id === 'oak-pane') result = reply.error ? failed(reply.error) : answer(pane, socket, reply.result, herdrCheckMs(100));
     }
   } catch { /* Unknown is outside, silently. */ }
   if (!result.unknown) decisions.set(key, result);

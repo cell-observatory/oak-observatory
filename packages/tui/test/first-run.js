@@ -23,7 +23,9 @@ for (const scenario of ['valid', 'tty', 'tty-retry', 'stale', 'foreign', 'timeou
     const ps = spawnSync('sh', ['-c', 'command -v ps'], { encoding: 'utf8' }).stdout.trim();
     fs.writeFileSync(path.join(home, 'ps'), `#!/bin/sh\nif [ "$*" = "-axo pid=,ppid=,tty=" ] && [ ! -e "$HOME/ps-failed" ]; then : > "$HOME/ps-failed"; exit 1; fi\nexec ${ps} "$@"\n`, { mode: 0o755 });
   }
-  fs.writeFileSync(binary, '#!/bin/sh\nif [ "$1" = "--version" ]; then echo "herdr 0.9.1"; exit; fi\nif [ "$#" != 0 ]; then echo "[]"; exit; fi\nprintf "%s|%s|%s|%s" "$HERDR_PANE_ID" "$HERDR_TAB_ID" "$HERDR_WORKSPACE_ID" "$HERDR_ENV" > "$PANE_CLIENT_LOG"\nwhile IFS= read -r line; do :; done\n', { mode: 0o755 });
+  // The client's marker appears whole (written aside, then renamed): the test waits for it to exist, and once read a
+  // file the shell had made but not yet written, on a loaded runner.
+  fs.writeFileSync(binary, '#!/bin/sh\nif [ "$1" = "--version" ]; then echo "herdr 0.9.1"; exit; fi\nif [ "$#" != 0 ]; then echo "[]"; exit; fi\nprintf "%s|%s|%s|%s" "$HERDR_PANE_ID" "$HERDR_TAB_ID" "$HERDR_WORKSPACE_ID" "$HERDR_ENV" > "$PANE_CLIENT_LOG.part" && mv "$PANE_CLIENT_LOG.part" "$PANE_CLIENT_LOG"\nwhile IFS= read -r line; do :; done\n', { mode: 0o755 });
   const env = { ...process.env, HOME: home, USERPROFILE: home, CLAUDE_CONFIG_DIR: path.join(home, 'claude'), CODEX_HOME: path.join(home, 'codex'),
     XDG_CONFIG_HOME: path.join(home, 'config'), HERDR_SOCKET_PATH: server.socketPath, HERDR_PANE_ID: 'w1:p1', HERDR_TAB_ID: 'w1:t1', HERDR_WORKSPACE_ID: 'w1', HERDR_ENV: '1',
     HERDR_BIN_PATH: binary, PATH: home + path.delimiter + process.env.PATH, PANE_CLIENT_LOG: marker, OAK_NO_BACKGROUND: '1', OAK_NO_SERVER: '1', TERM: 'xterm-256color' };
@@ -348,6 +350,7 @@ test('a folder with no session: the Observatory lists every session, and Review 
     if (!pty || process.platform === 'win32') return;
     const term = new Terminal({ cols: 120, rows: 30, allowProposedApi: true });
     const child = pty.spawn(process.execPath, [CLI, 'tui', '--tab', 'observatory', '--tick', '3600'], { cols: 120, rows: 30, cwd: repo, env, name: 'xterm-256color' });
+    const exited = new Promise((resolve) => child.onExit(resolve));
     child.onData((d) => term.write(d));
     const screen = () => new Promise((resolve) => term.write('', () => {
       const b = term.buffer.active;
@@ -368,8 +371,14 @@ test('a folder with no session: the Observatory lists every session, and Review 
       child.write('\t');
       await until(/no session to review/);
       assert.match(await screen(), /no session to review — b picks one, or select one in the Observatory/);
-    } finally { child.kill(); }
+    } finally {
+      child.kill();
+      await Promise.race([exited, new Promise((r) => setTimeout(r, 5000))]);
+    }
   } finally {
-    fs.rmSync(home, { recursive: true, force: true });
+    // The home was removed while something still wrote in it once on a loaded runner (ENOTEMPTY), right after the kill
+    // and before the app had exited. Which process wrote is not known: the app writes nothing between the kill and its
+    // exit, even on a starved machine. The removal waits for the exit, and retries as keys-pty.js's does.
+    fs.rmSync(home, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
   }
 });
