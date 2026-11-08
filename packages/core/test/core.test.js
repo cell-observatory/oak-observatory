@@ -17511,7 +17511,9 @@ test('statusline: the vendored installer keeps the fixes a sync would silently d
   // THE SWEEP (2026-10-21): their temporary files and aside locks, more than two minutes old. Upstream leaves them.
   assert.match(sh, /^_sweep\(\) \{ local f t\n {2}for f in "\$_LAST"\.tmp\.\* "\$_LAST"\.lock\.\*\.\*; do$/m, 'the sweep must survive a sync');
   assert.match(sh, /^\[ -n "\$_lt" \] && printf '%s\\n%s' "\$_old" "\$input" \| jq -c -n /m, 'a render without it writes nothing');
-  assert.match(sh, /&& \[ -d "\$_LAST\.lock\/\$_lt" \] && mv "\$_LAST\.tmp\.\$\$" "\$_LAST"/, 'and one renames only while it still holds it');
+  assert.match(sh, /> "\$_LAST\.tmp\.\$\$" 2>\/dev\/null && _commit \|\| true$/m, 'and one renames only while it still holds it');
+  assert.match(sh, /^_commit\(\) \{ local s=\$SECONDS i\n {2}for \(\( i = 0; i < 50 && SECONDS - s < 2; i\+\+ \)\); do \[ -d "\$_LAST\.lock\/\$_lt" \] \|\| return 1\n {4}mv "\$_LAST\.tmp\.\$\$" "\$_LAST" 2>\/dev\/null && return 0;/m,
+    'checking before each try, which a reader with the cache open on Windows makes fail for a moment (2026-11-08)');
   // A new 5h window scans at once: the last scan's 5h reads were its own window's. Upstream waits for THR.
   assert.match(sh, /^_due = \(now - last\) >= THR or not st or \(r5 and s5 is not None and abs\(r5 - s5\) > 60\)$/m, 'a new 5h window must still scan at once after a sync');
   assert.match(sh, /^if _due or \(TOT and _hadfc\):$/m, 'and the totals are taken at the scan cadence, and by the render that drops a scan\'s file map');
@@ -23830,6 +23832,73 @@ test('usage: OAK\'s account pull writes the status line\'s cache under its lock,
     });
     both(`the pull holding the lock (${bash})`, i, w, await render);
   }
+});
+
+/** A program other than OAK with the status line's cache open, python, as a render's own reads of it outside the lock
+ *  are: from `opened` until 300 ms after a temporary file for the cache appears, or until `stop`. `done` says whether it
+ *  saw one. `refusesRename` tries a rename onto the cache meanwhile and gives its error code, or false when it worked. */
+function holdOpen(PATH, file) {
+  const py = PATH.split(path.delimiter).flatMap((d) => ['python3', 'python3.exe'].map((n) => path.join(d, n))).find((p) => fs.existsSync(p));
+  const code = ['import glob, sys, time', 'f = open(sys.argv[1])', 'print("open", flush=True)', 'saw = False', 'end = time.time() + 20',
+    'while time.time() < end:', '    if glob.glob(glob.escape(sys.argv[1]) + ".tmp.*"):', '        saw = True', '        time.sleep(0.3)',
+    '        break', '    time.sleep(0.002)', 'f.close()', 'print("saw" if saw else "none", flush=True)'].join('\n');
+  const p = cp.spawn(py, ['-c', code, file]);
+  let out = '';
+  const opened = new Promise((resolve, reject) => {
+    p.stdout.on('data', (d) => { out += d; if (out.includes('open')) resolve(); });
+    p.on('error', reject);
+    p.on('close', () => reject(new Error(`python ended before it opened the cache: ${out}`)));
+  });
+  const done = new Promise((resolve) => p.on('close', () => resolve(out.includes('saw'))));
+  const refusesRename = () => {
+    const c = `${file}-control`;
+    fs.copyFileSync(file, c);
+    try { fs.renameSync(c, file); return false; } catch (e) { return e.code; } finally { fs.rmSync(c, { force: true }); }
+  };
+  return { opened, done, refusesRename, stop: () => p.kill() };
+}
+
+test('statusline: a render whose cache another program has open renames its write once that program lets go (2026-11-08)', async (t) => {
+  // On Windows a rename onto a file another program has open fails, and a render reads the cache with jq or python
+  // outside the lock: a render that renamed while another read the cache lost its write, and the next render wrote over
+  // it from the cache before it (a Windows run of "two renders started together"). A render now tries its rename again,
+  // for about a second, while its token is in the lock. On Linux and macOS a rename onto an open file works, so only
+  // Windows tests the retry here; there, the controls show the held cache refuses a rename and python saw the write wait.
+  const rig = quotaLineRig();
+  if (!rig) return t.skip('python3 or jq is not installed');
+  const f = lockFixture(rig);
+  f.reset();
+  const hold = holdOpen(rig.env.PATH, path.join(rig.cdir, 'statusline-last.json'));
+  await hold.opened;
+  if (process.platform === 'win32') assert.ok(hold.refusesRename(), 'control: the open cache refuses a rename');
+  const r = await startRender(rig, f.session('held', 10, 25, 50, 2.5));
+  hold.stop();
+  const saw = await hold.done;
+  assert.equal(r.code, 0);
+  if (process.platform === 'win32') assert.equal(saw, true, 'control: the render\'s write waited for python');
+  const after = f.read();
+  assert.deepEqual([after.five_pct, after.five_at, after.costs.held?.usd, after.costs.kept?.usd], [25, f.now - 10, 2.5, 9], 'the render\'s reading and spend stand');
+  assert.deepEqual(fs.readdirSync(rig.cdir).filter((n) => /\.(tmp|lock)/.test(n)), [], 'no lock or temporary file is left');
+});
+
+test('usage: the account pull renames its write once a program that has the cache open lets go (2026-11-08)', async (t) => {
+  // The pull's rename is the render's, in Node: on Windows it threw EPERM while a render read the cache. It is tried
+  // again as the render's is (statusline-lock.ts).
+  const rig = quotaLineRig();
+  if (!rig) return t.skip('python3 or jq is not installed');
+  const f = lockFixture(rig);
+  f.reset();
+  const pull = pullWriter(f);
+  const hold = holdOpen(rig.env.PATH, path.join(rig.cdir, 'statusline-last.json'));
+  await hold.opened;
+  if (process.platform === 'win32') assert.ok(hold.refusesRename(), 'control: the open cache refuses a rename');
+  let w;
+  try { w = await pull.write(pull.merge(7)); } finally { hold.stop(); }
+  const saw = await hold.done;
+  assert.equal(w, 'written');
+  if (process.platform === 'win32') assert.equal(saw, true, 'control: the pull\'s write waited for python');
+  assert.deepEqual([f.read().fable_pct, f.read().costs.kept?.usd], [7, 9], 'the pull\'s share stands, and the cache it merged into');
+  assert.deepEqual(fs.readdirSync(rig.cdir).filter((n) => /\.(tmp|lock)/.test(n)), [], 'no lock or temporary file is left');
 });
 
 test('usage: OAK\'s account pull waits about a second for a held cache lock without blocking, then writes nothing (2026-10-22)', async () => {
