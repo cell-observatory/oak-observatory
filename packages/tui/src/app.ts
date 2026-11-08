@@ -13,16 +13,19 @@
  */
 import { chromeBottom } from './layout';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
+import { isatty, ReadStream } from 'tty';
+import { StringDecoder } from 'string_decoder';
 import { createNativeInput, translateNativeMouse, type NativeInputPart, type NativeKeyEvent } from './native-input';
 import { routeNativeHostReply } from './native';
-import { selectAndPin, observatoryReply, observatorySelection, sessionMachine, listedMachine, newestAnywhere, pickerSessionRows, type ObservatorySelection } from './observatory';
+import { selectAndPin, observatoryReply, observatorySelection, observatorySessions, hasActiveWorker, sessionMachine, listedMachine, newestAnywhere, pickerSessionRows, syncConflictResolution, syncInUse, type ObservatorySelection, type SyncView } from './observatory';
 import { createObservatory } from './observatory-runtime';
-import { commentAnchor } from './richdiff';
+import { commentAnchor, firstChangedLine } from './richdiff';
 // helpLines() is module-level so a test can read it; it cannot reach the `core` handle the app is
 // constructed with, so it takes the keymap straight from the settings layer.
-import { keymap as coreKeymap } from '@oak-observatory/core';
-import { fuzzyMatch } from './textwidth';
+import { keymap as coreKeymap, herdrPrefixFrom, OAK_TAB_KEYS, type OakPrefixKey, type OakTabKey } from '@oak-observatory/core';
+import { fuzzyMatch, wrapVisible } from './textwidth';
 import { pointerSeq, pointerForTreeHit, pointerForDockHit, dropZone, type PointerShape } from './pointer';
 // The rendering half of this package. `core` stays a PARAMETER — it is the data layer, and
 // injecting it is what lets the app be driven against a fixture store in tests.
@@ -30,6 +33,8 @@ import {
   BAR_ENTRIES,
   PANE_SPECS,
   TAB_SCREEN,
+  APP_PREF_KEYS,
+  type AppPrefKey,
   applyOption,
   buildMapTree,
   OUTSIDE,
@@ -57,6 +62,7 @@ import {
   MAP_DECOR,
   mapRows,
   optionRows,
+  optionRowLines,
   paneListRows,
   paneRowCount,
   paneScreenOf,
@@ -69,8 +75,11 @@ import {
   renderRichDiff,
   reverseVisibleSpan,
   rowsFor,
-  sliceSpan,
+  selectedText,
+  charCount,
   spanCols,
+  spanEnds,
+  stripSgr,
   type SpanClip,
   stepReviewId,
   selectableRows,
@@ -94,6 +103,8 @@ import {
   treeReclaimsRow,
   tabLabel,
   tabParts,
+  TAB_KEYS,
+  herdrPrefixHints,
   resolveTree,
   resolveZoomedTree,
   hitTreeBody,
@@ -113,6 +124,8 @@ import {
   nativeAvailable,
   spawnNative,
   spawnCwd,
+  overlayListRows,
+  overlayScroll,
 } from './index';
 import type {
   Layout,
@@ -189,7 +202,12 @@ const MOUSE_ON = '\x1b[?1003h\x1b[?1006h';
 const MOUSE_OFF = '\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l';
 const FOCUS_ON = '\x1b[?1004h';
 const FOCUS_OFF = '\x1b[?1004l';
+/** The focus server's reconnect: the first wait after a disconnect, and the longest a run of failures doubles it to. */
+const FOCUS_RETRY_MS = 3_000;
+const FOCUS_RETRY_MAX_MS = 60_000;
 /** The keys a reader HOLDS DOWN — movement, and the two that edit text. See `repeatActs`. */
+/** The rebindable verbs the Observatory answers too, with the meaning they have on Review. */
+const OBSERVATORY_SHARED: ReadonlySet<string> = new Set(['help', 'options', 'filter', 'session', 'inbox', 'nextHand', 'refresh']);
 const HELD_KEYS = new Set(['up', 'down', 'left', 'right', 'pgup', 'pgdn', 'home', 'end', 'tab', 'backtab', 'backspace', 'delete']);
 /** The two overlays whose rows answer a choice: the right-click row menu and `P`'s go-to-file list. Their state
  *  (`rowMenu`, `jumpRows`) acts only while that overlay is the one open: a command's answer that replaced the
@@ -228,6 +246,8 @@ function viewsForLayoutOf(core: Core, lay: Layout): string[] {
 
 export function runTui(core: Core, args: string[], resolveSession: (a: string[]) => string | { session: string; elsewhere: boolean }): void {
   const flag = (name: string): string | null => {
+    const inline = args.find((a) => a.startsWith(name + '=')); // `--root=dir`, as the CLI reads it
+    if (inline !== undefined) return inline.slice(name.length + 1) || null;
     const i = args.indexOf(name);
     return i >= 0 && args[i + 1] ? args[i + 1] : null;
   };
@@ -268,6 +288,9 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
   /** The frame as last painted — what drag-to-copy extracts from, so the copied text is exactly
    *  what was on screen when the reader selected it. */
   let lastPainted: string[] = [];
+  /** Where that frame's bottom rows begin (the status row when it speaks, else the usage bar) and its status text
+   *  whole, which the row cuts at the terminal's edge (FrameOpts.bottom). Null under an overlay. */
+  let lastBottom: { first: number; status: string } | null = null;
   /** An armed text selection: a left press on a body cell that may become a drag-to-copy. Columns
    *  ride along because the copy is CHARACTER-precise — the span runs cell to cell, like the
    *  terminal's own selection, not row to row. On a tree tab (the Observatory) the selection is held
@@ -277,14 +300,45 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
   let textDrag: {
     startRow: number; lastRow: number; startCol: number; lastCol: number; moved: boolean;
     clip?: { x0: number; x1: number; y0: number; y1: number }; click?: () => void; pane?: string;
+    /** On the bottom rows, which move when the status row comes or goes. */
+    bottom?: true;
   } | null = null;
-  /** A drag's span, normalized so `a` precedes `b` — ONE implementation for the live-drag paint
-   *  and the kept selection (two inline copies of the direction ternary had already crept in). */
-  const normSpan = (td: { startRow: number; startCol: number; lastRow: number; lastCol: number }) => {
-    const fwd = td.startRow < td.lastRow || (td.startRow === td.lastRow && td.startCol <= td.lastCol);
-    return fwd
-      ? { a: { row: td.startRow, col: td.startCol }, b: { row: td.lastRow, col: td.lastCol } }
-      : { a: { row: td.lastRow, col: td.lastCol }, b: { row: td.startRow, col: td.startCol } };
+  /** Who has the mouse button pressed last, until its release: OAK (its tab bar, the rows under a native tab's
+   *  screen, and every other tab) or the program on a native tab. Its motion and its release go there. */
+  let buttonHeld: 'oak' | 'program' | null = null;
+  /** Where the program last had the button it holds: its press's code and the cell, in the program's own rows. */
+  let programAt: { code: number; col: number; row: number } | null = null;
+  /** The button let go in the program while still down (letProgramGo): until it comes up, its motion and release are
+   *  no one's, so the program never sees a drag after its release. A press of that button ends it (its release was
+   *  lost), and so does motion with no button held; another button's press does not. */
+  let programLetGo: number | null = null;
+  /** Send the program a mouse report, keeping where its held button is. */
+  const toProgram = (sess: NativeSession, bytes: Buffer): void => {
+    sess.write(bytes);
+    const r = /\x1b\[<(\d+);(\d+);(\d+)([Mm])/.exec(bytes.toString('latin1'));
+    if (!r) return;
+    const code = Number(r[1]), at = { col: Number(r[2]), row: Number(r[3]) };
+    if (r[4] === 'm' || (code & 35) === 35) programAt = null; // its release, or motion with no button held
+    else if (!(code & 96)) programAt = { code, ...at }; // a press
+    else if (programAt && !(code & 64)) programAt = { ...programAt, ...at }; // the held button's motion
+  };
+  /** The program's held button let go where it last was: the reader left its tab, or pressed on OAK's rows or tab bar,
+   *  with the button still down. herdr kept such a selection up, and a program reading the mouse its button down. */
+  const letProgramGo = (sess: NativeSession | undefined): void => {
+    if (programAt && sess && !sess.ended) sess.write(Buffer.from(`\x1b[<${programAt.code};${programAt.col};${programAt.row}m`));
+    programLetGo = programAt ? programAt.code & 3 : null;
+    programAt = null;
+  };
+  /** A drag's span, normalized so `a` precedes `b` (spanEnds, which the copy reads too): the live-drag paint and the
+   *  kept selection. */
+  const normSpan = (td: { startRow: number; startCol: number; lastRow: number; lastCol: number }) =>
+    spanEnds({ row: td.startRow, col: td.startCol }, { row: td.lastRow, col: td.lastCol });
+  /** What the status row says while a drag on a dock tab selects (onMouse). It goes when the drag ends, however it
+   *  ends: it stood beside the toast that said what was copied. */
+  const SELECTING = 'selecting — release to copy';
+  const endTextDrag = (): void => {
+    textDrag = null;
+    if (state.status === SELECTING) state.status = 'ready';
   };
   /** A drag's clip with, in a tree pane, the rows it draws now that hold text in only some of their
    *  cells: ONE reading for the band and the copy. */
@@ -312,6 +366,12 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
    *  the same rule). */
   const reviewNewestAnywhere = !flag('--session') && !flag('--root') && !process.env.CLAUDE_OBSERVATORY_SESSION
     && !process.env.CLAUDE_CHANGES_SESSION && !core.repoRoot(cwd);
+  /** With no session to review (a first run, or a workspace with none of its own), what the status and the Review panes
+   *  say. The Observatory lists every session all the same; in a workspace (a repository, or --root), other workspaces'
+   *  sessions may be there. */
+  const noSessionStatus = (): string =>
+    `no agent session${flag('--root') || core.repoRoot(cwd) ? ' in this workspace' : ''} yet — start one in the herdr tab; the Observatory lists every session`;
+  const noSessionReview = (): string => `no session to review — ${keyForAction('session')} picks one, or select one in the Observatory`;
 
   /**
    * The ONE place a layout request is built.
@@ -338,9 +398,24 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
       tab: state.panes!.tab,
       sizes: state.panes!.sizes,
       tabs: tabs.map((t, i) => tabLabel(t, i, glyphs)),
+      tabNames: tabs.map((t, i) => tabParts(t, i, glyphs).body),
       activeTab: active,
       ...over,
     };
+  }
+
+  /** Save the keys `sets` names (APP_PREF_KEYS) as `next` has them, over prefs.json as it is now, so every other key
+   *  stays as the file has it. Written whole, the copy read at start undid what the file was given while the app ran,
+   *  at the next tab switch: a switch turned off (`oak titles --off`, `"machineUsage": false`) came back on, and a
+   *  store `oak store --move` moved was looked for where it had been. */
+  function writeOwn(next: import('@oak-observatory/core').Prefs, sets: readonly AppPrefKey[]): void {
+    // A file that does not parse (a hand edit half done) is left as it is: `writePrefs` refuses it, and the caller says so.
+    const now = core.readPrefs();
+    for (const k of sets) {
+      if (next[k] === undefined) delete now[k];
+      else Object.assign(now, { [k]: next[k] });
+    }
+    core.writePrefs(now);
   }
 
   /**
@@ -368,7 +443,7 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
         };
       }
       prefs = { ...prefs, layout: { version: core.LAYOUT_VERSION, active: tabs[active].id, tabs: out } };
-      core.writePrefs(prefs);
+      writeOwn(prefs, ['layout']);
     } catch (e) {
       state.status = `layout not saved: ${(e as Error).message}`;
     }
@@ -414,6 +489,20 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
     }
   }
 
+  /** herdr's prefix, pressed on the herdr tab and held back from the client until the next key says whose
+   *  it is: OAK's (`m`, `M`, when herdr leaves them unbound) or herdr's, which then gets both unchanged. */
+  let prefixHeld: Buffer | null = null;
+  /** A ctrl+q pressed on the herdr tab, held while it may be the first of OAK's quit: a second one quits, and
+   *  anything else the reader does there sends it on to the program first, as the quit window ending does. */
+  let quitHeld: { bytes: Buffer; timer: NodeJS.Timeout } | null = null;
+  const dropQuitHeld = (): void => {
+    if (quitHeld) clearTimeout(quitHeld.timer);
+    quitHeld = null;
+  };
+  /** The OAK tab (not herdr's) the reader was last on: herdr's prefix then `m` goes back to it. */
+  let lastOakTab = -1;
+  /** Each tab's `/` filter while another tab is up, by tab id. */
+  const tabFilters = new Map<string, string>();
   /**
    * Switch tabs. The workspace comes with it — each tab keeps its own minimize set, focus, dragged
    * sizes, cursors and scroll, so returning to a tab finds it exactly as it was left.
@@ -426,7 +515,7 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
   function switchTab(i: number): void {
     if (i === active || i < 0 || i >= tabs.length) return;
     if (state.confirm) {
-      state.status = 'answer the pending keep/undo first — y or n';
+      state.status = 'answer the pending question first — y or n';
       return schedulePaint();
     }
     if (tabs[i].id === 'herdr') {
@@ -434,7 +523,24 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
       const old = nativeSessions.get('herdr');
       if (old?.ended) { nativeSessions.delete('herdr'); old.close(); }
     }
+    // A button still down: the program holding it gets its release where it last had it, and the rest of that gesture
+    // is OAK's, which takes nothing from it. OAK's own selection ends here, held or kept: let go, or copied again with
+    // ctrl+c, on the next tab, it took that tab's text.
+    if (buttonHeld === 'program') letProgramGo(nativeSessions.get(tabs[active]?.id));
+    if (buttonHeld) buttonHeld = 'oak';
+    endTextDrag();
+    state.selSpan = null;
     nativeSessions.get(tabs[active]?.id)?.setHostActive?.(false);
+    // The `/` filter belongs to the tab it was typed on: one typed on the Observatory narrowed Review's
+    // lists too. A filter still being typed ends with the switch (its key row would sit on another tab).
+    tabFilters.set(tabs[active]?.id ?? '', state.filter);
+    prefixHeld = null; // a prefix held for herdr is not carried to another tab or a new client
+    dropQuitHeld(); // nor is a ctrl+q held there: OAK's quit stays armed, and the program left never gets it
+    filterOpen = false;
+    state.filterOpen = false;
+    state.filter = tabFilters.get(tabs[i].id) ?? '';
+    // The OAK tab being left, the one the app opened on included: herdr's prefix then `m` returns to it.
+    if (tabs[active]?.kind !== 'native') lastOakTab = active;
     state.activeTab = i;
     nativeSessions.get(tabs[active]?.id)?.setHostActive?.(true, [2004, 1004, ...(mouse ? [1003, 1006] : [])]);
     state.hoverTab = null;
@@ -471,13 +577,22 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
     schedulePaint();
   }
 
+  /**
+   * ONE RULE for the list overlays (the inbox, search results, the view picker, the help, the row menu):
+   * ↑↓ or j/k move, Enter chooses, Esc or q closes, and every other key is swallowed. Some closed on any
+   * other key, j and k included, and the options window ignored q. The overlays that TYPE (the palette,
+   * the session picker, the help's own filter) close on Esc only, since q is text there.
+   */
+  const listKey = <E extends { key: string; ctrl?: boolean; alt?: boolean }>(ev: E): E =>
+    ev.ctrl || ev.alt ? { ...ev, key: '' } : ev.key === 'j' ? { ...ev, key: 'down' } : ev.key === 'k' ? { ...ev, key: 'up' } : ev;
+
   // ---- Needs you: the raised-hand inbox and the next-hand jump ----
   // The hooks record what every session waits on (attention.json); the sessions payload carries it as
   // `attention`. `i` lists every hand, most urgent first; `h` jumps to the next one; a new hand toasts
   // once (keyed by its ts, the editors' rule) and asks core to announce it on the desktop — core's
   // claim file makes that fire once per machine however many surfaces are open.
   type HandKind = import('@oak-observatory/core').HandKind;
-  type HandRowLite = { id: string; title?: string; agent?: string; attention: { kind: HandKind; message: string; ts: number } };
+  type HandRowLite = { id: string; title?: string; agent?: string; attention: { kind: HandKind; message: string; ts: number }; host?: string; machine?: string };
   let inboxOpen = false;
   let inboxIds: string[] = [];
   let inboxCursor = 0;
@@ -488,19 +603,66 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
     return '?';
   };
   function handRows(): HandRowLite[] {
-    const rows = ((state.views?.sessions as { sessions?: unknown[] } | undefined)?.sessions ?? []) as { id: string; attention: { kind: HandKind; message: string; ts: number } | null }[];
-    return core.rankedHands(rows, true) as unknown as HandRowLite[];
+    const listing = state.views?.sessions as { sessions?: unknown[]; syncedHands?: unknown[] } | undefined;
+    const rows = (listing?.sessions ?? []) as { id: string; attention: { kind: HandKind; message: string; ts: number } | null }[];
+    // Other machines' hands, as the listing carries them from their records, each on the machine it waits on.
+    return [...core.rankedHands(rows, true) as unknown as HandRowLite[], ...syncedHandRows(listing?.syncedHands)].sort((a, b) => core.byHand(a.attention, b.attention));
   }
+  /** The listing's `syncedHands` (core InboxRow) as hand rows. */
+  function syncedHandRows(list: unknown): HandRowLite[] {
+    return (Array.isArray(list) ? list as import('@oak-observatory/core').InboxRow[] : []).filter((h) => typeof h?.id === 'string' && typeof h.host === 'string' && typeof h.ts === 'number')
+      .map((h) => ({ id: h.id, title: h.title ?? undefined, agent: h.agent, attention: { kind: h.kind, message: h.message, ts: h.ts }, host: h.host, machine: h.machine }));
+  }
+  /** A hand row's key in the inbox: its session, and another machine's with that machine (an id can repeat across them). */
+  const handKey = (r: HandRowLite): string => (r.host ? `${r.id}@${r.host}` : r.id);
+
+  // ---- oak sync: what its last run left, for the Observatory's machine rows, the inbox and the options ----
+  // `oak sync status --json`, read at start and then only when one of sync's own files moved (its status, conflicts, run
+  // lock and key, and prefs.json) or the day changed (its clock times then carry the date): five stats on each poll, and
+  // a child only when the stamp moved.
+  let syncStamp = '';
+  let syncReading = false;
+  function readSyncStatus(force = false): void {
+    if (syncReading || !backend) return;
+    const dir = path.join(core.rootDir(), 'sync');
+    const stamp = [path.join(dir, 'status.json'), path.join(dir, 'conflicts.json'), path.join(dir, 'now.lock'), path.join(dir, 'key'), core.prefsPath()].map((f) => {
+      try {
+        const st = fs.statSync(f);
+        return `${st.mtimeMs}:${st.size}`;
+      } catch {
+        return '-';
+      }
+    }).join('|') + `|${new Date().toDateString()}`;
+    if (!force && stamp === syncStamp) return;
+    syncStamp = stamp;
+    syncReading = true;
+    void backend.run(['sync', 'status', '--json'], undefined, { timeoutMs: 30_000 }).then((out) => {
+      const v = JSON.parse(out) as SyncView;
+      if (v?.syncStatus !== 1) return;
+      state.sync = v;
+      if (inboxOpen) renderInbox();
+      schedulePaint();
+    }).catch(() => { /* an older CLI, or an answer that is not JSON: what was read before stands */ }).finally(() => { syncReading = false; });
+  }
+  /** The inbox's id for one of oak sync's open conflicts: no session id has a colon. */
+  const SYNC_ROW = 'sync:';
+  /** The sync conflict the inbox opened (its id), and which of its two ways out the cursor is on. */
+  let conflictOpen: string | null = null;
+  let conflictCursor = 0;
+
   function renderInbox(): void {
+    if (conflictOpen !== null) return renderConflict();
     const rows = handRows();
-    inboxIds = rows.map((r) => r.id);
-    if (!rows.length) {
+    // oak sync's open conflicts follow the hands: a hand is an agent waiting now.
+    const conflicts = syncInUse(state.sync) ? state.sync.conflicts : [];
+    inboxIds = [...rows.map(handKey), ...conflicts.map((c) => `${SYNC_ROW}${c.id}`)];
+    if (!inboxIds.length) {
       inboxOpen = false;
       state.overlay = null;
       state.status = 'nobody is waiting on you';
       return schedulePaint();
     }
-    inboxCursor = Math.min(inboxCursor, rows.length - 1);
+    inboxCursor = Math.min(inboxCursor, inboxIds.length - 1);
     const now = Date.now();
     const lines = rows.map((r, i) => {
       const a = r.attention;
@@ -508,22 +670,99 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
       const wait = done ? '' : ` · ${core.compactDuration(Math.max(0, now - a.ts))}`;
       const who = r.agent && r.agent !== 'claude' ? `[${r.agent}] ` : '';
       const name = r.title || `session ${r.id.slice(0, 8)}`;
-      return `${i === inboxCursor ? '> ' : '  '}${done ? '  ' : `${glyphs.pending} `}${(done ? 'done' : a.kind).padEnd(10)} ${who}${name}${a.message ? ` — ${a.message}` : ''}${wait}`;
+      // Another machine's hand says which: Enter opens it there.
+      const where = r.host ? ` · on ${r.machine || r.host}` : '';
+      return `${i === inboxCursor ? '> ' : '  '}${done ? '  ' : `${glyphs.pending} `}${(done ? 'done' : a.kind).padEnd(10)} ${who}${name}${a.message ? ` — ${a.message}` : ''}${wait}${where}`;
     });
+    conflicts.forEach((c, j) => lines.push(`${rows.length + j === inboxCursor ? '> ' : '  '}${glyphs.pending} ${'conflict'.padEnd(10)} ${c.family} ${c.name} from ${c.from} — ${syncConflictResolution(c.reason)}`));
     const waiting = rows.filter((r) => r.attention.kind !== 'idle-done').length;
-    state.overlay = { title: `needs you — ${waiting} waiting · ↑↓ choose · ↵ open · esc`, lines, scroll: 0, cursor: inboxCursor };
+    const syncing = conflicts.length ? ` · ${conflicts.length} sync conflict${conflicts.length === 1 ? '' : 's'}` : '';
+    state.overlay = { title: `needs you — ${waiting} waiting${syncing} · ↑↓ choose · ↵ open · esc`, lines, scroll: 0, cursor: inboxCursor };
     schedulePaint();
+  }
+  /** One open conflict, chosen in the inbox: its two copies and the two ways out `oak inbox` names, open both copies in
+   *  the reader's editor, or delete the other machine's copy so this machine's stands (`oak sync resolve`). */
+  function renderConflict(): void {
+    const c = state.sync?.conflicts.find((x) => x.id === conflictOpen);
+    if (!c) {
+      conflictOpen = null;
+      state.status = 'that conflict is resolved';
+      return renderInbox();
+    }
+    const choices = ['open both copies in your editor', `delete ${c.from}'s copy, so yours stands`];
+    state.overlay = {
+      title: 'sync conflict — ↑↓ choose · ↵ do it · esc back',
+      lines: [
+        ...choices.map((t, i) => `${i === conflictCursor ? '> ' : '  '}${t}`),
+        '',
+        `  ${c.family} ${c.name}, from ${c.from} (${c.reason}): ${syncConflictResolution(c.reason)}`,
+        `  yours: ${c.file ?? 'not where sync reaches it here'}`,
+        `  ${c.from}'s copy: ${c.copy}`,
+      ],
+      scroll: 0,
+      cursor: conflictCursor,
+    };
+    schedulePaint();
+  }
+  function conflictKey(ev: { key: string }): void {
+    if (ev.key === 'down' || ev.key === 'up') {
+      conflictCursor = ev.key === 'down' ? 1 : 0;
+      return renderConflict();
+    }
+    if (ev.key === 'enter') {
+      const c = state.sync?.conflicts.find((x) => x.id === conflictOpen);
+      if (!c) return renderConflict();
+      inboxOpen = false;
+      conflictOpen = null;
+      state.overlay = null;
+      if (conflictCursor === 0) {
+        // The copy deleted by hand since the last run is a conflict resolved, which the next run closes.
+        if (!fs.existsSync(c.copy)) {
+          state.status = `${c.from}'s copy of ${c.name} is gone: the conflict is resolved`;
+          readSyncStatus(true);
+          return schedulePaint();
+        }
+        return openInEditorHere([c.file, c.copy].filter((f): f is string => !!f));
+      }
+      state.confirm = { verb: 'keep yours', ids: [], conflict: c.id, label: `delete ${c.from}'s copy of ${c.family} ${c.name} (it goes to sync's trash)` };
+      return schedulePaint();
+    }
+    if (ev.key !== 'escape' && ev.key !== 'q') return;
+    conflictOpen = null;
+    renderInbox();
+  }
+  /** `oak sync resolve`: the other machine's copy goes to sync's trash, this machine's file stands, and the conflict
+   *  closes at once. */
+  function applySyncResolve(id: string): void {
+    const c = state.sync?.conflicts.find((x) => x.id === id);
+    state.status = `deleting ${c ? `${c.from}'s copy of ${c.name}` : 'the copy'}…`;
+    schedulePaint();
+    void backend!.run(['sync', 'resolve', id, '--json']).then((out) => {
+      let r: { syncResolve?: number; name?: string; from?: string; trash?: string | null } | null = null;
+      try {
+        r = JSON.parse(out);
+      } catch {
+        /* the CLI's own words, below */
+      }
+      state.status = r?.syncResolve === 1 ? `resolved: ${r.from}'s copy of ${r.name} ${r.trash ? 'is in sync\'s trash' : 'was gone already'}, and yours stands`
+        : `could not resolve it: ${out.trim().split('\n')[0].replace(/^oak: /, '')}`;
+      readSyncStatus(true);
+      schedulePaint();
+    });
   }
   function openInbox(): void {
     if (state.confirm) {
-      state.status = 'answer the pending keep/undo first — y or n';
+      state.status = 'answer the pending question first — y or n';
       return schedulePaint();
     }
     inboxCursor = 0;
+    conflictOpen = null;
     inboxOpen = true;
     renderInbox();
   }
-  function inboxKey(ev: { key: string }): void {
+  function inboxKey(ev: { key: string; ctrl?: boolean; alt?: boolean }): void {
+    ev = listKey(ev);
+    if (conflictOpen !== null) return conflictKey(ev);
     if (ev.key === 'down') {
       inboxCursor = Math.min(inboxIds.length - 1, inboxCursor + 1);
       return renderInbox();
@@ -534,28 +773,42 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
     }
     if (ev.key === 'enter') {
       const id = inboxIds[inboxCursor];
+      if (id?.startsWith(SYNC_ROW)) {
+        conflictOpen = id.slice(SYNC_ROW.length);
+        conflictCursor = 0;
+        return renderConflict();
+      }
       inboxOpen = false;
       state.overlay = null;
       return id ? jumpToHand(id) : schedulePaint();
     }
+    if (ev.key !== 'escape' && ev.key !== 'q') return;
     inboxOpen = false;
     state.overlay = null;
     schedulePaint();
   }
   function jumpNextHand(): void {
-    const id = core.nextAttention(handRows(), state.session);
+    // This machine's own: another machine's hand is opened from the inbox, on that machine.
+    const id = core.nextAttention(handRows().filter((r) => !r.host), state.session);
     if (!id) {
-      state.status = 'nobody is waiting on you';
+      state.status = core.nobodyWaitingHere(handRows().filter((r) => r.host && r.attention.kind !== 'idle-done').length, keyForAction('inbox'));
       return schedulePaint();
     }
     jumpToHand(id);
   }
   /** Switch the observatory to a raised hand and say what it waits on — through the session picker's
    *  own Enter (guards included), so an unsafe or remote row is refused exactly the same way. */
-  function jumpToHand(id: string): void {
-    const row = handRows().find((r) => r.id === id);
-    if (state.session !== id) choosePicked(id);
-    if (row) state.status = `${row.title || `session ${id.slice(0, 8)}`} ${core.attentionLabel(row.attention.kind)}${row.attention.message ? ` — ${row.attention.message}` : ''}`;
+  function jumpToHand(key: string): void {
+    const row = handRows().find((r) => handKey(r) === key);
+    const id = row?.id ?? key;
+    // Another machine's hand: its session, read and reviewed on that machine through `--machine`, which takes a machine
+    // saved here (the label it is saved under). One whose records came through another machine is answered there.
+    if (row?.host && !(state.observatory?.machines ?? []).some((m) => !m.local && m.label === row.machine)) {
+      state.status = `${row.title || `session ${id.slice(0, 8)}`} ${core.attentionLabel(row.attention.kind)} · on ${row.machine || row.host}, which is not saved here (oak machine add): it is answered there`;
+      return schedulePaint();
+    }
+    if (state.session !== id || row?.host) choosePicked(id, row?.host ? row.machine || row.host : undefined);
+    if (row) state.status = `${row.title || `session ${id.slice(0, 8)}`} ${core.attentionLabel(row.attention.kind)}${row.attention.message ? ` — ${row.attention.message}` : ''}${row.host ? ` · on ${row.machine || row.host}` : ''}`;
     schedulePaint();
   }
 
@@ -571,12 +824,24 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
     out.write(`\x1b]2;${title.replace(/[\x00-\x1f\x7f-\x9f]/g, ' ')}\x07`);
   }
 
-  // ---- Find anything: the ctrl+o palette over sessions, tabs, workspaces and actions ----
+  // ---- The `:` palette: every command, and find anything — sessions, tabs, workspaces and actions ----
   // One index, typed-to-narrow with the same scattered-letters match every filtered pane uses. Enter
   // does what the row IS: a session switches to it, a tab raises it, a workspace opens the session
-  // picker narrowed to it, an action presses its key — the palette can never do something the
-  // keyboard cannot.
-  type PaletteItem = { kind: 'session' | 'tab' | 'workspace' | 'action' | 'search'; label: string; detail: string; run: () => void };
+  // picker narrowed to it, an action does what its key does, a command runs. A typed command name
+  // (`status`, `comment 12: note`) puts that command first, so `:` then a command then Enter runs it,
+  // as the command line it replaced did.
+  type PaletteItem = { kind: 'session' | 'tab' | 'workspace' | 'action' | 'command' | 'search'; label: string; detail: string; run: () => void };
+  /** The palette's commands: the fixed ones, and the review-comment ones that take text. */
+  const TEXT_COMMANDS: Readonly<Record<string, string>> = {
+    comment: 'comment on the edit whose diff is shown — comment [<line>:] <note>',
+    'send-comments': 'draft every unsent review comment into the reply box',
+    quote: "quote the agent's last reply into the reply box",
+    ignore: 'apply .observatoryignore to the reviewed session — counts, then asks before dropping',
+  };
+  const isCommand = (name: string): boolean => Object.hasOwn(COMMANDS, name) || Object.hasOwn(TEXT_COMMANDS, name) || name === 'comments';
+  /** A text box's backspace: its last character as a reader counts them goes whole. `slice(0, -1)` took one UTF-16
+   *  unit, so a pasted emoji lost half of its surrogate pair, or a family its last member and left the joiner. */
+  const backspaced = (s: string): string => core.graphemeHead(s, s.length - 1);
   let paletteOpen = false;
   let paletteFilter = '';
   let paletteCursor = 0;
@@ -616,27 +881,64 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
       });
     }
     // An action row presses its key, so it is offered only where that key means the action: Review's verbs
-    // on Review, and elsewhere only the ones every tab shares (on the
-    // Observatory "Keep the selection" pressed `a`, which asks to accept every edit and clear the store).
-    const onReview = tabs[active]?.id === 'review';
-    const shared = ['session', 'options', 'help', ...(tabs[active]?.id === 'observatory' ? ['filter'] : [])];
+    // on Review, and on the Observatory the ones both tabs share plus the Observatory's own (on the
+    // Observatory "Keep the selection" once pressed `a`, which asked to accept every edit and clear the store).
+    const tabId = tabs[active]?.id;
     for (const r of core.REBINDABLE) {
-      if (!onReview && !shared.includes(r.action)) continue;
-      const key = keyForAction(r.action);
-      items.push({ kind: 'action', label: r.label, detail: key, run: () => onKey({ key, ctrl: false, alt: false }) });
+      if (tabId === 'observatory' ? !OBSERVATORY_SHARED.has(r.action) : tabId !== 'review' && !['session', 'options', 'help'].includes(r.action)) continue;
+      // A rebind can leave an action with no key (another action took it): the row then runs the action
+      // itself, where pressing keyForAction's '?' opened the help instead.
+      const bound = [...coreKeymap(prefs)].some(([, a]) => a === r.action);
+      const key = bound ? keyForAction(r.action) : '';
+      items.push({ kind: 'action', label: r.label, detail: key, run: () => onKey({ key, ctrl: false, alt: false, ...(bound ? {} : { action: r.action }) }) });
+    }
+    if (tabId === 'observatory') {
+      const obs: [string, string, () => void][] = [
+        ['Review this session', '⌕ review', () => { const sc = state.scopeWorker; const sn = sc?.session || tabs.find((t) => t.id === 'review')?.session || state.session; reviewSession(sn, sc || undefined); }],
+        ['Reply to the pinned conversation', 'c', () => void observatoryKey('c')],
+        ["Go to the session's herdr pane", 't', () => void observatoryKey('t')],
+        ['Pin the selected conversation', 'enter', () => void observatoryKey('enter')],
+        ['Resolve the session: keep its pending edits and clear its store', 'R', () => void observatoryKey('R')],
+        ["Stop the session's agent", 'X', () => void observatoryKey('X')],
+        ['Show or hide archived sessions', 'B', () => void observatoryKey('B')],
+        ['Choose what the focused pane shows', 'v', () => paneOp('view')],
+        ['Split the focused pane side by side', '|', () => paneOp('|')],
+        ['Split the focused pane stacked', '-', () => paneOp('-')],
+        ['Close the focused pane', '', () => paneOp('close')],
+        ['Focus the next pane', '', () => paneOp('cycle')],
+        ['Zoom the focused pane', keyForAction('zoom'), () => paneOp('zoom')],
+        ['Swap the focused pane with the one to its left', 'H', () => paneOp('H')],
+        ['Swap the focused pane with the one below', 'J', () => paneOp('J')],
+        ['Swap the focused pane with the one above', 'K', () => paneOp('K')],
+        ['Swap the focused pane with the one to its right', 'L', () => paneOp('L')],
+      ];
+      for (const [label, detail, run] of obs) items.push({ kind: 'action', label, detail, run });
+    }
+    for (const [name, c] of Object.entries(COMMANDS)) if (name !== '?') items.push({ kind: 'command', label: name, detail: c.what, run: () => runCommand(name) });
+    for (const [name, what] of Object.entries(TEXT_COMMANDS)) {
+      // `comment` needs its note: choosing the row types the command and waits for the rest.
+      items.push({ kind: 'command', label: name, detail: what, run: name === 'comment'
+        ? () => { paletteOpen = true; paletteFilter = 'comment '; renderPalette(); } : () => runCommand(name) });
     }
     return items;
   }
   function renderPalette(): void {
-    const f = paletteFilter.trim();
-    paletteShown = paletteItems.filter((it) => !f || fuzzyMatch(`${it.label} ${it.detail} ${it.kind}`, f) !== null);
+    const f = paletteFilter.trim().replace(/^:/, '');
+    const word = f.split(/\s+/)[0] ?? '';
+    // A typed command runs as typed, arguments and all: it leads the list, where Enter takes it. What else the
+    // words find follows it (a command's own row once, as the typed one): a session titled "Status page" was
+    // hidden behind `status` taking the whole list.
+    const typed: PaletteItem[] = word && isCommand(word)
+      ? [{ kind: 'command', label: f, detail: '↵ runs it', run: () => runCommand(f) }] : [];
+    paletteShown = [...typed, ...paletteItems.filter((it) => !(typed.length && it.kind === 'command' && it.label === f)
+      && (!f || fuzzyMatch(`${it.label} ${it.detail} ${it.kind}`, f) !== null))];
     // With words typed, the last row searches every CONVERSATION for them — the
     // asks and answers behind the sessions, not just their titles.
     if (f.length >= 2) paletteShown.push({ kind: 'search', label: `search conversations for “${f}”`, detail: 'asks and answers, every session', run: () => runConversationSearch(f) });
     paletteCursor = Math.max(0, Math.min(paletteCursor, paletteShown.length - 1));
     const lines = paletteShown.map((it, i) => `${i === paletteCursor ? '> ' : '  '}${it.kind.padEnd(9)} ${it.label}${it.detail ? `  \x1b[2m${it.detail}\x1b[0m` : ''}`);
     state.overlay = {
-      title: `find — ${paletteFilter}▏  · type to narrow · ↑↓ · ↵ opens · esc`,
+      title: `: ${paletteFilter}▏  · a command, or type to find · ↑↓ · ↵ runs · esc`,
       lines: lines.length ? lines : ['  nothing matches'],
       scroll: Math.max(0, paletteCursor - 10),
       cursor: paletteCursor,
@@ -645,7 +947,7 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
   }
   function openPalette(): void {
     if (state.confirm) {
-      state.status = 'answer the pending keep/undo first — y or n';
+      state.status = 'answer the pending question first — y or n';
       return schedulePaint();
     }
     paletteFilter = '';
@@ -664,9 +966,10 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
       return renderPalette();
     }
     if (ev.key === 'backspace') {
-      paletteFilter = paletteFilter.slice(0, -1);
+      paletteFilter = backspaced(paletteFilter);
       return renderPalette();
     }
+    if (ev.ctrl && !ev.alt && ev.key === 'v') return pasteFromClipboard();
     if (ev.key === 'enter') {
       const it = paletteShown[paletteCursor];
       paletteOpen = false;
@@ -680,7 +983,8 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
       paletteCursor = 0;
       return renderPalette();
     }
-    // esc, or any chord: close.
+    // esc closes; it takes typing, so q is text here. Every other key is the palette's and does nothing.
+    if (ev.key !== 'escape') return;
     paletteOpen = false;
     state.overlay = null;
     schedulePaint();
@@ -695,7 +999,7 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
   function runConversationSearch(q: string): void {
     paletteOpen = false;
     const placeholder = `searching every conversation for “${q}”…`;
-    state.overlay = { title: placeholder, lines: ['  one moment — the first search builds the index'], scroll: 0 };
+    state.overlay = { title: placeholder, lines: ['  one moment — the first search prepares the search cache'], scroll: 0 };
     schedulePaint();
     // The answer replaces only its own placeholder, and through closeOverlay: an overlay the reader opened
     // meanwhile is theirs, and taking it down directly left its modes (the help's filter, the picker, a row
@@ -715,7 +1019,7 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
         }
         const hits = Array.isArray(parsed?.hits) ? parsed!.hits! : [];
         if (!ours()) {
-          state.status = `search for “${q}” finished: ${hits.length} matching ask${hits.length === 1 ? '' : 's'} (ctrl+o to search again)`;
+          state.status = `search for “${q}” finished: ${hits.length} matching ask${hits.length === 1 ? '' : 's'} (: to search again)`;
           return schedulePaint();
         }
         closeOverlay();
@@ -748,7 +1052,8 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
     state.overlay = { title: `“${searchQuery}” — ${searchHits.length} matching ask${searchHits.length === 1 ? '' : 's'} · ↑↓ · ↵ opens the session · esc`, lines, scroll: Math.max(0, searchCursor * 2 - 10), cursor: searchCursor * 2 };
     schedulePaint();
   }
-  function searchKey(ev: { key: string }): void {
+  function searchKey(ev: { key: string; ctrl?: boolean; alt?: boolean }): void {
+    ev = listKey(ev);
     if (ev.key === 'down') {
       searchCursor = Math.min(searchHits.length - 1, searchCursor + 1);
       return renderSearchResults();
@@ -767,6 +1072,7 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
       }
       return schedulePaint();
     }
+    if (ev.key !== 'escape' && ev.key !== 'q') return;
     searchOpen = false;
     state.overlay = null;
     schedulePaint();
@@ -811,6 +1117,9 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
     const out: PaneState = { ...base };
     if (s.minimized) out.minimized = new Set(s.minimized.filter(isPane));
     if (s.zoom !== undefined) out.zoom = typeof s.zoom === 'string' && isPane(s.zoom) ? s.zoom : null;
+    // A zoomed Diff shows the edit the reader opened, and nothing is picked at launch (`picked`), so a
+    // saved zoom on it restored a screen holding one hint and every other pane hidden. It is not kept.
+    if (out.zoom === 'detail') out.zoom = null;
     if (s.focus && isPane(s.focus)) out.focus = s.focus;
     if (s.sizes) {
       const sizes: Partial<Record<PaneId, number>> = {};
@@ -846,13 +1155,12 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
   };
   const obsTree = restoredTree('observatory', OBSERVATORY_TREE, 'obs-sessions');
 
-  // INSIDE a herdr pane (the attach model: `oak attach` puts OAK in a pane of the host session) there is
-  // no herdr tab at all — herdr IS the host, its own keys move between its tabs, and a tab that could
-  // only show a note saying so was a dead tab the reader had to skip.
-  // From a plain terminal the herdr tab spawns the real client.
-  const nestedInHerdr = Boolean(process.env.HERDR_PANE_ID);
+  // Paint with F1 available. Only a confirmed pane context removes it; inherited editor markers
+  // and an unreachable server leave it available. No client starts while that decision is pending.
+  let paneContextPending = Boolean(process.env.HERDR_PANE_ID);
+  const paneContext = core.herdrPaneContext();
   const tabs: TabState[] = [
-    ...(nestedInHerdr ? [] : [{ id: 'herdr', kind: 'native', name: 'herdr', command: [core.findHerdrBin() || core.herdrInstallPath(require('os').homedir(), process.platform)], panes: mkPanes() } as TabState]),
+    { id: 'herdr', kind: 'native', name: 'herdr', command: [core.findHerdrBin() || core.herdrInstallPath(require('os').homedir(), process.platform)], panes: mkPanes() },
     {
       // Default landing tab. The herdr client spawns only when the reader switches to its tab.
       id: 'observatory',
@@ -896,6 +1204,57 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
   // one; the views poll adopts the first session that appears (see ask()).
   if (!session && !wantTab && tabs.some(t => t.id === 'herdr')) active = tabs.findIndex(t => t.id === 'herdr');
 
+  /** herdr's keys as the herdr client this app runs reads its config: the client applies the prefix, and before 0.9.2
+   *  a list of prefixes is a parse error that leaves it on its defaults. Its version is asked once. */
+  let herdrClientVersion: string | null | undefined;
+  const herdrConfig = (): import('@oak-observatory/core').HerdrPrefix => {
+    if (herdrClientVersion === undefined) {
+      const bin = tabs.find((t) => t.id === 'herdr')?.command?.[0] ?? core.findHerdrBin();
+      let out = '';
+      try { if (bin) out = String(core.spawnToolSync(bin, ['--version'], { encoding: 'utf8', timeout: 2000 }).stdout ?? ''); } catch { /* not known: the newest herdr's reading */ }
+      herdrClientVersion = core.parseHerdrVersion(out);
+    }
+    return core.herdrPrefix(process.env, herdrClientVersion ?? undefined);
+  };
+
+  // A rebind saved onto a key the frame now keeps for itself (an older build allowed it) is not live:
+  // said on the first status row of each launch until the reader chooses another key, so the reader
+  // learns why the key does something else now. What to do comes first: a narrow terminal cuts the row.
+  const blocked = Object.entries(prefs.blockedKeys ?? {});
+  const blockedNotice = blocked.length
+    ? `Options (${keyForAction('options')}): choose ${blocked.length === 1 ? 'another key' : 'other keys'} for ${blocked.map(([a]) => core.REBINDABLE.find((r) => r.action === a)?.label ?? a).join(', ')} — the frame now keeps your saved ${blocked.map(([, k]) => (k === ' ' ? 'space' : k)).join(', ')}`
+    : null;
+  // A status a key or click wrote, or any new one, is an ANSWER: for STATUS_HOLD_MS it outranks the rows
+  // that otherwise stand on the status line (an error, the size note, the zoomed edit's bar). Under them,
+  // `e`'s answer on a zoomed Diff was drawn nowhere, and the key looked dead (DashState.statusUntil).
+  const STATUS_HOLD_MS = 5000;
+  // oak sync's settings put back in prefs.json from its copy (core keptPrefs, run here first): said once, on the first
+  // status row, as `oak` says it after a command, whose line this app's screen would take with it. What to do first.
+  // Taken only where that row shows it: an app someone answers to, with no rebind to ask about first; else the next
+  // `oak` command run in a terminal says it, and `oak doctor` does.
+  const keptNotice = (() => {
+    try {
+      core.keptPrefs(true);
+      if (once || blockedNotice || !process.stdin.isTTY || !process.stdout.isTTY) return null;
+      const text = core.takeKeptPrefsNotice();
+      return text ? `Quit or update that older OAK (\`oak doctor\` says where it may be running): ${text}` : null;
+    } catch {
+      return null;
+    }
+  })();
+  const delegateNotice = (() => {
+    if (once || !process.stdin.isTTY || !process.stdout.isTTY || blockedNotice || keptNotice) return null;
+    try { return core.takeAgentSetupNotice(cwd); } catch { return null; }
+  })();
+  const launchNotice = blockedNotice ?? keptNotice ?? delegateNotice;
+  let statusText = launchNotice ?? 'starting…';
+  let inputTurn = false;
+  let holdTimer: NodeJS.Timeout | null = null;
+  // A new error written after the answer is the newer news: it ends the hold (the same one again, as a
+  // failing read repeats it every tick, does not). A decision's own failure (actionFailed) always ends
+  // it, and outlives the re-read that decision forces for as long as an answer holds.
+  let errorText: string | null = null;
+  let errorHeldUntil = 0;
   const state: DashState = {
     views: null,
     screen: 'edits',
@@ -919,8 +1278,24 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
     // every save below, or a rebind made in the options window would not reach the surfaces that
     // advertise it until the next launch.
     keys: keys(),
-    status: 'starting…',
-    error: null,
+    get status(): string {
+      return statusText;
+    },
+    set status(text: string) {
+      // `--once` paints one frame nobody answers to: its size note and error stay on top there.
+      if (!once && (text !== statusText || inputTurn)) state.statusUntil = Date.now() + STATUS_HOLD_MS;
+      // Said after a toast, it takes a row too narrow for both (statusWithToast): a new text, or a key's answer said again
+      // (a quit hint re-armed, `y` with still nothing to copy); not the idle `ready` said again, as closing the help says it.
+      if (!once && (text !== statusText || (inputTurn && text !== 'ready'))) state.statusAt = Date.now();
+      statusText = text;
+    },
+    get error(): string | null {
+      return errorText;
+    },
+    set error(text: string | null) {
+      if (text && text !== errorText) state.statusUntil = 0;
+      errorText = text;
+    },
     confirm: null,
     now: Date.now(),
     watcherMode: 'native',
@@ -956,6 +1331,18 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
   // see writer.ts for the failure this prevents. The exit path (`restore`) stays outside the gate
   // on purpose: it must hand back a working terminal no matter when it runs.
   const out = createGatedWriter((seq) => process.stdout.write(seq));
+  const applyPaneContext = (context: import('@oak-observatory/core').HerdrPaneContext): void => {
+    paneContextPending = false;
+    if (!context.nested) return;
+    const selected = tabs[active]?.id;
+    const previous = tabs[lastOakTab]?.id;
+    const at = tabs.findIndex(t => t.id === 'herdr');
+    if (at >= 0) tabs.splice(at, 1);
+    active = tabs.findIndex(t => t.id === selected);
+    if (active < 0) active = tabs.findIndex(t => t.id === 'observatory');
+    lastOakTab = tabs.findIndex(t => t.id === previous);
+    state.hoverTab = null;
+  };
 
   /** The launch session when `--session` named one this machine does not hold (the CLI checked, and let
    *  it through because saved machines exist). Review never reads this machine's store for it: it waits
@@ -995,6 +1382,14 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
   // means `setRawMode` does not exist and would throw a TypeError instead of explaining itself.
   const interactive = Boolean(process.stdin.isTTY && process.stdout.isTTY) && !once;
   if (!interactive) {
+    // The frame reads each saved machine through herdr, apart from the terminal (`herdr --machine`): ctrl+c,
+    // a hangup or a deadline's SIGTERM stops those reads too, then ends this process as the signal would
+    // have. Windows runs no read apart (execFileTool), and has no SIGQUIT.
+    if (process.platform !== 'win32') {
+      for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP', 'SIGQUIT'] as const) {
+        process.once(sig, () => { core.stopDetachedChildren(); process.kill(process.pid, sig); });
+      }
+    }
     const onceViews = (
       // NOT `layoutReq()`: this runs before the live frame exists (`frameCols` is still in its
       // temporal dead zone), and a one-shot has no resize state to borrow. It still has to carry
@@ -1011,10 +1406,12 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
       }))
     );
     void (async () => {
+      applyPaneContext(await paneContext);
       let views: Record<string, unknown> | null = null;
       // Read-only: a one-shot prints a frame. It used to tidy herdr's tabs on the way (made a btop tab,
       // renamed and moved tabs, typed into a pane) on this machine and every saved one.
-      const observatory = createObservatory(core, state, { cwd, changed() {}, status(message) { state.status = message; }, watch: false, timers: false, readOnly: true });
+      const observatory = createObservatory(core, state, { cwd, changed() {}, status(message) { state.status = message; }, watch: false, timers: false, readOnly: true,
+        workersVisible: () => !!tabs[active]?.root && leafPanes(tabs[active].root!).some(p => p.view === 'workers' || p.view === 'sessions-nav') });
       let target = session;
       try {
         await observatory.start();
@@ -1042,13 +1439,19 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
         }
         const machine = tabs[active]?.id !== 'observatory' && owner && !owner.local ? owner.label : undefined;
         if (machine) state.reviewMachine = { label: machine };
+        // No session to read (a workspace with none of its own): the frame lists every session all the same, as the live
+        // app does, and its Review panes say there is nothing to review.
+        if (!target) {
+          listing ??= await sessionsOnce(core, cwd).catch(() => null);
+          state.reviewFinding = noSessionReview();
+        }
         // The listing already read is this frame's catalog: it is not read twice.
         const names = machine ? [...new Set([...onceViews, 'sessions'])] : listing ? onceViews.filter((v) => v !== 'sessions') : onceViews;
         views = await createOnce(core, cwd, target, names, machine, machine ? observatorySelection(state, target).root : undefined);
         if (machine && views) {
           state.reviewSession = (views.sessions as { sessions?: Record<string, unknown>[] } | undefined)?.sessions?.find(row => row.id === target);
           state.views = { ...views, sessions: listing?.sessions ?? await createOnce(core, cwd, target, ['sessions']).then(p => p?.sessions) };
-        } else state.views = views && listing ? { ...views, sessions: listing.sessions } : views;
+        } else state.views = views && listing ? { ...views, sessions: listing.sessions } : views ?? (listing ? { sessions: listing.sessions } : null);
         // The header names the session as the live frame does: its map's title, or its own machine's.
         state.sessionTitle = (views?.changemap as { summary?: { title?: string } } | null | undefined)?.summary?.title
           || (machine && core.realSessionTitle(String(state.reviewSession?.title ?? ''))) || '';
@@ -1067,13 +1470,15 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
           // before they landed, so every one-shot conversation read "Workers · 0".
           await observatory.refreshWorkers();
         }
+        // A Codex pane whose state hangs on its screen reads as the live app reads it, now that the listing is in.
+        if (tabs[active]?.id === 'observatory') await observatory.readScreens();
       } catch (error) {
         state.error = String((error as Error).message || error);
         if (state.reviewMachine) state.reviewMachine.error = state.error;
         process.exitCode = 1;
       } finally { observatory.close(); }
       state.now = Date.now();
-      state.status = state.error || (views ? `${target.slice(0, 8)} · one frame (--once)` : target ? 'no view data for this session' : 'no agent session yet — start one in the herdr tab; the Observatory lists every session');
+      state.status = state.error || (views ? `${target.slice(0, 8)} · one frame (--once)` : target ? 'no view data for this session' : noSessionStatus());
       for (const line of renderDashFrame(state, { cols, rows, color: colorDepth, glyphs })) {
         out.write(line + '\n');
       }
@@ -1083,9 +1488,6 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
 
   let restored = false;
   let filterOpen = false;
-  /** The leader (ctrl+a) is armed: the NEXT key is a pane/tab command, not itself. A mode, shown in the
-   *  status row, always left by esc — never one a reader can get stuck in. */
-  let leaderArmed = false;
   /** Ids for reader-created split panes — monotonic so two splits never collide. Seeded past every
    *  `split-N` a restored layout already holds: starting at 1 after a restart made the next split a
    *  duplicate `split-1`, and a tree with two leaves of one id fails to parse on the launch after
@@ -1099,10 +1501,28 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
   let daemon: import('@oak-observatory/core').DaemonClient | null = null;
   let focusRetry: NodeJS.Timeout | undefined;
   let focusClosed = false;
+  /** Until the next try, after a disconnect or a try that failed: doubled by each failure, to a minute, and back to the
+   *  first once one connects. A reconnect that failed (the server it starts not up yet where the store went) was never
+   *  tried again, so focus requests went nowhere until the app restarted. */
+  let focusWaitMs = FOCUS_RETRY_MS;
+  let focusFailing = false;
   async function connectFocus(): Promise<void> {
     const result = await core.ensureDaemon({ client: 'tui-focus', repairOutdated: true });
     if (focusClosed) { result.client?.close(); return; }
-    if (!result.client) { state.status = result.why; schedulePaint(); return; }
+    const again = (): void => {
+      if (focusClosed) return;
+      focusRetry = setTimeout(() => { void connectFocus(); }, focusWaitMs);
+      focusRetry.unref();
+    };
+    if (!result.client) {
+      if (!focusFailing) { state.status = result.why; schedulePaint(); } // said once, not at every try
+      focusFailing = true;
+      again();
+      focusWaitMs = Math.min(focusWaitMs * 2, FOCUS_RETRY_MAX_MS);
+      return;
+    }
+    focusFailing = false;
+    focusWaitMs = FOCUS_RETRY_MS;
     const client = daemon = result.client;
     client.on(ev => {
       if (ev.event !== 'focus') return;
@@ -1113,12 +1533,12 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
     });
     client.onClose(() => {
       daemon = null;
-      if (!focusClosed) { focusRetry = setTimeout(() => { void connectFocus(); }, 3000); focusRetry.unref(); }
+      again();
     });
     try { await client.request({ op: 'watch' }); }
     catch (e) { state.status = `focus endpoint: ${String(e)}`; schedulePaint(); }
   }
-  if (!once && !args.includes('--no-server') && !process.env.OAK_NO_SERVER) void connectFocus();
+  if (!once && !args.includes('--no-server') && !process.env.OAK_NO_SERVER && !core.noBackgroundChildren()) void connectFocus();
   /** Native tabs whose spawn FAILED (bad command) — cached so a paint does not re-fork a PTY forever. */
   const nativeFailed = new Set<string>();
   /** A pane being DRAGGED by its title: where the press was, whether the
@@ -1139,6 +1559,7 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
   function syncPointer(col: number, row: number): void {
     const tab = tabs[active];
     if (!tab || tab.kind === 'native' || state.overlay || state.confirm || paneDrag) return;
+    if (lastBottom && row >= lastBottom.first) return setPointer('text'); // the bottom rows select as a pane's text does
     if (tab.root) {
       const { tl, topRows, bodyH } = treeGeom(tab.root);
       if (row < topRows) return setPointer(hitTest(layout(), col, row)?.t === 'tabbar' ? 'pointer' : 'default');
@@ -1150,7 +1571,7 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
     setPointer(pointerForDockHit(hit, hit?.t === 'seam' ? lay.seams[hit.index]?.axis : undefined));
   }
   /** The pane beside `id` in `dir` — nearest edge first, widest overlap breaking ties — for the
-   *  keyboard move (ctrl+a H/J/K/L). Null when nothing lies that way. */
+   *  keyboard move (H/J/K/L on the Observatory). Null when nothing lies that way. */
   function neighbourPane(root: PaneNode, id: string, dir: 'left' | 'right' | 'up' | 'down'): string | null {
     const { tl } = treeGeom(root);
     const me = tl.placements.find((p) => p.id === id);
@@ -1173,7 +1594,7 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
     return best?.id ?? null;
   }
 
-  // ---- The view picker for a pane: after a split, or ctrl+a v on the focused pane ----
+  // ---- The view picker for a pane: after a split, or v on the focused pane ----
   let viewPickOpen = false;
   let viewPickFor = '';
   let viewPickCursor = 0;
@@ -1205,7 +1626,8 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
     viewPickOpen = true;
     renderViewPicker();
   }
-  function viewPickerKey(ev: { key: string }): void {
+  function viewPickerKey(ev: { key: string; ctrl?: boolean; alt?: boolean }): void {
+    ev = listKey(ev);
     if (ev.key === 'down') {
       viewPickCursor = Math.min(VIEW_CHOICES.length - 1, viewPickCursor + 1);
       return renderViewPicker();
@@ -1232,6 +1654,7 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
       }
       return schedulePaint();
     }
+    if (ev.key !== 'escape' && ev.key !== 'q') return;
     viewPickOpen = false;
     state.overlay = null;
     schedulePaint();
@@ -1259,9 +1682,6 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
    *  id. Until then the dashboard opens on the change map with nothing selected, which is the view
    *  that answers "what happened here" before you have picked anything to answer it about. */
   let picked = false;
-  /** Command mode's buffer, and whether it owns the keyboard. */
-  let cmdBuf = '';
-  let cmdOpen = false;
   /** Find-in-diff's buffer, and whether it owns the keyboard. */
   let diffFind = '';
   let diffFindOpen = false;
@@ -1269,7 +1689,7 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
    *  the runtime's state, because `paint` reads it — and `paint` runs once during setup, before any
    *  declaration further down the function body has initialised. A `let` down beside its handlers
    *  read beautifully and crashed the first frame with a temporal-dead-zone error. */
-  let options: { cursor: number; scroll: number; capture: null | { id: string; kind: 'text' | 'key'; buf: string } } | null = null;
+  let options: { cursor: number; scroll: number; capture: null | { id: string; kind: 'text' | 'key'; buf: string }; id?: string } | null = null;
   /** Whether the overlay currently on screen is the OPTIONS window — so the paint knows whose layer
    *  to take down, and never clears a picker that happens to be open instead. */
   let optionsShown = false;
@@ -1293,6 +1713,10 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
     if (repaintTimer) clearTimeout(repaintTimer);
     backend?.close();
     observatory?.close();
+    // A saved machine's herdr command (an Observatory read, a tab name) runs apart from the terminal, so
+    // neither a hangup nor this exit reaches it: stopped here, or it ran on after the app. A reply being sent
+    // there is the exception (keepOnExit): it finishes after the app has gone, as a send from VS Code does.
+    core.stopDetachedChildren();
     // LOCAL passthrough children die with us — no PTY of ours outlives the tab that opened it. A
     // SERVER-owned tab's `close()` is a detach: its program keeps running, which is the point.
     for (const s of nativeSessions.values()) {
@@ -1326,16 +1750,47 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
     }
   };
 
-  process.on('exit', restore);
+  /** When the terminal last came back from a child (resumeTerminal). */
+  let resumedAt = 0;
+  process.on('exit', () => {
+    restore();
+    // Node 22.16 aborts in ResetStdio when tcsetattr sees a hung-up terminal. After restoring, close only
+    // former terminal descriptors that are no longer TTYs; live terminals and redirected output stay open.
+    if (process.platform !== 'win32') for (const [fd, stream] of [process.stdin, process.stdout, process.stderr].entries()) {
+      if (stream.isTTY && !isatty(fd)) try { fs.closeSync(fd); } catch { /* already closed */ }
+    }
+  });
   // SIGTERM, SIGHUP and SIGQUIT do NOT run 'exit' handlers, so each needs its own. SIGINT is handled
   // both ways: raw mode stops the tty driver turning ^C into a signal (so the decoder reads 0x03), but
   // an explicitly sent SIGINT still arrives here.
   for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGQUIT'] as const) {
     process.on(sig, () => {
+      // While a child has the terminal ($EDITOR, a saved machine's editor over `ssh -t`, still connecting or
+      // asking for a passphrase), ctrl+c and ctrl+\ are the child's: the terminal signals its whole job, this
+      // app included, and the app ended under the child it had handed the terminal to. The child's end can be
+      // handled before this app's own copy of the signal, so the second after the terminal came back counts too.
+      if ((sig === 'SIGINT' || sig === 'SIGQUIT') && (out.suspended() || Date.now() - resumedAt < 1000)) return;
       restore();
       process.exit(0);
     });
   }
+  // A closed terminal can fail the read on stdin (EIO) before its SIGHUP arrives: the same hangup, not a crash.
+  // A write to it fails the same way, which the CLI's handler on stdout takes as a hangup too. (This path runs only
+  // with a terminal on stdin.)
+  process.stdin.on('error', (e: NodeJS.ErrnoException) => {
+    if (e.code !== 'EIO') throw e;
+    restore();
+    process.exit(0);
+  });
+  // Or the read ends: a hung-up terminal reads as the end of input. With no SIGHUP (the app in a session of its own)
+  // and no paint to fail its write (a paint that changes nothing writes nothing), this is all that says it has gone.
+  // A ctrl+d at a prompt read with the terminal not raw ends the read too, on a terminal still there, and a stdin that
+  // never was a terminal (a pipe, under a test that sets isTTY) ends without one.
+  process.stdin.on('end', () => {
+    if (!(process.stdin instanceof ReadStream) || isatty(0)) return;
+    restore();
+    process.exit(0);
+  });
   process.on('uncaughtException', (e) => {
     restore(); // restore FIRST, so the error is readable in a working terminal
     process.stderr.write(`dash: ${e?.stack || e}\n`);
@@ -1350,6 +1805,10 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
   let frameCols = cols;
   let frameRows = rows;
   let dirty = true;
+  /** The rows the terminal shows as `paint` last wrote them, and the cursor it left. Null after anything that may have
+   *  disturbed the screen — a resize, a child's turn on the terminal, the window regaining focus (a terminal's "clear
+   *  buffer") — so the next paint writes every row. */
+  let onScreen: { lines: string[]; cursor: string } | null = null;
   const REPAINT_FLOOR_MS = 60; // ~16 fps; TTY writes are blocking, so this is a budget on the key loop
 
   // Declared before `paint`, which calls syncDetailDiff on the first frame. These are `let`, so they
@@ -1361,6 +1820,7 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
   let lastUsageFetch = 0;
   /** The first ^C of the quit chord, still fresh: a second before this expires exits. */
   let quitArmedUntil = 0;
+  const QUIT_WINDOW_MS = 2000;
 
   let jumpArmed = false;
   /** The selection SGR derived from the terminal's OSC 11 background answer; null = reverse video. */
@@ -1424,13 +1884,14 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
       try {
         // This reader runs in-process, so it needs the same provider refresh as `oak usage`.
         // Keep account I/O outside the paint loop; the next poll consumes the published cache.
-        if (core.dueAccountUsagePull()) {
+        if (!core.noBackgroundChildren() && core.dueAccountUsagePull()) {
           const pull = core.spawnTool(process.execPath, [process.argv[1], 'usage', '--pull-account', '--json'], { detached: true, stdio: 'ignore' });
           pull.on('error', () => { /* retain the last usable cache */ });
           pull.unref();
         }
         core.kickMonthRefresh(cwd); // the bill-cycle month is scanned only by the statusline — keep it live here too
         core.kickRemoteTitles(); // Remote Control titles from claude.ai: detached, throttled, never on this paint
+        core.kickMachineUsage(); // the saved machines' readings of the Claude account, the same way
       } catch { /* an unavailable account refresh does not prevent local usage rendering */ }
       try {
         state.usage = core.usageLine(cwd, state.session);
@@ -1471,6 +1932,7 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
     if (options) {
       optionsShown = true;
       const rows = optRows();
+      anchorOptions(rows);
       const cap = options.capture;
       state.overlay = {
         title: cap
@@ -1485,13 +1947,19 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
               'options  —  ↑↓ · ←→ · enter · esc',
               'options',
             ].find((t) => displayWidth(t) <= frameCols - 1) ?? 'options'),
-        lines: renderOptions(rows, options.cursor, frameCols, options.scroll, Math.max(1, frameRows - 6), glyphs, colorDepth),
+        lines: renderOptions(rows, options.cursor, frameCols, options.scroll, overlayRows(), glyphs, colorDepth),
         scroll: 0,
       };
     }
     updateNativeGrid();
     syncWindowTitle();
-    const lines = renderDashFrame(state, { cols: frameCols, rows: frameRows, color: colorDepth, glyphs });
+    lastBottom = null;
+    const lines = renderDashFrame(state, { cols: frameCols, rows: frameRows, color: colorDepth, glyphs, bottom: (first, status) => { lastBottom = { first, status }; } });
+    // The frame after the hold ends puts the standing row back.
+    if (state.statusUntil && state.statusUntil > state.now && !holdTimer) {
+      holdTimer = setTimeout(() => { holdTimer = null; schedulePaint(); }, state.statusUntil - state.now + 1);
+      holdTimer.unref?.();
+    }
     lastPainted = lines; // drag-to-copy reads the frame the reader actually selected from
     // The live drag highlight decorates the OUTPUT only — never `lastPainted`, whose whole job is
     // to stay the clean text the release will slice. Reverse video over the span, composed with
@@ -1519,8 +1987,13 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
     // cursor flashing across the window. `?2026h`/`l` make the terminal show the frame atomically (a
     // no-op on terminals that don't support it), and CURSOR_HIDE at the top keeps the sweep invisible
     // even there; the caret is restored last, inside the same atomic frame.
-    let buf = '\x1b[?2026h' + CURSOR_HIDE + '\x1b[H';
-    for (let i = 0; i < shown.length; i++) buf += `\x1b[${i + 1};1H\x1b[K` + shown[i];
+    //
+    // Only the rows that differ from what the terminal shows are written, and nothing at all when no row and no
+    // cursor differs: rewriting all of them on every refresh tick and live update, most of them unchanged, made
+    // the whole window flash (2026-11-05, iTerm2).
+    const prev = onScreen;
+    let rowsBuf = '';
+    for (let i = 0; i < shown.length; i++) if (prev?.lines[i] !== shown[i]) rowsBuf += `\x1b[${i + 1};1H\x1b[K` + shown[i];
     // A NATIVE tab shows the program's OWN cursor: placed where its emulator has it, only while the
     // program shows it, and only while nothing of OAK's is drawn over the tab. A program whose caret
     // IS the terminal cursor (Claude Code's prompt) had no cursor at all inside OAK (2026-09-23).
@@ -1528,14 +2001,16 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
     const nativeSess = nativeTab?.kind === 'native' ? nativeSessions.get(nativeTab.id) : undefined;
     // `cursor` is optional on the session: a stand-in without an emulator simply keeps the cursor hidden.
     const cur = nativeSess && !nativeSess.ended && !state.overlay && !state.confirm ? nativeSess.cursor?.() : undefined;
+    let cursor = '';
     if (cur) {
       const top = layout().tabbar.length ? 1 : 0; // the single-row tab bar above the program's screen
       const bodyH = Math.max(0, frameRows - top - chromeBottom(frameRows) + 1);
       if (cur.visible && cur.y >= 0 && cur.y < bodyH && cur.x >= 0 && cur.x < frameCols)
-        buf += `\x1b[${top + cur.y + 1};${cur.x + 1}H` + CURSOR_SHOW;
+        cursor = `\x1b[${top + cur.y + 1};${cur.x + 1}H` + CURSOR_SHOW;
     }
-    buf += '\x1b[?2026l';
-    out.write(buf);
+    if (prev && !rowsBuf && prev.cursor === cursor) return;
+    const written = out.write('\x1b[?2026h' + CURSOR_HIDE + '\x1b[H' + rowsBuf + cursor + '\x1b[?2026l');
+    onScreen = written ? { lines: shown, cursor } : null;
   };
 
   const schedulePaint = (): void => {
@@ -1554,6 +2029,18 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
     repaintTimer.unref?.();
   };
 
+  /** How a copy went, as a toast on the status row: what it copied, for 2.5 s, or for 8 s why nothing was copied. A
+   *  refusal stood on the status row while the session was open, beside every later copy's toast, and on the herdr tab
+   *  over herdr's last row. An empty text says nothing: herdr announces its own copies. */
+  const copyToast = (text: string, ms = 2500): void => {
+    if (!text) return;
+    state.toast = { text, until: Date.now() + ms, at: Date.now() };
+    const t = setTimeout(() => schedulePaint(), ms + 100);
+    t.unref?.();
+    schedulePaint();
+  };
+  const copyRefused = (text: string): void => copyToast(text, 8000);
+
   const refreshSize = (): void => {
     // Re-reading process.stdout.columns is a NO-OP: getWindowSize() returns the cached pair and only
     // _refreshSize() issues the syscall. Calling it also emits 'resize' itself, which covers both the
@@ -1563,13 +2050,21 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
     } catch {
       /* not available on this platform — the 'resize' listener below still applies */
     }
+    const size = `${frameCols}x${frameRows}`;
     frameCols = process.stdout.columns || frameCols;
     frameRows = process.stdout.rows || frameRows;
     // A kept selection is coordinates into the OLD frame — after a resize they band whatever
     // reflowed underneath. The copy already happened at release; drop the ghost.
     state.selSpan = null;
+    // So is one still held: it would copy what reflowed under it. It is dropped, and its release copies nothing; a
+    // selection already drawn says so.
+    if (textDrag && `${frameCols}x${frameRows}` !== size) {
+      if (textDrag.moved) copyRefused('nothing copied: the terminal changed size during the selection');
+      endTextDrag();
+    }
   };
   process.stdout.on('resize', () => {
+    onScreen = null; // the terminal reflows or clears its screen to the new size, whatever size that is
     refreshSize();
     schedulePaint();
   });
@@ -1639,16 +2134,20 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
         // would go unnoticed forever. When the reader did not pin one with --session, say — once per
         // newcomer — that a newer session is live. Never auto-switch: yanking the store out from
         // under an open review would lose the reader's place mid-decision.
-        // Throttled to every 30s: outside a repo this is a machine-wide transcript scan (readdir +
-        // stat of every session), and running it on every 3-second tick was a measurable drag.
-        if (!args.includes('--session') && !process.env.CLAUDE_OBSERVATORY_SESSION && !process.env.CLAUDE_CHANGES_SESSION && Date.now() - newerSessionCheckedAt > 30_000) {
+        // Throttled to every 30s. Outside a repo the machine-wide newest comes from the local index, as the
+        // worker's last catch-up left it: walking every transcript for it (readdir + stat of every session) on
+        // every 3-second tick was a measurable drag, and every 30 s still the TUI's largest scan.
+        if (!flag('--session') && !process.env.CLAUDE_OBSERVATORY_SESSION && !process.env.CLAUDE_CHANGES_SESSION && Date.now() - newerSessionCheckedAt > 30_000) {
           newerSessionCheckedAt = Date.now();
           // The SAME scope the launch default used (core.defaultTuiSession): inside a repo, that
-          // workspace's newest; outside any repo, the machine-wide newest.
-          const newest = core.defaultTuiSession(cwd);
+          // workspace's newest; outside any repo, the machine-wide newest (the walk only where the index
+          // cannot be read here).
+          const named = Boolean(flag('--root'));
+          const anywhere = named || core.repoRoot(cwd) ? undefined : core.indexedNewestSession();
+          const newest = anywhere === undefined ? core.defaultTuiSession(cwd, named) : anywhere ?? core.resolveSessionId(cwd);
           if (newest && newest !== state.session && newest !== newerSessionHinted && tookTurnSinceLaunch(newest)) {
             newerSessionHinted = newest;
-            state.status = 'a newer session is live — press b to switch';
+            state.status = `a newer session is live — press ${keyForAction('session')} to switch`;
           }
         }
         const follow = claudeAtTail(); // sampled against the frame the reader was actually looking at
@@ -1667,21 +2166,28 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
           if (done) state.doneUnseen = done;
           // RAISED HANDS: toast once per hand — keyed by the attention ts,
           // the editors' rule — and hand the desktop announcement to core, whose claim file fires it
-          // once per machine however many surfaces are open. idle-done stays quiet.
-          for (const r of nextRows as { id?: unknown; title?: unknown; agent?: unknown; attention?: unknown }[]) {
+          // once per machine however many surfaces are open. idle-done stays quiet. A permission prompt
+          // toasts only once it has stood for the desktop's wait (core.whenHandDue), as in both editors.
+          // Other machines' hands too, as their records brought them: each once, naming its machine.
+          const synced = syncedHandRows((payload.sessions as { syncedHands?: unknown } | undefined)?.syncedHands);
+          for (const r of [...nextRows, ...synced] as { id?: unknown; title?: unknown; agent?: unknown; attention?: unknown; host?: string; machine?: string }[]) {
             const a = r.attention as { kind: HandKind; message: string; ts: number } | null | undefined;
             const id = typeof r.id === 'string' ? r.id : '';
             if (!id || !a || typeof a.ts !== 'number' || a.kind === 'idle-done') continue;
-            if ((handToasted.get(id) ?? 0) >= a.ts) continue;
-            handToasted.set(id, a.ts);
+            const key = r.host ? `${id}@${r.host}` : id;
+            if ((handToasted.get(key) ?? 0) >= a.ts) continue;
+            handToasted.set(key, a.ts);
             const name = typeof r.title === 'string' && r.title ? r.title : `session ${id.slice(0, 8)}`;
-            state.toast = {
-              // The Observatory takes `i` for the reply box and `h` for the selected session's pane, so
-              // there the keys are named as the Review tab's.
-              text: `${name} ${core.attentionLabel(a.kind)}${a.message ? ` — ${a.message}` : ''} · ${tabs[active]?.id === 'observatory' ? 'on Review, ' : ''}${keyForAction('nextHand')} jumps there · ${keyForAction('inbox')} lists every hand`,
-              until: Date.now() + 8000,
-            };
-            core.announceAttention({ id, title: name, agent: typeof r.agent === 'string' ? r.agent : '', attention: a });
+            core.whenHandDue(id, a, () => {
+              state.toast = {
+                // The same keys on both OAK tabs; `h` jumps to this machine's own.
+                text: `${name}${r.host ? ` on ${r.machine || r.host}` : ''} ${core.attentionLabel(a.kind)}${a.message ? ` — ${a.message}` : ''} · ${r.host ? '' : `${keyForAction('nextHand')} jumps there · `}${keyForAction('inbox')} lists every hand`,
+                until: Date.now() + 8000,
+                at: Date.now(),
+              };
+              schedulePaint();
+            }, Date.now(), r.host);
+            core.announceAttention({ id, title: name, agent: typeof r.agent === 'string' ? r.agent : '', attention: a, ...(r.host ? { host: r.host, machine: r.machine } : {}) });
           }
         }
         // The recap the feed view now carries — rendered above the prompt, labelled by source.
@@ -1706,8 +2212,12 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
         // older OAK there titles a forwarded map from the ssh login's directory, which finds nothing).
         state.sessionTitle = cm?.summary?.title || (machine && core.realSessionTitle(String(state.reviewSession?.title ?? ''))) || '';
         refreshTabFacts(payload);
-        state.error = null;
+        // Only when this read brought no problem: clearing and then re-setting the same standing problem
+        // counted as a new error and cut every key's answer short.
+        if (!err && Date.now() >= errorHeldUntil) state.error = null;
         if (state.status === 'starting…') state.status = 'ready';
+        // A refresh is done once a read lands: its "refreshing…" stood on the status row long after.
+        if (state.status === 'refreshing…') state.status = 'refreshed';
         // Re-anchor the TRACES cursor by row key across the swap (reanchorIndex says why). Traces
         // is the pane whose cursor drives the Detail diff, so an index left pointing at a
         // different row did not just move a highlight — it re-picked the selection and demoted
@@ -1896,6 +2406,8 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
       const label = found.machine?.label ?? ''; // '' pins this machine
       const row = (found.machine ? found.machine.sessions?.sessions : local)?.find((r) => r.id === found.session);
       const title = core.realSessionTitle(String(row?.title ?? '')) || found.session.slice(0, 8);
+      // The launch's notice (a saved key, oak sync's settings put back) is said first, over this as over the first run's own status.
+      const notice = launchNotice && state.status === launchNotice ? launchNotice : null;
       if (active === ri) {
         choosePicked(found.session, label);
         adoptOpen = true; // its own switch is not the reader's choice: a machine answering later may still outrank it
@@ -1903,7 +2415,7 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
         sessionMachines.set(found.session, label);
         tabs[ri].session = found.session;
       }
-      state.status = `Review is on ${title}${label ? ` on ${label}` : ''}, active more recently`;
+      state.status = notice ?? `Review is on ${title}${label ? ` on ${label}` : ''}, active more recently`;
       schedulePaint();
     }
     // Decided once every saved machine has answered and the session Review is on could be weighed.
@@ -1920,6 +2432,7 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
    *  taken before it, so coalescing the two shows the reader the state they just changed away
    *  from. */
   const ask = (force = false): void => {
+    readSyncStatus();
     const root = sessionRoot();
     const names = new Set(tabs[active]?.id === 'observatory' ? ['sessions'] : viewsForLayoutOf(core, layout()));
     // Observatory reads conversations/workers on demand and only polls the session catalog.
@@ -1937,14 +2450,20 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
     const scoped = treeRoot && tabs[active]?.id !== 'observatory' && state.scopeWorker;
     const fetchSession = scoped ? state.scopeWorker!.session : state.session;
     if (!fetchSession) {
-      // Nothing resolved at launch (a first run): there is no session to read, so a `views` request
-      // would only fail. Adopt the first session this machine gets — the launch default's own scope —
-      // through the same switch the picker uses; until then say what is missing, every poll.
-      const first = core.defaultTuiSession(cwd);
+      // Nothing resolved at launch (a first run, or a workspace with no session of its own): there is no
+      // session to read, so a `views` request would only fail. Adopt the first session this machine gets
+      // — the launch default's own scope — through the same switch the picker uses; until then say what
+      // is missing, every poll.
+      const first = core.defaultTuiSession(cwd, Boolean(flag('--root')));
       // Deferred: the launch's own first read runs before the picker's state below it is declared, and
       // `oak tui --root <dir>` from a directory with no session of its own crashed on it at startup.
       if (first && core.isSafeSessionId(first) && !state.overlay) return void queueMicrotask(() => choosePicked(first));
-      state.status = 'no agent session yet — start one in the herdr tab; the Observatory lists every session';
+      // Review has nothing to read and says so. The Observatory still lists every session: the listing
+      // needs no session, and this poll reads it as a session's own `views` read would.
+      state.reviewFinding = noSessionReview();
+      void observatory?.refreshSessions();
+      // The launch's notice (a saved key, oak sync's settings put back) is said first; this one follows once anything replaces it.
+      if (!launchNotice || state.status !== launchNotice) state.status = noSessionStatus();
       return schedulePaint();
     }
     // A session on another machine is reviewed THERE. Not on the Observatory tab, whose catalog is this
@@ -2170,6 +2689,14 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
     state.views = { ...state.views };
   };
 
+  /** A decision failed: the error the reader must see, kept through the re-read the decision forces. */
+  const actionFailed = (err: string | null): void => {
+    state.error = err;
+    state.statusUntil = 0;
+    state.errorAt = Date.now(); // newer than a toast, it takes a row too narrow for both (statusWithToast)
+    errorHeldUntil = Date.now() + STATUS_HOLD_MS;
+  };
+
   const reportMutation = (verb: string, asked: number, session = state.session, machine = reviewMachine(session)) => (r: { ok: boolean; json: unknown; err: string | null }) => {
     if (session !== state.session || machine !== reviewMachine(state.session)) {
       ask(true); // completed on the old owner; never apply those ids to the current rows
@@ -2187,7 +2714,7 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
       // Remembered until a read taken AFTER this write confirms it.
       pendingLocal.push({ at: Date.now(), ids: done, to });
     }
-    if (!r.ok) state.error = r.err;
+    if (!r.ok) actionFailed(r.err);
     else if (typeof j.status === 'string') {
       // The single-unit verbs answer the engine's own result — its message IS the report, and a
       // refusal arrives named (dependents, closure) rather than as a count.
@@ -2211,12 +2738,12 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
       if (errors) parts.push(`${errors} refused${first ? ` — ${first}` : ''}`);
       state.status = parts.join(' · ');
     }
-    if (r.ok && typeof unrecorded === 'string') state.error = unrecorded;
+    if (r.ok && typeof unrecorded === 'string') actionFailed(unrecorded);
     ask(true); // a mutation always forces a fresh read; stale counts must not outlive the action
     schedulePaint();
   };
 
-  const applyUnder = (verb: 'keep' | 'undo' | 'redo', under: string): void => {
+  const applyUnder = (verb: 'keep' | 'undo' | 'redo', under: string, after?: string): void => {
     if (!reviewReady()) return;
     state.status = `${verb}ing everything under ${under}…`;
     schedulePaint();
@@ -2229,10 +2756,11 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
       return schedulePaint();
     }
     const scope = machine && typeof root === 'string' && !path.posix.isAbsolute(under) ? path.posix.join(root, under) : under;
-    void backend!.mutateUnder(verb, scope, state.session, machine).then(reportMutation(verb, 0));
+    const session = state.session;
+    void backend!.mutateUnder(verb, scope, session, machine).then(reportMutation(verb, 0)).then(() => sayAfter(after, session));
   };
 
-  const applyMutation = (verb: 'keep' | 'undo' | 'redo', ids: number[]): void => {
+  const applyMutation = (verb: 'keep' | 'undo' | 'redo', ids: number[], after?: string): void => {
     if (!reviewReady()) return;
     state.status = `${verb}ing ${ids.length} edit(s)…`;
     schedulePaint();
@@ -2242,7 +2770,8 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
     // The marks are SPENT here. Leaving them standing means the next `a` silently re-acts on edits the
     // reader already dealt with, and the set is not on screen once its rows have gone.
     state.marked = new Set<number>();
-    void backend!.mutate(verb, ids, state.session, reviewMachine(state.session)).then(reportMutation(verb, ids.length));
+    const session = state.session;
+    void backend!.mutate(verb, ids, session, reviewMachine(session)).then(reportMutation(verb, ids.length)).then(() => sayAfter(after, session));
   };
 
   /**
@@ -2334,6 +2863,31 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
     const q = state.confirm;
     if (!q) return;
     state.confirm = null;
+    applyAnswer(q, yes);
+    // A notice that arrived while the question stood (askSweep) is said after the answer.
+    sayAfter(q.after);
+  };
+  /** A notice a question held back (askSweep), after the status its answer set. Work a yes starts says it again after
+   *  its own result, which replaces that status, unless the reader has moved to another session since (`session`, the one
+   *  it ran on), whose status reportMutation leaves standing. */
+  const sayAfter = (after: string | undefined, session = state.session): void => {
+    if (!after || session !== state.session || state.status.endsWith(after)) return;
+    state.status = `${state.status} · ${after}`;
+    schedulePaint();
+  };
+  const applyAnswer = (q: NonNullable<DashState['confirm']>, yes: boolean): void => {
+    // A refresh that would sweep asks first; no still refreshes, and drops nothing.
+    if (q.verb === 'refresh') {
+      if (yes) return applySweep(q.session ?? state.session, q.machine, q.after);
+      state.status = `refreshing… · kept the ${q.pending ?? 0} now-ignored edit(s)`;
+      ask(true);
+      return schedulePaint();
+    }
+    if (q.verb === 'reset' && yes) {
+      saveOptions({}, APP_PREF_KEYS); // all of the app's own keys, whoever set them last; the others stay as the file has them
+      state.status = 'every option is back to its default';
+      return schedulePaint();
+    }
     if (!yes) {
       state.status = 'cancelled';
       // The delete confirm REPLACED the picker's rows with its explanation — put the list back so
@@ -2342,30 +2896,119 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
       return schedulePaint();
     }
     if (q.verb === 'delete') return applyDeleteSession(q.session ?? '', q.pending ?? 0, q.seenThrough);
-    if (q.verb === 'resolve') return applyResolve(q.session ?? state.session);
+    if (q.verb === 'keep yours') return applySyncResolve(q.conflict ?? '');
+    if (q.verb === 'take over') return applySyncRestore();
+    if (q.verb === 'resolve') return applyResolve(q.session ?? state.session, q.after);
     if (q.verb === 'kill') return applyKill(q.session ?? state.session);
-    if (q.all && (q.verb === 'keep' || q.verb === 'undo')) return applyAll(q.verb);
-    if (q.under) return applyUnder(q.verb, q.under);
-    return applyMutation(q.verb, q.ids as number[]);
+    if (q.verb === 'reset') return schedulePaint();
+    if (q.all && (q.verb === 'keep' || q.verb === 'undo')) return applyAll(q.verb, q.after);
+    if (q.under) return applyUnder(q.verb, q.under, q.after);
+    return applyMutation(q.verb, q.ids as number[], q.after);
   };
 
-  const applyAll = (verb: 'keep' | 'undo'): void => {
+  const applyAll = (verb: 'keep' | 'undo', after?: string): void => {
     if (!reviewReady()) return;
     state.status = `${verb}ing every pending edit…`;
     schedulePaint();
-    void backend!.mutateAll(verb, state.session, reviewMachine(state.session)).then(reportMutation(verb, 0));
+    const session = state.session;
+    void backend!.mutateAll(verb, session, reviewMachine(session)).then(reportMutation(verb, 0)).then(() => sayAfter(after, session));
   };
 
-  const applyResolve = (session: string = state.session): void => {
+  /** The refresh's ignore sweep, once confirmed: where the session's store is, then a forced re-read. */
+  const applySweep = (session: string, machine?: string, after?: string): void => {
+    const droppedNote = (dropped: number) => dropped > 0 ? `refreshing… · dropped ${dropped} now-ignored edit${dropped === 1 ? '' : 's'}` : 'refreshing…';
+    if (machine) {
+      state.status = 'refreshing…';
+      void backend!.run(['ignore', '--session', session, '--json'], machine).then((out) => {
+        let dropped: number | null = null;
+        try { dropped = Number(JSON.parse(out).droppedNow) || 0; } catch { /* reported below */ }
+        state.status = dropped === null
+          ? `could not apply .observatoryignore on ${machine}: ${out.trim().split('\n').pop()?.replace(/^oak: /, '') || 'no answer'}`
+          : droppedNote(dropped);
+        ask(true);
+        schedulePaint();
+        sayAfter(after);
+      });
+      return schedulePaint();
+    }
+    let dropped = 0;
+    try { dropped = core.dropIgnored(session).dropped; } catch { /* a torn store still refreshes */ }
+    state.status = droppedNote(dropped);
+    ask(true);
+    schedulePaint();
+  };
+
+  /**
+   * Refresh, applying a newly-added `.observatoryignore` to the reviewed session: counts first and asks
+   * before dropping anything. Both the refresh key and `:ignore` come here.
+   */
+  const refreshAsking = (): void => {
+    // A user-CLICKED Refresh is the safe place to apply a newly-added `.observatoryignore`.
+    // Adding the file fires no capture hook, so the sweep that drops now-ignored records (capture.ts,
+    // the WRITE path) never runs, and a plain refresh — a read — left them. The sweep cannot be
+    // undone, so the refresh counts first and asks when it would drop anything; only HERE, never on
+    // the auto-refresh tick, which must not rewrite the store under concurrent readers.
+    // On the Observatory, the reviewed session is the one the Review tab shows: `state.session` there can
+    // still be the launch session, which Review has since moved off.
+    const igSes = (tabs[active]?.id === 'observatory' && tabs.find((t) => t.id === 'review')?.session) || state.scopeWorker?.session || state.session;
+    // A session reviewed on another machine keeps its store there, so the count and the sweep run
+    // there too: run here they found no store and did nothing, silently.
+    const igMachine = igSes ? reviewMachine(igSes) : undefined;
+    const askSweep = (would: number, late = false): void => {
+      const covered = `${would} recorded edit${would === 1 ? '' : 's'} in ${igSes.slice(0, 8)}${igMachine ? ` on ${igMachine}` : ''}`;
+      // Another machine's count can answer after the reader has moved on: to another question, into text being
+      // typed, or to the herdr tab, whose keys are the program's. A question raised then took the next key for
+      // its answer (a y meant for a keep-all, or typed into a search, dropped the records) or was not drawn at
+      // all. The refresh then drops nothing, and says how many edits it kept and how to drop them.
+      if (would > 0 && late && (state.confirm || state.overlay || options || filterOpen || diffFindOpen || markPending
+        || claudeAsk || focusedReplyPane() || tabs[active]?.kind === 'native')) {
+        state.status = `refreshed without dropping · .observatoryignore covers ${covered}, kept — ${keyForAction('refresh')} on Review asks to drop ${would === 1 ? 'it' : 'them'}`;
+        // A standing question holds the status row until it is answered; its answer says this after its own.
+        if (state.confirm) state.confirm.after = state.status;
+        ask(true);
+        return schedulePaint();
+      }
+      if (would > 0) {
+        state.confirm = { verb: 'refresh', ids: [], session: igSes, machine: igMachine, pending: would,
+          label: `drop the ${covered} that .observatoryignore covers (cannot be undone; n keeps them)` };
+        return schedulePaint();
+      }
+      state.status = 'refreshing…';
+      ask(true);
+      schedulePaint();
+    };
+    if (igSes && igMachine) {
+      state.status = 'refreshing…';
+      void backend!.run(['ignore', '--dry-run', '--session', igSes, '--json'], igMachine).then((out) => {
+        let j: { wouldDrop?: unknown } | null = null;
+        try { j = JSON.parse(out) as { wouldDrop?: unknown }; } catch { /* not JSON: the CLI's own words, below */ }
+        const would = j?.wouldDrop;
+        if (typeof would === 'number' && Number.isInteger(would) && would >= 0) return askSweep(would, true);
+        // No count is an error, never 0: an older build there ignores --dry-run and would have swept.
+        // The refresh still re-reads; it drops nothing.
+        state.status = `could not count what .observatoryignore covers on ${igMachine}: ${
+          (!j && out.trim().split('\n').pop()?.replace(/^oak: /, '')) || `update OAK on ${igMachine}`} · refreshed without dropping`;
+        ask(true);
+        schedulePaint();
+      });
+      return schedulePaint();
+    }
+    let would = 0;
+    if (igSes) { try { would = core.countIgnored(igSes); } catch { /* a torn store still refreshes */ } }
+    return askSweep(would);
+  };
+
+  const applyResolve = (session: string = state.session, after?: string): void => {
     if (!reviewReady()) return;
     state.status = 'resolving the session…';
     schedulePaint();
     void backend!.resolveAll(session, reviewMachine(session)).then((r) => {
       const j = (r.json ?? {}) as Record<string, unknown>;
-      if (!r.ok) state.error = r.err;
+      if (!r.ok) actionFailed(r.err);
       else state.status = `resolved: accepted ${Number(j.accepted ?? 0)} pending, cleared ${Number(j.cleared ?? 0)} record(s)`;
       ask(true); // the map is now empty of what it just resolved; stale counts must not outlive it
       schedulePaint();
+      sayAfter(after);
     });
   };
 
@@ -2390,8 +3033,9 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
 
   /**
    * DELETE a session from Observatory. `core.deleteSession`
-   * hides it from every enumeration AND purges its stored edits for good — the agent's own transcript/rollout
-   * on disk is left untouched, and `oak sessions --undelete <id>` lists the session again, without its edits.
+   * hides it from every enumeration AND purges its stored edits here — the agent's own transcript/rollout
+   * on disk is left untouched, and `oak sessions --undelete <id>` lists the session again: without its edits, or with
+   * a backup folder set, with what of them the folder holds once the next `oak sync now` brings it back (core.deleteWords).
    * In-process, the same call the CLI verb runs, so the picker and the standalone command can never disagree
    * about what "delete" removes. `confirmedPending` is how many edits still pending review the confirmation
    * named and `seenThrough` the newest edit id of the listing it counted from (the row's `lastEdit`): core
@@ -2415,13 +3059,14 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
     // resolver already skips hidden sessions ("a deleted session is never auto-selected"), so this is the
     // same fallback the terminal front door uses.
     if (state.session === id) {
-      const next = core.defaultTuiSession(cwd);
+      const next = core.defaultTuiSession(cwd, Boolean(flag('--root')));
       if (next && next !== id) state.session = next;
     }
     // Any tab pinned to the deleted session loses its pin and follows the terminal's session, so no tab is
     // left reviewing a session that no longer appears in any menu.
     for (const t of tabs) if (t.session === id) t.session = state.session;
-    state.status = `deleted ${id.slice(0, 8)} and purged its edits — oak sessions --undelete ${id} lists it again, without them`;
+    const said = core.deleteWords();
+    state.status = `deleted ${id.slice(0, 8)} and purged its edits — oak sessions --undelete ${id} lists it again, ${said.folder ? said.after : 'without them'}`;
     if (pickerOpen) renderSessionPicker();
     else schedulePaint();
     ask(true); // re-fetch the authoritative session list (every enumeration filters hidden sessions)
@@ -2441,6 +3086,9 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
     diffWanted = -1;
     picked = false;
     state.marked = new Set();
+    // The zoomed edit was the old session's: its zoom left standing showed the new session an empty Diff
+    // with every other pane hidden.
+    for (const t of tabs) if (t.panes?.zoom === 'detail') t.panes = { ...t.panes, zoom: null };
   }
 
   const mutateScope = (verb: 'keep' | 'undo' | 'redo', scope: 'one' | 'all'): void => {
@@ -2479,7 +3127,7 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
       return schedulePaint();
     }
     if (focusedBox && paneScreenOf(state, focusedBox) === 'diff') {
-      state.status = `Detail is showing a diff — press F3 for Traces to ${verb} an edit`;
+      state.status = `Detail is showing a diff — press F5 for Traces to ${verb} an edit`;
       return schedulePaint();
     }
     // The FOCUSED pane's screen, not `state.screen` — acting on a list the reader is not looking at
@@ -2518,6 +3166,7 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
    * and paste reporting.
    */
   const enterTerminal = (): void => {
+    onScreen = null; // the alternate screen starts blank, and a child had the terminal before a resume
     out.write(ALT_ON + CURSOR_HIDE + PASTE_ON + MOUSE_OFF + (mouse ? MOUSE_ON : '') + FOCUS_ON);
     if (process.stdin.isTTY) process.stdin.setRawMode(true);
     process.stdin.resume();
@@ -2548,6 +3197,7 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
   let awayPending: number | null = null;
 
   const resumeTerminal = (): void => {
+    resumedAt = Date.now();
     // Open the gate BEFORE `enterTerminal`, whose mode sequences are the first bytes of taking the
     // terminal back. Everything dropped during the suspension left `dirty` standing, so the single
     // `paint()` at the end of this function is the one full frame that catches the screen up.
@@ -2596,15 +3246,18 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
    * while vim waited for input it could not receive.
    */
   function openConversation(sessionId: string): void {
-    pinSession(sessionId, state.scopeWorker?.session === sessionId ? state.scopeWorker.machineId : undefined);
+    const picked = state.scopeWorker?.session === sessionId ? state.scopeWorker : undefined;
+    pinSession(sessionId, picked?.machineId, pinLeaf, picked);
   }
 
   /** The conversation leaf the last pin filled; a master click fills it again (see pinSession). */
   let pinLeaf: string | undefined;
   /** All conversation entry points share this transition. Changing the master selection alone
    * never calls it. Each detail leaf keeps its own pin and scroll when the reader splits it: the
-   * pin fills the focused conversation leaf, else `leaf` when it is one, else the first. */
-  function pinSession(sessionId: string, machineId?: string, leaf?: string): void {
+   * pin fills the focused conversation leaf, else `leaf` when it is one, else the first. A row of the session's
+   * worker group the reader picked in the master (`within`: a worker, or the group's summary or a header) stays
+   * picked: a worker opens its own log. */
+  function pinSession(sessionId: string, machineId?: string, leaf?: string, within?: Pick<ObservatorySelection, 'agentId' | 'workers' | 'processId'>): void {
     if (!sessionId || state.confirm) return;
     const tab = tabs.find(t => t.id === 'observatory')!;
     const detailLeaf = (id?: string) => leafPanes(tab.root!).find(p => p.id === id && p.view === 'session-detail');
@@ -2617,8 +3270,9 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
       saveLayout();
     }
     switchTab(tabs.indexOf(tab));
-    const next = selectAndPin(state, sessionId, paneId, machineId);
-    state.scopeWorker = next.scopeWorker;
+    const next = selectAndPin(state, sessionId, paneId, machineId, within);
+    state.scopeWorker = next.scopeWorker && (within?.agentId || within?.workers)
+      ? { ...next.scopeWorker, agentId: within.agentId, workers: within.workers } : next.scopeWorker;
     state.observatory = next.observatory;
     state.treeScroll = next.treeScroll;
     // Review follows the pin: switching to it — its tab, its key, `r` — shows this session, read on
@@ -2626,7 +3280,7 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
     targetReview(sessionId, next.scopeWorker ?? undefined);
     pinLeaf = paneId;
     observatory?.load(paneId);
-    state.status = `pinned ${state.scopeWorker?.label} · h herdr · r review`;
+    state.status = within?.agentId ? `worker ${within.agentId} · live log · Tab to Review` : `pinned ${state.scopeWorker?.label} · t herdr · Tab to Review`;
     schedulePaint();
   }
 
@@ -2637,8 +3291,8 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
   }
 
 
-  function viewSubagent(sessionId: string, _agentId: string): void {
-    openConversation(sessionId);
+  function viewSubagent(sessionId: string, agentId: string, machineId?: string): void {
+    pinSession(sessionId, machineId, pinLeaf, { agentId });
   }
 
   /** Reveal a session's store folder on disk — the blob's store size is clickable.
@@ -2650,7 +3304,8 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
     const dir = core.storeDir(session);
     const cmd = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'explorer' : 'xdg-open';
     try {
-      const child = core.spawnTool(cmd, [dir], { stdio: 'ignore', detached: true });
+      // windowsHide: false — the launcher hides a child's window on Windows, and this one is a window to show.
+      const child = core.spawnTool(cmd, [dir], { stdio: 'ignore', detached: true, windowsHide: false });
       child.on('error', () => {}); // best-effort — the path below is the guaranteed feedback, never silent
       child.unref();
     } catch { /* no file manager (headless/SSH) — the path still shows */ }
@@ -2677,6 +3332,12 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
   function reviewSession(session: string, selection?: ObservatorySelection): void {
     const ri = tabs.findIndex((t) => t.id === 'review');
     if (ri < 0 || active === ri || !session) return;
+    // A standing question keeps the tab (switchTab), and Review's session with it: `V`'s late answer moved Review to
+    // another session and emptied the tab on screen until the next read, then the switch was refused.
+    if (state.confirm) {
+      state.status = 'answer the pending question first — y or n';
+      return schedulePaint();
+    }
     targetReview(session, selection);
     state.views = null;
     switchTab(ri); // → state.session, ask() refetches the review for this session
@@ -2748,39 +3409,220 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
     schedulePaint();
   }
 
+  /** Whether the master draws the worker group of the session `sel` names: once its last worker has finished, a row of
+   *  it the reader had picked is gone, and the keys act on the session the mark falls back to. */
+  function workerGroupDrawn(sel: ObservatorySelection): boolean {
+    return hasActiveWorker(observatorySessions({ ...state, allSessions: true }).find((s) => s.session === sel.session && s.machineId === sel.machineId)?.meta);
+  }
+
+  /** Open (`open`) the Observatory master's worker group whose summary is picked, or close the group of any of its
+   *  rows that is picked; true when that changed it. Closing leaves the summary picked. */
+  function workerFold(open: boolean): boolean {
+    const picked = state.scopeWorker;
+    if (!picked || !(picked.workers || picked.agentId) || (open && picked.workers !== 'all') || !workerGroupDrawn(picked)) return false;
+    const fold = `workers:${picked.machineId}:${picked.session}`;
+    if (state.open.has(fold) === open) return false;
+    toggleOpenKey(fold);
+    state.scopeWorker = { ...picked, agentId: undefined, workers: 'all' };
+    return true;
+  }
+
+  /**
+   * The real path a change-map row names: `abs` for an outside node, the workspace root joined to the
+   * relative path otherwise, and whether it is a folder. Null for a row that is not a map node.
+   */
+  function mapRowTarget(row: { openPath?: string }): { path: string; dir: boolean } | { refuse: string } | null {
+    if (row.openPath === undefined || row.openPath.startsWith('edits:')) return null;
+    const tree = mapTree();
+    const node = tree ? mapRows(tree, state.open).find((r) => r.node.path === row.openPath)?.node : null;
+    if (!node) return null;
+    // The legacy anonymous bucket (an older CLI's payload, no root to resolve with) names no real
+    // path — joining its label to the workspace would hand the editor a directory that does not
+    // exist. Refuse with the reason, per the no-silent-no-op rule this key follows.
+    if (node.name === OUTSIDE && node.abs === undefined) {
+      return { refuse: 'this row is the anonymous outside-workspace bucket (older CLI payload) — it names no real path' };
+    }
+    const cmv = view(state, 'changemap') as { summary?: { root?: unknown } } | null;
+    const root = typeof cmv?.summary?.root === 'string' ? (cmv.summary.root as string) : cwd;
+    return { path: node.abs ?? (node.path ? path.join(root, node.path) : ''), dir: !node.isFile };
+  }
+
+  let openingWorkspace = false;
+  let workspaceGroupSelection: ObservatorySelection | undefined;
+  async function openWorkspaceWindow(selection?: ObservatorySelection): Promise<void> {
+    if (openingWorkspace) { state.status = 'a workspace window is already opening'; schedulePaint(); return; }
+    openingWorkspace = true;
+    try {
+      if (!selection) throw new Error('select a session or a group naming one workspace');
+      const machine = state.observatory?.machines.find(m => m.id === selection.machineId);
+      if (!machine && selection.machineId && selection.machineId !== 'unresolved') throw new Error('the session’s machine is no longer listed; refresh Observatory');
+      const away = machine && !machine.local ? machine.label : undefined;
+      let meta = observatorySessions({ ...state, allSessions: true }).find(s => s.session === selection.session && s.machineId === selection.machineId)?.meta;
+      let folder = meta?.workspacePath || selection.root;
+      if (away && (!folder || meta?.workspaceExists === undefined)) {
+        // --session: the CLI answers a bare listing of a machine oak sync keeps from the local index, whose rows carry the
+        // `~/…` display path and no workspaceExists; asked for one session, the machine itself answers.
+        const listing = JSON.parse(await backend!.run(['sessions', '--json', '--session', selection.session], away));
+        meta = listing.sessions?.find((r: { id: string }) => r.id === selection.session);
+        folder = meta?.workspacePath || folder;
+      }
+      if (!folder || (!path.isAbsolute(folder) && !path.posix.isAbsolute(folder))) throw new Error('this session has no workspace');
+      const exists = away ? meta?.workspaceExists : core.workspaceDirectoryExists(folder);
+      if (exists === false) throw new Error(`workspace folder is missing or unavailable${away ? ` on ${away}` : ''}: ${folder}`);
+      if (exists !== true) throw new Error(`could not verify the workspace folder on ${away}; refresh its listing or update OAK there`);
+      await launchGuiEditor({ away, session: selection.session, folder, workspace: true });
+    } catch (e) { state.status = String((e as Error).message || e); }
+    finally { openingWorkspace = false; schedulePaint(); }
+  }
+
+  /**
+   * The GUI editor W runs: the GUI editor setting, else the terminal editor setting, $VISUAL or $EDITOR when it is a GUI
+   * editor, else the editor whose integrated terminal this is, else the first GUI editor on PATH (core.resolveGuiEditor).
+   * Throws the refusal naming the setting when there is none, or when the setting names a terminal editor.
+   */
+  function guiEditor(): NonNullable<ReturnType<Core['resolveGuiEditor']>> {
+    const gui = core.resolveGuiEditor(prefs, process.env, detectedEditors);
+    if (!gui) throw new Error(core.GUI_EDITOR_REFUSAL);
+    return gui;
+  }
+
+  /**
+   * Run the GUI editor on a session's workspace `folder` (the Observatory's W), or on `file` at `line` (Review's W).
+   * A session on a saved machine (`away`) opens there: VS Code and Cursor through Remote-SSH from here, a JetBrains IDE
+   * through Gateway on the session's project. Over SSH with no display, the status row prints the command to run on the
+   * machine with the editor. The status row names the command that ran and where the GUI editor came from. Throws what
+   * it cannot do, for the caller's status row.
+   */
+  async function launchGuiEditor(o: { away?: string; session: string; folder?: string; file?: string; line?: number; workspace?: boolean }): Promise<void> {
+    const gui = guiEditor();
+    const ed = gui.command;
+    const parts = ed.split(/\s+/).filter(Boolean);
+    const from = `GUI editor ${core.editorBin(ed)}, from ${core.GUI_EDITOR_SOURCE[gui.source]}`;
+    // Window reuse belongs to the editor: never force a new window or reuse an unrelated one.
+    const args = parts.slice(1).filter(a => !['-n', '--new-window', '-r', '--reuse-window', '-w', '--wait'].includes(a));
+    // What the editor opens there: the folder, or the file with its line in Remote-SSH's `--goto file:line`.
+    const where = o.file ? (o.line ? `${o.file}:${o.line}` : o.file) : o.folder ?? '';
+    let launch = { command: parts[0], args: [...args, ...(o.file ? core.guiEditorFileArgs(ed, o.file, o.line) : [o.folder ?? ''])] };
+    let after = '';
+    // A Gateway link goes through the system's URL opener, which exits non-zero when nothing handles the link.
+    let gatewayLink = false;
+    if (o.away) {
+      const away = o.away;
+      state.status = o.file ? `opening ${path.basename(o.file)} on ${away}…` : `opening workspace on ${away}…`; schedulePaint();
+      const binary = core.findHerdrBin();
+      if (!binary) throw new Error('herdr is not installed on this machine');
+      const matches = (await core.herdrMachines({ binary, timeoutMs: 15000 })).filter(m => m.label === away || m.id === away);
+      if (matches.length !== 1 || !matches[0].enabled || !matches[0].target) throw new Error(`saved machine ${away} has no unique enabled SSH target`);
+      const target = matches[0].target;
+      const remote = core.remoteEditorLaunch([parts[0], ...args].join(' '), target, where, !o.file);
+      if (remote) launch = remote;
+      else if (core.isJetBrainsEditor(ed)) {
+        // Gateway opens a project, not a file: Review's W opens the session's project, and says where the edit is.
+        let folder = o.folder;
+        if (!folder) folder = JSON.parse(await backend!.run(['sessions', '--json', '--session', o.session], away)).sessions?.find((r: { id: string }) => r.id === o.session)?.workspacePath;
+        if (!folder) throw new Error(`this session has no workspace on ${away} for JetBrains Gateway to open`);
+        const info = JSON.parse(await backend!.run(['editor-review', 'info', '--session', o.session, '--editor', 'jetbrains', '--json'], away));
+        const connection = JSON.parse(await backend!.run(['editor-review', 'connection', '--target', target, '--json']));
+        const enc = encodeURIComponent;
+        const link = connection.host && connection.user && Number.isInteger(connection.port) && connection.port > 0 && connection.port <= 65535 && info.idePath?.startsWith('/') && folder.startsWith('/')
+          ? `jetbrains-gateway://connect#idePath=${enc(info.idePath)}&projectPath=${enc(folder)}&host=${enc(connection.host)}&port=${connection.port}&user=${enc(connection.user)}&type=ssh&deploy=false` : null;
+        if (!link) throw new Error(`Open JetBrains Gateway → SSH → New Connection on the machine with the editor; use ${target} and open ${folder}`);
+        launch = { command: process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'rundll32' : 'xdg-open',
+          args: process.platform === 'win32' ? ['url.dll,FileProtocolHandler', link] : [link] };
+        gatewayLink = true;
+        if (o.file) {
+          const rel = path.posix.relative(folder, o.file);
+          after = `; Gateway opens the project, the edit is at ${rel && !rel.startsWith('..') ? rel : o.file}${o.line ? `:${o.line}` : ''}`;
+        }
+      } else throw new Error(`${parts[0]} cannot open ${o.file ? 'a file' : 'a remote workspace'} on ${away}; set code, cursor or a JetBrains IDE as the GUI editor under ${keyForAction('options')} (prefs.guiEditor)`);
+    }
+    if (!o.away && (process.env.SSH_CONNECTION || process.env.SSH_TTY)) {
+      const host = process.env.SSH_CONNECTION?.split(/\s+/)[2] || os.hostname();
+      const target = `${os.userInfo().username}@${host}`;
+      const remote = core.remoteEditorLaunch(core.editorBin(ed), target, where, !o.file);
+      if (!remote) throw new Error(`Open JetBrains Gateway → SSH → New Connection on the machine with the editor; use ${target} and open ${o.folder ?? where}`);
+      launch = remote;
+    }
+    if (o.workspace) {
+      const editor = core.isJetBrainsEditor(ed) ? 'jetbrains' : core.editorBin(ed).startsWith('cursor') ? 'cursor' : 'vscode';
+      if (o.away) {
+        const result = JSON.parse(await backend!.run(['editor-review', 'prepare', '--session', o.session, '--editor', editor, '--action', 'workspace', '--json'], o.away));
+        if (!result.request || result.workspace !== o.folder) throw new Error('The workspace handoff was not written for this folder; refresh its session listing');
+      } else core.writeEditorReviewRequest({ editor, session: o.session, workspace: o.folder!, action: 'workspace' });
+    }
+    const quote = (word: string) => /^[a-zA-Z0-9_./:@+=,-]+$/.test(word) ? word : process.platform === 'win32' ? `'${word.replace(/'/g, "''")}'` : `'${word.replace(/'/g, "'\\''")}'`;
+    const ran = (process.platform === 'win32' ? '& ' : '') + [launch.command, ...launch.args].map(quote).join(' ');
+    const noGui = !!(process.env.SSH_CONNECTION || process.env.SSH_TTY) || (process.platform === 'linux' && !process.env.DISPLAY && !process.env.WAYLAND_DISPLAY);
+    // Which editor and why first: the command can be long enough for the status row to cut it.
+    if (noGui) { state.status = `${from}${after}. Run on the machine with the editor: ${ran}`; return; }
+    await new Promise<void>((resolve) => {
+      const child = core.spawnTool(launch.command, launch.args, { stdio: 'ignore', cwd, detached: true, windowsHide: false });
+      child.once('error', (e: Error) => { state.status = `Could not run ${ran}: ${e.message}. Run on the machine with the editor: ${ran}`; resolve(); });
+      child.once('spawn', () => { state.status = `${from}${after} — ran ${ran}`; child.unref(); resolve(); });
+      if (gatewayLink) child.once('exit', (code: number | null) => {
+        if (!code) return;
+        state.status = `Could not open the Gateway link (is JetBrains Gateway or Toolbox installed?): ${ran}`; schedulePaint();
+      });
+    });
+  }
+
+  /**
+   * Review's W: the focused selection (as `e` picks it) in the GUI editor, at the selected edit's first changed line —
+   * from the Diff on screen when it shows that edit, else fetched. A file header or a Map row opens with no line.
+   */
+  let openingGuiFile = false;
+  async function openSelectionInGuiEditor(): Promise<void> {
+    if (openingGuiFile) return;
+    const row = rowsOf()[state.cursor];
+    const onDiff = state.panes?.focus === 'detail';
+    let target = onDiff ? '' : selectedPath(row);
+    let id = !onDiff && row?.key.startsWith('e') && row.ids.length === 1 ? row.ids[0] : undefined;
+    let mapDir = false;
+    if (!onDiff && !target && row) {
+      const map = mapRowTarget(row);
+      if (map && 'refuse' in map) { state.status = map.refuse; return schedulePaint(); }
+      if (map) { target = map.path; mapDir = map.dir; }
+    }
+    if (!target && state.diffMeta?.path) { target = state.diffMeta.path; id = state.diffMeta.id; }
+    if (!target) { state.status = 'select an edit first — there is no file here to open'; return schedulePaint(); }
+    openingGuiFile = true;
+    try {
+      const session = state.session;
+      const machine = reviewMachine(session);
+      let line = 0;
+      if (id !== undefined) {
+        const patch = state.diffMeta?.id === id && state.diffPatch !== undefined ? state.diffPatch : await backend!.diff(id, session, machine);
+        line = firstChangedLine(patch);
+      }
+      await launchGuiEditor(mapDir ? { away: machine, session, folder: target } : { away: machine, session, file: target, line });
+    } catch (e) { state.status = String((e as Error).message || e); }
+    finally { openingGuiFile = false; schedulePaint(); }
+  }
+
   function openInEditor(): void {
     const row = rowsOf()[state.cursor];
-    let target = state.diffMeta?.path || selectedPath(row);
+    // The FOCUSED pane's selection names the file; the diff on screen does only when the Diff pane has
+    // focus, or when the row names no file (a Prompts row). The diff used to win everywhere, so once an
+    // edit's diff was open, `e` on another Map row opened the diff's file again.
+    const onDiff = state.panes?.focus === 'detail';
+    let target = onDiff ? '' : selectedPath(row);
     let mapDir = false; // a map FOLDER — openable only by editors that accept a directory
-    if (!target && row?.openPath !== undefined && !row.openPath.startsWith('edits:')) {
-      // A change-map row. Files open at their real absolute path — `abs` for an outside node, the
-      // workspace root joined to the relative path otherwise. Folders are offered too (VS Code and
-      // friends open one); the tty branch below says why not rather than silently no-opping.
-      const tree = mapTree();
-      const node = tree ? mapRows(tree, state.open).find((r) => r.node.path === row.openPath)?.node : null;
-      // The legacy anonymous bucket (an older CLI's payload, no root to resolve with) names no real
-      // path — joining its label to the workspace would hand the editor a directory that does not
-      // exist. Refuse with the reason, per the no-silent-no-op rule this key follows.
-      if (node && node.name === OUTSIDE && node.abs === undefined) {
-        state.status = 'this row is the anonymous outside-workspace bucket (older CLI payload) — no real path to open';
+    if (!onDiff && !target && row) {
+      // A change-map row. Folders are offered too (VS Code and friends open one); the tty branch
+      // below says why not rather than silently no-opping.
+      const map = mapRowTarget(row);
+      if (map && 'refuse' in map) {
+        state.status = map.refuse;
         return schedulePaint();
       }
-      if (node) {
-        const cmv = view(state, 'changemap') as { summary?: { root?: unknown } } | null;
-        const root = typeof cmv?.summary?.root === 'string' ? (cmv.summary.root as string) : cwd;
-        target = node.abs ?? (node.path ? path.join(root, node.path) : '');
-        mapDir = !node.isFile;
+      if (map) {
+        target = map.path;
+        mapDir = map.dir;
       }
     }
+    if (!target) target = state.diffMeta?.path || '';
     if (!target) {
       state.status = 'select an edit first — there is no file here to open';
-      return schedulePaint();
-    }
-    // A session reviewed on another machine names paths on THAT machine; an editor here would open
-    // an empty buffer at a path that does not exist (and create it on save).
-    const away = reviewMachine(state.session);
-    if (away) {
-      state.status = `${target} is on ${away} — open it there (oak attach ${away})`;
       return schedulePaint();
     }
     // The READER'S OWN SETTING FIRST, then the environment. This read only the environment, so the
@@ -2790,7 +3632,7 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
     const ed = prefs.editor?.trim() || process.env.VISUAL || process.env.EDITOR;
     if (!ed) {
       // Name the fix that is one keystroke away before the one that needs a shell restart.
-      state.status = 'no editor set — press o and pick one under EDITOR, or export $EDITOR';
+      state.status = `no editor set — press ${keyForAction('options')} and pick one under Terminal editor, or export $EDITOR`;
       return schedulePaint();
     }
     // Split on whitespace so `EDITOR="code -w"` works. No shell: a path with a space in it must not
@@ -2803,14 +3645,28 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
       state.status = `${parts[0]} opens files, not folders — pick a file row, or set a GUI editor under o`;
       return schedulePaint();
     }
-    // A GUI editor opens its own window and returns. Suspending this terminal for a fork-and-return
-    // child is one full flash of the alternate screen for nothing — so it is spawned DETACHED, the
-    // dashboard never blinks, and the status row says where the file went. Terminal editors get the
-    // real terminal, inherited, and this process waits (below).
-    if (kind === 'gui') {
+    // A session reviewed on another machine names paths on THAT machine; an editor here would open
+    // an empty buffer at a path that does not exist (and create it on save). It opens there instead.
+    const away = reviewMachine(state.session);
+    if (away) return void openOnMachine(away, ed, target, mapDir);
+    launchEditorHere(ed, [target]);
+  }
+
+  /**
+   * Run the reader's editor here on `targets`. A GUI editor opens its own window and returns. Suspending this terminal
+   * for a fork-and-return child is one full flash of the alternate screen for nothing — so it is spawned DETACHED, the
+   * dashboard never blinks, and the status row says where the files went. Terminal editors get the real terminal,
+   * inherited, and this process waits (below).
+   */
+  function launchEditorHere(ed: string, targets: string[]): void {
+    // Split on whitespace so `EDITOR="code -w"` works. No shell: a path with a space in it must not
+    // become two arguments, and these come from the store rather than from the reader.
+    const parts = ed.split(/\s+/).filter(Boolean);
+    if (core.editorKind(ed) === 'gui') {
       let win;
       try {
-        win = core.spawnTool(parts[0], [...parts.slice(1), target], { stdio: 'ignore', cwd, detached: true });
+        // windowsHide: false — the editor's window is the point; the launcher would start it hidden on Windows.
+        win = core.spawnTool(parts[0], [...parts.slice(1), ...targets], { stdio: 'ignore', cwd, detached: true, windowsHide: false });
       } catch (e) {
         state.status = `could not run $EDITOR (${ed}): ${String((e as Error)?.message || e)}`;
         return schedulePaint();
@@ -2828,7 +3684,9 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
     suspendTerminal();
     let child;
     try {
-      child = core.spawnTool(parts[0], [...parts.slice(1), target], { stdio: 'inherit', cwd });
+      // windowsHide: false — an editor not known to be a GUI one is run here and waited on, and may still be one
+      // (notepad): started hidden on Windows, it would hold the app with no window to close.
+      child = core.spawnTool(parts[0], [...parts.slice(1), ...targets], { stdio: 'inherit', cwd, windowsHide: false });
     } catch (e) {
       resumeTerminal();
       state.status = `could not run $EDITOR (${ed}): ${String((e as Error)?.message || e)}`;
@@ -2845,14 +3703,14 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
       state.status = failed;
       schedulePaint();
     });
-    child.on('close', (code: number | null) => {
+    child.on('close', (code: number | null, signal: NodeJS.Signals | null) => {
       resumeTerminal();
       if (failed) {
         state.status = failed; // the spawn never happened; 'close' says nothing about it
-      } else if (code) {
+      } else if (code || signal) {
         // A non-zero exit is not a crash of ours, but it is not "back from" either — the reader's
-        // editor refused, and the file may be unsaved.
-        state.status = `${parts[0]} exited ${code}`;
+        // editor refused, and the file may be unsaved. Nor is one that ctrl+c stopped (the app stays).
+        state.status = `${parts[0]} ${signal ? `was stopped (${signal})` : `exited ${code}`}`;
       } else {
         state.status = `back from ${parts[0]}`;
       }
@@ -2860,8 +3718,112 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
     });
   }
 
+  /** Open `files` in the reader's editor here: the options window's editor first, then $VISUAL and $EDITOR, as `e` does. */
+  function openInEditorHere(files: string[]): void {
+    const ed = prefs.editor?.trim() || process.env.VISUAL || process.env.EDITOR;
+    if (!ed) {
+      state.status = `no editor set — press ${keyForAction('options')} and pick one under Terminal editor, or export $EDITOR`;
+      return schedulePaint();
+    }
+    launchEditorHere(ed, files);
+  }
+
   /**
-   * F1 again: hand the WHOLE terminal to `claude --resume <session>`, in the session's own workspace.
+   * `e` on a session reviewed on a saved machine: the file opens where it lives. A terminal editor runs
+   * there over `ssh -t`, with this terminal handed over as the local launcher hands it; VS Code and
+   * Cursor open it from here through their own Remote-SSH (core.remoteEditorLaunch). The ssh target is
+   * herdr's saved machine, the one `--machine` reaches. Every outcome, the command that ran included,
+   * lands on the status row. One at a time: a second `e` (or key autorepeat) while the first is still
+   * reading the machine list would start a second editor on this one terminal.
+   */
+  let openingOnMachine = false;
+  async function openOnMachine(label: string, ed: string, file: string, dir: boolean): Promise<void> {
+    if (openingOnMachine) return;
+    openingOnMachine = true;
+    try {
+      await launchOnMachine(label, ed, file, dir);
+    } finally {
+      openingOnMachine = false;
+    }
+  }
+
+  /** openOnMachine's one launch: settles once a terminal editor there has given this terminal back. */
+  async function launchOnMachine(label: string, ed: string, file: string, dir: boolean): Promise<void> {
+    const bin = ed.trim().split(/\s+/)[0];
+    const refuse = `${bin} cannot open a file on ${label} — a terminal editor such as nvim, vim or hx runs there over ssh, and code or cursor open it through Remote-SSH: pick one under ${keyForAction('options')}, or run oak attach ${label}`;
+    if (!core.remoteEditorKind(ed, dir)) {
+      state.status = refuse;
+      return schedulePaint();
+    }
+    state.status = `opening ${path.basename(file)} on ${label}…`;
+    schedulePaint();
+    let target = '';
+    try {
+      const herdr = core.findHerdrBin();
+      if (!herdr) throw new Error('herdr is not installed on this machine');
+      const matches = (await core.herdrMachines({ binary: herdr, timeoutMs: 15000 })).filter((x) => x.label === label || x.id === label);
+      // As `--machine` refuses it: two saved machines answer to this name, and either could be meant.
+      if (matches.length > 1) throw new Error(`ambiguous saved machine "${label}" — give it a unique label in herdr`);
+      const m = matches[0];
+      if (!m) throw new Error(`no saved machine "${label}" (oak machine list)`);
+      if (!m.enabled) throw new Error(`saved machine "${label}" is disabled in herdr`);
+      target = m.target;
+    } catch (e) {
+      state.status = `could not open ${path.basename(file)} on ${label}: ${String((e as Error)?.message || e)}`;
+      return schedulePaint();
+    }
+    const launch = core.remoteEditorLaunch(ed, target, file, dir);
+    if (!launch) {
+      state.status = `could not open ${path.basename(file)} on ${label}: invalid ssh target "${target}"`;
+      return schedulePaint();
+    }
+    const ran = [launch.command, ...launch.args].join(' ');
+    if (launch.kind === 'gui') {
+      let win;
+      try {
+        win = core.spawnTool(launch.command, launch.args, { stdio: 'ignore', cwd, detached: true, windowsHide: false }); // a window to show
+      } catch (e) {
+        state.status = `could not run ${ran}: ${String((e as Error)?.message || e)}`;
+        return schedulePaint();
+      }
+      win.on('error', (e: Error) => {
+        state.status = `could not run ${ran}: ${e.message}`;
+        schedulePaint();
+      });
+      win.unref();
+      state.status = `opened ${path.basename(file)} on ${label} in ${bin} — ran ${ran}`;
+      return schedulePaint();
+    }
+    suspendTerminal();
+    let child;
+    try {
+      // `direct`: ssh is a real executable, and the Windows shell route would drop the command's quotes.
+      child = core.spawnTool(launch.command, launch.args, { stdio: 'inherit', cwd, direct: true, env: core.machineSshEnv() });
+    } catch (e) {
+      resumeTerminal();
+      state.status = `could not run ${ran}: ${String((e as Error)?.message || e)}`;
+      return schedulePaint();
+    }
+    let failed = '';
+    child.on('error', (e: Error) => {
+      failed = `could not run ${ran}: ${e.message}`;
+      resumeTerminal();
+      state.status = failed;
+      schedulePaint();
+    });
+    child.on('close', (code: number | null, signal: NodeJS.Signals | null) => {
+      resumeTerminal();
+      // ssh exits 255 when it cannot connect, and otherwise with the editor's own status. ctrl+c while it
+      // connects or asks for a passphrase stops it, and the app stays.
+      state.status = failed || (signal ? `${bin} on ${label} was stopped (${signal}) — ran ${ran}`
+        : code ? `${bin} on ${label} exited ${code} — ran ${ran}` : `back from ${bin} on ${label} — ran ${ran}`);
+      schedulePaint();
+    });
+    await new Promise((resolve) => child.once('close', resolve).once('error', resolve));
+  }
+
+  /**
+   * `r` on the Agent pane: hand the WHOLE terminal to `claude --resume <session>`, in the session's own workspace.
    *
    * The same suspend → spawn(stdio:'inherit') → resume pair `openInEditor` and ^Z use — Claude Code is
    * a full-screen program and gets the real terminal, so typing there is 100% the real CLI: colours,
@@ -2906,7 +3868,7 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
   /**
    * KNOWN LIMIT, deliberate for now: while Claude owns the terminal there is no key that returns to
    * the observatory — the handoff is stdio-inherit, so OUR process cannot see keystrokes at all.
-   * Exiting Claude (`/exit`, ctrl+c) returns instantly, and F1-F1 relaunches `--resume` just as
+   * Exiting Claude (`/exit`, ctrl+c) returns instantly, and `r` relaunches `--resume` just as
    * fast, so the loop is cheap. A true in-place toggle means owning Claude under a PTY and swapping
    * screens — a real feature with a native-dependency decision (node-pty vs the zero-native-deps
    * rule), queued for 0.10 rather than faked here.
@@ -2916,7 +3878,7 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
     if (!ws) {
       // Refuse, loudly. This session's transcript is not under any workspace this machine can see —
       // resuming it from some other directory would hand a writer the wrong tree.
-      state.status = `this session's workspace is not on this machine — F1 needs it to run Claude there`;
+      state.status = `this session's workspace is not on this machine — resuming needs it to run Claude there`;
       return schedulePaint();
     }
     const native = core.nativeSessionCommand(state.session);
@@ -2982,13 +3944,46 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
   // --- terminal setup ---------------------------------------------------------------------------
   observatory = createObservatory(core, state, { cwd, changed: () => { machinesChanged(); schedulePaint(); },
     status(message) { state.status = message; schedulePaint(); },
-    // The poll lists this machine's sessions every tick unless Review is reading another machine's.
-    catalogFresh: () => !state.reviewMachine });
+    // The poll lists this machine's sessions every tick unless Review is reading another machine's, or there is no
+    // session to read: then a store write lists them again here, as it starts a session's own read.
+    processesVisible: () => tabs[active]?.id === 'observatory',
+    // The Observatory Sessions tree also renders fleet states and queued workers.
+    workersVisible: () => {
+      const tab = tabs[active];
+      return !!tab?.root && treeGeom(tab.root).tl.placements.some(p => p.view === 'workers' || p.view === 'sessions-nav');
+    },
+    visibleProcesses: paneId => {
+      const tab = tabs[active];
+      if (tab?.id !== 'observatory' || !tab.root) return [];
+      const pl = treeGeom(tab.root).tl.placements.find(p => p.id === paneId);
+      if (!pl) return [];
+      const boxed = pl.view !== 'sessions-nav' && glyphs.boxes && pl.rect.w >= 4 && pl.rect.h >= 3;
+      const rows = treePaneRows(state, pl.view, pl.rect.w - (boxed ? 2 : 0), glyphs, colorDepth, pl.id);
+      const height = treePaneBodyHeight(state, pl, glyphs);
+      const scroll = Math.max(0, Math.min(state.treeScroll?.[paneId] ?? 0, Math.max(0, rows.length - height)));
+      return rows.slice(scroll, scroll + height).flatMap(row => row.scope?.processId ? [row.scope.processId] : []);
+    },
+    catalogFresh: () => !state.reviewMachine && !!state.session,
+    catalog: (sessions) => { localCatalog = sessions; } });
   void observatory.start().catch(() => undefined).then(() => { searched = true; machinesChanged(); schedulePaint(); });
   enterTerminal();
   out.write('\x1b]11;?\x07'); // ask the terminal its background — the reply event above consumes it
   refreshSize();
   paint(); // immediately, before any data: a blank terminal for several seconds reads as hung
+  // An undecided check (the process table too slow to read) is asked again a few times, the herdr tab still starting no
+  // client meanwhile, before the app settles on it; a decided one applies at once. A herdr that does not answer in time
+  // is decided (outside herdr) and cached, so no later check waits on it again.
+  const settlePane = (context: import('@oak-observatory/core').HerdrPaneContext, tries = 0): void => {
+    if (restored) return;
+    if (context.unknown && tries < 4) {
+      setTimeout(() => { void core.herdrPaneContext().then(next => settlePane(next, tries + 1)); }, 500 * 2 ** tries);
+      return;
+    }
+    applyPaneContext(context);
+    ask();
+    schedulePaint();
+  };
+  void paneContext.then(context => settlePane(context));
   ask();
   tick = setInterval(() => {
     ask();
@@ -3019,13 +4014,23 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
   const input = createNativeInput();
   let escTimer: NodeJS.Timeout | null = null;
 
+  /** One input event, with what it writes to the status line counted as an answer (`inputTurn`). */
+  const onInput = (ev: InputEvent | NativeKeyEvent): void => {
+    inputTurn = ev.t === 'key' || (ev.t === 'mouse' && ev.kind === 'down');
+    try {
+      onEvent(ev);
+    } finally {
+      inputTurn = false;
+    }
+  };
   const onEvent = (ev: InputEvent | NativeKeyEvent): void => {
     if (ev.t === 'key' && 'event' in ev && (ev.event === 'release' || ev.super || ev.hyper || ev.meta)) return;
     // Acting in the Review tab settles what it reviews: the launch no longer moves it (adoptNewestAnywhere).
-    // Leaving it is not acting in it: the leader and the key after it, quit, the other tab-switch keys
-    // (ctrl+n/ctrl+p, alt+<digit>), the tab bar and a click's release are exempt.
-    if (tabs[active]?.id === 'review' && !leaderArmed
-      && !(ev.t === 'key' && ((ev.ctrl && ['a', 'q', 'n', 'p'].includes(ev.key)) || (ev.alt && /^[1-9]$/.test(ev.key))))
+    // Leaving it is not acting in it: quit, the tab-switch keys (Tab, shift+Tab, ctrl+n/ctrl+p,
+    // alt+<digit>, F1 to F3), the tab bar and a click's release are exempt.
+    if (tabs[active]?.id === 'review'
+      && !(ev.t === 'key' && ((ev.ctrl && ['q', 'n', 'p'].includes(ev.key)) || (ev.alt && /^[1-9]$/.test(ev.key))
+        || (!ev.ctrl && !ev.alt && (ev.key === 'tab' || ev.key === 'backtab')) || !!tabKeyOf(ev)))
       && (ev.t === 'key' || ev.t === 'paste' || (ev.t === 'mouse' && ev.kind !== 'move' && ev.kind !== 'up' && hitTest(layout(), ev.col, ev.row)?.t !== 'tabbar'))) adoptOpen = false;
     // Global quit also bypasses typing walls such as the palette and view picker. An AUTO-REPEAT is
     // the same press still held down, never a second one: holding ctrl+q armed the confirmation and
@@ -3035,6 +4040,17 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
       if (!('event' in ev) || ev.event === 'press') requestQuit('ctrl+q');
       return;
     }
+    // OAK's tab keys, F1 to F3, from every tab and over every overlay below, each of which owns the rest of the keyboard.
+    // An auto-repeat is the same press still held down: it raises nothing again.
+    if (ev.t === 'key') {
+      const tab = tabKeyOf(ev);
+      if (tab) {
+        if (!('event' in ev) || ev.event === 'press') tabKeyPressed(tab);
+        return;
+      }
+    }
+    // ^C quits from over these overlays too, as it does from every other mode.
+    if (ev.t === 'key' && ev.ctrl && !ev.alt && ev.key === 'c' && (searchOpen || viewPickOpen || paletteOpen || inboxOpen)) return onKey(ev);
     // The conversation-search results own input the same way while they are up.
     if (searchOpen) {
       if (ev.t === 'key') return searchKey(ev);
@@ -3112,31 +4128,96 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
 
   const routeInput = (part: NativeInputPart): void => {
     if (routeNativeHostReply(part.bytes)) return;
+    // The window regaining focus repaints every row, so a terminal's "clear buffer" heals. Before the routing below:
+    // on a native tab the report goes on to the program too.
+    if (part.events.some(ev => ev.t === 'focus' && ev.focused)) { onScreen = null; schedulePaint(); }
     const tab = tabs[active];
     const sess = tab?.kind === 'native' ? nativeSessions.get(tab.id) : undefined;
+    // A held button's motion and release go wherever its press went (buttonHeld). A release, the next press, or motion
+    // with no button held ends the hold. That motion means the release was let go outside the window: OAK takes it as
+    // the release of a selection of its own (onMouse), and the program gets it only where any motion would reach it.
+    const first = part.events[0];
+    const mouse = first?.t === 'mouse' ? first : undefined;
+    const lost = mouse?.kind === 'move' && mouse.button === 3;
+    const holder = mouse?.kind === 'up' || (mouse?.kind === 'move' && !(lost && buttonHeld === 'program')) ? buttonHeld : null;
+    const programWasHolding = buttonHeld === 'program';
+    if (mouse?.kind === 'up' || mouse?.kind === 'down' || lost) buttonHeld = null;
+    if ((mouse?.kind === 'down' && mouse.button === programLetGo) || lost) programLetGo = null;
     const key = part.events.find(ev => ev.t === 'key');
+    // ctrl+q is OAK's on every tab (unless herdr's prefix is ctrl+q: herdrPrefixPart). ctrl+a is the program's (line start in both agents): OAK has no
+    // leader of its own, and on the herdr tab it listens on herdr's prefix instead.
     const ownKey = key?.t === 'key' && key.ctrl && !key.alt && !key.shift &&
-      !('super' in key && (key.super || key.hyper || key.meta)) && (key.key === 'a' || key.key === 'q');
-    if (sess && !sess.ended && !state.overlay && !leaderArmed && !ownKey) {
+      !('super' in key && (key.super || key.hyper || key.meta)) && key.key === 'q';
+    // On the herdr tab OAK's tab keys go first, as a click on its tab bar does; then a held ctrl+q (its second press
+    // quits; anything else sends it on), then herdr's prefix, then a first ctrl+q, which arms the quit and is held. The
+    // program's own motion and release reach it wherever they are let go (holder).
+    const heldByProgram = holder === 'program';
+    if (sess && !sess.ended && !state.overlay && tab.id === 'herdr'
+      && (herdrTabKeyPart(part) || (quitHeld && herdrQuitPart(part, sess, heldByProgram)) || herdrPrefixPart(part, sess, heldByProgram)
+        || (ownKey && herdrQuitPart(part, sess, heldByProgram)))) return;
+    if (sess && !sess.ended && !state.overlay && !ownKey) {
       // Only actual mouse events need coordinates. In particular a pasted escape sequence is text.
-      if (part.events[0]?.t !== 'mouse') { sess.write(part.bytes); return; }
-      const lay = layout();
-      const topRows = lay.tabbar.length ? 1 : 0; // single-row tab bar (no rules)
-      const bodyRows = Math.max(0, lay.rows - topRows - lay.chrome.bottom + 1);
-      const translated = translateNativeMouse(part.bytes, topRows, bodyRows);
-      for (const mousePart of translated.parts) {
-        if (mousePart.target === 'chrome') { for (const ev of part.events) onEvent(ev); }
-        else sess.write(mousePart.bytes);
+      if (!mouse) { sess.write(part.bytes); return; }
+      // A selection on OAK's bottom rows holds the pointer until its release, wherever it goes: its motion over the
+      // program's screen must not reach the program as a drag it never saw begin.
+      if (holder === 'oak') { for (const ev of part.events) onInput(ev); return; }
+      // A drag in the program's screen let go over OAK's rows ends in the program, on the nearest row of its screen that
+      // OAK shows: herdr kept such a selection highlighted and copied nothing, and a program reading the mouse got a press
+      // with no release.
+      if (heldByProgram) {
+        for (const mousePart of translateNativeMouse(part.bytes, ...nativeBodyRows(), undefined, true).parts) if (mousePart.target === 'pty') toProgram(sess, mousePart.bytes);
+        return;
       }
+      if (programLetGo !== null && (mouse.kind === 'move' || mouse.kind === 'up') && mouse.button === programLetGo) {
+        if (mouse.kind === 'up') programLetGo = null;
+        return;
+      }
+      // A press while a selection of OAK's is armed means its release was lost: the selection is dropped, as onMouse
+      // drops it, and the press goes where any press goes, as the wheel does.
+      if (textDrag && mouse.kind === 'down') {
+        textDrag = null;
+        schedulePaint();
+      }
+      const translated = translateNativeMouse(part.bytes, ...nativeBodyRows());
+      const reaches = translated.parts.some((p) => p.target === 'pty');
+      // Two buttons at once: a press on OAK's rows or tab bar while the program holds a button lets go of that one first,
+      // and the rest of that button's gesture is no one's (programLetGo).
+      if (mouse.kind === 'down' && programWasHolding && !reaches) letProgramGo(sess);
+      for (const mousePart of translated.parts) {
+        if (mousePart.target === 'chrome') { for (const ev of part.events) onInput(ev); }
+        else toProgram(sess, mousePart.bytes);
+      }
+      if (mouse.kind === 'down') buttonHeld = reaches ? 'program' : 'oak';
       return;
     }
-    for (const ev of part.events) onEvent(ev);
+    if (mouse?.kind === 'down') buttonHeld = 'oak';
+    for (const ev of part.events) onInput(ev);
   };
+  /** The rows of a native tab's program that the last frame showed: below the single-row tab bar, above OAK's divider.
+   *  A status row that speaks takes the program's last row, under the divider (bottomChrome), and what the reader sees
+   *  there is OAK's. */
+  const nativeBodyRows = (): [top: number, body: number] => {
+    const lay = layout();
+    const top = lay.tabbar.length ? 1 : 0;
+    const body = Math.max(0, lay.rows - top - lay.chrome.bottom + 1);
+    return [top, lastBottom ? Math.max(0, Math.min(body, lastBottom.first - 1 - top)) : body];
+  };
+  /** Whether a part with a mouse report in it reaches the program's screen: a click on OAK's tab bar, or on
+   *  the rows under the program's screen, never does; the motion and release of a button the program holds (`held`)
+   *  always do. */
+  const reachesProgram = (part: NativeInputPart, held = false): boolean =>
+    translateNativeMouse(part.bytes, ...nativeBodyRows(), undefined, held).parts.some((p) => p.target === 'pty' && p.bytes.length > 0);
 
   process.stdin.on('data', (buf: Buffer) => {
+    // A verb run on the terminal (runOnTerminal) has its last words on screen until Enter.
+    if (holdForEnter) {
+      // Enter, or ctrl+d / ctrl+c: each means "back to OAK" here (raw mode reads them as keys).
+      if (buf.includes(13) || buf.includes(10) || buf.includes(4) || buf.includes(3)) holdForEnter();
+      return;
+    }
     if (escTimer) { clearTimeout(escTimer); escTimer = null; }
-    // Route each key in order: ctrl+a and its following CSI-u key can share or span reads, and a
-    // native key after the leader's tab switch belongs to the newly active tab.
+    // Route each key in order: herdr's prefix and its following CSI-u key can share or span reads, and a
+    // native key after the prefix's tab switch belongs to the newly active tab.
     for (const part of input.push(buf)) routeInput(part);
     if (input.pending() === '\x1b') {
       escTimer = setTimeout(() => {
@@ -3147,6 +4228,8 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
     }
   });
 
+  /** The lines an overlay's list gets under its title, measured from the frame's own chrome. */
+  const overlayRows = (): number => overlayListRows(state, layout(), frameCols, frameRows, glyphs);
   /** The layout this frame is using. Resolved from the same inputs the renderer resolves from, so a
    *  click and a glyph can never disagree about where a pane is. */
   function layout(): Layout {
@@ -3185,8 +4268,8 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
     return { tl, topRows, cols: lay.cols, bodyH };
   }
 
-  /** Advance a tree tab's focus to the next VISIBLE pane (fold/zoom-aware, via treeGeom). Shared by the
-   *  leader's `tab` command and the top-level Tab key. */
+  /** Advance a tree tab's focus to the next VISIBLE pane (fold/zoom-aware, via treeGeom). Run by the
+   *  palette's “Focus the next pane” row. */
   function cycleTreeFocus(tab: TabState): void {
     if (!tab.root) return;
     const ids = treeGeom(tab.root).tl.placements.map((p) => p.id);
@@ -3226,18 +4309,22 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
    *  which drives the detail beside it — and scrolls the master so the pick stays in view. The row order
    *  and the scopes come from the master's OWN producer, so keyboard and mouse can never disagree. */
   function navObservatory(dir: 1 | -1): void {
+    workspaceGroupSelection = undefined;
     const root = tabs[active]?.root;
     if (!root) return;
     const master = () => treeGeom(root).tl.placements.find((p) => p.view === 'sessions-nav');
     // Each session once, in painted order, with the rows of its entry: its first listing and the rows
-    // right after it. A fold that lists the session again further down is not part of its entry.
+    // right after it. A fold that lists the session again further down is not part of its entry. Each of its
+    // worker group's rows drawn under it (its summary, a state's header, a worker) is an entry of its own, so the
+    // arrows pick it as they pick a session.
+    const entryKey = (sc: ObservatorySelection | string): string => typeof sc === 'string' ? sc : `${sc.machineId}:${sc.session}:${sc.workers ?? ''}:${sc.agentId ?? ''}`;
     const sessionsIn = (rows: DashRow[]) => {
-      const uniq: ObservatorySelection[] = [];
+      const uniq: (ObservatorySelection | string)[] = [];
       const span = new Map<string, [number, number]>();
       rows.forEach((r, i) => {
-        const sc = r.scope;
+        const sc = r.scope ?? (r.openPath?.startsWith('done:') && !r.cont ? r.openPath : undefined);
         if (!sc) return;
-        const key = `${sc.machineId}:${sc.session}`;
+        const key = entryKey(sc);
         const seen = span.get(key);
         if (!seen) { uniq.push(sc); span.set(key, [i, i]); }
         else if (seen[1] === i - 1) seen[1] = i;
@@ -3248,15 +4335,20 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
     if (!pl) return;
     const { uniq } = sessionsIn(treePaneRows(state, pl.view, pl.rect.w, glyphs, colorDepth, pl.id));
     if (!uniq.length) return;
-    const cur = state.scopeWorker ? uniq.findIndex((s) => s.session === state.scopeWorker!.session && s.machineId === state.scopeWorker!.machineId) : -1;
+    const at = (sc: ObservatorySelection | string): number => uniq.findIndex((s) => entryKey(s) === entryKey(sc));
+    // A picked row of a worker group that is no longer drawn (its worker finished, or its group closed): the
+    // arrows go on from its session.
+    let cur = state.observatoryFold ? at(state.observatoryFold) : state.scopeWorker ? at(state.scopeWorker) : -1;
+    if (cur < 0 && state.scopeWorker) cur = at({ ...state.scopeWorker, agentId: undefined, workers: undefined });
     // From no selection, `down` lands on the first row and `up` on the last — the natural first step.
     const start = cur < 0 ? (dir > 0 ? -1 : uniq.length) : cur;
     const pick = uniq[Math.max(0, Math.min(uniq.length - 1, start + dir))];
-    state.scopeWorker = pick;
+    state.observatoryFold = typeof pick === 'string' ? pick : undefined;
+    state.scopeWorker = typeof pick === 'string' ? null : pick;
     // Review follows the cursor as it follows a pin: the session the Observatory
     // shows is the one the Review tab opens on, read on the machine its row names.
-    if (tabs[active]?.id === 'observatory') targetReview(pick.session, pick);
-    state.status = `${pick.label} — Enter pins its conversation`;
+    if (typeof pick !== 'string' && tabs[active]?.id === 'observatory') targetReview(pick.session, pick);
+    state.status = typeof pick === 'string' ? 'Done sessions — Enter opens or closes them' : pick.workers === 'all' ? `${pick.label} · its workers — Enter opens or closes them` : `${pick.label} — Enter pins its conversation`;
     // Measure only now: a status that speaks takes the tree's last row, and the selection decides which
     // rows exist (a selected session surfaces under its machine while its fold is closed).
     pl = master() ?? pl;
@@ -3265,7 +4357,7 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
     // `+N more` hint that takes the body's last row while rows remain below. Moving up brings the
     // workspace and machine headers directly above it into view too, so the pick shows whose it is.
     const bodyH = Math.max(1, pl.rect.h - 1);
-    const [first, last] = sessionsIn(rows).span.get(`${pick.machineId}:${pick.session}`) ?? [0, 0];
+    const [first, last] = sessionsIn(rows).span.get(entryKey(pick)) ?? [0, 0];
     let top = first;
     while (top > 0 && !rows[top - 1].scope) top--;
     let scroll = Math.max(0, Math.min(state.treeScroll?.[pl.id] ?? 0, Math.max(0, rows.length - bodyH)));
@@ -3280,12 +4372,23 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
    *  it to the body, and hand renderDashFrame the styled grid. Cleared on any non-native tab. */
   function updateNativeGrid(): void {
     const tab = tabs[active];
+    if (tab?.id === 'herdr' && paneContextPending) {
+      state.nativeGrid = null;
+      state.nativeNote = null;
+      return;
+    }
     if (tab?.kind !== 'native') {
       state.nativeGrid = null;
       state.nativeNote = null;
       // Off a remote tab: detach, so the server stops pushing rows nobody paints. The program runs on.
       return;
     }
+    const herdrKeys = tab.id === 'herdr' ? herdrConfig() : undefined;
+    state.herdrPrefix = herdrKeys?.label;
+    // No way back by key when herdr's prefix is one this reader cannot follow from every terminal (ctrl+shift on a letter
+    // needs the kitty keyboard protocol): the hint says to click instead.
+    state.herdrBack = herdrKeys ? (herdrKeys.prefix ? herdrKeys.oak[0] ?? null : null) : undefined;
+    state.herdrTabs = herdrKeys ? core.OAK_TAB_KEYS.filter((k) => !herdrKeys.tabTaken[k]) : undefined;
     // The program in a native tab owns the pointer — ours steps back to the arrow while it is up.
     if (pointerShape !== 'default') setPointer('default');
     const fail = (note: string): void => {
@@ -3307,9 +4410,6 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
     if (sess && nativeFailed.has(tab.id) && !ownWords(sess)) return fail(launchFailed);
     if (!sess) {
       if (!nativeAvailable()) return fail('node-pty is not installed — passthrough is unavailable on this machine');
-      // OAK is already running inside a herdr pane (the tmux-attach model): herdr refuses to nest, so
-      // do not spawn a second one in the herdr tab. herdr IS the host session here — its own keys drive it.
-      if (tab.id === 'herdr' && process.env.HERDR_PANE_ID) return fail("you're already inside herdr — it is the host session here; press ctrl+b to move between its tabs and panes. OAK's Observatory and Review tabs (above) are what this window is for.");
       if (nativeFailed.has(tab.id)) return fail(launchFailed);
       // The session's root when it exists on this machine (a synced session's root may not — see spawnCwd).
       const ws = spawnCwd(sessionRoot());
@@ -3319,7 +4419,8 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
       // Claude Code session carries that session's identity into every pane (see
       // core's stripSessionIdentity) — so the identity is dropped from the spawn, not passed on.
       const identityStrip = tab.id === 'herdr'
-        ? Object.fromEntries(Object.keys(process.env).filter((k) => core.isSessionIdentityKey(k)).map((k) => [k, undefined]))
+        ? Object.fromEntries(Object.keys(process.env).filter((k) => core.isSessionIdentityKey(k)
+          || ['HERDR_PANE_ID', 'HERDR_TAB_ID', 'HERDR_WORKSPACE_ID', 'HERDR_ENV'].includes(k)).map((k) => [k, undefined]))
         : {};
       const spawned = spawnNative(cmd[0], cmd.slice(1), lay.cols, bodyH, ws, tab.name ?? cmd[0], { ...identityStrip, OAK_TAB: `${tab.id}@${process.pid}` });
       if (!spawned) {
@@ -3327,6 +4428,14 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
         return fail(launchFailed);
       }
       spawned.onUpdate(() => schedulePaint());
+      // Background panes and covered screens stay quiet; the writer also gates terminal handovers.
+      spawned.onBell?.(() => {
+        if (tabs[active]?.id === tab.id && !state.overlay && !state.confirm) out.write('\x07');
+      });
+      // What herdr copies as OSC 52 (its own selection, or what a program in its pane wrote) goes on through OAK's own
+      // door, to the terminal OAK runs in. herdr shows that it copied, so OAK adds no toast; it says only a copy it
+      // cannot make.
+      spawned.onClipboard?.((text) => copyText(text, ''));
       // A detached client returns to Observatory; the fixed herdr tab remains available. A child
       // that dies almost immediately never
       // really started — a bad command whose exec failed (node-pty forks, then the exec 127s) — so that
@@ -3342,7 +4451,7 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
     sess.setHostActive?.(true, [2004, 1004, ...(mouse ? [1003, 1006] : [])]);
     sess.resize(lay.cols, bodyH);
     state.nativeGrid = sess.grid(lay.cols, bodyH, colorDepth);
-    state.nativeNote = sess.ended ? `${tab.name ?? 'the program'} exited — ctrl+a then n/p leaves` : null;
+    state.nativeNote = sess.ended ? `${tab.name ?? 'the program'} exited — Tab or ctrl+n goes to OAK's tabs` : null;
   }
 
   /** The screen behind the focused pane's selected tab. */
@@ -3450,25 +4559,66 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
    *  native tools write the REMOTE machine's clipboard — the wrong one — so the escape stays the
    *  only honest path there and oversize stays a refusal. */
   const REMOTE_CLIPBOARD = !!(process.env.SSH_CONNECTION || process.env.SSH_TTY || process.env.WSL_DISTRO_NAME || process.env.WSLENV);
+  /** One copy process at a time on each path, tmux's buffer and the system's tools: while one runs the newest copy
+   *  waits, and an older one waiting is dropped, since only the newest would stay on the clipboard. A program in herdr's
+   *  pane that writes the clipboard on every change started a process for every write. A process that has not finished
+   *  in ten seconds holds its path no longer: it is stopped (`stop`, which a copy sets for the process it runs), a toast
+   *  says that nothing was copied, and what it does after is not heard. Failing late, it ran the next tool with its older
+   *  text after a newer copy. */
+  const copying: Record<'tmux' | 'tools', { busy: boolean; next: ((done: () => void) => void) | null; stop: (() => void) | null }> = {
+    tmux: { busy: false, next: null, stop: null },
+    tools: { busy: false, next: null, stop: null },
+  };
+  const oneCopyAtATime = (via: 'tmux' | 'tools', run: (done: () => void) => void): void => {
+    const lane = copying[via];
+    if (lane.busy) {
+      lane.next = run;
+      return;
+    }
+    lane.busy = true;
+    let finished = false;
+    const done = (): void => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(stuck);
+      lane.busy = false;
+      const next = lane.next;
+      lane.next = null;
+      if (next) oneCopyAtATime(via, next);
+    };
+    const stuck = setTimeout(() => {
+      lane.stop?.();
+      done();
+    }, 10_000);
+    stuck.unref?.();
+    run(done);
+  };
+  /** What a copy says when the ten-second release stopped its process: nothing reached the clipboard. herdr said that it
+   *  copied, so a copy of herdr's is named. */
+  const copyStopped = (cmd: string, doneMsg: string, refuseTail: string): void =>
+    copyRefused(`${doneMsg ? 'nothing copied' : "herdr's copy did not reach the clipboard"}: ${cmd} did not finish in 10 s${refuseTail}`);
   /**
    * The ONE clipboard door (adopted from herdr). Within the OSC 52 ceiling: the escape,
    * which works locally and remotely alike. Past it, on a LOCAL terminal: pipe to the platform's
    * own tool (wl-copy → xclip → pbcopy — first present wins), because the ceiling exists only for
    * the escape. Past it remotely, or with no tool: the same loud refusal as ever — never truncate.
+   * An empty `doneMsg` is a copy herdr made: herdr says so itself, so OAK adds no toast, and a refusal names herdr's copy.
    */
   const copyText = (text: string, doneMsg: string, refuseTail = ''): void => {
     const payload = Buffer.from(text, 'utf8').toString('base64');
     const plan = clipboardPlan(payload.length, { remote: REMOTE_CLIPBOARD, platform: process.platform, tmux: !!process.env.TMUX });
-    if (plan.via === 'tmux') {
-      // THROUGH tmux, never past it: under the default `set-clipboard external` tmux IGNORES an
-      // inner application's OSC 52 — the escape died in tmux while the toast said "copied"
-      // (verified live). `load-buffer -w` is tmux's own door: the paste buffer gets
-      // the text unconditionally (prefix ] pastes), and tmux forwards it to the outer terminal's
-      // clipboard — its OWN copies are exactly what `external` permits. A failed spawn (a tmux too
-      // old for `-w`) falls back to the ordinary ladder.
+    if (plan.via !== 'tmux') return copyVia(plan, text, payload, doneMsg, refuseTail);
+    // THROUGH tmux, never past it: under the default `set-clipboard external` tmux IGNORES an
+    // inner application's OSC 52 — the escape died in tmux while the toast said "copied"
+    // (verified live). `load-buffer -w` is tmux's own door: the paste buffer gets
+    // the text unconditionally (prefix ] pastes), and tmux forwards it to the outer terminal's
+    // clipboard — its OWN copies are exactly what `external` permits. A failed spawn (a tmux too
+    // old for `-w`) falls back to the ordinary ladder.
+    oneCopyAtATime('tmux', (done) => {
       const fallback = (): void => {
         const p = clipboardPlan(payload.length, { remote: REMOTE_CLIPBOARD, platform: process.platform });
         if (p.via !== 'tmux') copyVia(p, text, payload, doneMsg, refuseTail); // tmux can't recur: the flag is off
+        done();
       };
       let child;
       try {
@@ -3476,20 +4626,28 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
       } catch {
         return fallback();
       }
-      child.on('error', fallback);
+      // A failed spawn can report both an error and an exit: the first decides. Stopped, it decides nothing.
+      let settled = false;
+      copying.tmux.stop = () => {
+        settled = true;
+        child.kill();
+        copyStopped('tmux', doneMsg, refuseTail);
+      };
+      child.on('error', () => {
+        if (settled) return;
+        settled = true;
+        fallback();
+      });
       child.stdin!.on('error', () => { /* the exit code decides; a dead pipe is not news */ });
       child.on('exit', (code: number | null) => {
-        if (code === 0) {
-          state.toast = { text: `${doneMsg} via tmux`, until: Date.now() + 2500 };
-          const t = setTimeout(() => schedulePaint(), 2600);
-          t.unref?.();
-          schedulePaint();
-        } else fallback();
+        if (settled) return;
+        settled = true;
+        if (code !== 0) return fallback();
+        copyToast(doneMsg && `${doneMsg} via tmux`);
+        done();
       });
       child.stdin!.end(text);
-      return;
-    }
-    return copyVia(plan, text, payload, doneMsg, refuseTail);
+    });
   };
 
   /** The non-tmux rungs of the one clipboard door — the escape within its ceiling, the platform's
@@ -3504,44 +4662,63 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
   ): void => {
     if (plan.via === 'osc52') {
       out.write(`\x1b]52;c;${payload}\x07`);
-      state.toast = { text: doneMsg, until: Date.now() + 2500 };
-      const t = setTimeout(() => schedulePaint(), 2600);
-      t.unref?.();
-      return schedulePaint();
+      return copyToast(doneMsg);
     }
+    // Too large for OSC 52. herdr's copy is named: nothing OAK selected was.
+    const tooLarge = `${doneMsg ? 'too large to copy through the terminal' : "herdr's copy is too large for the terminal"} (${Math.round(payload.length / 1024)}KB, limit ~73KB)`;
     if (plan.via === 'tools') {
       const tools = plan.tools;
-      const tryTool = (i: number): void => {
-        if (i >= tools.length) {
-          state.status = `too large to copy through the terminal (${Math.round(payload.length / 1024)}KB, limit ~73KB) — install wl-copy or xclip for big copies${refuseTail}`;
-          return schedulePaint();
-        }
-        const [cmd, args] = tools[i];
-        let child;
-        try {
-          child = core.spawnTool(cmd, args, { stdio: ['pipe', 'ignore', 'ignore'] });
-        } catch {
-          return tryTool(i + 1);
-        }
-        child.on('error', () => tryTool(i + 1));
-        // A fast-exiting tool (wl-copy with no Wayland session) EPIPEs the pending write — an
-        // unhandled stream error is an uncaughtException that kills the whole review (proven by
-        // the re-review's positive control). The exit handler already advances the ladder.
-        child.stdin!.on('error', () => { /* the exit code decides; a dead pipe is not news */ });
-        child.on('exit', (code: number | null) => {
-          if (code === 0) {
-            state.toast = { text: `${doneMsg} via ${cmd}`, until: Date.now() + 2500 };
-            const t = setTimeout(() => schedulePaint(), 2600);
-            t.unref?.();
-            schedulePaint();
-          } else tryTool(i + 1);
-        });
-        child.stdin!.end(text);
-      };
-      return tryTool(0);
+      return oneCopyAtATime('tools', (done) => {
+        // The tools that ran and failed (with no display to copy to, say) are named: installing one would not help. One
+        // that is not installed is named to install (on X11, xclip where wl-copy has no Wayland display); pbcopy is macOS's.
+        const failed: string[] = [], missing: string[] = [];
+        const tryTool = (i: number): void => {
+          if (i >= tools.length) {
+            copyRefused(`${tooLarge}${failed.length ? `, and ${failed.join(' and ')} failed` : ''}${missing.length ? ` — install ${missing.join(' or ')} for big copies` : ''}${refuseTail}`);
+            return done();
+          }
+          const [cmd, args] = tools[i];
+          const absent = (): void => {
+            if (cmd !== 'pbcopy') missing.push(cmd);
+            tryTool(i + 1);
+          };
+          let child;
+          try {
+            child = core.spawnTool(cmd, args, { stdio: ['pipe', 'ignore', 'ignore'] });
+          } catch {
+            return absent();
+          }
+          let settled = false;
+          copying.tools.stop = () => {
+            settled = true;
+            child.kill();
+            copyStopped(cmd, doneMsg, refuseTail);
+          };
+          child.on('error', () => {
+            if (settled) return;
+            settled = true;
+            absent();
+          });
+          // A fast-exiting tool (wl-copy with no Wayland session) EPIPEs the pending write — an
+          // unhandled stream error is an uncaughtException that kills the whole review (proven by
+          // the re-review's positive control). The exit handler already advances the ladder.
+          child.stdin!.on('error', () => { /* the exit code decides; a dead pipe is not news */ });
+          child.on('exit', (code: number | null) => {
+            if (settled) return;
+            settled = true;
+            if (code !== 0) {
+              failed.push(cmd);
+              return tryTool(i + 1);
+            }
+            copyToast(doneMsg && `${doneMsg} via ${cmd}`);
+            done();
+          });
+          child.stdin!.end(text);
+        };
+        tryTool(0);
+      });
     }
-    state.status = `too large to copy through the terminal (${Math.round(payload.length / 1024)}KB, limit ~73KB) — select less${refuseTail}`;
-    schedulePaint();
+    copyRefused(`${tooLarge}${doneMsg ? ' — select less' : ''}${refuseTail}`);
   };
 
   /** Route pasted text to whoever owns the keyboard — the Observatory's reply box when it has focus
@@ -3550,16 +4727,36 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
    *  destructive verbs. One door for the terminal's bracketed paste AND the app's own ^V. */
   const routePaste = (raw: string): void => {
     const replyPane = focusedReplyPane();
+    // One line of text, as each of the boxes below takes.
+    const line = (): string => raw.replace(/[\r\n\t]+/g, ' ').replace(/[\x00-\x1f\x7f-\x9f]/g, '');
     if (replyPane) {
       const reply = state.observatory!.details[replyPane].reply!;
-      const text = raw.replace(/[\r\n\t]+/g, ' ').replace(/[\x00-\x1f\x7f-\x9f]/g, '');
+      const text = line();
       observatory?.editReply(replyPane, reply.text.slice(0, reply.caret) + text + reply.text.slice(reply.caret), reply.caret + text.length);
     } else if (filterOpen) {
       state.filter += raw.replace(/[\r\n]/g, '');
       clampCursor();
       schedulePaint();
+    } else if (state.overlay && pickerFilter !== null && !state.confirm) {
+      // The session picker's search box.
+      pickerFilter += line();
+      pickerTyped();
+    } else if (paletteOpen) {
+      paletteFilter += line();
+      paletteCursor = 0;
+      renderPalette();
+    } else if (state.overlay && helpFilter !== null) {
+      helpFilter += line();
+      rerenderHelp();
+    } else if (diffFindOpen) {
+      diffFind += line();
+      state.status = `find in diff: ${diffFind}`;
+      schedulePaint();
     }
   };
+  /** Whether anything on screen takes text a paste would go into (routePaste's list). */
+  const takesPaste = (): boolean => !!focusedReplyPane() || filterOpen || !!(state.overlay && pickerFilter !== null && !state.confirm)
+    || paletteOpen || !!(state.overlay && helpFilter !== null) || diffFindOpen;
 
   /** How much of a clipboard ^V will take. A runaway buffer pasted into the prompt would wrap
    *  megabytes per paint; half a MB is far past any real prompt and still instant. */
@@ -3570,14 +4767,21 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
    *  own paste where neither can reach the right clipboard (remote, no tmux: the machine's tools
    *  would read the REMOTE clipboard, which is not the one the reader means). */
   const pasteFromClipboard = (): void => {
+    // Only what takes text takes a paste. Elsewhere the paste went nowhere while the status
+    // row said "pasted N chars".
+    if (!takesPaste()) {
+      state.status = `nothing here takes a paste — ^V pastes into the filter (${keyForAction('filter')}), a search box or a reply box`;
+      return schedulePaint();
+    }
     const deliver = (text: string): void => {
       if (!text) {
         state.status = 'nothing to paste';
         return schedulePaint();
       }
       const cut = text.length > PASTE_MAX;
-      routePaste(cut ? text.slice(0, PASTE_MAX) : text);
-      state.status = cut ? `pasted the first ${Math.round(PASTE_MAX / 1024)}KB — the clipboard held more` : `pasted ${text.length} chars`;
+      // Cut where a character ends: cut at a UTF-16 index, the paste could end in half of an emoji's surrogate pair.
+      routePaste(cut ? core.graphemeHead(text, PASTE_MAX) : text);
+      state.status = cut ? `pasted the first ${Math.round(PASTE_MAX / 1024)}KB — the clipboard held more` : `pasted ${charCount(text)}`;
       schedulePaint();
     };
     const run = (plan: ReturnType<typeof pastePlan>): void => {
@@ -3602,12 +4806,14 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
           return tryTool(i + 1);
         }
         let out = '';
+        // Decoded as one stream: decoded read by read, a character whose bytes two reads split came out as U+FFFDs.
+        const utf8 = new StringDecoder('utf8');
         child.stdout!.on('data', (d: Buffer) => {
-          if (out.length <= PASTE_MAX) out += d.toString('utf8');
+          if (out.length <= PASTE_MAX) out += utf8.write(d);
         });
         child.on('error', () => tryTool(i + 1));
         child.on('exit', (code: number | null) => {
-          if (code === 0) deliver(out);
+          if (code === 0) deliver(out + utf8.end());
           else tryTool(i + 1);
         });
       };
@@ -3617,17 +4823,17 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
   };
 
   const copySpan = (a: { row: number; col: number }, b: { row: number; col: number }, clip?: SpanClip): void => {
-    const plain = lastPainted.map((l) => l.replace(/\x1b\[[0-9;]*m/g, ''));
-    const text = sliceSpan(plain, a, b, clip);
+    // Every colour form the row passes (sanitizeCell), the colon-separated one too.
+    const plain = lastPainted.map(stripSgr);
+    // The status row is cut at the terminal's edge, never wrapped: the bottom rows keep one height, which the panes
+    // and herdr's screen are sized by. A selection from its text to that edge takes the rest of the status too.
+    const text = selectedText(plain, a, b, clip, lastBottom, frameCols);
     // A drag entirely in right-edge padding selects nothing — writing '' would CLEAR the reader's
     // clipboard under a "copied 0 chars" toast, which is worse than saying so.
-    if (!text) {
-      state.status = 'nothing under that selection — it was all padding';
-      return schedulePaint();
-    }
+    if (!text) return copyRefused('nothing under that selection — it was all padding');
     // One door for every copy (see copyText): OSC 52 within bounds, the platform's own tool past
     // them on a local terminal — and the same honest refusal where neither can work.
-    copyText(text, `copied ${text.length} chars to clipboard`);
+    copyText(text, `copied ${charCount(text)} to clipboard`);
   };
 
   // `button` is on the wire and always has been — 0 left, 1 middle, 2 right — it simply was not in
@@ -3637,7 +4843,7 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
     // so (a terminal that does not report any-motion, a release let go outside the window). Drop it
     // without acting — no copy, no late click — and take the press as itself: the stale press's click
     // fired under the next click, and a seam drag copied text nobody selected.
-    if (textDrag && ev.kind === 'down') textDrag = null;
+    if (textDrag && ev.kind === 'down') endTextDrag();
     // An armed text selection owns move/up until the button comes up. Checked before the seam drag
     // for the same reason the seam drag is checked before hit-testing: motion leaves the start cell
     // immediately. On a dock tab the press's own click has ALREADY done its work (selection is instant
@@ -3660,14 +4866,14 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
         // a tree tab: a status that starts speaking takes a row from the panes, and a conversation
         // following its tail slid one line under the anchor mid-drag. The band says it there, as in herdr.
         if (textDrag.moved) {
-          if (!textDrag.click) state.status = 'selecting — release to copy'; // not on a tree tab (above)
+          if (!textDrag.click) state.status = SELECTING; // not on a tree tab (above)
           schedulePaint();
         }
         return;
       }
       if (released) {
         const td = textDrag;
-        textDrag = null;
+        endTextDrag();
         if (td.moved) {
           // The span OUTLIVES the release: kept and painted until the next key or click,
           // stored normalized so the paint pass never re-derives direction, held to its pane. A tree
@@ -3675,6 +4881,12 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
           // herdr's does: those panes are live, a kept band would sit over whatever scrolled under it,
           // and the toast already says what was copied.
           if (!td.click) state.selSpan = { ...normSpan(td), ...(td.clip ? { clip: td.clip } : {}) };
+          // The bottom rows moved under a selection held on them: the status row went (a toast ran out, or herdr's
+          // prefix note went with the press), so the selection now lies on the divider or another row, which nobody
+          // selected. Nothing is copied, and a toast says so.
+          if (td.bottom && (!lastBottom || Math.min(td.startRow, td.lastRow) < lastBottom.first)) {
+            return copyRefused('nothing copied: the rows under the selection moved before its release');
+          }
           return copySpan({ row: td.startRow, col: td.startCol }, { row: td.lastRow, col: td.lastCol }, dragClip(td));
         }
         if (td.click) return td.click();
@@ -3760,6 +4972,11 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
       // I-beam over text, an arrow-hand on a tab. One hit-test per motion event (~0.06 ms), one
       // OSC 22 write per CHANGE — a sweep across a pane writes nothing.
       syncPointer(ev.col, ev.row);
+      const overUsage = ev.row === frameRows - 2;
+      if (overUsage !== !!state.hoverUsage) {
+        state.hoverUsage = overUsage;
+        schedulePaint();
+      }
       // ROW 0 FIRST, before anything else touches the layout. Two reasons, both measured:
       //
       //  - `layout()` is not a read. It LATCHES forced-minimized panes, writing `state.panes` and
@@ -3820,6 +5037,16 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
     }
     if (state.overlay) {
       if (ev.row === 0) return void closeOverlay();
+      return;
+    }
+    // THE BOTTOM ROWS (the status row, the usage bar, the key row) lie outside every pane, on every tab: a left press
+    // there arms a selection held to them, as a pane's is held to its own. Its click, a release that never moved,
+    // does what a click there always did, which is nothing; and while it is held it leaves the status row alone,
+    // since that row may be what is being selected.
+    if ((ev.button ?? 0) === 0 && lastBottom && ev.row >= lastBottom.first) {
+      const clip = { x0: 0, x1: frameCols - 1, y0: lastBottom.first, y1: lastPainted.length - 1 };
+      const col = Math.max(clip.x0, Math.min(clip.x1, ev.col));
+      textDrag = { startRow: ev.row, lastRow: ev.row, startCol: col, lastCol: col, moved: false, clip, click: () => {}, bottom: true };
       return;
     }
     // Every mouse target comes out of the SAME hit-test the renderer drew from. Recomputing geometry
@@ -3903,24 +5130,40 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
               (b) => wp !== undefined && ev.col >= wp.rect.x + (boxed ? 2 : 1) + b.x && ev.col < wp.rect.x + (boxed ? 2 : 1) + b.x + b.w
             );
             const picked = clickedRow?.scope;
+            if (picked) workspaceGroupSelection = undefined;
             const openPath = clickedRow?.openPath;
-            if (btn && picked) {
+            if (btn?.action === 'workspace-window' && clickedRow?.workspaceWindow) {
+              const target = clickedRow.workspaceWindow;
+              act = () => { void openWorkspaceWindow(target); };
+            } else if (clickedRow?.workspaceWindow) {
+              const target = clickedRow.workspaceWindow;
+              act = () => { workspaceGroupSelection = target; state.status = `${target.root} — W opens its workspace window`; };
+            } else if (btn && picked) {
               act = () => blobAction(btn.action, picked.session, picked.label, picked);
             } else if (openPath) {
-              act = () => toggleOpenKey(openPath);
-            } else if (picked?.agentId) {
-              // A DETAIL-pane spawn subagent row: open THAT spawn's own live feed, read-only. No drive —
-              // viewSubagent ends any standing one, so viewing and driving never conflate (the reply-went-
-              // unseen mismatch that made the earlier per-spawn DRIVE wrong).
+              // A session's worker summary is picked as it opens or closes, so the arrows go on from it.
+              act = () => {
+                toggleOpenKey(openPath);
+                if (th.view === 'sessions-nav') {
+                  state.observatoryFold = openPath.startsWith('done:') ? openPath : undefined;
+                  if (state.observatoryFold) state.scopeWorker = null;
+                  else if (picked) state.scopeWorker = picked;
+                }
+              };
+            } else if (picked?.processId) {
+              act = () => pinSession(picked.session, picked.machineId, wp?.id, picked);
+            } else if (picked?.agentId && th.view !== 'sessions-nav') {
+              // Open this worker's own log in the Observatory detail, on the machine its row names.
               const agentId = picked.agentId;
-              act = () => viewSubagent(picked.session, agentId);
+              act = () => viewSubagent(picked.session, agentId, picked.machineId);
             } else if (picked && th.view === 'sessions-nav') {
               // ONE click on a master session — its pane line, title or stat line — pins its
-              // conversation. The first click used to select only. The arrow keys still
+              // conversation; one on a worker's rows under it pins it too, and picks that worker. The first
+              // click used to select only. The arrow keys still
               // preview without pinning; Enter pins what they previewed. In a split view the click
               // fills the conversation leaf the reader focused, else the one the last pin filled.
               const chosen = leafPanes(treeTab.root).some((p) => p.id === focusBefore && p.view === 'session-detail');
-              act = () => pinSession(picked.session, picked.machineId, chosen ? focusBefore : pinLeaf);
+              act = () => { state.observatoryFold = undefined; pinSession(picked.session, picked.machineId, chosen ? focusBefore : pinLeaf, picked); };
             } else if (picked && (picked.session !== state.scopeWorker?.session || picked.machineId !== state.scopeWorker?.machineId)) {
               act = () => {
                 state.scopeWorker = picked;
@@ -3949,6 +5192,10 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
       }
       return;
     }
+    // A native tab draws none of the dock's windows: below its tab bar lie the program's screen and OAK's divider and
+    // bottom rows, of which only the bottom rows (above) take a press. The windows' hit-test would answer for a divider
+    // that covers the program's last row.
+    if (tabs[active]?.kind === 'native' && ev.row >= nativeBodyRows()[0]) return;
 
     const lay0 = layout();
     const hit = hitTest(lay0, ev.col, ev.row);
@@ -3988,7 +5235,7 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
         offer('mark', 'Mark for a bulk keep or undo');
       }
       if (selectedPath(row)) offer('copy', 'Copy the path');
-      if (row?.ids.length === 1) offer('editor', 'Open in $EDITOR');
+      if (row?.ids.length === 1) offer('editor', 'Open in the terminal editor');
       if (!items.length) {
         state.status = 'nothing to do on this row';
         return schedulePaint();
@@ -4352,8 +5599,158 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
     // Resolved on every open, not captured once: a move performed from this very screen has to be
     // reflected the moment it happens.
     store: core.rootDir(),
+    sync: syncEnv(),
+    // What the GUI editor row's Auto runs now: the resolution without the row's own value.
+    gui: core.resolveGuiEditor({ editor: prefs.editor }, process.env, detectedEditors),
   });
   const optRows = () => optionRows(prefs, optEnv());
+
+  /** This workspace's project, by the identity key `oak sync exclude <folder>` gives it: read once, it reads git's files. */
+  let syncProject: { key: string; folder: string } | undefined | null = null;
+  /** The options window's SYNC section: only while sync is in use here or a machine is saved, so a machine that has
+   *  neither is shown nothing new. */
+  function syncEnv(): import('./options').OptionEnv['sync'] {
+    const machines = (state.observatory?.machines ?? []).filter((m) => !m.local).map((m) => core.plainLabel(m.label));
+    if (!syncInUse(state.sync) && !machines.length) return undefined;
+    if (syncProject === null) {
+      try {
+        syncProject = { key: core.identityKey(cwd, { home: os.homedir(), shares: core.readMountTable() }).key, folder: cwd };
+      } catch {
+        syncProject = undefined;
+      }
+    }
+    return { status: state.sync ?? null, machines, project: syncProject, now: Date.now() };
+  }
+  /** The `oak sync now` this window started, while it runs: Enter on the Sync now row stops it, with the ssh it started. */
+  let syncRun: AbortController | null = null;
+  /** One SYNC row's work, through the CLI: setup on the terminal, taking the folder's record over (once asked), a run
+   *  (or stopping it), the last run whole, or including or excluding a machine or project. Every outcome is said. */
+  function syncOption(id: string): void {
+    if (id === 'sync.setup') {
+      return runOnTerminal(['sync', 'setup'], (code) => {
+        state.status = code === 0 ? 'back from oak sync setup' : `oak sync setup ${code === null ? 'did not finish' : `exited ${code}`}`;
+        readSyncStatus(true);
+      });
+    }
+    if (id === 'sync.now' && syncRun) {
+      syncRun.abort();
+      state.status = 'stopping oak sync now…';
+      return schedulePaint();
+    }
+    if (id === 'sync.now' || id === 'sync.last') {
+      // The window closes now, so the answer, an overlay of its own, is not cleared with it when it lands first.
+      options = null;
+      optionsShown = false;
+      state.overlay = null;
+      if (id === 'sync.last') return runVerb('oak sync status', ['sync', 'status']);
+      state.status = `running oak sync now… (${keyForAction('options')}, then Enter on Sync now, stops it)`;
+      schedulePaint();
+      const run = (syncRun = new AbortController());
+      return runVerb('oak sync now', ['sync', 'now'], run.signal, () => {
+        if (syncRun === run) syncRun = null;
+        readSyncStatus(true);
+      });
+    }
+    if (id === 'sync.restore') {
+      // Asked first, as the editors ask: the record may be another machine's that writes it still.
+      state.confirm = { verb: 'take over', ids: [], label: 'the backup folder\'s record of this machine, as a reinstall' };
+      return schedulePaint();
+    }
+    const [args, doing] = id === 'sync.project' && syncProject
+        ? [['sync', state.sync?.exclude.projects.includes(syncProject.key) ? 'include' : 'exclude', syncProject.folder, '--json'], 'changing which projects sync']
+        : id.startsWith('sync.project:')
+          ? [['sync', 'include', id.slice('sync.project:'.length), '--json'], 'including the project again']
+          : id.startsWith('sync.machine:')
+            ? [['sync', state.sync?.exclude.machines.includes(id.slice('sync.machine:'.length)) ? 'include' : 'exclude', id.slice('sync.machine:'.length), '--json'], 'changing which machines sync']
+            : [null, ''];
+    if (!args) return;
+    runSyncVerb(args, doing, () => `${args[1] === 'include' ? 'syncing' : 'not syncing'} ${args[2]}${args[1] === 'include' ? ' again' : ' any more'}`);
+  }
+
+  /** `oak sync setup --folder <the backup folder> --restore`: the reader said this machine is a reinstall. */
+  function applySyncRestore(): void {
+    const folder = state.sync?.backup?.kind === 'folder' ? state.sync.backup.path : null;
+    if (!folder) {
+      state.status = 'the backup is no folder now: nothing to take over';
+      return schedulePaint();
+    }
+    runSyncVerb(['sync', 'setup', '--folder', folder, '--restore', '--json'], 'taking the backup folder\'s record over',
+      (j) => {
+        const record = j.record as { claimed?: boolean; state?: string } | undefined;
+        return record?.claimed ? 'this machine took the folder\'s record over: Sync now restores its sessions from it'
+          : record?.state === 'mine' ? 'the folder\'s record is this machine\'s already' : 'the folder holds no record of this machine to take over';
+      });
+  }
+
+  /** One of sync's `--json` verbs: what it is doing on the status row, then what it did (`said`), or the CLI's own words. */
+  function runSyncVerb(args: string[], doing: string, said: (j: Record<string, unknown>) => string): void {
+    state.status = `${doing}…`;
+    schedulePaint();
+    void backend!.run(args).then((out) => {
+      let j: Record<string, unknown> | null = null;
+      try {
+        j = JSON.parse(out);
+      } catch {
+        /* the CLI's own words, below */
+      }
+      state.status = !j ? `could not: ${out.trim().split('\n')[0].replace(/^oak: /, '')}` : typeof j.error === 'string' ? `could not: ${j.error}` : said(j);
+      readSyncStatus(true);
+      schedulePaint();
+    });
+  }
+
+  /**
+   * Hand the terminal to one of this CLI's verbs that asks its own questions (`oak sync setup`), as `e` hands it to a
+   * terminal editor, then hold its last words on screen until Enter, which the dashboard would paint over at once.
+   */
+  let holdForEnter: (() => void) | null = null;
+  function runOnTerminal(args: string[], done: (code: number | null) => void): void {
+    suspendTerminal();
+    let child;
+    try {
+      child = core.spawnTool(process.execPath, [process.argv[1], ...args], { stdio: 'inherit', cwd, env: { ...process.env, CLAUDE_OBSERVATORY_NO_UPDATE_CHECK: '1' } });
+    } catch (e) {
+      resumeTerminal();
+      state.status = `could not run oak ${args.join(' ')}: ${String((e as Error)?.message || e)}`;
+      return schedulePaint();
+    }
+    let ended = false;
+    const end = (code: number | null, failed = ''): void => {
+      if (ended) return;
+      ended = true;
+      // Through the gate, opened for this one line: the child has exited, and the terminal is not taken back yet.
+      out.resume();
+      out.write(`\n${failed ? `${failed}\n` : ''}Press Enter to go back to OAK. `);
+      out.suspend();
+      holdForEnter = () => {
+        holdForEnter = null;
+        resumeTerminal();
+        done(code);
+        if (failed) state.status = failed;
+        schedulePaint();
+      };
+      // Raw, so ctrl+d is a key here and not the end of input: read with the terminal not raw, ctrl+d ended stdin for good
+      // and the prompt could never be answered (review 2026-11-05).
+      if (process.stdin.isTTY) process.stdin.setRawMode(true);
+      process.stdin.resume();
+    };
+    child.on('error', (e: Error) => end(null, `could not run oak ${args.join(' ')}: ${e.message}`));
+    child.on('close', (code: number | null) => end(code));
+  }
+
+  /** The window's cursor is an index into its rows, which change under it (oak sync's come and go with its status and
+   *  the saved machines): it stays on the row it was on, by its id, or, when that row went, moves to the one above it,
+   *  so a key never acts on a row the reader did not choose. */
+  function anchorOptions(rows: ReturnType<typeof optRows>): void {
+    if (!options) return;
+    if (options.id !== undefined && rows[options.cursor]?.id !== options.id) {
+      const at = rows.findIndex((r) => r.id === options!.id);
+      const sel = selectableRows(rows);
+      options.cursor = at >= 0 ? at : (sel.filter((i) => i < options!.cursor).pop() ?? sel[0] ?? 0);
+      options.scroll = Math.min(options.scroll, options.cursor);
+    }
+    options.id = rows[options.cursor]?.id;
+  }
 
   function openOptions(): void {
     const rows = optRows();
@@ -4362,8 +5759,10 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
     schedulePaint();
   }
 
-  /** Persist, then re-apply the ones that change how this session already looks. */
-  function saveOptions(next: import('@oak-observatory/core').Prefs): void {
+  /** Persist, then re-apply the ones that change how this session already looks. `sets` are the keys saved
+   *  (writeOwn): those `next` changes, unless the caller names them. */
+  function saveOptions(next: import('@oak-observatory/core').Prefs,
+    sets: readonly AppPrefKey[] = APP_PREF_KEYS.filter((k) => JSON.stringify(next[k]) !== JSON.stringify(prefs[k]))): void {
     // A value the settings layer refused comes back carrying its reason instead of being dropped on
     // the floor. Show it and keep the old setting; never write the marker to disk.
     if (next.__reject) {
@@ -4375,7 +5774,7 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
     setTheme(prefs.theme); // …and a theme change reaches the very next paint, not the next launch
     state.syntax = prefs.syntax !== false;
     try {
-      core.writePrefs(prefs);
+      writeOwn(prefs, sets);
     } catch (e) {
       // A settings screen that cannot save must SAY so. Silently keeping the value in memory would
       // have the reader set it once and find it gone at the next start with no explanation.
@@ -4404,8 +5803,10 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
 
   /** Keys while the options window owns the keyboard. Returns true when it consumed the event. */
   function optionsKey(ev: { key: string; ctrl: boolean; alt: boolean }): boolean {
-    if (!options) return false;
+    // A standing question (the reset's) is answered by the confirm wall, not by the window under it.
+    if (!options || state.confirm) return false;
     const rows = optRows();
+    anchorOptions(rows);
     const sel = selectableRows(rows);
 
     // A capture is a WALL, like the filter: it reads one key or one line and nothing escapes into the
@@ -4441,23 +5842,29 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
             state.status = `store not moved — ${res.error}`;
             return (schedulePaint(), true);
           }
+          // Said as "store moved", one prefs.json could not record hid that it still names where the store was.
+          if (res.unrecorded) {
+            state.status = `store moved to ${res.to}, but its location was not saved, so OAK looks for it where it was — ${res.unrecorded}`;
+            return (schedulePaint(), true);
+          }
+          // The move recorded the new location in prefs.json (while captures waited for it); this copy follows it.
           const next = { ...prefs };
           if (want) next.storeDir = parsed.dir;
           else delete next.storeDir;
-          saveOptions(next);
-          state.status = `store moved to ${res.to}`;
+          prefs = next;
+          state.status = `store moved to ${res.to}${res.left ? ` — ${res.left}` : ''}${res.missed ? ` — ${core.missedDuringMove(res.missed)}` : ''}`;
           ask();
           return (schedulePaint(), true);
         }
         saveOptions(setOption(prefs, cap.id, cap.buf));
         return true;
       }
-      if (ev.key === 'backspace' || ev.key === 'delete') { cap.buf = cap.buf.slice(0, -1); return (schedulePaint(), true); }
+      if (ev.key === 'backspace' || ev.key === 'delete') { cap.buf = backspaced(cap.buf); return (schedulePaint(), true); }
       if (ev.key.length === 1 && !ev.ctrl && !ev.alt) { cap.buf += ev.key; return (schedulePaint(), true); }
       return true;
     }
 
-    if (ev.key === 'escape' || (ev.key.length === 1 && keys().get(ev.key) === 'options')) {
+    if (ev.key === 'escape' || (!ev.ctrl && !ev.alt && ev.key === 'q') || (ev.key.length === 1 && keys().get(ev.key) === 'options')) {
       options = null;
       state.status = 'ready';
       return (schedulePaint(), true);
@@ -4466,20 +5873,29 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
     // The view FOLLOWS the cursor. Without this the list scrolled never, so every row past the
     // seventeenth — which is all of the KEYS section — could be selected and could not be seen.
     const follow = () => {
-      const body = Math.max(1, frameRows - 5);
-      // Each row can draw up to three lines (row, problem, help), so the window is bounded by the
-      // worst case rather than by a row count that would let the selected row fall off the bottom.
-      const visible = Math.max(1, Math.floor(body / 3));
+      // By the lines each row draws (a detail of several lines, a wrapped help), so the selected row never falls off
+      // the bottom of the window, however tall the rows above it are.
+      const budget = Math.max(1, overlayRows());
+      const drawn = (from: number): number => {
+        let n = 0;
+        for (let i = from; i <= options!.cursor; i++) n += optionRowLines(rows[i], i === options!.cursor, i === from, frameCols, glyphs, colorDepth).length;
+        return n;
+      };
       if (options!.cursor < options!.scroll) options!.scroll = options!.cursor;
-      if (options!.cursor >= options!.scroll + visible) options!.scroll = options!.cursor - visible + 1;
+      while (options!.scroll < options!.cursor && drawn(options!.scroll) > budget) options!.scroll++;
       if (options!.scroll < 0) options!.scroll = 0;
     };
-    if (ev.key === 'down') { options.cursor = sel[Math.min(sel.length - 1, at + 1)]; follow(); return (schedulePaint(), true); }
-    if (ev.key === 'up') { options.cursor = sel[Math.max(0, at - 1)]; follow(); return (schedulePaint(), true); }
-    if (ev.key === 'pgdn') { options.cursor = sel[Math.min(sel.length - 1, at + 5)]; follow(); return (schedulePaint(), true); }
-    if (ev.key === 'pgup') { options.cursor = sel[Math.max(0, at - 5)]; follow(); return (schedulePaint(), true); }
+    if (ev.key === 'down') { options.cursor = sel[Math.min(sel.length - 1, at + 1)]; options.id = rows[options.cursor]?.id; follow(); return (schedulePaint(), true); }
+    if (ev.key === 'up') { options.cursor = sel[Math.max(0, at - 1)]; options.id = rows[options.cursor]?.id; follow(); return (schedulePaint(), true); }
+    if (ev.key === 'pgdn') { options.cursor = sel[Math.min(sel.length - 1, at + 5)]; options.id = rows[options.cursor]?.id; follow(); return (schedulePaint(), true); }
+    if (ev.key === 'pgup') { options.cursor = sel[Math.max(0, at - 5)]; options.id = rows[options.cursor]?.id; follow(); return (schedulePaint(), true); }
     const row = rows[options.cursor];
     if (!row) return true;
+    // The SYNC rows run the CLI, which keeps sync's settings in prefs.json: nothing here saves them.
+    if (row.id.startsWith('sync.')) {
+      if (ev.key === 'enter' || (row.kind === 'toggle' && (ev.key === 'left' || ev.key === 'right'))) syncOption(row.id);
+      return true;
+    }
     if (ev.key === 'left' || ev.key === 'right') {
       // `choices` is what makes a TEXT row steppable: the editor row offers what this machine has AND
       // still takes anything typed, so it is both. Stepping reads the same list the row rendered.
@@ -4492,14 +5908,14 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
       if (row.kind === 'text') {
         // Seeded from the row being edited, not from one hard-coded field: the remote rows are text
         // too, and starting them at the editor command would have the reader delete it every time.
-        const seed = row.id === 'editor' ? prefs.editor ?? '' : row.id === 'storeDir' ? prefs.storeDir ?? '' : '';
+        const seed = row.id === 'editor' ? prefs.editor ?? '' : row.id === 'guiEditor' ? prefs.guiEditor ?? '' : row.id === 'storeDir' ? prefs.storeDir ?? '' : '';
         options.capture = { id: row.id, kind: 'text', buf: seed };
       } else
 if (row.kind === 'key') options.capture = { id: row.id, kind: 'key', buf: '' };
       else if (row.kind === 'toggle') saveOptions(applyOption(prefs, row.id, 1));
       else if (row.id === 'reset') {
-        saveOptions({});
-        state.status = 'every option is back to its default';
+        // Irreversible in one key, so it asks: the file goes, and with it every rebind and the layout.
+        state.confirm = { verb: 'reset', ids: [], label: 'reset every option to its default — keys, layout, editor, theme and the store location (the store itself is not moved)' };
       }
       return (schedulePaint(), true);
     }
@@ -4531,7 +5947,8 @@ if (row.kind === 'key') options.capture = { id: row.id, kind: 'key', buf: '' };
       const now = pickerSourcesNow();
       if (now.length !== pickerSources.length || now.some((x, i) => x !== pickerSources[i])) renderSessionPicker(true);
     }
-    if (state.reviewFinding) ask();
+    // Only a session that waits for its owner: with none at all, the read this would start changes the facts again.
+    if (state.reviewFinding && state.session) ask();
     queueAdopt();
   }
   /** What the reader has typed to narrow the session picker. Null when the picker is closed. */
@@ -4555,7 +5972,7 @@ if (row.kind === 'key') options.capture = { id: row.id, kind: 'key', buf: '' };
   let helpFilter: string | null = null;
   const helpShowing = (): boolean => !!state.overlay && /esc or \? to close/.test(state.overlay.title);
   function rerenderHelp(): void {
-    const all = helpLines(prefs);
+    const all = helpLines(prefs, herdrConfig());
     const q = (helpFilter ?? '').toLowerCase();
     const lines = q ? all.filter((l) => l.toLowerCase().includes(q)) : all;
     state.overlay = {
@@ -4572,7 +5989,7 @@ if (row.kind === 'key') options.capture = { id: row.id, kind: 'key', buf: '' };
       // The confirm wall sits above the picker wall by design — opening the picker over a
       // standing keep/undo would let a typed filter letter answer an invisible question with a
       // store mutation (re-review). Answer it first.
-      state.status = 'answer the pending keep/undo first — y or n';
+      state.status = 'answer the pending question first — y or n';
       return schedulePaint();
     }
     pickerFilter = '';
@@ -4580,6 +5997,108 @@ if (row.kind === 'key') options.capture = { id: row.id, kind: 'key', buf: '' };
     pickerState = 'all';
     pickerOlder = false;
     renderSessionPicker();
+  }
+
+  /**
+   * The picker's search box matches names on every keystroke, and what was SAID in each session through
+   * `oak search` on this machine and on every saved machine (`--machine`), all at once. That part waits
+   * for the typing to pause, so a word typed quickly is one search per machine rather than one per letter,
+   * and it never holds a keystroke: each answer arrives later and repaints the open picker in place.
+   * One search per machine runs at a time — a newer query waits for it, replacing any query already
+   * waiting — and an answer for text no longer in the box is kept out of the list. Each machine answers
+   * with its sessions' best hits, up to PICKER_SEARCH_LIMIT of them, and the box says when it had more.
+   */
+  const PICKER_SEARCH_DEBOUNCE_MS = 275;
+  const PICKER_SEARCH_TIMEOUT_MS = 30_000;
+  const PICKER_SEARCH_LIMIT = 200;
+  /** Per machine ('' is this one): the query in flight (and how to stop it) and the one waiting behind it,
+   *  the query last answered, its first hit's excerpt per session and whether the limit cut it, or why
+   *  that answer failed. */
+  const pickerText = new Map<string, { inflight: string | null; abort?: AbortController; queued: string | null; query: string | null; hits: Map<string, string>; cut?: boolean; error?: string }>();
+  let pickerSearchTimer: ReturnType<typeof setTimeout> | undefined;
+  /** The picker is closing, by any path: a search its typing scheduled never starts, and for one still
+   *  running OAK stops waiting, stops its process here and the ssh that process runs, and drops its
+   *  answer. So a reopened picker never runs a second search to a machine alongside the first. A saved
+   *  machine's own search is not signalled through ssh, and may still finish there. */
+  function cancelPickerSearch(): void {
+    clearTimeout(pickerSearchTimer);
+    pickerSearchTimer = undefined;
+    for (const m of pickerText.values()) m.abort?.abort();
+    pickerText.clear();
+  }
+  // Quitting stops them too: every way out of the app goes through process.exit.
+  process.on('exit', cancelPickerSearch);
+  /** Each machine's answer for exactly `q`, the text now in the box: an answer for older text is never
+   *  shown under newer text. */
+  function pickerAnswered(q: string): [string, NonNullable<ReturnType<typeof pickerText.get>>][] {
+    return q ? [...pickerText].filter(([, m]) => m.query === q) : [];
+  }
+  /** The text in the search box changed: names now, what was said once the typing pauses. */
+  function pickerTyped(): void {
+    clearTimeout(pickerSearchTimer);
+    pickerSearchTimer = undefined;
+    const q = (pickerFilter ?? '').trim();
+    if (q) {
+      pickerSearchTimer = setTimeout(() => {
+        pickerSearchTimer = undefined;
+        if ((pickerFilter ?? '').trim() === q) searchPickerText(q);
+      }, PICKER_SEARCH_DEBOUNCE_MS);
+    }
+    renderSessionPicker();
+  }
+  function searchPickerText(q: string): void {
+    if (!backend) return;
+    // The saved machines whose sessions the picker can list; one that cannot list them already has its note.
+    const remotes = (state.observatory?.machines ?? []).filter((m) => !m.local && !m.sessionsError).map((m) => m.label);
+    for (const machine of ['', ...remotes]) {
+      let m = pickerText.get(machine);
+      if (!m) pickerText.set(machine, (m = { inflight: null, queued: null, query: null, hits: new Map() }));
+      if (m.inflight !== null) m.queued = q;
+      else if (m.query !== q || m.error) runPickerSearch(machine, m, q);
+    }
+    if (pickerOpen && !state.confirm) renderSessionPicker(true);
+  }
+  function runPickerSearch(machine: string, m: NonNullable<ReturnType<typeof pickerText.get>>, q: string): void {
+    m.inflight = q;
+    const abort = (m.abort = new AbortController());
+    // `--query=`: one argv value, so a query that starts with a dash is still the query. `--per-session`:
+    // one session's many matching asks take one of the limit's places, not all of them.
+    void backend!.run(['search', '--json', `--query=${q}`, '--per-session', '--limit', String(PICKER_SEARCH_LIMIT)], machine || undefined,
+      { timeoutMs: PICKER_SEARCH_TIMEOUT_MS, signal: abort.signal }).then((out) => {
+      if (pickerText.get(machine) !== m) return; // cancelled with the picker that asked
+      m.inflight = null;
+      m.abort = undefined;
+      m.query = q;
+      m.hits = new Map();
+      m.cut = false;
+      m.error = undefined;
+      try {
+        const res = JSON.parse(out) as { hits?: { session?: unknown; snippet?: unknown }[]; matched?: unknown };
+        const hits = res.hits;
+        if (!Array.isArray(hits)) throw new Error('no hits in the answer');
+        // Cut at the limit: a build that counts its matches says so; an older one does not count, and
+        // ignores `--per-session` too, so a full answer may have left some out.
+        m.cut = typeof res.matched === 'number' ? res.matched > hits.length : hits.length >= PICKER_SEARCH_LIMIT;
+        // Ranked best first, so a session's first hit is its best excerpt.
+        for (const h of hits) if (typeof h.session === 'string' && !m.hits.has(h.session)) m.hits.set(h.session, String(h.snippet ?? ''));
+      } catch {
+        m.error = out.trim().split('\n')[0]?.replace(/^oak: /, '') || 'no answer';
+      }
+      const next = m.queued;
+      m.queued = null;
+      if (next !== null && next !== q && (pickerFilter ?? '').trim() === next) runPickerSearch(machine, m, next);
+      if (pickerOpen && !state.confirm) renderSessionPicker(true);
+    });
+  }
+  /** One line of a hit's excerpt in `room` columns: from a word shortly before the first matching word,
+   *  cut at a word boundary — never an ellipsis, and none of the control characters a transcript holds. */
+  function saidLine(snippet: string, q: string, room: number): string {
+    const text = snippet.replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').replace(/^…|…$/g, '').replace(/\s+/g, ' ').trim();
+    const term = q.toLowerCase().split(/\s+/)[0] ?? '';
+    const at = term ? text.toLowerCase().indexOf(term) : -1;
+    // The excerpt starts at its beginning when the matching word fits there, else a few words before it.
+    const from = at > 12 && at + term.length > room ? text.lastIndexOf(' ', at - 12) + 1 : 0;
+    return wrapVisible(text.slice(from), Math.max(1, room))[0] ?? '';
   }
 
   /**
@@ -4603,7 +6122,8 @@ if (row.kind === 'key') options.capture = { id: row.id, kind: 'key', buf: '' };
     if (localListing.reading || Date.now() - (localListing.at ?? 0) < 10_000) return;
     localListing.reading = true;
     localListing.at = Date.now();
-    void backend!.run(['views', '--views', 'sessions', '--json', '--session', state.session]).then((out) => {
+    // No session to name (a workspace with none of its own): `--session ''` is refused, and the listing failed.
+    void backend!.run(['views', '--views', 'sessions', '--json', ...(state.session ? ['--session', state.session] : [])]).then((out) => {
       localListing.reading = false;
       try {
         const listing = (JSON.parse(out) as { sessions?: { sessions?: unknown } }).sessions;
@@ -4648,14 +6168,29 @@ if (row.kind === 'key') options.capture = { id: row.id, kind: 'key', buf: '' };
       // LAST session is deleted (the confirm's explanation overlay would otherwise linger), as well as
       // on a machine that has no transcripts at all, where the overlay was already null.
       pickerOpen = false;
+      cancelPickerSearch();
       state.overlay = null;
       state.status = 'no sessions found — this machine has no Claude Code transcripts yet';
       return schedulePaint();
     }
     const f = (pickerFilter ?? '').toLowerCase();
-    const textList = f
-      ? all.filter((x) => isNote(x) || `${x.title ?? ''} ${x.id} ${x.workspace ?? ''} ${x.machine ?? ''}`.toLowerCase().includes(f))
-      : all;
+    const named = (x: Record<string, unknown>): boolean => `${x.title ?? ''} ${x.id} ${x.workspace ?? ''} ${x.machine ?? ''}`.toLowerCase().includes(f);
+    // What was SAID: each machine's answer for the text now in the box, by row. Rows that match only
+    // this way follow the name matches, in the same order, each with an excerpt of its hit.
+    // The text as typed, as each search was asked for it: case is the search's own business.
+    const q = (pickerFilter ?? '').trim();
+    const answered = pickerAnswered(q);
+    const said = new Map<string, string>();
+    for (const [machine, m] of answered) for (const [id, snippet] of m.hits) said.set(`${machine}\u0000${id}`, snippet);
+    const saidOnly = f ? all.filter((x) => !isNote(x) && !named(x) && said.has(pickerKey(x))) : [];
+    const saidOf = new Map(saidOnly.map((x) => [x, said.get(pickerKey(x))!]));
+    // A machine whose search failed says so where its rows would be, as one that cannot list them does.
+    const searchFailed = answered.filter(([, m]) => m.error).map(([machine, m]): Record<string, unknown> => ({ id: `!search${machine}`, machine: machine || core.THIS_MACHINE,
+      error: m.error, note: `could not search ${machine ? `${machine}'s` : "this machine's"} conversations — ${m.error}` }));
+    const searching = !!q && (pickerSearchTimer !== undefined || [...pickerText.values()].some((m) => m.inflight === q || m.queued === q));
+    // A machine with more matches than its answer held says so: the list is not everything that matched.
+    const cut = answered.filter(([, m]) => m.cut && !m.error).map(([machine]) => machine || 'this machine');
+    const textList = f ? [...all.filter((x) => isNote(x) || named(x)), ...saidOnly, ...searchFailed] : all;
     // The STATE chips (adopted from herdr): one key (tab) cycles all → working → done → idle,
     // narrowing to the sessions in that phase — `done` is the seen-bit set, so "what finished
     // while I was elsewhere" is one keystroke.
@@ -4744,7 +6279,9 @@ if (row.kind === 'key') options.capture = { id: row.id, kind: 'key', buf: '' };
     // go; the workspace is the longest and least discriminating, so it goes first.
     const whenW = Math.max(1, ...tableRows.map((x) => core.relTime(Number(x.lastActiveMs) || 0).length));
     const keep = new Set(['machine', 'churn', 'cost', 'brain', 'store']);
-    const widthOf = (): number =>
+    // An excerpt needs room beside its row: columns give way for it the way they do for a narrow terminal.
+    const saidW = shownList.some((x) => saidOf.has(x)) ? 2 + 30 : 0;
+    const widthOf = (): number => saidW +
       1 + 1 + 1 + whenW + 2 + titleW +
       (keep.has('machine') ? 2 + mcW : 0) +
       (keep.has('churn') ? 2 + dW * 2 + 1 : 0) +
@@ -4830,7 +6367,11 @@ if (row.kind === 'key') options.capture = { id: row.id, kind: 'key', buf: '' };
       if (keep.has('brain')) cells.push(paint(brain.padEnd(brainW), 'undone', colorDepth));
       if (keep.has('store') && storeW) cells.push(paint((sizes.get(x) ?? '').padStart(storeW), 'undone', colorDepth));
       const row = cells.join('  ');
-      return quiet && colorDepth !== 'none' ? `\x1b[2m${row}\x1b[0m` : row;
+      const lit = quiet && colorDepth !== 'none' ? `\x1b[2m${row}\x1b[0m` : row;
+      const snippet = saidOf.get(x);
+      if (snippet === undefined) return lit;
+      const room = frameCols - 1 - displayWidth(row) - 2 - 'said '.length;
+      return room > 0 ? `${lit}  ${tint(`said ${saidLine(snippet, q, room)}`, 'accent', colorDepth)}` : lit;
     });
     // …and one row for everything older than a week, which choosing EXPANDS rather than opens.
     if (older.length) {
@@ -4840,7 +6381,7 @@ if (row.kind === 'key') options.capture = { id: row.id, kind: 'key', buf: '' };
       pickerRows.push({ id: OLDER_ROW });
     }
     if (!lines.length) {
-      lines.push(`  nothing matches “${pickerFilter}” — backspace to widen it`);
+      lines.push(searching ? `  no name matches “${pickerFilter}” — searching what was said…` : `  nothing matches “${pickerFilter}” — backspace to widen it`);
       pickerIds = [];
       pickerRows = [];
     }
@@ -4849,9 +6390,9 @@ if (row.kind === 'key') options.capture = { id: row.id, kind: 'key', buf: '' };
     const kept = before ? pickerRows.findIndex((r) => pickerKey(r) === pickerKey(before)) : -1;
     const at = kept >= 0 ? kept : Math.max(0, pickerRows.findIndex(inEffect));
     // The cursor row on screen: rows can arrive above it, and a picker opened on a session far down a
-    // long list must still show it.
-    const view = Math.max(1, frameRows - 6);
-    const scroll = Math.min(at, Math.max(prevScroll, at - view + 1));
+    // long list must still show it. Counted under the search box, a line the picker always draws and the
+    // measure leaves out while another overlay, or none, is up: the picker opened with its row one line below.
+    const scroll = overlayScroll(lines, at, prevScroll, Math.max(1, overlayRows() - (state.overlay?.head === undefined ? 1 : 0)), frameCols);
     state.overlay = {
       // Two halves, separated once: WHAT you are looking at, then WHAT the keys do. The old line
       // interleaved a count, a state name, three phase counts and four key hints in one run of
@@ -4860,11 +6401,15 @@ if (row.kind === 'key') options.capture = { id: row.id, kind: 'key', buf: '' };
         `sessions · ${tableRows.length}`,
         `[${pickerState}]`,
         `working ${phaseCount.working} · done ${phaseCount.done} · idle ${phaseCount.idle}`,
-        pickerFilter ? `filter ${pickerFilter}_` : '',
         pickerOlder ? 'incl. older' : '',
         '—',
-        'tab state · type filters · enter opens · ^D deletes · esc closes',
+        'tab state · type to search · enter opens · ^D deletes · esc closes',
       ].filter(Boolean).join('  '),
+      // The search box: always there, and what it is matching said in it.
+      head: `search ${pickerFilter ?? ''}▏  ${
+        !q ? (colorDepth === 'none' ? 'names, and what was said in each session' : '\x1b[2mnames, and what was said in each session\x1b[0m')
+        : searching ? `searching… ${[...new Set([...pickerText].filter(([, m]) => m.inflight !== null).map(([machine]) => machine || 'this machine'))].join(', ')}`.trimEnd()
+        : [saidOnly.length ? `${saidOnly.length} more by what was said` : '', cut.length ? `more matches on ${cut.join(', ')} than shown — refine the search` : ''].filter(Boolean).join(' · ')}`,
       lines,
       scroll,
       cursor: at,
@@ -4933,6 +6478,7 @@ if (row.kind === 'key') options.capture = { id: row.id, kind: 'key', buf: '' };
       pickerOpen = true;
       return renderSessionPicker();
     }
+    cancelPickerSearch(); // the picker is closing
     state.overlay = null;
     // A saved machine's note (still answering, or unreachable) is not a session: say what it says.
     if (typeof row?.note === 'string') {
@@ -4983,8 +6529,8 @@ if (row.kind === 'key') options.capture = { id: row.id, kind: 'key', buf: '' };
    *
    * The confirm replaces the picker's body with a full, wrapping explanation so nothing about what
    * delete does is truncated onto a status line — it names the session, says the transcript is kept,
-   * names the edits still pending review that go with it for good, and says what `--undelete` brings
-   * back: the session, not its edits. The list returns on y or n.
+   * names the edits still pending review that go with it, and says what `--undelete` brings back: the
+   * session, and its edits only from a backup folder (core.deleteWords). The list returns on y or n.
    */
   function requestDeleteSession(): void {
     const o = state.overlay;
@@ -5014,15 +6560,16 @@ if (row.kind === 'key') options.capture = { id: row.id, kind: 'key', buf: '' };
     const pending = Math.max(0, Number(row?.pending) || 0);
     const seenThrough = typeof row?.lastEdit === 'number' ? row.lastEdit : undefined;
     const edits = `${pending} pending edit${pending === 1 ? '' : 's'}`;
+    const said = core.deleteWords();
     const lines = [
       `  Delete “${title}”  (${id.slice(0, 8)})?`,
       '',
-      '  It disappears from every Observatory session menu and its stored edits are purged for good.',
+      `  It disappears from every Observatory session menu and its stored edits are purged ${said.purged}.`,
       '  The transcript on disk is NOT deleted — only Observatory’s record of the session.',
       ...(pending ? ['', `  ${pending === 1 ? '1 of those edits is' : `${pending} of those edits are`} still pending review: the purge drops ${pending === 1 ? 'its before-snapshot' : 'their before-snapshots'},`,
-        `  so OAK can no longer undo ${pending === 1 ? 'that change' : 'those changes'}.`] : []),
+        `  so OAK can no longer undo ${pending === 1 ? 'that change' : 'those changes'}${said.folder ? ' here, unless the backup folder brings them back' : ''}.`] : []),
       '',
-      `  oak sessions --undelete ${id} lists the session again, without its edits.`,
+      `  oak sessions --undelete ${id} lists the session again, ${said.after}.`,
       '',
       pending ? `  y — delete and purge the ${edits}    n — cancel` : '  y — delete    n — cancel',
     ];
@@ -5113,6 +6660,7 @@ if (row.kind === 'key') options.capture = { id: row.id, kind: 'key', buf: '' };
     jumpRows = null;
     if (!state.overlay) return false;
     pickerFilter = null; // one place every dismissal goes through, so the mode cannot outlive the overlay
+    cancelPickerSearch(); // …and the picker's searches with it
     helpFilter = null;
     // …and the picker's open flag with it, so a deferred remote fetch that lands after the reader has
     // escaped cannot repaint an overlay they already dismissed.
@@ -5145,15 +6693,15 @@ if (row.kind === 'key') options.capture = { id: row.id, kind: 'key', buf: '' };
     const items = filterMenuItems(state);
     const lines = filterMenuLines(items, colorDepth);
     const cur = Math.min(Math.max(0, cursor), Math.max(0, lines.length - 1));
-    const viewH = Math.max(1, frameRows - 6);
+    const viewH = overlayRows();
     const scroll = cur >= viewH ? cur - viewH + 1 : 0;
     state.filterMenu = { cursor: cur };
     // The title carries what is currently applied, so the picker doubles as the "what filter is on"
     // readout while it is open (`/` sets the query, which shows here `/…/` when it is a live regex).
     const applied = filterSummary(state);
     const title = applied
-      ? `filter: ${applied} — space toggles · c clears · \\ or esc closes`
-      : 'filter — / to search · space toggles a bucket · c clears · \\ or esc closes';
+      ? `filter: ${applied} — space toggles · c clears · ${keyForAction('filter-menu')} or esc closes`
+      : `filter — space toggles a bucket · c clears · ${keyForAction('filter-menu')} or esc closes, then ${keyForAction('filter')} types the query`;
     state.overlay = { title, lines, scroll, cursor: cur };
     schedulePaint();
   }
@@ -5199,12 +6747,14 @@ if (row.kind === 'key') options.capture = { id: row.id, kind: 'key', buf: '' };
     const items = filterMenuItems(state);
     const cur = o.cursor ?? 0;
     const selectable = (i: number): boolean => !!items[i] && items[i].kind !== 'head';
-    if (ev.key === 'escape' || ev.key === 'enter' || ev.key === 'q' || ev.key === '\\') {
+    // The key that opened it closes it, the reader's own when rebound.
+    if (ev.key === 'escape' || ev.key === 'enter' || ev.key === 'q' || ev.key === '\\' || (!ev.ctrl && !ev.alt && keys().get(ev.key) === 'filter-menu')) {
       closeFilterMenu();
       return true;
     }
-    if (ev.key === 'up' || ev.key === 'down' || ev.key === 'pgup' || ev.key === 'pgdn') {
-      const dir = ev.key === 'down' || ev.key === 'pgdn' ? 1 : -1;
+    const plain = !ev.ctrl && !ev.alt;
+    if (ev.key === 'up' || ev.key === 'down' || ev.key === 'pgup' || ev.key === 'pgdn' || (plain && (ev.key === 'j' || ev.key === 'k'))) {
+      const dir = ev.key === 'down' || ev.key === 'pgdn' || ev.key === 'j' ? 1 : -1;
       let next = cur;
       for (let step = 0; step < items.length; step++) {
         next = (next + dir + items.length) % items.length;
@@ -5317,6 +6867,9 @@ if (row.kind === 'key') options.capture = { id: row.id, kind: 'key', buf: '' };
       return schedulePaint();
     }
     const [name, ...rest] = line.split(/\s+/).filter(Boolean);
+    // Not the bare `oak ignore` verb: that sweeps the launch directory's session without asking. This is
+    // the refresh's sweep, on the reviewed session where its store is, counted and confirmed first.
+    if (name === 'ignore') return refreshAsking();
     // Review comments take free text; local comments use core and remote comments use the CLI, so they
     // are handled before the fixed-arg COMMANDS table below (whose `rest` is dropped). `:comment` marks
     // up the edit whose diff is on screen; `:send-comments` batches every unsent one into the composer.
@@ -5359,7 +6912,14 @@ if (row.kind === 'key') options.capture = { id: row.id, kind: 'key', buf: '' };
         });
         return;
       }
-      const added = core.addComment(state.session, { unit: id, line: lineNo, text });
+      let added: ReturnType<typeof core.addComment>;
+      try {
+        added = core.addComment(state.session, { unit: id, line: lineNo, text });
+      } catch (e) {
+        // A comment the store could not take is said, never shown as added (the CLI fails the same way).
+        state.status = `the comment was not saved: ${String((e as Error)?.message || e)}`;
+        return schedulePaint();
+      }
       state.status = added
         ? `comment added on #${id}${lineNo ? ` line ${lineNo}` : ''} · ${core.pendingCommentCount(state.session)} pending · :send-comments drafts them`
         : `no pending edit #${id} to comment on`;
@@ -5421,14 +6981,25 @@ if (row.kind === 'key') options.capture = { id: row.id, kind: 'key', buf: '' };
     if (!cmd) {
       // Names the alternatives rather than only refusing — a prompt that says "no" and stops is a
       // prompt nobody uses twice.
-      state.status = `no command “${name}” — try: ${Object.keys(COMMANDS).join(', ')}`;
+      state.status = `no command “${name}” — try: ${[...Object.keys(COMMANDS).filter((c) => c !== '?'), ...Object.keys(TEXT_COMMANDS)].join(', ')}`;
       return schedulePaint();
     }
     // `rest` is deliberately DROPPED, not forwarded — see COMMANDS. Say so rather than ignoring it
     // silently, or `:store --move /tmp/x` looks like it worked.
     state.status = rest.length ? `${name} takes no arguments here — running the plain form…` : `running ${name}…`;
     schedulePaint();
-    void backend!.run(cmd.args()).then((out) => {
+    runVerb(name, cmd.args());
+  }
+
+  /** Run one of this CLI's verbs and show its answer: its first line on the status row, all of it in an overlay. `signal`
+   *  stops it (said as stopped), and `done` follows the answer. */
+  function runVerb(name: string, args: string[], signal?: AbortSignal, done?: () => void): void {
+    void backend!.run(args, undefined, signal ? { signal } : undefined).then((out) => {
+      done?.();
+      if (signal?.aborted) {
+        state.status = `${name}: stopped`;
+        return schedulePaint();
+      }
       const first = out.trim().split('\n').filter(Boolean);
       state.status = first.length ? first[0].replace(/\x1b\[[0-9;]*m/g, '') : `${name}: nothing to report`;
       // The full answer goes to the overlay, because a status row is one line and these verbs answer
@@ -5445,6 +7016,8 @@ if (row.kind === 'key') options.capture = { id: row.id, kind: 'key', buf: '' };
     });
   }
 
+  /** Where the overlay on screen stops scrolling, for the lines and size it was measured at (see move). */
+  let overlayEnd: { lines: readonly string[]; budget: number; cols: number; scroll: number } | null = null;
   function move(delta: number): void {
     if (!state.overlay && tabs[active]?.root) {
       // A tree tab has no dock cursor; the arrows / j·k scroll the focused pane instead.
@@ -5456,14 +7029,18 @@ if (row.kind === 'key') options.capture = { id: row.id, kind: 'key', buf: '' };
         // A picker moves its SELECTION, and the view follows it — scrolling a list you are choosing
         // from without moving the choice is the classic picker bug.
         const cur = Math.min(o.lines.length - 1, Math.max(0, o.cursor + delta));
-        const view = Math.max(0, frameRows - 6);
-        const scroll = cur < o.scroll ? cur : cur >= o.scroll + view ? cur - view + 1 : o.scroll;
+        const scroll = overlayScroll(o.lines, cur, o.scroll, overlayRows(), frameCols);
         state.overlay = { ...o, cursor: cur, scroll };
       } else {
-        // rows-6: the overlay viewport shrank with the three-line chrome — the old rows-5 clamp
-        // left the last line of every scrolled overlay unreachable.
-        const max = Math.max(0, o.lines.length - (frameRows - 6));
-        state.overlay = { ...o, scroll: Math.min(max, Math.max(0, o.scroll + delta)) };
+        // The overlay viewport as drawn, in the lines the renderer draws: a fixed rows-6 left the last
+        // lines of every scrolled overlay unreachable under the boxed session row, and so did counting
+        // a line wide enough to wrap as one. Measured once per overlay and size: every key measured each
+        // of its lines again, a cost that grew with the overlay.
+        const budget = overlayRows();
+        if (overlayEnd?.lines !== o.lines || overlayEnd.budget !== budget || overlayEnd.cols !== frameCols) {
+          overlayEnd = { lines: o.lines, budget, cols: frameCols, scroll: overlayScroll(o.lines, o.lines.length - 1, 0, budget, frameCols) };
+        }
+        state.overlay = { ...o, scroll: Math.min(overlayEnd.scroll, Math.max(0, o.scroll + delta)) };
       }
       return schedulePaint();
     }
@@ -5527,73 +7104,27 @@ if (row.kind === 'key') options.capture = { id: row.id, kind: 'key', buf: '' };
       restore();
       return process.exit(0);
     }
-    quitArmedUntil = Date.now() + 2000;
+    quitArmedUntil = Date.now() + QUIT_WINDOW_MS;
     state.status = `press ${chord} again to exit`;
     schedulePaint();
   }
 
-  /** A leader command — the key pressed after ctrl+a. Tab ops work on any tab; pane ops need a tree. */
-  function leaderCommand(ev: { key: string; ctrl: boolean; alt: boolean; shift?: boolean }): void {
-    if (ev.key === 'escape') {
-      state.status = 'ready';
-      return schedulePaint();
-    }
-    // ctrl+a twice sends one ctrl+a to the program in a native tab, as herdr, tmux and screen do with their
-    // prefix: Claude Code and Codex both use it for line start.
-    if (ev.ctrl && !ev.alt && ev.key === 'a') {
-      const t = tabs[active];
-      const s = t?.kind === 'native' ? nativeSessions.get(t.id) : undefined;
-      if (s && !s.ended) s.write(Buffer.from('\x01'));
-      state.status = 'ready';
-      return schedulePaint();
-    }
-    // A command is a plain key. `ctrl+a ctrl+k` is readline's "line start, then kill the line", and it
-    // killed the herdr client.
-    if (ev.ctrl || ev.alt) {
-      state.status = tabs[active]?.kind === 'native' ? 'ctrl+a takes a plain key next · ctrl+a ctrl+a sends ctrl+a to the program' : 'ctrl+a takes a plain key next';
-      return schedulePaint();
-    }
-    if (ev.key === 'q') return requestQuit('ctrl+a q');
-    if (ev.key === 'n') return switchTab((active + 1) % tabs.length);
-    if (ev.key === 'p') return switchTab((active - 1 + tabs.length) % tabs.length);
-    if (ev.key === 'o' && tabs[active]?.id === 'herdr') {
-      void observatory?.current().then(selection => pinSession(selection.session, selection.machineId))
-        .catch(error => { state.status = String(error.message || error); schedulePaint(); });
-      return;
-    }
-    if (/^[1-9]$/.test(ev.key)) {
-      const i = Number(ev.key) - 1;
-      if (i < tabs.length) return switchTab(i);
-      state.status = `no tab ${ev.key} — ${tabs.length} open`;
-      return schedulePaint();
-    }
-    if (ev.key === 'k') {
-
-      // (quitting oak, switching away, closing the window: all of those merely detach).
-      const t = tabs[active];
-      if (!t || t.kind !== 'native') {
-        state.status = 'ctrl+a k kills the program in a native tab';
-        return schedulePaint();
-      }
-      const s = nativeSessions.get(t.id);
-      if (s) s.close();
-      else closeNativeTab(t.id);
-      state.status = `killed ${t.name ?? 'the program'}`;
-      return schedulePaint();
-    }
+  /** The Observatory's pane operations (they were the ctrl+a leader's): zoom, close, split, swap and the
+   *  view picker, on the focused pane of the tree tab. Shared by the keys and the palette. */
+  function paneOp(op: 'zoom' | 'close' | 'cycle' | '|' | '-' | 'view' | 'H' | 'J' | 'K' | 'L'): void {
     const tab = tabs[active];
     if (!tab?.root) {
-      state.status = 'pane ops need a tree tab (observatory)';
+      state.status = 'pane operations are on the Observatory tab';
       return schedulePaint();
     }
     const focus = tab.treeFocus ?? firstLeafId(tab.root);
-    if (ev.key === 'z') {
+    if (op === 'zoom') {
       tab.treeZoom = tab.treeZoom === focus ? null : focus;
-      state.status = tab.treeZoom ? 'zoomed — ctrl+a z restores' : 'ready';
+      state.status = tab.treeZoom ? `zoomed — ${keyForAction('zoom')} restores` : 'ready';
       return schedulePaint();
     }
-    if (ev.key === 'tab') return cycleTreeFocus(tab);
-    if (ev.key === 'x') {
+    if (op === 'cycle') return cycleTreeFocus(tab);
+    if (op === 'close') {
       if (paneCount(tab.root) <= 1) {
         state.status = 'cannot close the last pane';
         return schedulePaint();
@@ -5610,39 +7141,323 @@ if (row.kind === 'key') options.capture = { id: row.id, kind: 'key', buf: '' };
       ask();
       return schedulePaint();
     }
-    if (ev.key === '|' || ev.key === '-') {
+    if (op === '|' || op === '-') {
       // A split starts with its own unpinned conversation header; Enter gives it an independent pin.
       const newId = `split-${nextSplitId++}`;
-      tab.root = splitPane(tab.root, focus, ev.key === '|' ? 'h' : 'v', newId, 'session-detail');
+      tab.root = splitPane(tab.root, focus, op === '|' ? 'h' : 'v', newId, 'session-detail');
       tab.treeFocus = newId;
       tab.treeZoom = null;
-      state.status = 'pane split — ctrl+a x closes it · ctrl+a v changes what it shows';
+      state.status = 'pane split — v changes what it shows · “close pane” in the : palette closes it';
       ask();
       return openViewPicker(newId);
     }
-    if (ev.key === 'v') return openViewPicker(focus);
-    if (ev.key === 'H' || ev.key === 'J' || ev.key === 'K' || ev.key === 'L') {
-      // Move the focused pane by keyboard: swap it with the neighbour that way —
-      // the same tree op the title drag's middle-drop applies.
-      const dir = ev.key === 'H' ? 'left' : ev.key === 'L' ? 'right' : ev.key === 'K' ? 'up' : 'down';
-      const nb = neighbourPane(tab.root, focus, dir);
-      if (!nb) {
-        state.status = `no pane ${dir === 'up' ? 'above' : dir === 'down' ? 'below' : `to the ${dir}`}`;
-        return schedulePaint();
-      }
-      tab.root = swapPanes(tab.root, focus, nb);
-      tab.treeZoom = null;
-      saveLayout();
-      state.status = 'panes swapped';
+    if (op === 'view') return openViewPicker(focus);
+    // Move the focused pane by keyboard: swap it with the neighbour that way — the same tree op the
+    // title drag's middle-drop applies.
+    const dir = op === 'H' ? 'left' : op === 'L' ? 'right' : op === 'K' ? 'up' : 'down';
+    const nb = neighbourPane(tab.root, focus, dir);
+    if (!nb) {
+      state.status = `no pane ${dir === 'up' ? 'above' : dir === 'down' ? 'below' : `to the ${dir}`}`;
       return schedulePaint();
     }
-    state.status = 'ready';
+    tab.root = swapPanes(tab.root, focus, nb);
+    tab.treeZoom = null;
+    saveLayout();
+    state.status = 'panes swapped';
     return schedulePaint();
+  }
+
+  /** Pin the session in herdr's focused pane in the Observatory (herdr's prefix, then `M`). It is the way back to
+   *  OAK's tabs when herdr's config binds `m`, so a pane with nothing to pin goes there too, with the reason. */
+  function pinHerdrFocused(): void {
+    void observatory?.current().then(selection => pinSession(selection.session, selection.machineId))
+      .catch(error => { toOakTab(); state.status = String(error.message || error); schedulePaint(); });
+  }
+
+  /** Open Review on the session in herdr's focused pane (herdr's prefix, then `V`) the way `oak focus --tab review` opens
+   *  it: no machine named, so Review reads the session where OAK's herdr snapshots show it running, this machine's pane
+   *  first. A pane with no session goes to OAK's tabs, with the reason, as `M` does. */
+  function reviewHerdrFocused(): void {
+    void observatory?.current().then(selection => reviewSession(selection.session))
+      .catch(error => { toOakTab(); state.status = String(error.message || error); schedulePaint(); });
+  }
+
+  /** The tab key (f1 to f3, `TAB_KEYS`) a key event is, if it is one: with shift, ctrl, alt, super, hyper or meta it is
+   *  another key, which goes where that key goes. */
+  const tabKeyOf = (ev: { key: string; ctrl?: boolean; alt?: boolean; shift?: boolean; super?: boolean; hyper?: boolean; meta?: boolean }): OakTabKey | undefined =>
+    !ev.ctrl && !ev.alt && !ev.shift && !ev.super && !ev.hyper && !ev.meta && Object.hasOwn(TAB_KEYS, ev.key) ? ev.key as OakTabKey : undefined;
+
+  /**
+   * F1, F2 and F3: herdr, the Observatory and Review, from every tab and over every overlay. What is open closes first, as
+   * esc would close it: an overlay, a picker, the palette, the options window, find in the diff, a one-key wait. A box
+   * holding text you typed (the palette, the session picker's search, the help's filter, find in the diff, an options
+   * entry) closes too, and its text goes with it. One thing holds the key back and says so on the status row: a question
+   * standing, which no tab switch leaves behind. The `/` filter keeps its text on its tab and the reply box its draft.
+   * Inside a herdr pane there is no herdr tab, and F1 says so.
+   */
+  function tabKeyPressed(key: OakTabKey): void {
+    const i = tabs.findIndex((t) => t.id === TAB_KEYS[key]);
+    if (i < 0) {
+      state.status = "F1: no herdr tab here — OAK runs in a herdr pane, and herdr's own keys move between its tabs";
+      return schedulePaint();
+    }
+    if (state.confirm) {
+      state.status = 'answer the pending question first — y or n';
+      return schedulePaint();
+    }
+    // What was open closes, and the status it wrote ("find in diff: …", a mark's or the resume's question) with it;
+    // with nothing open the status stands, as a tab switch leaves it.
+    const open = closeOverlay() || !!options || diffFindOpen || !!markPending || !!claudeAsk;
+    paletteOpen = viewPickOpen = inboxOpen = searchOpen = false;
+    options = null;
+    if (diffFindOpen) { diffFindOpen = false; clearFind(); }
+    markPending = null;
+    claudeAsk = null;
+    state.goto = null;
+    if (open) state.status = 'ready';
+    if (i !== active) return switchTab(i);
+    schedulePaint();
+  }
+
+  /** OAK's tab keys on the herdr tab, before herdr or the program sees them, as a click on OAK's tab bar is (a ctrl+q
+   *  held there is dropped with them, and the quit stays armed). Not one herdr's config binds (`tabTaken`, its prefix
+   *  among them), which goes on to herdr; and while herdr's prefix waits for its key, `herdrPrefixPart` decides. Their
+   *  auto-repeat and release are OAK's too, so F1 on its own tab reaches no one. Returns true when it took the part. */
+  function herdrTabKeyPart(part: NativeInputPart): boolean {
+    if (prefixHeld) return false;
+    const ev = part.events.length === 1 && part.events[0].t === 'key' ? part.events[0] as Partial<NativeKeyEvent> & { key: string } : undefined;
+    const key = ev && tabKeyOf(ev);
+    if (!key || herdrConfig().tabTaken[key]) return false;
+    if (!ev.event || ev.event === 'press') tabKeyPressed(key);
+    return true;
+  }
+
+  /** The OAK tab herdr's prefix then `m` returns to: the last one used, else the Observatory. */
+  function toOakTab(): void {
+    const i = lastOakTab >= 0 && lastOakTab < tabs.length && tabs[lastOakTab].kind !== 'native' ? lastOakTab
+      : tabs.findIndex((t) => t.kind !== 'native');
+    if (i >= 0) switchTab(i);
+  }
+
+  /**
+   * herdr's prefix on the herdr tab. OAK sees each key before the client does; the prefix is held until the
+   * next key says whose it is. `m`, `M` and `V`, and the tab keys F1 to F3, are OAK's when herdr leaves them
+   * unbound (defaults and the reader's config.toml both counted); any other key goes to herdr with the prefix
+   * in front, unchanged, so herdr's own bindings, and the prefix pressed twice, work exactly as they do without OAK.
+   * Returns true when the part was taken here. `herdrHolds`: the part is the motion or release of a button herdr
+   * holds, which reaches herdr wherever it is let go.
+   */
+  function herdrPrefixPart(part: NativeInputPart, sess: NativeSession, herdrHolds = false): boolean {
+    const ev = part.events.length === 1 && part.events[0].t === 'key' ? part.events[0] : undefined;
+    const kitty = ev && 'event' in ev ? ev as NativeKeyEvent : undefined;
+    const chord = !!kitty && !!(kitty.super || kitty.hyper || kitty.meta);
+    // A super chord can be the prefix itself (super+b, which herdr reads from a terminal with the kitty protocol).
+    if (!prefixHeld && (!ev || (kitty && kitty.event !== 'press'))) return false; // mouse, paste, releases
+    const cfg = herdrConfig();
+    if (prefixHeld) {
+      // A release, an auto-repeat, or a modifier pressed on its own (kitty's report-all-keys flag, which herdr
+      // asks the terminal for when a pane's program does: shift on its way to M) is still the prefix being pressed.
+      if (kitty && (kitty.event === 'release' || kitty.event === 'repeat' || modifierOnly(kitty))) {
+        prefixHeld = Buffer.concat([prefixHeld, part.bytes]);
+        return true;
+      }
+      // Pointer motion, the wheel and focus changes (OAK turns on 1003 and 1004 for this tab) say nothing about
+      // whose the prefix is: they go on to herdr and the prefix stays held. Keys, clicks and pastes decide.
+      if (passesThrough(part)) return false;
+      const held = prefixHeld;
+      prefixHeld = null;
+      // A click herdr never receives (OAK's tab bar, the rows under herdr's screen) drops the prefix with it. Sent
+      // on alone, it left herdr waiting in prefix mode, and the next key typed on its tab ran as a herdr command. The
+      // release of herdr's own drag let go there does reach herdr, and the prefix goes on before it.
+      if (part.events.some((e) => e.t === 'mouse') && !reachesProgram(part, herdrHolds)) {
+        state.status = 'ready';
+        return false;
+      }
+      // ctrl+q as OAK's quit reads it (herdrQuitPart): with shift, super, hyper or meta it is another key, and herdr's.
+      if (ev && ev.ctrl && !ev.alt && !ev.shift && !chord && ev.key === 'q') {
+        // A prefix of ctrl+q pressed twice is herdr's literal prefix, as every other prefix is: OAK's quit is
+        // then on its own tabs. Otherwise ctrl+q is OAK's quit, and the prefix before it is dropped.
+        if (cfg.prefixes.some((k) => k.ctrl && !k.alt && !k.shift && !k.super && !k.hyper && k.key === 'q')) {
+          sess.write(held);
+          sess.write(part.bytes);
+          state.status = 'ready';
+          schedulePaint();
+          return true;
+        }
+        return false;
+      }
+      const mine = ev && !chord && !ev.ctrl && !ev.alt && (cfg.oak as string[]).includes(ev.key) ? ev.key : null;
+      state.status = 'ready';
+      if (mine === 'm') { toOakTab(); return true; }
+      // M pins herdr's focused session, which goes to OAK's tabs too, so it is the way back when herdr took m; V opens
+      // Review on it, the same way.
+      if (mine === 'M') { pinHerdrFocused(); return true; }
+      if (mine === 'V') { reviewHerdrFocused(); return true; }
+      // A tab key is OAK's after the prefix as before it, and the prefix goes with it, as with m, unless herdr's config binds
+      // it there.
+      const tab = ev && tabKeyOf(ev);
+      if (tab && !cfg.taken[tab]) { tabKeyPressed(tab); return true; }
+      sess.write(held);
+      schedulePaint();
+      return false; // the key itself follows the prefix through the normal route
+    }
+    const p = pressedPrefix(part, cfg);
+    if (!p) return false;
+    prefixHeld = Buffer.from(part.bytes);
+    // The way back from here: m, M or V, which OAK takes after any prefix it caught, a tab key, or a click when herdr's
+    // config binds them all. The widest wording that fits the row, so a narrow terminal drops a part rather than cutting one.
+    const hints = herdrPrefixHints(core.herdrKeyLabel(p), cfg.oak, core.OAK_TAB_KEYS.filter((k) => !cfg.taken[k]));
+    state.status = hints.find((s) => displayWidth(s) <= frameCols - 1) ?? hints[hints.length - 1];
+    schedulePaint();
+    return true;
+  }
+
+  /** The herdr prefix a part presses, if it presses one: any of those herdr's config lists. Without the kitty
+   *  protocol a ctrl chord is one C0 byte, which the decoder names as some other key (ctrl+space as ctrl+`,
+   *  ctrl+h as backspace): the prefix is matched on the bytes it sends. */
+  function pressedPrefix(part: NativeInputPart, cfg = herdrConfig()): import('@oak-observatory/core').HerdrKey | undefined {
+    const ev = part.events.length === 1 && part.events[0].t === 'key' ? part.events[0] : undefined;
+    const kitty = ev && 'event' in ev ? ev as NativeKeyEvent : undefined;
+    // herdr reads `meta` in its config as alt, and no key with the kitty protocol's own meta.
+    if (!ev || (kitty && (kitty.event !== 'press' || kitty.meta))) return undefined;
+    // A letter with shift is its capital, as herdr reads both (the kitty protocol reports ctrl+shift+a as `a` with shift, or
+    // as `A`), and a capital letter is the letter with shift: ctrl+shift+b is not the prefix ctrl+b. Shift on any other key
+    // is part of the key, as it is for herdr: ctrl+shift+space is not ctrl+space, nor shift+f5 f5. shift+tab is backtab.
+    const key = ev.shift && /^[a-z]$/.test(ev.key) ? ev.key.toUpperCase() : ev.key;
+    const shift = /^[A-Za-z]$/.test(key) || key === 'backtab' ? null : ev.shift;
+    // A shifted symbol as the kitty protocol reports it with the alternate keys herdr asks for (alt+! is 49:33;4u, ctrl+_ is
+    // 45:95;6u) is, as herdr reads it, that symbol without shift too.
+    const shifted = kitty && ev.shift ? Number(/^\x1b\[\d+:(\d+)/.exec(part.bytes.toString('latin1'))?.[1]) : NaN;
+    const symbol = shifted > 0 && shifted <= 0x10ffff ? String.fromCodePoint(shifted) : undefined;
+    return cfg.prefixes.find((k) => {
+      const legacy = kitty ? null : core.legacyKeyBytes(k);
+      if (legacy !== null) return part.bytes.equals(Buffer.from(legacy));
+      if (!!ev.ctrl !== !!k.ctrl || !!ev.alt !== !!k.alt || !!kitty?.super !== !!k.super || !!kitty?.hyper !== !!k.hyper) return false;
+      return (key === k.key && (shift === null || shift === !!k.shift)) || (symbol !== undefined && symbol === k.key && !k.shift);
+    });
+  }
+
+  /** A kitty report of a modifier on its own (57441-57454, shift to level-5 shift): the flag that reports every
+   *  key, which herdr asks the terminal for when a pane's program does, sends one on the way to a chord. */
+  const modifierOnly = (kitty: NativeKeyEvent): boolean => /^[\u{e061}-\u{e06e}]$/u.test(kitty.key);
+  /** Pointer motion, the wheel and focus changes, which decide nothing about a key held on the herdr tab. */
+  const passesThrough = (part: NativeInputPart): boolean => part.events.length > 0
+    && part.events.every((e) => e.t === 'focus' || (e.t === 'mouse' && (e.kind === 'move' || e.kind === 'wheel-up' || e.kind === 'wheel-down')));
+
+  /**
+   * ctrl+q on the herdr tab, where it is OAK's quit pressed twice, and a key of the program's pressed once
+   * (emacs's quoted-insert, zsh's push-line). The first press arms the quit and is held; a second one within
+   * the quit window quits. A key, click or paste for the program sends the held ctrl+q on before it, and the
+   * window ending sends it on too; herdr's prefix waits for the key after it, so prefix then ctrl+q is the
+   * second press. A click on OAK's own rows sends nothing: the ctrl+q stays held and the quit armed. Returns true
+   * when it took the part. `herdrHolds` as for herdrPrefixPart.
+   */
+  function herdrQuitPart(part: NativeInputPart, sess: NativeSession, herdrHolds = false): boolean {
+    const ev = part.events.length === 1 && part.events[0].t === 'key' ? part.events[0] : undefined;
+    const kitty = ev && 'event' in ev ? ev as NativeKeyEvent : undefined;
+    const q = !!ev && ev.ctrl && !ev.alt && !ev.shift && ev.key === 'q' && !(kitty && (kitty.super || kitty.hyper || kitty.meta));
+    if (!quitHeld) {
+      if (!q || (kitty && kitty.event !== 'press')) return false;
+      requestQuit('ctrl+q'); // a quit armed on another tab (ctrl+c on Review) ends here
+      const held = Buffer.from(part.bytes);
+      const timer = setTimeout(() => {
+        if (quitHeld?.timer !== timer) return;
+        quitHeld = null;
+        if (sess.ended || tabs[active]?.kind !== 'native') return;
+        sess.write(held);
+        if (state.status === 'press ctrl+q again to exit') state.status = 'ready';
+        schedulePaint();
+      }, QUIT_WINDOW_MS);
+      timer.unref?.();
+      quitHeld = { bytes: held, timer };
+      return true;
+    }
+    // Its own repeat or release, or a modifier on its own, is still the held press.
+    if (kitty && ((q && kitty.event !== 'press') || modifierOnly(kitty))) {
+      quitHeld.bytes = Buffer.concat([quitHeld.bytes, part.bytes]);
+      return true;
+    }
+    if (passesThrough(part)) return false;
+    // herdr's prefix decides with the key after it: ctrl+q there is this quit's second press (the prefix is
+    // dropped, as before a first one), and any other key sends this ctrl+q on ahead of the prefix. The prefix
+    // pressed again once held is such a key (herdr's literal prefix): the ctrl+q goes on ahead of both.
+    if (!prefixHeld && pressedPrefix(part)) return false;
+    // A click the program never receives (OAK's tab bar, the rows under herdr's screen) decides nothing either: the
+    // ctrl+q stays held for the key after it, and the quit stays armed.
+    if (part.events.some((e) => e.t === 'mouse') && !reachesProgram(part, herdrHolds)) return false;
+    const held = quitHeld.bytes;
+    dropQuitHeld();
+    if (q) {
+      if (quitArmedUntil > Date.now()) { requestQuit('ctrl+q'); return true; }
+      // The window ended a moment before its timer ran: the first goes on to the program, and this one starts over.
+      sess.write(held);
+      return herdrQuitPart(part, sess, herdrHolds);
+    }
+    quitArmedUntil = 0;
+    if (state.status === 'press ctrl+q again to exit') { state.status = 'ready'; schedulePaint(); }
+    sess.write(held);
+    return false; // the part itself follows through the normal route
+  }
+
+  /**
+   * The Observatory's own keys, on its session list and conversation panes. Returns false for a key it
+   * does not own. Each of these letters means nothing on Review (RESERVED_KEYS in core keeps a rebind
+   * off them), so one letter never means two things across the two tabs. Shared by the keyboard and the
+   * palette's Observatory rows.
+   */
+  function observatoryKey(key: string): boolean {
+    const tab = tabs[active];
+    if (tab?.id !== 'observatory' || !tab.root) return false;
+    const focused = leafPanes(tab.root).find(p => p.id === tab.treeFocus);
+    const detail = focused?.view === 'session-detail' ? state.observatory?.details[focused.id] : undefined;
+    const selection = detail?.selection || state.scopeWorker;
+    // With nothing selected these act on the reviewed session: the Review tab's, which the launch rule may
+    // have moved to a saved machine while `state.session` stayed the launch session.
+    const reviewed = (): string => tabs.find((t) => t.id === 'review')?.session || state.session;
+    const session = selection?.session || reviewed();
+    const label = selection?.label || session.slice(0, 8);
+    if (selection?.agentId && (key === 'R' || key === 'X' || key === 't')) {
+      state.status = 'Worker log · select the parent session for its herdr pane or session actions'; schedulePaint(); return true;
+    }
+    switch (key) {
+      case 'W': void openWorkspaceWindow(detail?.selection || workspaceGroupSelection || selection || undefined); return true;
+      case 'c': {
+        const pane = focused?.view === 'session-detail' ? focused : leafPanes(tab.root).find(p => p.view === 'session-detail');
+        if (pane) { tab.treeFocus = pane.id; observatory?.focusReply(pane.id); }
+        else state.status = 'Pin a session to reply';
+        schedulePaint();
+        return true;
+      }
+      case 't':
+        if (selection) jumpHerdr(selection);
+        else { state.status = 'select a session to go to its herdr pane'; schedulePaint(); }
+        return true;
+      case 'd': case 'f': case 'enter':
+        // Enter on a session's worker summary opens or closes its group; anything else picked, it pins.
+        if (key === 'enter' && state.scopeWorker?.workers === 'all' && workerGroupDrawn(state.scopeWorker)) { toggleOpenKey(`workers:${state.scopeWorker.machineId}:${state.scopeWorker.session}`); return true; }
+        if (state.scopeWorker?.session) openConversation(state.scopeWorker.session);
+        else pinSession(reviewed(), reviewMachineId(reviewed()));
+        return true;
+      // Both ask first, and esc (or n) cancels: the blob's resolve and stop buttons, from the keyboard.
+      case 'R': blobAction('resolve', session, label, selection || undefined); return true;
+      case 'X': blobAction('kill', session, label, selection || undefined); return true;
+      case 'B':
+        // Changes retention, not identity. A pinned conversation survives the filter.
+        state.allSessions = !state.allSessions;
+        state.scopeWorker = null;
+        state.status = state.allSessions ? 'show archived sessions' : 'hide archived · live panes and unresolved edits';
+        schedulePaint();
+        return true;
+      case 'v': paneOp('view'); return true;
+      case '|': case '-': case 'H': case 'J': case 'K': case 'L': paneOp(key); return true;
+    }
+    if (keys().get(key) === 'zoom') { paneOp('zoom'); return true; }
+    return false;
   }
 
   function focusedReplyPane(): string | undefined {
     const tab = tabs[active];
-    if (tab?.id !== 'observatory' || state.overlay || state.confirm || filterOpen || cmdOpen || diffFindOpen) return;
+    if (tab?.id !== 'observatory' || state.overlay || state.confirm || filterOpen || diffFindOpen) return;
     const pane = leafPanes(tab.root!).find(p => p.id === tab.treeFocus && p.view === 'session-detail');
     return pane && state.observatory?.details[pane.id]?.reply?.focused ? pane.id : undefined;
   }
@@ -5659,10 +7474,10 @@ if (row.kind === 'key') options.capture = { id: row.id, kind: 'key', buf: '' };
     const { detail, reason } = observatoryReply(state, paneId);
     if (reason || !detail?.reply) return;
     let { text, caret } = detail.reply;
-    const before = Array.from(text.slice(0, caret));
-    const after = Array.from(text.slice(caret));
-    const left = before.at(-1)?.length || 0;
-    const right = after[0]?.length || 0;
+    // A character at a time, as the row draws it: an emoji built from several, or a letter and its accents, is stepped
+    // over and deleted whole. A caret inside one left the row without it, which never fits either side of the caret.
+    const left = caret - core.graphemeHead(text, caret - 1).length;
+    const right = core.graphemeEnd(text, caret) - caret;
     if (ev.key === 'left' && !ev.alt) caret -= left;
     else if (ev.key === 'right' && !ev.alt) caret += right;
     else if (ev.key === 'home' || (ev.ctrl && ev.key === 'a')) caret = 0;
@@ -5686,11 +7501,11 @@ if (row.kind === 'key') options.capture = { id: row.id, kind: 'key', buf: '' };
   function repeatActs(ev: { key: string; ctrl: boolean; alt: boolean }): boolean {
     if (HELD_KEYS.has(ev.key)) return true;
     if (ev.ctrl || ev.alt) return false;
-    if (filterOpen || cmdOpen || diffFindOpen || helpFilter !== null || options?.capture) return true;
+    if (filterOpen || diffFindOpen || helpFilter !== null || options?.capture) return true;
     return (ev.key === 'j' || ev.key === 'k') && !keys().get(ev.key);
   }
 
-  function onKey(ev: { key: string; ctrl: boolean; alt: boolean; shift?: boolean; event?: 'press' | 'repeat' | 'release' }): void {
+  function onKey(ev: { key: string; ctrl: boolean; alt: boolean; shift?: boolean; event?: 'press' | 'repeat' | 'release'; action?: import('@oak-observatory/core').Action }): void {
     // ^C arrives as a NAMED key with `ctrl` set — `{key:'c'}` — never as the raw byte. A `case '\x04'`
     // in the verb switch was therefore dead. ^D used to be folded in here too and quit alongside it;
     // it is a pager key now (see the ctrl layer below), because in vim, less and everything that
@@ -5698,15 +7513,10 @@ if (row.kind === 'key') options.capture = { id: row.id, kind: 'key', buf: '' };
     // a long diff the way they scroll everything else. ^C alone keeps the quit — that one is universal.
     const ch = ev.ctrl && ev.key === 'c' ? '\x03' : ev.key;
     const replyPane = focusedReplyPane();
-    if (replyPane && ch !== '\x03' && !leaderArmed) return replyKey(replyPane, ev);
+    // The reply box types. ^C, and the tab-switch chords (ctrl+n/ctrl+p, alt+<digit>), still leave it.
+    const switchChord = (ev.ctrl && !ev.alt && (ev.key === 'n' || ev.key === 'p')) || (ev.alt && !ev.ctrl && /^[1-9]$/.test(ev.key));
+    if (replyPane && ch !== '\x03' && !switchChord) return replyKey(replyPane, ev);
     if (ev.event === 'repeat' && !repeatActs(ev)) return;
-    // The LEADER (ctrl+a): a tmux-style prefix for the full-BSP pane/tab ops. Armed = the next key is a
-    // command; ^C still quits, esc always leaves. A MODE, shown in the status row — never a stuck one.
-    if (leaderArmed && ch !== '\x03') {
-      if (ev.event === 'repeat') return; // a held key is the same press, never the leader's command
-      leaderArmed = false;
-      return leaderCommand(ev);
-    }
     // esc during a pane drag cancels it — the pane stays where it was.
     if (paneDrag && ev.key === 'escape') {
       paneDrag = null;
@@ -5714,23 +7524,11 @@ if (row.kind === 'key') options.capture = { id: row.id, kind: 'key', buf: '' };
       state.status = 'move cancelled';
       return schedulePaint();
     }
-    // ctrl+o: find anything. A fixed chord like the others, and never over another
-    // overlay or a standing keep/undo.
-    if (ev.ctrl && ev.key === 'o' && !state.confirm && !state.overlay) return openPalette();
-    if (
-      ev.ctrl && ev.key === 'a' && !state.confirm && !state.overlay
-    ) {
-      leaderArmed = true;
-      state.status = `ctrl+a — |/- split · z zoom · x close · tab cycle · n/p·1-${tabs.length} tabs · q quit · ctrl+q ×2 quit · esc`;
-      return schedulePaint();
-    }
-    // TAB SWITCHING IS GLOBAL, and sits above every screen's own handler: the tab bar is chrome that
-    // every tab shows, so the key that moves between tabs cannot belong to one of them.
-    //
-    // `ctrl+n`/`ctrl+p` and `alt+<digit>` rather than the planned `ctrl+a` leader — those four
-    // combinations are genuinely unbound here (only ^C ^F ^G ^X are taken), and a leader mode is a
-    // mode a reader can get stuck in. The digits stay free of a bare binding because a bare digit
-    // names an EDIT in this product, which is the thing a reviewer says out loud.
+    // TAB SWITCHING sits above every screen's own handler: the tab bar is chrome that every OAK tab
+    // shows, so the key that moves between tabs cannot belong to one of them. Tab and shift+Tab are the
+    // plain keys (in the switch below, so a typing wall keeps them); `ctrl+n`/`ctrl+p` and `alt+<digit>`
+    // are the chords. On the herdr tab every key is the program's: herdr's prefix then `m` comes back.
+    // The digits stay free of a bare binding because a bare digit names an EDIT in this product.
     if (!state.confirm && tabs.length > 1) {
       if (ev.ctrl && (ev.key === 'n' || ev.key === 'p')) {
         const d = ev.key === 'n' ? 1 : -1;
@@ -5745,13 +7543,18 @@ if (row.kind === 'key') options.capture = { id: row.id, kind: 'key', buf: '' };
         return schedulePaint();
       }
     }
-    // On a NATIVE tab, non-leader keys belong to the program (routed raw in the stdin handler). Once it
-    // has EXITED they fall through to here instead — swallow them, or k/u/j would act on the dashboard
-    // behind the dead grid. The leader (ctrl+a) and the tab-switches above still work.
+    // On a NATIVE tab, keys belong to the program (routed raw in the stdin handler). Once it has EXITED
+    // they fall through to here instead — swallow them, or k/u/j would act on the dashboard behind the
+    // dead grid. The tab-switch chords above, and Tab / shift+Tab here, still work.
     // An overlay painted OVER a native tab still owns the keyboard (switching
     // tabs with help/options open dead-locked every key — esc could not close, ^C could not arm,
     // and the pty was blocked by the overlay gate too).
-    if (tabs[active]?.kind === 'native' && !state.overlay) return;
+    if (tabs[active]?.kind === 'native' && !state.overlay) {
+      if (!ev.ctrl && !ev.alt && (ev.key === 'tab' || ev.key === 'backtab') && tabs.length > 1) {
+        return switchTab((active + (ev.key === 'tab' ? 1 : tabs.length - 1)) % tabs.length);
+      }
+      return;
+    }
     // The filter picker is a typing-wall-style mode: while it is open it owns every key but ^C.
     if (ch !== '\x03' && filterMenuKey(ev)) return;
     // ^C with a SELECTION standing is the OS copy, never the quit. The drag already copied on release; this is the
@@ -5791,7 +7594,7 @@ if (row.kind === 'key') options.capture = { id: row.id, kind: 'key', buf: '' };
         return rerenderHelp();
       }
       if (ev.key === 'backspace' || ev.key === 'delete') {
-        helpFilter = helpFilter.slice(0, -1);
+        helpFilter = backspaced(helpFilter);
         return rerenderHelp();
       }
       if (ev.key === 'up' || ev.key === 'down' || ev.key === 'pgup' || ev.key === 'pgdn') {
@@ -5818,35 +7621,31 @@ if (row.kind === 'key') options.capture = { id: row.id, kind: 'key', buf: '' };
     }
     // OBSERVATORY NAV: the arrow keys drive the whole tab. ↑/↓ move the session
     // SELECTION through the master (which drives the detail); when the detail holds focus they scroll it.
-    // ←/→ move focus between the two panes. `d`/`↵` open the selected session's agent tab — its live feed
-    // and prompt box (selection = `scopeWorker`, falling back to the reviewed session). Gated to the
-    // observatory tab so these keys keep their meaning everywhere else.
+    // ←/→ move focus between the two panes; the letters are `observatoryKey`'s. Gated to the observatory
+    // tab so these keys keep their meaning everywhere else.
     if (
-      !state.overlay && !state.confirm && !filterOpen && !cmdOpen && !diffFindOpen && !ev.ctrl && !ev.alt &&
+      !state.overlay && !state.confirm && !filterOpen && !diffFindOpen && !ev.ctrl && !ev.alt &&
       tabs[active]?.id === 'observatory'
     ) {
       const focused = leafPanes(tabs[active].root!).find(p => p.id === tabs[active].treeFocus);
       const onMaster = focused?.view === 'sessions-nav';
+      // F4, F5, … are the panes in order (F1 to F3 are OAK's tabs, taken before this).
       const fkey = /^f([1-9][0-9]*)$/.exec(ev.key);
       if (fkey) {
-        const pane = leafPanes(tabs[active].root!)[Number(fkey[1]) - 1];
+        const panes = leafPanes(tabs[active].root!);
+        const pane = panes[Number(fkey[1]) - 4];
         if (pane) {
           const tab = tabs[active];
           if (tab.treeFocus === pane.id) tab.treeZoom = tab.treeZoom === pane.id ? null : pane.id;
           else { tab.treeFocus = pane.id; tab.treeZoom = null; }
           saveLayout(); schedulePaint();
+        } else {
+          // Said rather than swallowed: a key past the last pane looked dead.
+          state.status = `no pane ${ev.key.toUpperCase()} here — ${panes.length === 1 ? 'F4 focuses the only pane' : `F4–F${panes.length + 3} focus the ${panes.length} panes`}`;
+          schedulePaint();
         }
         return;
       }
-      const detail = focused?.view === 'session-detail' ? state.observatory?.details[focused.id] : undefined;
-      const selection = detail?.selection || state.scopeWorker;
-      if (ev.key === 'i') {
-        const pane = focused?.view === 'session-detail' ? focused : leafPanes(tabs[active].root!).find(p => p.view === 'session-detail');
-        if (pane) { tabs[active].treeFocus = pane.id; observatory?.focusReply(pane.id); }
-        else state.status = 'Pin a session to reply';
-        return schedulePaint();
-      }
-      if (ev.key === 'h' && selection) { jumpHerdr(selection); return; }
       if (ev.key === 'end' && focused?.view === 'session-detail') return newestConversation(focused.id);
       if (ev.key === 'up' || ev.key === 'down' || ev.key === 'pgup' || ev.key === 'pgdn') {
         const step = ev.key === 'pgdn' ? 10 : ev.key === 'pgup' ? -10 : ev.key === 'down' ? 1 : -1;
@@ -5854,33 +7653,26 @@ if (row.kind === 'key') options.capture = { id: row.id, kind: 'key', buf: '' };
         else treeScrollBy(tabs[active].treeFocus ?? '', step);
         return;
       }
+      // On the master, → opens the worker group whose summary is picked, and ← closes the group of any row of it that
+      // is picked, leaving its summary picked. Otherwise they move between the panes.
+      if (onMaster && state.observatoryFold && ['left', 'right', 'enter'].includes(ev.key)) {
+        const fold = state.observatoryFold;
+        if (ev.key === 'enter' || state.open.has(fold) !== (ev.key === 'right')) toggleOpenKey(fold);
+        return;
+      }
+      if (onMaster && (ev.key === 'left' || ev.key === 'right') && workerFold(ev.key === 'right')) return;
       if (ev.key === 'left') { tabs[active].treeFocus = 'obs-sessions'; return schedulePaint(); }
       if (ev.key === 'right') { tabs[active].treeFocus = 'obs-detail'; return schedulePaint(); }
-      // With nothing selected these act on the reviewed session: the Review tab's, which the launch rule may
-      // have moved to a saved machine while `state.session` stayed the launch session.
-      const reviewed = (): string => tabs.find((t) => t.id === 'review')?.session || state.session;
-      if (ev.key === 'd' || ev.key === 'enter') {
-        if (state.scopeWorker?.session) openConversation(state.scopeWorker.session);
-        else pinSession(reviewed(), reviewMachineId(reviewed()));
-        return;
-      }
-      // The blob buttons from the keyboard: f feed · r review · a resolve · x kill — acting on the
-      // SELECTED session (or the reviewed one when nothing is picked), the same as clicking them.
-      if (ev.key === 'f' || ev.key === 'r' || ev.key === 'a' || ev.key === 'x') {
-        const sc = selection;
-        const session = sc?.session || reviewed();
-        const label = sc?.label || session.slice(0, 8);
-        const action = ev.key === 'f' ? 'feed' : ev.key === 'r' ? 'review' : ev.key === 'a' ? 'resolve' : 'kill';
-        blobAction(action, session, label, sc || undefined);
-        return;
-      }
-      // Shift+A changes retention, not identity. A pinned conversation survives the filter.
-      if (ev.key === 'A') {
-        state.allSessions = !state.allSessions;
-        state.scopeWorker = null;
-        state.status = state.allSessions ? 'show archived sessions' : 'hide archived · live panes and unresolved edits';
-        return schedulePaint();
-      }
+      if (observatoryKey(ev.key)) return;
+      // Every other key: only the ones both OAK tabs share reach the handlers below. The rest are
+      // swallowed, never Review's verbs acting on a dock this tab does not draw (typing 12 and Enter
+      // pinned a session and left "go to edit #12" in the status row).
+      const act = ev.action ?? keys().get(ch);
+      // j and k scroll here as they do everywhere (the switch below turns them into ↓ and ↑) while
+      // no rebind gives them a verb.
+      if ((ch === 'j' || ch === 'k') && !act) return void onKey({ ...ev, key: ch === 'j' ? 'down' : 'up' });
+      if (ev.key === 'escape' || ev.key === 'tab' || ev.key === 'backtab' || ch === ':' || (act && OBSERVATORY_SHARED.has(act))) { /* below */ }
+      else return;
     }
     // ^C still quits from inside the options window; everything else there belongs to it.
     if (ch !== '\x03' && optionsKey(ev)) return;
@@ -5890,11 +7682,11 @@ if (row.kind === 'key') options.capture = { id: row.id, kind: 'key', buf: '' };
       /**
        * THE TEXT WALLS COME FIRST, because this ladder RETURNS.
        *
-       * Command mode and find-in-diff each have their own escape handler further down, and both were
-       * unreachable whenever an earlier rung matched — which the last rung, "unselect", does as soon
-       * as anything is selected. So with an edit picked, `:` followed by esc unselected the edit and
-       * left the prompt OPEN, its status row overwritten by the unselect message, so nothing on
-       * screen said the next letters were still going into a command instead of running as keys.
+       * Find-in-diff has its own escape handler further down, and it was unreachable whenever an
+       * earlier rung matched — which the last rung, "unselect", does as soon as anything is selected.
+       * So with an edit picked, esc unselected the edit and left the prompt OPEN, its status row
+       * overwritten by the unselect message, so nothing on screen said the next letters were still
+       * going into the find instead of running as keys.
        *
        * It looked fine from a test that opened the prompt without selecting anything first: with
        * nothing picked the ladder falls off the end and reaches the wall's own handler.
@@ -5903,11 +7695,6 @@ if (row.kind === 'key') options.capture = { id: row.id, kind: 'key', buf: '' };
        * first esc under "stop the running agent?" cleared the selection and left the question up).
        */
       if (state.confirm) return answerConfirm(false);
-      if (cmdOpen) {
-        cmdOpen = false;
-        state.status = 'ready';
-        return schedulePaint();
-      }
       if (diffFindOpen) {
         diffFindOpen = false;
         clearFind(); // esc means "done searching", so n/p go back to stepping the review
@@ -5931,7 +7718,8 @@ if (row.kind === 'key') options.capture = { id: row.id, kind: 'key', buf: '' };
       // observatory would swallow esc on Review before its own actions (promptScope, etc.).
       if (state.scopeWorker && tabs[active]?.root) {
         state.scopeWorker = null; // the panes widen back to the terminal's own session
-        state.status = 'showing every worker again';
+        workspaceGroupSelection = undefined;
+          state.status = 'showing every worker again';
         ask(true);
         return schedulePaint();
       }
@@ -6032,7 +7820,7 @@ if (row.kind === 'key') options.capture = { id: row.id, kind: 'key', buf: '' };
       }
       const want = marks.get(name);
       if (want === undefined) {
-        state.status = `no mark ‘${name}’ — set one with ’${name} first`;
+        state.status = `no mark ‘${name}’ — set one with '${name} first`;
         return schedulePaint();
       }
       // Through revealEdit: the marked edit may be inside a folded group (the default now), and a
@@ -6065,39 +7853,13 @@ if (row.kind === 'key') options.capture = { id: row.id, kind: 'key', buf: '' };
         return jumpToMatch(diffFind.trim(), 1);
       }
       if (ev.key === 'backspace' || ev.key === 'delete') {
-        diffFind = diffFind.slice(0, -1);
+        diffFind = backspaced(diffFind);
         state.status = `find in diff: ${diffFind}`;
         return schedulePaint();
       }
       if (ev.key.length === 1 && !ev.ctrl && !ev.alt) {
         diffFind += ev.key;
         state.status = `find in diff: ${diffFind}`;
-        return schedulePaint();
-      }
-      return;
-    }
-
-    // Command mode is a WALL, like the filter and the confirmation: it reads one line and nothing
-    // escapes into the verb switch, which in this app binds single letters to actions that revert
-    // files.
-    if (cmdOpen) {
-      if (ev.key === 'escape') {
-        cmdOpen = false;
-        state.status = 'ready';
-        return schedulePaint();
-      }
-      if (ev.key === 'enter') {
-        cmdOpen = false;
-        return runCommand(cmdBuf.trim());
-      }
-      if (ev.key === 'backspace' || ev.key === 'delete') {
-        cmdBuf = cmdBuf.slice(0, -1);
-        state.status = `: ${cmdBuf}`;
-        return schedulePaint();
-      }
-      if (ev.key.length === 1 && !ev.ctrl && !ev.alt) {
-        cmdBuf += ev.key;
-        state.status = `: ${cmdBuf}`;
         return schedulePaint();
       }
       return;
@@ -6112,7 +7874,7 @@ if (row.kind === 'key') options.capture = { id: row.id, kind: 'key', buf: '' };
         return schedulePaint();
       }
       if (ev.key === 'backspace' || ev.key === 'delete') {
-        state.filter = state.filter.slice(0, -1);
+        state.filter = backspaced(state.filter);
         clampCursor();
         syncPane();
         return schedulePaint();
@@ -6147,12 +7909,12 @@ if (row.kind === 'key') options.capture = { id: row.id, kind: 'key', buf: '' };
       // until it is answered.
       if (ev.ctrl && ev.key === 'd') return requestDeleteSession();
       if (ev.key === 'backspace' || ev.key === 'delete') {
-        pickerFilter = pickerFilter.slice(0, -1);
-        return renderSessionPicker();
+        pickerFilter = backspaced(pickerFilter);
+        return pickerTyped();
       }
       if (ev.key.length === 1 && !ev.ctrl && !ev.alt) {
         pickerFilter += ev.key;
-        return renderSessionPicker();
+        return pickerTyped();
       }
       return; // nothing else escapes while the picker is open
     }
@@ -6177,7 +7939,7 @@ if (row.kind === 'key') options.capture = { id: row.id, kind: 'key', buf: '' };
       }
       // `?` toggles: the key that opened the help closes it. Only `q`/enter closing it meant the
       // advertised key appeared to do nothing on the second press.
-      if (ch === 'q' || ch === '?' || ev.key === 'enter') return void closeOverlay();
+      if (ch === 'q' || ch === '?' || ev.key === 'enter' || (plain && keys().get(ch) === 'help')) return void closeOverlay();
       // Every other key is the overlay's too: the keys that scroll it do so here, and none reaches a verb
       // behind it (with the help open, `u` reverted an edit, and so did
       // a verb rebound to j, k, g or G). ctrl+z still suspends.
@@ -6188,10 +7950,10 @@ if (row.kind === 'key') options.capture = { id: row.id, kind: 'key', buf: '' };
       if (step) return move(step);
       if (!(ev.ctrl && ev.key === 'z')) return;
     }
-    // F1..F5 are the window bar, left to right. Detail answers to two of them, one per face, so F3
-    // means "the map" and F4 means "this diff" rather than "the centre, and then find the swap".
-    // Pressing the key for what is ALREADY showing zooms it, and again puts it back — the same
-    // second-press-drills-in gesture the edit list uses, so full screen costs no new key and no timer.
+    // F4..F7 are Review's window bar, left to right (BAR_ENTRIES; F1 to F3 are OAK's tabs, taken before this).
+    // Map and Diff have a key each, so F6 means "the map" and F7 means "this diff" rather than "the centre,
+    // and then find the swap". Pressing the key for what is ALREADY showing zooms it, and again puts it back —
+    // the same second-press-drills-in gesture the edit list uses, so full screen costs no new key and no timer.
     // ONE exception, documented on BAR_ENTRIES: the Claude strip has nothing to zoom into, so its
     // second press LAUNCHES Claude — the drill-in, applied to the pane whose drill-in is the agent.
     const fkey = BAR_ENTRIES.find((e) => ev.key === `f${e.key}`);
@@ -6209,6 +7971,10 @@ if (row.kind === 'key') options.capture = { id: row.id, kind: 'key', buf: '' };
       }
 
       return focusPane(fkey.pane);
+    }
+    if (/^f[0-9]+$/.test(ev.key)) {
+      state.status = `${ev.key.toUpperCase()} is not a window key — F4 to F7 focus Prompts, Traces, Map and Diff`;
+      return schedulePaint();
     }
     // Digits name an EDIT, not a window. They accumulate, because ids run well past 9, and the
     // number is shown before Enter commits to it — this moves the selection that `u` reverts.
@@ -6247,7 +8013,7 @@ if (row.kind === 'key') options.capture = { id: row.id, kind: 'key', buf: '' };
         // ran off into blank columns would look exactly like a diff that had lost its content.
         const widest = (state.diffPatch ?? '').split('\n').reduce((w, l) => Math.max(w, l.length), 0);
         state.panX = Math.max(0, Math.min(next, Math.max(0, widest - 8)));
-        state.status = state.panX ? `panned ${state.panX} columns — ←→ to pan, w to wrap` : 'at the left edge';
+        state.status = state.panX ? `panned ${state.panX} columns — ←→ to pan, ${keyForAction('wrap')} to wrap` : 'at the left edge';
         return schedulePaint();
       }
       if (f) {
@@ -6277,16 +8043,16 @@ if (row.kind === 'key') options.capture = { id: row.id, kind: 'key', buf: '' };
      * copied and ^Q quit — ^U in particular being the kill-line reflex of every terminal there is.
      *
      * The paging set is vim's and every pager's: ^D/^U half, ^F/^B whole (a "page" is the ten rows
-     * PgDn/PgUp already move, so ^F and PgDn agree). ^R is vim's redo. Anything else is SWALLOWED by
-     * the return at the end, which is the whole point — an unbound chord must do nothing, not
-     * something.
+     * PgDn/PgUp already move, so ^F and PgDn agree). Anything else is SWALLOWED by the return at the
+     * end, which is the whole point — an unbound chord must do nothing, not something. ^R (redo until
+     * 0.11.0, now `U`) and ^O (the palette, now `:`) are among them: both agents use them for history
+     * and transcript, so on OAK's tabs they do nothing rather than something else.
      */
     if (ev.ctrl) {
       if (ev.key === 'd') return move(5);
       if (ev.key === 'u') return move(-5);
       if (ev.key === 'f') return move(10);
       if (ev.key === 'b') return move(-10);
-      if (ev.key === 'r') return mutateScope('redo', 'one');
       /**
        * ^Z — JOB CONTROL, which every terminal app is expected to honour and this one owns the whole
        * screen of. Raw mode means the driver never turns this into a signal for us, so it arrives as a
@@ -6311,21 +8077,17 @@ if (row.kind === 'key') options.capture = { id: row.id, kind: 'key', buf: '' };
     if (ev.alt) return;
     // Verbs dispatch on the ACTION a key is bound to, not on the key itself — that indirection is
     // what makes the options window's rebinds real rather than a list of numbers it saves and nothing
-    // reads. Structural keys (F1-F6, arrows, Tab, Enter, Esc, Space, digits) are handled above and are
+    // reads. Structural keys (F1-F9, arrows, Tab, Enter, Esc, Space, digits) are handled above and are
     // deliberately not rebindable: several of them are the only way out of a mode.
-    const verb = keys().get(ch) ?? null;
+    const verb = ev.action ?? keys().get(ch) ?? null;
     switch (verb ?? ch) {
-      // VIM MOVEMENT, bound but deliberately NOT advertised. The key row promises arrows, because
-      // that is what a reader who has never used vi will try — but every tool in this class binds
-      // j/k, and a vim user pressing them into a dead keymap concludes the app is broken. Both work;
-      // only one is taught.
-      case ':': {
-
-        cmdBuf = '';
-        cmdOpen = true;
-        state.status = ': ';
-        return schedulePaint();
-      }
+      // VIM MOVEMENT, bound but kept off the key row, which promises arrows because that is what a
+      // reader who has never used vi will try; the `?` help lists both. Every tool in this class binds
+      // j/k, and a vim user pressing them into a dead keymap concludes the app is broken.
+      // `:` opens the palette, which is also the command line: it lists sessions, tabs and actions, and a
+      // typed command (`status`, `comment 12: note`) runs.
+      case ':':
+        return openPalette();
       /**
        * MARK / UNMARK the row under the cursor, for acting on several at once.
        *
@@ -6345,7 +8107,7 @@ if (row.kind === 'key') options.capture = { id: row.id, kind: 'key', buf: '' };
         for (const id of row.ids) (already ? marked.delete(id) : marked.add(id));
         state.marked = marked;
         state.status = marked.size
-          ? `${marked.size} edit(s) marked — a/u act on all of them, esc clears`
+          ? `${marked.size} edit(s) marked — ${keyForAction('keep')}/${keyForAction('undo')} act on all of them, esc clears`
           : 'nothing marked';
         return schedulePaint();
       }
@@ -6357,7 +8119,7 @@ if (row.kind === 'key') options.capture = { id: row.id, kind: 'key', buf: '' };
         markPending = 'jump';
         state.status = marks.size
           ? `go to mark: ${[...marks.keys()].sort().join(' ')} (esc cancels)`
-          : 'no marks yet — set one with ’ then a letter';
+          : "no marks yet — set one with ' then a letter";
         return schedulePaint();
       case 'sort': {
         // Through applyOption, the same call the options window's Order row makes, rather than a third
@@ -6378,7 +8140,8 @@ if (row.kind === 'key') options.capture = { id: row.id, kind: 'key', buf: '' };
         // anything open closes everything, nothing open opens everything. Map folders keep their
         // own state untouched — the `edits:` key namespace is what makes the two independent
         // inside the one open-set.
-        const headers = rowsOf('edits', 'traces').filter((r) => r.openPath?.startsWith('edits:'));
+        // One per file: a header's counts line carries its openPath too, and counting it said "4 files" for two.
+        const headers = rowsOf('edits', 'traces').filter((r) => r.openPath?.startsWith('edits:') && !r.cont);
         if (!headers.length) {
           state.status = 'nothing to fold — the list has no file groups';
           return schedulePaint();
@@ -6406,7 +8169,7 @@ if (row.kind === 'key') options.capture = { id: row.id, kind: 'key', buf: '' };
         // for a reader who never panned this one.
         state.panX = 0;
         state.status = state.noWrap
-          ? 'long lines pan sideways — ←→ to pan, w to wrap again'
+          ? `long lines pan sideways — ←→ to pan, ${keyForAction('wrap')} to wrap again`
           : 'long lines wrap again';
         return schedulePaint();
       }
@@ -6425,10 +8188,13 @@ if (row.kind === 'key') options.capture = { id: row.id, kind: 'key', buf: '' };
         const row = rowsOf()[state.cursor];
         // A FILE HEADER addresses every edit in its file, so `rowFile` (which answers only for a
         // single-edit row, by design) returns nothing for it — and the header is exactly the row a
-        // reader is sitting on when they want the path. Its key carries that path.
-        const text = onDiff ? state.diffPatch ?? '' : selectedPath(row) || state.diffMeta?.path || '';
+        // reader is sitting on when they want the path. Its key carries that path. A Map row names its
+        // own path, as it does for `e`, rather than the diff that happens to be open.
+        const map = row && !onDiff ? mapRowTarget(row) : null;
+        const text = onDiff ? state.diffPatch ?? '' : selectedPath(row) || (map ? ('path' in map ? map.path : '') : state.diffMeta?.path || '');
         if (!text) {
-          state.status = 'nothing here to copy — select an edit, or open its diff';
+          // The legacy anonymous Map row says why, as `e` does, rather than the generic note.
+          state.status = map && 'refuse' in map ? map.refuse : 'nothing here to copy — select an edit, or open its diff';
           return schedulePaint();
         }
         // One door (copyText): OSC 52 within bounds; wl-copy/xclip/pbcopy past them locally; the
@@ -6444,18 +8210,13 @@ if (row.kind === 'key') options.capture = { id: row.id, kind: 'key', buf: '' };
         return void onKey({ ...ev, key: 'up' });
       // …and the jumps. `g`/`G` are universal, and a 2,000-row Traces pane without them means holding
       // a key for a page at a time.
-      case 'g': {
-        state.cursor = 0;
-        state.scroll = 0;
-        syncPane();
-        return schedulePaint();
-      }
-      case 'G': {
-        state.cursor = Math.max(0, rowsOf().length - 1);
-        clampCursor();
-        syncPane();
-        return schedulePaint();
-      }
+      // Through `move`, so they land where the arrows would: on the first or last row the arrows stop
+      // on. `G` set the cursor to the list's last line, which is a file header's counts line, and the
+      // selection was drawn on that line with its header left unmarked.
+      case 'g':
+        return move(-1e9);
+      case 'G':
+        return move(1e9);
       // `case '\x03'` used to sit here too, and was dead: `ch === '\x03'` already returned 200 lines
       // above, at the only place ^C can reach. Two spellings of one key, one of them unreachable.
       // 'quit' left the keymap with its `q` binding: ^C twice is the one exit.
@@ -6464,11 +8225,14 @@ if (row.kind === 'key') options.capture = { id: row.id, kind: 'key', buf: '' };
       // is what made the bug invisible — one key in the table spelled as a byte, the rest as names.
       case 'tab': {
         // Cycle TABS, not panes. Pane focus
-        // moves by the arrow keys and the F-keys now, and by the leader (ctrl+a then tab) for the full
+        // moves by the arrow keys and the F-keys now, and by the palette's “Focus the next pane” for the full
         // BSP rotation; a bare tab is the one gesture every terminal reader means as "next tab".
         if (tabs.length > 1) switchTab((active + 1) % tabs.length);
         return;
       }
+      case 'backtab':
+        if (tabs.length > 1) switchTab((active + tabs.length - 1) % tabs.length);
+        return;
       case 'minimize': {
         // Minimize/restore the focused pane. The dual of zoom, and the pane keeps its chip and its
         // counter on the window bar — a tool does not withdraw its alarm to save a row.
@@ -6570,7 +8334,10 @@ if (row.kind === 'key') options.capture = { id: row.id, kind: 'key', buf: '' };
         return move(verb === 'next' ? 1 : -1);
       }
       case 'editor':
+      case 'E': // e and E both open the terminal editor, unless a rebind gave E a verb of its own (dispatched above)
         return openInEditor();
+      case 'W':
+        return void openSelectionInGuiEditor();
       case 'options':
         return openOptions();
       case 'keep':
@@ -6581,6 +8348,8 @@ if (row.kind === 'key') options.capture = { id: row.id, kind: 'key', buf: '' };
         return mutateScope('keep', 'all');
       case 'undoAll':
         return mutateScope('undo', 'all');
+      case 'redo':
+        return mutateScope('redo', 'one');
       case ' ':
         // Space is the fold key everywhere a tree exists — and on a row that is not a folder it does
         // nothing rather than drilling in, because Enter already means "open this" and a space bar
@@ -6605,36 +8374,8 @@ if (row.kind === 'key') options.capture = { id: row.id, kind: 'key', buf: '' };
       case 'nextHand':
         jumpNextHand();
         return;
-      case 'refresh': {
-        // A user-CLICKED Refresh is the safe place to apply a newly-added `.observatoryignore`.
-        // Adding the file fires no capture hook, so the sweep that drops now-ignored records (capture.ts,
-        // the WRITE path) never runs, and a plain refresh — a read — left them. `dropIgnored` is
-        // self-gating (a no-op when nothing matches); only HERE, never on the auto-refresh tick, which
-        // must not rewrite the store under concurrent readers. `ask(true)` forces the post-drop read.
-        const igSes = state.scopeWorker?.session || state.session;
-        const droppedNote = (dropped: number) => dropped > 0 ? `refreshing… · dropped ${dropped} now-ignored edit${dropped === 1 ? '' : 's'}` : 'refreshing…';
-        // A session reviewed on another machine keeps its store there, so the sweep runs there too:
-        // run here it found no store and did nothing, silently.
-        const igMachine = igSes && tabs[active]?.id !== 'observatory' ? reviewMachine(igSes) : undefined;
-        if (igSes && igMachine) {
-          state.status = 'refreshing…';
-          void backend!.run(['ignore', '--session', igSes, '--json'], igMachine).then((out) => {
-            let dropped: number | null = null;
-            try { dropped = Number(JSON.parse(out).droppedNow) || 0; } catch { /* reported below */ }
-            state.status = dropped === null
-              ? `could not apply .observatoryignore on ${igMachine}: ${out.trim().split('\n').pop()?.replace(/^oak: /, '') || 'no answer'}`
-              : droppedNote(dropped);
-            ask(true);
-            schedulePaint();
-          });
-          return schedulePaint();
-        }
-        let dropped = 0;
-        if (igSes) { try { dropped = core.dropIgnored(igSes).dropped; } catch { /* a torn store still refreshes */ } }
-        state.status = droppedNote(dropped);
-        ask(true);
-        return schedulePaint();
-      }
+      case 'refresh':
+        return refreshAsking();
       case 'filter':
         // ON THE DIFF FACE, `/` searches the PATCH. Everywhere else it filters the list.
         //
@@ -6655,7 +8396,7 @@ if (row.kind === 'key') options.capture = { id: row.id, kind: 'key', buf: '' };
         openFilterMenu();
         return;
       case 'help': {
-        state.overlay = { title: 'keys  —  esc or ? to close', lines: helpLines(prefs), scroll: 0 };
+        state.overlay = { title: 'keys  —  esc or ? to close', lines: helpLines(prefs, herdrConfig()), scroll: 0 };
         return schedulePaint();
       }
       default:
@@ -6671,7 +8412,6 @@ export const COMMANDS: Readonly<Record<string, { args: () => string[]; what: str
   // into a prompt first. It answered "no command" until now.
   '?': { args: () => ['help'], what: 'the CLI’s own help — every verb this build has' },
   store: { args: () => ['store'], what: 'where the observatory keeps its data' },
-  ignore: { args: () => ['ignore'], what: 'what .observatoryignore covers' },
   doctor: { args: () => ['doctor'], what: 'check the setup' },
   status: { args: () => ['status'], what: 'hooks, session and edit counts' },
   version: { args: () => ['version'], what: 'this build' },
@@ -6685,8 +8425,13 @@ export const COMMANDS: Readonly<Record<string, { args: () => string[]; what: str
  * bound to keys that no surface in the product named. `keymapCoverage` in the core tests walks this
  * against REBINDABLE and fails on the next verb that ships without a door.
  */
-export function helpLines(prefs: import('@oak-observatory/core').Prefs): string[] {
-  const keys = () => coreKeymap(prefs);
+export function helpLines(prefs: import('@oak-observatory/core').Prefs, herdr: import('@oak-observatory/core').HerdrPrefix = herdrPrefixFrom('')): string[] {
+  const km = coreKeymap(prefs);
+  /** The reader's key for an action; `—` when a rebind left it with none (keyConflicts says why). */
+  const k = (action: string): string => {
+    for (const [key, a] of km) if (a === action) return key;
+    return '—';
+  };
   /**
    * Rows built from the reader's OWN keymap.
    *
@@ -6694,138 +8439,175 @@ export function helpLines(prefs: import('@oak-observatory/core').Prefs): string[
    * for a build that had none — and once keys became rebindable, a hard-coded list is a list
    * that lies to exactly the reader who customised it.
    */
-  const boundRows = (rows: readonly (readonly [string, string])[]): string[] => {
-    const km = keys();
-    const keyFor = (action: string): string => {
-      for (const [k, a] of km) if (a === action) return k;
-      return '—'; // rebound onto a key another action won: keyConflicts already says so
-    };
-    return rows.map(([action, what]) => `    ${keyFor(action).padEnd(14)} ${what}`);
-  };
-  // A real help surface, not a one-line status. It listed "1-6 screens" — a keymap that never
-  // existed in this build (there were eight, and now there are five windows), and `?` is the
-  // key the frame itself advertises, so it is the one thing that must not be stale.
+  const boundRows = (rows: readonly (readonly [string, string])[]): string[] =>
+    rows.map(([action, what]) => `    ${k(action).padEnd(14)} ${what}`);
+  const p = herdr.label;
+  const prefixRow = (key: OakPrefixKey, what: string): string =>
+    herdr.taken[key] ? `    ${`${p} ${key}`.padEnd(19)} your herdr config binds it (${herdr.taken[key]}), so it is herdr's`
+      : `    ${`${p} ${key}`.padEnd(19)} ${what}`;
+  // The tab keys that leave the herdr tab, F2 and F3, where herdr's config leaves them to OAK.
+  const away = (['f2', 'f3'] as const).filter((k) => !herdr.tabTaken[k]).map((k) => k.toUpperCase()).join(' or ');
+  // A prefix OAK follows only through the kitty keyboard protocol (ctrl+shift+a, super+b) leaves the herdr tab by a tab key or
+  // a click from any other terminal, as the key row says; one OAK does not follow at all, or after which herdr's config binds
+  // m, M and V, only by those, as the key row and the status row say.
+  const click = (why: string): string => `    ${"click OAK's tab bar".padEnd(19)} from the herdr tab, back to OAK's tabs: ${why}`;
+  const prefixRows = !herdr.prefixes.length ? [click(`OAK does not follow herdr's prefix (${p})`)]
+    : [prefixRow('m', 'from the herdr tab, back to the OAK tab you were last on'),
+      prefixRow('M', "from the herdr tab, pin its focused pane's session in the Observatory"),
+      prefixRow('V', "from the herdr tab, open Review on its focused pane's session"),
+      ...(!herdr.oak.length ? [click(`your herdr config binds m, M and V${away ? `; ${away} leaves it too` : ''}`)] : herdr.prefix ? []
+        : [`                        (${herdr.oak.length > 1 ? `${herdr.oak.length === 2 ? 'both' : 'all three'} ` : ''}only from a terminal that reports keys with the kitty keyboard protocol;`,
+          `                        from any other, ${away ? `${away}, or a click on OAK's tab bar, leaves` : "click OAK's tab bar to leave"} the herdr tab)`])];
   return [
       '  TABS',
-      '    herdr               the native herdr client; ctrl+b belongs to herdr',
+      "    herdr               the native herdr client; herdr's tab bar starts agents. Every key there but F1 to F3",
+      `                        is the program's, or herdr's after its prefix (${p}, read from herdr's config)`,
       '    Observatory         machine → workspace → agent pane → session → Workers; pinned conversation beside it',
       '    Review              captured edits and keep/undo',
-      "    ctrl+a n/p or 1-3   switch OAK tabs; herdr's tab bar starts agents; ctrl+a k detaches its client",
-      '    ctrl+a o            from herdr, select and pin its focused session in Observatory',
-      '    ctrl+a q            quit OAK (repeat within two seconds to confirm)',
-      '    ctrl+a ctrl+a       send ctrl+a to the program (line start in Claude Code and Codex)',
-      '    ctrl+q twice        quit OAK from any tab (repeat within two seconds to confirm)',
+      '    F1 / F2 / F3        herdr / Observatory / Review, from every tab and over every overlay, which closes first;',
+      "                        on the herdr tab before herdr or the program sees them, with herdr's prefix or without,",
+      "                        unless herdr's config binds the key. A box you typed in closes and drops the text (the",
+      '                        palette, the session picker or help search, find in the diff, an options entry); a',
+      '                        standing question keeps them until you answer it',
+      ...Object.entries(herdr.tabTaken).map(([k, why]) => `                        ${k.toUpperCase()}: your herdr config binds it (${why}), so on the herdr tab it is herdr's`),
+      ...OAK_TAB_KEYS.filter((k) => herdr.taken[k]).map((k) => `                        ${p} ${k.toUpperCase()}: your herdr config binds it (${herdr.taken[k]}), so it is herdr's`),
+      '    Tab / shift+Tab     next / previous tab, from Observatory and Review (ctrl+n / ctrl+p and alt+1-3 too)',
+      ...prefixRows,
+      `                        after ${p} every other key is herdr's own${herdr.detach ? `: ${herdr.detach} detaches its client,` : ','} and`,
+      `                        ${p} pressed twice sends it to the program. Inside a herdr pane (oak attach)`,
+      '                        herdr keeps its prefix, and Tab / shift+Tab and F2 / F3 switch OAK tabs.',
+      "    ctrl+q twice        quit OAK from any tab (repeat within two seconds to confirm); when herdr's",
+      "                        prefix is ctrl+q, that is herdr's on its tab and OAK quits from its own tabs.",
+      '                        Pressed once on the herdr tab, ctrl+q reaches the program when the two seconds',
+      '                        pass, or before the next key you press there',
+      '    drag a bottom row   copy the status row, the usage bar or the key row, on any tab. A drag in a',
+      "                        status cut at the terminal's edge that reaches that edge, or goes on past",
+      '                        the row, copies the rest of the status too',
       '',
       '  OBSERVATORY',
-      '    ↑/↓                 select a session: the detail header and the Review tab follow it',
+      '    ↑/↓ or j/k          select a session: the detail header and the Review tab follow it',
+      "                        (its workers row, and an open group's headers and workers, are stops too)",
       '    Enter / d / f       pin the selected conversation; browsing keeps the pin',
+      "                        (Enter on a session's workers row opens or closes its group of workers)",
       '    click a session     pin its conversation — its pane line, title or stats line',
-      '    i / esc             focus / leave the pinned reply box; Enter sends through herdr',
-      '                        blocked sessions need an answer in herdr; no pane disables replies',
-      '    h / r               jump to its herdr pane / scope Review to it',
-      '    Shift+A             show or hide archived sessions (no pane and no pending edits)',
-      '    F1, F2, …           focus a pane; press again to zoom, again to restore',
+      "                        (a click on its workers row opens or closes it; one on a worker opens its live log)",
+      '    c / esc             focus / leave the pinned reply box; Enter sends through herdr',
+      '                        blocked sessions, and working ones with a question waiting, need an answer',
+      '                        in herdr; no pane disables replies',
+      "    t                   go to the session's herdr pane",
+      '    W                   open this workspace window in your GUI editor (one machine and workspace)',
+      '    R                   resolve the session: keep its pending edits and clear its store (asks first)',
+      "    X                   stop the session's running agent (asks first; esc or n cancels either)",
+      '    B                   show or hide archived sessions (no pane, no pending edits and no worker at it)',
+      '    buttons             ↗ herdr · ⌕ review · ⚑ resolve · ■ stop, under the session title',
+      '    F4, F5, …           focus a pane; press again to zoom, again to restore',
       '    ←/→                 focus master / detail; wheel or PgUp/PgDn scroll each pane',
+      "                        (on a session's workers row, → opens its group and ← closes it)",
       '    End / ↓ newest      jump to the newest message and follow the conversation',
       '    click a fold        expand thinking, action boxes, Workers or Tasks',
       '    drag across text    copy it; the selection stays in its pane and copies on release',
+      `    ${`${k('inbox')} ${k('nextHand')} ${k('refresh')} ${k('session')} ${k('filter')}`.padEnd(19)} the inbox, the next hand, refresh, sessions and the filter, as on Review`,
       '',
-      '  REVIEW WINDOWS',
-      '    F2 / F3             focus Prompts / Traces',
-      '    F4 / F5 / F6        focus Map / Diff / Dashboards; a second press zooms',
-      '    Tab                 next tab; [ ] selects a tab inside a review window',
-      '    m / z               minimize / zoom; drag seams to resize',
-      '    < / > / =           grow / shrink / reset the layout',
-      '    drag across a body  copy characters (OSC 52)',
-      '',
-      '  PANES (on a tree tab such as the observatory: ctrl+a, then…)',
-      '    | / -               split the focused pane side by side / stacked, then pick what it shows',
-      '    v                   pick what the focused pane shows     x  close it     z  zoom it',
+      '  OBSERVATORY PANES',
+      `    ${`${k('zoom')} / v`.padEnd(19)} zoom the focused pane / choose what it shows`,
+      '    | / -               split the focused pane side by side / stacked, then choose what it shows',
       '    H J K L             swap the focused pane with its neighbour left / below / above / right',
-      '    tab                 focus the next pane',
+      '    :  close pane       close the focused pane; the palette lists every pane operation',
       '    drag a pane by its TITLE onto another: the middle swaps them, an edge places it beside;',
       '    drag a rule to resize. The mouse pointer shows what a spot does (kitty, Ghostty, foot,',
       '    xterm; inside tmux: set -g allow-passthrough on).',
       '',
+      '  REVIEW WINDOWS',
+      '    F4 / F5             focus Prompts / Traces',
+      '    F6 / F7             focus Map / Diff; a second press zooms',
+      `    ${`${k('minimize')} / ${k('zoom')}`.padEnd(19)} minimize / zoom the focused window; drag seams to resize`,
+      `    ${`< / > / ${k('reset')}`.padEnd(19)} shrink / grow the focused window / reset the layout (, . and _ too)`,
+      '    drag across a body  copy characters (OSC 52)',
+      '',
       '  THE DETAIL NAVBAR  (click a button, or use the key)',
-      '    Keep / Undo    a / u — act on the edit Detail is SHOWING',
-      '    prev / next    p / n — step the review one edit at a time, from any window',
+      `    Keep / Undo    ${k('keep')} / ${k('undo')} — act on the edit Detail is SHOWING`,
+      `    prev / next    ${k('prev')} / ${k('next')} — step the review one edit at a time, from any window`,
       '                   (with a find standing on the Diff face they repeat it instead, and',
       '                    N goes back a match; esc or moving the selection ends the find)',
       '',
       '  MOVING',
-      '    up / down       move the selection in the FOCUSED window; on Detail, scroll the diff',
-      '    left / right    previous / next tab       PgUp / PgDn   move ten',
+      '    ↑↓ or j/k       move the selection in the FOCUSED window; on Detail, scroll the diff',
+      '    PgUp / PgDn     move ten              g / G   first / last row',
+      `    ← / →           pan a long diff line while long lines pan (${k('wrap')})`,
       '    0-9 then enter  go to an edit by its id (esc cancels, backspace deletes)',
       '    space           fold or unfold a change-map folder, or a Traces file group',
-      '    F               fold or unfold every file group in the Traces list at once',
+      `    ${k('fold').padEnd(15)} fold or unfold every file group in the Traces list at once`,
       '    enter           open — a folder on Map, otherwise the edit full screen',
       '    esc             back — closes a zoom, a prompt scope, a filter or an overlay',
-      '    /               filter (esc clears and closes, enter keeps it)',
       '',
       '  REVIEWING  (these act on the focused window only)',
       ...boundRows([
         ['keep', 'keep the selection — on the Map, everything under the row'],
         ['undo', 'undo the selection — on the Map, everything under the row'],
+        ['redo', 'redo the selection (an undone edit)'],
         ['keepAll', 'keep everything the window lists — on the Map, the whole SESSION'],
         ['undoAll', 'undo everything the window lists — on the Map, the whole SESSION'],
       ]),
-      '    (both ask first, with the real count. The Map draws its own icon buttons: [ ✓ ] keeps',
+      '    (a single edit is kept, undone or redone at once; a row or marks covering more ask',
+      '     first, with the real count. The Map draws its own icon buttons: [ ✓ ] keeps',
       '     and [ ✗ ] undoes on every pending row, [ ↺ ] redoes a reverted one, and the heading',
       '     carries [ ✓ N ] keep-all · [ ✗ N ] undo-all · [ ⚑ ] resolve — the question they',
       '     raise is answered in the map itself, by key or by clicking [ y ] / [ n ])',
-      '    ^R             redo — vim’s own. Not rebindable: the ctrl chords are a fixed layer',
       '    y / n          answer a confirmation while one is standing (that question is a wall:',
-      '                   it takes every key until you answer, so y means yes there and copy',
-      '                   everywhere else)',
+      '                   it takes every key until you answer; esc is no)',
       '',
-      '  CTRL  (a fixed layer — beyond these and the herdr leader above, other ctrl',
-      '         chords do nothing, on purpose)',
+      '  CTRL  (a fixed layer)',
       '    ^D / ^U        half a page down / up          ^F / ^B   a whole page',
-      '    ^R             redo          ^Z   suspend (fg brings it back)          ^C   quit',
+      '    ^Z             suspend (fg brings it back)    ^C        copy a drag selection, else quit',
+      '    ^V             paste into the reply box, a filter, the palette or a search box',
+      "    Other ctrl chords do nothing on OAK's tabs (ctrl+a, ctrl+r and ctrl+o among them); on the",
+      '    herdr tab they reach the program.',
       '',
       '    P              go to a file — a picker, not a filter: it takes you there and leaves the',
       '                   list alone (the filter narrows; this jumps)',
       '',
       '  MARKS  (vim’s `m` is taken — it minimizes a window — so both jump keys do the work)',
-      '    ’ then a letter   set a mark on the selected edit',
+      "    ' then a letter   set a mark on the selected edit",
       '    ` then a letter   go back to it. Marks follow the EDIT, so a re-sort or a filter cannot',
       '                      leave one pointing at a different file. They last for this session.',
       '',
-      '  MOVING',
-      '    ↑↓ or j/k      move            g / G   first / last row',
-      '    PgUp / PgDn    a page          /       filter (matches scattered letters: pcsi finds',
-      '                                           packages/core/src/index.ts)',
-      '',
       '  THE LIST',
       ...boundRows([
-        ['mark', 'mark or unmark this row — then a / u act on every marked edit at once, and esc clears'],
+        ['mark', 'mark or unmark this row — then keep and undo act on every marked edit at once, and esc clears'],
         ['sort', 'order the list by time (newest first) or by name — cycles, and says which is in force'],
         ['wrap', 'wrap long diff lines, or leave them long and pan across with ← →'],
-        ['filter', 'filter — scattered letters (pcsi finds packages/core/src/index.ts), or a regex the moment it has regex syntax'],
+        ['filter', 'filter this tab — scattered letters (pcsi finds packages/core/src/index.ts), or a regex the moment it has regex syntax'],
         ['filter-menu', 'filter options: the file-type / extension buckets to show, and what filter is applied'],
       ]),
       '',
       '  SESSION AND APP',
       ...boundRows([
-        ['session', 'browse local sessions — type to filter'],
-        ['inbox', 'needs you — every session waiting on you, most urgent first; enter jumps to it'],
-        ['nextHand', 'jump to the next session waiting on you (permission, then question, then input)'],
-        ['refresh', 'refresh'],
+        ['session', 'choose a session, here or on a saved machine — type to search names and what was said in each'],
+        ['inbox', 'needs you — every session waiting on you, the other machines\' too as oak sync brought them, most urgent first, then oak sync\'s open conflicts; enter jumps to a session (another machine\'s is read there), or opens a conflict'],
+        ['nextHand', 'jump to the next session waiting on you on this machine (permission, then question, then input)'],
+        ['refresh', 'refresh; asks first when .observatoryignore now covers recorded edits, which it drops'],
         ['copy', 'copy the selected path — or the diff, when the Diff face is focused'],
-        ['editor', 'open the selection in $EDITOR (GUI editors detach; terminal ones take over until exit)'],
-        ['options', 'options (editor, display, store, keys)'],
+      ]),
+      // E opens the terminal editor too, unless a rebind gave E a verb of its own.
+      `    ${(km.get('E') ? k('editor') : `${k('editor')} / E`).padEnd(14)} open the selection in the terminal editor (GUI editors detach; terminal ones take over until exit; a saved machine's file opens there, over ssh or Remote-SSH)`,
+      `    W              open the selection in the GUI editor, at the edit's line when an edit is selected (${k('options')} sets it; a saved machine's file opens through Remote-SSH, a JetBrains IDE's project through Gateway)`,
+      ...boundRows([
+        ['options', 'options (editor, display, store, sync, keys)'],
         ['help', 'these keys'],
       ]),
-      '    ctrl+o              find anything — sessions, tabs, workspaces and actions in one list;',
-      '                        type to narrow (scattered letters work), ↵ opens what the row is',
+      '    :              the palette: type a command (status, doctor, store, ignore, version, help,',
+      '                   comment [<line>:] <note>, send-comments, quote) and Enter runs it; or type to',
+      '                   find sessions, tabs, workspaces and actions (scattered letters work)',
       '',
-      '  ctrl+q twice quits on every tab; ctrl+c twice and ctrl+a q twice share its confirmation.',
+      '  OVERLAYS  ↑↓ or j/k move, Enter chooses, esc or q closes; the palette, the session picker and',
+      '  the help filter type, so q is text there: esc closes them, as F1 to F3 do.',
       '',
-      '  Every key in the two lists above is READ FROM YOUR OWN KEYMAP, so a rebind shows here',
-      '  the moment you make it. They can all be rebound from the options window; the structural',
-      '  keys cannot — F1-F6, the arrows, Tab, Enter, Esc, Space and the digits are how you leave',
-      '  a mode, and a rebind that took one away would leave no way out.',
+      "  ctrl+q twice quits on every tab (OAK's own when herdr's prefix is ctrl+q); ctrl+c twice shares its confirmation.",
+      '',
+      '  Every verb key above is READ FROM YOUR OWN KEYMAP, so a rebind shows here the moment you',
+      '  make it, and the options window rebinds them. It refuses the keys the frame keeps for',
+      "  itself — Space, the digits, : ' ` and the Observatory's own c d f t v B H J K L R W X | -;",
+      '  F-keys, arrows, Tab, Enter and Esc are never offered, because they are how you leave a mode.',
   ];
 }
 

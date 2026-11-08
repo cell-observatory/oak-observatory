@@ -1,5 +1,5 @@
 Fix the demo · laptop · ? blocked · Opus · 900 tokens · 2 pending
-↗ herdr   ⌕ review
+↗ herdr   ⌕ review   ⚑ resolve   ■ stop
 +- You                                                                  14:00:00 +
 |Fix the demo and make a plan.                                                   |
 +--------------------------------------------------------------------------------+
@@ -33,5 +33,7 @@ All focused tests pass.
 — turn ended · end_turn · 0 edits
 Workers · 0/1 active
   > 1 finished
+Processes · 0
+  Reading shells…
 Tasks · 1/1 open
   v Run checks · in progress

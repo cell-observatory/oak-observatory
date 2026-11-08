@@ -2,11 +2,24 @@ import { deferredTurns } from './deferred-capture';
 /** Read-only capture health and historical integrity. Never rewrites records, blobs or statuses. */
 import * as fs from 'fs';
 import * as path from 'path';
-import { readLog, readBlob, readSkips, storeDir, maxOf, uncertainCreation, type EditRecord } from './store';
+import { readLog, readSkips, storeDir, maxOf, uncertainCreation, type EditRecord } from './store';
 import { readCaptureEvents } from './capture-events';
 import { findCodexRollout } from './codex';
 import { codexParserHealth } from './codex-events';
 export { uncertainCreation } from './store';
+/** Whether a snapshot is there to read: a file this account may open. A stat and an access check, never a read (reading
+ *  every snapshot in full to learn that it exists cost the whole store's bytes), and not existence alone, which passed
+ *  one this account cannot read (as a capture run under sudo leaves it) or a folder in its place, and Undo then failed. */
+function snapshotReadable(session: string, sha: string): boolean {
+  const p = path.join(storeDir(session), 'blobs', sha);
+  try {
+    if (!fs.statSync(p).isFile()) return false;
+    fs.accessSync(p, fs.constants.R_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
 export interface IntegrityIssue { severity: 'error' | 'warning'; code: string; message: string; recordIds: number[]; file?: string }
 export function captureIntegrity(session: string): { session: string; records: number; issues: IntegrityIssue[]; skipped: number; skipReasons: { reason: string; count: number }[];
   lastCaptureTs: number | null; inFlight: number; parser: ReturnType<typeof codexParserHealth>; healthy: boolean } {
@@ -14,7 +27,7 @@ export function captureIntegrity(session: string): { session: string; records: n
   const sources = new Map<string, number>();
   for (const r of records) {
     for (const sha of [r.beforeBlob,r.afterBlob]) if (sha && !blobs.has(sha)) {
-      blobs.add(sha); try { readBlob(session,sha); } catch { issues.push({ severity:'error',code:'missing-blob',message:'Referenced snapshot content is missing',recordIds:[r.id],file:r.file }); }
+      blobs.add(sha); if (!snapshotReadable(session,sha)) issues.push({ severity:'error',code:'missing-blob',message:'Referenced snapshot content is missing',recordIds:[r.id],file:r.file });
     }
     if (r.partial || uncertainCreation(r)) issues.push({ severity:'warning',code:'uncertain-before',message:r.uncertainty || 'Before-state lacks sufficient evidence for safe Undo',recordIds:[r.id],file:r.file });
     const prior=latest.get(r.file);

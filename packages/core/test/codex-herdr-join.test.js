@@ -6,7 +6,7 @@ const path = require('node:path');
 const net = require('node:net');
 const cp = require('node:child_process');
 const spawn = require('../dist/spawn');
-const { handleCodexHookPayload } = require('../dist/codex');
+const { handleCodexHookPayload, isCodexMemoryCwd } = require('../dist/codex');
 const { handleHookPayload } = require('../dist/capture');
 const { readHerdrPaneLink, reportHerdrSession } = require('../dist/herdr-link');
 const { storeDir } = require('../dist/store');
@@ -25,6 +25,9 @@ function sandbox(t) {
   });
   const calls = [];
   let answer = { status: 0 };
+  t.mock.method(require('../dist/herdr-context'), 'herdrPaneContextSync', () => process.env.HERDR_PANE_ID && process.env.HERDR_SOCKET_PATH
+    ? { nested: true, paneId: process.env.HERDR_PANE_ID, socketPath: process.env.HERDR_SOCKET_PATH }
+    : { nested: false });
   t.mock.method(spawn, 'spawnToolSync', (...args) => { calls.push(args); return answer; });
   const payload = { session_id: 'codex-session', cwd: root, hook_event_name: 'SessionStart', transcript_path: null, model: 'test', source: 'startup' };
   return { root, calls, payload, answer(value) { answer = value; } };
@@ -106,13 +109,102 @@ test('Codex capture does not report without pane/socket identity or overwrite an
   assert.equal(b.calls.length, 1);
 });
 
+test('Codex capture never links the pane or reports the memory-writing thread its hooks run beside (2026-09-30)', t => {
+  const b = sandbox(t);
+  // Codex runs that agent in the pane session's own process, as an ephemeral thread of its own in
+  // <CODEX_HOME>/memories (memories_v2 for its second format): `startup`, no transcript.
+  for (const dir of ['memories', 'memories_v2']) {
+    const memory = { session_id: `memory-${dir}`, cwd: path.join(process.env.CODEX_HOME, dir), transcript_path: null, model: 'test', permission_mode: 'bypassPermissions' };
+    handleCodexHookPayload({ ...memory, hook_event_name: 'SessionStart', source: 'startup' });
+    handleCodexHookPayload({ ...memory, hook_event_name: 'UserPromptSubmit', turn_id: 'turn-1', prompt: 'consolidate' });
+    handleCodexHookPayload({ ...memory, hook_event_name: 'PreToolUse', turn_id: 'turn-1', tool_name: 'Bash', tool_use_id: 'call-1', tool_input: { command: 'ls' } });
+    handleCodexHookPayload({ ...memory, hook_event_name: 'PostToolUse', turn_id: 'turn-1', tool_name: 'apply_patch', tool_use_id: 'call-2',
+      tool_input: { command: `*** Begin Patch\n*** Add File: ${path.join(memory.cwd, 'MEMORY.md')}\n+note\n*** End Patch\n` }, tool_response: '' });
+    assert.equal(readHerdrPaneLink(memory.session_id), null, `no pane link (${dir})`);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(storeDir(memory.session_id), 'agent.json'), 'utf8')).cwd, memory.cwd, 'still recorded as a Codex session');
+  }
+  assert.equal(b.calls.length, 0, 'nothing reported to herdr');
+  // Control: the pane's own thread, beside it, still links and reports.
+  handleCodexHookPayload(b.payload);
+  assert.equal(b.calls.length, 1);
+  assert.equal(readHerdrPaneLink('codex-session').paneId, 'w2:p3');
+});
+
+test('a symlinked CODEX_HOME still names the memory-writing thread; a project folder named memories never does', t => {
+  const b = sandbox(t);
+  // CODEX_HOME names a link; Codex reports the folder's real path (or the reverse), as macOS's /var
+  // for /private/var does. A junction needs no privilege on Windows.
+  const real = path.join(b.root, 'real-codex');
+  fs.mkdirSync(path.join(real, 'memories'), { recursive: true });
+  fs.symlinkSync(real, process.env.CODEX_HOME, 'junction');
+  assert.equal(isCodexMemoryCwd(path.join(process.env.CODEX_HOME, 'memories')), true, 'as written');
+  assert.equal(isCodexMemoryCwd(path.join(real, 'memories')), true, 'the real path of a linked CODEX_HOME');
+  process.env.CODEX_HOME = real;
+  assert.equal(isCodexMemoryCwd(path.join(b.root, 'codex', 'memories')), true, 'a link to the real CODEX_HOME');
+  process.env.CODEX_HOME = path.join(b.root, 'codex');
+  const project = path.join(b.root, 'project', 'memories');
+  fs.mkdirSync(project, { recursive: true });
+  assert.equal(isCodexMemoryCwd(project), false, 'a project folder named memories');
+  assert.equal(isCodexMemoryCwd(path.join(real, 'memories_v2')), false, 'a memories_v2 folder that does not exist');
+  // Capture takes the same rule: the thread reported under the real path links no pane.
+  handleCodexHookPayload({ ...b.payload, session_id: 'memory-real', cwd: path.join(real, 'memories') });
+  assert.equal(readHerdrPaneLink('memory-real'), null);
+  assert.equal(b.calls.length, 0);
+});
+
+test('the memory-writing thread in Codex\'s default home links no pane, whatever CODEX_HOME or HOME its hook gets (2026-10-06)', t => {
+  const b = sandbox(t);
+  // Codex runs each hook with its own environment through the person's login shell, whose startup files
+  // can point CODEX_HOME (here the sandbox's) or HOME elsewhere while the thread runs in ~/.codex.
+  const saved = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE }; // os.homedir() reads USERPROFILE on Windows
+  t.after(() => { for (const [key, value] of Object.entries(saved)) if (value === undefined) delete process.env[key]; else process.env[key] = value; });
+  process.env.HOME = process.env.USERPROFILE = path.join(b.root, 'login-home');
+  const threads = { 'memory-account': path.join(os.userInfo().homedir, '.codex', 'memories'), 'memory-home': path.join(os.homedir(), '.codex', 'memories_v2') };
+  for (const [id, cwd] of Object.entries(threads)) {
+    assert.equal(isCodexMemoryCwd(cwd), true, cwd);
+    // A start and a prompt only: nothing here reads the folder itself.
+    const memory = { session_id: id, cwd, transcript_path: null, model: 'test', permission_mode: 'bypassPermissions' };
+    handleCodexHookPayload({ ...memory, hook_event_name: 'SessionStart', source: 'startup' });
+    handleCodexHookPayload({ ...memory, hook_event_name: 'UserPromptSubmit', turn_id: 'turn-1', prompt: 'consolidate' });
+    assert.equal(readHerdrPaneLink(id), null, `no pane link (${id})`);
+  }
+  assert.equal(b.calls.length, 0, 'nothing reported to herdr');
+  // Control: a folder of that name under any other `.codex` is a project's, and its session links.
+  const project = path.join(b.root, 'work', '.codex', 'memories');
+  assert.equal(isCodexMemoryCwd(project), false);
+  handleCodexHookPayload({ ...b.payload, session_id: 'project-session', cwd: project });
+  assert.equal(readHerdrPaneLink('project-session').paneId, 'w2:p3');
+  assert.equal(b.calls.length, 1);
+});
+
+test('a Codex session resumed in its pane links newer than one that started and exited there since', t => {
+  const b = sandbox(t);
+  // The Observatory's heal gives a pane to the session with the newest link there, so a resume must
+  // refresh the link's time: R1 starts, R2 starts and exits, R1 resumes, and the pane is R1's again.
+  let clock = 1_000;
+  t.mock.method(Date, 'now', () => clock);
+  handleCodexHookPayload({ ...b.payload, session_id: 'r1', source: 'startup' });
+  clock = 2_000;
+  handleCodexHookPayload({ ...b.payload, session_id: 'r2', source: 'startup' });
+  clock = 3_000;
+  handleCodexHookPayload({ ...b.payload, session_id: 'r1', source: 'resume' });
+  assert.equal(readHerdrPaneLink('r1').at, 3_000);
+  assert.ok(readHerdrPaneLink('r1').at > readHerdrPaneLink('r2').at, 'the resumed session is the pane\'s newest link');
+  // A turn in between is not a session start and keeps the time.
+  clock = 4_000;
+  handleCodexHookPayload({ ...b.payload, session_id: 'r1', hook_event_name: 'UserPromptSubmit', turn_id: 'turn-1', prompt: 'test' });
+  assert.equal(readHerdrPaneLink('r1').at, 3_000);
+});
+
 test('Codex capture wire request through the real herdr CLI and a fake socket', async t => {
   const b = sandbox(t);
   // Restore the real spawn for this test only. The capture process is separate so its synchronous
   // CLI report cannot block this test's socket server from replying.
   t.mock.restoreAll();
-  const binary = path.join(os.homedir(), '.local', 'bin', process.platform === 'win32' ? 'herdr.exe' : 'herdr');
-  if (!fs.existsSync(binary)) {
+  // Found as the other real-binary tests find it, PATH first: the suite's bootstrap gives each test a HOME of its own,
+  // so `~/.local/bin/herdr` named a folder that never holds one, and the test skipped even where CI installs herdr.
+  const binary = process.env.HERDR_BIN || require('../dist/herdr-install').findHerdrBin();
+  if (!binary || !fs.existsSync(binary)) {
     const why = 'SKIP LIVE CODEX JOIN: herdr binary unavailable; request construction is covered, wire delivery is NOT verified.';
     console.error(why); t.skip(why); return;
   }
@@ -128,7 +220,8 @@ test('Codex capture wire request through the real herdr CLI and a fake socket', 
       // herdr's CLI opens every invocation with a compatibility ping (id api-client:status) and
       // aborts with UnexpectedResult unless a server answers it as one; a blanket {type:'ok'}
       // fixture would make the report under test never leave the process.
-      const result = request.method === 'ping' ? { type: 'pong', version: '0.9.1', protocol: 22 } : { type: 'ok' };
+      const result = request.method === 'ping' ? { type: 'pong', version: '0.9.1', protocol: 22 }
+        : request.method === 'pane.process_info' ? { type: 'pane_process_info', process_info: { pane_id: request.params.pane_id, shell_pid: process.pid } } : { type: 'ok' };
       socket.end(JSON.stringify({ id: request.id, result }) + '\n');
     });
   });
@@ -141,14 +234,16 @@ test('Codex capture wire request through the real herdr CLI and a fake socket', 
   }
   t.after(() => new Promise(resolve => server.close(resolve)));
   const script = `require(${JSON.stringify(path.resolve(__dirname, '../dist/codex'))}).runCodexCapture(); process.exit(0);`;
-  const child = cp.spawn(process.execPath, ['-e', script], { env: process.env, stdio: ['pipe', 'pipe', 'pipe'] });
+  // OAK_HERDR_CHECK_MS: the report follows the pane check, and on a loaded runner the check's 400 ms probe did not reach
+  // the server, so no report was sent.
+  const child = cp.spawn(process.execPath, ['-e', script], { env: { ...process.env, OAK_HERDR_CHECK_MS: '10000' }, stdio: ['pipe', 'pipe', 'pipe'] });
   child.stdin.end(JSON.stringify(b.payload));
   let stdout = '', stderr = '';
   child.stdout.on('data', d => stdout += d); child.stderr.on('data', d => stderr += d);
   const code = await new Promise((resolve, reject) => { child.once('error', reject); child.once('exit', resolve); });
   assert.equal(code, 0, stderr);
   assert.equal(stdout, '');
-  const reports = () => requests.filter(request => request.method !== 'ping');
+  const reports = () => requests.filter(request => request.method === 'pane.report_agent_session');
   assert.equal(reports().length, 1, 'report reached the server before process.exit');
   assert.equal(reports()[0].method, 'pane.report_agent_session');
   assert.equal(reports()[0].params.source, 'herdr:codex');

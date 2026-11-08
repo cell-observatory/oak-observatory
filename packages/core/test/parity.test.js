@@ -1,12 +1,16 @@
-const { test } = require('node:test');
+const { test, after } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const cp = require('child_process');
 const C = require('../dist');
+// The temp dirs fresh() makes, removed when this file ends (a direct `node --test` run left them behind).
+const tmpDirs = [];
+after(() => { for (const dir of tmpDirs) fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5 }); });
 function fresh() {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-parity-'));
+  tmpDirs.push(base);
   process.env.CLAUDE_CONFIG_DIR = path.join(base, 'claude');
   process.env.CODEX_HOME = path.join(base, 'codex');
   const cwd = path.join(base, 'work'); fs.mkdirSync(cwd);
@@ -135,6 +139,35 @@ test('parity: read-only integrity identifies unsafe historical creations without
   assert.ok(C.captureIntegrity(s).issues.some(x=>x.code==='uncertain-before'));assert.deepEqual(fs.readFileSync(log),before);
   assert.equal(C.undoEdit(s,1).ok,false);assert.equal(fs.readFileSync(f,'utf8'),'keep');
 });
+test('parity: integrity tests each snapshot by stat, never by reading it, and still names a missing one (0.11.0)',()=>{
+  // It read every referenced blob in full only to learn that it exists: the whole store's bytes on each `oak integrity`.
+  const {cwd}=fresh();const s='integrity-stat';C.ensureStore(s);const f=path.join(cwd,'f');
+  const a=C.writeBlob(s,Buffer.from('old\n')),b=C.writeBlob(s,Buffer.from('new\n')),gone=C.writeBlob(s,Buffer.from('gone\n'));
+  C.appendLog(s,{ts:1,file:f,tool:'Edit',beforeBlob:a,afterBlob:b,status:'pending'});C.appendLog(s,{ts:2,file:f,tool:'Edit',beforeBlob:b,afterBlob:gone,status:'pending'});
+  fs.rmSync(path.join(C.storeDir(s),'blobs',gone));
+  const read=fs.readFileSync;let blobReads=0;
+  fs.readFileSync=function(p,...r){if(path.basename(path.dirname(String(p)))==='blobs')blobReads++;return read.call(this,p,...r);};
+  let report;try{report=C.captureIntegrity(s);}finally{fs.readFileSync=read;}
+  assert.equal(blobReads,0,'no snapshot is read');
+  assert.deepEqual(report.issues.filter(x=>x.code==='missing-blob').map(x=>x.recordIds),[[2]],'the missing one is still named');
+});
+test('parity: integrity names a snapshot that is there but cannot be read, still without reading it (0.11.0)',(t)=>{
+  // Read in full, an unreadable snapshot (another account's file, as a capture run under sudo leaves it) or a folder in
+  // its place failed the read and was named; tested by existence alone it passed, and an undo of its record then failed.
+  if(process.platform==='win32'||process.getuid?.()===0)return t.skip('file modes do not stop this account reading');
+  const {cwd}=fresh();const s='integrity-unreadable';C.ensureStore(s);const f=path.join(cwd,'f');
+  const a=C.writeBlob(s,Buffer.from('old\n')),b=C.writeBlob(s,Buffer.from('new\n')),c=C.writeBlob(s,Buffer.from('newer\n'));
+  C.appendLog(s,{ts:1,file:f,tool:'Edit',beforeBlob:a,afterBlob:b,status:'pending'});C.appendLog(s,{ts:2,file:f,tool:'Edit',beforeBlob:a,afterBlob:c,status:'pending'});
+  const blobs=path.join(C.storeDir(s),'blobs');
+  fs.chmodSync(path.join(blobs,b),0);t.after(()=>fs.chmodSync(path.join(blobs,b),0o600));
+  fs.rmSync(path.join(blobs,c));fs.mkdirSync(path.join(blobs,c));
+  assert.throws(()=>fs.readFileSync(path.join(blobs,b)),{code:'EACCES'},'control: this account cannot read it');
+  const read=fs.readFileSync;let blobReads=0;
+  fs.readFileSync=function(p,...r){if(path.basename(path.dirname(String(p)))==='blobs')blobReads++;return read.call(this,p,...r);};
+  let report;try{report=C.captureIntegrity(s);}finally{fs.readFileSync=read;}
+  assert.equal(blobReads,0,'no snapshot is read');
+  assert.deepEqual(report.issues.filter(x=>x.code==='missing-blob').map(x=>x.recordIds),[[1],[2]],'both are named');
+});
 test('parity: oversized rollout records do not lose their neighbours; newline-less messages preview once',()=>{
   const {cwd}=fresh();const f=rollout(cwd,'bounds');
   const message=text=>JSON.stringify({timestamp:'2026-09-09T10:00:00Z',type:'event_msg',payload:{type:'agent_message',message:text}});
@@ -154,6 +187,14 @@ test('parity: malformed TOML and disabled hooks are never installed or called he
   const altered=original.replace(/trusted_hash = "([^"]+)"/,(_,hash)=>`trusted_hash = "changed" # ${hash}`);
   fs.writeFileSync(f,altered);assert.notEqual(C.codexHooksStatus(c=>c.includes('#ours')).trust,'trusted');
   fs.writeFileSync(f,original);assert.equal(C.codexHooksStatus(c=>c.includes('#ours')).trust,'trusted');
+});
+test('parity: doctor names a Codex hook turned off in Codex apart from trust, which it leaves trusted',()=>{
+  const {cwd}=fresh();fs.mkdirSync(process.env.CODEX_HOME,{recursive:true});rollout(cwd,'doctor-off',[{timestamp:'2026-09-09T10:00:01Z',type:'event_msg',payload:{type:'user_message',message:'check the hooks'}}]);
+  C.installCodexHooks(`oak capture --agent codex #${C.HOOK_MARKER}`,C.isOurCommand);const f=C.codexConfigTomlPath();
+  fs.writeFileSync(f,fs.readFileSync(f,'utf8').replace(/(:post_tool_use:0:0"\]\ntrusted_hash = "[^"]*")/,'$1\nenabled = false'));
+  const row=C.diagnose({cwd,binOnPath:true,jqPresent:true}).find(c=>c.id==='hooks');
+  assert.equal(row.label,'Codex capture hooks');assert.equal(row.level,'ok',row.detail);
+  assert.match(row.detail,/trust configuration: trusted\. Turned off in Codex: PostToolUse\./);
 });
 test('parity: review units retain uncertain creation evidence and separate model switches',()=>{
   const {cwd}=fresh(),s='mixed-group',file=path.join(cwd,'f');C.ensureStore(s);
@@ -203,9 +244,9 @@ test('parity: a zero-token line does not mark a priced bucket unavailable', () =
   assert.equal(zero.known, true, 'nothing to price is not "price unknown"');
   const real = C.priceUsage('provider:ollama/llama', { input: 1000, output: 100, cacheWrite: 0, cacheRead: 0 });
   assert.equal(real.known, false, 'a real un-priceable spend IS still flagged unavailable');
-  // codex's own opaque model names (codex-auto-review) and unlisted GPT versions (gpt-6-astra) are
+  // codex's own opaque model names (codex-auto-review) and unlisted GPT versions (gpt-6.2-sol) are
   // OpenAI calls — family-priced (approx) so they carry a cost instead of blanking the GPT bucket.
-  for (const m of ['codex-auto-review', 'gpt-6-astra']) {
+  for (const m of ['codex-auto-review', 'gpt-6.2-sol']) {
     const r = C.priceUsage(m, { input: 1000, output: 100, cacheWrite: 0, cacheRead: 0 });
     assert.equal(r.known, true, `${m} is family-priced, not unavailable`);
     assert.equal(r.approx, true, `${m} is flagged approximate`);
@@ -245,4 +286,53 @@ test('parity: usage --json flattens the Fable cap beside the other claude accoun
   assert.equal(usage.claudeFablePct, 93);
   assert.equal(usage.claudeFableLabel, 'Fable');
   assert.equal(usage.claudeFivePct, 26, 'the keys it sits beside are unchanged');
+});
+test('parity: both editors bind one prefix, terminal action letters and file arrows', () => {
+  // One chord prefix (ctrl+alt+X, ⌥⌘X on macOS) that neither editor's default keymap uses, followed by the key the
+  // terminal app binds to the same verb, with Left/Right for the file axis. Both editors bind the same actions.
+  const key = (action) => C.REBINDABLE.find(r => r.action === action).fallback;
+  const want = {
+    reviewNext: key('next'), reviewPrev: key('prev'), keepAtCursor: key('keep'), undoAtCursor: key('undo'),
+    keepOpenFile: key('keepAll'), undoOpenFile: key('undoAll'), nextAttention: key('nextHand'),
+    diffPrevRevision: '[', diffNextRevision: ']', addReviewComment: 'c', navFilePrev: 'left', navFileNext: 'right',
+  };
+  const second = (k) => k.length === 1 && k === k.toUpperCase() && k !== k.toLowerCase() ? `shift+${k.toLowerCase()}` : k;
+  const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '../../vscode/package.json'), 'utf8'));
+  const vs = {};
+  for (const b of pkg.contributes.keybindings) {
+    const [first, stroke, ...rest] = b.key.split(' ');
+    const [mfirst, mstroke] = b.mac.split(' ');
+    assert.deepEqual([first, mfirst, rest.length, mstroke], ['ctrl+alt+x', 'cmd+alt+x', 0, stroke], JSON.stringify(b));
+    vs[b.command === 'workbench.action.addComment' ? 'addReviewComment' : b.command.replace('claudeObservatory.', '')] = stroke;
+  }
+  assert.deepEqual(vs, Object.fromEntries(Object.entries(want).map(([a, k]) => [a, second(k)])));
+  const xml = fs.readFileSync(path.join(__dirname, '../../jetbrains/src/main/resources/META-INF/plugin.xml'), 'utf8');
+  const JB = { ReviewNextFile: 'navFileNext', ReviewPrevFile: 'navFilePrev', ReviewNext: 'reviewNext', ReviewPrev: 'reviewPrev', KeepAtCursor: 'keepAtCursor', UndoAtCursor: 'undoAtCursor', KeepOpenFile: 'keepOpenFile',
+    UndoOpenFile: 'undoOpenFile', NextAttention: 'nextAttention', DiffPrevRevision: 'diffPrevRevision', DiffNextRevision: 'diffNextRevision', AddReviewComment: 'addReviewComment' };
+  const jb = {};
+  // Each action element on its own: a self-closing one ends at its `/>`, before the next action's body.
+  for (const m of xml.split('<action ').slice(1).map(chunk => /^id="ClaudeObservatory\.(\w+)"[^>]*?(\/>|>([\s\S]*?)<\/action>)/.exec(chunk)).filter(Boolean).map(m => [m[0], m[1], m[3] ?? ''])) {
+    const shortcuts = [...m[2].matchAll(/<keyboard-shortcut keymap="([^"]+)" first-keystroke="([^"]+)" second-keystroke="([^"]+)"/g)];
+    if (!shortcuts.length) continue;
+    assert.ok(m[1] in JB, `${m[1]} is bound in JetBrains but not in VS Code`);
+    const byMap = Object.fromEntries(shortcuts.map(s => [s[1], [s[2], s[3]]]));
+    assert.deepEqual(Object.keys(byMap).sort(), ['$default', 'Mac OS X 10.5+']);
+    assert.equal(byMap.$default[0], 'ctrl alt X'); assert.equal(byMap['Mac OS X 10.5+'][0], 'meta alt X');
+    assert.equal(byMap.$default[1], byMap['Mac OS X 10.5+'][1]);
+    const s = byMap.$default[1];
+    jb[JB[m[1]]] = s === 'OPEN_BRACKET' ? '[' : s === 'CLOSE_BRACKET' ? ']' : s.startsWith('shift ') ? `shift+${s.slice(6).toLowerCase()}` : s.toLowerCase();
+  }
+  assert.deepEqual(jb, vs, 'the same action on the same keys in both editors');
+  assert.ok(!/first-keystroke="(ctrl|meta) alt [A-Z_]+"(?! second)/.test(xml), 'no single-stroke ctrl+alt binding is left');
+  // Each chord runs a real command. VS Code: ours are contributed (the smoke test holds every contributed
+  // command to a registration), and the one built-in is VS Code's own. JetBrains: the action class exists.
+  const contributed = new Set(pkg.contributes.commands.map((c) => c.command));
+  for (const b of pkg.contributes.keybindings) assert.ok(contributed.has(b.command) || b.command === 'workbench.action.addComment', `${b.command} is a command`);
+  const kotlin = [];
+  const walk = (dir) => { for (const e of fs.readdirSync(dir, { withFileTypes: true })) e.isDirectory() ? walk(path.join(dir, e.name)) : e.name.endsWith('.kt') && kotlin.push(fs.readFileSync(path.join(dir, e.name), 'utf8')); };
+  walk(path.join(__dirname, '../../jetbrains/src/main/kotlin'));
+  for (const chunk of xml.split('<action ').slice(1).filter((c) => /<keyboard-shortcut/.test(c.split('</action>')[0]))) {
+    const cls = /class="([\w.]+)\.(\w+)"/.exec(chunk);
+    assert.ok(cls && kotlin.some((src) => src.includes(`package ${cls[1]}\n`) && new RegExp(`\\bclass ${cls[2]}\\b[^{]*AnAction\\(`).test(src)), `${cls?.[2]} is an AnAction in ${cls?.[1]}`);
+  }
 });

@@ -5,7 +5,6 @@ import com.intellij.openapi.actionSystem.ActionToolbar
 import com.intellij.openapi.actionSystem.ActionUpdateThread
 import com.intellij.openapi.actionSystem.AnActionEvent
 import com.intellij.openapi.actionSystem.impl.SimpleDataContext
-import com.intellij.testFramework.fixtures.BasePlatformTestCase
 
 /**
  * The Timeline's session selector, asserted EXPLICITLY.
@@ -15,7 +14,7 @@ import com.intellij.testFramework.fixtures.BasePlatformTestCase
  * part no other test covers: this chip is re-evaluated on every toolbar tick of a window that stays open
  * all day, so an EDT-bound `update()` or one that spawns the CLI costs the same either way.
  */
-class TitleActionContractTest : BasePlatformTestCase() {
+class TitleActionContractTest : ObservatoryPlatformTestCase() {
 
     fun testTimelineSessionSelectorContract() {
         val action = TimelineSessionAction(project)

@@ -515,8 +515,8 @@ const gADD = '#7ee787', gREM = '#ffa198';
 // ---------- 0.10.0: the Observatory Timeline panel ----------
 // ONE webview (`claudeObservatory.timeline`), whose own chrome is drawn below in the order `timelineShell`
 // builds it: the SESSION SELECTOR leads the window, then the tab strip — Feed · Prompts · Observations · Actions,
-// each with its badge — with the GROUP TABS toggle beside the strip it rearranges, then the forward tab's
-// heading, its description, and its list. Every count and every ask below is the bundled demo session's
+// each counted with its unit on its tab (`badgeOf`) — with the GROUP TABS toggle beside the strip it rearranges, then
+// what the tab does not already say, its description, and its list. Every count and every ask below is the bundled demo session's
 // own (`demo --fast`, then `prompts --json` / `observations` / `actions`): 3 asks · 8 review units, 9 edit
 // rows in Observations, and 39 tool calls in the Actions tree — the CLI's 41 less the `agent` category the
 // tree filters out and the uncurated `read` group, which contributes only its failures and had none.
@@ -548,13 +548,12 @@ const timelinePanel = `
   </div>
   <div style="display:flex;align-items:flex-start;gap:6px;padding:5px 9px 0">
     <div style="display:flex;flex:1 1 auto;flex-wrap:wrap;gap:4px;min-width:0">
-      ${tlTab('Feed', 0, false)}${tlTab('Prompts', 3, true)}${tlTab('Observations', 9, false)}${tlTab('Actions', 39, false)}
+      ${tlTab('Feed', 0, false)}${tlTab('Prompts', '3 asks', true)}${tlTab('Observations', '9 edits', false)}${tlTab('Actions', '39 tool calls', false)}
     </div>
     <span style="flex:none;display:inline-flex;align-items:center;gap:5px;border:1px solid var(--border2);border-radius:5px;padding:3px 9px;font-size:11px;color:var(--dim);white-space:nowrap"><span style="opacity:.3">${icoSplit}</span> Group tabs</span>
   </div>
   <div style="border-top:1px solid var(--border);padding:6px 9px 5px;display:flex;align-items:baseline;gap:8px">
-    <span style="font-size:9px;letter-spacing:.6px;text-transform:uppercase;color:var(--dim)">Prompts</span>
-    <span class="mono" style="font-size:10px;color:var(--faint)">3 asks · 3 with edits · 8 edits</span>
+    <span class="mono" style="font-size:10px;color:var(--faint)">3 with edits · 8 edits</span>
   </div>
   <div style="font-size:10px;line-height:1.45;color:var(--faint);padding:0 9px 6px;border-bottom:1px solid var(--border)">What you asked for, in order. Select one to scope the Overview beside it — its fleet, runs, tasks, shells and change map narrow to the work that ask caused.</div>
   <div style="padding:6px 9px 10px">
@@ -564,10 +563,11 @@ const timelinePanel = `
   </div>`;
 // A compact fleet row for the Overview's LEFT master rail: phase dot · worktree ⑂branch · sparkline.
 const cmFleetRow = (dot, name, branch, bars, sel) => `
-  <div style="display:flex;align-items:center;gap:7px;font-size:11px;padding:3px 0${sel ? ';box-shadow:inset 2px 0 0 var(--accent);background:var(--hl)' : ''}">
-    <span class="dot" style="background:${dot};flex:none"></span>
-    <span class="mono" style="color:${sel ? 'var(--ink)' : 'var(--dim)'};white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:0 1 auto">${name} <span style="color:var(--faint)">⑂${branch}</span></span>
-    <span style="margin-left:auto;flex:none">${spark(bars, dot)}</span>
+  <div style="font-size:11px;padding:4px 0${sel ? ';box-shadow:inset 2px 0 0 var(--accent);background:var(--hl)' : ''}">
+    <div style="display:flex;align-items:center;gap:7px"><span class="dot" style="background:${dot}"></span>
+      <span>${branch === 'demo/pipeline' ? 'Validate data' : branch === 'feat-x' ? 'Check inputs' : 'Repair loader'}</span>
+      <span style="margin-left:auto">${spark(bars, dot)}</span></div>
+    <div style="font-size:9px;color:var(--faint);padding:2px 0 0 15px">lab · ${sel ? 'claude · working' : branch === 'feat-x' ? 'codex · blocked' : 'codex · done'} · 12k tok · 2m</div>
   </div>`;
 // Overview (formerly Change Map) — now MASTER-DETAIL: a thin left rail (Fleet · Workflows tabs + a few
 // agent rows) feeds the right change-map detail (Folders strip + churn-ranked file ledger).
@@ -577,9 +577,9 @@ const changeMapCol = `
       <div style="display:flex;gap:11px;font-size:9.5px;letter-spacing:.04em;margin-bottom:6px">
         <span style="color:var(--faint)">Sessions 4</span>
         <span style="color:var(--ink);border-bottom:1.5px solid var(--accent);padding-bottom:3px">Workers 3</span>
-        <span style="color:var(--faint)">Workflows 1</span>
-        <span style="color:var(--faint)">Tasks 3</span>
         <span style="color:var(--faint)">Processes <span style="color:var(--kept)">1/2</span></span>
+        <span style="color:var(--faint)">Tasks 3</span>
+        <span style="color:var(--faint)">Workflows 1</span>
       </div>
       ${cmFleetRow('var(--blue)', 'demo', 'demo/pipeline', [.3, .6, .4, .8, .5, .9, .7, 1], true)}
       ${cmFleetRow('var(--pending)', 'demo', 'feat-x', [.5, .7, .3, .6, .8, .4, .6, .5], false)}
@@ -601,9 +601,9 @@ const changeMapCol = `
 // One agent (worktree) row: badge · worktree ⑂branch · self tag · sparkline · ± · ⚠risk · ⇄collisions.
 const agentRow = (badge, name, branch, self, bars, sparkColor, added, removed, risk, coll) => `
   <div style="display:flex;align-items:center;gap:9px;padding:7px 16px;font-size:12.5px">
+    <span style="color:var(--ink)">${name}</span>
     ${badge}
-    <span class="mono" style="color:var(--ink)">${name}</span>
-    <span class="mono" style="color:var(--dim);font-size:11.5px">⑂${branch}</span>
+    <span class="mono" style="color:var(--dim);font-size:10.5px">lab · ${self ? "claude" : "codex"} · 12k tok · 2m</span>
     ${self ? `<span style="font-size:8.5px;font-weight:700;color:var(--coral);border:1px solid var(--coral);border-radius:8px;padding:0 6px">self</span>` : ''}
     <span style="margin-left:auto;display:flex;align-items:center;gap:13px">
       ${spark(bars, sparkColor)}
@@ -616,9 +616,9 @@ const agentRow = (badge, name, branch, self, bars, sparkColor, added, removed, r
 const subRow = (badge, type, desc, task, added, removed) => `
   <div style="display:flex;align-items:center;gap:8px;padding:4px 16px 4px 42px;font-size:11.5px">
     <span style="color:var(--faint)">└</span>
+    <span style="color:var(--purple);white-space:nowrap">${desc}</span>
     ${badge}
-    <span style="color:var(--purple);white-space:nowrap">${type}</span>
-    <span style="color:var(--faint);font-style:italic;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:0 1 auto">${desc}</span>
+    <span style="color:var(--faint);font-size:10px">lab · claude · 3k tok · 1m</span>
     <span style="color:var(--dim);font-size:10.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:0 1 auto">${task}</span>
     <span style="margin-left:auto;display:flex;align-items:center;gap:11px;white-space:nowrap">
       <span class="mono" style="font-size:10.5px"><span style="color:${gADD}">+${added}</span> <span style="color:${gREM}">−${removed}</span></span>
@@ -697,16 +697,16 @@ const multitaskingBody = `
   <div style="display:flex;align-items:center;gap:14px;padding:9px 16px 0;border-bottom:1px solid var(--border);font-size:12px">
     <span style="color:var(--faint);padding-bottom:8px">Sessions 4</span>
     <span style="color:var(--ink);border-bottom:1.5px solid var(--accent);padding-bottom:8px">Workers 3</span>
-    <span style="color:var(--faint);padding-bottom:8px">Workflows 1</span>
-    <span style="color:var(--faint);padding-bottom:8px">Tasks 3</span>
     <span style="color:var(--faint);padding-bottom:8px;white-space:nowrap">Processes <span style="color:var(--kept)">1/2</span></span>
+    <span style="color:var(--faint);padding-bottom:8px">Tasks 3</span>
+    <span style="color:var(--faint);padding-bottom:8px">Workflows 1</span>
     <span style="margin-left:auto;display:flex;gap:14px;color:var(--faint);font-size:11px;padding-bottom:8px"><span>☐ Active only</span><span>Clear completed</span></span>
   </div>
-  ${agentRow(phase('working', 'var(--blue)'), 'demo', 'main', true, [.3, .6, .4, .8, .5, .9, .7, 1], 'var(--blue)', 15, 0, 1, 1)}
+  ${agentRow(phase('working', 'var(--blue)'), 'Validate the dataset', 'main', true, [.3, .6, .4, .8, .5, .9, .7, 1], 'var(--blue)', 15, 0, 1, 1)}
   ${subRow(phase('working', 'var(--blue)'), 'Explore', 'maps the models layer', 'reading src/models/*.py', 0, 0)}
-  ${subRow(phase('done', 'var(--kept)'), 'Explore', 'audits the import graph', '12 files scanned', 0, 0)}
-  ${agentRow(phase('awaiting', 'var(--pending)'), 'demo-feat-x', 'feat-x', false, [.5, .7, .3, .6, .8, .4, .6, .5], 'var(--pending)', 42, 7, 2, 1)}
-  ${agentRow(phase('done', 'var(--kept)'), 'demo-hotfix', 'hotfix', false, [.4, .8, .6, .3, .7, .5, .2, .4], 'var(--kept)', 6, 0, null, null)}`;
+  <div style="padding:4px 42px;color:var(--faint);font-size:11px">▸ 1 done</div>
+  ${agentRow(phase('blocked', 'var(--pending)'), 'Check model inputs', 'feat-x', false, [.5, .7, .3, .6, .8, .4, .6, .5], 'var(--pending)', 42, 7, 2, 1)}
+  ${agentRow(phase('done', 'var(--kept)'), 'Repair the loader', 'hotfix', false, [.4, .8, .6, .3, .7, .5, .2, .4], 'var(--kept)', 6, 0, null, null)}`;
 
 // One Sessions-tab row, as the Overview draws it: ● live / ○ past · the session's title · the agent (when
 // it is not Claude) and model chips · ± lines · what is left to review, edits, tokens and duration, then
@@ -715,7 +715,7 @@ const multitaskingBody = `
 const sChip = (text, color, ink = color) => `<span class="mono" style="flex:none;font-size:9.5px;border:1px solid ${color};color:${ink};border-radius:3px;padding:0 4px;white-space:nowrap">${text}</span>`;
 const sBtn = (text) => `<span style="flex:none;font-size:9.5px;border:1px solid var(--border2);border-radius:3px;padding:0 5px;color:var(--dim);white-space:nowrap">${text}</span>`;
 const sessionRow = (live, title, agent, model, stats, store, effort, when, reviewing, pending) => `
-  <div style="display:flex;align-items:center;flex-wrap:wrap;gap:4px 8px;padding:5px 16px;font-size:12px${reviewing ? ';background:var(--side);box-shadow:inset 2px 0 0 var(--accent)' : ''}">
+  <div class="mt-trow${reviewing ? ' sel' : ''}" style="display:flex;align-items:center;flex-wrap:wrap;gap:4px 8px;padding:5px 16px;font-size:12px${reviewing ? ';background:var(--side);box-shadow:inset 2px 0 0 var(--accent)' : ''}">
     <span style="color:var(--${live ? 'blue' : 'faint'});flex:none">${live ? '●' : '○'}</span>
     <span style="color:var(--${reviewing ? 'ink' : 'dim'});min-width:0;overflow-wrap:anywhere">${title}</span>
     ${agent ? sChip(agent, 'var(--pending)') : ''}${sChip(model, 'var(--pending)')}
@@ -724,14 +724,25 @@ const sessionRow = (live, title, agent, model, stats, store, effort, when, revie
     <span class="mono" style="margin-left:auto;color:var(--faint);font-size:10.5px;flex:none">${when}${reviewing ? ' · reviewing' : ''}</span>
     ${sBtn('conversation')}${pending ? sBtn('resolve') : ''}${sBtn('🗑')}
   </div>`;
-// Overview MASTER-DETAIL — a left nav (Fleet · Workflows · Tasks · Processes · Sessions) drives the
+// savedSessionHtml carries the machine and workspace; only a saved (not indexed) row can resolve there.
+const remoteSessionRow = (title, machine, model, workspace, when, pending, synced) => `
+  <div class="mt-trow" style="display:flex;align-items:center;flex-wrap:wrap;gap:4px 8px;padding:5px 16px;font-size:12px">
+    <span style="color:var(--faint);flex:none">○</span>
+    <span style="color:var(--dim);min-width:0;overflow-wrap:anywhere">${title}</span>
+    ${sChip('on ' + machine, 'var(--pending)')}${sChip(model, 'var(--pending)')}
+    <span class="mono" style="margin-left:auto;color:var(--faint);font-size:10.5px">${workspace} · ${when}</span>
+    ${pending ? `<span style="color:var(--pending);font-size:10px">${pending} pending</span>` : ''}
+    ${pending && !synced ? sBtn('resolve') : ''}
+  </div>`;
+// Overview MASTER-DETAIL — a left nav (Sessions · Workers · Processes · Tasks · Workflows) drives the
 // right change-map detail (session chip + Folders strip + file ledger). Self/orchestrator selected.
 const ovAgentRow = (dot, branch, self, bars, added, removed, sel) => `
-  <div style="display:flex;align-items:center;gap:7px;padding:6px 12px;font-size:11.5px${sel ? ';background:var(--bg);box-shadow:inset 2px 0 0 var(--accent)' : ''}">
-    <span class="dot" style="background:${dot};flex:none"></span>
-    <span class="mono" style="color:${sel ? 'var(--ink)' : 'var(--dim)'};white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:0 1 auto;min-width:0">demo <span style="color:var(--faint)">⑂${branch}</span></span>
-    ${self ? `<span style="font-size:8px;font-weight:700;color:var(--coral);border:1px solid var(--coral);border-radius:8px;padding:0 5px;flex:none">self</span>` : ''}
-    <span style="margin-left:auto;display:flex;align-items:center;gap:7px;flex:none">${spark(bars, dot)}<span class="mono" style="font-size:9.5px"><span style="color:${gADD}">+${added}</span> <span style="color:${gREM}">−${removed}</span></span></span>
+  <div style="padding:6px 12px;font-size:11.5px${sel ? ';background:var(--bg);box-shadow:inset 2px 0 0 var(--accent)' : ''}">
+    <div style="display:flex;align-items:center;gap:7px"><span class="dot" style="background:${dot}"></span>
+      <span>${branch === 'demo/pipeline' ? 'Validate data' : branch === 'feat-x' ? 'Check inputs' : 'Repair loader'}</span>
+      ${self ? '<span style="font-size:8px;color:var(--coral);border:1px solid var(--coral);border-radius:8px;padding:0 5px">self</span>' : ''}
+      <span style="margin-left:auto">${spark(bars, dot)}</span></div>
+    <div style="font-size:9px;color:var(--faint);padding-top:3px">lab · ${self ? 'claude · working' : branch === 'feat-x' ? 'codex · blocked' : 'codex · done'} · 12k tok · 2m</div>
   </div>`;
 const overviewTabsBody = `
   <div style="display:flex;align-items:stretch">
@@ -739,9 +750,9 @@ const overviewTabsBody = `
       <div style="display:flex;flex-wrap:wrap;gap:4px 10px;padding:9px 12px 7px;border-bottom:1px solid var(--border);font-size:11px;line-height:1.5">
         <span style="color:var(--faint);white-space:nowrap">Sessions 4</span>
         <span style="color:var(--ink);border-bottom:1.5px solid var(--accent);padding-bottom:4px;white-space:nowrap">Workers 3</span>
-        <span style="color:var(--faint);white-space:nowrap">Workflows 1</span>
-        <span style="color:var(--faint);white-space:nowrap">Tasks 3</span>
         <span style="color:var(--faint);white-space:nowrap">Processes <span style="color:var(--kept)">1/2</span></span>
+        <span style="color:var(--faint);white-space:nowrap">Tasks 3</span>
+        <span style="color:var(--faint);white-space:nowrap">Workflows 1</span>
       </div>
       ${ovAgentRow('var(--blue)', 'demo/pipeline', true, [.3, .6, .4, .8, .5, .9, .7, 1], 40, 3, true)}
       ${ovAgentRow('var(--pending)', 'feat-x', false, [.5, .7, .3, .6, .8, .4, .6, .5], 42, 7, false)}
@@ -804,9 +815,9 @@ const workflowsBody = `
   <div style="display:flex;align-items:center;gap:14px;padding:9px 16px 0;border-bottom:1px solid var(--border);font-size:12px">
     <span style="color:var(--faint);padding-bottom:8px">Sessions 4</span>
     <span style="color:var(--faint);padding-bottom:8px">Workers 3</span>
-    <span style="color:var(--ink);border-bottom:1.5px solid var(--accent);padding-bottom:8px">Workflows 2</span>
-    <span style="color:var(--faint);padding-bottom:8px">Tasks 3</span>
     <span style="color:var(--faint);padding-bottom:8px;white-space:nowrap">Processes <span style="color:var(--kept)">1/2</span></span>
+    <span style="color:var(--faint);padding-bottom:8px">Tasks 3</span>
+    <span style="color:var(--ink);border-bottom:1.5px solid var(--accent);padding-bottom:8px">Workflows 2</span>
     <span style="margin-left:auto;display:flex;gap:14px;color:var(--faint);font-size:11px;padding-bottom:8px"><span>☐ Active only</span><span>Clear completed</span></span>
   </div>
   ${wfRunRow('var(--blue)', 'review-changes', phase('running', 'var(--blue)'), '3/5 phases · 41k tok · 12m', [.4, .5, .7, .6, .9, .5, .8, .6], 'var(--blue)')}
@@ -829,9 +840,9 @@ const tasksBody = `
   <div style="display:flex;align-items:center;gap:14px;padding:9px 16px 0;border-bottom:1px solid var(--border);font-size:12px">
     <span style="color:var(--faint);padding-bottom:8px">Sessions 4</span>
     <span style="color:var(--faint);padding-bottom:8px">Workers 3</span>
-    <span style="color:var(--faint);padding-bottom:8px">Workflows 1</span>
-    <span style="color:var(--ink);border-bottom:1.5px solid var(--accent);padding-bottom:8px">Tasks 3</span>
     <span style="color:var(--faint);padding-bottom:8px;white-space:nowrap">Processes <span style="color:var(--kept)">1/2</span></span>
+    <span style="color:var(--ink);border-bottom:1.5px solid var(--accent);padding-bottom:8px">Tasks 3</span>
+    <span style="color:var(--faint);padding-bottom:8px">Workflows 1</span>
     <span style="margin-left:auto;display:flex;gap:14px;color:var(--faint);font-size:11px;padding-bottom:8px"><span>☐ Active only</span><span>Clear completed</span></span>
   </div>
   <div style="font-size:9.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--dim);padding:8px 16px 2px">3 tasks · 2 done</div>
@@ -895,7 +906,7 @@ const scenes = {
       </div>
       <div class="statusbar">
         <span class="sb-warn">${microscope} 3</span>
-        <span>⎇ main</span><span style="margin-left:auto">Ln 8, Col 1&nbsp;&nbsp;UTF-8&nbsp;&nbsp;Python</span>
+        <span>⎇ main</span><span>✳ claude wk: 35% 1d 2h · mo: 48% 12d ~$18</span><span style="margin-left:auto">Ln 8, Col 1&nbsp;&nbsp;UTF-8&nbsp;&nbsp;Python</span>
       </div>
     </div>`),
 
@@ -907,7 +918,7 @@ const scenes = {
         <div style="padding:8px 18px;background:var(--bg);border-right:1px solid var(--border);font-size:12.5px;display:flex;align-items:center;gap:8px;">train.py<span style="font-size:10px;color:var(--pending)">1</span></div>
       </div>
       ${editorCodeCombined()}
-      <div class="statusbar"><span class="sb-warn">${microscope} 3</span><span style="color:var(--faint)">⌥⌘N next · ⌥⌘Y keep · ⌥⌘U undo · ⌥⌘- / ⌥⌘= revisions</span></div>
+      <div class="statusbar"><span class="sb-warn">${microscope} 3</span><span style="color:var(--faint)">⌥⌘X then n next · a keep · u undo · [ / ] revisions</span></div>
     </div>`),
 
   // C. observations panel closeup, with the tooltip of the single-edit features.py row above it, line for
@@ -998,10 +1009,12 @@ const scenes = {
 
   // J2. 0.8.7 — the Prompts window: the session as the conversation, one row per ask, each with what
   //     it produced. The ask is never clipped — it wraps over as many lines as it takes. Selecting one
-  //     scopes the Overview beside it (the scoped row is outlined, and its scope bar appears there).
+  //     scopes the Overview beside it (the scoped row is outlined, and its scope bar appears there). Its tab counts the
+  //     asks; the line under the strip says the rest.
   'prompts': scene(700, `
     <div class="window" style="padding-bottom:8px;">
-      <div class="viewhead" style="padding-top:12px;">OBSERVATORY TIMELINE: PROMPTS <span style="float:right;color:var(--faint)">6 asks · 4 with edits · 71 edits</span></div>
+      <div style="display:flex;flex-wrap:wrap;gap:4px;padding:10px 16px 0">${tlTab('Feed', 0, false)}${tlTab('Prompts', '6 asks', true)}${tlTab('Observations', 0, false)}${tlTab('Actions', 0, false)}</div>
+      <div class="mono" style="border-top:1px solid var(--border);padding:6px 16px 5px;font-size:10px;color:var(--faint)">4 with edits · 71 edits</div>
       <div style="font-size:10.5px;color:var(--faint);padding:0 16px 8px;line-height:1.45;border-bottom:1px solid var(--border)">What you asked for, in order. Select one to scope the Overview beside it — its fleet, runs, tasks, shells and change map narrow to the work that ask caused.</div>
       ${promptRow(6, '14:43:10', '', '', 'add a Processes tab so I can see the shells that are still running, and let me click one to follow its output', '2 tool calls · 41k tok', '~4m', false)}
       ${promptRow(5, '', '+412 −96', '31 edits · 8f · 3fo · 12 pending', 'the loader is still reading the whole file into memory — stream it instead, and add a test that fails on the old behaviour', '190k tok · 2 tasks · 1 subagent · 1 shell', '22m', true,
@@ -1020,24 +1033,24 @@ const scenes = {
       ${overviewTabsBody}
     </div>`),
 
-  // L. the Sessions tab: the Auto row, which both editors put above every workspace header, then this
-  //    machine's sessions grouped by workspace, this workspace first, the live one
-  //    marked; stamps are clock times, as every surface prints them. Selecting a row switches what the whole observatory is reviewing. The listing is
-  //    built from directory stats and cached titles, so it opens instantly however large the store is.
+  // L. the Sessions tab: machine state, then Auto, then one newest-first list across machines and
+  //    workspaces. Remote rows carry their machine badge; live and reviewing remain separate marks.
   'sessions': scene(900, `
     <div class="window" style="padding-bottom:10px;">
-      <div class="viewhead" style="padding-top:12px;">OVERVIEW · SESSIONS <span style="float:right;color:var(--faint)">4 sessions · 2 workspaces</span></div>
-      <div style="font-size:10.5px;color:var(--faint);padding:0 16px 8px;line-height:1.45;border-bottom:1px solid var(--border)">Sessions on this machine, grouped by workspace. This workspace is first; select a session to review its conversation and edits.</div>
-      <div style="display:flex;align-items:center;gap:9px;padding:5px 16px;font-size:12px">
+      <div class="viewhead" style="padding-top:12px;">OVERVIEW · SESSIONS <span style="float:right;color:var(--faint)">6 sessions</span></div>
+      <div style="font-size:10.5px;color:var(--faint);padding:0 16px 8px;line-height:1.45;border-bottom:1px solid var(--border)">Sessions from every machine, newest activity first. Search, Active and Sort cover the whole list; select a session to review it.</div>
+      <div class="mt-scope" style="font-size:10px;line-height:1.35;color:var(--dim);border-left:2px solid var(--border);padding:2px 0 2px 6px;margin:5px 16px">laptop · read 14:42:58 (1)</div>
+      <div class="mt-scope" style="font-size:10px;line-height:1.35;color:var(--dim);border-left:2px solid var(--border);padding:2px 0 2px 6px;margin:5px 16px">build-box · from its records, synced 14:40:02 (1)</div>
+      <div class="mt-trow" style="display:flex;align-items:center;gap:9px;padding:5px 16px;font-size:12px">
         <span style="color:var(--faint);flex:none">○</span>
         <span style="color:var(--dim)">Auto — newest session in this workspace</span>
       </div>
-      <div style="padding:6px 16px;color:var(--faint);font-size:11px">~/projects/training · 3 sessions</div>
       ${sessionRow(true, 'Extend the training pipeline', '', 'Opus 5', '<span style="color:var(--kept)">+412</span> <span style="color:var(--reverted)">−96</span> · <span style="color:var(--pending)">5 pending</span> · 14 edits · 190k tok · 22m', '3.1 MB', 'xhigh', '14:43:10', true, true)}
+      ${remoteSessionRow('Check the training artifacts', 'build-box', 'gpt-6', '~/projects/training', '14:38:22', 2, true)}
+      ${sessionRow(false, 'Explain the dataset validation rules', 'codex', 'gpt-6', '0 edits · 12k tok · 4m', '88 KB', '', '14:20:05', false, false)}
+      ${remoteSessionRow('Tighten the dataset checks', 'laptop', 'Sonnet 5', '~/projects/data-tools', '13:10:44', 1, false)}
       ${sessionRow(false, 'Split the training loop out of models.py', '', 'Opus 5', '<span style="color:var(--kept)">+188</span> <span style="color:var(--reverted)">−41</span> · <span style="color:var(--kept)">✓</span> · 8 edits · 120k tok · 31m', '1.4 MB', 'high', '12:41:07', false, false)}
       ${sessionRow(false, 'Add type hints to the dataset module', '', 'Sonnet 5', '<span style="color:var(--kept)">+94</span> <span style="color:var(--reverted)">−12</span> · <span style="color:var(--kept)">✓</span> · 4 edits · 58k tok · 11m', '640 KB', '', 'Sep 25 16:05', false, false)}
-      <div style="padding:6px 16px;color:var(--faint);font-size:11px">~/projects/data-tools · 1 session</div>
-      ${sessionRow(false, 'Explain the dataset validation rules', 'codex', 'gpt-6', '0 edits · 12k tok · 4m', '88 KB', '', 'Sep 25 09:32', false, false)}
     </div>`),
 
   // L2. 0.8.7 — the FEED under whatever the nav selected: a live tail while the thing is still working,
@@ -1161,7 +1174,7 @@ for (const [name, html] of Object.entries(scenes)) {
   writeFileSync(src, html);
   if (htmlOnly) { writeFileSync(join(OUT, `${name}.html`), html); console.log('rendered HTML', name); continue; }
   const png = capturePng(CHROME, [
-    '--headless', '--disable-gpu', '--no-sandbox', '--ozone-platform=headless', '--use-mock-keychain', '--password-store=basic', '--default-background-color=00000000',
+    '--headless', '--disable-extensions', '--disable-gpu', '--no-sandbox', '--ozone-platform=headless', '--default-background-color=00000000',
     '--force-device-scale-factor=2', '--hide-scrollbars',
     `--window-size=${SIZE[name] || '1028,344'}`,
     `file://${src}`,
@@ -1175,7 +1188,7 @@ for (const [name, html] of Object.entries(scenes)) {
 for (const name of ['pyc-layout']) {
   if (htmlOnly || (only.length && !only.includes(name))) continue;
   const png = capturePng(CHROME, [
-    '--headless', '--disable-gpu', '--no-sandbox', '--ozone-platform=headless', '--use-mock-keychain', '--password-store=basic', '--default-background-color=00000000',
+    '--headless', '--disable-extensions', '--disable-gpu', '--no-sandbox', '--ozone-platform=headless', '--default-background-color=00000000',
     '--force-device-scale-factor=2', '--hide-scrollbars',
     '--window-size=1900,860',
     `file://${join(OUT, `${name}.src.html`)}`,

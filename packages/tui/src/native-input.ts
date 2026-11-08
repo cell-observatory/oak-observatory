@@ -8,7 +8,7 @@ export interface NativeKeyEvent extends KeyEvent {
 }
 
 /** Decode kitty keys before handing the rest to the legacy decoder. Keep modifiers which OAK does
- * not bind, so super+w can never turn into an ordinary w command in an overlay or after a leader. */
+ * not bind, so super+w can never turn into an ordinary w command in an overlay or after herdr's prefix. */
 export function decodeNativeKey(raw: string): NativeKeyEvent | null {
   const match = /^\x1b\[(\d+(?::\d*){0,2})(?:;(\d*)(?::([123]))?)?(?:;[\d:]+)?([uA-DFHP-SZ~])$/.exec(raw);
   if (!match) return null;
@@ -81,6 +81,18 @@ export function createNativeInput() {
             const end = pending.indexOf('\x1b[201~', 6);
             if (end < 0) break;
             size = end + 6;
+          } else if (pending.startsWith('\x1b[[')) {
+            // The console's F1 to F5 (ESC [ [ A to E) are one key: framed as a CSI ending in `[`, the letter went on alone.
+            if (pending.length < 4) break;
+            if (!'ABCDE'.includes(pending[3])) {
+              // Any other ESC [ [ is the CSI it always was, ending in `[`: a reply. Handed to the decoder alone, it waited
+              // there for a console letter, and the next part carried it too, so that part was no single key: F2, or
+              // herdr's prefix, after it went to the program.
+              out.push({ bytes: Buffer.from('\x1b[[', 'latin1'), events: [{ t: 'reply', raw: '\x1b[[' }] });
+              pending = pending.slice(3);
+              continue;
+            }
+            size = 4;
           } else if (pending[1] === '[') {
             const csi = /^\x1b\[[0-?]*[ -/]*[@-~]/.exec(pending);
             if (!csi && /^\x1b\[[0-?]*[ -/]*$/.test(pending)) break;
@@ -125,12 +137,15 @@ export function createNativeInput() {
 
 /** Translate terminal mouse coordinates into the native body's coordinates. All other bytes stay
  * opaque (including split UTF-8). The caller retains `pending` between reads and routes chrome
- * reports through OAK's hit test, in stream order, so a tab click cannot leak into the child. */
+ * reports through OAK's hit test, in stream order, so a tab click cannot leak into the child.
+ * `childHeld`: the child holds the button its press got. Motion and the release are the child's wherever they are, on
+ * the nearest row of its screen: a drag let go over OAK's rows still ends in the child. */
 export function translateNativeMouse(
   chunk: Buffer,
   topRows: number,
   bodyRows: number,
   pending: Buffer = Buffer.alloc(0),
+  childHeld = false,
 ): { parts: { target: 'pty' | 'chrome'; bytes: Buffer }[]; pending: Buffer } {
   const parts: { target: 'pty' | 'chrome'; bytes: Buffer }[] = [];
   const put = (target: 'pty' | 'chrome', text: string) => {
@@ -138,7 +153,7 @@ export function translateNativeMouse(
   };
   // A held prefix is glued to the next read ONLY when that read continues it. A lone ESC followed by
   // an unrelated key (ESC, then ctrl+a within the hold window) is two keystrokes: gluing them made
-  // `\x1b\x01n` one opaque part whose first byte is no longer the leader, so the leader went to the
+  // `\x1b\x01n` one opaque part whose first byte is no longer the prefix, so the prefix went to the
   // child and the reader could not leave the tab. The prefix goes out on its own first.
   const held = pending.toString('latin1');
   const next = chunk.toString('latin1');
@@ -159,11 +174,17 @@ export function translateNativeMouse(
     const report = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])/.exec(tail);
     if (report) {
       put('pty', input.slice(start, at));
-      const row = Number(report[3]);
-      if (row > 0 && row <= topRows) put('chrome', report[0]);
+      const row = Number(report[3]), code = Number(report[1]);
+      if (childHeld && bodyRows > 0 && (report[4] === 'm' || ((code & 32) !== 0 && (code & 64) === 0))) {
+        put('pty', `\x1b[<${report[1]};${report[2]};${Math.max(1, Math.min(bodyRows, row - topRows))}${report[4]}`);
+      }
+      else if (row > 0 && row <= topRows) put('chrome', report[0]);
       else if (row > topRows && row <= topRows + bodyRows) {
         put('pty', `\x1b[<${report[1]};${report[2]};${row - topRows}${report[4]}`);
       }
+      // Below the program's screen are OAK's status, usage and key rows: their presses, motion and releases are
+      // OAK's (a drag there copies them). The wheel there is no one's.
+      else if (row > topRows + bodyRows && !(Number(report[1]) & 64)) put('chrome', report[0]);
       at += report[0].length - 1;
       start = at + 1;
     } else if (tail === '\x1b' || tail === '\x1b[' || /^\x1b\[<[\d;]*$/.test(tail)) {

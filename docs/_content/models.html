@@ -3,3 +3,34 @@
 <p>Select a model in Claude Code or Codex, in the agent’s own terminal in the <a href="tui-herdr.html">herdr tab</a>. OAK reads the model each turn ran on from the transcript.</p>
 <h2>Local models</h2>
 <p><code>oak models</code> lists local Ollama models and the model configured for Codex. <code>oak models use &lt;name&gt;</code> updates that native configuration and verifies it with a live turn. Local model names do not imply hosted pricing; unavailable pricing stays unavailable.</p>
+<h2>Other models</h2>
+<p>Claude Code and Codex can each send their requests to a model from another provider. OAK records such a session the same way as any other: the hooks capture each edit, and the transcript supplies the model name and the token counts. The Laguna models from Poolside and the Inkling models from Thinking Machines are two examples.</p>
+<h3>Laguna through Codex</h3>
+<p>Poolside publishes Laguna S 2.1 and Laguna XS 2.1 as open weights. To run Laguna XS 2.1 locally, have Ollama serve it and set it as Codex’s model. <code>oak models use</code> pulls the model when Ollama does not have it yet:</p>
+<pre><code>oak models use laguna-xs-2.1</code></pre>
+<p>To use the hosted models instead, define OpenRouter as a custom provider in <code>~/.codex/config.toml</code> and export your key as <code>OPENROUTER_API_KEY</code>:</p>
+<pre><code>model = "poolside/laguna-s-2.1"
+model_provider = "openrouter"
+
+[model_providers.openrouter]
+name = "OpenRouter"
+base_url = "https://openrouter.ai/api/v1"
+env_key = "OPENROUTER_API_KEY"</code></pre>
+<p>OpenRouter’s Codex guide also shows a command-based <code>auth</code> block in place of <code>env_key</code>, which lets Codex read OpenRouter’s model metadata. We have not run Laguna through OpenRouter end to end.</p>
+<h3>Dollar estimates</h3>
+<p>OAK estimates dollars from a table of published prices. The table holds Anthropic’s and OpenAI’s models, Laguna S 2.1, Laguna XS 2.1, Inkling and Inkling-Small at OpenRouter’s prices when Codex’s provider is <code>openrouter</code>, and any OpenRouter model id ending in <code>:free</code> at $0. A model id takes the row that names it, and a date suffix or a <code>[1m]</code> tag on the id names the same model. A Claude model id that no row names, such as a newer release of a known family, is priced from the row of that family’s nearest earlier version, and a Claude model id of no known family at the Opus 4.5 rate. A GPT model id that no row names is priced from the nearest earlier GPT row with the same suffix, such as <code>-mini</code>. Each of these is marked approximate with an asterisk. gpt-oss is the exception: it is an open-weight model that is usually run locally, so it has no price unless a provider in the table lists it. A Claude Code transcript does not name its provider, so a model from another provider there has no price. Every other model shows its tokens without a dollar figure:</p>
+<pre><code>$ oak usage --breakdown --by model --agent codex
+usage breakdown · by model · last 8 weeks · this machine's records
+~$ are estimates at today's API list prices, not a bill (subscriptions are flat-rate)
+the oldest bucket may be partial — records before the 8-week cutoff are not counted
+
+gpt (codex) — 6.0M tok · 0 cache reads · price unavailable*
+  poolside/laguna-s-2.1      2.0M tok        0 reads     $0.3        1 msgs
+  laguna-xs-2.1:latest       2.0M tok        0 reads        —*       1 msgs
+  gpt-5.2-codex              2.0M tok        0 reads      $16        1 msgs
+
+* includes an approximate or unavailable model rate; totals with unpriced usage show no dollar estimate</code></pre>
+<p>Claude Code writes to the prompt cache for five minutes or for one hour, and the transcript records how many tokens each write held. OAK prices each at its own rate. A record that does not split its cache writes, as in a transcript from an older Claude Code, is priced at the five-minute rate and marked approximate.</p>
+<p>Some models charge more for a long prompt, where the prompt is a request’s input, cache reads and cache writes together. A Haiku 5.5 request with a prompt over 100,000 tokens, and a request to a GPT model with a long rate whose prompt is over 272,000 tokens, is priced at the long rate as a whole. Fast mode and US-only inference also cost more on the Claude models that offer them. OAK applies those rates only to a turn whose transcript records them, as <code>"speed": "fast"</code> and <code>"inference_geo": "us"</code>.</p>
+<p>Each dollar figure is an estimate at today’s list prices. A <code>~</code> marks it as one, and the text of <code>oak usage</code> and the editors’ hover text say so in words. The local database records which version of the price table priced each message. When an update changes the table, the database prices every stored message again, this machine’s and the other machines’ alike, so every total uses one table. It never prices again the spend that Claude Code reported for a session.</p>
+<p>A total that includes unpriced usage shows no dollar figure. The Claude status line’s month figure prices each model from the same table. The Codex month figure in the status bars counts a turn as $0 when Codex names its provider <code>ollama</code>, <code>lmstudio</code> or <code>ollama-launch</code>: Codex’s built-in providers for a local Ollama and LM Studio, and the one <code>ollama launch codex</code> sets up. OAK decides this by the provider id alone and does not read a provider’s <code>base_url</code>, so a custom provider you define under <code>[model_providers]</code>, such as a vLLM server on localhost, is not counted as local: a turn from it, like one from any other provider that OAK cannot price, makes the month’s figure unavailable.</p>

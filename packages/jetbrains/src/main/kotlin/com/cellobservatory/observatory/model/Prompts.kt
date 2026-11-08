@@ -63,6 +63,10 @@ data class PromptsResult(
     val summary: PromptSummary,
     /** Chronological, oldest first — exactly as core ordered them. */
     val prompts: List<SessionPrompt>,
+    /** The CLI's own reason when it could list nothing (`{"transcript":null,"error":…}`), shown as it gave it. */
+    val error: String? = null,
+    /** Set when the transcript is gone and the list is what the local index kept (`fromIndex`) — says so. */
+    val note: String? = null,
 )
 
 /** the agent's prose reply to one ask (core.PromptResponse) — its tool calls stripped, so the reader gets
@@ -104,6 +108,8 @@ object PromptsParser {
             ),
             prompts = (o.getAsJsonArray("prompts") ?: JsonArray())
                 .mapNotNull { it.takeIf { e -> e.isJsonObject }?.asJsonObject?.let(::prompt) },
+            error = str(o, "error"),
+            note = if (o.get("fromIndex")?.takeIf { it.isJsonPrimitive }?.asBoolean == true) str(o, "note") else null,
         )
     } catch (_: Exception) {
         null

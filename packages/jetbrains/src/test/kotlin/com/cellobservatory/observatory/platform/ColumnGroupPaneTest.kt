@@ -4,7 +4,6 @@ import com.cellobservatory.observatory.model.ColumnLayout
 import com.cellobservatory.observatory.settings.ObservatorySettings
 import com.cellobservatory.observatory.ui.ColumnGroupPane
 import com.intellij.openapi.ui.Splitter
-import com.intellij.testFramework.fixtures.BasePlatformTestCase
 import java.awt.Container
 import javax.swing.JLabel
 import javax.swing.JPanel
@@ -18,7 +17,7 @@ import javax.swing.JPanel
  * the whole group with it: all three compile, and all three are invisible until someone drags a divider
  * and comes back the next day.
  */
-class ColumnGroupPaneTest : BasePlatformTestCase() {
+class ColumnGroupPaneTest : ObservatoryPlatformTestCase() {
 
     private val group = "runs"
     private val members = listOf("workflows", "tasks", "processes")

@@ -8,6 +8,1624 @@ the release notes.
 
 ## [Unreleased]
 
+## [0.11.0] — 2026-11-07
+
+### Upgrading from 0.10.0
+
+- **Node.js 24 or newer.** 0.10 ran on Node 20, and `oak update` installs this release there with
+  only npm's `EBADENGINE` warning. Every `oak` command then refuses to start until Node is upgraded; the capture hooks
+  still record edits meanwhile. Check with `node --version` before updating.
+
+- Messages sent while Claude Code is working appear once in Prompts, Feed and search, in the user's words,
+  with subsequent work attributed to them. Task and peer notices, meta image notes and API replay copies are
+  excluded. Stored asks and prompt caches are derived again, including the records synced to another machine.
+  `oak prompts --machine <label>` now reads on that saved machine. Codex steering messages within one native
+  turn keep separate ask identities and work windows, including repeated messages.
+
+- **Quit or update every OAK 0.10 still running.** A terminal app started before the update, a VS Code window not
+  reloaded since, or an older `oak` on the PATH runs OAK 0.10's code, and two of its writes would undo this release's:
+  - Its plain `oak clean` removes a folder in the store that it does not know and takes for an empty session. This
+    release keeps three: `sync/`, oak sync's state with the backup folder's key, `records/`, every machine's record
+    log, and `delegated/`, the agents started from a brief. Each holds `blobs/README`, which that cleaner keeps. This machine's record log, lost all the same (by hand,
+    say), is written again at the next listing from the local database, once that database has read all of it. A backup key
+    lost with `sync/` is not: copy it from a machine that has it (`oak sync key --from <machine>`), or from where you
+    kept it (`oak sync key --import`). `oak doctor` says when either is missing, and how to recover it. A log lost
+    while the database was reading it back waits for `oak sync now` to bring it back. Doctor names that log and the
+    recovery steps. Once a complete sync run finds no copy on any saved machine or in the backup, the next listing
+    compacts what remains, so a deleted session's text does not stay in the log sent to every machine.
+  - It rewrites `prefs.json` with only the settings it knows, which drops oak sync's (the backup, the machines and
+    projects left out, the placements, the cache size, `auto`) and `"machineUsage": false`: the backup stopped without
+    a word, and an excluded project synced again. This release keeps a copy of those settings in oak sync's state,
+    `sync/settings.json`, which follows every change made to them, and marks each `prefs.json` it writes with
+    `"prefsFormat": 2`, which OAK 0.10 drops with them. Over a `prefs.json` without that mark, every reader takes each
+    of those settings it lacks from the copy, the next listing, sync run or save of a setting writes them back, the next
+    `oak` command run in a terminal (or the terminal app, on its status row) says so once, and `oak doctor` says it for
+    a week. A setting you remove by hand from a `prefs.json` that keeps the mark stays removed. Restoring settings
+    and saving them now share a lock, so a save cannot land between the restore's check and its replacement of the file.
+
+### Added
+
+- Processes always follows Workers in the terminal Observatory and both editor dashboards, including empty, Codex and saved-machine sessions. The terminal keeps a counted header and any unavailable reason, and the editors say why a saved machine's shells could not be read; editor tabs and grouped columns use the same order and say “No shells in this session” when empty. Saved-machine process reads resolve the session on its owner and use the shared deadline.
+
+- **Open workspace window:** `W` on an Observatory session in the terminal app, or **Open workspace window** in either editor’s session lists, opens one workspace on its owning machine. VS Code/Cursor use Remote-SSH for saved machines; JetBrains uses Gateway. The folder is read from the owning machine itself, never from the local database's copy of its listing. Missing folders are refused, a Gateway link nothing on this machine can open says so, and a terminal app without a GUI prints the command to run on the machine with the editor.
+- **Workspace review layout:** `W` and **Open workspace window** pin the session, open all pending changes stacked, reveal Review and Timeline, show the grouped Overview and change map, and reuse one OAK terminal running `oak`, preserving view placements. Both editors pick up requests in already-open windows; empty reviews show a note. JetBrains terminal support uses the optional Terminal plugin.
+
+- **Terminal app: a GUI editor beside the terminal editor.** Options has two editor rows: **Terminal editor** (`prefs.editor`, unchanged, used by `e`) and **GUI editor** (`prefs.guiEditor`, used by `W`; blank is Auto). Auto takes a GUI editor from the terminal editor setting, `$VISUAL` or `$EDITOR`, then the editor whose integrated terminal this is, then the first GUI editor on `PATH`, so `nvim` as the terminal editor no longer stops `W`; `W` refuses only when there is no GUI editor, and names the setting. On Review, `e` or `E` opens the selection in the terminal editor and `W` in the GUI editor at the selected edit's line (Remote-SSH `--goto` for a saved machine's session, Gateway for a JetBrains IDE). The status row names the GUI editor that ran and where it came from.
+
+- Observatory (F2) lists the pinned session’s background shells and its workers’ shells, running first,
+  with state, runtime and exit code. Finished shells fold into one row. Clicking a shell follows a bounded,
+  plain-text output tail; visible running rows show their last few lines.
+- `oak processes --follow <id> [--session <id>] [--machine <label>]` streams output locally or on a saved
+  machine. `--json` emits snapshots. Both editors’ Processes selections use this route in the background,
+  with the shared remote deadline. Only task-named output files are read; terminal controls are stripped.
+- Codex exec sessions appear when they report a running session ID. Their output updates from recorded
+  exec and `write_stdin` results, with an explicit note that Codex supplies no output file to watch.
+- `oak agent tell <id…> <text>` (or `--file <path>`) sends a running agent more to do through its own chatbox, here
+  or on a saved machine, for Claude Code and Codex. The message reaches the agent's transcript, so its Prompts and
+  Feed show it, and OAK records who sent it and when (`oak agent list --json`'s `lastMessageMs`). A gone, done or
+  closed agent is refused before anything is sent.
+- `oak agent start … --after <id…>` records an agent as `queued` and starts it once every agent it names is done
+  (`--after-any` also accepts gone), even after the terminal that queued it closed. A failed dependency, an unknown
+  id or a cycle stops it with the reason; `oak agent close` cancels it. A queued agent with `--worktree` makes its
+  worktree when it starts.
+- `oak finding add "<text>" [--path <file>…]` posts a fact other agents should know, such as a generated file or a
+  build step tests need; `oak finding list`, `oak query findings` and `oak finding resolve` read and retire them.
+  Findings travel to every machine in the record log and always show as quoted, untrusted text.
+- When an agent is about to edit a file that another active agent, on this machine or another, has pending edits
+  to, OAK's capture hook adds a one-line note to its context: who, where and since when. The note never blocks the
+  edit, and the hook does not open the database to find it.
+- `oak agent setup` opts agents into delegation through herdr tabs, with managed Claude and Codex guidance,
+  an `oak-builder` agent, model/effort and writable-root defaults, a permission rule, checks and surgical removal.
+  Update refreshes unedited guidance, uninstall removes it, and doctor and the terminal app suggest setup.
+- Delegated agents can start in new worktrees. Their records carry path, branch, base and bounded Git readings
+  across machines; the CLI and all Workers views show change and merge state. Doctor lists orphaned agent worktrees
+  (only ones OAK made, on an `oak/<id>` branch), and `agent close --remove-worktree` removes only clean, merged ones OAK made.
+
+- `oak feed --kind agent --id <worker> --follow` follows a worker’s own log, with a file watch and a quiet
+  polling fallback. It prints the recorded end time and exits when the worker ends. Add `--machine <label>`
+  to read a saved machine’s worker over SSH every ten seconds; `--json` prints one snapshot per line.
+- Agents started from a brief, tracked by OAK. `oak agent start --kind claude|codex --brief <file>` opens a herdr tab
+  labelled with the brief's `# Title`, starts the agent's own CLI there and hands it the brief, here or on a saved
+  machine (`--machine <label>`, where that machine's OAK starts it). Claude Code's agent type and permission mode, and
+  Codex's model, effort and sandbox, come from `agents` in `prefs.json` unless a flag sets them. The start answers a
+  folder-trust prompt with its first choice, sends Enter after the brief, starts the tab's shell with
+  `DISABLE_AUTO_UPDATE=true`, and checks the pane before it believes that herdr's start timed out.
+  `oak agent list` shows each agent with a state OAK derives from the agent's report, transcript or rollout, raised
+  hand, process and pane, and Claude Code's `claude agents --json` (starting, working, waiting, blocked, errored with
+  the error's text, done, gone), when that state began, its machine, tab, tokens and cost, and its workers.
+  `oak agent wait <id…> --until done|blocked|any` returns once that is reached, watching the files it reads, so a
+  report written shows as done within a second. `oak agent close <id…>` closes the tab and keeps the row. An agent on a
+  saved machine is read from the local database when oak sync read that machine in the last ten minutes, else over SSH.
+  The database keeps the agents in a `delegated` table (schema version 5), which the record log carries to every
+  machine; `oak query delegated` lists them with their workers. The terminal app's Observatory, and VS Code's and
+  JetBrains' Workers tabs, list them with their states; the Observatory opens an agent's tab.
+- Each machine keeps a local database of its sessions, in one SQLite file in `~/.claude/claude-observatory-index/`, beside
+  the store's config and never inside the store: sessions, every ask and the answer to it, edit metadata with line
+  counts, tool calls with their paths within the project, workers and workflow runs, raised hands and waits, review
+  comments, plans, memories and skills, the usage of every message, and every other machine's sessions from the record
+  logs `oak sync` keeps (below), each marked with the machine it came from. It uses the SQLite built into Node, so it
+  adds no native dependency; it is kept current as each command reads, from a byte cursor per transcript, and built in
+  the background when there is more to read than a command waits for, as on a first build of a machine with many
+  transcripts. `oak sessions --json`, `oak search` and `oak inbox` answer from it when it is current, with the same
+  answers as from the files (and, from it alone, the other machines' raised hands), and so does `oak notify --watch`,
+  which listed every session's files every three seconds; `OAK_INDEX=off` reads the files instead, and
+  `OAK_INDEX=shadow` reads them and records where the database would differ. The terminal app and both editors get those
+  answers wherever they run these commands, and read the database themselves where it saves a walk of the files (below). It
+  grows with the text of the asks and answers, not with tool output: about twice that text, plus about half a kilobyte
+  per tool call, a kilobyte per edit and a third of a kilobyte per assistant message's usage. Nothing caps it, since
+  archived sessions are kept; deleting its folder reclaims it, rebuilt from the files and the record logs. A value in a
+  session's files that no column of the database can hold keeps only that session out, and while one does the database never
+  reports itself current: the listings read the files, `oak query --status` lists the session with why, and `oak doctor`
+  warns. `oak doctor` has a row for it, with its size, and `oak uninstall --all` names its folder and the record logs'
+  folder.
+- `oak query` answers from the local database in JSON, for agents and scripts: `sessions` (every machine's the database
+  holds), `edits`, `files`, `prompts`, `search` (asks and answers ranked with bm25, an ask over its answer), `workers`,
+  `sync`, `notes`, `usage`, `readings` and `schema`, with
+  filters such as `--since 7d`, `--text <words>` and `--status pending`, and `oak query sql "<SELECT …>"` for one
+  read-only statement, run in a child process stopped at its deadline. Every answer carries its columns, rows, whether a
+  limit cut them, and how current the database was; `--arrays` and `--table` shape it, and `oak query --serve` answers one
+  request per line. Exit status 2 means the query cannot run, 3 that there is no database here, and 124 that raw SQL ran
+  past its deadline. The rows of `sessions`, `edits`, `prompts`, `search`, `workers` and `notes` name their machine by
+  id, which a query's own `--machine` takes, as it takes `self` and the label a saved machine has here (any other name
+  is refused with `bad_param`), and by the name this machine knows it by (`machine_label`: the label it saved that
+  machine under, which the other commands' `--machine` takes, else the name the machine gives itself), and the
+  `machines` table keeps both names (`label`, `saved_label`). `files` counts a file once by its repository and its path
+  within it, so a repository cloned at different paths on two machines, or edited from sessions in different folders of
+  it, is one file, and `edits --path` takes an absolute path in this machine's clone as that path, or refuses one
+  outside every project with `bad_param`, where it answered with no rows.
+- The local database keeps what a session did after its files are gone. A session whose transcript, rollout and store are
+  all gone (its store removed by `oak clean`, its transcript swept by Claude Code's retention or deleted by hand) is
+  archived, with when and why, and its asks and answers, edit metadata, tool calls and comments stay searchable when
+  asked for (`oak query … --archived` or `--all`); the edit records of a store `oak clean` removed, and a record
+  `oak clean --resolved` drops, stay too, marked cleared, as do the records, operations, capture gaps and review units
+  of a store `oak clean` removed when the session then went on. OAK's cleanup records each session it removes first, from
+  every surface that cleans up (the CLI, the terminal app and both editors), except where an editor's Node has no
+  `node:sqlite`: there what the session did since the database last caught up goes with its files. Only a deliberate
+  delete forgets a session, at once and with its full-text entries. `oak sessions --delete` forgets it on every machine
+  whose oak sync reads this machine's record log after the delete, as a delete made there forgets one: in every database
+  file there, and out of the write-ahead log, whether the log brings the delete or a base its machine compacted it
+  into. `oak uninstall --all --purge-store` forgets the sessions whose stores it removes in this machine's database and
+  record log, and a transcript the purge leaves is added to the database again from the file. Another machine forgets what those
+  stores held once a run brings it this machine's record log, and, while this machine's OAK still answers its runs,
+  lets its copies of the stores go, as after any cleanup; one that does not reach this machine again keeps its copies.
+  `oak demo --clean` forgets the demo's sessions and their usage, which no record log or usage pull carries. A new
+  database file reads the archive back from this machine's record log, and carries it over from the previous file too,
+  which `oak clean` removes once the copy is verified.
+- The local database keeps the usage of every assistant message, on every machine whose records it holds: one row per
+  message at its largest snapshot, kept for ever, with its input, output and cache-creation tokens, its cache reads
+  apart, its model, list-price cost, session, machine and account, and a rollup by day; each share a machine read of
+  the Claude account's 5-hour, weekly and per-model weekly windows, with when it was measured; the spend Claude Code
+  reported for each session; and the account each machine is signed in to. `oak usage --window
+  5h|week|bill|month|day|all --by machine|model|session|day|agent|account` and `oak query usage` break a window down
+  from it, each message counted once however many machines hold it, and `oak query readings` lists the shares each
+  machine read; `oak usage --json` carries the account's 5-hour, weekly and bill-cycle windows as `usageTotals`. It reads
+  no credentials. Readings and spend reports are kept whole for 35 days, and then as the account's usage over time: one
+  reading of each machine, agent, kind and hour (and of each answer on the five-hour limit), and one report of each
+  session and day, carrying what that day's reports added. A session deleted on purpose keeps its usage, without the
+  session, since the account was billed for it, and has it back when it is added to the database again; so does a session deleted
+  with OAK 0.10.0, its transcript kept, which no database knew (read from cursors of its own, so an undelete reads it
+  whole); the demo's sessions, never billed, take theirs with them. The account's answers on its five-hour limit
+  (below) are readings of their own, apart from its shares, each kept with when the account answered: with no
+  five-hour window, or with one.
+- Each machine publishes what its local database derives of its own sessions to an append-only record log in its store
+  (`records/`), and `oak sync` keeps every machine's log on every machine and in the backup: sessions, every ask and
+  the answer to it, edit metadata, tool calls, workers, comments, raised hands, plans, memories and skills, and usage.
+  So each machine's database lists every machine's sessions, and counts every machine's usage, without its transcripts; a
+  machine set up again gets its own log back, and with it its archive, even one used before oak sync brought that log
+  back: rewriting the log it began anew replaces only that log, so the other machines keep the one it kept before, and
+  read the two together (a session from before that is deleted there leaves that log once oak sync brings it back). A
+  log that lost what the database published in it
+  (OAK 0.10's `oak clean` removed `records/`, for one) is written again whole from the database at the next catch-up, where
+  that database has read all of it, and `oak doctor` says so meanwhile where oak sync reads it; a log the database was still
+  reading back is left for oak sync to bring back. A log is rewritten as its latest rows once it
+  holds 32 MB and twice what it held when last rewritten, and at once after a deliberate delete, whose session then
+  leaves every machine's copy of the log (a backup folder keeps the segments it was sent). `oak sessions --json
+  --machine <label>` answers from the database when `oak sync` read that machine in
+  the last ten minutes and nothing there may be running (no session active in the last two hours, as its records and
+  the files that run saw say, no hand raised in the last day still up), saying so and how fresh it is (`fromIndex`,
+  `syncedAt`, `publishedAt`), and over SSH otherwise. The capture hooks never write it: once `oak sync` has run on a
+  machine, each starts a catch-up of the database in the background, at most once a minute and at once when it moved a
+  hand, so what the agents do is published while they work; and a machine that another machine's `oak sync now` asks
+  catches up first, for up to five seconds (the rest in the background, for a later run), so a first run brings every
+  machine's sessions with nothing listed anywhere first. The log carries your prompts and
+  their answers to every machine you sync with ([SECURITY.md](SECURITY.md#good-to-know)).
+  Compaction requires a local append receipt or the writer's final segment seal, and bases name the verified
+  segments they replace. Bases retain purges, including through repeated compaction and database rebuilding.
+  Writer lifetimes keep unrelated old segments behind the selected base after a reinstall with a clock rollback;
+  disconnected bases are selected conservatively and retain uncovered history. Doctor reports a partly read log.
+- Both editors list the sessions of every machine whose records `oak sync` brought to the local database, with when it
+  last read that machine (or when its records arrived, for one it does not read): VS Code in Switch Session and the
+  Timeline's session selector (read in-process where its Node can, from the CLI otherwise), JetBrains in Switch
+  Session, in one list with this machine's sessions, each row naming its machine. A machine no longer saved, or one
+  whose records came through another, is listed too. When no saved machine can be contacted for that record, its
+  session shows what its records say of it, read-only, and offers to fetch it here (`oak sync fetch`), after which its
+  conversation opens here. Its captured edits are not listed on this machine, where no view lists another machine's
+  edit log, and it is reviewed on the machine that made it. The terminal app lists its saved machines' sessions in the Observatory and the
+  session picker as before, now from the database when `oak sync` read that machine in the last ten minutes and nothing
+  there may be running (no session active in the last two hours, as its records and the files that run saw say, and no
+  hand raised in the last day still up), saying so under the machine with when, and over SSH otherwise. `oak sessions
+  --json --synced` adds the other machines' sessions to the listing (`machines`), and `oak search --machine <label>`
+  searches a machine's conversations in its records here when `oak sync` read it in the last ten minutes, without SSH.
+  Until `oak sync` brings another machine's records here, no synced-only row is added; saved-machine listings work independently. `oak siblings --repo` (`oak fleet --repo`)
+  lists the other machines' sessions of the same repository too, from their records, read-only.
+- A session's raised hand reaches the other machines in its machine's record log. `oak inbox` lists every machine's
+  hands, most urgent first, another machine's labelled with that machine and when `oak sync` brought it (`--json` adds
+  the machine's id and label and how fresh the hand is); the terminal app's `i` list, VS Code's session selector and
+  the JetBrains Sessions tab list them the same way, and a running terminal app, editor or `oak notify --watch`
+  announces each once on each machine, naming its machine. A permission prompt travels only once it has stood its
+  wait there (5 seconds, or Codex Auto-review's 90), as that machine announces it, a question as a question, named by
+  its header, and a hand up for more than a day is listed on its own machine alone. The phase the database gives another
+  machine's session (`session_phase`, the `workers` query, the listings) follows its hand, so a session waiting on a
+  permission prompt there never reads as working here.
+- `oak sync` shares the agents' state across the saved machines over SSH. Memory, plans, skills, agents and
+  commands, which Claude Code reads from local disk, are kept on every machine and merged three ways against the
+  last version the machines shared; changes to the same lines keep both copies as a conflict, listed by
+  `oak sync status` and `oak inbox`. Claude Code transcripts and Codex rollouts are kept on the machine that
+  made them and on one backup machine (`oak sync backup <label>`), which restores a machine that was wiped;
+  the other machines keep an index of them and bring one over with `oak sync fetch <session>`, as a copy
+  evicted past a size cap. A longer copy of a session is pulled only once its first bytes match this machine's,
+  and only up to its last complete line, and never onto a session written in the last minute on the machine
+  that pulls it; diverged copies are kept apart. A machine that sends slowly is stopped after ten minutes in a
+  run, and what it sent lands up to its last complete line. Each project lands in each machine's own folder
+  for it, matched by its repository's origin, its path under the home directory or its network share. Every
+  machine pulls and none writes another's; writes are atomic, what one replaces goes to a dated trash first,
+  every write is logged, and one run goes at a time. Names Windows cannot hold are never synced, on any
+  platform. Deletes made with `oak sessions --delete`, and memory, plans, skills, agents and commands removed
+  on one machine, reach the others, and a delete dated more than a day ahead of a machine's clock counts there
+  as made a day after it arrived; Claude Code's retention sweep does not reach them, and no transcript older
+  than a machine's `cleanupPeriodDays` is pulled there (`oak doctor` warns when it is unset, once sync has been
+  used on that machine). A machine whose user name is not this machine's refuses before it reads anything,
+  and every machine you sync with is trusted with the skills, agents, commands, memories and plans your agents
+  follow (SECURITY.md). `oak sync plan` previews a run, `oak sync include` and `exclude` choose machines and
+  projects, `oak sync family` where each kind of file is kept, and every command takes `--json`; `oak sync now`
+  exits 1 when every machine it asked failed and nothing was pulled. Once a run with a saved machine to sync
+  with, or with a backup folder set, has happened on a machine, the capture hooks and the pollers keep it current
+  in the background, waiting up to an hour after a background run that stopped with an error or was killed. The terminal app and both editors show its runs and its conflicts, and run it,
+  set it up and choose its machines and projects through the CLI (below). OAK's session lists take a session pulled
+  from a machine that names its directory differently for a copy and leave it out.
+- `oak sync` carries OAK's own store too. Each session's edit log, comments and agent record reach every machine
+  as a replica under the machine that made it (`sync/replicas/<machine>/<session>/`), so one session id on two
+  machines never mixes and no machine takes its own in as a replica; a log is mirrored whole whenever the machine
+  that writes it changes it, a clear included, the copy it replaces to the trash unless the new one only extends it.
+  Its content snapshots and hook events stay on that machine and the backup, and `oak sync fetch <session>` brings
+  them. A session removed with `oak clean` is never pulled back, and the other machines let their copies go once its
+  machine says it cleaned it up; a copy whose machine is away, or lost the session with no cleanup, is kept, and is
+  how that machine gets it back. A session folder made anew after its store was lost with no cleanup (removed by
+  hand, a crash, a machine reinstalled and used before its first restore) is a new generation of the session: every
+  copy, the backup folder's included, keeps the history it held of the one before it as a session of its own,
+  `<session>_earlier-<generation>`, which comes back to its machine and is listed there as the session's earlier
+  history. A clear or an ignore sweep is no new generation, on a machine that never runs a sync of its own too, and a
+  session cleaned up with `oak clean` and captured into again keeps no earlier history, nor does one deleted with
+  `oak sessions --delete` once a run has seen the delete. A run and `oak store --move` never overlap: each refuses
+  while the other runs.
+  In this release no OAK view lists the replicas.
+- The backup can be a folder every machine reaches, such as a network share others can read
+  (`oak sync backup --folder <path>`, its path set on each machine). Each machine writes its own files there,
+  encrypted on the machine with AES-256-GCM under names that are keyed hashes; the share holds ciphertext, those
+  names, sizes and times, and never the key. A machine reinstalled with its key takes its record there over with
+  `oak sync setup --restore`, then restores its own files from it, over as many runs as that takes, but the sessions
+  it cleaned up or deleted, and `oak sync fetch` reads the folder when a session's machine is off. Each part of a
+  machine's record carries that machine's writer id, so two machines of one host name and home (two Macs with their
+  default names, two virtual machines made from one image, whether or not that image had written to the folder) never
+  take each other's sessions or write each other's record: every run and `oak sync status` say so, and what to do. A growing transcript writes only what it grew by,
+  small objects are packed, writers never collide, and a run killed part way leaves the folder as it was; a machine
+  whose own record there is damaged or went back writes it whole again. The key is 32 random bytes kept in each
+  machine's store with mode 0600: `oak sync key --from <machine>` copies it over SSH, `--show` prints it for a
+  password manager, and `--import` takes it back on standard input or at a prompt that shows nothing, never as an
+  argument. A wrong key, an altered byte, or a pipe or link in the folder is reported and nothing of it is used
+  (SECURITY.md).
+- `oak sync setup` chooses where sessions are backed up (none, a saved machine or a folder), makes or brings the
+  folder's key, and previews a first run; it asks on a terminal and takes flags otherwise. For a folder that holds a
+  record under this machine's name it has not written, it says when and by what machine that was written and asks
+  whether this machine is a reinstall of it (`--restore` off a terminal). `oak machine add`
+  suggests it, and `oak doctor` does on a machine with a saved machine and no choice made yet.
+- `oak sync` reaches every surface: each renders the CLI's `--json` and changes sync's settings, which stay in OAK's
+  `prefs.json`, through the CLI. The terminal app's Observatory shows under each saved machine what the last run pulled
+  from it and when, or why it failed, and under this machine the run, the backup and its key's fingerprint; VS Code and
+  JetBrains have an OAK sync item on the status bar, with each machine's last run a line in its tooltip. The open
+  conflicts are listed where each surface lists the raised hands (the terminal app's `i` list, the Timeline's session
+  list in VS Code, the Overview's Sessions tab in JetBrains), each with its two ways out: both copies opened (in the
+  reader's editor from the terminal app, side by side in a diff in the editors), or the other machine's copy deleted.
+  Each surface runs it now, with its progress and result, and stops a run it started; shows the last run whole; sets it
+  up or changes the backup with the choices `oak sync setup` offers (nowhere else, a saved machine, or a folder whose
+  key is made, copied from a saved machine or pasted, replacing another key kept here once asked; the terminal app hands
+  the terminal to `oak sync setup` itself); takes a backup folder's record over when a run refused it (`--restore`),
+  after saying why and asking; and includes or excludes each saved machine and this project (the terminal app's options
+  window, VS Code's OAK: Sync, and JetBrains' status bar menu and OAK Settings page). Until sync is in use on a machine
+  (a run set it up, a backup is chosen, or a conflict is open) none of its status shows there, and nothing asks to set
+  it up; with no machine saved either, the terminal app's options and the JetBrains Settings page show no sync section.
+  `oak doctor`'s oak sync and local database rows, with their fixes, appear in every surface's doctor report. A session's
+  delete, and its refusal of edits pending review, say what the CLI says: with a backup folder set, its edits are purged
+  here only, and the next `oak sync now` after an undelete brings back what the folder holds.
+- `oak sync resolve <conflict>` keeps this machine's file: it moves the other machine's copy to sync's trash and
+  closes the conflict at once, as the next run would, and never while a run holds sync's lock. `oak sync status` lists
+  each conflict's id, and `oak inbox` and `oak doctor` say the command. For the surfaces, `oak sync status --json`
+  names each conflict's file on this machine (`file`, in `oak inbox --json` too), each machine's line as the text
+  prints it (`text`), a backup folder's refused record (`record`, in `oak sync now --json` too), and the project in
+  `--root` (`project`); `oak sync setup --json` exits 1 with `needsKey` for a folder that holds a backup this
+  machine's key does not open, naming another key kept here (`keyHere`), which the folder's replaces only with
+  `--replace`, and changes nothing. On a terminal, `oak sync setup` asks before a key brought for a folder replaces
+  the one kept here.
+- `oak update` updates everything OAK installed, on this machine and on each saved machine. On this
+  machine it now also covers the extension in each VS Code-family Remote-SSH server
+  (`~/.vscode-server`, `~/.cursor-server` and the others), which the editor's own command never
+  reached, and the plugin in every JetBrains IDE that has it, not only PyCharm, IntelliJ IDEA, WebStorm
+  and GoLand. It also covers the Claude Code capture hooks in your user settings and the Codex capture
+  hooks, which it repairs when a release adds a hook event (until now `oak status` reported a hook
+  install one event short after an update), and a focus server still running an older build, which it
+  stops. A project's own
+  `.claude/settings.json`, which its repository shares, is never written: one that needs a repair gets
+  a row naming the `oak init --repair` to run there. A Codex hook you turned off in Codex stays off,
+  and where herdr publishes no build (Windows on ARM, or Linux on 32-bit ARM), herdr is left alone.
+  Each enabled saved machine then runs its own `oak update --here` over ssh, in parallel, with a
+  deadline and once for machines saved with the same ssh target, and downloads the release itself; a
+  machine without OAK, or with an OAK older than `--here`, gets a row saying what to do there. The
+  command prints one plan and one result table, leaves what is current alone, and exits non-zero when
+  anything on any machine could not be updated, the setup step of the CLI it installed included.
+  Stopped (SIGTERM, SIGINT, SIGHUP, or SIGQUIT on macOS and Linux), or ended by an unexpected error,
+  it stops the ssh it started on the saved machines. `--json`
+  adds `components` and `machines` to the plan. An extension a marketplace installed is left to that
+  marketplace on the stable channel, as the VS Code extension's own updater already did. The editors'
+  Update now runs the same command on every click, so it updates the saved machines too, gives it
+  fifteen minutes, and then names each repair it left to you on this machine.
+- OAK gives dollar estimates for Poolside's Laguna S 2.1 and XS 2.1 and Thinking Machines' Inkling and Inkling-Small, at
+  OpenRouter's prices, when Codex's provider is `openrouter`. The same model from any other provider, such as a local
+  Ollama, shows tokens without a dollar figure. The Models page of the docs describes how to run Laguna through Codex so
+  that OAK records it.
+- The terminal app's session picker (`b`, on the Observatory and Review tabs) opens with a search box.
+  Typing still narrows the rows by title, id, workspace and machine at once, and when the typing pauses
+  the picker also searches what was said in each session, on this machine and on every saved machine,
+  and lists the sessions that match only that way after the others, each with a line of the matching
+  text. Each machine contributes up to 200 sessions, and the box says when one had more matches than
+  that. Closing the picker or quitting OAK stops waiting for any search still running and stops its
+  processes on this machine, as does a search passing its 30-second deadline; a search already running
+  on a saved machine may still finish there. On Windows, the search's ssh to a saved machine runs until
+  the search there ends. A paste goes into the box.
+  `oak search --machine <label>` searches a saved machine's conversations there (in its records here when `oak sync`
+  read it in the last ten minutes).
+- Where this machine has no current reading of your Claude account's 5-hour, weekly or per-model weekly
+  share, the detailed Usage views and `oak usage --json`
+  show the reading a saved machine took of the same account, and name that machine: `✳ claude (build-box)
+  wk: 22% · mo: 2%`. A laptop signed in to Claude Code whose agents run on another machine showed
+  only the month, because its own shares were out of date. The status bars name the machine only for the
+  windows they show, so a per-model weekly share from a saved machine is named in their tooltips and the
+  Stats panels, which show it, and not on the bars. The editors' tooltips and Stats panels say when that
+  machine measured the reading, by this machine's clock: OAK compares the time each answer was printed
+  with the time it arrived, so the readings of a machine whose clock runs minutes fast or slow are shown,
+  dated and placed in their windows as if its clock were right. In the background, at most every five
+  minutes, OAK reads each enabled saved machine's usage over ssh (`oak __usage-records --json` there, from
+  where the last read ended: its usage rows and readings, never its conversations), except a machine whose
+  record log `oak sync` keeps current here, and no readout waits for it; a machine that does not answer
+  keeps its last reading until its shares fall out of their windows, and one whose OAK predates this
+  release refuses the command and supplies no reading until it is updated. `oak doctor` has a row for each
+  saved machine the last read asked, saying whether it answered and, when it gave no reading, why and what
+  to do: ssh's own reason when it could not connect, no answer within 30 seconds, no OAK there, an OAK
+  there from before this release (update OAK on that machine), or output before OAK's own, such as a shell
+  startup file there that prints. It also says when a machine is signed in to another account or has
+  measured none of its shares itself, and when its clock is a minute or more off. The cache keeps that
+  outcome with at most one line of what ssh or that machine said. An answer is read once ssh ends, even
+  when a process that ssh started (a `LocalCommand`) still holds its output. A machine's herdr label is
+  shown without its control, bidirectional or zero-width characters (an emoji family keeps its joiners,
+  and a Persian or Indic word its non-joiners), and a claim, lock or attempt dated in the future, as a
+  clock stepped back leaves one, does not hold the read off. `"machineUsage": false` in OAK's `prefs.json`
+  turns the background read off, and the readouts then show this machine's own readings only. On Windows,
+  the read opens no console window, and neither does a herdr command OAK runs to read herdr's status or
+  saved machines or to reach a saved machine. A reading is used only for the same Claude account, which
+  each machine names by a hash of the account id in Claude Code's `.claude.json`; a machine with no Claude
+  Code login of its own uses the one account its saved machines name, and none when they name two, and its
+  tooltips say that the account could not be matched. A reading is used only when it was measured inside
+  its current window, and only when it is newer than this machine's own or of a later week; a share
+  this machine measured in the last five minutes is replaced only by a later week's, and this machine's
+  5-hour window, once ended, by any running one. The month comes whole from the machine whose weekly
+  share is shown, never added to this machine's shown month: each machine's month already adds up the
+  account's machines (below). GPT's month is likewise the account's: every machine's usage the database holds.
+- The Claude Code status line shows the same readings. On a laptop whose sessions were idle and whose own
+  shares were days old, it drew `5h 0%` and `wk —` while OAK's readouts on the same machine showed the
+  account's shares from the machine running its agents. A window that `oak usage --json` takes from a saved
+  machine is now drawn with that machine's share, countdown and estimate, the month with the week, and the
+  machine is named in a dim label ahead of the windows: `(build-box)`, or `(build-box: wk mo)` when only
+  some came from it. The reading comes from the `oak usage` call the status line already makes on every
+  render. It is only drawn: the status line's cache, which the editors and the other machines read, keeps
+  this machine's own readings, no saved machine's share calibrates the token estimate, and a share this
+  machine measured in the last five minutes stands unless a saved machine reports a later week, as in OAK's
+  readouts. With no saved machine's reading, or no `oak`, the line is unchanged. `oak update` or
+  `oak statusline` refreshes an installed status line.
+- `oak search --per-session` keeps each session's best match only, before `--limit` applies, so one
+  session with many matching asks no longer fills every row. `oak search --json` reports `matched`, the
+  number of matches before the limit, and the plain output says how many of them it shows.
+- The terminal app's Observatory shows each session's workers that are still at it under the session,
+  without pinning it. One row under the session's stats counts them by state, in herdr's words
+  (`▸ 12 workers · ⠴ 6 working · ◐ 6 blocked`). `→`, Enter or a click opens it into a group for each
+  state, those waiting on a person first, and each worker takes two rows, as a session does: its title,
+  then its status, model, edits and their lines, tokens, how many of its edits await review and when it
+  last wrote. `←`, Enter or a second click closes it, and each session's group stays open or closed while
+  the app runs. The arrow keys move through the summary, the headers and the workers, and Enter or a
+  click on a worker opens its own live log. A session on a saved machine shows its workers from that machine.
+  A phase no record states, such as a wait that only a call left unanswered suggests (a permission
+  prompt, or a long command) in a session whose hooks OAK does not record, is marked `~`, as the Workers
+  lists mark it. A finished worker is not
+  listed (the pinned session's Workers section keeps it), and a session with a worker still at it is
+  listed under its machine, even with nothing pending and outside herdr. The Sessions tab of both
+  editors groups each session's workers the same way under its row, a click on a worker opens its own live log, and Active only keeps a session whose workers are at it. `oak sessions --json` gives each
+  session an `activeWorkers` list: each worker that is working or waiting on a person, with its title,
+  phase, model, tokens, last write, and its share of the session's captured edits (the review units whose
+  latest edit one of its own tool calls made), with their lines and how many await review. Only a worker
+  whose transcript changed in the last two hours is asked, and one already found finished is not read
+  again until it changes. A selected worker’s log stays readable after completion, and resumes updating if the
+  worker resumes. A quiet pause does not end it. In-process workers get no herdr tab; those tabs run the agent’s CLI.
+- The docs' Database & sync page explains the local database and `oak query`, what `oak sync` carries between
+  machines and what never leaves one, the encrypted backup and its key, the archive, and how usage is
+  counted once across machines, with worked examples from two synthetic machines. The README's section
+  on the database and sync points to it.
+- A docs page, The database across machines, explains how each machine's local database, the record logs it exchanges
+  over SSH and an encrypted backup folder on a shared storage server fit together, and why the database stays local.
+- The docs' Multi-agent work across machines page follows three synthetic machines through briefs, native CLI
+  starts, OAK-derived agent states, worker logs, waits, terminal and editor review, git integration and tab closure.
+  The commands and outputs come from the built CLI using isolated homes and stand-ins for SSH and herdr. It explains
+  the delegated records in the shared database, freshness, usage and privacy, and distinguishes OAK's review decisions
+  from committing and merging branches. The README, REMOTE.md and related pages link to it.
+- VS Code and JetBrains list the sessions of each machine saved in herdr (`oak machine list`), as the terminal app
+  does, without `oak sync`. Switch Session, the Timeline selector, Sessions and Workers share one background cache
+  per machine. Reads run in parallel, at most once per ten seconds, with a 45-second remote deadline. This machine's
+  list never waits for them. Switch Session, the Timeline selector and Sessions show every machine's sessions in one
+  list, newest first unless sorted otherwise, another machine's rows naming it; search, filters and sorts cover them
+  all. Above the rows, one line per machine gives the age of its last answer, or why the last read failed and when it
+  last answered; a failed read also removes its stale worker rows. Selecting a session reads its Timeline and
+  Overview on that machine, and Review lists its edits as it does a local session's. Keep, Undo, Redo and Resolve,
+  for an edit, a file, a task or the whole session, review comments, quotes and prompts run there. Open first uses a
+  verified mounted share, then a new Remote-SSH window (VS Code/Cursor) or Gateway (JetBrains) at the session workspace.
+  An expiring, single-use request selects the session and requested edit, file or Open all view. Diff is a separate
+  native before/after view. The Review reply box is removed; replies remain in Timeline/Feed, quotes and comments. Conversation search covers this machine and every
+  saved machine, each hit naming its machine. Mounted files use inline review while decisions still run on the saved
+  machine; explicit refreshes account for delayed SMB notifications. VS
+  Code's Actions shows the session's risky actions, writes outside the workspace, egress and live conflicts; JetBrains
+  reads risk and egress there and omits live conflicts.
+- `oak prompts` lists the asks and answers of a session whose transcript is gone from the local database, and says so
+  (`fromIndex` and `note` in `--json`). The terminal app, VS Code and JetBrains show that note above the list.
+  `oak views --views actions` returns the Actions view, so an editor can read it on another machine.
+
+### Changed
+
+- Done sessions start collapsed in the terminal Observatory and both editors’ Overview Sessions lists, in one “N done” fold per machine. Opening it shows the sessions grouped by workspace. A done session folds even with edits left to review, and the fold row counts them. Pins, selections, the
+  watched session and active workers stay visible, new turns leave the fold, and search reveals matching done sessions. The editors retain their existing Active-only toggle, which is on by default.
+
+- Account estimates are the whole account's on every machine: GPT's month tokens, cache reads and dollars, and the
+  weekly tokens its budget is calibrated from, count every machine's usage the database holds, including usage
+  whose Codex rollout files are gone. `oak usage --bill-day N` and `--gpt-bill-day N` set an account's bill day
+  once; the setting travels with the usage records and sync, so every machine counts the same month. The tooltips and
+  `oak usage --json` (`claudeUsageFreshness`, `gptUsageFreshness`) say how fresh each machine's usage is.
+- Workers lists every active agent by name in both editors and the terminal app: the agents in herdr panes on each
+  machine, the agents OAK started, recent Claude Code and Codex sessions in the repository's worktrees, and the
+  session's own workers. A session whose process is gone reads gone, never working; Active only hides finished
+  agents and folds a session's finished subagents into one row. The dashboards order their panels Sessions ·
+  Workers · Processes · Tasks · Workflows.
+- Placeholder herdr tab labels no longer replace session titles in the Observatory or Workers, including
+  `oak tui --once`. A tab's workspace position, a blank label or an agent kind is not a session title;
+  a user-named tab still keeps its name.
+- `oak prompt`, `oak comment send` and `oak quote --send` exit with status 75 when they keep the text as a draft
+  (nothing was sent: the pane is blocked or gone, or herdr did not confirm a forwarded prompt), in every output mode,
+  where they exited 0, so an agent that drives another agent can tell. The terminal app, VS Code and JetBrains show a
+  kept draft as a draft, never as an error.
+- A tool call with no result, in a Claude Code or a Codex session, reads as awaiting permission only while the
+  session's raised hand says it waits on a permission prompt, and as working otherwise, however long the command runs:
+  a command that ran longer than ten seconds read as awaiting permission. No hook reports the answer to a prompt, so a
+  call the person allowed reads as awaiting permission until its result, and a hand raised before a call was made is not
+  about that call; once the hooks report the turn over, a call made before that and left without a result reads as an
+  ended turn, idle and then done, unless the session's workers are still at it. Only a session no capture hook records,
+  which has no OAK store, and a Codex subagent's own thread, whose hooks write to its parent's store, keep that
+  ten-second guess.
+- `oak` and the capture hooks start faster: the `oak` launcher turns on Node's compile cache, so each start after the
+  first reuses what Node compiled of OAK's code instead of compiling it again. On a Linux workstation `oak --version`
+  takes 51 ms, against 71 ms in OAK 0.10.0 and 88 ms in this release without the cache, and the two capture hooks of
+  one edit take about 100 ms, as in OAK 0.10.0, against about 115 ms without the cache. The cache is in
+  `$XDG_CACHE_HOME/oak/compile-cache` (`~/.cache/oak/compile-cache` where that is unset or not an absolute path),
+  never in the store. Node checks each entry against the file it was compiled from, so code an update replaced is
+  compiled again, never run from the cache.
+- A session listing from a caught-up local database reads a session's store files only for a session with a call still
+  without a result (its raised hand) or a worker still running (its edit log and agent record), and asks no finished
+  worker again: the database keeps each session's raised hand and native tab, read again when they change, and the workers
+  found finished. On a synthetic machine of 1,200 sessions, `oak sessions --json` takes about 300 ms from the database,
+  where OAK 0.10.0 took about 610 ms reading the files (on one of 300 sessions, 180 ms where it took 260 ms). A catch-up
+  that finds nothing changed writes nothing but its time, at most every 30 seconds, so `PRAGMA data_version` moves only
+  when the database did or that time was written.
+- Outside any workspace, the terminal app's "a newer session is live" check reads the newest session from the database
+  (1 ms on a synthetic machine of 1,200 sessions) instead of walking every transcript every 30 seconds (42 ms in OAK
+  0.10.0); its check for a local copy of another machine's transcript is answered by its warm worker instead of a
+  process each time.
+- A write to a Codex rollout refreshes an editor only when the local database says that session ran in its project's
+  folder, a worktree of its repository that its sessions are known in, or below one of them, or is a session on screen,
+  or when the database does not know it or cannot say: VS Code checks the folder each rollout ran in (reloaded when `PRAGMA
+  data_version` moves), and JetBrains asks `oak query --serve` once its two-second sum of the rollouts' stamps moves.
+  Any Codex session's write on the machine refreshed every open project before. Off the EDT, JetBrains' check that a
+  pinned Codex session still exists asks the same serve before reading the head of every rollout.
+- An account with no five-hour limit shows no 5-hour readout. Anthropic's Ultra plan (formerly Max 20x) has none once
+  the account is verified, and its usage answer then carries no five-hour window: `five_hour` is null or missing, or its
+  utilization is null. Claude Code's own usage view draws no Current session bar for such an answer, but OAK read it as
+  a five-hour window with nothing running and showed `5h 0%`, or kept showing a share measured before. OAK's account
+  read and the Claude Code status line's own read now record when the account last answered with no five-hour window and
+  when it last answered with one (`five_none_at` and `five_seen_at` in `statusline-last.json`), and record no 5-hour
+  share for a no-limit answer. Only these answers decide whether the account has a five-hour limit, never a 5-hour
+  share. While the newest of them is a no-limit answer, the status line, both editors'
+  Stats panels, and `oak usage --json` show no 5-hour window, with no gap where it was, whatever 5-hour
+  share a session, the cache or a saved machine holds; the weekly and per-model readouts are unchanged.
+  `oak usage --json` reports when the account said so as `fiveNoneAt` and gives no 5-hour share, reset, estimate or
+  spend; its `usageTotals.five` counts the account's usage in the last five hours. The rule follows the usage answer,
+  never the plan's name: an Ultra account that is not yet verified keeps its temporary five-hour limit and its 5-hour
+  readout in those detailed views. Terminal and editor status bars omit it for every plan. An account that gains a
+  five-hour limit shows its detailed 5-hour readout again from the first account read that
+  answers with a five-hour window. An answer whose five-hour window has a share
+  and no reset, beside the weekly window, still has a five-hour limit with no window running, read as before. The saved
+  machines of the same account count alike: each one's answers go in the brief the others read, and in its local database
+  as readings (`oak query readings`, kind `limit`), which `oak sync` and the usage read carry to the others, and the
+  newest answer on any of them decides; `oak usage --window 5h` then counts the last five hours. A status line input
+  that carries the weekly window and no five-hour window is not taken for this:
+  Claude Code leaves a five-hour window out of that input once its reset has passed, so an account whose window has
+  ended sends one too. `oak update` or `oak statusline` refreshes an installed status line.
+- OAK needs Node.js 24 or newer (it needed 20), enforced by the CLI before command dispatch: its local database uses
+  the SQLite built into Node, with full-text search. The install scripts and `oak machine add` check for it, and CI
+  runs on Node 24. An older OAK may install this release under an unsupported Node
+  with npm’s `EBADENGINE` warning, but the new CLI refuses to start until Node is upgraded. The capture hooks keep
+  recording edits there, saying on stderr that Node needs upgrading. An editor embedding core can still fall back to
+  file readers when its own host lacks SQLite.
+- The README introduces OAK as it is now: an observatory for Claude Code and Codex sessions on every
+  machine you work on, reviewed in the terminal app, VS Code or JetBrains. Its quickstart covers
+  Codex, and the terminal app's tabs, keys, herdr backend and other machines are described in one
+  section instead of across the introduction.
+- Packaging the VS Code extension from a checkout (`./install.sh`, `npm run release`) uses
+  @vscode/vsce 4, which requires Node.js 22 or newer; on Node.js 20, `npm ci` warns `EBADENGINE` about
+  it. `./install.sh` checks the version before it installs anything, and on a Node.js that OAK now refuses (above)
+  says so and stops.
+- VS Code and JetBrains ask before Refresh drops the recorded edits that a newly-added
+  `.observatoryignore` covers, as the terminal app does: the confirm names how many edits and which
+  session, and says the drop cannot be undone. They dropped them without asking. VS Code counts and
+  drops in-process, as the terminal app does for a session on this machine, so it needs no CLI for this.
+  JetBrains counts with `oak ignore --dry-run`, which an older CLI ignores and sweeps instead, so with a
+  CLI older than this version it asks you to update the CLI and drops nothing; when it cannot read a
+  count at all, it reports that and drops nothing. In VS Code, the refresh that follows a keep, undo,
+  resolve or clear no longer applies `.observatoryignore`; only Refresh does.
+- VS Code's update notification and **OAK: Check for updates** now run the same update as the version
+  chip's Update now: the extension, then `oak update` for the CLI, the other editors, the JetBrains
+  plugin, OAK's setup and the saved machines. They installed the extension alone. The command
+  palette's **OAK: Update now** is now titled for that, "everything OAK installed, here and on saved
+  machines", where it said "CLI + both editor plugins".
+- **The terminal app and the editors have new keys.** No letter now means one thing on the Observatory
+  tab and another on Review, and OAK has no leader key of its own. Old → new:
+  - The `ctrl+a` leader is gone, and `ctrl+a` now reaches the program on the herdr tab (both agents use
+    it for line start). On the herdr tab OAK listens on herdr's own prefix instead, read from herdr's
+    config (`ctrl+b` by default): prefix then `m` goes back to the OAK tab you last used, prefix then
+    `M` pins herdr's focused session in the Observatory (was `ctrl+a o`), and prefix then `V` opens Review
+    on that session, read on the machine whose herdr runs it, as `oak focus --tab review` opens it
+    (herdr binds `R` itself, to reload its config); on a pane with no session, `M` and `V` still go to
+    OAK's tabs and say why. Where herdr's config binds `m`, `M` and `V` after the prefix, all three are
+    herdr's, and the key row, the status row and the help offer `F1` to `F3` instead, or a click on OAK's
+    tab bar to leave the herdr tab where herdr's config binds those too. After the prefix the status row
+    names the keys OAK takes there, in fewer words on a narrow terminal. Every other key after the prefix
+    is herdr's, so prefix then `q` detaches herdr's client (was `ctrl+a k`), and the `?` help names the
+    detach key herdr's config sets, or none where herdr disables that binding (`prefix+question`, or `q`
+    without the prefix). Inside a herdr pane herdr keeps its prefix. OAK reads herdr's config as TOML, as
+    herdr does, so a `[keys]` table, dotted keys, an inline table and a list written over several lines
+    all count, and a file herdr cannot parse, or a
+    binding in `[keys]` of the wrong type, leaves both on herdr's defaults; a prefix herdr cannot read
+    falls back to `ctrl+b` in both. OAK also reads herdr's key names `quote`, `double_quote`, `percent`
+    and `bs`. A list of prefixes, which herdr 0.9.2 and later take (`prefix = ["ctrl+space", "ctrl+s"]`),
+    gives OAK each of them, and the key row names every one OAK can follow from any terminal; herdr 0.9.1
+    refuses the list and stays on its defaults, and so does OAK, which asks the herdr it runs for its
+    version. The prefix is recognised without the kitty keyboard protocol too. Like herdr, OAK reads a
+    capital letter as the letter with shift (`ctrl+A` is ctrl+shift+a) and tells ctrl+shift+b from
+    ctrl+b, keeps shift as part of any other key (ctrl+shift+space is not ctrl+space, nor shift+f5 f5),
+    and names every prefix as herdr does, in the key row, the `?` help and the status row
+    (`ctrl+shift+a`; super is `cmd` on macOS). A terminal without the protocol sends ctrl+shift+a as it
+    sends ctrl+a and ctrl+shift+space as it sends ctrl+space, and sends no super chord at all, so herdr
+    and OAK follow such a prefix (ctrl+shift+a, super+b) only through the protocol; the key row and the
+    help then say to click OAK's tab bar to leave the herdr tab. So do ctrl+tab, ctrl or shift on enter,
+    backspace or esc, alt on esc, and `ctrl+i`, `ctrl+m`, `ctrl+[` and `ctrl+?`, whose bytes herdr reads
+    as tab, enter, esc and backspace: OAK no longer holds those keys as the prefix. A prefix of backspace
+    or enter is taken on DEL or CR alone, as herdr takes it, not on 0x08 or LF, which herdr reads as
+    ctrl+h and ctrl+j. A prefix of `ctrl+q` stays herdr's when pressed twice, and OAK then quits from its
+    own tabs.
+  - Switching OAK tabs: `ctrl+a n`/`p`/`1`–`3` → `Tab` and `shift+Tab` on the Observatory and Review
+    (`ctrl+n`/`ctrl+p` and `alt+1`–`alt+3` still work, now also from the reply box). `F1`, `F2` and `F3`
+    raise the herdr, Observatory and Review tabs from any tab, and the tab bar names each tab with its key.
+    They work over any overlay, which closes first, as `Esc` would close it; a box holding text you typed
+    (the palette, a picker's or the help's search, find in the diff, an options entry) closes too, and the
+    text goes with it, while the reply box keeps its draft and the `/` filter its text. A question waiting
+    for its answer keeps them until you answer it. On the herdr tab OAK takes them before herdr or the
+    program sees them, with or without herdr's prefix, unless herdr's config binds the key; with `shift`,
+    `ctrl`, `alt` or `super` an F-key reaches the program unchanged. Inside a herdr pane there is no herdr
+    tab, and `F1` says so. Review's windows move to make room: Prompts, Traces, Map and Diff `F2`–`F5` →
+    `F4`–`F7`. Quitting:
+    `ctrl+a q` twice → `ctrl+q` twice. On the herdr tab a single `ctrl+q` reaches the program, once
+    the two seconds OAK waits for the second have passed or before the next key you press there.
+  - Observatory: resolve `a` → `R`, stop the agent `x` → `X` (both still ask first, and are now
+    also `⚑ resolve` and `■ stop` buttons beside `↗ herdr` and `⌕ review`); reply `i` → `c`; go to
+    the herdr pane `h` → `t`; archived sessions `Shift+A` → `B`; open Review `r` → `Tab` (Review
+    follows the selection) or the `⌕ review` button. `i`, `h` and `r` now mean the inbox, the next
+    hand and refresh, as on Review. The pane keys drop the leader: `ctrl+a z`/`v`/`|`/`-`/`H J K L`
+    → `z`/`v`/`|`/`-`/`H J K L`, focusing the next pane (`ctrl+a Tab`) → `F4`, `F5` and so on by
+    position, `←`/`→`, or the palette, and closing a pane (`ctrl+a x`) is in the palette. Keys the
+    Observatory does not use now do nothing there, rather than running Review's verbs.
+  - Review: redo `ctrl+r` → `U`; undo everything listed `U` → `D`.
+  - The palette `ctrl+o` and the `:` command line are one: `:` lists every command and action and
+    finds sessions, tabs and workspaces, and a typed command (`status`, `comment 12: note`) still
+    runs, listed above whatever else its words find. `ctrl+r` and `ctrl+o` now do nothing on OAK's
+    tabs.
+  - Refresh (`r`) now asks before its `.observatoryignore` sweep drops recorded edits, and says how
+    many (`oak ignore --dry-run` gives the count); Options → Reset every option asks first too. For a
+    session on another machine, the count needs this version of OAK there: an older one would ignore
+    `--dry-run` and sweep, so Refresh says to update OAK on that machine and drops nothing. When that
+    machine's count arrives after you have moved on, to another question, into text you are typing or
+    to the herdr tab, Refresh asks nothing, drops nothing, and says how many edits it kept (under
+    another question, once you answer it): `r` asks again.
+  - The `/` filter belongs to the tab it was typed on. Every list overlay closes on `Esc` or `q` and
+    ignores other keys, except the ones you type into (the `:` palette, the session picker and the
+    `?` help's `/` filter), which take `q` as text and close on `Esc`, or as `F1`–`F3` switch tabs. The
+    key rows and `?` help name your own rebinds. Options refuses keys the frame keeps for itself (Space,
+    the digits, `:`, the mark keys and the Observatory's letters).
+    A rebind an earlier version saved onto one of those keys stays in your preferences file but is not
+    used: the action keeps its default key, the terminal app says so each time it starts, and Options names
+    it until you choose another key. A rebind onto `D` or `U` leaves undo-everything or redo without a
+    key, as Options shows; the palette still runs it.
+  - VS Code and JetBrains: every shortcut is now `ctrl+alt+X` (`⌥⌘X` on macOS) then a key, the
+    terminal app's where it has one: `n`/`p` next and previous pending edit, `←`/`→` previous and next file,
+    `a`/`u` keep and undo at the cursor, `shift+a`/`shift+d` keep and undo every edit in the file, `[`/`]` file
+    revisions, `c` a review comment and `h` the next session waiting on you. They were `ctrl+alt+n`/`p`/`y`/`u`/`k`/`r`,
+    `-`/`=` (VS Code) or `[`/`]` (JetBrains), `c` and `i` (JetBrains only). VS Code now binds the
+    comment and next-hand keys too, and JetBrains titles its file actions Keep and Undo.
+    The editors' READMEs note the prefix's two collisions and how to rebind it: VS Code's LaTeX
+    Workshop extension binds the same chord, and on Windows a layout where AltGr+X types a character
+    (`ź` in Polish, `#` in Hungarian or Czech) loses it to the chord.
+- On macOS and Linux, the ssh that a `--machine` command runs to a saved machine now runs apart from
+  your terminal, as the ssh that `oak update` runs there does, so that ctrl+c reaches OAK, which stops
+  it. So do the `herdr --machine` commands with which the terminal app reads and acts on a saved
+  machine, `oak prompt`, `oak quote --send` and `oak comment send` send a prompt to a pane there, and
+  `oak doctor` times the forwarding to it. Stopping `oak prompt`, `oak quote --send`, `oak comment send`
+  or `oak doctor` (SIGTERM, SIGINT, SIGHUP, or SIGQUIT) stops the herdr command it waits on, and the
+  terminal app stops its reads when you quit it or close its terminal, or press ctrl+c on its `--once`
+  frame. A reply the terminal app is already sending still arrives after it ends, as one sent from VS Code
+  does, and a prompt that has already reached the saved machine may still arrive in its pane. A reply
+  that a JetBrains IDE is sending when it quits arrives if the IDE leaves `oak` running, and may not if
+  the IDE stops the processes it started, as in 0.10.0. At its deadline OAK now stops such a command with
+  herdr's ssh and the ssh of a jump host: it stopped herdr alone, and both went on running on the
+  terminal app's terminal. None of this ssh asks anything, on the terminal or in a dialog, and neither
+  does the ssh that reaches a jump host in your ssh configuration (`ProxyJump`, or a `ProxyCommand`
+  that runs ssh), which does not get OAK's or herdr's `BatchMode=yes`. All of it runs with
+  `SSH_ASKPASS_REQUIRE=never` (OpenSSH 8.4 and newer), so that no background read
+  opens your desktop's askpass dialog or asks for a passphrase on the terminal app's terminal. The
+  exception is a FIDO security key (an `-sk` key) that needs a touch: OpenSSH shows its request for the
+  touch through the askpass program when a display is set, whatever `SSH_ASKPASS_REQUIRE` says, though
+  that notice asks for nothing. A jump host that needs a password or a key's passphrase, or that ssh
+  meets for the first time, fails instead, and the command names ssh's reason, such as
+  `Host key verification failed.` for the first meeting. Connect to the jump host once with plain `ssh`
+  to record its key, and use a key without a passphrase, or an agent, rather than a password.
+  `oak machine add`, `oak attach` and `oak agent start --machine` still run ssh on your terminal, as OAK
+  does on Windows, where a jump host can still ask; the ssh and scp of `oak machine add` now also carry
+  none of this machine's store or agent identity, as OAK's other ssh does.
+- `oak doctor` checks that the `oak` a login shell finds is the installation it runs from. Codex runs
+  its hooks through a login shell, whose PATH comes from the login startup files: on macOS, path_helper
+  puts /usr/local/bin and Homebrew's directories before ~/.local/bin there, so another installation in
+  one of them ran every such hook, and nothing said so. The row names both installations with their
+  versions, and how to remove the other one or put this one first; it also says when a login shell
+  finds no `oak`, or one it cannot follow to an installation. The check starts one login shell from the
+  home folder, for at most 5 seconds, and is skipped on Windows, where the hooks run `oak` from the PATH
+  every process inherits.
+- The Claude Code status line draws each gauge as a progress bar again, its figures inside the bar over
+  very dim colours: the used share on a dim tint of the usage colour (green, yellow or red), the rest of
+  the bar on an even dimmer grey, and light text over both, so the figures stand out on a dark or a
+  light terminal. It replaces the underline under the figures that 0.10.0 drew. The colours are 24-bit
+  where Claude Code draws 24-bit colour (`COLORTERM` is `truecolor`); elsewhere they are
+  the nearest of the 256-colour palette, in which every bar fills in grey and the label and percentage
+  carry the colour. `oak update` or `oak statusline` refreshes an installed status line.
+- A session that started agents, such as subagents or a workflow's agents, shows two labelled figures in the usage
+  readouts: `own`, its own turns, and `with N agents`, its own turns and those of every agent it started. They are on
+  the Claude Code status line, the terminal app's status row, the Session tokens section of VS Code's Stats panel,
+  JetBrains' Stats panel, and `oak usage --window` and `--breakdown` with `--by session`. `oak usage --json` carries
+  the session with its agents as `sessionTreeTokens`, and `oak query usage --by session` adds `agents`, `own_tokens`,
+  `own_cache_read` and `own_cost` to each row. A row from a machine whose OAK predates this release does not say
+  whether an agent made it, so a session with such rows has no own figure (`null`) and shows its total alone. The
+  session lists show a session's own tokens, as before.
+- The Claude Code status line compacts a row that is too wide for the pane before it wraps it, measuring the row
+  again after each step. The model row drops the output style, think, the duration, the tokens with the agents, the
+  session's own tokens and the effort, in that order, and keeps the context figure at its end. The gauges are drawn
+  as text without their bars, then without their token figures. The path and the session title are no longer cut
+  (the title was cut at 48 characters) and wrap at their spaces. With a long title and a session that started
+  agents, the status line takes 5 rows at 70 columns, where it took 6, and 6 rows at 50 columns, where it took 8; at
+  120 columns it takes 4 rows, where it took 3, because the whole title shows. `oak update` or `oak statusline`
+  refreshes an installed status line.
+- OAK's status bars, which are the terminal app's bottom bar and the VS Code and JetBrains status bar items with their
+  tooltips, no longer show the 5-hour window, for any plan. They show the week and the month for Claude and for GPT.
+  The editors' Stats panels, `oak usage` and its JSON, and the Claude Code status line keep the 5-hour readout for a
+  plan that has one.
+- On OAK's status bars, the month ends with the month's dollar figure, after its reset time, for Claude and for GPT:
+  `✳ claude wk: 44% 6d 6h · mo: 64% 10d 7h ~$10.0k  |  ⬡ gpt wk: 9% 22h 16m · mo: 2% 10d 7h ~$13`. It is the figure
+  the Claude Code status line shows for the month, written as that line writes it. On a subscription it is the
+  estimate at today's list prices, marked `~`. On a Claude plan with no rolling windows, such as pay-as-you-go API use
+  or Enterprise, it is the spend Claude Code reported for the sessions it last reported this month, with no `~`, and
+  the status line shows that spend too where it showed the estimate. Codex reports no spend, so GPT's figure is always
+  the estimate. A provider with no reading for the month shows no figure, never a zero or an older one. The tooltips
+  say whether the figure is an estimate or the reported spend. When the terminal app's bar is too narrow, it drops
+  the reset times and then the dollar figures before it cuts anything short. `oak usage --json` gives the figures as
+  `claudeMonthUsd` and `gptMonthUsd`, and the reported spend as `claudeAccount.monthSpend`; the status line keeps it
+  in its cache as `month_spend`. `oak update` or `oak statusline` refreshes an installed status line.
+
+### Fixed
+
+- **Open all in editor** pages large reviews in VS Code, Cursor and JetBrains, releasing previous diff pages and keeping the UI responsive. Saved-machine reviews open stacked in the current window, read ten edits per call, and send Keep/Undo/Redo back to that machine. Missing files remain reviewable from their records; verified mounts are used by the side-by-side view, and file editing still falls back to SSH when needed.
+
+- The terminal app no longer flashes its whole window every few seconds (seen in iTerm2). Each refresh and each
+  update of the herdr tab rewrote every row of the screen, most of them unchanged; a paint now writes only the rows
+  that changed, and nothing when none did. A resize, a return from `$EDITOR` or ctrl+z, and the window regaining focus
+  still repaint every row.
+- A terminal that inherited `HERDR_PANE_ID` from a herdr pane it is not in, such as one in an editor started from a herdr
+  pane, no longer makes OAK hide its herdr tab, link sessions to that pane or report to it. OAK takes the pane as its own
+  only when herdr confirms this process runs there, without delaying the first paint, and `oak doctor` names a stale one.
+- An OAK focus server that has exited but that its parent app has not yet collected (a zombie) now counts as stopped.
+  `oak doctor` reported it as an outdated server that "did not stop", and a new server would not start over it.
+- On macOS, a delegated agent whose process has ended but has not been collected by its parent (a zombie) now shows as
+  gone. It stayed waiting.
+- On Windows, the local database catches up. NTFS gives most files an id above 2^53, which the database stored but
+  could not read back as a number, so no catch-up finished and `oak usage` read no totals from the index.
+- On Windows 11 24H2 and Windows Server 2025 with Node 24.0–24.1, OAK keeps each transcript's derived facts
+  between reads, and the status line's usage read writes nothing when nothing changed. Those Node versions report
+  another device for a file's path than for the open file, so no read counted as complete and every view re-read
+  whole transcripts.
+- On Windows, the status line draws its bars and widths by character. It now checks that Bash itself counts
+  characters before it takes a UTF-8 locale; where Bash counted bytes, ↺ was split and every bar misdrawn.
+- `oak uninstall --all` no longer stops with an error on a machine whose home folder the system cannot name (on
+  Windows, an empty USERPROFILE).
+- On Windows, `oak doctor --json` and `--markdown` end once their report is written. The terminal check left a
+  console worker running, so the process never exited and the editors' Doctor waited out its timeout.
+- In VS Code on Windows, moving the store records the folder with the drive letter as Windows spells it. The folder
+  dialog's lower-case drive letter got past the check that refuses a move into the current store.
+- The Observatory's and editors' Processes lists no longer show a worker's background shells as running for good.
+  OAK now reads the end a worker's transcript records for its shell, and a shell that never reported one stops
+  counting as running once its worker has ended and the shell has gone quiet ("no end recorded"). An idle
+  `--follow` no longer emits a snapshot nothing changed.
+- A herdr answer that arrives while OAK is busy, such as during the terminal app's first paint on a loaded machine, is
+  no longer counted as a timeout. A timeout now measures herdr's own time from the request, and the terminal app asks
+  again when the process table could not be read in time. A herdr that does not answer in time is still taken as
+  outside herdr for the rest of that process, so nothing waits on it twice.
+- A herdr pane that closes no longer puts herdr's raw JSON error on the terminal app's status row. OAK stops
+  reporting to that pane, here or on a saved machine, until herdr lists it again, and a herdr error it does show
+  reads as herdr's own message.
+- Sync refuses a small file that shrinks while being sent rather than padding it with zero bytes. A partly restored
+  record segment is fetched again from its complete-line offset. Importing the same backup key repairs its `0600`
+  permissions. A family symlink to a relocated store cannot expose or overwrite current or replaced backup keys,
+  and inventory validates transcript paths before reading headers, so credential symlinks are never opened.
+- Repository discovery requires valid git metadata, follows worktree `gitdir` and `commondir` pointers, and honors
+  `GIT_CEILING_DIRECTORIES`; arbitrary files or empty directories named `.git` are not repositories.
+- Database derivation version 4 defers Codex rollouts that change while being read. It retries them on a later pass
+  without publishing partial facts or advancing their saved stamp; an upgrade derives the older facts again.
+- OAK's dollar estimates use the current list prices, and a model id takes only the row that names it; a date suffix
+  or a `[1m]` tag names the same model. Opus 5.5 was priced as Opus 5 ($5 and $25 per million input and output tokens,
+  where it costs $4 and $20), Sonnet 5.5's cache reads at Sonnet 5's rate, Fable 5's cache reads at $0.25 where they
+  cost $1, Haiku 5.5 at the Opus 5 rate, and GPT's mini, nano and pro models and every GPT model from GPT-5.4 on at
+  GPT-5's rate. A newer release of a known family is priced from that family's nearest earlier version and marked
+  approximate. Haiku 5.5's rate for a prompt over 100,000 tokens, GPT's rate for a prompt over 272,000 tokens, fast
+  mode and US-only inference apply to a turn whose transcript records them. The bundled status line carries the same
+  table. The Models page lists the rules.
+- Cache writes kept for one hour are priced at their own rate, twice the input rate, where every cache write was
+  priced at the five-minute rate. The local database keeps the one-hour part of each message's cache writes
+  (`cache_create_1h` in `usage_messages`, the daily rollup and the record log), and a message whose record does not
+  split them is priced at the five-minute rate and marked approximate (`cost_approx`). Schema 6 also stores each message’s worker, provider, speed, geography and price version. After the update, the database
+  reads this machine's transcripts and the record logs it holds once more to fill the new columns.
+- The local database records which price table priced each message, and prices every stored message again when an
+  update changes the table, this machine's and the other machines' alike, so every total uses one table: 200,000
+  messages took 2.9 seconds, once. The spend that Claude Code reported for a session is never priced again. Every
+  calculated dollar figure is labelled an estimate at today's list prices; reported charges keep their actual amount.
+- The 5-hour and weekly spend that the status line adds up from what Claude Code reported (`fiveCost` and `weekCost`
+  in `oak usage --json`, and this machine's own spend in the usage it sends the other machines) counts from the start
+  of its window, as the window's tokens do. It counted the last 5 hours and the last 7 days, so a week's spend also
+  took in spend from before the weekly reset.
+- The usage another machine sends (`oak __usage-brief`) gives the tokens its status line counted in each window,
+  marked `measured`, with the share times the estimated allowance beside it as `est`. It gave that estimate as the
+  window's tokens.
+- One Codex rollout whose session id cannot be used as a file name (a file written by hand, or damaged) no longer
+  stops every session listing: it is left out, and the rest are listed. The listing read from the files failed with
+  "invalid session id" and listed nothing.
+- The terminal app's pinned conversation no longer marks a tool call still waiting for its result with ✓, as if it
+  had succeeded: it draws the pending mark while the session waits on you, and the running mark otherwise.
+- A review comment that could not be saved is no longer reported as added. The failed write was ignored, so
+  `oak comment add` printed the comment's id and the terminal app and VS Code showed it, and the comment was
+  gone at the next read. Now `oak comment add` exits 1 and says why, the terminal app's status line and VS
+  Code show the reason, and JetBrains reports what the CLI says. A prompt that carries comments and is
+  delivered while they cannot be marked sent is reported as sent: `oak prompt` and `oak comment send` exit 1
+  and say that the prompt went out and the comments will be drafted again. Two comments added at the same
+  moment, or one added while another is removed or marked sent, no longer lose one of them: each change is
+  made under the session's lock. A session's comments are kept in its own folder in the store
+  (`<store>/<session>/comments.json`), beside its log, instead of among the caches. Comments an earlier
+  version kept among the caches, and those an editor still running an earlier version writes there until it
+  is reloaded, are read with them and moved at the next change.
+- Each edit a session captures from Edit or Write checks whether a shell command running beside it already
+  recorded the change by reading only the end of the session's edit log, where OAK 0.10.0 parsed the whole
+  log: 39 ms for each edit on a 5.4 MB log, now 2 ms, or 3 ms for a file the log does not name.
+- A session's token counts, the Stats charts, each prompt's tokens, and the tokens of workers and workflow
+  agents count each message at its largest usage, as the status line and `oak usage --breakdown` do. Claude
+  Code writes one message as a line per part, each with the usage as it stood when the line was written,
+  and a later line can carry more output than the first; these counts took the first line's and came out
+  short, by 0.7% of the output tokens on real transcripts. The caches that hold these counts are recomputed
+  once. The usage cursors and the Stats caches are now named by their version
+  (`usage-cursors/<hash>.v3.json`, `stats-cache-v3.json`, `stats-cache-claude-v3.json`): kept under one
+  name, an editor still running an earlier version and this one discarded each other's and read the
+  transcripts again at every call until that editor was reloaded. The transcript facts and the session
+  sidecar (titles and the workers' figures) are still rebuilt after each other's writes while such an
+  editor runs. `oak clean` removes the cache files an earlier version left (the usage cursors and Stats
+  caches under their old names, and the asks scan, prompts projection and transcript facts of an earlier
+  version), and never this version's own.
+- Deleting or restoring sessions (`oak sessions --delete`, `--undelete`) while another change to the list
+  of deleted sessions is made, such as an `oak sync` pull, no longer loses one of the two changes: the list
+  is changed under a lock. It stays a JSON array of session ids. A delete or restore that waited for a store
+  move takes its locks where the store went, as a change made after the move does, where it took them under
+  the store's old path and could run beside one.
+- A Codex session's `agent.json` in the store is replaced whole and is readable by its owner only, like the
+  rest of the store. It was rewritten in place, so a reader could find it half written, and it was created
+  with the default permissions.
+- Conversation search keeps the index of a session OAK has only read among its caches, and no longer makes
+  a folder in the store for it. `oak clean` removed that folder as an empty one, the index with it, and the
+  next search read the whole transcript again. An index an earlier version kept in a session's folder is
+  removed when this version first indexes the session, and a folder it alone held goes with it.
+- `oak integrity` checks that each snapshot a record names is there and readable without reading it, where it
+  read every snapshot in full.
+- The Claude Code status line keeps writing its cache once the cache passes 128 KiB, as the spend ledger of
+  a month with many sessions does. The whole cache went to `jq` as one argument, which Linux refuses past
+  that size, so every write failed and the readouts that read the cache stopped changing. It now goes on
+  `jq`'s standard input. `oak update` or `oak statusline` refreshes an installed status line.
+- `oak clean --drop` (and an editor's Drop) and `oak sessions --delete` (and the Delete in the terminal app and the
+  editors) refuse the folders the store keeps for itself, whatever the case of the name: `oak clean --drop sync`
+  removed oak sync's state, which now holds the backup key and every other machine's replicas too, and on macOS and
+  Windows, whose file systems ignore case, `SYNC` named the same folder.
+- `oak search`, and the search in the terminal app and both editors, find the text of an answer that follows a
+  thinking block or a tool call. Claude Code writes each block of a reply on a line of its own, with the reply's id,
+  and only the first line of each reply was searched, so a model that thinks first had most of its answers left out.
+  Each session's search index is rebuilt once, and `oak clean` reclaims the one it replaces.
+- On machines signed in to one Claude account, the token estimates beside the 5-hour, weekly and per-model
+  weekly shares, their budgets, and the month's tokens, cache reads and dollars are now the account's, the
+  same on each machine that has the others saved. Each machine learned its tokens per percent from its own
+  transcripts against the account's share, so a laptop whose agents run on another machine credited the
+  whole share to its own few turns: its budgets came out more than ten times too small, and its month read
+  100% and a few hundred dollars where the other machine's read under a fifth and thousands. The status
+  line now calibrates against the account's usage as the local database counts it (`usageTotals` in `oak usage
+  --json`): every message of the account once, by its message id, from this machine's transcripts and from
+  every other machine's usage the database holds, which `oak sync`'s record logs or the read of each saved
+  machine (above) bring, in the same 5-hour or weekly window and bill cycle; the month is that sum too, with
+  its cache reads and dollars. So a transcript synced or forked between machines is counted once, whichever
+  machines hold it. Each machine is counted once, also when it is saved under two targets. The 5-hour and
+  weekly dollar budgets in `oak usage --json` calibrate the same way, on the spend each machine's sessions
+  reported. With those totals the status line reads no transcript and keeps no map of the files it read:
+  on a synthetic machine of 1,200 sessions its state file went from 3.1 MB in OAK 0.10.0 to about 2 KB, a
+  render whose scan was due from 790 ms to 320 ms, and one between two scans from 340 ms to 280 ms (on one of
+  300 sessions, 400 ms to 320 ms and 290 ms to 280 ms), the compile cache (above) among it: without that cache a
+  render between two scans takes about 320 ms on either machine. With an OAK without the database, a database still
+  building, or a window that turned over between its two reads, it scans as before. On one machine the figures
+  are the scan's; a machine that held the turns of another and counted them as its own (turns that ran
+  outside any home directory, or under a home path two machines share) no longer counts them twice. An OAK
+  from before this release sends no figures and adds nothing, and `oak doctor` says so for that machine. A
+  sum that adds more machines than the estimates
+  have been calibrated with starts their smoothing over, so the figures are right at the next scan rather
+  than hours later. The month refresh OAK runs on a machine used from an editor alone reads them too, from
+  the `oak usage` call it now makes. The editors' tooltips and Stats panels name the machines whose usage
+  the estimates include; the status line and the terminal app's usage bar, which have no tooltip, do not.
+  With no saved machine of the account, or none with figures for a window, every figure is as before.
+  `oak update` or `oak statusline` refreshes an installed status line.
+- The terminal app writes a token count of a billion or more as the status line and both editors do
+  (`6B`, `1.2B`); its readout wrote `6070M`.
+- A worker's tokens in the Workers lists count each of its messages once, as a session's do. Claude Code
+  writes one message as a record per part (its thinking, its text and each tool call), each carrying the
+  whole message's usage, and a worker's input, output and cache counts added up every record.
+- A lock, claim or last attempt dated in the future, as a clock stepped back leaves one, no longer holds
+  work off until the clock catches up, which can be hours. It held off the Remote Control titles refresh
+  and its daily read of every page; desktop notifications, where a crashed holder's lock muted every
+  raised hand and a claim muted every new one of its kind; the conversion of a Codex session's
+  transcript; the trust OAK writes for herdr's Codex hook, so each install and `oak doctor --fix` waited
+  ten seconds and failed; and the capture lock of a session whose holder had died, so every capture
+  dropped its edit. A lock still counts for a live holder, by the monotonic clock it records, and a torn
+  Bash snapshot dated in the future is dropped, so its session can be cleaned up. A snapshot of a command
+  still running is kept however it is dated. A file is dated by the clock of the file system it is on, so
+  on a store whose file system's clock runs ahead of this machine's (a network share's server, or the host
+  under a virtual machine's shared folder), a lock or claim just taken there still holds: read as dated in
+  the future, a live capture's lock on another machine sharing the store was broken, and two captures
+  wrote at once.
+- The terminal app draws text from outside, such as a session's title, a workspace's or machine's label
+  and a herdr pane's title, without bidirectional controls, which reordered the rest of the row in a
+  terminal that lays out right-to-left text, zero-width characters, which hid in the text and were
+  measured as columns the terminal does not draw, line and paragraph separators (U+2028, U+2029), or
+  the other characters drawn as nothing or as a blank: the soft hyphen, the Khmer inherent vowels, the
+  Hangul fillers (U+3164 among them, which JavaScript takes for a name) and the tag characters, which
+  spell out text no one sees, a known way to hide words in a prompt; after 🏴 they draw a black flag
+  with those words behind it. The zero-width joiner an emoji family, a rainbow flag or an Indic letter
+  is built with, the non-joiner a Persian or Indic word is written with, the combining grapheme joiner
+  and the Mongolian vowel separator Hebrew's points and Mongolian words are written with, the tags of
+  England's, Scotland's and Wales's flags and the variation selectors are kept, there and in a saved
+  machine's label on every surface. Each of those characters in a file's text is shown rather than
+  dropped, since a line of code that hides one runs differently from how it reads (Trojan Source;
+  JavaScript reads a line or paragraph separator as a line break): each is a mark that names it, such as
+  `⟨U+202E⟩` or `⟨U+E0041⟩`, dimmed except in the ghost text, in the terminal app's diff and the edits the
+  Feed shows, in `oak diff` and `oak review`, in VS Code's review bubble, stacked review and Feed, in
+  JetBrains' Feed, and in the removed lines' ghost text in both editors. So is a zero-width joiner or
+  non-joiner, a combining grapheme joiner, a Mongolian vowel separator or a variation selector with only
+  ASCII text beside it, where it hides in an identifier or a string (`is⟨U+200D⟩admin` is not
+  `isadmin`, and `isAdmin⟨U+200D⟩` and `isAdmin⟨U+FE0F⟩` are second names); after an emoji or an
+  ideograph, and in an Indic letter or a Persian, Hebrew or Mongolian word, it stays as it is. So is a
+  variation selector after another one, which chooses nothing: a run of them spells out text no one
+  sees, one byte each, after an emoji too. `oak diff --patch` in a pipe and `--json` keep the text
+  exactly.
+- `oak doctor --markdown`, which VS Code and JetBrains open as the setup check, shows the text a
+  check carries from outside OAK as text: a server's banner that ssh printed before its login, which
+  the row of a saved machine ssh could not reach keeps, herdr's errors, a remote's message and a login
+  shell's output. Put in as it was, an image there (`![](https://…)` or an `<img>` tag) loaded when the
+  editor showed the report, a link could be clicked, and a line break and a heading after it made rows
+  that read as OAK's own. Each label, detail and fix is now one line, with what Markdown would read in
+  it escaped, a bare link and HTML included, and without the characters the terminal app drops from a
+  title (above); the zero-width joiner and non-joiner are kept. A code span stays one, OAK's own or one
+  in the text, since Markdown shows its text as it is: it is formatting only, and loads or links
+  nothing.
+- VS Code's review bubble shows each line of an edit's diff as it is written. The diff went into the
+  bubble's Markdown, which read it: a line with an image, such as a README's `![build](https://…)` badge,
+  loaded the image when the bubble opened, a link could be clicked, and `**bold**`, `_emphasis_` or a
+  `` `code` `` span lost its marks.
+- `oak update` no longer replaces a CLI linked to a source checkout. `npm link`,
+  `npm i -g ./packages/cli` and `./install.sh` leave npm's global package a link to the checkout, and
+  installing a release over it replaced the link with a copy of that release: from then on every `oak`,
+  the capture hooks included, ran the release's code, and rebuilding the checkout changed nothing. The
+  CLI's row now names the checkout and says to update it there (`git pull`, then `npm run build`), even
+  with `--force`, and the rest of the update goes on as usual; a CLI run from a checkout is left alone
+  the same way. A saved machine's `oak update --here` does the same, and on a saved machine whose OAK is
+  older than this, `oak update` runs nothing where npm's package there is such a link, and its row says
+  so. `oak update --json` gives that CLI the reason `linked`, with the checkout's path.
+  `oak version --check` and both editors' version chips no longer offer such a CLI a release, and say
+  it is linked to a checkout; the daily nudge to run `oak update` is not shown for a CLI that runs from
+  a checkout.
+- `oak update` no longer installs the release with npm on a saved machine that `oak machine add`
+  provisioned, where the CLI is the copy it pushed to `~/.local/lib/oak`: npm put a second CLI beside
+  it that nothing ran, and `oak update` said it had updated the CLI. The copy is left to
+  `oak machine add`, which updates it, and the machine's row names that command; the rest there is
+  updated as before. A copy from a release older than this one is not run at all, and its row says the
+  same. `oak update --json` gives such a CLI the reason `provisioned`, `oak version --check` and both
+  editors' version chips offer it no release, and the daily nudge is not shown there. A saved machine
+  whose CLI is still behind after its update is now a failed row, and `oak update` exits non-zero.
+- `oak update` no longer replaces a local build: a CLI, VS Code extension or JetBrains plugin whose
+  version ends in `-dev.0`, which every build of a `dev` checkout carries and no release does (CI numbers
+  its rolling builds from `-dev.1`). On the pre-release channel it installed the rolling build over one,
+  and on stable an older release. Its row now says it is a local build, here and on a saved machine, and
+  `--force` or `--channel` replaces it with that channel's newest; `oak update --json` gives it the reason
+  `local`. `oak version --check` (with `local` in its `--json`, and `local build` as the `--compare`
+  reason), the daily nudge, VS Code's update check and both editors' version chips offer a local build no
+  release and say what it is, and the chips' Update now leaves it alone. The JetBrains IDE's own plugin
+  updates read the plugin repository, which OAK cannot steer for one install, so an IDE subscribed to it
+  may still offer the repository's build over a local build of the plugin.
+- `oak machine add` no longer writes its launcher over an `oak` on the machine that it did not put there.
+  Where npm's prefix is `~/.local`, `npm link` makes `~/.local/bin/oak` a link into the checkout's build,
+  and the launcher was written through that link, over the checkout's `packages/cli/dist/index.js`. Such
+  an `oak`, or one npm installed, is now left as it is, with a line that says so, and the capture hooks are
+  installed with it. The launcher is written beside its place and renamed over it, so it never writes
+  through a link.
+- When `oak update` cannot update something, the line it writes to stderr, which is what both editors
+  show, names each surface, part of OAK's setup or saved machine with its reason, such as
+  `machine build-box (not reachable over ssh (me@build-box): ssh: connect to host build-box port 22: No route to host)`.
+  It named them alone, and the reasons were only in the notes above it, which the editors do not show.
+  The editors no longer cut that line, or any other reason a CLI command fails with, at 300 characters,
+  which left out the later reasons. A saved machine's reason is one line, in that line and in the table:
+  when its `oak` crashed, it is Node's error line, such as
+  `TypeError: Cannot read properties of undefined (reading 'surfaces')`, not the whole report with the
+  source line and every frame of the stack.
+- `oak init --codex` no longer turns back on a Codex hook of OAK's that you turned off in Codex
+  (`enabled = false` in its state in Codex's `config.toml`): rewriting the hooks' trust state keeps it.
+  `oak status` and `oak doctor` name such a hook as turned off in Codex, where they reported the hooks'
+  trust as partial and told you to re-run `oak init --codex`.
+- OAK reads a Codex `config.toml` that begins with a UTF-8 byte order mark, as Codex does. `oak init`,
+  `oak init --codex` and `oak uninstall` stopped on one with "Invalid TOML document", and `oak status`
+  reported the Codex hooks' trust as `no-config`; the TOML parser OAK bundles, smol-toml, reads past the
+  mark from version 1.9.0. OAK's edits to such a file keep the mark first, once. `oak models use` put its
+  `model` and `model_provider` lines in front of the mark when a table came right after it, and Codex then
+  refused to load the file; where a `model` line came first, it rewrote that line without the mark. In
+  herdr's `config.toml`, a `[ui]` or `[theme]` header or a sidebar width right after the mark was missed:
+  OAK added a second table or width, which herdr refuses, so OAK put the file back and said herdr had
+  rejected its sidebar widths or theme.
+- OAK reads its preferences file (`prefs.json`) when it begins with a UTF-8 byte order mark. It took such
+  a file for no preferences at all, and the next setting it saved, such as the terminal app's layout,
+  `oak titles --off` or VS Code's sort order, replaced the file and lost the others.
+- A setting made in `prefs.json` while the terminal app runs stays set. The app wrote back the preferences
+  it had read at start on every tab switch and every option it saved, which undid `oak titles --off`
+  (`"remoteTitles": false`), so OAK read session titles from claude.ai again; `"machineUsage": false`, so
+  the saved machines' usage read resumed; `oak usage --bill-day`; and `oak store --move`, so the store was
+  looked for where it had been. The app now saves only its layout and the options it changes, over the
+  file as it is then, and leaves a file that does not parse (a hand edit saved half done) as it is, saying
+  so on the status row. Options → Reset every option keeps the settings made outside the options window,
+  such as the bill days and `oak titles --off`.
+- A store moved while OAK runs is followed there. The terminal app's views worker, the VS Code extension and
+  `oak notify --watch` kept the location they started with: after `oak store --move`, or a move from another
+  surface, Review listed none of the session's files, the old location was given a `session-meta` folder
+  again, and moving the store back there was refused because it was no longer empty. Every long-running OAK
+  process now looks up the store's location in `prefs.json` each time it resumes work, on a file system that
+  dates a write to the second or two (FAT, HFS+) too, where a location written twice within that time was
+  missed. VS Code and JetBrains
+  watch the store where it went, after their own move as after another surface's: VS Code's watcher stayed on
+  the folder it started on even after its own Store location command. The focus server stops once the store
+  has moved, and the terminal app's reconnect starts one where the store went: where a move took its endpoint
+  away (a move made by copying, as one back to the default location is; a new path too long for a socket;
+  any move on Windows), `oak focus` could not reach it, and it kept a new focus server from starting until
+  it exited. Stopping, the focus server removes its own socket and pidfile only: it removed them by path,
+  and a server started since where the store is now (moved back there) lost both while it ran. The terminal
+  app tries a reconnect that failed again, waiting longer each time, up to a minute; it gave up after one try.
+- A `prefs.json` that does not parse (a hand edit saved half done) leaves every running OAK process on the
+  store where it is. Read as no preferences, it sent them to the default location until it parsed again:
+  Review listed nothing, the terminal app's views worker wrote its caches there, the focus server stopped
+  and one started there, and `oak store --default` then refused the default location as not empty.
+- No capture or review decision is lost while the store moves. An edit an agent made during `oak store
+  --move`, or during a move from the terminal app's options or either editor, was written where the store
+  had been: during a move to another file system, which copies the store, it was copied or not, and the
+  removal of the original then deleted it or failed on it; after a rename, or before the new location was
+  recorded, it made the old location again and stayed there, where nothing looked. With six agents editing
+  through a move of a 400 MB store to another file system, eight edits of 59 were lost. A decision made
+  meanwhile was lost the same way: a keep, undo, redo or resolve, a comment, an ignore sweep, a deleted or
+  hidden session, `oak clean`, the update channel and the install ledger. An undo lost so left its file
+  reverted and its edit still pending. During a move on one file system, which renames the store, a decision
+  made before the new location was recorded found no store where `prefs.json` pointed: a keep kept nothing,
+  an undo said there was no such edit. A move now takes a lock, waits for the captures and decisions already
+  being written to finish, moves the store, records the new location in `prefs.json`, removes the original
+  and lets go; a capture or decision that starts meanwhile waits for the move, then reads and writes where
+  the store went. Either waits up to 10 seconds, and a move that cannot begin within 8, because something is
+  still being written, is refused before any of them gives up. A capture made during a move that takes
+  longer, a Bash command's included, is recorded as a capture gap in its session, and the move says how many;
+  a decision is refused, saying the store is being moved, and writes nothing, so it can be made again. A move
+  that crashed holds nothing up for long: its lock is broken by the same rules as a session's capture lock,
+  or once it has gone a minute without the refresh a running move gives it, whatever process now has its
+  number. A move stopped that long, or one that took a minute to copy a single file, finds its lock taken,
+  also once it has renamed the store or recorded where a copy went, and undoes itself and says so: the
+  rename is reversed, or the copy removed and the location put back. Where a capture let in meanwhile made
+  the old folder of a renamed store again, the store stays where it went, and the move says that the old
+  folder holds what was recorded while it was stopped. A second move while one runs is refused.
+  The lock, a registration for each capture or decision while it is written, and those notes are kept in
+  `claude-observatory-move` beside the default store folder. What OAK rebuilds as it reads, written where
+  the store had been by a process that had not followed it yet (the terminal app's views worker, between two
+  refreshes), no longer makes a move back there refuse the folder as not empty: it is removed first.
+- A store move to another file system stands once the copy is made and recorded. A removal of the original
+  that stopped part way (a file another program holds open, a folder OAK cannot empty) was reported as a
+  failure that left the original half removed, `prefs.json` with it, and the whole copy where nothing
+  looked. It is now a note beside the move on every surface; JetBrains said only "Store moved to …". A move
+  whose new location `prefs.json` cannot record (a hand edit saved half done meanwhile) is undone, by
+  removing the copy or reversing the rename; one that cannot be undone either says, on every surface, that
+  the store moved and OAK looks for it where it was. The copy keeps the store's folders private to you
+  (Node's fast copy, in recent versions, gave them the default mode, such as 0775), copies no lock, which
+  held up the next capture of its session as a live holder's would, and leaves out the focus server's
+  socket, which no copy can take.
+- A store location written as `~name/…` is refused as relative, by `oak store --move` and the terminal app's
+  options, and ignored in `prefs.json` by every surface, JetBrains included. Only the home
+  (`~`, `~/…`) is expanded, so it was kept in the folder each process started in, an agent's project among
+  them.
+- VS Code's Store location command no longer undoes a setting made while its pick or folder dialog was open,
+  in the terminal app's Options or with `oak usage --bill-day`: it wrote back the preferences it had read
+  before the dialogs, with the new location.
+- Saving a setting keeps what this build of OAK cannot read in `prefs.json`: a setting a newer build added,
+  a key bound to an action this build does not have, a notification kind or field it does not have, and a
+  value it does not recognize, such as a newer palette. Every writer (the terminal app's layout and options,
+  `oak usage --bill-day`, `oak titles`, `oak store --move`, VS Code's sort and Store location, and JetBrains
+  through the CLI) rebuilt the file from the settings it knew and dropped the rest. Every writer now leaves
+  a `prefs.json` that does not parse (a hand edit saved half done) as it is and says so, where it replaced
+  the file with its one setting, and a store move stops before anything moves while `prefs.json` does not
+  parse, since the new location could not be recorded in it. `oak titles --off` then keeps the cached
+  titles, which it removed before the save was refused.
+- The month figures' bill day falls back to the subscription date in the `.claude.json` Claude Code uses,
+  which is in `CLAUDE_CONFIG_DIR` when that is set. OAK and the bundled status line read the one in the home
+  folder, so with a relocated config the month followed the calendar instead of the bill cycle.
+- The terminal app no longer says `watching projects degraded: ENOENT` (or `Observatory store watcher:
+  ENOENT`) when it starts in a folder no agent has run in, or on a machine with no agent session yet. A
+  folder that is not there yet is watched once it appears; the whole projects folder was given up to
+  polling instead. On Linux a folder deleted and made again, such as a session's folder or the store moved
+  away and back, is watched again, as JetBrains now watches a store folder deleted and made again by the
+  next capture: each kept a watcher that no longer reported, and a live view stopped updating.
+- OAK reads Claude Code's `settings.json` when it begins with a UTF-8 byte order mark, and its writes keep
+  the mark first. `oak init` and `oak doctor` called such a file invalid JSON, `oak status` found no
+  capture hooks in it, and `oak uninstall` could not parse it, while `oak statusline` rewrote it without
+  the mark; the bundled status line's installer keeps the mark too.
+- The bundled status line's installer finds a `[tui]` table right after a byte order mark in Codex's
+  `config.toml`, and keeps the mark first, once. It added a second `[tui]` table there, which Codex
+  refuses. The status line reads a `prefs.json` that begins with a byte order mark, so the bill day you
+  set with `oak usage --bill-day` anchors its month again.
+- `oak uninstall --all` removes the status line the bundled installer set in Codex's `config.toml`: its
+  lines marked `# oak-statusline`, and the `[tui]` table it added when nothing of yours is left in it. It
+  reverted only Claude Code's, although its tip says it reverts the bundled status line.
+- `oak uninstall --project --all` leaves the bundled status line, which its installer sets up for your
+  user rather than for a project, and says that `oak uninstall --all` reverts it. It deleted the status
+  line's script while your user settings still ran it.
+- `oak uninstall --purge-store` without `--all` says that it purged nothing, and names the command that does.
+  `--purge-store` takes effect only with `--all`, and alone it left the stored edits in place and said nothing of them.
+- `oak uninstall --all --purge-store` removes every session folder in the store, one holding no edit log among them (a
+  session that only asked and read, a Bash command's snapshot stub), where it took only those with a log. `oak uninstall
+  --all` names the files it leaves: those the bundled status line keeps beside its cache (`statusline-usage.json`, and
+  `statusline-last.json.month-refresh`, `.pull-log` and `.pulling`), and the compile cache the `oak` launcher keeps.
+- The GPT month estimate no longer disappears after Codex's weekly reset. The month's budget is projected
+  from the week's own fill, and from the reset until GPT is used again the week has none; the budget the
+  last sampled week gave now stands in, for up to 35 days, in the terminal app's status bar,
+  `oak usage --json` and both editors' GPT rows. A fresh sample replaces it.
+- A month with no usage yet reads 0%, for Claude and for GPT, on the status bars of the terminal app,
+  VS Code and JetBrains and in both editors' Stats panels, and the Claude Code status line draws it as a
+  `0%` bar (`~0/` its budget). Right after a bill cycle rolled over, the month's count of 0 was read as
+  no data: the month was left out, and on the status bars so was the whole Claude or GPT group when its
+  5-hour and weekly windows had nothing to show either. `oak usage --json` reports such a month as 0
+  where it reported null. A month that was never measured, such as GPT's before it has a budget to share
+  against, is still left out.
+- VS Code's Update now names what the CLI updated on this machine, from the plans read before and after
+  it. It showed "CLI and JetBrains plugin refreshed" whenever the CLI's update succeeded, whatever the
+  CLI had updated.
+- A `--machine` command that is stopped (SIGTERM, SIGINT, SIGHUP, or SIGQUIT on macOS and Linux) now
+  stops its ssh as well, then ends by that signal as before, so ctrl+c still stops a shell loop that
+  runs it; one that ends with an unexpected error stops its ssh too. The ssh was left running on its own
+  until the remote command finished, as it still is when the command is killed with SIGKILL (`kill -9`),
+  which no program can handle. The command on the saved machine is not signalled, and may still finish
+  there. On Windows, only ctrl+c and closing the console window reach the command this way: when another
+  program stops it, as the terminal app does at its deadline, it ends at once and its ssh runs until the
+  remote command ends, as after SIGKILL.
+- When ssh cannot reach a saved machine, a `--machine` command names why with the last two lines ssh
+  wrote that can say so, joined by ` — `, where it showed the first line ssh wrote. For a host whose key
+  has changed, that first line was a row of `@` signs from ssh's warning banner; the reason now reads
+  `Host key for <host> has changed and you have requested strict checking. — Host key verification failed.`
+  Two lines, because the line that says why is not always ssh's last: a server that refuses the login,
+  such as one whose PAM configuration refuses logins while it starts, says why before ssh's line that it
+  closed the connection, and its banner comes in the same place. The lines that never say why are passed
+  over: a stale control socket, the host key that `accept-new` has just recorded, the login that
+  `LogLevel VERBOSE` reports as done, ssh's note that it allocates no terminal (where your ssh
+  configuration asks for one with `RequestTTY`), and the rows of `@` around a warning. So are the lines
+  ssh adds once another line has said why, such as
+  `Connection closed by UNKNOWN port 65535` through a jump host or `ProxyCommand`, a jump host's
+  `stdio forwarding failed`, the transfer totals that `LogLevel VERBOSE` prints, and scp's closing lines.
+  The rows `oak update` prints for saved machines name the reason the same way, and so does
+  `oak machine add`, which also showed the first line, for its ssh and scp.
+- A search stopped while it writes a session's search index no longer leaves the partial index behind,
+  often several megabytes: the next search there removes it.
+- OAK's ssh to a saved machine (`--machine`, `oak machine add`) no longer becomes the master of a
+  shared connection that ends with it, and the ssh `oak update` now runs to each saved machine never
+  does. With ControlMaster on and no ControlPersist in your ssh configuration, the first ssh to a host
+  is the master that every later session to that host rides on, and OAK stops its ssh at a deadline or
+  at ctrl+c, which closed those sessions too. OAK's ssh now runs with `ControlMaster=no` there, and
+  still uses a master that is already open. It does the same when ssh cannot print its configuration
+  for the host (`ssh -G` fails, or runs past five seconds). With ControlPersist set, the master runs in
+  the background, and OAK's ssh shares it as before. On macOS and Linux, the same holds for the ssh that
+  herdr runs for OAK's `herdr --machine` commands (the terminal app's reads and replies, an editor's
+  prompt to a pane there, `oak prompt`, `oak quote --send`, `oak comment send` and `oak doctor`), which
+  OAK now stops with herdr. Wherever OAK's ssh to the saved machine's target would run with
+  `ControlMaster=no`, herdr 0.9.1's does too, since it gives that ssh no option about connection
+  sharing. OAK runs herdr's ssh through a small `ssh` script that it puts first on the command's `PATH`,
+  kept in the `herdr-ssh` directory of its store, which only you can write to. A reply the terminal app
+  sends gets `ControlMaster=no` without OAK asking `ssh -G` first, so that it starts at once; it still
+  uses a master that is already open. When OAK cannot put that script in place, or the store is on a
+  `noexec` mount where it cannot run, herdr's ssh runs without `ControlMaster=no`, as before, and `oak
+  doctor` names the machine and why. herdr 0.9.2 and later give that ssh a shared connection of their
+  own, kept in the background with `ControlPersist`: the script leaves it as herdr sets it up, and
+  `oak doctor` gives no warning about the script with them.
+- In the terminal app, `e` on a session reviewed on a saved machine opens the selected file on that
+  machine: a terminal editor (`nvim`, `vim`, `hx` and the others the options list) runs there over
+  `ssh -t`, and VS Code or Cursor open it from here through Remote-SSH. Other editors say they cannot.
+  It used to refuse, and on a zoomed Diff, below a size note or below an error that refusal was never
+  drawn, so the key seemed to do nothing. A status a key writes now shows for five seconds over those
+  rows before they return, also while a list such as the session picker is open, and an error that
+  arrives in that time replaces it at once. `ctrl+c` while that machine's ssh connects or asks for a
+  passphrase stops the ssh and leaves the app running. The editor is run by its name, found on that
+  machine's PATH, a second `e` while the first is starting is ignored, and the ssh session carries none
+  of this machine's store or agent identity.
+- In the terminal app, a Keep, Undo, Redo or Resolve that fails shows its error on the status row for
+  at least five seconds. The read that follows every decision cleared it at once, so a failed decision
+  looked like one still running.
+- The terminal app ends with status 0 when its terminal closes, as on the hangup signal that closing
+  sends. A read from the closed terminal, or a write to it, could fail (`EIO`) before that signal
+  arrived, which ended the app as a crash, with status 1 and `dash: Error: read EIO` or `write EIO` on
+  its error output. It happened rarely, and more often on a busy machine.
+- In the terminal app's Review tab, `e` (open in `$EDITOR`) and `y` (copy the path) act on the
+  selected Map row. While an edit's diff was open, both used the diff's file instead, so `e` on another
+  Map row reopened the same file and `y` copied the wrong path. On the Diff pane both still use the
+  diff on screen, and `e` on a row that names no file (a Prompts row) opens the diff's file, as before.
+  On the outside-the-workspace row of an older CLI's map, which names no real path, `y` says so, as `e`
+  does.
+- An overlay on the Observatory tab (the `?` help, the palette, Options or a picker) keeps the
+  Observatory's own key row. It showed Review's window bar, session line and key row, which name keys
+  (`a`, `u`, `e`) that do nothing on the Observatory.
+- In the terminal app, the session picker keeps its highlighted row on screen, and scrolls to the last
+  row of a long list. It sized its window four lines taller than the list drawn under Review's window
+  bar and session row, so the row it opened on could sit below the screen, and the last rows (another
+  machine's sessions, listed after this machine's) never came into view. A row wide enough to wrap is
+  counted as the lines it takes. The filter menu uses the same measured height, so its selected row
+  stays on screen in a short terminal.
+- In the terminal app, the `?` help and the other text windows scroll to their last line. Scrolling
+  stopped several lines short of it, because the limit took the window to be taller than the one
+  drawn under Review's window bar and session row, and counted a line wide enough to wrap as one.
+- Review no longer opens onto an empty full-screen Diff. A Diff zoomed when the layout was saved came
+  back zoomed at the next launch, when no edit is selected, so the screen showed only the hint to select
+  one; switching session from a zoomed edit did the same. The zoom now ends with the session it
+  belonged to and is not restored at launch.
+- On Review, `g` and `G` stop where the arrows stop, so `G` selects the last file's whole header
+  instead of only its counts line. On the Diff pane they scroll to the top and bottom of the diff.
+- `F` reports how many files it folded or unfolded; it counted each file twice.
+- `ctrl+v` where nothing takes text says that it pastes into the filter or a reply box. It reported
+  "pasted N chars" while the text went nowhere.
+- Codex's Auto-review threads no longer fill the session lists. Codex runs each approval under
+  Auto-review (`approvals_reviewer = "auto_review"`) as a thread with a rollout of its own, and OAK
+  listed every one as a session named after the session it reviews, which pushed the sessions
+  themselves out of view. The terminal app's picker and Observatory, both editors and `oak sessions`
+  now leave them out, as do the lists of a saved machine once it runs this version, and none of them
+  becomes the session a workspace resolves to. This holds for Codex 0.160.1 as well, which names each
+  such thread "Guardian review" in its index; an OAK from before this version still lists them, as
+  "Auto-review: " followed by the reviewed session's name. Conversation search leaves them out as
+  well: each quotes the session it reviews, so a search for that session's words returned its reviews
+  ahead of it. `--session` naming one still opens it, `oak sessions --all` lists them, and usage
+  figures still count their tokens.
+- herdr tabs that run Codex no longer end up named "Codex memory update". Codex runs its
+  memory-writing agent inside the session in the pane, and OAK reported that agent to herdr as the
+  pane's session, so herdr gave it the pane and OAK named the tab after it. OAK now leaves the pane
+  and its tab to the session that runs there, for the agent in `memories` and in `memories_v2`, also
+  when the login shell Codex runs each hook through sets CODEX_HOME or HOME to another folder while
+  the agent runs in Codex's default `~/.codex`. No pass of the terminal app names a tab after the
+  agent. A pane already given to the agent goes back to its session at that session's next turn, even
+  before the session has a title, and its tab takes the session's name once there is one. A pane on
+  the machine the terminal app runs on also goes back on the app's next pass while it is open, each
+  time the agent takes it, including one the app had itself reported for that session before the agent
+  took it. Checked against the source of Codex 0.160.1 and on herdr 0.9.1 and 0.9.3. Nothing needs to
+  be reset, but Codex runs whichever `oak` its hook's login shell finds first, so a machine where that
+  is an older OAK keeps giving the agent the pane until that `oak` is updated or removed.
+- The terminal app no longer reports "herdr review tokens: herdr command did not return JSON" for a
+  session on a saved machine. herdr 0.9.1 prints nothing when it records a pane's review count, and
+  OAK took that silence as a failure, so it sent the count again over ssh on every pass. The btop
+  tab on a saved machine had the same problem when OAK started the monitor in it.
+- Codex sessions whose approvals go to Auto-review (`approvals_reviewer = "auto_review"`) no longer
+  post "needs your permission" on the desktop, or in the terminal app, VS Code or JetBrains, while
+  Codex's reviewer, not you, answers the prompt.
+  Codex runs its permission hook before the reviewer decides, and the hand comes down only when the
+  approved call reports its result. OAK reads the setting from the session's rollout, and in such a
+  session announces a permission prompt only if it is still up after 90 seconds, the time Codex gives
+  its reviewer. Codex hands a prompt to you only when the review cannot finish, so such a prompt is
+  announced up to 90 seconds late. A prompt whose approved command Codex left running in the
+  background, such as a server still running when its `yield_time_ms` passed, stays up until Codex
+  reports the command's end, the agent starts another call, or the turn ends, so it can still be
+  announced after the 90 seconds. Any other permission prompt, Claude Code's included, is announced
+  only if it is still unanswered five seconds after it went up. The message each surface shows in its
+  own window for the prompt (a note at the bottom of the terminal app, a notification in VS Code, a
+  balloon in JetBrains) waits the same way; it showed at once. The hand still rises at once in every
+  surface.
+- `oak notify --session`, which JetBrains posts through, ends as soon as the permission prompt is
+  answered instead of waiting out the whole wait. With `--json` it also reports `stillUp`, whether the
+  prompt was still up when its wait ended.
+- A permission prompt stays up while a call of another agent in the same session starts, such as a
+  subagent's while the main agent waits on you, or the main agent's while a subagent does. That call's
+  start lowered it, so the terminal app and the editors showed nobody waiting while the prompt was
+  still open. Each agent's own next call lowers the prompts that agent asked for, and any call lowers a
+  prompt that names no call, such as one raised by Claude Code's permission notification alone. A
+  subagent's prompts also come down when the subagent finishes, since a call it was denied reports
+  nothing: `oak init` now hooks Claude Code's `SubagentStop`, so run it again with Claude Code closed
+  (`oak doctor` names the event until then), and Codex's is already hooked.
+- VS Code's jump to the next session waiting on you (`ctrl+alt+x` then `h`, `⌥⌘X` then `h` on macOS,
+  or a click on the status bar's `⚠` chip) now reads who is waiting when you use it. It used the list
+  the Timeline last drew, which the Timeline updates only while it is visible, so with the Timeline
+  hidden it could jump to a session already answered, or say that the session list did not load.
+- On macOS, a notification posted from an editor or a herdr pane no longer opens Script Editor when
+  clicked, if terminal-notifier is installed. OAK now posts through terminal-notifier in preference to
+  osascript: a click brings forward the app OAK was started from and, for a notification posted by
+  the terminal app or JetBrains, selects the session in an open OAK terminal app; a newer
+  notification for the same session replaces the older one. OAK finds terminal-notifier in Homebrew's
+  directories (`/opt/homebrew/bin`, then `/usr/local/bin`) when it is not on PATH, as in an editor
+  launched from the Dock. Without terminal-notifier, `oak doctor` warns that a click opens Script
+  Editor and suggests `brew install terminal-notifier`; it looks in the same places the notification
+  does.
+- The Codex month's dollar figure no longer leaves out a turn from a hosted custom provider that OAK
+  has no price for, such as an OpenRouter model outside its price table. Such a turn now makes the
+  figure unavailable; turns from a local Ollama or LM Studio still count as $0, and so do OpenRouter's
+  `:free` variants. A custom provider is judged by its id, not its `base_url`, so one that serves a
+  local model, such as a vLLM server on localhost, also makes the figure unavailable.
+- The Claude status line's month dollar figure now prices each model by the same rules as `oak usage`
+  and the editors' usage views. It priced a model outside Claude's families, such as a local model or a
+  gateway model behind `ANTHROPIC_BASE_URL`, at the Opus 5 rate; such a model now adds nothing. It
+  also priced Bedrock and Vertex ids such as `us.anthropic.claude-sonnet-4-5-20250929-v1:0` at
+  nothing, Opus 4.5 to 4.8 at the Opus 4.0 rate, and GPT ids at nothing; they now carry the same rates
+  as in `oak usage`, where gpt-oss has none. It prices each model once per render rather than once for
+  every usage line it reads.
+- gpt-oss, the open-weight model usually run locally, has no dollar figure outside a provider's price
+  table, as other local models have none. `oak usage`, the editors' usage views and the status line priced
+  it at GPT-5's rate, marked approximate.
+- JetBrains' version chip compares the plugin's own build with the channel as well as the CLI's, as
+  VS Code's compares its extension and the CLI: a plugin behind or above the channel, other than a local
+  build, shows the dot and says so in the menu, where the plugin row used to repeat the CLI's state. After
+  an update the plugin row shows the installed build as pending a restart, and only in the IDE whose
+  plugin was updated: `oak update --json` names each JetBrains row's plugins folder. `oak version --check
+  --json --compare <version>` reports how another build stands against the channel.
+- In VS Code and JetBrains, Update now or a channel switch while an update started in the same VS Code
+  window or the same JetBrains IDE is still running says that one is running there, and starts nothing.
+  It started a second `oak update` beside the first, over the same installs. An update started anywhere
+  else, such as `oak update` in a terminal, another VS Code window or another IDE, is not detected.
+- JetBrains' Update Now offers the IDE restart whenever the plugin in the IDE's own plugins folder is
+  not the build it runs, as `oak update --json` reads that folder after the update, and marks that
+  build pending a restart. It said "no restart needed" while the old build ran when VS Code's Update
+  now, `oak update` in a terminal, or an earlier Update Now answered with Later had already replaced
+  the plugin, and it offered no restart when the update replaced the plugin but failed at something
+  else. It still reports that failure.
+- `oak undo --json`, `oak redo --json` and `oak ignore` with `--json`, `-v` or several paths no longer cut
+  their answer short when it goes through a pipe whose reader is slower than OAK. They ended the process
+  as soon as the answer was handed to the pipe, which dropped everything past the pipe's buffer (8 KB on
+  macOS, 64 KB on Linux), so a script or editor received JSON it could not parse.
+- A command whose reader stops reading early (`| head`) now ends with its own exit status, such as 1 from
+  `oak comment rm` for a comment that does not exist, or from an `oak tui --once` frame that fails; it ended
+  with 0.
+- The CLI's human-readable output no longer passes escape sequences from agent-written text (session
+  titles, prompts, replies, file names) to your terminal, where one could retitle the window, clear the
+  screen or write the clipboard. Control characters are filtered as the terminal app filters them,
+  keeping colour. `--json`, `oak blob`, `oak export`, `oak diff --patch` and `oak ignore -z` stay byte-exact
+  in a pipe or a file; `--json`, `oak diff --patch` and `oak ignore -z` printed to a terminal are filtered too,
+  as is what a command run on another machine with `--machine` prints to a terminal.
+- An edit captured after clearing resolved edits, or after an `.observatoryignore` sweep, no longer
+  takes the id of an edit the rewrite removed. A session delete confirmed before that edit arrived could
+  purge it unseen; it now refuses, as it does for any edit newer than the listing it was confirmed from.
+- Windows desktop notifications now post under Windows PowerShell's registered app id. The previous
+  `OAK` id was registered by no Start-menu shortcut, so Windows could drop the notification.
+- Parsing a heading that runs into a bare carriage return, a long blank run in `.observatoryignore`, and
+  a prompt of many unclosed `<pasted_content>` openers is now linear; each took seconds at tens of
+  thousands of characters.
+- `:ignore` in the terminal app's palette applies `.observatoryignore` to the session under review, as
+  Refresh does: on the machine where that session is, and only after asking with the count. It ran
+  `oak ignore` for the directory the app was started from, which dropped that session's now-ignored
+  edits without asking.
+- `oak tui --root <dir>` and `oak tui --root=<dir>` review the session of `<dir>`, in its first frame, in `--once`, in the
+  newer-session hint and after deleting the session under review. It opened on the session of the directory it was
+  started from, and outside a repo on the newest session anywhere. An empty `--root=` now fails with
+  "`--root` requires a path" in every command and the app; commands read it as an empty root, and
+  `oak export` wrote `"root": ""`.
+- `oak tui --session=<id>` opens that session, as `oak tui --session <id>` does. It opened the session the
+  terminal app picks when none is named, and an id this machine does not have was not reported.
+  `oak sessions --session=<id>` likewise lists that session, as the two-word form does. An empty
+  `--session=` now fails with "`--session` requires a session id", as a bare `--session` does, instead of
+  reviewing or listing the current directory's session. `oak stats` and `oak usage` read `--session=<id>`
+  too, with the checks `--session <id>` gets; they ignored it, an unsafe id included, and exited with
+  status 0. In both, and in `oak clean`, an empty `--session=` and a bare `--session` now fail with
+  "`--session` requires a session id": `oak clean --session=` cleaned the whole store, and in `oak stats`
+  and `oak usage` a bare `--session` read the current directory's session, or took the flag after it,
+  such as `--json`, as the session id.
+- A herdr tab keeps following its session's title when the terminal app's tab pass and the session's
+  own tab sync save their records at the same moment. The pass could erase the claim the sync had just
+  written, and the tab then kept that title. When the title changed twice while a pass ran, the pass
+  could also rename the tab back to the older title after the sync had named it, and the tab kept that.
+- The status line no longer shows last week's `fable` share beside this week's countdown when the
+  account's usage has not been read since the weekly reset; the terminal app and both editors already
+  left it out. JetBrains' Stats panel lists the `fable` cap on a plan with no `5h` and `wk` windows,
+  as VS Code's panel, the terminal app and the status line do.
+- The Claude Code status line no longer shows `5h —` or `wk —` when its session has sent no share for
+  that window since the window reset but this machine has already measured one for the current window.
+  The line now shows the share its own read of the account's usage returned, else the one another
+  session or an earlier read measured inside the window, with the same bar, figures and countdown as a
+  share from the session; a share measured before the window began is still not shown. A share the
+  status line reads from the account's usage is now dated by when its render began, not when the render
+  finished: one read just before its window reset, by a render that ended after the reset, counted as
+  the next window's, in the terminal app and both editors as well. A window at 0% with no figures to
+  show, such as the `fable` cap of a model not used this week, reads `~0` inside its bar instead of an
+  empty bar, as the month at 0% reads `~0/` its budget. `oak update` or `oak statusline` refreshes an
+  installed status line.
+- The Claude 5-hour and weekly shares no longer drop to an idle session's old share. Every Claude Code
+  session redraws its status line every minute, idle or not, and a session idle for days sends the shares
+  of its last reply: the status line drew them, recorded them as measured that minute over the share
+  another session had just measured, and OAK's readouts and the saved machines that read this one showed
+  them (`wk: 0%` beside a week at 49%). The status line now dates each share: one a session sends by that
+  session's last reply, or by its newest subagent's when that is later, its own read of the account's
+  usage by the moment it reads it, and the one already recorded by the time it was measured. Each window
+  shows, and records with its own date, the most recent of them, so a share from an idle session no longer
+  replaces a newer one, also when two sessions redraw at the same moment; a share that falls within a
+  window, as after a plan upgrade or a limit promotion, still shows once the account or a session reports
+  it. A share measured more than five minutes before the line is drawn no longer calibrates the token
+  estimate. `oak update` or `oak statusline` refreshes an installed status line.
+- A 5-hour window whose reset has passed now reads `0%` with no countdown in the status line, the
+  terminal app, both editors, `oak usage --json` and the reading saved machines take of this one, until
+  a session or the account's usage reports a newer window. The token estimate and the cache reads
+  (`+30M↺`) shown beside it were the ended window's, and are left out. A 5-hour window starts only with
+  the first message after the last one ended, so the countdown rolled forward from the last reset named a
+  window that did not exist: after a night with no use the readouts showed `5h: 0% 48m` for a window that
+  had begun a minute earlier and would reset in five hours. A share above 0 measured after the last reset
+  by a Claude Code that sends no reset with it, as 2.1.263 did, still gets its countdown estimated from that
+  reset; the weekly windows run on a fixed schedule and still roll forward. `oak update` or
+  `oak statusline` refreshes an installed status line.
+- GPT's 5-hour window, once the reset Codex reported has passed with no newer reading, reads `0%` with no
+  countdown in the terminal app, both editors and `oak usage --json`, as Claude's does. It was left out,
+  and its slot with it. A newer reading is one any session on this machine took: a Codex session named in
+  a Stats panel whose own window has ended, or the session written to last, shows the window another
+  session has open. A plan whose Codex reports no 5-hour window, only the weekly one, still shows none.
+- A GPT window whose reset Codex reports only as the seconds left in it (`resets_in_seconds`, which older
+  Codex versions write in place of `resets_at`) now resets that many seconds after the reading was taken.
+  It was read as having no reset, so its share stayed, with no countdown, in the terminal app, both editors
+  and `oak usage --json` after the window had reset: `40%` two hours after a reset that was ten minutes
+  away when the reading was taken. Once that reset passes, the 5-hour window reads `0%` with no countdown
+  and the weekly one is left out, as when Codex reports the reset's time; until then each shows its
+  countdown. The weekly window's tokens, and the month's budget and share estimated from them, count from
+  the start of the week that reset ends, as when Codex reports the reset's time, and `oak usage --breakdown`
+  divides Codex's weeks there; they counted the last seven days.
+- The status line's cache reads beside a new 5-hour window are that window's from its first redraw. They
+  were the last window's (`+30M↺` beside a window a minute old) until the next scan, up to ten minutes
+  later. `oak update` or `oak statusline` refreshes an installed status line.
+- In both editors' Stats panels, a window at 0% reads `~0`, as the status line reads it: against its
+  budget where it has one (`~0/` the budget), and alone where it has none yet. That is Claude's 5-hour,
+  weekly, `fable` and month rows, and GPT's 5-hour, weekly and month rows. The used column was empty, and
+  on the 5-hour and weekly rows the budget too.
+- The status line keeps the weekly and `fable` shares of an account usage answer that reports no 5-hour
+  window, which it dropped whole. `oak update` or `oak statusline` refreshes an installed status line.
+  OAK's own read of the account's usage records an answer whose 5-hour window has no reset (no window
+  running) as the status line does: the 5-hour share
+  as 0, measured at that read, beside the reset already recorded, so the terminal app, both editors,
+  `oak usage --json` and the status line read a 5-hour window whose reset has passed as ended, `0%` with
+  no countdown. The read recorded the share the answer gave beside no reset, or kept the share recorded
+  before, and a share above 0 measured after that reset was read as the current window's, with a
+  countdown estimated from it (`7% ·4h 0m` in the status line, for a window that had ended an hour before).
+  The status line's own read of such an answer now ends that window too, where it kept such a share and
+  its countdown. A 5-hour reset already recorded that is still ahead keeps the share recorded beside it, in
+  both reads, as the status line's own read kept it. An answer with no 5-hour window at all is an account
+  with no five-hour limit, which shows no 5-hour readout (under Changed).
+- Two Claude Code sessions redrawing their status lines at the same moment no longer break the record the
+  status line keeps of the usage shares and of the spend each session reported. Both wrote it through one
+  temporary file, which could leave it unreadable; the next redraw then started it over, and the shares
+  and the spend it held, which OAK's spend totals add up, were lost. `oak update` or `oak statusline`
+  refreshes an installed status line.
+- Two Claude Code sessions redrawing their status lines at the same moment no longer undo each other's
+  readings in that record. Each redraw rewrites the whole record from a copy it read a moment before, so of
+  two redraws started together, the one that finished last put back what the other had just recorded: an
+  idle session's redraw restored the older 5-hour and weekly shares with the times they were measured, and
+  dropped the spend the other session had just reported until that session's next redraw. A redraw now
+  reads and rewrites the record under a lock, which it waits about a second for; when another redraw holds
+  it longer, it records nothing that time, and the next redraw, a minute later, records what it would have.
+  Its line is drawn either way. A lock left by a redraw that was killed is taken over once it is five
+  seconds old, and one the redraw cannot remove (another user's, as a redraw run under `sudo` leaves it) is
+  renamed aside. OAK's own read of the account's usage, which records into the same file, takes this lock
+  too and waits for it the same way, so a read and a redraw finishing together no longer undo each other's
+  readings either; a read that cannot have the lock records nothing, and the next read records the
+  account's usage. `oak update` or `oak statusline` refreshes an installed status line.
+- The status line removes the temporary files that redraws killed while recording their readings leave
+  beside its record (`statusline-last.json.tmp.` followed by a number), and the stale locks it renamed
+  aside, once they are more than two minutes old; nothing removed them before. Only the redraw that holds
+  the record's lock removes them, and a redraw writes its own file only while it holds that lock. A renamed lock
+  that your user cannot remove, such as one a redraw run under `sudo` left, stays. `oak uninstall --all`
+  removes them by the same rule. `oak update` or `oak statusline` refreshes an installed status line.
+- On a plan with no `5h` and `wk` windows, VS Code's Stats panel reads the month's share, budget and
+  cache reads, and the `$` row's share and projected total, as JetBrains' panel does. It showed only the
+  month's token count (`~0` before any use), and kept a `$` row with no spend to show.
+- A Codex session that Codex has not named yet is titled by its first prompt's first phrase up to a comma
+  as well, so a long first sentence no longer becomes the whole title. The comma counts like the other
+  clause breaks: only when the phrase before it has at least two words and 12 characters. A first
+  sentence that ends within 64 characters is kept whole rather than cut at a clause break inside it,
+  so "In packages/core, fix the parser." is not shortened to "In packages/core".
+- In the terminal app, `ctrl+c` while `e` has handed the terminal to an editor that keeps it in its
+  line mode stops that editor, not the app. The terminal sends `ctrl+c` to every process of the job, so
+  the app quit while the editor still had the terminal. The status row then says the editor was stopped.
+- Started in a folder with no session of its own, the terminal app's Observatory lists every session,
+  as it does from a folder with one, and Review says it has nothing to review. The Observatory listed no
+  session there, while its status row said it listed every session, and Review's windows said
+  `building…` for good; `oak tui --once` did the same.
+- The installers, `oak update` and `oak doctor --fix` add herdr's sidebar widths and gruvbox theme to a
+  `config.toml` that writes its `ui` or `theme` table as dotted keys (`ui.status_indicators = …`) or as
+  an inline table (`ui = { … }`), in that same form, and under a `[ui]` header written with spaces or
+  quotes. They added a second `[ui]` or `[theme]` table, which herdr refuses, so OAK put the file back
+  and warned on every run. A `[ui]` line inside a multiline string, such as a custom command's script,
+  is no longer taken for the table: the widths went into the string, and herdr got none. The file's own
+  line endings are kept.
+- When herdr refuses its `config.toml`, the warning from the installers, `oak update` and
+  `oak doctor --fix` gives herdr's reason (`unknown config key ui.bogus; ignoring key`). It quoted the
+  `config: issues found` line herdr prints first.
+- In a workspace with no session of its own, the terminal app's session picker lists this machine's
+  sessions. It said it could not list them (`view sessions exited 1`), because it named the session
+  as an empty `--session`, which the CLI refuses.
+- A paste in the terminal app, the terminal's own or `ctrl+v`, goes into the `:` palette, the `?`
+  help's `/` filter and the Diff's find, as typing does. It was dropped.
+- The terminal app reads `F1` to `F5` as the Linux console sends them (`ESC [[A` to `ESC [[E`). They
+  arrived as their last letter: `F1` was `A`, which asks to keep everything on Review.
+- An F-key in the terminal app that names no window or pane says so: `F8` to `F12` on Review, and
+  on the Observatory an F-key past its last pane. They did nothing.
+- After Refresh the terminal app's status row says `refreshed` once the new read has landed. It kept
+  saying `refreshing…` until another message replaced it.
+- The terminal app's screenshots and the site's terminal demo no longer draw a coloured cell over the
+  top of the row below it, which hid the top of herdr's second row under OAK's tab labels. A coloured
+  run of text now paints exactly one row, as it does in the terminal. The rows are also as tall as the
+  letters, so the tail of a letter such as y or g is no longer cut off by the row below, and the pane
+  borders stay joined: the demo names DejaVu Sans Mono and Noto Sans Mono before the browser's own
+  monospace, which can be a font whose `│` is shorter than those rows, such as Ubuntu Mono or FreeMono.
+  The demo on the terminal app's docs page also shows the frame on the terminal's dark background rather
+  than the page's light code box.
+- In the terminal app, a drag across the status row, the usage bar or the key row copies the text
+  there, on the Observatory, Review and herdr tabs, as a drag in a pane does: the drag highlights the
+  text it covers, and the release copies it. Those rows could not be copied, and on the herdr tab a
+  press there reached nothing. The status row is cut at the terminal's edge rather than wrapped, so a
+  drag that starts in the status text and reaches that edge, or goes on past the row, copies the rest
+  of the status too, and a drag that starts in a toast on the row copies the toast as it shows. When
+  the rows move under a drag before its release (the status row goes when its toast runs out or when
+  the press clears herdr's prefix note), nothing is copied, and a toast says so. Only the left button
+  selects there, a click still does nothing, and on the herdr tab nothing of such a drag reaches herdr.
+- In the terminal app, a drag still held when the terminal changes size, in a pane or on the rows at
+  the bottom, ends there: nothing is copied, and a toast says so. Its release copied whatever the
+  resize had moved under it.
+- In the terminal app, each of OAK's copies says how it went in a toast that goes after a few seconds:
+  what it copied, as before, or why it copied nothing (a drag over blank space alone, rows that moved
+  under the drag, a resize, a copy too large to make, tmux or a clipboard tool that did not finish in
+  ten seconds). A drag over blank space and a copy too large to make said so on the status row until
+  something else replaced it, on the herdr tab over herdr's last row, and a later copy's toast showed
+  beside it. A copy too large to make on a terminal of this machine names the clipboard tools that ran
+  and failed (with no display to copy to, say) and which to install, of those not installed; it said
+  to install wl-copy or xclip whatever had failed. When the status row is too narrow for a toast and
+  the message beside it, that message takes the row in the toast's place if it is a question, a status
+  message other than `ready` said after the toast, or the error of a keep, undo, redo or resolve that
+  failed after it; the toast cut or hid it. On Review, `selecting — release to copy` goes when the drag
+  ends, and `y` with nothing to copy still says so on the status row, as `e` does with nothing to open.
+- On the terminal app's herdr tab, what herdr copies reaches the clipboard of the terminal OAK runs
+  in. herdr copies a selection in its pane, and passes on what a program in its pane copies, with the
+  system's clipboard tool where it has one (pbcopy on macOS, wl-copy, xclip or xsel on Linux), and
+  otherwise, or over ssh, in VS Code's terminal or in WSL, as an OSC 52 sequence, which OAK's herdr tab
+  dropped. Such a copy now goes on as OAK's own copies do: OSC 52 to the terminal, tmux's buffer inside
+  tmux, and on a local terminal the system's clipboard tool for one too large for OSC 52. herdr says
+  that it copied, so OAK adds no toast of its own unless the copy cannot be made: for one too large, a
+  toast says that herdr's copy is too large for the terminal, and on this machine which clipboard tools
+  ran and failed and which to install, as for OAK's own copies. One tmux or clipboard tool runs at a time,
+  so a program that writes the clipboard on every change does not start one for each write: the
+  newest text waiting goes next. A tool that has not finished in ten seconds is stopped, so the copies
+  after it wait no longer than that, and a toast names it and says that nothing was copied. A
+  program's request to read the clipboard is never passed on or answered.
+- On the terminal app's herdr tab, a drag in herdr's pane released over OAK's rows below it, or over
+  OAK's tab bar, ends in herdr, on the nearest row of its screen that OAK shows: herdr finishes the
+  selection and copies it, and a program in the pane that reads the mouse gets the release. herdr got
+  the press and the motion but never the release, so its selection stayed highlighted and nothing was
+  copied, and such a program was left with a button that never came up. While the status row shows a
+  message, OAK's divider covers herdr's last row: such a drag no longer selects that hidden row, and a
+  click on the divider no longer reaches it.
+- On the terminal app's herdr tab, a mouse button still down in herdr's pane is let go there, where it
+  last was, when you leave the tab (herdr's prefix, then `m`) or press another button on OAK's rows or
+  tab bar: herdr kept its selection up, and a program in the pane that reads the mouse was left with its
+  button down. A drag of OAK's own still held when the tab changes ends there, and the selection Review
+  keeps after a drag goes with its tab: let go, or copied again with `ctrl+c`, on the next tab, they
+  took that tab's text. herdr's prefix pressed during a drag in its pane goes on to herdr before the
+  drag's release when that is let go over OAK's rows.
+- A drag in the terminal app that ends on a letter followed by a combining accent copies the accent too:
+  `café` written with a combining accent copied as `cafe`. One that covers any part of an emoji built
+  from several, such as a family, a flag or one with a skin tone, copies and highlights all of it, and
+  text coloured with escapes written with colons (`ESC[38:2::255:0:0m`) copies without them. The toast
+  after a copy, and `ctrl+v`'s `pasted` count, count a letter and the combining accents after it as one
+  character, and so an emoji, and say `1 char` for one; they counted UTF-16 code units, so an emoji or
+  such an accented letter counted as two. An emoji built from several, such as a flag, one with a skin
+  tone or a family, is one character too.
+- The terminal app's status row shows the line breaks and other control characters in a message as
+  spaces, and passes no escape sequence but colour, under the help, a picker or the options too, and
+  in a toast, which can carry a session's title. A herdr error line not in Rust's debug form came
+  through as it was written: a line break in it broke the row in two, and an escape sequence from a
+  saved machine's ssh could clear the screen.
+- OAK shows a herdr failure as herdr's own message: the terminal app's status row and Observatory,
+  `oak doctor`, the CLI, and VS Code's and JetBrains' messages. herdr ends a failed command with
+  Rust's debug form of the error, which all of them showed as it came: `Error: Custom { kind:
+  ConnectionAborted, error: "machine 'build-box' (session default): remote SSH connection failed: …"
+  }`. A line in that form, `Error: Custom { … }`, now reads as its message, `machine 'build-box'
+  (session default): remote SSH connection failed: ssh: connect to host build-box port 22: Operation
+  timed out`, with the lines of a longer message joined by ` — `; herdr's lines in any other form are
+  kept as they are, and so is the line when its message is empty. `oak doctor` no longer puts
+  `HerdrError:` before such a failure, and VS Code's `Prompt failed:` message no longer starts with
+  it.
+- While a saved machine cannot be reached, the terminal app no longer writes herdr's error over the
+  status row on every pass. The review count it sends herdr for each session pane on that machine
+  failed and was sent again on every pass, each time waiting out the connection timeout, and each
+  failure replaced the status row. The failure is shown where the machine is: in the Observatory,
+  which marks the machine once its own read of it fails, in herdr's sidebar on the herdr tab, and in
+  `oak doctor`. The counts for that machine wait 15 seconds before they are sent again, then twice as
+  long after each failure, up to two minutes, and that wait starts again from 15 seconds when the
+  machine is removed or disabled in herdr and added again. Any other failure of that count, or of the
+  report that tells herdr which session runs in a pane, is shown once rather than on every pass, and
+  waits the same way. A saved machine whose herdr is too old to forward OAK's commands is such a
+  failure, on every herdr version, though herdr 0.9.2 and later word it as a failure to find herdr
+  there, and `oak doctor` now says to update herdr on that machine, where it said to check ssh access
+  to it. A conversation pinned from a saved machine that cannot be reached shows its Workers read's
+  failure once, and once more each time its pane is opened again; it wrote that failure over the
+  status row on every read. Each of these failures leaves the status row once what failed works again,
+  or once the pane whose Workers read failed is closed, unless the row has said something else since;
+  it stayed there after the machine was back. Another count or read still failing in the same words
+  says them again at its next failure.
+- A session's title, an ask, a search excerpt or a label cut to fit no longer splits a character: the
+  terminal app's session picker showed a family emoji cut at a title's 64th character as `👨‍👩‍�…`, half
+  of the family and half of the next emoji. Every such cut now ends where a character does, never inside
+  an emoji built from several (a family, a flag, one with a skin tone, a keycap) or between a letter and
+  its combining accents: the titles, asks, excerpts and actions core gives every surface, and in the
+  terminal app each row fitted to its width, each wrapped line, the columns a sideways pan shows, and
+  what a drag highlights and copies; the Observatory's reply box moves over and deletes a character
+  whole, and backspace in the filter, the session picker's search, the palette, the help's search, the
+  diff's find and an option's text takes one back whole. VS Code and JetBrains cut their own labels the
+  same way: a diff's title, the removed lines' ghost text, the folder counter, and JetBrains' feed rows,
+  asks and Map labels. A title cut by an earlier version is read again from its transcript. So does a
+  cut to a size with no `…`: what `ctrl+v` pastes past its half-megabyte limit, the asks and answers
+  the conversation search keeps, a hook's oversized value, the label a workflow's agent takes from its
+  prompt, the targets, descriptions and reasoning `oak actions`, `oak risk`, `oak processes`,
+  `oak subagents` and `oak insights` cut to fit, the message of a failed title or quota read, and the
+  error output a JetBrains notification shows. `ctrl+v` also reads the clipboard tool's output as one
+  stream: a character whose bytes two reads split came out as replacement characters.
+- In the terminal app, the session picker highlights the whole selected row, as the other lists do.
+  On a session with edits the highlight stopped after the session's time, because the colours in the
+  row ended it, and a file row in Traces kept it only on its fold arrow.
+- On Windows, the programs OAK runs no longer open console windows: herdr's commands when OAK installs
+  or checks herdr, the herdr server it starts, ssh, and every other command run by a refresh in the
+  background, by VS Code or by the CLI a JetBrains IDE runs. A console program started by a process with
+  no console of its own, such as VS Code's extension host or a background refresh, opened a window of its
+  own for as long as it ran. An editor or the file manager that OAK opens still shows its window, and
+  the ssh and scp of `oak machine add`, a `--machine` command and `oak update` share the command's
+  own console, where a jump host's ssh asks its questions.
+- The terminal app's Observatory shows a Codex agent that asked a question and kept working as
+  working, with `? question` beside it in the waiting colour, in its session row and the conversation
+  header. It showed blocked: Codex titles its terminal Action Required while a question waits, and herdr
+  reports a pane with that title as blocked even while Codex's turn goes on. OAK now reads the session's
+  Codex rollout, and shows such a pane as working while the rollout's last turn has started and not
+  ended, no permission prompt is waiting, and either the rollout was written within the last 90 seconds
+  or the pane's screen shows Codex's running timer (`Working (5m 2s • esc to interrupt)`) above its
+  prompt. A long command writes nothing to the rollout while it runs: once the rollout has been quiet
+  for 90 seconds, OAK reads the pane's visible screen through herdr, and again every 15 seconds while it
+  stays that way. A turn that has ended, one gone quiet with no timer on screen, a Claude Code pane, and
+  every other state show as herdr reports them, and herdr's own sidebar is unchanged. The reply box still
+  waits for the answer in herdr and says so (`Question waiting · answer in herdr`): herdr refuses to send
+  to a pane it reports as blocked, and Codex takes the answer in its own question view. In
+  `oak sessions --json`, a Codex session active in the last two hours has a `turnOpen` field, true while
+  its last turn is running.
+- When `oak prompts` lists nothing for a session, the Prompts tab in VS Code and JetBrains and the terminal app's
+  Prompts screen show the CLI's reason (such as "no transcript found for this session under this directory"). They
+  said the CLI on PATH was older than 0.8.8 and had no `prompts` command.
+- The Timeline in VS Code shows one header per column, or per tab, with the count and its unit (`25 edits`). With
+  Group tabs on, each column repeated its header inside it (`OBSERVATIONS 25`, then `OBSERVATIONS 25 edits`). Moved to
+  another panel, the Timeline's title reads "OAK: Observatory Timeline"; in Cursor it read "Observatory Timeline:
+  Observatory Timeline".
+- The Timeline's labels in VS Code wrap between words, so "Context" no longer breaks inside the word. The Feed's
+  first row is no longer hidden under the line above the list; a shadow marks the edge once the list is scrolled.
+- Text OAK reads from a pane, a transcript or a configuration file can no longer stall it. Reading a Codex pane's
+  status row, a model name, a shell's output, a git remote, a mount table or an `oak sync` key took time that grew
+  with the square of the input's length, or exponentially for a Codex screen; each now takes linear time and reads the
+  same text the same way. `oak agent setup` refuses a plan that names `__proto__` or another built-in property as an
+  agent, instead of writing into a shared object.
+
 ## [0.10.0] — 2026-09-28
 
 **claude-observatory is now OAK.** The command is `oak`, the npm package is `oak-observatory`, the

@@ -58,7 +58,7 @@ class NavGroupingTest {
     private companion object {
         val ChangeMapPanelMembers = listOf(
             NavGrouping.SESSIONS, NavGrouping.FLEET,
-            NavGrouping.WORKFLOWS, NavGrouping.TASKS, NavGrouping.PROCESSES,
+            NavGrouping.PROCESSES, NavGrouping.TASKS, NavGrouping.WORKFLOWS,
         )
     }
 }

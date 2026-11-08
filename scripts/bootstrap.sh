@@ -65,7 +65,15 @@ case "$CHANNEL" in
   *) warn "unknown channel \"$CHANNEL\" — use stable or dev"; exit 1 ;;
 esac
 
-command -v npm  >/dev/null 2>&1 || { warn "npm not found — install Node.js 20+ first."; exit 1; }
+command -v npm  >/dev/null 2>&1 || { warn "npm not found — install Node.js 24 or newer first."; exit 1; }
+# OAK needs Node.js 24 or newer (core runtime.ts INDEX_NODES): its local index uses the SQLite built into Node, with
+# full-text search.
+node_v="$(node -v 2>/dev/null || true)"; node_major="${node_v#v}"; node_major="${node_major%%.*}"
+case "$node_major" in ''|*[!0-9]*) node_major=0 ;; esac
+if [ "$node_major" -lt 24 ]; then
+  warn "OAK needs Node.js 24 or newer, and this is Node.js ${node_v:-(none found)}. Install it and re-run."
+  exit 1
+fi
 command -v curl >/dev/null 2>&1 || { warn "curl not found — install curl first."; exit 1; }
 
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT

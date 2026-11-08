@@ -6,7 +6,7 @@
  * plain property (a spread does exactly that, silently), every tab shares one workspace and the
  * product looks like tab switching does nothing.
  */
-const assert = require('node:assert');
+const assert = require('node:assert/strict');
 
 // The accessor pattern itself, exercised the way app.ts builds it. This is a MODEL of the runtime
 // wiring rather than a reach into it — `runTui` needs a TTY, a store and a backend to construct.

@@ -14,7 +14,6 @@ import com.intellij.notification.Notifications
 import com.intellij.openapi.actionSystem.AnAction
 import com.intellij.openapi.actionSystem.AnActionEvent
 import com.intellij.openapi.actionSystem.impl.SimpleDataContext
-import com.intellij.testFramework.fixtures.BasePlatformTestCase
 import java.awt.Container
 import java.awt.event.MouseEvent
 import java.awt.image.BufferedImage
@@ -30,7 +29,7 @@ import javax.swing.JList
  * file-manager reveal is stubbed, so each test sees exactly which folder a click asked for and no run
  * spawns a real file manager; the CLI is pointed at /bin/false, so no panel reads the real store.
  */
-class StoreFolderRevealTest : BasePlatformTestCase() {
+class StoreFolderRevealTest : ObservatoryPlatformTestCase() {
 
     private lateinit var cfg: Path
     private lateinit var realOpen: (File) -> Unit

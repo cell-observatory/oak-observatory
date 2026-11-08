@@ -3,8 +3,15 @@
 <h2>Where it lives</h2>
 <p>In the editors, the Timeline’s <strong>Feed</strong> tab is the one conversation surface: for the selected session it carries your prompts, the agent's replies and thinking, and every tool call, read from the native transcript; for a worker, run, task or shell picked in the Overview it carries that thing's own activity. In the terminal, conversation and activity are part of Observatory’s detail.</p>
 
+<h2>Worker logs</h2>
+<p>Pick a worker in the Overview’s Sessions or Workers list to open its own live log in the Timeline’s Feed panel, in both VS Code and JetBrains. In the terminal app, click or press Enter on the worker to open its log in the Observatory detail pane. In-process workers have no herdr tab: those tabs run an agent’s own CLI and chatbox.</p>
+<pre><code>oak feed --kind agent --id &lt;worker&gt; --session &lt;parent&gt; --follow
+# A worker on a saved machine:
+oak feed --kind agent --id &lt;worker&gt; --session &lt;parent&gt; --follow --machine &lt;label&gt;</code></pre>
+<p>The local command watches the worker log and the files that record completion, with a file check every two seconds as a fallback. An unchanged file costs no transcript read. On a saved machine, it asks that machine’s OAK over SSH every ten seconds, with one read at a time. The panels use the same machine and session as the worker’s row. Connection errors are shown in the log panel.</p>
+<p>When completion is recorded, the log says <code>Worker ended at …</code> with the exact UTC timestamp and the follow command exits. Silence alone never supplies an end time. Open panels keep the finished log and update again if the worker resumes. <code>--json --follow</code> emits one JSON snapshot per line, with <code>endedTs</code> as milliseconds since the epoch on the last snapshot. <code>--limit</code> sets the initial tail; every new entry after that is included, even when many arrive together. Ctrl+C stops the command.</p>
 <h2>Live, then an audit log</h2>
-<p>While the source is still being written, the feed is <strong>live</strong>: it is polled, and its header stamps the exact time of the newest evidence rather than claiming real time. Once the source stops, the same view is an <strong>audit log</strong> — a record, not a stream — and polling stops. The distinction is honest: OAK never claims real-time when it is polling a file.</p>
+<p>While the source is still being written, the feed is <strong>live</strong>: it is polled, and its header stamps the exact time of the newest evidence rather than claiming real time. Once completion is recorded, the same view is an <strong>audit log</strong>. A worker panel checks for resumed activity; the follow command exits. The distinction is honest: OAK never claims real-time when it is polling a file.</p>
 
 <figure><img src="media/feed.png" loading="lazy" alt="The Timeline Feed tab: the user's prompt on a grey band, the agent's reply and a folded thought, then one bordered entry per tool call with its time, a shell call rendered as a command and an edit's diff as background bands, headed by the selection it follows"><figcaption>The feed, in the Timeline Feed tab — live while it runs, an audit log once it stops.</figcaption></figure>
 

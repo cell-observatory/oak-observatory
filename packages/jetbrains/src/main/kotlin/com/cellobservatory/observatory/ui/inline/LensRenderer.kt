@@ -33,6 +33,8 @@ class LensRenderer(
     private val delta: com.cellobservatory.observatory.model.Delta? = null,
 ) : EditorCustomElementRenderer {
 
+    private val machine = com.cellobservatory.observatory.services.ObservatoryService.getInstance(project).currentMachine()
+
     private class Seg(val text: String, val run: (() -> Unit)?) {
         var x0 = 0
         var x1 = 0
@@ -44,7 +46,7 @@ class LensRenderer(
         // Cancelled-out chains are not stops on either axis (the nav bar and the overlay both skip
         // them), so counting them here would print "edit 3/5" on a bar that steps two.
         val svc = com.cellobservatory.observatory.services.ObservatoryService.getInstance(project)
-        val log = StoreReader.readLog(session).filter { !svc.isHidden(it) }
+        val log = svc.reviewRecords().filter { !svc.isHidden(it) }
         val filePending = log.filter { it.file == rec.file && it.status == "pending" }.sortedBy { it.id }
         val editIdx = filePending.indexOfFirst { it.id == rec.id }
         val files = log.filter { it.status == "pending" }.map { it.file }.distinct().sorted()
@@ -63,9 +65,9 @@ class LensRenderer(
         // Reasoning is NOT shown here — it lives in the diff's title. Icons/spacing match VS Code.
         add(Seg("✦ #${rec.id}$churn$posLabel  view changes") { Diffs.show(project, session, rec) })
         add(Seg("      ", null))
-        add(Seg("✓ Keep") { ReviewOps.keep(project, session, rec.id) })
+        if (!rec.undone) add(Seg("✓ Keep") { ReviewOps.keep(project, session, rec.id) })
         add(Seg("      ", null))
-        add(Seg("✗ Undo") { ReviewOps.undoOrRedo(project, session, rec, redo = false) })
+        add(Seg(if (rec.undone) "↻ Redo" else "✗ Undo") { ReviewOps.undoOrRedo(project, session, rec, redo = rec.undone) })
         add(Seg("      ", null))
         // ❝ = a monochrome quotation/speech dingbat (matches the row's symbol style; NOT the 💬 emoji).
         add(Seg("❝ Chat") { ReviewOps.chatAbout(project, session, rec.id) })
@@ -137,5 +139,9 @@ class LensRenderer(
         return true
     }
 
-    fun actionAt(xInInlay: Int): (() -> Unit)? = segments.getOrNull(segmentAt(xInInlay))?.run
+    fun actionAt(xInInlay: Int): (() -> Unit)? {
+        val svc = com.cellobservatory.observatory.services.ObservatoryService.getInstance(project)
+        if (svc.currentMachine() != machine || svc.currentSession() != session) return null
+        return segments.getOrNull(segmentAt(xInInlay))?.run
+    }
 }

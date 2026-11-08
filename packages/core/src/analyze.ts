@@ -7,6 +7,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { spawnTool } from './spawn';
+import { graphemeHead, graphemeTail } from './graphemes';
 import { findRecord, readBlob, readLog, storeDir } from './store';
 import { summarize } from './observe';
 
@@ -154,7 +155,7 @@ function blobText(sessionId: string, sha: string | null): string {
 }
 
 function clip(s: string, n: number): string {
-  return s.length > n ? s.slice(0, n) + '…' : s;
+  return s.length > n ? graphemeHead(s, n) + '…' : s;
 }
 
 /** Try the cheap resume path first (Claude reuses its cached session context); on any failure —
@@ -174,7 +175,7 @@ async function runResumeOrFresh(
         { cwd: d.cwd ?? process.cwd(), stdio: ['pipe','pipe','pipe'] });
       let raw = '', err = '';
       const timer = setTimeout(() => { child.kill('SIGTERM'); reject(new Error('Codex analysis timed out')); }, opts.timeoutMs ?? 90000);
-      child.stdout.on('data', (b) => { raw += b.toString(); }); child.stderr.on('data', (b) => { err = (err+b.toString()).slice(-16000); });
+      child.stdout.on('data', (b) => { raw += b.toString(); }); child.stderr.on('data', (b) => { err = graphemeTail(err + b.toString(), 16000); });
       child.stdin.on('error', () => {});
       child.on('error', (e) => { clearTimeout(timer); reject(e); });
       child.on('close', (code) => {
@@ -256,10 +257,9 @@ export async function analyzeRecap(
   const ask =
     'In ONE sentence, what was I working on in this session and where did I leave off? ' +
     'Reply with ONLY that sentence — no preamble, no quotes, no markdown.';
-  const digest = readLog(sessionId)
+  const digest = graphemeHead(readLog(sessionId)
     .map((r) => summarize(sessionId, r))
-    .join('; ')
-    .slice(0, 4000);
+    .join('; '), 4000);
   const freshPrompt = `Here are the file changes made in a coding session:\n${digest}\n\n${ask}`;
   const raw = await runResumeOrFresh(ask, freshPrompt, sessionId, opts);
   const text = raw.trim().replace(/^["'`]|["'`]$/g, ''); // strip any wrapping quotes

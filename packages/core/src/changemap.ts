@@ -13,6 +13,7 @@ import * as path from 'path';
 import * as crypto from 'crypto';
 import { EditStatus, EditRecord, readLog, minOf, maxOf, logPath, readScopeOverrides, rootDir, isSafeSessionId } from './store';
 import { canonPath } from './paths';
+import { graphemeHead } from './graphemes';
 import { fileExt, fileCategory, type FileCategory } from './filetype';
 import { buildEditTree, EditTree, TreeEdit, TreeFolder, TreeFile } from './tree';
 import { reasoningByEdit, transcriptInsights, sessionViewTitle, sessionTitleParts, findTranscript, flagsFor } from './observe';
@@ -24,7 +25,8 @@ import { buildEgressReport } from './egress';
 import { projectSessionIds, listRepoSiblings, SiblingSession, isFoldedAge } from './fleet';
 import { parseWorkflows, workflowWindows, workflowForTs } from './workflows';
 import { taskSnaps, digest12 } from './tasks';
-import { sessionPrompts } from './prompts';
+import { sessionPrompts, PROMPTS_CACHE_VERSION } from './prompts';
+import { ASKS_CACHE_VERSION } from './asks';
 import { sessionProcesses } from './processes';
 import { cachedByFiles } from './fscache';
 import { derivedInventory, withDerivedInventory } from './derived';
@@ -381,7 +383,7 @@ function rollupModules(files: ChangeMapFile[]): ChangeMapModule[] {
 function firstLine(s: string, cap = 160): string {
   const l = s.split('\n').find((x) => x.trim()) ?? '';
   const t = l.trim();
-  return t.length > cap ? t.slice(0, cap - 1) + '…' : t;
+  return t.length > cap ? graphemeHead(t, cap - 1) + '…' : t;
 }
 
 /** Flatten the folder/file/class tree into (rel, class, edit) rows — the leaves the map places. */
@@ -453,6 +455,7 @@ function todoSnaps(transcriptPath: string): TodoSnap[] {
 }
 
 export function foldTodoFacts(out: TodoSnap[], o: any): void {
+  if (o?.type === 'api-request-blob') return;
   if (o.isSidechain === true) return; // a subagent's checklist is not the main plan
   const msg = o.message;
   if (!msg || msg.role !== 'assistant' || !Array.isArray(msg.content)) return;
@@ -956,7 +959,8 @@ export function taskEditIds(cwd: string, session: string, taskId: string): numbe
 // 8: a Codex session's summary.title is its own title (`codexSessionTitle`), no longer its first prompt
 //    read the Claude way — and a build still on 7 must not share (and rebuild) the same files (2026-09-24).
 // 9: summary.title is plain text — no markdown heading markers, no line breaks (`plainTitle`) (2026-09-24).
-export const MAP_CACHE_VERSION = 9;
+// Human queued deliveries are asks; replay blobs and meta notes are not.
+export const MAP_CACHE_VERSION = 10;
 
 /** (mtimeMs:size) for a file, or '' when it can't be stat'd. */
 /**
@@ -1233,6 +1237,47 @@ export function pruneStaleMaps(session: string): { removed: number; bytes: numbe
       out.bytes += size;
     } catch {
       /* unreadable or already gone — leave it */
+    }
+  }
+  return out;
+}
+
+/**
+ * `oak clean`'s sweep of one session's derived caches: `pruneStaleMaps`, and the other caches here whose NAME carries
+ * their version — the asks scan (`asks-v<N>.json`) and the prompts projection (`prompts-v<N>-<key>.json`) — of a version
+ * older than the one this build writes, which nothing in it reads. This build's own are live, and a newer version's are a
+ * newer build's. Never on the read path, where `pruneStaleMaps` also runs: an older build still running beside this one
+ * (an editor window not yet reloaded) reads and writes the version before, and taking it at every read made that build
+ * rebuild it at every read. What such a build writes again, the next clean takes again.
+ */
+export function pruneSupersededCaches(session: string): { removed: number; bytes: number } {
+  const out = pruneStaleMaps(session);
+  if (!isSafeSessionId(session)) return out;
+  const dir = path.join(rootDir(), 'changemap-cache', session);
+  let names: string[];
+  try {
+    names = fs.readdirSync(dir);
+  } catch {
+    return out; // no cache for this session
+  }
+  const versioned: [RegExp, number][] = [
+    [/^asks-v(\d+)\.json$/, ASKS_CACHE_VERSION],
+    [/^prompts-v(\d+)-[0-9a-f]{16}\.json$/, PROMPTS_CACHE_VERSION],
+  ];
+  for (const n of names) {
+    const older = versioned.some(([name, live]) => {
+      const m = name.exec(n);
+      return m !== null && Number(m[1]) < live;
+    });
+    if (!older) continue;
+    const p = path.join(dir, n);
+    try {
+      const size = fs.statSync(p).size;
+      fs.unlinkSync(p);
+      out.removed++;
+      out.bytes += size;
+    } catch {
+      /* already gone — leave it */
     }
   }
   return out;

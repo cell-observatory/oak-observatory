@@ -5,7 +5,7 @@
  * tab it was drawn over, a hover that reveals a model without inventing one, and a saved layout that
  * degrades to the defaults instead of to a blank frame.
  */
-const assert = require('node:assert');
+const assert = require('node:assert/strict');
 const path = require('node:path');
 
 const tui = require(path.join(__dirname, '..', 'dist', 'index.js'));
@@ -214,7 +214,7 @@ for (const rows of [24, 30, 44, 60]) {
   const { tabLabel, glyphs } = tui;
   const tab = { id: 'review', kind: 'panes', name: 'review', panes: panes(),
     session: 'fixture', autoTitle: 'A conversation title', agent: 'claude', phase: 'working', active: true };
-  assert.equal(tabLabel(tab, 2, glyphs('ascii')), 'review');
+  assert.equal(tabLabel(tab, 2, glyphs('ascii')), 'F3 review');
 }
 
 console.log('tabs: strip, row budget, hit test, hover, stored layout, native usage, fixed labels, and the blank-frame guard — all pinned');
@@ -259,30 +259,163 @@ const usageFixture = (over = {}) => {
 const usageRow = (state, width = 180) => tui.statuslineFor(state, width, tui.glyphs('ascii'), 'none', 1);
 
 // The account's per-model weekly cap (its "Fable" row) is detail, not a window of the bar:
-// the line is `5h · wk · mo` whatever the cap reports (a shared or a distinct reset, a
-// zero share, another model's name), and wk keeps its own countdown throughout.
-test('TUI usage: the bar is 5h · wk · mo with no per-model cap chip, and wk keeps its countdown', () => {
+// the line is `wk · mo` whatever the cap reports (a shared or a distinct reset, a
+// zero share, another model's name), and wk keeps its own countdown throughout. No bar shows the 5-hour
+// window, for any plan (the fixture has one).
+test('TUI usage: the bar is wk · mo with no 5h or per-model cap chip, and wk keeps its countdown', () => {
   const now = Date.parse('2026-09-19T12:00:00Z');
   const at = (ms) => tui.untilStr(ms, now);
-  const five = now + 3 * 3600000, week = now + 2 * 86400000 + 5 * 3600000, month = now + 10 * 86400000;
-  // The whole line, as the reader sees it with both providers (the 2026-09-24 screenshot's case: the
-  // cap reports the week's own reset).
+  const week = now + 2 * 86400000 + 5 * 3600000, month = now + 10 * 86400000;
+  // The whole line, as the reader sees it with both providers (a cap that reports the week's own
+  // reset).
   const state = usageFixture();
-  state.usageBoth.gpt = { five: { pct: null, resetMs: null }, week: { pct: 22, resetMs: now + 6 * 86400000 }, month: { pct: 33, resetMs: month } };
+  state.usageBoth.gpt = { five: { pct: 4, resetMs: now + 3600000 }, week: { pct: 22, resetMs: now + 6 * 86400000 }, month: { pct: 33, resetMs: month } };
   assert.equal(usageRow(state)[0].trimEnd(),
-    `✳ claude 5h: 12% ${at(five)} · wk: 71% ${at(week)} · mo: 50% ${at(month)}  |  ⬡ gpt wk: 22% ${at(now + 6 * 86400000)} · mo: 33% ${at(month)}`);
+    `✳ claude wk: 71% ${at(week)} · mo: 50% ${at(month)}  |  ⬡ gpt wk: 22% ${at(now + 6 * 86400000)} · mo: 33% ${at(month)}`);
   for (const over of [{ fableReset: week + 59000 }, { fableReset: week + 86400000 }, { fablePct: 0 }, { fablePct: 12, fableLabel: 'Opus' }]) {
     const [line] = usageRow(usageFixture(over));
-    assert.ok(line.includes(`claude 5h: 12% ${at(five)} · wk: 71% ${at(week)} · mo: 50% ${at(month)}`), line);
-    assert.doesNotMatch(line, /Fable|Opus/, line);
+    assert.ok(line.includes(`✳ claude wk: 71% ${at(week)} · mo: 50% ${at(month)}`), line);
+    assert.doesNotMatch(line, /Fable|Opus|5h:/, line);
   }
-  // Compacted for a narrow terminal: the same three windows, without their countdowns.
-  assert.match(usageRow(usageFixture(), 44)[0], /claude 5h: 12% · wk: 71% · mo: 50% *$/);
+  // Compacted for a narrow terminal: the same windows, without their countdowns.
+  assert.match(usageRow(usageFixture(), 34)[0], /^✳ claude wk: 71% · mo: 50% *$/);
+  // A GPT reading with a 5-hour window alone has nothing for the bar, so it draws no gpt group, as the editors hide it.
+  state.usageBoth.gpt = { five: { pct: 4, resetMs: now + 3600000 }, week: { pct: null, resetMs: null }, month: { pct: null, resetMs: null } };
+  assert.equal(usageRow(state)[0].trimEnd(), `✳ claude wk: 71% ${at(week)} · mo: 50% ${at(month)}`);
+});
+
+// The month ends with its dollar figure, after its reset, as core's monthUsd writes it (the Claude Code status line's
+// text): `~` where it is the estimate at list prices, none where it is the charge Claude Code reported. No figure,
+// nothing drawn (the test above).
+test('TUI usage: the month ends with its dollar figure, for Claude and GPT', () => {
+  const now = Date.parse('2026-09-19T12:00:00Z');
+  const at = (ms) => tui.untilStr(ms, now);
+  const week = now + 2 * 86400000 + 5 * 3600000, month = now + 10 * 86400000, gweek = now + 22 * 3600000;
+  const state = usageFixture();
+  state.usageBoth.claude.month.usd = '~$10.0k';
+  state.usageBoth.gpt = { five: { pct: 4, resetMs: now + 3600000 }, week: { pct: 9, resetMs: gweek }, month: { pct: 2, resetMs: month, usd: '~$13' } };
+  assert.equal(usageRow(state)[0].trimEnd(),
+    `✳ claude wk: 71% ${at(week)} · mo: 50% ${at(month)} ~$10.0k  |  ⬡ gpt wk: 9% ${at(gweek)} · mo: 2% ${at(month)} ~$13`);
+  // Compacted, the countdowns go and the figures stay; narrower still, the figures go before any is cut short.
+  assert.match(usageRow(state, 70)[0], /^✳ claude wk: 71% · mo: 50% ~\$10\.0k  \|  ⬡ gpt wk: 9% · mo: 2% ~\$13 *$/);
+  assert.match(usageRow(state, 64)[0], /^✳ claude wk: 71% · mo: 50%  \|  ⬡ gpt wk: 9% · mo: 2% *$/);
+  // A plan with no rolling windows (pay-as-you-go API): the month is its charge alone.
+  state.usageBoth.claude = { five: { pct: null, resetMs: null }, week: { pct: null, resetMs: null }, month: { pct: null, resetMs: null, usd: '$12' } };
+  state.usageBoth.gpt = null;
+  assert.equal(usageRow(state)[0].trimEnd(), '✳ claude mo: $12');
+});
+
+// Where this machine had no current share, the readout is a saved machine's reading of the account, and says so.
+test('TUI usage: a reading from a saved machine names that machine after the provider, at every width', () => {
+  const now = Date.parse('2026-09-19T12:00:00Z');
+  const at = (ms) => tui.untilStr(ms, now);
+  const week = now + 2 * 86400000 + 5 * 3600000, month = now + 10 * 86400000;
+  const state = usageFixture();
+  assert.match(usageRow(state)[0], /^✳ claude wk: 71%/, 'control: this machine\'s own reading names no machine');
+  state.usageBoth.claude.machine = 'build-box';
+  assert.equal(usageRow(state)[0].trimEnd(), `✳ claude (build-box) wk: 71% ${at(week)} · mo: 50% ${at(month)}`);
+  assert.match(usageRow(state, 46)[0], /^✳ claude \(build-box\) wk: 71% · mo: 50% *$/, 'compacted, it keeps the name');
+  state.usageBoth.claude.machine = 'build-box: wk';
+  assert.match(usageRow(state)[0], /^✳ claude \(build-box: wk\) wk: 71% /, 'a machine that supplied some windows names them');
+  // Where the name and every window cannot share the row, the name gives up its room first: no window loses its
+  // share, with GPT's on the row too, and the reading still says it is another machine's.
+  state.usageBoth.claude.machine = 'gpu-build-server-in-the-basement-lab-rack-7';
+  for (const width of [40, 50]) {
+    const [row] = usageRow(state, width);
+    assert.match(row, /^✳ claude \(gpu-[^)]*\) wk: 71% · mo: 50% *$/, `${width} columns: ${row}`);
+  }
+  state.usageBoth.gpt = { five: { pct: 4, resetMs: null }, week: { pct: 37, resetMs: null }, month: { pct: 12, resetMs: null } };
+  for (const width of [64, 80]) {
+    const [row] = usageRow(state, width);
+    assert.match(row, /^✳ claude \(gpu-[^)]*\) wk: 71% · mo: 50%  \|  ⬡ gpt wk: 37% · mo: 12% *$/, `${width} columns: ${row}`);
+  }
+});
+
+// The bar shows wk and mo, and names a saved machine by those windows alone; the machine's herdr label shows
+// without its hidden characters. Drawn from core's own reading of a saved machine's cache, as the app reads it.
+test('TUI usage: the bar names a saved machine only for the windows it shows, by a label with nothing hidden in it', () => {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const crypto = require('node:crypto');
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-tabs-usage-'));
+  const was = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE, CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR };
+  const put = (file, value) => { fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(`${file}.tmp`, JSON.stringify(value)); fs.renameSync(`${file}.tmp`, file); };
+  try {
+    process.env.HOME = process.env.USERPROFILE = home;
+    process.env.CLAUDE_CONFIG_DIR = path.join(home, '.claude');
+    const now = Date.now(), nowS = Math.floor(now / 1000);
+    put(path.join(home, '.claude', '.claude.json'), { oauthAccount: { accountUuid: 'acct-1' } });
+    // This machine's 5-hour and weekly shares are live, its month too; the per-model cap comes from the saved machine.
+    put(path.join(home, '.claude', 'statusline-last.json'), { v: 3, five_pct: 9, five_at: nowS - 30, five_reset: nowS + 3600, week_pct: 30, week_at: nowS - 30, week_reset: nowS + 86400,
+      month_tok: 1000000, month_tok_total: 50000000, month_reset: nowS + 5 * 86400 });
+    const machine = (label, brief) => ({ label, target: 'me@build-box', brief: { brief: 1, account: crypto.scryptSync('acct-1', 'oak-claude-account', 6).toString('hex'), at: now,
+      five: null, week: null, fable: { pct: 9, reset: now + 2 * 86400000, at: now - 60000, tok: null, total: null, label: 'Fable' }, month: null, ...brief } });
+    put(core.machineUsageCachePath(), { version: 1, attemptedAt: now, machines: [machine('build-box', {})] });
+    const row = () => usageRow({ ...usageFixture(), now, usageBoth: core.usageBrief(home) })[0].trimEnd();
+    assert.equal(core.usageLine(home, '').machineNote, 'build-box: fable', 'control: the cap is the saved machine\'s');
+    assert.match(row(), /^✳ claude wk: 30% .* · mo: 2% /, 'the bar names no machine: none of its windows is one\'s');
+    // Its 5-hour share alone: the bar shows no 5h, so it names no machine either, where the Stats panels, which show the
+    // 5h, name it.
+    const five = { pct: 4, reset: now + 3 * 3600000, at: now - 30000, tok: null, total: null };
+    put(path.join(home, '.claude', 'statusline-last.json'), { v: 3, week_pct: 30, week_at: nowS - 30, week_reset: nowS + 86400, month_tok: 1000000, month_tok_total: 50000000, month_reset: nowS + 5 * 86400 });
+    put(core.machineUsageCachePath(), { version: 1, attemptedAt: now, machines: [machine('build-box', { fable: null, five })] });
+    assert.deepEqual([core.usageLine(home, '').machineNote, core.usageLine(home, '').machineBarNote, core.usageLine(home, '').machineTipNote], ['build-box: 5h', '', ''],
+      'control: the 5h is the saved machine\'s');
+    assert.match(row(), /^✳ claude wk: 30% .* · mo: 2% /, row());
+    // Its week, from a label with bidi controls and zero-width characters in it: named, and nothing hidden.
+    const week = { pct: 4, reset: now + 2 * 86400000, at: now - 30000, tok: null, total: null };
+    put(path.join(home, '.claude', 'statusline-last.json'), { v: 3, month_tok: 1000000, month_tok_total: 50000000, month_reset: nowS + 5 * 86400 });
+    put(core.machineUsageCachePath(), { version: 1, attemptedAt: now, machines: [machine('build\u202e-\u200bbox\u2066\u200f\ufeff', { week })] });
+    assert.match(row(), /^✳ claude \(build-box: wk\) wk: 4% /, row());
+    assert.doesNotMatch(row(), /[\u061c\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/u);
+  } finally {
+    for (const [k, v] of Object.entries(was)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// No bar shows the 5-hour window, for any plan: an account with one keeps it on the status line port (the Claude Code
+// status line's own readout), and an account with no five-hour limit (its newest usage answer carries no 5h window, as
+// a verified Ultra account's does) has no 5h segment there either, and leaves no gap where it was, whatever 5h share the
+// cache holds. Drawn from core's own reading of the cache, as the app reads it.
+test('TUI usage: the bar never shows the 5h window; the status line port shows it where the account has one', () => {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-tabs-no5h-'));
+  const was = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE, CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR };
+  try {
+    process.env.HOME = process.env.USERPROFILE = home;
+    process.env.CLAUDE_CONFIG_DIR = path.join(home, '.claude');
+    fs.mkdirSync(process.env.CLAUDE_CONFIG_DIR, { recursive: true });
+    const now = Date.now(), nowS = Math.floor(now / 1000);
+    // A 5h share measured half a minute ago, after the account answered, a minute ago, that it has no five-hour limit.
+    const cache = { v: 3, five_pct: 12, five_at: nowS - 30, five_reset: nowS + 3600, week_pct: 30, week_at: nowS - 60, week_reset: nowS + 86400,
+      month_tok: 1000000, month_tok_total: 50000000, month_reset: nowS + 5 * 86400 };
+    const put = (c) => fs.writeFileSync(path.join(home, '.claude', 'statusline-last.json'), JSON.stringify(c));
+    const row = () => usageRow({ ...usageFixture(), now, usageBoth: core.usageBrief(home) })[0].trimEnd();
+    const port = () => tui.statuslineGauges(tui.statuslineDataFor({ now, usage: core.usageLine(home, ''), views: {}, session: '' }), 'none', false);
+    put(cache);
+    assert.equal(core.usageLine(home, '').fiveHourPct, 12, 'control: the account has a 5-hour window');
+    assert.match(port(), /^5h \[[^\]]+\] 12% ·/, 'the status line port shows it');
+    assert.match(row(), /^✳ claude wk: 30% \S.* · mo: 2% /, `the bar does not, and leaves no gap — got ${JSON.stringify(row())}`);
+    assert.doesNotMatch(row(), /5h:/);
+    put({ ...cache, five_none_at: nowS - 60 });
+    assert.match(row(), /^✳ claude wk: 30% \S.* · mo: 2% /, `no 5h chip, and no gap — got ${JSON.stringify(row())}`);
+    assert.match(port(), /^wk \[[^\]]+\] 30% ·/, `no 5h segment — got ${JSON.stringify(port())}`);
+    assert.doesNotMatch(port(), /5h/);
+    // Control: an answer with a 5h window since brings the segment back, and still no chip.
+    put({ ...cache, five_none_at: nowS - 60, five_seen_at: nowS - 40 });
+    assert.match(row(), /^✳ claude wk: 30% \S.* · mo: 2% /, 'an answer with a 5h window since: still no 5h chip');
+    assert.match(port(), /^5h \[[^\]]+\] 12% ·/, 'and the 5h segment');
+  } finally {
+    for (const [k, v] of Object.entries(was)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+    fs.rmSync(home, { recursive: true, force: true });
+  }
 });
 
 // ── the Diff face with nothing selected ──────────────────────────────────────────────────────────
 // The rich-diff renderer heads every patch with `● Verb(path)`; with no patch and no edit that header
-// came out as a bare `● Edit()` — a phantom edit on a session that had none (2026-09-22). Nothing
+// came out as a bare `● Edit()` — a phantom edit on a session that had none. Nothing
 // selected draws nothing but the pane's own instruction.
 {
   const tabs = TABS();
@@ -299,6 +432,26 @@ test('TUI usage: the bar is 5h · wk · mo with no per-model cap chip, and wk ke
   state.diffMeta = { id: 7, path: 'x.ts', added: 1, removed: 1, verb: 'Update' };
   const withPatch = renderDashFrame(state, { cols: 120, rows: 40, color: 'none' }).map(strip).join('\n');
   assert.ok(withPatch.includes('Update(x.ts)'), 'a selected edit keeps its header');
+}
+
+// ── Prompts for a session whose transcript is gone ───────────────────────────────────────────────
+// The CLI answers `{"transcript":null,"error":…}` when it has nothing to list; the pane gives that reason, never
+// "yet". When the local index kept the asks, they are listed with the note that says where they came from.
+{
+  const tabs = TABS();
+  tabs[1].panes = panes({ focus: 'prompts', zoom: 'prompts' });
+  const state = mkState(tabs, 1);
+  state.screen = 'prompts';
+  const base = { list: { edits: [] }, changemap: { files: [], summary: {} }, sessions: { sessions: [] }, multitask: { agents: [] } };
+  const draw = (prompts) => { state.views = { ...base, prompts }; return renderDashFrame(state, { cols: 120, rows: 40, color: 'none' }).map(strip).join('\n'); };
+  const refused = draw({ session: 'abc', transcript: null, error: 'no transcript found for this session under this directory' });
+  assert.match(refused, /nothing on Prompts — the oak CLI answered: no transcript found for this session under this directory/, 'the refusal, in the CLI\'s words');
+  assert.doesNotMatch(refused, /fills in as the agent works/, '…not "yet"');
+  assert.match(draw({ session: 'abc', summary: { total: 0 }, prompts: [] }), /nothing on Prompts yet — it fills in as the agent works/, 'control: a real empty list is still "yet"');
+  const kept = draw({ session: 'abc', fromIndex: true, note: 'the transcript is gone; these asks and answers are what the local database kept of it',
+    summary: { total: 1 }, prompts: [{ id: 'p1', index: 1, text: 'Teach the zebracorn lexer', ts: 1, endTs: 2, edits: 0 }] });
+  assert.match(kept, /the transcript is gone; these asks and answers are what the local database kept of it/, 'an index-kept list says so');
+  assert.match(kept, /Teach the zebracorn lexer/, '…above the asks it kept');
 }
 
 // One of a thing reads in the singular (the change map said "1 files · 1 edits").
@@ -340,18 +493,65 @@ require('node:test').test('Feed tail renders reply words normally, folds thought
   for (const words of ['Alpha words', 'Beta words']) assert.equal(text.split(words).length - 1, 1);
   const folded = render([{ ...said(1, '', 'Long thought '.repeat(100)), label: 'thinking', reasoningKind: 'thinking' }]);
   assert.equal(folded.length, 3);
-  assert.match(strip(folded.join('\n')), /more rows.*F1 again/);
+  assert.match(strip(folded.join('\n')), /more rows.*F8 again/);
 });
 
-// Keys that must not act by accident, driven through the interactive app: a
-// letter behind an open overlay, an alt chord, ctrl+a ctrl+k in the herdr tab, a palette action on the
-// Observatory, and esc under a standing question.
-for (const check of ['overlay-verbs', 'overlay-rebind', 'row-menu-key', 'row-menu-rebind', 'row-menu-unbound', 'stale-row-menu', 'search-under-overlay', 'search-help-filter', 'alt-verb', 'herdr-leader', 'palette-tabs', 'esc-confirm', 'esc-picker-delete']) require('node:test').test(`keys, driven: ${check}`, () => {
-  const result = require('child_process').spawnSync(process.execPath, [path.join(__dirname, 'fixtures/keys-probe.cjs')], {
-    encoding: 'utf8', timeout: 20000, env: { ...process.env, NODE_TEST_CONTEXT: '', OAK_KEYS_CHECK: check,
-      ...(check === 'overlay-rebind' ? { OAK_KEYS_REBIND: JSON.stringify({ undo: 'k' }) } : check === 'row-menu-rebind' ? { OAK_KEYS_REBIND: JSON.stringify({ undo: 'k', keep: 'q' }) }
-        : check === 'row-menu-unbound' ? { OAK_KEYS_REBIND: JSON.stringify({ keep: 'u' }) } : {}) },
-  });
-  assert.equal(result.status, 0, result.stderr || result.error?.message);
-  assert.match(result.stderr, new RegExp(`PASS: ${check}`));
+// Keys driven through the interactive app: nothing acts by accident (a letter behind an open overlay, an
+// alt chord, a Review verb on the Observatory, a palette action on the wrong tab, esc under a question),
+// and every 0.11.0 mapping and confirm is pressed for real: herdr's prefix, Tab, R/X, U, D, :, r, reset.
+const KEY_CHECK_ENV = {
+  'overlay-rebind': { OAK_KEYS_REBIND: JSON.stringify({ undo: 'k' }) },
+  'row-menu-rebind': { OAK_KEYS_REBIND: JSON.stringify({ undo: 'k', keep: 'q' }) },
+  'row-menu-unbound': { OAK_KEYS_REBIND: JSON.stringify({ keep: 'u' }) },
+  'hints-rebind': { OAK_KEYS_REBIND: JSON.stringify({ keep: 'k' }) },
+  'refresh-confirm': { OAK_KEYS_WOULD_DROP: '3' },
+  'herdr-prefix-config': { OAK_KEYS_HERDR_CONFIG: '[keys]\nprefix = "ctrl+g"\ndetach = "prefix+m"\n' },
+  'herdr-prefix-legacy': { OAK_KEYS_HERDR_CONFIG: 'keys.prefix = "ctrl+space"\n' },
+  'herdr-prefix-none': { OAK_KEYS_HERDR_CONFIG: '[keys]\nprefix = "super+b"\n' },
+  'herdr-prefix-upper': { OAK_KEYS_HERDR_CONFIG: '[keys]\nprefix = "Ctrl+A"\n' },
+  'herdr-prefix-ctrl-q': { OAK_KEYS_HERDR_CONFIG: '[keys]\nprefix = "ctrl+q"\n' },
+  'rebind-blocked': { OAK_KEYS_REBIND: JSON.stringify({ keep: 'c' }) },
+  'rebind-blocked-first-run': { OAK_KEYS_REBIND: JSON.stringify({ keep: ' ' }) },
+  'kept-prefs-blocked': { OAK_KEYS_REBIND: JSON.stringify({ keep: ' ' }) },
+  'palette-unbound': { OAK_KEYS_REBIND: JSON.stringify({ redo: 'D' }) },
+  'palette-unbound-obs': { OAK_KEYS_REBIND: JSON.stringify({ session: 'r' }), OAK_KEYS_WOULD_DROP: '1' },
+};
+// Where a check's launch runs besides here, a repository: the first run's notice from a folder in no repository too,
+// where Review takes the newest session on any machine and says so (it said so over the notice, and only a run from a
+// tree without a .git saw it).
+const KEY_CHECK_OUTSIDE_REPO = new Set(['rebind-blocked-first-run']);
+for (const check of ['overlay-verbs', 'overlay-rebind', 'row-menu-key', 'row-menu-rebind', 'row-menu-unbound', 'stale-row-menu', 'search-under-overlay',
+  'search-help-filter', 'alt-verb', 'herdr-prefix', 'herdr-prefix-config', 'herdr-prefix-motion', 'herdr-prefix-legacy', 'herdr-prefix-none', 'herdr-prefix-upper',
+  'herdr-prefix-kitty-shift', 'herdr-prefix-ctrl-q', 'herdr-prefix-switch', 'obs-jk', 'confirm-tab-note', 'rebind-blocked', 'rebind-blocked-first-run', 'kept-prefs-first-run',
+  'kept-prefs-blocked', 'palette-unbound', 'palette-unbound-obs', 'tab-keys', 'obs-keys', 'obs-buttons', 'redo-key', 'palette-tabs',
+  'refresh-confirm', 'options-reset', 'store-back', 'reset-keeps-elsewhere', 'rebind-reserved', 'filter-per-tab', 'overlay-close', 'hints-rebind', 'esc-confirm', 'esc-picker-delete']) require('node:test').test(`keys, driven: ${check}`, (t) => {
+  const fs = require('node:fs'), os = require('node:os');
+  const outside = KEY_CHECK_OUTSIDE_REPO.has(check) ? fs.mkdtempSync(path.join(os.tmpdir(), 'oak-keys-cwd-')) : null;
+  if (outside) t.after(() => fs.rmSync(outside, { recursive: true, force: true }));
+  if (outside) assert.equal(core.repoRoot(outside), null, `control: ${outside} is in no repository`);
+  for (const cwd of [undefined, outside].filter((d) => d !== null)) for (const platform of check === 'herdr-prefix-none' ? ['linux', 'darwin'] : [null]) {
+    const probe = path.join(__dirname, 'fixtures/keys-probe.cjs');
+    const args = platform ? ['-e', `Object.defineProperty(process, 'platform', { value: ${JSON.stringify(platform)} }); process.argv[1] = ${JSON.stringify(probe)}; require(process.argv[1]);`] : [probe];
+    const result = require('child_process').spawnSync(process.execPath, args, {
+      encoding: 'utf8', timeout: 30000, cwd, env: { ...process.env, NODE_TEST_CONTEXT: '', OAK_KEYS_CHECK: check, ...(KEY_CHECK_ENV[check] ?? {}) },
+    });
+    assert.equal(result.status, 0, `${cwd ? 'outside every repository' : 'here'}: ${result.stderr || result.error?.message}`);
+    assert.match(result.stderr, new RegExp(`PASS: ${check}`));
+  }
 });
+
+// Account totals keep the same text on both machines; hovering names the measured union or local fallback.
+{
+  const state = mkState(TABS());
+  state.usageBoth = { claude: { five: { pct: null }, week: { pct: null }, month: { pct: null }, machine: '' },
+    gpt: { five: { pct: null }, week: { pct: 20 }, month: { pct: 11, tok: 10_000_000, usd: '~$18' }, measuredMachines: 'work-box, build-box' } };
+  const line = tui.statuslineFor(state, 200, {}, 'none', 1)[0].trim();
+  assert.equal(line, '⬡ gpt wk: 20% · mo: 11% ~$18');
+  state.hoverUsage = true;
+  assert.match(tui.statusWithToast('ready', state, 200), /GPT estimates include usage measured on work-box, build-box/);
+  state.usageBoth.gpt.usageFreshness = 'Usage received — build-box: 2026-11-04T12:00:00.000Z (stale; unreachable)';
+  assert.match(tui.statusWithToast('ready', state, 100), /12:00:00.000Z.*stale; unreachable/);
+  state.usageBoth.gpt.usageFreshness = '';
+  state.usageBoth.gpt.measuredMachines = 'this machine alone';
+  assert.match(tui.statusWithToast('ready', state, 200), /GPT estimates include usage measured on this machine alone/);
+}

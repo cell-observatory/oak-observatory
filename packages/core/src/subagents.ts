@@ -13,7 +13,7 @@
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
-import { findTranscript } from './observe';
+import { findTranscript, unitsByCall, UnitTotals } from './observe';
 import { sidecarMemo } from './store';
 import { parseTranscriptActions, ActionRecord, ActionSummary, summarizeActions, agentPhaseDetail, Phase, PhaseConfidence, attributeEditIds, EditAttributionAuthor } from './actions';
 import { sessionTaskRows, taskIdForSubject, SessionTaskRow } from './tasks';
@@ -31,6 +31,7 @@ interface SubagentMeta {
   toolUseCount?: number; // toolUseResult.totalToolUseCount
   ts: number; // spawn time (the Agent/Task tool_use's ms epoch)
   toolUseId?: string; // the spawning Agent/Task tool_use id
+  endedTs?: number; // the foreground spawn's terminal tool result, never its start + duration
 }
 
 export interface SubagentInfo {
@@ -184,9 +185,13 @@ export interface SubagentFacts {
   /** Each background task's latest completion notice, by task id (an agent's is its agentId): the harness's
    *  own status word and when the task ended (its enqueue). */
   ended: Map<string, { status: string; ts: number }>;
+  /** The message ids whose usage `vitals` already counts, each with the snapshot it counts [in, out, cache read, cache
+   *  create]: one API message is written as a record per content block, each carrying the message's usage as it stood
+   *  then, so each id is counted once, at its largest snapshot, as the session's own count does (metrics.ts). */
+  usageIds: Map<string, number[]>;
 }
 export function newSubagentFacts(): SubagentFacts {
-  return { spawns: new Map(), meta: new Map(), todos: [], ended: new Map(),
+  return { spawns: new Map(), meta: new Map(), todos: [], ended: new Map(), usageIds: new Map(),
     vitals: { model: '', effort: '', tokensIn: 0, tokensOut: 0, tokensCacheRead: 0, tokensCacheCreate: 0, firstTs: 0, lastTs: 0, lastTurnTs: 0 } };
 }
 
@@ -251,11 +256,13 @@ function foldSubagentMeta(facts: SubagentFacts, o: any): void {
       toolUseCount: fin(tur.totalToolUseCount),
       ts: spawn?.ts ?? ts,
       toolUseId,
+      ...(/^(completed|failed|killed|stopped|error)$/.test(tur.status) && ts > 0 ? { endedTs: ts } : {}),
     });
   }
 }
 
 export function foldSubagentFacts(facts: SubagentFacts, o: any): void {
+  if (o?.type === 'api-request-blob') return;
   foldSubagentMeta(facts, o);
   const { vitals } = facts;
   const content = o.message && Array.isArray(o.message.content) ? o.message.content : [];
@@ -269,18 +276,26 @@ export function foldSubagentFacts(facts: SubagentFacts, o: any): void {
   if (typeof o.message?.model === 'string' && o.message.model) vitals.model = o.message.model;
   if (typeof o.effort === 'string' && o.effort) vitals.effort = o.effort;
   const usage = o.message?.usage;
+  const usageId = typeof o.message?.id === 'string' ? o.message.id : null;
   if (usage) {
-    vitals.tokensIn += usage.input_tokens || 0;
-    vitals.tokensOut += usage.output_tokens || 0;
-    vitals.tokensCacheRead += usage.cache_read_input_tokens || 0;
-    vitals.tokensCacheCreate += usage.cache_creation_input_tokens || 0;
+    // A later record of a message counted already replaces its snapshot only when larger (input + output + cache
+    // creation, the status line's rule), and then adds only the difference.
+    const now = [usage.input_tokens || 0, usage.output_tokens || 0, usage.cache_read_input_tokens || 0, usage.cache_creation_input_tokens || 0];
+    const prev = usageId === null ? undefined : facts.usageIds.get(usageId);
+    if (!prev || now[0] + now[1] + now[3] > prev[0] + prev[1] + prev[3]) {
+      if (usageId !== null) facts.usageIds.set(usageId, now);
+      vitals.tokensIn += now[0] - (prev ? prev[0] : 0);
+      vitals.tokensOut += now[1] - (prev ? prev[1] : 0);
+      vitals.tokensCacheRead += now[2] - (prev ? prev[2] : 0);
+      vitals.tokensCacheCreate += now[3] - (prev ? prev[3] : 0);
+    }
   }
   const timestamp = toMs(o.timestamp);
   if (timestamp) {
     if (!vitals.firstTs) vitals.firstTs = timestamp;
     vitals.lastTs = timestamp;
     // A user record counts even when it is meta: Claude Code resumes a finished agent (SendMessage, a child's
-    // notice) with a meta prompt, well before its first reply (a median 10 s, up to four minutes).
+    // notice) with a meta prompt, well before its first reply, which can be minutes later.
     if ((o.type === 'user' || (o.type === 'assistant' && o.isMeta !== true)) && o.message?.model !== '<synthetic>') vitals.lastTurnTs = timestamp;
   }
 }
@@ -506,8 +521,8 @@ export function subagentDigests(cwd: string, sessionId: string): SubagentDigest[
   // cached under the old logic is discarded rather than served stale. 6: parent results and metadata
   // sidecars can change the labels/totals while every subagent transcript stays unchanged. 7: `background`.
   // 8: each agent's latest notice and last turn, so a hit never decodes the parent's facts. 9: a
-  // meta user record is a turn.
-  const stamp = parts.length ? `9|${crypto.createHash('sha256').update(parts.join('|')).digest('hex').slice(0, 16)}` : '';
+  // meta user record is a turn. 10: an agent's tokens count each message once. 11: at its largest snapshot.
+  const stamp = parts.length ? `11|${crypto.createHash('sha256').update(parts.join('|')).digest('hex').slice(0, 16)}` : '';
   const stable = sidecarMemo(sessionId, 'subagentDigests', stamp, () => {
     const ended = transcript ? subagentFacts(transcript).ended : undefined;
     return parseSubagents(cwd, sessionId).map((s) => {
@@ -516,7 +531,8 @@ export function subagentDigests(cwd: string, sessionId: string): SubagentDigest[
       // without this a live session re-parses EVERY spawn transcript's usage each rebuild. Keyed on that
       // one file's stamp, so an unchanged spawn's vitals are served from its sidecar and only the active
       // one re-reads. `v5|` version so a change to the extraction discards the old per-agent cache too.
-      const v = sidecarMemo(sessionId, `subVitals:${s.agentId}`, `v7|${stampByFile.get(file) ?? ''}`, () =>
+      // v9: each message's tokens at its largest snapshot.
+      const v = sidecarMemo(sessionId, `subVitals:${s.agentId}`, `v9|${stampByFile.get(file) ?? ''}`, () =>
         vitalsFromTranscript(path.join(dir, file))
       );
       return {
@@ -544,6 +560,141 @@ export function subagentDigests(cwd: string, sessionId: string): SubagentDigest[
   // Phase is asked of the file every time, never remembered; a background agent's end is its notice.
   return stable.map(({ ended, lastTurnTs, ...s }) => ({ ...s,
     ...workerPhase(path.join(dir, `agent-${s.agentId}.jsonl`), transcript, !!s.background, ended ?? undefined, lastTurnTs ?? 0, agentsWritten) }));
+}
+
+/** A worker that is still at it, as its session's row in the listing carries it (`SessionMetaRow.activeWorkers`). */
+export interface ActiveWorker {
+  agentId: string;
+  /** Its spawn's description, else the to-do it is on, else its id: one line. */
+  title: string;
+  /** `working`, `awaiting-input` or `awaiting-permission`: the phases in which workerPhase calls a worker running. */
+  phase: Phase;
+  phaseConfidence: PhaseConfidence;
+  /** The model it last declared, as a display label ('' when it declared none). */
+  model: string;
+  /** Its share of the session's captured edits (`unitsByCall`): the review units whose latest edit one of its own
+   *  calls made, how many of them still await review, and their lines. */
+  edits: number;
+  pending: number;
+  added: number;
+  removed: number;
+  /** Tokens processed once (input + output + cache creation), the measure a session's own `tokens` uses. */
+  tokens: number;
+  /** When its transcript was last written. */
+  lastActiveMs: number;
+}
+
+/** How long after its transcript's last write a worker is still asked what it is doing: the window in which the
+ *  listing asks a session the same (observe.ts PHASE_WINDOW_MS). A worker waiting on a person writes nothing while
+ *  it waits, so the window is hours, not the five minutes after which a quiet agent counts as done. */
+const ACTIVE_WINDOW_MS = 2 * 60 * 60_000;
+
+/** Agent transcripts already found finished, each with the (mtime:size) it was judged at, so an unchanged one is
+ *  not read again. Only a verdict that nothing but a write to that file can reverse is kept: a foreground worker's
+ *  (its tail alone decides it) and a background worker's whose completion notice ended it. A background worker
+ *  with no notice is done only while its whole session is silent, which other files decide. */
+const finishedWorkers = new Map<string, string>();
+
+/**
+ * The session's workers that are still at it, for its row in the session listing: the ones workerPhase calls
+ * running (working, or waiting on a person), newest spawn first, as the Workers list orders them. Only an agent
+ * transcript written within ACTIVE_WINDOW_MS is asked, and one already found finished is not asked again until it
+ * is written; any other costs a stat. Asking reads a bounded tail of the file, and its parent's spawn and
+ * completion facts through the parent's incremental cursor; a running worker's own facts (its title, model,
+ * tokens and calls) ride its own cursor the same way, so an unchanged file costs a stat. `known` names more workers
+ * found finished, each by its file's name and the stamp it had then (`finishedWorkerStamps`, which the local index
+ * keeps), so a process that has not asked them itself does not ask them again.
+ */
+export function activeWorkers(transcript: string, sessionId: string, now = Date.now(), known?: ReadonlyMap<string, string>): ActiveWorker[] {
+  const dir = path.join(path.dirname(transcript), sessionId, 'subagents');
+  let names: string[];
+  try {
+    names = fs.readdirSync(dir);
+  } catch {
+    return []; // no subagents/ directory: no worker ever ran
+  }
+  const recent: { agentId: string; file: string; mtimeMs: number; stamp: string }[] = [];
+  let agentsWritten = 0;
+  for (const name of names) {
+    if (!name.startsWith('agent-') || !name.endsWith('.jsonl')) continue;
+    const file = path.join(dir, name);
+    let st: fs.Stats;
+    try {
+      st = fs.statSync(file);
+    } catch {
+      continue; // vanished mid-scan
+    }
+    agentsWritten = Math.max(agentsWritten, st.mtimeMs);
+    const stamp = `${st.mtimeMs}:${st.size}`;
+    if (now - st.mtimeMs <= ACTIVE_WINDOW_MS && finishedWorkers.get(file) !== stamp && known?.get(name) !== stamp)
+      recent.push({ agentId: name.slice('agent-'.length, -'.jsonl'.length), file, mtimeMs: st.mtimeMs, stamp });
+  }
+  if (!recent.length) return [];
+  const parent = subagentFacts(transcript);
+  const oneLine = (s: string | null | undefined): string => (s ?? '').replace(/\s+/g, ' ').trim();
+  const workers: (ActiveWorker & { spawned: number; calls: string[] })[] = [];
+  for (const { agentId, file, mtimeMs, stamp } of recent) {
+    const spawn = parent.meta.get(agentId);
+    const sidecar = readSidecar(path.join(dir, `agent-${agentId}.meta.json`));
+    const background = spawn?.status === 'async_launched' || sidecar?.requestShape === 'background';
+    const ended = parent.ended.get(agentId);
+    // Its own last turn decides only whether a background worker was resumed after its notice, which needs a write
+    // after it: a file last written by then is judged without reading its facts (its last turn is no later).
+    const lastTurnTs = background && ended && ended.ts > 0 && mtimeMs > ended.ts + RESUME_GRACE_MS ? subagentFacts(file, true).vitals.lastTurnTs : 0;
+    const state = workerPhase(file, transcript, background, ended, lastTurnTs, agentsWritten);
+    if (!state.running) {
+      // Remembered only when nothing but a write to this file can reverse it: a foreground worker's verdict (its
+      // tail alone decides it) or its completion notice's. One found done because its whole session went quiet is
+      // asked again.
+      if (!background || (ended && !(ended.ts > 0 && lastTurnTs > ended.ts + RESUME_GRACE_MS))) {
+        if (finishedWorkers.size >= 4096) finishedWorkers.clear();
+        finishedWorkers.set(file, stamp);
+      }
+      continue;
+    }
+    const own = transcriptFacts(file, true);
+    const v = own.subagents.vitals;
+    workers.push({
+      agentId,
+      title: oneLine(spawn?.description ?? sidecar?.description) || oneLine(own.subagents.todos.find((t) => t.status === 'in_progress')?.content) || agentId,
+      phase: state.phase,
+      phaseConfidence: state.phaseConfidence,
+      model: v.model ? friendlyModel(v.model) : '',
+      edits: 0,
+      pending: 0,
+      added: 0,
+      removed: 0,
+      tokens: v.tokensIn + v.tokensOut + v.tokensCacheCreate,
+      lastActiveMs: mtimeMs,
+      spawned: spawn?.ts || v.firstTs,
+      // Every call it made, not only its Edit and Write calls: a file one of its Bash commands changed is captured
+      // under that command's id.
+      calls: own.actions.actions.flatMap((a) => (a.toolUseId ? [a.toolUseId] : [])),
+    });
+  }
+  const units = workers.some((w) => w.calls.length) ? unitsByCall(sessionId) : new Map<string, UnitTotals>();
+  for (const w of workers) {
+    for (const call of w.calls) {
+      const u = units.get(call);
+      if (!u) continue;
+      w.edits += u.edits;
+      w.pending += u.pending;
+      w.added += u.added;
+      w.removed += u.removed;
+    }
+  }
+  return workers.sort((a, b) => b.spawned - a.spawned || a.agentId.localeCompare(b.agentId)).map(({ spawned, calls, ...w }) => w);
+}
+
+/** The session's workers found finished, as `activeWorkers` remembers them (only what a write to the worker's own file
+ *  can reverse): each file's name and the stamp it was judged at. Asks the ones written within ACTIVE_WINDOW_MS that
+ *  have not been asked at their stamp; the local index keeps the answer for the listings (index/ingest.ts). */
+export function finishedWorkerStamps(transcript: string, sessionId: string, now = Date.now()): Record<string, string> {
+  activeWorkers(transcript, sessionId, now);
+  const dir = path.join(path.dirname(transcript), sessionId, 'subagents');
+  const out: Record<string, string> = {};
+  for (const [file, stamp] of finishedWorkers) if (path.dirname(file) === dir) out[path.basename(file)] = stamp;
+  return out;
 }
 
 export interface SubagentsSummary {

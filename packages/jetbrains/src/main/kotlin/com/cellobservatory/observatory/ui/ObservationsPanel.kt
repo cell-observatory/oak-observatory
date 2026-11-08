@@ -160,6 +160,7 @@ class ObservationsPanel(private val project: Project) : SimpleToolWindowPanel(tr
     }
 
     private fun repaintTree() {
+        border = ObservatoryService.getInstance(project).currentMachine()?.let { javax.swing.BorderFactory.createTitledBorder("On $it") } ?: com.intellij.util.ui.JBUI.Borders.empty()
         root.removeAllChildren()
         val d = data
         if (d != null && d.runs.isNotEmpty()) {

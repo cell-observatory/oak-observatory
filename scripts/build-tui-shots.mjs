@@ -34,6 +34,9 @@ fs.mkdirSync(scratch, { recursive: true });
 const home = fs.mkdtempSync(path.join(scratch, 'home-'));
 const ws = fs.realpathSync(fs.mkdtempSync(path.join(scratch, 'workspace-')));
 fs.mkdirSync(path.join(ws, '.git'), { recursive: true });
+// Repository discovery validates HEAD and the common directory, even in a synthetic checkout.
+for (const dir of ['objects', 'refs']) fs.mkdirSync(path.join(ws, '.git', dir));
+fs.writeFileSync(path.join(ws, '.git', 'HEAD'), 'ref: refs/heads/demo\n');
 process.env.HOME = home; process.env.USERPROFILE = home;
 process.env.CLAUDE_CONFIG_DIR = path.join(home, 'claude');
 process.env.XDG_CONFIG_HOME = path.join(home, 'config');
@@ -99,11 +102,12 @@ const TABS = [
 
 for (const t of TABS) {
   const frame = t.id === 'herdr' ? await capture.herdrFrame(CLI, session, t.cols, t.rows) : once(session, t.id, t.cols, t.rows);
-  validateFrame(frame, { conversation: t.id === 'observatory', herdr: t.id === 'herdr' });
+  validateFrame(frame, { conversation: t.id === 'observatory', herdr: t.id === 'herdr', review: t.id === 'review' });
   if (!frame.includes('\x1b')) throw new Error(`${t.id}: no styled TUI frame; existing media was not replaced`);
-  // JetBrains Mono via webfont (it is not installed on every render box) and line-height 1:
-  // the site's interactive demo uses the same pair, and any taller line box opens a gap between
-  // rows that breaks every │ pane border into dashes — a terminal's cell height IS its line height.
+  // JetBrains Mono via webfont (it is not installed on every render box) and line-height 1.15, the
+  // pair the site's interactive demo uses. At 1 the tails of letters such as y and g hang below their
+  // row, under the next row's coloured cells; the web font has no box-drawing glyphs, and DejaVu Sans
+  // Mono, which draws │ here, draws it 1.19em tall, so the borders still join at 1.15.
   const html = `<!doctype html><meta charset="utf8">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -111,16 +115,18 @@ for (const t of TABS) {
   <style>
     html,body{margin:0;background:#0d0d10}
     pre{margin:0;padding:26px 30px;display:inline-block;
-      font:16px/1 "JetBrains Mono","DejaVu Sans Mono","Menlo",monospace;
+      font:16px/1.15 "JetBrains Mono","DejaVu Sans Mono","Menlo",monospace;
       color:#c9cdd3;background:#0d0d10;font-variant-ligatures:none;letter-spacing:0}
   </style><pre>${frameHtml(frame)}</pre>`;
   const htmlPath = path.join(home, `tuishot-${t.id}.html`);
   fs.writeFileSync(htmlPath, html);
   // --virtual-time-budget makes the screenshot wait for the webfont fetch; without it the shot
-  // races the font load and silently renders the fallback.
-  const raw = capturePng(CHROME, [ '--headless','--disable-gpu','--no-sandbox',
+  // races the font load and silently renders the fallback. The capture resolves no host name but the
+  // font's two (chrome.mjs).
+  const raw = capturePng(CHROME, [ '--headless','--disable-extensions','--disable-gpu','--no-sandbox',
     '--ozone-platform=headless','--hide-scrollbars','--force-device-scale-factor=2',
     '--window-size=1500,1100','--virtual-time-budget=10000',
+    '--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE fonts.googleapis.com, EXCLUDE fonts.gstatic.com',
     'file://'+htmlPath]);
   const trimmed = trim(raw);
   const outPath = path.join(ROOT, 'docs', 'media', t.out + '.png');

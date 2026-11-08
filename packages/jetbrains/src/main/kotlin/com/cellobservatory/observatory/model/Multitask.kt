@@ -40,6 +40,11 @@ data class MtSubagent(
     val tokensOut: Long = 0,
     val tokensCacheRead: Long = 0,
     val durationMs: Long = 0,
+    val state: String? = null,
+    val machine: String = "",
+    val kind: String = "claude",
+    val tokens: Long = 0,
+    val lastActiveMs: Long = 0,
 )
 
 /** One running agent (a session in a worktree), the top-level Multitasking row. */
@@ -75,6 +80,15 @@ data class RunningAgent(
      * field, keeps reporting its rows as real instead of silently rendering every one as "not loaded".
      */
     val loaded: Boolean = true,
+    val title: String = "",
+    val machine: String = "",
+    val remote: String? = null,
+    val kind: String = "claude",
+    val state: String? = null,
+    val after: List<String> = emptyList(),
+    val key: String = session,
+    val lastActiveMs: Long = 0,
+
 )
 
 /** A file touched by 2+ agents — computed from the UNCAPPED distinct file sets, path-only (no contents
@@ -141,6 +155,51 @@ data class WorkflowRun(
     val sparkline: List<Int>,
 )
 
+/** One of a delegated agent's in-process workers still at it (core delegated.ts DelegatedWorker). */
+data class DelegatedWorkerRow(val id: String, val title: String, val state: String, val model: String?)
+
+/** An agent OAK started from a brief (`oak agent start --brief`, multitask's `delegated`): OAK's own state and when it
+ *  began (queued · starting · working · waiting · blocked · errored · done · gone), the error a turn stopped on, the machine and
+ *  herdr tab, its session's tokens and list-price cost (null where unknown), and its workers. */
+data class DelegatedAgentRow(
+    val id: String,
+    val title: String,
+    val kind: String,
+    val state: String,
+    val since: Long,
+    val model: String?,
+    val effort: String?,
+    val machine: String?,
+    val tab: String?,
+    val remoteId: String?,
+    val error: String?,
+    val tokens: Long?,
+    val cost: Double?,
+    val workers: List<DelegatedWorkerRow>,
+    val session: String? = null,
+    val cwd: String? = null,
+    val worktreeSummary: String? = null,
+    val after: List<String> = emptyList(),
+) {
+    /** The session phase its state is drawn as (VS Code's DELEGATED_PHASE, the terminal app's DELEGATED_FACE). */
+    val phase: String get() = when (state) {
+        "working" -> "working"
+        "blocked" -> "awaiting-input"
+        "errored" -> "errored"
+        "done" -> "done"
+        else -> "idle"
+    }
+
+    /** The row's facts after its state, as the terminal app's Observatory and VS Code's Workers print them. */
+    fun facts(now: Long = System.currentTimeMillis()): String = listOfNotNull(
+        "since ${relTime(since, now)}", kind, if (state == "queued") "waiting on ${after.joinToString(", ")}" else null, worktreeSummary, listOfNotNull(model, effort).joinToString(" ").ifBlank { null },
+        machine?.let { "on $it" } ?: "this machine", tab?.let { "tab ${remoteId ?: id}" },
+        tokens?.takeIf { it > 0 }?.let { "${compactTok(it)} tok" }, cost?.takeIf { it > 0 }?.let { "$" + String.format(java.util.Locale.ROOT, "%.2f", it) },
+    ).joinToString(" · ")
+
+    private fun compactTok(n: Long): String = if (n >= 1_000_000) String.format(java.util.Locale.ROOT, "%.1fM", n / 1e6) else if (n >= 1000) "${Math.round(n / 1000.0)}k" else "$n"
+}
+
 data class MultitaskResult(
     val agents: List<RunningAgent>,
     val collisions: List<Collision>,
@@ -155,6 +214,8 @@ data class MultitaskResult(
     /** The ACTIVE session's task list (TaskCreate/TaskUpdate — the numbered system next to TodoWrite),
      *  for the Overview's Tasks tab. Empty for sessions that never used it, or an older CLI. */
     val tasks: List<SessionTask>,
+    /** The agents OAK started from a brief, newest first — empty for an older CLI without the field. */
+    val delegated: List<DelegatedAgentRow> = emptyList(),
 )
 
 /** One task from the session's task list (~/.claude/tasks/<session>/<id>.json, read by core). */
@@ -203,6 +264,7 @@ object MultitaskParser {
                     taskId = str(to, "taskId") ?: "",
                 )
             },
+            delegated = arr(o, "delegated").map { delegated(it.asJsonObject) },
         )
     } catch (_: Exception) {
         null
@@ -252,6 +314,37 @@ object MultitaskParser {
     )
     private fun bool(o: JsonObject, k: String): Boolean = o.get(k)?.takeIf { !it.isJsonNull }?.asBoolean ?: false
 
+    private fun worktreeSummary(o: JsonObject): String? {
+        val w = o.get("worktree")?.takeIf { it.isJsonObject }?.asJsonObject ?: return null
+        if (long(w, "removedMs") > 0) return "worktree removed"
+        val s = w.get("state")?.takeIf { it.isJsonObject }?.asJsonObject ?: return "worktree not read yet"
+        if (str(s, "error") != null) return "worktree state unavailable"
+        return "${long(s, "files")} files · +${long(s, "added")} −${long(s, "removed")} · ${if (s.get("merged")?.asBoolean == true) "merged" else "not merged"}"
+    }
+
+    private fun delegated(o: JsonObject) = DelegatedAgentRow(
+        worktreeSummary = worktreeSummary(o),
+        session = str(o, "session"),
+        cwd = str(o, "cwd"),
+        id = str(o, "id") ?: "",
+        title = str(o, "title") ?: "",
+        kind = str(o, "kind") ?: "",
+        state = str(o, "state") ?: "starting", after = arr(o, "after").map { it.asString },
+        since = long(o, "since"),
+        model = str(o, "model"),
+        effort = str(o, "effort"),
+        machine = str(o, "machine"),
+        tab = str(o, "tab"),
+        remoteId = str(o, "remoteId"),
+        error = str(o, "error"),
+        tokens = o.get("tokens")?.takeIf { !it.isJsonNull }?.asLong,
+        cost = o.get("cost")?.takeIf { !it.isJsonNull }?.asDouble,
+        workers = arr(o, "workers").map { w ->
+            val wo = w.asJsonObject
+            DelegatedWorkerRow(id = str(wo, "id") ?: "", title = str(wo, "title") ?: "", state = str(wo, "state") ?: "", model = str(wo, "model"))
+        },
+    )
+
     private fun todos(o: JsonObject): List<MtTodo> =
         arr(o, "todos").mapNotNull { t ->
             val to = t.asJsonObject
@@ -259,11 +352,14 @@ object MultitaskParser {
             MtTodo(content, str(to, "status") ?: "")
         }
 
-    private fun agent(o: JsonObject): RunningAgent {
+    fun agent(o: JsonObject): RunningAgent {
         val diff = o.getAsJsonObject("diff")
         val risk = o.getAsJsonObject("risk")
         return RunningAgent(
             session = str(o, "session") ?: "",
+            title = str(o, "title") ?: "", machine = str(o, "machine") ?: "",
+            kind = str(o, "kind") ?: "claude", state = str(o, "state"), after = arr(o, "after").map { it.asString },
+            key = str(o, "key") ?: str(o, "session") ?: "", lastActiveMs = long(o, "lastActiveMs"),
             worktree = str(o, "worktree") ?: "",
             gitBranch = str(o, "gitBranch") ?: "",
             self = bool(o, "self"),
@@ -290,6 +386,8 @@ object MultitaskParser {
     }
 
     private fun subagent(o: JsonObject) = MtSubagent(
+        state = str(o, "state"), machine = str(o, "machine") ?: "", kind = str(o, "kind") ?: "claude",
+        tokens = long(o, "tokens"), lastActiveMs = long(o, "lastActiveMs"),
         agentId = str(o, "agentId") ?: "",
         agentType = str(o, "agentType"),
         description = str(o, "description"),

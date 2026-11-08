@@ -18,6 +18,12 @@ export function claudeConfigDir(): string {
   return process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
 }
 
+/** Claude Code's global config, which holds its login (`oauthAccount`): `.claude.json` in CLAUDE_CONFIG_DIR when that is
+ *  set, else in the home, as Claude Code itself places it. */
+export function claudeJsonPath(): string {
+  return path.join(process.env.CLAUDE_CONFIG_DIR || os.homedir(), '.claude.json');
+}
+
 /**
  * Canonicalize a path's DRIVE-LETTER case (issue #43).
  *

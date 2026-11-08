@@ -1,0 +1,28 @@
+[
+  {
+    "id": "machine-usage:box",
+    "label": "Claude usage from b![](https://evil.example/label.png)x",
+    "level": "warn",
+    "detail": "could not be reached over ssh at 12:01: Welcome ![](https://evil.example/banner.png) <img src=\"https://evil.example/tag.png\"> <iframe src=\"https://evil.example/frame\"></iframe> <https://evil.example/auto> see https://evil.example/bare, //evil.example/proto, www.evil.example and admin@evil.example, [docs](https://evil.example/link) &lt;img src=x&gt; **bold** _em_ ~strike~ ~~gone~~ $x^2$ <!-- hidden -->",
+    "fix": "Check that `ssh me@box`![](https://evil.example/out.png)` b` connects without asking for a password or about a host key: OAK's ssh runs in batch mode."
+  },
+  {
+    "id": "herdr-forwarding:box",
+    "label": "herdr forwarding: box",
+    "level": "warn",
+    "detail": "# a heading\n\n### ✅ capture hooks installed\n- a list item\n> a quote\n1. ordered\n| a | b |\n|---|---|\n```\nfenced\n```\n[ref]: https://evil.example/ref\n![ref]",
+    "fix": "Check SSH access to me@box and that herdr is running there."
+  },
+  {
+    "id": "underline:box",
+    "label": "herdr forwarding: underline",
+    "level": "warn",
+    "detail": "==="
+  },
+  {
+    "id": "plain",
+    "label": "safe\u202e label with \u200bhidden characters",
+    "level": "ok",
+    "detail": "kept as written: ~/.ssh/config, my_project, C#, `oak doctor --fix` and ``a `b` c``"
+  }
+]

@@ -221,11 +221,12 @@
   /* interactive terminal demo */
   .tuid{margin-top:clamp(22px,3vw,38px)}
   .tuid-term{background:#0d0d0f;border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow);overflow-x:auto;text-align:center}
-  /* JetBrains Mono FIRST: its box-drawing glyphs join edge-to-edge, so the frame's ─ rules render as
-     solid lines like the real terminal (a generic monospace draws ─ with side gaps → a dashed look).
-     line-height:1 for the same reason on the vertical axis: any taller line box opens a gap between
-     rows and breaks every │ pane border into dashes — a terminal's cell height IS its line height. */
-  .tuid-term pre{margin:0;padding:14px 16px;font-family:"JetBrains Mono",var(--mono);font-size:clamp(7.5px,1.28vw,12px);line-height:1;color:#cccccc;white-space:pre;letter-spacing:0;min-width:max-content;display:inline-block;text-align:left}
+  /* Rows are 1.15em tall because at 1em the tails of letters such as y and g hang below their row, where
+     the next row's coloured cells paint over them. The web font has no box-drawing glyphs; SF Mono and
+     Menlo draw │ in its place on macOS, and DejaVu Sans Mono or Noto Sans Mono on Linux, named before
+     monospace because a browser's monospace can be a font whose │ is shorter than a row (Ubuntu Mono,
+     FreeMono). Each draws it at least 1.16em tall, so the borders still join. */
+  .tuid-term pre{margin:0;padding:14px 16px;font-family:"JetBrains Mono",ui-monospace,"SF Mono",Menlo,Consolas,"DejaVu Sans Mono","Noto Sans Mono",monospace;font-size:clamp(7.5px,1.28vw,12px);line-height:1.15;color:#cccccc;white-space:pre;letter-spacing:0;min-width:max-content;display:inline-block;text-align:left}
   .tuid-cap{font-family:var(--mono);font-size:.76rem;color:var(--ink-faint);margin-top:14px;text-align:center;min-height:1.3em;padding:0 12px}
   .tuid-cap b{color:var(--accent-ink);font-weight:600}
   .tuid-ui{display:flex;align-items:center;justify-content:center;gap:14px;margin-top:12px;flex-wrap:wrap}
@@ -537,7 +538,7 @@
           <div class="ovbar" id="ovbar"></div>
           <div class="ovwrap">
             <div class="ovnav">
-              <div class="ovtabs"><span title="Sessions on this machine, grouped by workspace. This workspace is first; select a session to review its conversation and edits.">Sessions 1</span><span class="on" id="wk-tab">Workers 1</span><span id="wf-tab">Workflows 0</span><span id="tk-tab" title="the agent's own numbered task list. An edit joins a task only if it was captured while that task was in progress; anything outside those windows stays unassigned.">Tasks</span><span id="pr-tab" title="Background shells this session launched with run_in_background — state, runtime and output volume. Shell ids are the harness's own; a transcript records no OS process id.">Processes</span></div>
+              <div class="ovtabs"><span title="Sessions from every machine, newest activity first. Search, Active and Sort cover the whole list; select a session to review it.">Sessions 1</span><span class="on" id="wk-tab">Workers 1</span><span id="wf-tab">Workflows 0</span><span id="tk-tab" title="the agent's own numbered task list. An edit joins a task only if it was captured while that task was in progress; anything outside those windows stays unassigned.">Tasks</span><span id="pr-tab" title="Background shells this session launched with run_in_background — state, runtime and output volume. Shell ids are the harness's own; a transcript records no OS process id.">Processes</span></div>
               <div id="fleet"></div>
             </div>
             <div class="ovdetail">
@@ -894,7 +895,7 @@
       if(st.gate==='acceptall'&&!res[step]) bulk+='<button id="ov-acceptall" class="hint">✓✓ Accept All</button>';
       else bulk+='<span class="tk">✓✓ Accept All</span>';
       bulk+='<span class="tu">✗✗ Reject All</span><span class="ts">Clear Resolved</span><span class="ts">Export</span></span>';
-      var view='<span class="g"><span class="ts">Search</span><span class="ts">Active only</span><span class="sep"></span><span class="ts">Spotlight</span><span class="ts">Refresh</span><span class="on"><span data-co-version>v0.10.0</span> ▾</span></span>';
+      var view='<span class="g"><span class="ts">Search</span><span class="ts">Active only</span><span class="sep"></span><span class="ts">Spotlight</span><span class="ts">Refresh</span><span class="on"><span data-co-version>v0.11.0</span> ▾</span></span>';
       var bar='<div class="row">'+axes+'</div><div class="row split">'+bulk+view+'</div>';
       el('ovbar').innerHTML=bar;
       var ab=el('ov-acceptall');

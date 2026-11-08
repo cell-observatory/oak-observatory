@@ -9,7 +9,6 @@ import com.intellij.diff.tools.simple.SimpleDiffTool
 import com.intellij.diff.tools.util.base.TextDiffSettingsHolder
 import com.intellij.diff.util.DiffUserDataKeys
 import com.intellij.diff.util.DiffUserDataKeysEx
-import com.intellij.icons.AllIcons
 import com.intellij.notification.NotificationType
 import com.intellij.openapi.actionSystem.AnAction
 import com.intellij.openapi.actionSystem.AnActionEvent
@@ -31,7 +30,6 @@ import com.intellij.openapi.util.Key
 import com.intellij.openapi.util.UserDataHolderBase
 import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.testFramework.LightVirtualFile
-import com.intellij.ui.InplaceButton
 import com.intellij.ui.JBColor
 import com.intellij.ui.SimpleColoredComponent
 import com.intellij.ui.SimpleTextAttributes
@@ -62,6 +60,7 @@ class ReviewAllVirtualFile(
     val session: String,
     val specs: List<ReviewAllSpec>,
     name: String,
+    val machine: String? = null,
 ) : LightVirtualFile(name) {
     init {
         isWritable = false
@@ -112,6 +111,10 @@ class ReviewAllEditor(private val project: Project, private val file: ReviewAllV
         alignmentX = JComponent.LEFT_ALIGNMENT
     }
     private var built = 0
+    private var generation = 0
+    private var loading = false
+    private val pagedPreview = file.specs.size > PAGE
+    private val previews = mutableListOf<Pair<javax.swing.JEditorPane, List<PreviewLine>>>()
 
     /** Set by [dispose]: a page whose blob read lands AFTER the tab closed (re-open replaces the
      *  file; the platform disposes this editor) must not build panels parented to a disposed
@@ -169,7 +172,7 @@ class ReviewAllEditor(private val project: Project, private val file: ReviewAllV
                 })
                 row.panel.add(JButton(t("↺ Revert", "↺")).apply {
                     toolTipText = "Revert kept #${rec.id} — its change comes off disk"
-                    addActionListener { ReviewOps.undoOrRedo(project, file.session, rec, redo = false, advance = false) }
+                    addActionListener { decide(rec, "undo") }
                 })
             }
             "undone" -> {
@@ -179,17 +182,17 @@ class ReviewAllEditor(private val project: Project, private val file: ReviewAllV
                 })
                 row.panel.add(JButton(t("↻ Redo", "↻")).apply {
                     toolTipText = "Re-apply reverted #${rec.id}"
-                    addActionListener { ReviewOps.undoOrRedo(project, file.session, rec, redo = true, advance = false) }
+                    addActionListener { decide(rec, "redo") }
                 })
             }
             else -> {
                 row.panel.add(JButton(t("✓ Keep", "✓")).apply {
                     toolTipText = "Keep #${rec.id}"
-                    addActionListener { ReviewOps.keep(project, file.session, rec.id, advance = false) }
+                    addActionListener { decide(rec, "keep") }
                 })
                 row.panel.add(JButton(t("✗ Undo", "✗")).apply {
                     toolTipText = "Surgically revert #${rec.id}"
-                    addActionListener { ReviewOps.undoOrRedo(project, file.session, rec, redo = false, advance = false) }
+                    addActionListener { decide(rec, "undo") }
                 })
             }
         }
@@ -200,12 +203,29 @@ class ReviewAllEditor(private val project: Project, private val file: ReviewAllV
         row.panel.repaint()
     }
 
+    private fun decide(rec: EditRecord, verb: String) {
+        if (file.machine != null) {
+            ReviewOps.remoteVerb(project, file.session, verb, listOf(rec.id.toString(), "--units"), advance = false, machine = file.machine) {
+                val token = generation
+                ApplicationManager.getApplication().executeOnPooledThread {
+                    val page = runCatching { remotePage(listOf(ReviewAllSpec(rec, rec.file, 0))) }.getOrNull()
+                    ApplicationManager.getApplication().invokeLater {
+                        if (!disposed && token == generation) page?.firstOrNull()?.let { fresh ->
+                            actsRows.find { it.rec.id == rec.id }?.let { fillActs(it, fresh.spec.rec.status) }
+                        }
+                    }
+                }
+            }
+        } else if (verb == "keep") ReviewOps.keep(project, file.session, rec.id, advance = false)
+        else ReviewOps.undoOrRedo(project, file.session, rec, redo = verb == "redo", advance = false)
+    }
+
     /** Bring every built row to the store's CURRENT statuses. Called on the EDT (the service
      *  coalesces its listener fan-out there); keyed on the log's (mtime,size) so an idle tick costs
      *  one stat and a real change costs one read. Internal so the platform test can drive the sync
      *  deterministically instead of racing the service's coalesced fan-out. */
     internal fun syncActs() {
-        if (disposed) return
+        if (disposed || file.machine != null) return
         val key = StoreReader.logKey(file.session)
         if (key == actsLogKey) return
         actsLogKey = key
@@ -228,7 +248,7 @@ class ReviewAllEditor(private val project: Project, private val file: ReviewAllV
         addActionListener {
             spotlightOn = !spotlightOn
             syncBar()
-            applySpotlight()
+            if (pagedPreview) previews.forEach { (pane, lines) -> pane.text = previewHtml(lines) } else applySpotlight()
         }
     }
     private val bar = JPanel(FlowLayout(FlowLayout.LEFT, 6, 4)).apply {
@@ -246,18 +266,21 @@ class ReviewAllEditor(private val project: Project, private val file: ReviewAllV
         viewBtn.text = if (sideBySide) "Stacked" else "Side by side"
         viewBtn.toolTipText =
             if (sideBySide) "Back to the stacked view — removed/added lines inline, one reading column"
+            else if (pagedPreview) "Side by side — before and after previews in two columns"
             else "Side by side — before and after in two panes, the platform's two-pane viewer"
         spotBtn.text = if (spotlightOn) "Spotlight on" else "Spotlight"
     }
 
-    /** Rebuild every block in the CURRENT view — the paged flow from the top, old viewers disposed. */
+    /** Rebuild the current page in the selected view, releasing its old viewers. */
     private fun rebuild() {
         diffPanels.forEach { Disposer.dispose(it) }
         diffPanels.clear()
+        previews.clear()
         actsRows.clear()
         actsLogKey = "" // the rebuilt rows start from snapshot statuses — re-derive them
         stack.removeAll()
-        built = 0
+        built = ((built - 1).coerceAtLeast(0) / PAGE) * PAGE
+        loading = false
         stack.revalidate()
         stack.repaint()
         addPage()
@@ -277,55 +300,127 @@ class ReviewAllEditor(private val project: Project, private val file: ReviewAllV
         })
     }
 
-    /** Read the NEXT page's blobs off the EDT, then append its panels — the whole point of paging. */
+    private data class PreviewLine(val kind: Char, val before: String, val after: String)
+    private data class PageBlock(val spec: ReviewAllSpec, val before: String?, val after: String?, val local: String? = null, val lines: List<PreviewLine>? = null)
+
+    /** Compare off the EDT and retain only a bounded hunk preview for large reviews. */
+    private fun previewLines(before: String, after: String): List<PreviewLine> {
+        val left = before.split('\n'); val right = after.split('\n')
+        val fragments = com.intellij.diff.comparison.ComparisonManager.getInstance().compareLines(before, after,
+            com.intellij.diff.comparison.ComparisonPolicy.DEFAULT, com.intellij.openapi.progress.EmptyProgressIndicator())
+        val rows = mutableListOf<PreviewLine>()
+        var count = 0
+        fun add(kind: Char, a: String, b: String) { count++; if (rows.size < 100) rows.add(PreviewLine(kind, a, b)) }
+        var end = 0
+        for (f in fragments) {
+            val start = maxOf(end, f.startLine1 - 3)
+            add('@', "@@ -${start + 1} +${maxOf(0, f.startLine2 - (f.startLine1 - start)) + 1} @@", "")
+            for (i in start until f.startLine1) add(' ', left[i], left[i])
+            for (i in f.startLine1 until f.endLine1) add('-', left[i], "")
+            for (i in f.startLine2 until f.endLine2) add('+', "", right[i])
+            end = minOf(left.size, f.endLine1 + 3)
+            for (i in f.endLine1 until end) add(' ', left[i], left[i])
+        }
+        if (count > rows.size) rows.add(PreviewLine('@', "+${count - rows.size} more diff lines — this block is previewed; open its full diff from Review", ""))
+        return rows
+    }
+
+    private fun previewHtml(lines: List<PreviewLine>): String {
+        fun esc(s: String) = com.cellobservatory.observatory.model.revealHidden(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;").replace(" ", "&nbsp;").replace("\t", "&nbsp;&nbsp;&nbsp;&nbsp;")
+        fun color(c: java.awt.Color) = "#%06x".format(c.rgb and 0xffffff)
+        val foreground = color(UIUtil.getLabelForeground())
+        val muted = color(UIUtil.getContextHelpForeground())
+        val added = color(JBColor(0xE6F4E8, 0x294436))
+        val removed = color(JBColor(0xFBE9E7, 0x4C3030))
+        return "<html><body style='font-family:monospace;color:$foreground'><table width='100%' cellspacing='0' cellpadding='2'>" + lines.joinToString("") { line ->
+            val style = when (line.kind) { '+' -> "background-color:$added"; '-' -> "background-color:$removed"; '@' -> "color:$muted"; else -> if (spotlightOn) "color:$muted" else "" }
+            val text = if (line.kind == '+') line.after else line.before
+            if (sideBySide && line.kind != '@') "<tr style='$style'><td width='50%'>${esc(line.before).ifEmpty { "&nbsp;" }}</td><td width='50%'>${esc(line.after).ifEmpty { "&nbsp;" }}</td></tr>"
+            else "<tr style='$style'><td colspan='2'>${esc("${line.kind}$text")}</td></tr>"
+        } + "</table></body></html>"
+    }
+
+    private fun remotePage(specs: List<ReviewAllSpec>): List<PageBlock> {
+        val args = listOf("diff", "--ids", specs.joinToString(",") { it.rec.id.toString() }, "--contents", "--preview-lines", "50", "--session", file.session, "--json", "--machine", file.machine!!)
+        val result = com.cellobservatory.observatory.core.ObservatoryCli.run(args, project.basePath)
+        check(result.ok) { com.cellobservatory.observatory.core.ObservatoryCli.failureMessage(result.stdout, result.stderr, "Could not read review page") }
+        val data = com.google.gson.JsonParser.parseString(result.stdout).asJsonObject
+        val mapped = if (sideBySide) RemoteEditorReview.mapPage(project, file.machine, data) else emptyMap()
+        return data.getAsJsonArray("records").map { entry ->
+            val item = entry.asJsonObject
+            val r = item.getAsJsonObject("rec")
+            val spec = specs.first { it.rec.id == r.get("id").asInt }
+            val rec = spec.rec.copy(status = r.get("status").asString)
+            // Retain the verified file for navigation; both preview sides describe the recorded edit.
+            PageBlock(spec.copy(rec = rec), item.get("before").asString, item.get("after").asString, mapped[rec.file])
+        }
+    }
+
+    /** One page owns its viewers; later pages release them. Build one viewer per EDT turn. */
     private fun addPage() {
-        val pageSpecs = file.specs.drop(built).take(PAGE)
+        if (loading || disposed) return
+        loading = true
+        val token = ++generation
+        val start = built
+        val pageSpecs = file.specs.drop(start).take(PAGE)
         built += pageSpecs.size
-        stack.remove(more)
+        diffPanels.forEach { Disposer.dispose(it) }
+        diffPanels.clear()
+        previews.clear()
+        actsRows.clear()
+        stack.removeAll()
+        stack.add(JBLabel("Loading changes ${start + 1}–$built…"))
         stack.revalidate()
-        stack.repaint() // the button leaves the screen NOW, not when the read returns — a painted-but-dead button reads as broken
+        stack.repaint()
         val app = ApplicationManager.getApplication()
         app.executeOnPooledThread {
-            val sides = pageSpecs.map {
-                StoreReader.readBlobOrNull(file.session, it.rec.beforeBlob) to
-                    StoreReader.readBlobOrNull(file.session, it.rec.afterBlob)
+            val result = runCatching {
+                val blocks = if (file.machine != null) remotePage(pageSpecs)
+                else pageSpecs.map { PageBlock(it, StoreReader.readBlobOrNull(file.session, it.rec.beforeBlob), StoreReader.readBlobOrNull(file.session, it.rec.afterBlob)) }
+                if (pagedPreview) blocks.map { item ->
+                    if (item.before == null || item.after == null) item
+                    else item.copy(lines = previewLines(item.before, item.after))
+                } else blocks
             }
             app.invokeLater {
-                if (disposed || project.isDisposed) return@invokeLater
+                if (disposed || project.isDisposed || token != generation) return@invokeLater
+                stack.removeAll()
+                val blocks = result.getOrElse {
+                    loading = false
+                    built = start
+                    stack.add(JBLabel("Could not read this page: ${it.message}"))
+                    stack.add(JButton("Retry").apply { addActionListener { addPage() } })
+                    stack.revalidate(); stack.repaint()
+                    return@invokeLater
+                }
                 val missing = mutableListOf<Int>()
-                pageSpecs.forEachIndexed { i, spec ->
-                    val (before, after) = sides[i]
-                    if (before == null || after == null) {
-                        missing.add(spec.rec.id)
-                        return@forEachIndexed
+                fun append(i: Int) {
+                    if (disposed || project.isDisposed || token != generation) return
+                    if (i < blocks.size) {
+                        val item = blocks[i]
+                        if (item.before == null || item.after == null) missing.add(item.spec.rec.id)
+                        else stack.add(block(item.spec, item.before, item.after, item.lines, item.local))
+                        stack.revalidate(); stack.repaint()
+                        // A timer also lets native viewer rediff/paint work finish between blocks.
+                        javax.swing.Timer(1) { append(i + 1) }.apply { isRepeats = false; start() }
+                        return
                     }
-                    stack.add(block(spec, before, after))
-                }
-                if (missing.isNotEmpty()) {
-                    ReviewOps.notify(
-                        project,
-                        "Skipped ${missing.joinToString(", ") { "#$it" }} — blob(s) missing from the store",
-                        NotificationType.WARNING,
-                    )
-                }
-                val left = file.specs.size - built
-                if (left > 0) {
+                    loading = false
+                    if (missing.isNotEmpty()) ReviewOps.notify(project, "Skipped ${missing.joinToString { "#$it" }} — blob(s) missing from the database", NotificationType.WARNING)
+                    val left = file.specs.size - built
                     more.removeAll()
-                    more.add(InplaceButton("Build the next ${minOf(PAGE, left)} diffs", NavTint.tint(AllIcons.Actions.MoveDown, NavTint.BLUE)) { addPage() })
-                    more.add(JBLabel("$left more not built yet — ten at a time keeps this tab instant"))
+                    if (start > 0) more.add(JButton("Previous $PAGE").apply {
+                        addActionListener { built = (start - PAGE).coerceAtLeast(0); addPage() }
+                    })
+                    more.add(JBLabel("${start + 1}–$built of ${file.specs.size} changes · $left remaining"))
+                    if (left > 0) more.add(JButton("Show ${minOf(PAGE, left)} more").apply { addActionListener { addPage() } })
                     stack.add(more)
+                    stack.revalidate(); stack.repaint()
+                    actsLogKey = ""
+                    syncActs()
+                    if (spotlightOn && !pagedPreview) app.invokeLater { if (token == generation) applySpotlight() }
                 }
-                stack.revalidate()
-                stack.repaint()
-                // Fresh rows were filled from SNAPSHOT statuses — re-derive against the store, so a
-                // block decided elsewhere (or before a view toggle's rebuild) opens with the truth.
-                actsLogKey = ""
-                syncActs()
-                // Spotlight rides new pages too — DOUBLY deferred: the viewers schedule their own
-                // rediff on the EDT queue, and dimming before their change highlighters exist would
-                // hit the empty-guard and no-op. A block that still slips through re-dims on the
-                // next toggle; the guard means it is never dimmed WRONGLY.
-                if (spotlightOn) app.invokeLater { app.invokeLater { applySpotlight() } }
+                append(0)
             }
         }
     }
@@ -396,29 +491,8 @@ class ReviewAllEditor(private val project: Project, private val file: ReviewAllV
             override fun actionPerformed(e: AnActionEvent) = run()
         }
 
-    private fun block(spec: ReviewAllSpec, before: String, after: String): JPanel {
+    private fun block(spec: ReviewAllSpec, before: String, after: String, lines: List<PreviewLine>? = null, local: String? = null): JPanel {
         val rec = spec.rec
-        val factory = DiffContentFactory.getInstance()
-        val type = FileTypeManager.getInstance().getFileTypeByFileName(File(rec.file).name)
-        val request = SimpleDiffRequest(
-            "#${rec.id} · ${spec.rel}",
-            factory.create(project, before, type),
-            factory.create(project, after, type),
-            if (rec.beforeBlob == null) "(new file)" else "before",
-            if (rec.afterBlob == null) "(deleted)" else "after",
-        ).apply {
-            // The same verbs on the embedded viewer's OWN toolbar, where a reader coming from the
-            // single-diff window looks for them. (The FORCED VIEW rides the processor CONTEXT, not
-            // this request — see [BlockDiffProcessor].)
-            putUserData(
-                DiffUserDataKeys.CONTEXT_ACTIONS,
-                listOf(
-                    act("Keep #${rec.id}", NavTint.KEEP) { ReviewOps.keep(project, file.session, rec.id, advance = false) },
-                    act("Undo #${rec.id}", NavTint.UNDO) { ReviewOps.undoOrRedo(project, file.session, rec, redo = false, advance = false) },
-                    act("Chat About #${rec.id}", NavTint.CHAT) { ReviewOps.chatAbout(project, file.session, rec.id) },
-                ),
-            )
-        }
         val header = SimpleColoredComponent().apply {
             append("#${rec.id}  ", SimpleTextAttributes.REGULAR_BOLD_ATTRIBUTES)
             append(spec.rel, SimpleTextAttributes.REGULAR_ATTRIBUTES)
@@ -440,6 +514,41 @@ class ReviewAllEditor(private val project: Project, private val file: ReviewAllV
             add(btns, BorderLayout.WEST)
             add(header, BorderLayout.CENTER)
             border = JBUI.Borders.empty(6, 0, 2, 0)
+        }
+        if (local != null) top.add(JButton("Open mounted file").apply {
+            addActionListener { Navigate.openLocalFile(project, local) }
+        }, BorderLayout.EAST)
+        if (lines != null) {
+            val pane = javax.swing.JEditorPane("text/html", previewHtml(lines)).apply { isEditable = false; background = UIUtil.getPanelBackground() }
+            previews.add(pane to lines)
+            return JPanel(BorderLayout()).apply {
+                add(top, BorderLayout.NORTH)
+                add(JBScrollPane(pane).apply { preferredSize = Dimension(0, JBUI.scale(19) * minOf(lines.size + 2, 30)) }, BorderLayout.CENTER)
+                alignmentX = JComponent.LEFT_ALIGNMENT
+                maximumSize = Dimension(Int.MAX_VALUE, preferredSize.height)
+                border = JBUI.Borders.emptyBottom(10)
+            }
+        }
+        val factory = DiffContentFactory.getInstance()
+        val type = FileTypeManager.getInstance().getFileTypeByFileName(File(rec.file).name)
+        val request = SimpleDiffRequest(
+            "#${rec.id} · ${spec.rel}",
+            factory.create(project, before, type),
+            factory.create(project, after, type),
+            if (rec.beforeBlob == null) "(new file)" else "before",
+            if (rec.afterBlob == null) "(deleted)" else "after",
+        ).apply {
+            // The same verbs on the embedded viewer's OWN toolbar, where a reader coming from the
+            // single-diff window looks for them. (The FORCED VIEW rides the processor CONTEXT, not
+            // this request — see [BlockDiffProcessor].)
+            putUserData(
+                DiffUserDataKeys.CONTEXT_ACTIONS,
+                listOf(
+                    act("Keep #${rec.id}", NavTint.KEEP) { decide(rec, "keep") },
+                    act("Undo #${rec.id}", NavTint.UNDO) { decide(rec, "undo") },
+                    *if (file.machine == null) arrayOf(act("Chat About #${rec.id}", NavTint.CHAT) { ReviewOps.chatAbout(project, file.session, rec.id) }) else emptyArray(),
+                ),
+            )
         }
         // The CONTEXT, preloaded BEFORE the processor exists — the only channel the forced view
         // actually travels (see [BlockDiffProcessor]). TextDiffSettings rides the same holder:

@@ -11,6 +11,7 @@ import java.nio.file.Path
 import java.nio.file.StandardWatchEventKinds.ENTRY_CREATE
 import java.nio.file.StandardWatchEventKinds.ENTRY_DELETE
 import java.nio.file.StandardWatchEventKinds.ENTRY_MODIFY
+import java.nio.file.WatchKey
 import java.nio.file.WatchService
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.ScheduledFuture
@@ -39,6 +40,15 @@ class StoreWatcher : Disposable {
     private var started = false
     /** The poll task, so a restart can cancel it instead of leaving a second one running. */
     private var pollTask: ScheduledFuture<*>? = null
+    /** The root it watches. A move made elsewhere (the terminal app, VS Code, `oak store --move`) is followed by a check
+     *  every two seconds, as this plugin's own move restarts it at once: left on the old root, live refresh stopped. */
+    @Volatile internal var watching: Path? = null
+        private set
+    /** The root's own registration. Deleted (by hand, say) and made again by the next capture, the root kept a key that
+     *  no longer reports, so no new session was watched and live refresh stopped until the IDE restarted. */
+    @Volatile internal var rootKey: WatchKey? = null
+        private set
+    private var followTask: ScheduledFuture<*>? = null
 
     fun addListener(l: Runnable) {
         listeners.add(l)
@@ -66,10 +76,20 @@ class StoreWatcher : Disposable {
     }
 
     @Synchronized
+    private fun follow() {
+        if (!started) return
+        // Its root's key dead, it starts again once the root is back: never before, which would make the folder again.
+        val dead = rootKey?.isValid == false && watching?.isDirectory() == true
+        if (ClaudePaths.rootDir() != watching || dead) restart()
+    }
+
+    @Synchronized
     private fun ensureStarted() {
         if (started) return
         started = true
         val root = ClaudePaths.rootDir()
+        watching = root
+        if (followTask == null) followTask = debouncer.scheduleWithFixedDelay({ follow() }, 2, 2, TimeUnit.SECONDS)
         try {
             Files.createDirectories(root) // watch works even before the first capture
             // macOS's default WatchService is a ~10s POLLING watcher (the JDK exposes no HIGH-sensitivity
@@ -81,7 +101,7 @@ class StoreWatcher : Disposable {
             }
             val ws = FileSystems.getDefault().newWatchService()
             watcher = ws
-            register(ws, root)
+            rootKey = register(ws, root)
             root.listDirectoryEntries().filter { it.isDirectory() }.forEach { register(ws, it) }
             Thread({ loop(ws, root) }, "claude-observatory-watch").apply { isDaemon = true }.start()
         } catch (e: Exception) {
@@ -113,13 +133,12 @@ class StoreWatcher : Disposable {
         0L
     }
 
-    private fun register(ws: WatchService, dir: Path) {
+    private fun register(ws: WatchService, dir: Path): WatchKey? =
         try {
             dir.register(ws, ENTRY_CREATE, ENTRY_MODIFY, ENTRY_DELETE)
         } catch (_: Exception) {
-            /* dir vanished between listing and registration */
+            null /* dir vanished between listing and registration */
         }
-    }
 
     private fun loop(ws: WatchService, root: Path) {
         while (true) {

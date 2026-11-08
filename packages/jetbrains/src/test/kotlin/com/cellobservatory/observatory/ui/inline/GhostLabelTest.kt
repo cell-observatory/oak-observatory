@@ -43,6 +43,23 @@ class GhostLabelTest {
     }
 
     @Test
+    fun `the cut ends where a character does, on the same lines VS Code's ghostText is tested on`() {
+        val fam = "\uD83D\uDC68\u200D\uD83D\uDC69\u200D\uD83D\uDC67\u200D\uD83D\uDC66"
+        assertEquals("− " + "c".repeat(52) + "…", ghostLabel(listOf("c".repeat(52) + fam + "d".repeat(20))))
+        assertEquals("− " + "c".repeat(48) + fam + "…", ghostLabel(listOf("c".repeat(48) + fam + "d".repeat(20))))
+        assertEquals("− " + "e".repeat(58) + "… …(+1)", ghostLabel(listOf("e".repeat(58) + "\uD83C\uDDEF\uD83C\uDDF5" + "f".repeat(9), "second")))
+    }
+
+    @Test
+    fun `a hidden character shows as the mark that names it, after the cut, on the lines VS Code's ghostText is tested on`() {
+        assertEquals("− if (a⟨U+202E⟩) {}", ghostLabel(listOf("if (a\u202E) {}")))
+        assertEquals("a mark is never cut", "− " + "a".repeat(58) + "⟨U+202E⟩…", ghostLabel(listOf("a".repeat(58) + "\u202E" + "b".repeat(10))))
+        assertEquals("a joiner inside an identifier shows", "− if (is⟨U+200D⟩admin) {}", ghostLabel(listOf("if (is\u200Dadmin) {}")))
+        val family = "\uD83D\uDC68\u200D\uD83D\uDC69\u200D\uD83D\uDC67"
+        assertEquals("and an emoji family keeps its joiners", "− f = \"$family\"", ghostLabel(listOf("f = \"$family\"")))
+    }
+
+    @Test
     fun `a multi-line hunk names the head and counts the rest`() {
         assertEquals("− head …(+2)", ghostLabel(listOf("head", "second", "third")))
     }

@@ -1,6 +1,7 @@
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
+import { fileWithinLast } from './stamp';
 
 export interface CodexCommandHook {
   type: 'command';
@@ -127,9 +128,10 @@ function withConfigLock<T>(configFile: string, run: () => T): T {
       break;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-      let age = 0;
-      try { age = Date.now() - fs.statSync(lockFile).mtimeMs; } catch { continue; /* released under us */ }
-      if (age > LOCK_TIMEOUT_MS) {
+      let at = 0;
+      try { at = fs.statSync(lockFile).mtimeMs; } catch { continue; /* released under us */ }
+      // Older than any repair takes, or dated ahead of this clock (stepped back since): its owner is gone.
+      if (!fileWithinLast(lockFile, at, LOCK_TIMEOUT_MS)) {
         try { fs.unlinkSync(lockFile); } catch { /* another waiter reclaimed it first */ }
         continue;
       }

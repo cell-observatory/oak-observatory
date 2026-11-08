@@ -4,12 +4,12 @@
 // JetBrains IDE, and on the Gateway/remote-dev backend (where ~/.claude lives).
 plugins {
     id("java")
-    kotlin("jvm") version "2.4.10"
-    id("org.jetbrains.intellij.platform") version "2.18.1"
+    kotlin("jvm") version "2.4.21"
+    id("org.jetbrains.intellij.platform") version "2.19.0"
 }
 
 group = "com.cell-observatory"
-version = "0.10.0" // keep in lockstep with the monorepo/vscode version (see root package.json)
+version = "0.11.0" // keep in lockstep with the monorepo/vscode version (see root package.json)
 
 repositories {
     mavenCentral()
@@ -22,6 +22,7 @@ dependencies {
         // com.intellij.modules.platform so it loads in PyCharm CE/Pro and every other JetBrains IDE.
         intellijIdeaCommunity("2025.2")
         testFramework(org.jetbrains.intellij.platform.gradle.TestFrameworkType.Platform)
+        bundledPlugin("org.jetbrains.plugins.terminal")
     }
     testImplementation("junit:junit:4.13.2")
 }
@@ -66,6 +67,10 @@ intellijPlatform {
             create(org.jetbrains.intellij.platform.gradle.IntelliJPlatformType.IntellijIdeaCommunity, "2025.2")
             // PyCharm Community stopped being published separately at 2025.3; `PyCharm` is the unified one.
             create(org.jetbrains.intellij.platform.gradle.IntelliJPlatformType.PyCharm, "2026.1")
+            // 2026.2, Compatible when first verified (2026-11-03): IntelliJ IDEA, one product since 2025.3 (`IntellijIdea`),
+            // and PyCharm.
+            create(org.jetbrains.intellij.platform.gradle.IntelliJPlatformType.IntellijIdea, "2026.2.4")
+            create(org.jetbrains.intellij.platform.gradle.IntelliJPlatformType.PyCharm, "2026.2")
         }
     }
 }
@@ -75,11 +80,14 @@ intellijPlatform {
 // throwaway HOME, so a run neither tests the installed CLI nor reads the developer's transcripts and
 // writes caches into their real store. herdr's socket points nowhere, as it does under `npm test`, and
 // there is no display and no session bus, as on CI: a draft the CLI keeps on the clipboard never reaches
-// the desktop, and the headless IDE does not connect to the developer's D-Bus.
+// the desktop, and the headless IDE does not connect to the developer's D-Bus. The JVM's temporary folder
+// is in that HOME too: every run left about ten entries in the system's own, the light test project's
+// folder (which the tests create on disk, and nothing removes), the folders some tests make and never
+// remove, and the platform's event-scheme file.
 tasks.test {
     val home = layout.buildDirectory.dir("test-home").get().asFile
     val bin = rootProject.file("../../node_modules/.bin")
-    doFirst { home.deleteRecursively(); home.mkdirs() }
+    doFirst { home.deleteRecursively(); home.resolve("tmp").mkdirs() }
     environment("HOME", home.path)
     environment("USERPROFILE", home.path)
     environment("CLAUDE_CONFIG_DIR", home.resolve(".claude").path)
@@ -90,4 +98,5 @@ tasks.test {
     environment("HERDR_SOCKET_PATH", home.resolve("no-herdr.sock").path)
     listOf("HERDR_PANE_ID", "HERDR_TAB_ID", "HERDR_WORKSPACE_ID", "HERDR_ENV", "DISPLAY", "WAYLAND_DISPLAY", "DBUS_SESSION_BUS_ADDRESS").forEach { environment.remove(it) }
     systemProperty("java.util.prefs.userRoot", home.resolve(".java").path)
+    systemProperty("java.io.tmpdir", home.resolve("tmp").path)
 }

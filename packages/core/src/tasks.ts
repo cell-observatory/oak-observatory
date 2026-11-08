@@ -127,6 +127,7 @@ export function newTaskFacts(): TaskFacts {
 }
 
 export function foldTaskFacts(facts: TaskFacts, o: any): void {
+  if (o?.type === 'api-request-blob') return;
   foldTaskNames(facts, o);
   const { state, pendingCreate, snaps } = facts;
   const toMs = (v: unknown): number => {

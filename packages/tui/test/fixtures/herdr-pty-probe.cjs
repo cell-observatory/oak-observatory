@@ -124,20 +124,21 @@ module.exports = async function probe(t, fixture = false) {
     child.write('\x1b');
   }
   let offset = hostOutput.length;
-  child.write('\x1b[97;5u\x1b[97;5:3u\x1b[110;1u');
-  await until(rows => /\[\s*observatory\s*\]/.test(rows[0]), 'CSI-u ctrl+a n to leave herdr');
+  child.write('\x1b[98;5u\x1b[98;5:3u\x1b[109;1u');
+  await until(rows => /\[\s*F2 observatory\s*\]/.test(rows[0]), "CSI-u ctrl+b m (herdr's prefix, then m) to leave herdr");
   assert.match(hostOutput.slice(offset), /\x1b\[<\d+u/, 'leaving pops the child keyboard stack');
   offset = hostOutput.length;
-  child.write('\x01' + '1');
-  await until(rows => /\[\s*herdr\s*\]/.test(rows[0]), 'return to herdr');
+  child.write('\x1b1');
+  await until(rows => /\[\s*F1 herdr\s*\]/.test(rows[0]), 'return to herdr');
   assert.match(hostOutput.slice(offset), /\x1b\[>\d+u/, 'returning re-pushes child flags');
   offset = hostOutput.length;
-  const quit = fixture === 'leader-quit' ? '\x1b[97;5u\x1b[113u' : '\x1b[113;5u';
+  // `prefix-quit`: herdr's prefix held, then ctrl+q — the prefix is dropped and the quit is OAK's.
+  const quit = fixture === 'prefix-quit' ? '\x1b[98;5u\x1b[113;5u' : '\x1b[113;5u';
   child.write(quit + '\x1b[113;5:3u');
   await until(rows => rows.some(line => /again to exit/.test(line)), 'first quit confirmation; release does not confirm it');
   assert.doesNotMatch(hostOutput.slice(offset), /\x1b\[<\d+u/, 'first quit keeps the live tab modes');
   child.write(quit);
   await Promise.race([closed, new Promise((_, reject) => setTimeout(() => reject(Error('CLI did not quit')), 3000))]);
   assert.match(hostOutput.slice(offset), /\x1b\[<\d+u/, 'quitting pops child flags');
-  t.diagnostic('built CLI at 120x36: host push, verbatim super+w, CSI-u leader, pop/re-push and quit cleanup passed');
+  t.diagnostic('built CLI at 120x36: host push, verbatim super+w, CSI-u prefix, pop/re-push and quit cleanup passed');
 };

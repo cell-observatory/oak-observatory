@@ -26,7 +26,9 @@ test('retired runtime and transport symbols do not survive in package sources', 
   assert.deepEqual(violations, []);
 });
 
-const retired = /oak (?:drive|send|wait|remotes)\b|--serve\b|--bridge\b|--remote |manageRemotes|DriveController|DriveService|Agent tab/;
+// `oak query --serve` (the local index's one-request-per-line mode) is current; every other `--serve`
+// (the retired remote bridge's `views --serve`) is not, so the exception is that exact spelling.
+const retired = /oak (?:drive|send|wait|remotes)\b|(?<!oak query )--serve\b|--bridge\b|--remote |manageRemotes|DriveController|DriveService|Agent tab/;
 
 function retiredLines(relative, text) {
   let historicalRelease = false;
@@ -49,6 +51,9 @@ test('retirement guard detects every retired documentation symbol and limits his
     assert.equal(retiredLines('CHANGELOG.md', `## [Unreleased]\n${symbol}`).length, 1);
     assert.deepEqual(retiredLines('CHANGELOG.md', `## [0.9.0] - 2026-01-01\n${symbol}`), []);
   }
+  assert.deepEqual(retiredLines('README.md', 'use `oak query --serve` for one request per line'), [], 'oak query --serve is current');
+  for (const line of ['use `views --serve`', 'use `query --serve`', 'use oak query sessions --serve', 'the `--serve` mode'])
+    assert.equal(retiredLines('README.md', line).length, 1, `${line} is still retired`);
   const removal = '- Removed `oak drive` (use `oak agent start` and `oak prompt`), `oak remotes` (use `oak machine`).';
   assert.deepEqual(retiredLines('CHANGELOG.md', removal), []);
   assert.equal(retiredLines('README.md', removal).length, 1, 'the removal exception is changelog-only');

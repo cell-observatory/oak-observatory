@@ -11,6 +11,7 @@ import { claudeConfigDir } from './paths';
 import { codexAccountId } from './codex';
 import { spawnTool } from './spawn';
 import type { Check } from './diagnose';
+import { graphemeHead } from './graphemes';
 
 export interface CodexAccountQuota {
   version: 1;
@@ -75,7 +76,14 @@ export function parseCodexAccountQuota(result: unknown, expectedAccount: string,
   for (const key of ['primary', 'secondary']) {
     const w = bucket[key] as { usedPercent?: number; windowDurationMins?: number; resetsAt?: number } | null;
     if (!w || !Number.isFinite(w.usedPercent) || !Number.isFinite(w.windowDurationMins) || !Number.isFinite(w.resetsAt)) continue;
-    if (w.usedPercent! < 0 || w.windowDurationMins! <= 0 || w.resetsAt! * 1000 <= now) continue;
+    if (w.usedPercent! < 0 || w.windowDurationMins! <= 0) continue;
+    // A 5-hour window whose reset has passed is over: a share of 0 with no reset, as gptUsagePanel reads one that
+    // passes later. Left out, it read as a plan with no 5-hour window, and this answer outranks the rollouts. Any
+    // other window whose reset has passed is left out.
+    if (w.resetsAt! * 1000 <= now) {
+      if (w.windowDurationMins! < 1440) { q.fivePct = 0; q.fiveReset = null; }
+      continue;
+    }
     // Bound the weekly band to ~a week (1 day .. 2 weeks). Codex 0.154 added a MONTHLY window
     // (~43200 min); the old ">= a day is weekly" rule put its ~30-day reset in the weekly slot.
     // Longer windows are the monthly one, which this quota does not track (month = transcript scan).
@@ -109,7 +117,7 @@ export function readCodexAccountQuotaOverChild(child: ChildProcess, account: str
       child.stdin?.end(); stop(false);
       killTimer = setTimeout(() => stop(true), 500); killTimer.unref();
     };
-    const said = (error: unknown): string => String((error as { message?: unknown })?.message ?? JSON.stringify(error)).slice(0, 200);
+    const said = (error: unknown): string => graphemeHead(String((error as { message?: unknown })?.message ?? JSON.stringify(error)), 200);
     const timer = setTimeout(() => finish(null, `no answer within ${timeoutMs / 1000}s`), timeoutMs);
     child.once('close', () => { finish(null, 'codex app-server exited before answering'); clearTimeout(timer); clearTimeout(killTimer); resolve(result); });
     child.once('error', (e) => finish(null, `could not start codex app-server: ${said(e)}`));
@@ -165,7 +173,7 @@ export async function pullCodexAccountUsage(): Promise<boolean> {
     fs.writeFileSync(tmp, JSON.stringify(quota), { mode: 0o600 }); fs.renameSync(tmp, dest);
     logCodexPull('ok');
     return true;
-  } catch (e) { logCodexPull(`could not read the quota: ${String((e as Error)?.message ?? e).slice(0, 200)}`); return false; }
+  } catch (e) { logCodexPull(`could not read the quota: ${graphemeHead(String((e as Error)?.message ?? e), 200)}`); return false; }
 }
 
 /** Doctor's word on the GPT quota bars: null while there is no Codex login or no read yet. A failed

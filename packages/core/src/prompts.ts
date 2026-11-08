@@ -20,6 +20,7 @@ import { parseWorkflows } from './workflows';
 import { groupMembers, reviewEdits } from './groups';
 import { cancelledMemberIds } from './units';
 import { lineDelta } from './format';
+import { graphemeHead } from './graphemes';
 import { captureEventsPath, readCaptureEvents } from './capture-events';
 import { cachedByFiles, readLines } from './fscache';
 import { EditRecord, logPath, readLog, readScopeOverrides } from './store';
@@ -79,7 +80,7 @@ export interface SessionPrompt {
 }
 
 /** Stable per-prompt id: the ask's time plus its opening words. */
-function promptId(ts: number, text: string): string {
+export function promptId(ts: number, text: string): string {
   // The separator is a literal NUL by ESCAPE, never a raw byte: a raw one makes this a "binary" file
   // to git, ripgrep and every review tool, which hides the diff of the module they most need to read.
   return crypto.createHash('sha256').update(`${ts}\u0000${text.slice(0, 200)}`).digest('hex').slice(0, 12);
@@ -115,7 +116,8 @@ export interface PromptWindow {
 function ownerWithOverrides<T extends { id: string }>(
   overrides: Map<number, string>,
   byPromptId: Map<string, T>,
-  temporal: (ts: number) => T | null
+  temporal: (ts: number) => T | null,
+  sharedTurns: Set<string>
 ): (rec: { id: number; ts: number; promptId?: string; nativeTurnId?: string }) => T | null {
   return (rec) => {
     const want = overrides.get(rec.id);
@@ -123,6 +125,7 @@ function ownerWithOverrides<T extends { id: string }>(
       const target = byPromptId.get(want);
       if (target) return target;
     }
+    if ((rec.promptId && sharedTurns.has(rec.promptId)) || (rec.nativeTurnId && sharedTurns.has(rec.nativeTurnId))) return temporal(rec.ts);
     if (rec.promptId && byPromptId.has(rec.promptId)) return byPromptId.get(rec.promptId)!;
     if (rec.nativeTurnId && byPromptId.has(rec.nativeTurnId)) return byPromptId.get(rec.nativeTurnId)!;
     return temporal(rec.ts);
@@ -153,7 +156,7 @@ export function promptWindows(cwd: string, sessionId: string): PromptWindow[] {
       id: a.id ? a.id : promptId(a.ts, a.text),
       index: i + 1,
       ts: a.ts,
-      title: a.text.length > 96 ? a.text.slice(0, 95) + '…' : a.text,
+      title: a.text.length > 96 ? graphemeHead(a.text, 95) + '…' : a.text,
       editIds: [],
       pending: 0,
     }));
@@ -169,7 +172,8 @@ export function promptWindows(cwd: string, sessionId: string): PromptWindow[] {
       }
       return reqs[lo];
     };
-    const resolve = ownerWithOverrides(readScopeOverrides(sessionId), new Map(reqs.map((r) => [r.id, r])), owner);
+    const resolve = ownerWithOverrides(readScopeOverrides(sessionId), new Map(reqs.map((r) => [r.id, r])), owner,
+      new Set(asks.filter(a => a.nativeTurnId && a.id !== a.nativeTurnId).map(a => a.nativeTurnId!)));
     // `editIds` stays FULL — a rewind to before this ask must reach every record it produced, cancelled
     // or not — while the COUNT skips chains that cancel out, so an ask's "N pending" matches the rows
     // the review surfaces will actually offer under it. PENDING-only: the count it gates is `pending`,
@@ -186,6 +190,13 @@ export function promptWindows(cwd: string, sessionId: string): PromptWindow[] {
   });
 }
 
+/** The version of the persisted prompts projection, in its stamp and its file NAME (`oak clean` removes the names of the
+ *  versions before: changemap.ts, pruneSupersededCaches). 2: pasted prompts (`<pasted_content>`) became asks
+ *  (2026-09-22) — a projection built before that holds none of them, and its inputs did not move. 4: each ask's tokens
+ *  count a message at its largest snapshot (asks.ts), which a projection built before holds short, its inputs unmoved. */
+// Human queued deliveries are asks; replay blobs and meta notes are not.
+export const PROMPTS_CACHE_VERSION = 5;
+
 export function sessionPrompts(cwd: string, sessionId: string): SessionPrompt[] {
   const transcript = findTranscript(cwd, sessionId);
 
@@ -194,13 +205,11 @@ export function sessionPrompts(cwd: string, sessionId: string): SessionPrompt[] 
   if (!transcript) return hookSessionPrompts(sessionId);
   // This finished projection is reused across fresh view processes too. Its input stamp includes
   // workflow/subagent inventories, so a child starting without a main-transcript append still moves it.
-  // 2: pasted prompts (`<pasted_content>`) became asks (2026-09-22) — a projection built before that
-  // holds none of them, and its inputs did not move.
-  const stamp = [3, cwd, fileMark(transcript), fileMark(logPath(sessionId)), fileMark(captureEventsPath(sessionId)),
+  const stamp = [PROMPTS_CACHE_VERSION, cwd, fileMark(transcript), fileMark(logPath(sessionId)), fileMark(captureEventsPath(sessionId)),
     derivedInputsStamp(cwd, sessionId, false)].join('|');
-  // v2 in the NAME as well as the stamp: an older build still running beside this one keeps its own
+  // The version in the NAME as well as the stamp: an older build still running beside this one keeps its own
   // file rather than the two rewriting one projection at each other's version on every append.
-  const name = `prompts-v3-${crypto.createHash('sha256').update(`${cwd}\0${transcript}`).digest('hex').slice(0, 16)}`;
+  const name = `prompts-v${PROMPTS_CACHE_VERSION}-${crypto.createHash('sha256').update(`${cwd}\0${transcript}`).digest('hex').slice(0, 16)}`;
   return persisted(sessionId, name, stamp, () => sessionPromptsUncached(transcript, cwd, sessionId), (value) =>
     Array.isArray(value) && value.every((p) => p && typeof p.id === 'string' && typeof p.text === 'string' &&
       Number.isFinite(p.ts) && Array.isArray(p.editIds) && Array.isArray(p.agents) && Array.isArray(p.workflows)));
@@ -244,7 +253,7 @@ function hookSessionPrompts(sessionId: string): SessionPrompt[] {
         ts: t.ts,
         endTs,
         text,
-        title: text.length > 96 ? text.slice(0, 95) + '…' : text,
+        title: text.length > 96 ? graphemeHead(text, 95) + '…' : text,
         editIds: mine.map((r) => r.id),
         edits: mine.length,
         added,
@@ -278,7 +287,7 @@ function sessionPromptsUncached(transcript: string, cwd: string, sessionId: stri
     ts: a.ts,
     endTs: i + 1 < asks.length ? asks[i + 1].ts : 0,
     text: a.text,
-    title: a.text.length > 96 ? a.text.slice(0, 95) + '…' : a.text,
+    title: a.text.length > 96 ? graphemeHead(a.text, 95) + '…' : a.text,
     editIds: [],
     edits: 0,
     added: 0,
@@ -338,7 +347,8 @@ function sessionPromptsUncached(transcript: string, cwd: string, sessionId: stri
     s.add(v);
   };
   // DISPLAY units: an ask's rollup must not count records the change map collapsed away.
-  const resolve = ownerWithOverrides(readScopeOverrides(sessionId), new Map(reqs.map((r) => [r.id, r])), owner);
+  const resolve = ownerWithOverrides(readScopeOverrides(sessionId), new Map(reqs.map((r) => [r.id, r])), owner,
+      new Set(asks.filter(a => a.nativeTurnId && a.id !== a.nativeTurnId).map(a => a.nativeTurnId!)));
   // Same split as `promptWindows`: every id stays reachable for a rewind, and nothing that cancels out
   // is counted as this ask's work.
   const cancelled = cancelledMemberIds(sessionId);
@@ -583,6 +593,7 @@ function buildResponse(transcript: string, r: SessionPrompt): PromptResponse {
     } catch {
       continue;
     }
+    if (o?.type === 'api-request-blob') continue;
     const msg = o.message;
     if (!msg || msg.role !== 'assistant' || o.isSidechain === true) continue;
     const ts = toMs(o.timestamp ?? o.ts);
@@ -602,7 +613,7 @@ function buildResponse(transcript: string, r: SessionPrompt): PromptResponse {
   }
   const full = segments.join('\n\n');
   const bytes = Buffer.byteLength(full, 'utf8');
-  const text = full.length > RESPONSE_CAP ? full.slice(0, RESPONSE_CAP) : full;
+  const text = full.length > RESPONSE_CAP ? graphemeHead(full, RESPONSE_CAP) : full;
   return {
     promptId: r.id,
     index: r.index,

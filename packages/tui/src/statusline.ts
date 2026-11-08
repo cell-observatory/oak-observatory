@@ -12,20 +12,22 @@
  * visible on screen:
  *
  *   - `uc` thresholds the TRUNCATED integer, so 49.6% is still green.
- *   - `bar` rounds a truncated percentage — 6.3% rules ZERO cells, not one — and marks the
- *     share with an UNDERLINE under the figures rather than a block beside them: the first pct%
- *     of CELLS are underlined and coloured, the rest dim and plain.
+ *   - `bar` rounds a truncated percentage — 6.3% fills ZERO cells, not one — and paints the share
+ *     as a progress bar holding the figures: the first pct% of CELLS on a very dim tint of the
+ *     usage colour, the rest on an even dimmer neutral, one light ink over both.
  *   - `human` TRUNCATES (1.19M → `1.1M`, 1.0M → `1M`), unlike core's compactTokens.
  *   - `untilStr` is `3d 11h` / `10h 42m` / `45m` / `now`, unlike core's compactDuration.
  *   - the ctx percentage truncates; the 5h/week percentages round.
  *
- * COLOUR: with the default theme these emit the script's own 16-colour codes at
- * every depth, so the row is identical. A theme the reader has EXPLICITLY chosen outranks that —
- * colorblind, light and mono re-tint through the palette, because an accessibility choice is an
+ * COLOUR: with the default theme the labels and shares are the script's own 16-colour codes at
+ * every depth, and the bars its own grounds: 24-bit at `truecolor` (the script reads COLORTERM,
+ * as colorDepth does), its 256-colour cells at every other depth. A theme the reader has
+ * EXPLICITLY chosen outranks that — colorblind, light and mono re-tint through the palette, and
+ * paint the bars on the theme's own grounds and ink, because an accessibility choice is an
  * instruction, not a preference to be overridden by a fidelity goal.
  */
 import { displayWidth, fitVisible } from './textwidth';
-import { ColorDepth, StateKey, tint } from './glyphs';
+import { ColorDepth, StateKey, inks, surfaces, tint } from './glyphs';
 
 const DIM = '\x1b[2m';
 const R = '\x1b[0m';
@@ -50,12 +52,20 @@ export interface StatuslineData {
   tokensIn?: number;
   tokensOut?: number;
   tokensCacheRead?: number;
+  /** The session with every agent it started (`oak usage`'s sessionTreeTokens), when it started any: drawn after its
+   *  own figure, each labelled, as the script draws them. */
+  treeAgents?: number;
+  treeIn?: number;
+  treeOut?: number;
+  treeCacheRead?: number;
   durationMs?: number;
   ctxPct?: number | null;
   ctxUsed?: number | null;
   ctxSize?: number | null;
   fivePct?: number | null;
   fiveResetMs?: number | null;
+  /** The account has no five-hour limit (core's fiveNoneAt): no 5h segment at all, as the shell draws none. */
+  fiveNone?: boolean;
   /** The per-model weekly cap the account reports (the desktop app's "Fable" row): share, reset,
    *  and the model's display name — drawn as its own segment, share + countdown only. */
   fablePct?: number | null;
@@ -84,6 +94,12 @@ export interface StatuslineData {
   weekEst?: number | null;
   weekTotal?: number | null;
   weekMeasured?: number | null;
+  /** The saved machine each window's reading came from (core's fiveMachine and its siblings), named in one dim
+   *  segment ahead of the windows, as the shell's line names it; null or absent for this machine's own reading. */
+  fiveMachine?: string | null;
+  weekMachine?: string | null;
+  fableMachine?: string | null;
+  monthMachine?: string | null;
   /** Whose measurements these are: 'here', or 'N machines'. Rendered beside them, because a token
    *  total that cannot say whose it is reads as the account's when it may be one laptop's. */
   usageScope?: string;
@@ -123,6 +139,12 @@ export function usd(n: number): string {
 /** The script's `human`: TRUNCATING compaction. 1_190_000 → `1.1M`, 1_000_000 → `1M`, 127_900 → `127k`. */
 export function human(n: number): string {
   const v = Math.trunc(n) || 0;
+  // Billions, as the script prints them (`6B`, `1.2B`): a month's cache reads reach them, the more so summed across
+  // an account's machines, where this read `+6070M↺` beside the script's `+6B↺`.
+  if (v >= 1_000_000_000) {
+    const b = Math.trunc((v % 1_000_000_000) / 100_000_000);
+    return b === 0 ? `${Math.trunc(v / 1_000_000_000)}B` : `${Math.trunc(v / 1_000_000_000)}.${b}B`;
+  }
   if (v >= 1_000_000) {
     const d = Math.trunc((v % 1_000_000) / 100_000);
     return d === 0 ? `${Math.trunc(v / 1_000_000)}M` : `${Math.trunc(v / 1_000_000)}.${d}M`;
@@ -158,36 +180,22 @@ function usageColor(pct: number, depth: ColorDepth, themed: boolean): { open: st
   return { open: tint('\0', key, depth).split('\0')[0], key };
 }
 
-/** The script's `bar`: the figures with a RULE under them — a `width`-cell field holding the
- *  figures LEFT-aligned, whose first pct% of CELLS are underlined and in the usage colour while
- *  the rest is dim and plain. Nothing is painted: no background, no block glyphs; the rule is the
- *  bar, and the figures stay legible end to end (after a painted field read as
- *  a slab and its fill edge cut numbers in half).
+/** The script's `bar`: a PROGRESS BAR holding its figures — a `width`-cell box with the figures
+ *  centred in it, whose first pct% of CELLS are painted a very dim tint of the usage colour and the
+ *  rest an even dimmer neutral. Cells are whole, so the fill edge falls between two cells.
  *
- *  LEFT-ALIGNED IS LOAD-BEARING. Right-aligned figures put the rule under the blank padding: at
- *  37% of a 22-cell field the whole rule sat in the gap and stopped before the first digit, which
- *  is a gauge pointing at nothing.
+ *  VERY DIM, SO THE FIGURES STAND OUT. A field painted in the usage colour itself read as a slab,
+ *  and its fill edge cut numbers in half, because the ink changed with the ground. Here ONE light
+ *  ink runs over both grounds: the edge changes the ground under a digit, never the digit. The ink
+ *  is explicit, because the box brings its own dark ground and a light terminal's dark default
+ *  would vanish into it. No caps: the painted box shows its own extent. Centred, as a progress
+ *  bar's label is; with one ink the figures need not start where the fill does.
  *
- *  EVERY BAR IS THE SAME LENGTH: `width` is the widest figures in the whole
- *  render, measured by `statuslineFieldWidth` before anything is drawn. A width smaller than the
- *  text cannot truncate a number — the field grows instead. An empty text still draws a bare rule,
- *  so a window whose estimate has not calibrated yet shows its share rather than vanishing.
- *
- *  THE RULE CARRIES THE USAGE COLOUR up to the share and goes GREY past it, and so do the figures
- *  it runs under. NO SGR 58: a coloured underline is the only way to hold a grey digit over a
- *  coloured rule, and it was tried — tmux stores it, but it does not reach a real screen here (the
- *  rule came out grey twice, observed live), and an underline with no SGR 58 takes the cell's
- *  FOREGROUND. The rule keeps the colour. The caps are always the usage colour: they
- *  mark the bar's extent, not its fill.
- *
- *  THE RULE SPANS THE WHOLE FIELD, CAPS INCLUDED. The caps are underlined too:
- *  ▏ and ▕ are drawn at the LEFT and RIGHT EDGE of their cell, so an un-underlined cap leaves seven
- *  eighths of a cell of bare ground between it and the rule — the small gap that made the bar look
- *  broken at both ends. The rule is also ONE HUE throughout: the usage colour at full strength up to
- *  the share and DIMMED past it, so it reads as one line that fills rather than as a coloured stub
- *  beside a grey one. That is what frees the figures to sit CENTRED — the gauge is read off where
- *  the colour drops, not off where the text starts. */
-function bar(pct: number, text: string, open: string, width = 0): string {
+ *  EVERY BAR IS THE SAME LENGTH: `width` is the widest figures in the whole render, measured by
+ *  `statuslineMetrics` before anything is drawn. A width smaller than the text cannot truncate a
+ *  number — the box grows instead. An empty text still draws a bare bar, so a window whose
+ *  estimate has not calibrated yet shows its share rather than vanishing. */
+function bar(pct: number, text: string, key: StateKey, depth: ColorDepth, themed: boolean, width = 0): string {
   const p = Math.min(100, Math.max(0, Math.trunc(pct) || 0));
   const t = [...text];
   const w = text ? Math.max(width, t.length + 2) : Math.max(width, 8);
@@ -195,20 +203,46 @@ function bar(pct: number, text: string, open: string, width = 0): string {
   const cells = text ? [...' '.repeat(left), ...t, ...' '.repeat(w - t.length - left)] : [...' '.repeat(w)];
   let f = Math.trunc((p * w + 50) / 100);
   if (f > w) f = w;
-  return `${open}${UL}${CAPL}${cells.slice(0, f).join('')}${GY}${cells.slice(f).join('')}${open}${CAPR}${R}`;
+  const c = barColours(key, depth, themed);
+  return `${c.ink}${c.fill}${cells.slice(0, f).join('')}${c.rest}${cells.slice(f).join('')}${R}`;
 }
 
-/** The figures past the share are GREY — a 256-colour foreground, NOT the DIM attribute, which
- *  also dims the rule drawn under them. */
-const GY = '\x1b[38;5;245m';
+/** The script's grounds and ink. 24-bit where the terminal has it; below that the palette has no
+ *  very dim hue (its darkest green and yellow are far brighter than the 24-bit tints, its darkest red
+ *  far more saturated), so every fill is the nearest grey a step above the neutral and the label and
+ *  share keep the hue. */
+const BAR_24 = {
+  ink: '\x1b[38;2;228;228;228m',
+  rest: '\x1b[48;2;30;30;34m',
+  kept: '\x1b[48;2;30;64;40m',
+  pending: '\x1b[48;2;60;52;24m',
+  risk: '\x1b[48;2;74;36;36m',
+};
+const BAR_256 = {
+  ink: '\x1b[38;5;254m',
+  rest: '\x1b[48;5;234m',
+  kept: '\x1b[48;5;236m',
+  pending: '\x1b[48;5;236m',
+  risk: '\x1b[48;5;236m',
+};
 
-/** SGR 4 and the two caps. The rule under the figures is the bar; the caps are its ends. */
-const UL = '\x1b[4m';
-const CAPL = '▏';
-const CAPR = '▕';
+/** A bar's ink and its two grounds. A chosen theme paints on its own grounds — the raised one for
+ *  the share, the panel for the rest, under its text ink, as `promptGround` does — so the light
+ *  theme gets a light bar, and colorblind and mono get no hue the palette did not choose. */
+function barColours(key: StateKey, depth: ColorDepth, themed: boolean): { ink: string; fill: string; rest: string } {
+  const tc = depth === 'truecolor';
+  if (themed) {
+    const s = surfaces();
+    const t = inks().text;
+    const bg = (g: { rgb: string; c256: number }): string => (tc ? `\x1b[48;2;${g.rgb}m` : `\x1b[48;5;${g.c256}m`);
+    return { ink: tc ? `\x1b[38;2;${t.rgb}m` : `\x1b[38;5;${t.c256}m`, fill: bg(s.raised), rest: bg(s.panel) };
+  }
+  const b = tc ? BAR_24 : BAR_256;
+  return { ink: b.ink, fill: key === 'risk' ? b.risk : key === 'pending' ? b.pending : b.kept, rest: b.rest };
+}
 
 /** The one field width a render uses everywhere: the widest figures in it, one trailing space
- *  before the share, and a floor of ten so an all-uncalibrated row draws rules, not slivers. */
+ *  before the share, and a floor of ten so an all-uncalibrated row draws bars, not slivers. */
 function fieldWidthOf(texts: readonly string[]): number {
   return Math.max(10, texts.reduce((m, t) => Math.max(m, [...t].length), 0) + 2);
 }
@@ -247,10 +281,10 @@ function segment(
     const f = Math.min(8, Math.max(0, Math.trunc((Math.trunc(pct) * 8 + 50) / 100)));
     return `${padLabel(label, labelWidth)} [${BLOCK.repeat(f)}${' '.repeat(8 - f)}] ${pctText}%${suffix}${plainTail}`;
   }
-  const { open } = usageColor(pct, depth, themed);
-  // The script's structure exactly: label, the capped and ruled field, then the share — each run
-  // closed where the script closes it, because the bytes are the contract this module exists to keep.
-  return `${open}${padLabel(label, labelWidth)}${R} ${bar(pct, barText, open, width)} ${open}${pctText}%${R}${suffix}`;
+  const { open, key } = usageColor(pct, depth, themed);
+  // The script's structure exactly: label, the painted bar, then the share — each run closed where
+  // the script closes it, because the bytes are the contract this module exists to keep.
+  return `${open}${padLabel(label, labelWidth)}${R} ${bar(pct, barText, key, depth, themed, width)} ${open}${pctText}%${R}${suffix}`;
 }
 
 /** Line 1 — when and where: clock · date | branch | dir | title. The session title closes this
@@ -279,7 +313,13 @@ export function statuslineSession(d: StatuslineData, depth: ColorDepth, _themed:
   if (d.outputStyle && !/^(default)$/i.test(d.outputStyle)) out += `${sep}${d.outputStyle}`;
   if (d.tokensIn !== undefined && d.tokensIn !== null) {
     // Dim glyph, plain number, NO space between them — the script's own spacing.
-    out += `${sep}${dim('↑', depth)}${human(d.tokensIn)} ${dim('↓', depth)}${human(d.tokensOut ?? 0)} ${dim('↺', depth)}${human(d.tokensCacheRead ?? 0)}`;
+    const tk = (i: number, o: number, c: number) => `${dim('↑', depth)}${human(i)} ${dim('↓', depth)}${human(o)} ${dim('↺', depth)}${human(c)}`;
+    const own = tk(d.tokensIn, d.tokensOut ?? 0, d.tokensCacheRead ?? 0);
+    // A session that started agents shows its own figure and the one with them, each labelled: its own is never the task's.
+    const n = d.treeAgents ?? 0;
+    out += n > 0
+      ? `${sep}${dim('own', depth)} ${own}${sep}${dim(`with ${n} agent${n === 1 ? '' : 's'}`, depth)} ${tk(d.treeIn ?? 0, d.treeOut ?? 0, d.treeCacheRead ?? 0)}`
+      : `${sep}${own}`;
   }
   if (d.durationMs !== undefined && d.durationMs !== null && d.durationMs >= 1000) {
     out += `${sep}${dim('◷', depth)}${durStr(d.durationMs)}`;
@@ -415,6 +455,7 @@ export function statuslineGauges(
     collectLabels?.push('ctx');
     if (!collect) parts.push(ctxSegment(d, depth, themed, width, labelWidth));
   }
+  const lead = parts.length; // where the windows begin: the saved machine's name goes ahead of them
   const window = (
     label: string,
     pct: number | null | undefined,
@@ -478,6 +519,12 @@ export function statuslineGauges(
       } else if (used) {
         bt = `~${human(used)}`;
         tail += ` ${dim(bt, depth)}`;
+      } else if (pct === 0) {
+        // A share of 0 projects no estimate (the cache keeps none), yet its figures are known: the script's
+        // ~0 over the budget where one is known, and ~0 alone where none is. An empty bar beside 0% read as
+        // a window with nothing to report.
+        bt = total ? `~0/${human(total)}` : '~0';
+        tail += ` ${dim(bt, depth)}`;
       }
       const wreads = label === '5h' ? d.fiveReads : label === 'wk' ? d.weekReads : null;
       if (wreads) {
@@ -495,12 +542,13 @@ export function statuslineGauges(
     return dim(`${label} —`, depth);
   };
   // Enterprise/API (no rolling quota): the 5h/wk slots say nothing such an account can use —
-  // the month segment below is its whole readout.
-  if (!d.noWindows) parts.push(window('5h', d.fivePct, d.fiveResetMs, d.fiveEst, d.fiveTotal, d.fiveMeasured, d.fiveCost));
+  // the month segment below is its whole readout. An account with no five-hour limit has no 5h slot either.
+  if (!d.noWindows && !d.fiveNone) parts.push(window('5h', d.fivePct, d.fiveResetMs, d.fiveEst, d.fiveTotal, d.fiveMeasured, d.fiveCost));
   // The per-model weekly cap (the account API's "Fable" row), BEFORE the whole-week segment it
   // narrows: same grammar as its neighbours — bar, share, countdown, ~est/total from its own
-  // union measurement + calibration, and its cache reads. Only when the account reports one.
-  if (!d.noWindows && typeof d.fablePct === 'number' && isFinite(d.fablePct)) {
+  // union measurement + calibration, and its cache reads. Whenever the account reports one, on a plan
+  // with no 5h/wk windows too, as the shell's segment does.
+  if (typeof d.fablePct === 'number' && isFinite(d.fablePct)) {
     const fs = d.fableResetMs && d.fableResetMs > d.now ? ` ${dim('·', depth)}${wht(untilStr(d.fableResetMs, d.now), depth)}` : '';
     let fbt = '';
     let ftail = '';
@@ -509,6 +557,9 @@ export function statuslineGauges(
       ftail += ` ${dim(fbt, depth)}`;
     } else if (d.fableEst) {
       fbt = `~${human(d.fableEst)}`;
+      ftail += ` ${dim(fbt, depth)}`;
+    } else if (d.fablePct === 0) {
+      fbt = '~0'; // a share of 0 with no figures, as in the windows above
       ftail += ` ${dim(fbt, depth)}`;
     }
     if (d.fableReads) {
@@ -521,10 +572,13 @@ export function statuslineGauges(
   // ONE dollar pair, MONTHLY, in its OWN segment: 30 days of spend against
   // four weekly cycles of budget (spend alone for plans with no quota to project from), plus the
   // live promotion with its dates — money and promos read apart from the quota bars.
+  let moDrawn = false;
   {
     const mo: string[] = [];
     let moHead = '';
-    if (d.monthTokens && d.monthTokensTotal) {
+    // A MEASURED month — a token count, 0 included, with a budget — is a bar, and an empty one reads 0%,
+    // as the shell's does. A month never measured or calibrated still shows nothing.
+    if (typeof d.monthTokens === 'number' && d.monthTokens >= 0 && d.monthTokensTotal && d.monthTokensTotal > 0) {
       // A quota-shaped month: the same bar grammar as the 5h/wk segments.
       const p30 = Math.min(100, Math.round((d.monthTokens / d.monthTokensTotal) * 100));
       const mr = d.monthResetMs && d.monthResetMs > d.now ? ` ${dim('·', depth)}${wht(untilStr(d.monthResetMs, d.now), depth)}` : '';
@@ -543,6 +597,22 @@ export function statuslineGauges(
     if (seg30 && !moHead) seg30 = `${dim('mo', depth)} ${seg30}`;
     if (d.promo?.label) seg30 = `${seg30 ? `${seg30} ` : ''}${yel(`${d.promo.label}${d.promo.dates ? ` ${d.promo.dates}` : ''}`, depth)}`;
     if (seg30) parts.push(seg30);
+    moDrawn = !!moHead || !!d.monthTokens;
+  }
+  // A SAVED MACHINE'S READING is named as the shell's line names it: one dim segment ahead of the windows, as core's
+  // machineNote spells it (in its order), the machine alone when every window drawn came from it, else each machine
+  // with its windows.
+  const drawn: [string, string | null | undefined][] = [];
+  if (!d.noWindows && d.fivePct != null) drawn.push(['5h', d.fiveMachine]);
+  if (!d.noWindows && d.weekPct != null) drawn.push(['wk', d.weekMachine]);
+  if (typeof d.fablePct === 'number' && isFinite(d.fablePct)) drawn.push([(d.fableLabel || 'fable').toLowerCase(), d.fableMachine]);
+  if (moDrawn) drawn.push(['mo', d.monthMachine]);
+  const from = drawn.filter((w): w is [string, string] => !!w[1]);
+  if (from.length) {
+    const by = new Map<string, string[]>();
+    for (const [label, m] of from) by.set(m, [...(by.get(m) ?? []), label]);
+    const note = by.size === 1 && from.length === drawn.length ? from[0][1] : [...by].map(([m, labels]) => `${m}: ${labels.join(' ')}`).join('; ');
+    parts.splice(lead, 0, dim(`(${note})`, depth));
   }
   // CREDIT, where the account reports one. It answers a different question from the windows — they
   // say how much of a rate is spent, this says how much is left to spend at all — so it sits beside
@@ -558,7 +628,7 @@ export function statuslineGauges(
   if (d.usageFrom === 'codex') parts.push(dim('codex', depth));
   if (d.staleAgeMs) parts.push(dim(`${durStr(d.staleAgeMs)} old`, depth));
   // NO DIVIDER between the gauges: every segment already opens with its own
-  // label and closes with its caps and share, so a pipe between them was one more thing to read.
+  // label and its painted bar sets it apart, so a pipe between them was one more thing to read.
   const row = parts.join('  ');
   if (collect) return '';
   // PASS 2 — paint every recorded gauge at the one width. When the caller did not hand one down

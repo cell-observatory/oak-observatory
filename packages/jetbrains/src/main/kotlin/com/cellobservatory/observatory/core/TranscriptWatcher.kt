@@ -52,6 +52,8 @@ class TranscriptWatcher(private val project: Project) : Disposable {
     private val registered = ConcurrentHashMap.newKeySet<Path>()
 
     @Volatile private var projectDirs: List<Path> = emptyList()
+    /** The project's folder and its worktree siblings' (discovery), whose Codex sessions refresh this project. */
+    @Volatile private var codexFolders: List<String> = listOfNotNull(project.basePath)
     @Volatile private var lastStamp: Long = 0L
 
     fun addListener(l: Runnable) {
@@ -92,17 +94,33 @@ class TranscriptWatcher(private val project: Project) : Disposable {
                 startPollFallback()
             }
         }
-        // Codex shards by date. Poll metadata without registering an unbounded watcher tree.
+        // Codex shards by date. Poll metadata without registering an unbounded watcher tree: any Codex session's write moves
+        // this sum. It refreshed this project for every one of them; the local index knows the folder each ran in (0.11.0,
+        // through `oak query --serve`), so a write refreshes only when a Codex session of this project and its worktree
+        // siblings (or one below them), or the one under review wherever it ran, moved, or when the index cannot say. The
+        // sum stays the trigger: asking the index every two seconds would cost its catch-up, which walks these folders and
+        // every other.
         val codexHome = Path.of(System.getenv("CODEX_HOME")?.takeIf { it.isNotBlank() } ?: System.getProperty("user.home") + "/.codex")
         var codexStamp = codexTranscriptStamp(codexHome)
+        var ours: String? = null // this project's Codex sessions as the index last said; unknown until the first write
         exec.scheduleWithFixedDelay({
             val next = codexTranscriptStamp(codexHome)
-            if (next != codexStamp) { codexStamp = next; debounceNotify() }
+            if (next != codexStamp) {
+                codexStamp = next
+                val now = QueryServe.codexStamp(codexFolders, reviewedSession())
+                if (now == null || now != ours) { ours = now; debounceNotify() }
+            }
         }, POLL_MS, POLL_MS, TimeUnit.MILLISECONDS)
         kickDiscovery() // async: fold in the worktree siblings
     }
 
     @Volatile private var lastProjectsSig: String? = null
+
+    /** The session under review as it stands, without a read of its own: the pinned one, else the one this project's last
+     *  session listing resolved. */
+    private fun reviewedSession(): String? =
+        com.cellobservatory.observatory.settings.ObservatorySettings.instance.state.session?.takeIf { it.isNotBlank() }
+            ?: com.cellobservatory.observatory.services.ObservatoryService.getInstance(project).peekSessions()?.active
 
     /** Discover the repo's worktree-sibling dirs on the POOLED thread (the CLI spawn is heavy and must
      *  never stall the poll), then UNION them in and (nio) register the new ones. Union-not-replace so a
@@ -133,6 +151,7 @@ class TranscriptWatcher(private val project: Project) : Disposable {
         // whichever sibling the payload calls its own.
         runCatching { ObservatoryCli.multitaskJson(null, base)?.let { MultitaskParser.parse(it)?.worktrees } }
             .getOrNull()?.let { cwds.addAll(it) }
+        codexFolders = (codexFolders + cwds).distinct()
         return projectDirsFor(cwds)
     }
 

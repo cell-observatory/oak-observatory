@@ -131,7 +131,7 @@ class TourTabContractTest {
     @Test
     fun `the panel maps exactly the five shipped Overview tabs`() {
         assertEquals(
-            listOf("sessions", "fleet", "workflows", "tasks", "processes"),
+            listOf("sessions", "fleet", "processes", "tasks", "workflows"),
             com.cellobservatory.observatory.ui.ChangeMapPanel.TOUR_TABS,
         )
     }

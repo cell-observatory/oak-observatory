@@ -374,7 +374,7 @@ in the others instantly. The layout is deliberately identical; only the host chr
 | Resolving one edit | opens the next unreviewed edit, crossing files (`revealNextOnResolve`, on) | same, via the settings checkbox **After keeping or reverting one edit, open the next edit still awaiting review** |
 | File spotlight | 📄 spotlight (tab-bar; also on the review bubble) | 📄 spotlight (status-bar nav bar / Overview title bar / the floating review bar; also on the editor banner when `editorReviewSurface` enables it) |
 | Scoreboard | status-bar `🔬 N` (amber while pending) + live bar in Stats | status-bar `🔬 N` + live bar in Stats |
-| Keyboard loop | `⌥⌘N` next · `⌥⌘Y` keep · `⌥⌘U` undo · `⌥⌘-`/`⌥⌘=` revisions (`Ctrl+Alt` on Win/Linux) | `⌥⌘N` next · `⌥⌘Y` keep · `⌥⌘U` undo · `⌥⌘[`/`⌥⌘]` revisions |
+| Keyboard loop | `⌥⌘X` (`Ctrl+Alt+X` on Win/Linux), then `n` next · `a` keep · `u` undo · `[`/`]` revisions | the same: `⌥⌘X` (`Ctrl+Alt+X`), then `n` · `a` · `u` · `[`/`]` |
 
 The **sidebar** ("Observatory Traces") carries the review panes — **Review · File History** (0.9.4
 removed the Edits and Diffs trees: Review is the one review surface, its rows grouped by file, with
@@ -397,7 +397,7 @@ lens and the gutter star now anchor on the surviving line a deletion follows.
 
 Beside each tab strip — the Overview's and the Timeline's, in both editors — sits a **Group tabs** toggle.
 It replaces the tabs with one group of side-by-side columns: all four in the Timeline, and all five in the
-Overview — **Sessions · Workers · Workflows · Tasks · Processes** — so which conversation, who is working in
+Overview — **Sessions · Workers · Processes · Tasks · Workflows** — so which conversation, who is working in
 it and what the work is doing are on screen together. Off by default. A divider between two columns drags
 to trade width (double-click resets the pair), and each column has a fold button that collapses it to a
 narrow **rail** carrying its name and its badge sideways; the rail is itself the button that brings the
@@ -489,7 +489,7 @@ opens the edit's before ⟷ after as a **unified diff** (reasoning in the title,
 toolbar).
 
 GitLens-style extras, in both editors: the **file spotlight** (📄) dims every unmodified line so the agent's
-edits pop; **revision navigation** (`⌥⌘-` / `⌥⌘=` in VS Code, `⌥⌘[` / `⌥⌘]` in PyCharm) steps a file's
+edits pop; **revision navigation** (`⌥⌘X` then `[` / `]`, in both editors) steps a file's
 edit history in a current-vs-revision diff.
 
 ![the file spotlight — every unmodified line dimmed so the agent's edits stand out](media/spotlight.png)
@@ -564,7 +564,8 @@ session-wide and destructive, and no counter above them says what they act on.
 The bar is **two-tier**. The File axis plus Clear / Spotlight / Search show whenever *any* edit is pending
 anywhere; the Diff axis and the per-edit / per-file actions appear only when the **open** file has
 pending edits. The counters **track the active editor**, so `Diff 1/2` always means "this file." The
-keyboard loop is unchanged — `⌥⌘N`/`⌥⌘P`, `⌥⌘Y`/`⌥⌘U`, `⌥⌘K`/`⌥⌘R` and the revision keys still drive it.
+keyboard loop drives the same actions from one chord, `⌥⌘X` (`ctrl+alt+X` elsewhere), followed by a letter:
+`n`/`p`, `a`/`u`, `A`/`D` and the revision keys `[`/`]`.
 
 ### File History — the active file's edits, in order
 
@@ -695,15 +696,13 @@ what was appended since the last refresh — so the UI never blocks.
 The flagship 0.8.0 surface, and the one that replaces both the old **Change Map** window and the old
 multi-agent window. **Overview** is a **master-detail** panel (both editors): a **left nav**
 (~25%) that lists every agent and every workflow, and a **right detail** (~75%) that shows the selected
-one's **change-map**. The left nav groups its rows under five tabs — **Workers**, **Workflows**, **Tasks**
-(the session's numbered tasks, or, on newer Claude Code builds, its background **Agent runs**),
-**Processes** (the background shells it started with `run_in_background`; see
-[Processes](#processes--the-background-shells-still-running)) and **Sessions** (this machine's
-sessions, grouped by workspace; see [Sessions](#sessions--the-sessions-in-this-workspace)) — each of which
+one's **change-map**. The left nav groups its rows under five tabs — **Sessions**, **Workers**,
+**Tasks** (the session's numbered tasks or background Agent runs), **Processes** (the background shells
+it started with `run_in_background`), and **Workflows** (multi-agent runs) — each of which
 opens with a one-line description of what it lists; every tab and change-map section also carries a
 hover description. A **Group tabs** toggle beside the tab strip puts all five side by side as the
-columns of one group instead — **Sessions · Workers · Workflows · Tasks · Processes** — each resizable by dragging
-the divider between two of them and foldable to a named rail. Selecting a row in the first four opens that thing's **feed** below the change-map
+columns of one group instead — **Sessions · Workers · Processes · Tasks · Workflows** — each resizable by dragging
+the divider between two of them and foldable to a named rail. Selecting a Workers, Processes, Tasks or Workflows row opens that thing's **feed** below the change-map
 (see [Feed](#feed--what-one-thing-is-doing-right-now)); selecting a **Sessions** row pins what the whole
 observatory reviews. A **title bar** across the top carries a **session
 label** (the session by its name — a label, not a control: the Sessions tab and the Timeline's selector
@@ -715,45 +714,36 @@ and *where did the work land, what still needs my eyes*.
 
 #### Left nav → **Workers** — every running agent, live
 
-The **Workers** tab lists **one row per running agent**
-across every git **worktree** of the repo. Worktrees are correlated **git-free** — the observatory reads
-the `.git` **pointer files** (a linked worktree's `.git` is a *file* naming its admin dir; that dir's
-`commondir` points back at the shared repo), never shelling out to the git binary — so sessions launched
-from sibling worktrees of one logical repo unify into a **single fleet** keyed by that shared repo.
+The **Workers** tab lists Claude Code and Codex agents in herdr panes on this machine and each saved
+machine, agents OAK started from briefs, and recently active sessions across the repository's git
+worktrees. The reviewed session and its subagents are included, with its machine first. Worktrees are
+correlated through their `.git` pointer files, without running git.
 
-Each agent row carries a live **phase** badge — `working` · `awaiting-input` · `awaiting-permission` ·
-`idle` · `errored` · `done` — its **worktree + branch**, an activity **sparkline**, its **±diff**,
-**tokens · time**, **risk** flags, a **conflict** badge, and an **↗** suffix counting the files that
-agent read or wrote **outside the workspace** (`↗ 3 read · 22 written outside`) — the one glanceable
-fact left over from the 0.8.6 footprint row, with the Actions panel's Risk and Egress nodes naming the
-files themselves. Unfold the row for the agent's nested
-**subagents**, each with its `agentType` / description, phase, current task + to-dos, ±lines, and a
-**chat** button. An **Active only** toggle hides the finished ones, and **Clear completed** *dismisses*
-them from view — it never deletes anything, because the observatory only ever observes. Live cross-agent **conflicts** lead the **Actions** view, flagging any file touched by **2+ agents**.
+Each row leads with its herdr tab title or session title, falling back to the brief's heading and then
+the worktree folder. It shows the machine, kind, OAK state, tokens and last activity. State is derived
+from process evidence, native agent status, raised hands and the conversation: **starting · working ·
+waiting · blocked · errored · done · gone**. An unfinished tool call whose agent process has disappeared
+reads **gone**. The terminal Observatory uses the same names and state; it has a machine/session tree
+rather than the editors' five-panel strip.
 
-The **phase** is detected **zero-token, from the transcript tail**: an active `tool_use` (or a trailing
-`tool_result` — the turn is mid-flight) reads `working`; a pending `AskUserQuestion` reads
-`awaiting-input`; a pending permission prompt reads `awaiting-permission`; otherwise `idle` / `errored` /
-`done`, staleness-gated. The querying (self) session shows **working** while it is actively running.
+**Active only** keeps working, waiting and blocked agents and subagents. With it off, each parent's
+finished subagents fold into one **N done** row that opens with a click. Selecting a worker opens its
+own log on its owning machine. **Clear completed** dismisses rows from view without deleting records.
 
-![The Workers / Workflows left nav — the fleet of running agents across the repo's git worktrees, each with a live phase, branch, activity sparkline, ±lines, tokens·time, risk and conflict counts; nested subagents with their task, to-dos and a chat button](media/multitasking.png)
+Both editors consume the same CLI answer. Local reads run in a background CLI; saved-machine reads
+share the existing session cache and 45-second deadline. The panels never wait for SSH.
 
-The view is one JSON payload — both editors render it thin, no client-side aggregation. `multitask`
-(its output is JSON either way) emits `agents[]`, `workflows[]`, `worktrees[]`, and `collisions[]`:
+![Workers leads with agent names and machine, kind, state, tokens and last activity; finished subagents fold into one count](media/multitasking.png)
 
 ```console
-$ oak multitask --json | jq -c '.agents[] | {worktree, branch: .gitBranch, phase, diff, subs: (.subagents|length)}'
-{"worktree":"/tmp/obs-demo/ws","branch":"demo/pipeline","phase":"working","diff":{"added":59,"removed":10},"subs":1}
-{"worktree":"/tmp/obs-demo/ws/observatory-demo","branch":"demo/hotfix","phase":"awaiting-permission","diff":{"added":2,"removed":0},"subs":0}
+$ oak fleet --json | jq -c '.workers[] | {title, machine, kind, state}'
+{"title":"Validate the dataset","machine":"lab","kind":"claude","state":"working"}
+{"title":"Check model inputs","machine":"lab","kind":"codex","state":"blocked"}
 
-$ oak multitask --json | jq -c '.collisions[]'      # same file, 2+ agents
-{"file":"/tmp/obs-demo/ws/observatory-demo/src/features.py","agents":["demo-ba9da914","demo-6841aa10"],"activeAgents":["demo-ba9da914","demo-6841aa10"],"anyPending":true}
+$ oak sessions --json --workers --machine lab
 ```
 
-The hotfix agent's last tool call never returns, so its phase reads `working` for the first ten
-seconds after the demo and `awaiting-permission` after that. The whole thing is **zero token,
-git-free, path-only** — filenames, never contents — so nothing one agent is editing leaks into
-another.
+`oak multitask --json` continues to provide the change maps, workflow runs, tasks and collision data.
 
 #### Left nav → **Workflows** — each multi-agent run
 
@@ -1096,8 +1086,7 @@ credit whatever you happened to be typing when a job ended.
 the agent can leave shells running in the background (`run_in_background`) — a test watcher, a build, a
 poll loop. Claude Code's own Background panel lists them; the observatory reconstructs the same set from
 the transcript and adds what that panel omits: how long each has been going, what it exited with, and how
-much output it has produced. They are a tab in the Overview, after Sessions · Workers · Workflows ·
-Tasks, and a verb. Shells that are **still running sort first** — the one you might act on should not
+much output it has produced. They are a tab in the Overview, after Sessions · Workers, before Tasks and Workflows, and a verb. Shells that are **still running sort first** — the one you might act on should not
 be at the bottom of a narrow pane:
 
 ```console
@@ -1141,22 +1130,27 @@ agent itself uses to read or kill the shell.
 
 One workspace accumulates many Claude Code sessions, and the work you want to review is not always the
 one running now. The **Sessions** tab — the first tab of the Overview's left nav in both editors — lists
-sessions on the workspace's machine under a header for each workspace, with a count.
-The editor's own workspace comes first, then the others by most recent conversation activity;
-rows within each group are newest first. Active only retains live sessions, pending work and the
-review pin. Sessions older than a week fold under an expandable header in each workspace.
+the sessions of this machine and of every saved machine in one list, newest activity first, each other
+machine's rows naming it; one line per machine above the rows says when it was read, or why it could not be.
+Search, Active and Sort cover the whole list. Active only retains live sessions, sessions whose workers are
+still at it, pending work and the review pin. Under a session whose workers are still at it, one row counts them by state; a click
+opens it into a group per state, those waiting on a person first, and a click on a worker reviews its
+session.
 
 In Remote-SSH, devcontainer and Gateway windows, the CLI runs on the remote workspace host,
-so that host supplies the listing. Mirrored transcripts and bridge pointers with no local
-conversation are excluded. The editors do not gather other machines in the background.
+so that host supplies this machine's listing. Mirrored transcripts and bridge pointers with no local
+conversation are excluded. Each saved machine's sessions are read in the background with
+`oak sessions --json --machine <label>` (from its records here when `oak sync` read it lately, else over SSH),
+and the sessions `oak sync` brought from other machines join the same list (below).
 
 `oak sessions --json` supplies the same scoped, ordered rows to both editors. Every row shows
 its title, edit count (including zero), tokens, duration, model and last activity. Codex uses its
 native thread name, falling back to the first user prompt after injected context. A name that only
 hands the task to a markdown brief, such as `Execute TASK.md`, shows the heading on the brief's first line instead.
 A heading or prompt longer than 64 characters shows its first phrase, up to its first sentence end or
-clause break, when that phrase has at least two words and 12 characters; a name that Codex or you gave
-stays whole.
+clause break, when that phrase has at least two words and 12 characters; a first sentence that ends
+within 64 characters is kept whole rather than cut at a clause break inside it, and a name that Codex or
+you gave stays whole.
 A title is always one line of plain text, without markdown heading markers or line breaks.
 
 A session in which nothing happened is not listed: no captured edit, no tokens, and no reply from the
@@ -1165,32 +1159,39 @@ error). One that may still be running stays listed before its first reply: the c
 pinned one, a Claude Code session whose process is still running, a session waiting on you, a Codex
 turn in progress, or any session active in the last five minutes.
 
-![The Overview's Sessions tab — sessions on this machine, grouped by workspace, each led by its title, the live one marked](media/sessions.png)
+![The Overview's Sessions tab — one list ordered by newest activity, with machine state lines above Auto and machine badges on remote rows](media/sessions.png)
 
 Clicking a local row does something the other tabs do not: it **pins what the whole observatory reviews**,
 the same choice **Switch Session** makes, so every panel follows it at once. The other tabs only
 re-point the change map and the feed.
 
-The **Switch Session** picker offers local sessions. Each entry leads with the session's title, the live
-session comes first, the rest follow by conversation recency, the row currently in effect is
-preselected, and typing filters by title or id. The listing is built from directory stats plus a bounded
+The **Switch Session** picker, like the Timeline's session selector, offers this machine's sessions, each saved
+machine's, and those of each other machine whose records `oak sync` brought to the local database, in one list. One line
+per machine says when it was last read (or when its records arrived, for one it does not read); sessions waiting on
+you lead, and the rest follow by last activity, each other machine's row naming its machine. Picking a saved
+machine's session reviews it on that machine; picking one known only from its records shows what they say of it,
+read-only, and offers to fetch it here (`oak sync fetch`). Each entry leads with the session's title, the row
+currently in effect is preselected, and typing filters by title or id. The listing is built from directory stats plus a bounded
 title scan cached in a small on-disk sidecar per session. Each row shows the session's title and when its conversation was last active; the workspace, edits, tokens, duration and model are visible in the pickers too.
 
 `oak sessions` prints the local listing as text; `--json` emits it whole:
 
 ```console
 $ oak sessions --json
-{"active":"demo-ba9da914","sessions":[{"id":"demo-ba9da914","workspace":"/tmp/obs-demo/ws","origin":"local","machine":"this machine","title":"Pipeline: scaling, validation, tests","lastActiveMs":1790473423902.68,"lastTurnMs":1790473423907,"liveMs":1790473423902.68,"attention":null,"tab":null,"current":true,"edits":8,"pending":8,"files":7,"added":59,"removed":10,"tokens":9280,"cached":0,"durationMs":207,"storeBytes":7149,"storePath":"/tmp/obs-demo/home/.claude/claude-observatory/demo-ba9da914","model":"Opus 4.8","effort":"high","agent":"claude","phase":"working","phaseConfidence":"high"},{"id":"demo-6841aa10","workspace":"/tmp/obs-demo/ws/observatory-demo","origin":"local","machine":"this machine","title":"Hotfix: clamp scale() so a constant column cannot divide by zer…","lastActiveMs":1790473423787.7693,"lastTurnMs":1790473423789,"liveMs":1790473423787.7693,"attention":null,"tab":null,"current":false,"edits":1,"pending":1,"files":1,"added":2,"removed":0,"tokens":435,"cached":0,"durationMs":5,"storeBytes":1094,"storePath":"/tmp/obs-demo/home/.claude/claude-observatory/demo-6841aa10","model":"Opus 4.8","effort":"high","agent":"claude","phase":"awaiting-permission","phaseConfidence":"heuristic"}]}
+{"active":"demo-ba9da914","sessions":[{"id":"demo-ba9da914","workspace":"/tmp/obs-demo/ws","origin":"local","machine":"this machine","title":"Pipeline: scaling, validation, tests","lastActiveMs":1790473423902.68,"lastTurnMs":1790473423907,"liveMs":1790473423902.68,"attention":null,"tab":null,"current":true,"edits":8,"pending":8,"files":7,"added":59,"removed":10,"lastEdit":9,"tokens":9280,"cached":0,"durationMs":207,"storeBytes":7149,"storePath":"/tmp/obs-demo/home/.claude/claude-observatory/demo-ba9da914","model":"Opus 4.8","effort":"high","agent":"claude","phase":"working","phaseConfidence":"high","activeWorkers":[]},{"id":"demo-6841aa10","workspace":"/tmp/obs-demo/ws/observatory-demo","origin":"local","machine":"this machine","title":"Hotfix: clamp scale() so a constant column cannot divide by zer…","lastActiveMs":1790473423787.7693,"lastTurnMs":1790473423789,"liveMs":1790473423787.7693,"attention":null,"tab":null,"current":false,"edits":1,"pending":1,"files":1,"added":2,"removed":0,"lastEdit":1,"tokens":435,"cached":0,"durationMs":5,"storeBytes":1094,"storePath":"/tmp/obs-demo/home/.claude/claude-observatory/demo-6841aa10","model":"Opus 4.8","effort":"high","agent":"claude","phase":"working","phaseConfidence":"high","activeWorkers":[]}]}
 ```
 
 `active` is the session that resolves for the current directory. Each row carries its `id`,
 `workspace`, `origin` and `machine`; its `title` (null when the transcript offers none);
 `lastActiveMs`, `lastTurnMs` (when it last took a turn, which a resume does not move) and `liveMs`; what it waits on (`attention`) and its herdr `tab`; `current`; the
-counts `edits`, `pending`, `files`, `added` and `removed`; `tokens` and `cached`;
-`durationMs`; the store's `storeBytes` and `storePath`; `model`, `effort` and `agent`; and its
-`phase` with `phaseConfidence`. The phases above were read between ten and 30 seconds after the
-demo: before ten seconds the hotfix agent still reads `working`, and after 30 the main session's
-confidence drops to `heuristic`.
+counts `edits`, `pending`, `files`, `added` and `removed`; `lastEdit`, the newest edit id in its
+log; `tokens` and `cached`; `durationMs`; the store's `storeBytes` and `storePath`; `model`, `effort`
+and `agent`; its `phase` with `phaseConfidence`; for a Codex session active in the last two hours, `turnOpen`, whether its
+last turn is still running; and `activeWorkers`, its workers still at it (working, or waiting on a
+person), each with its `agentId`, `title`, `phase`, `model`, `tokens`, `lastActiveMs` and its share of the
+session's captured edits (`edits`, `pending`, `added`, `removed`). The demo's subagent has finished by the
+time the listing is read, so the list is empty. The phases above were read within 30 seconds of the
+demo; after 30 the main session's confidence drops to `heuristic`.
 
 ### Feed — what one thing is doing right now
 
@@ -1203,16 +1204,17 @@ in the terminal it is a verb, with `--kind session|agent|workflow|task|process` 
 A feed means a different thing depending on whether its source is still going, so core decides and every
 surface renders the same word: **● live** while it is still writing (follow it, and its time comes from
 real evidence — the last write it saw, never a claim of realtime), and **▣ audit log** once it has finished, because
-a completed run is a record rather than a stream, and the editors stop polling it. A capped feed always
+a completed run is a record rather than a stream. Worker panels also notice a later resumed turn. A capped feed always
 reports how many earlier entries it did not show, above the rows, since entries are oldest-first and
 anything dropped was dropped off the top.
 
-An agent that has finished reads the same way — note the title is the agent's own description, not its
-id, and that the id must be the full one the transcript recorded (here the demo session's subagent):
+The demo worker has written its last reply, but the fixture has no completion record, so the log stays
+live. Its title is the worker's own description, and its id is the full one the transcript recorded:
 
 ```console
 $ oak feed --kind agent --id demosub1 --limit 4
-Write pipeline tests  ▣ audit log · 21:43:43 · agent
+Write pipeline tests  ● live · 21:43:43 · agent
+Following worker log; no completion recorded yet.
 
 21:43:43   TodoWrite Write tests for scale/summarize/validate
 21:43:43   said — Covering scale, summarize, and both validate branches.
@@ -1220,8 +1222,10 @@ Write pipeline tests  ▣ audit log · 21:43:43 · agent
 21:43:43   said — Tests written and passing locally.
 ```
 
-A finished agent's feed is an **audit log**: it is fetched once and left alone, because re-polling a run
-that can no longer change would spend a process per tick to re-read the same file.
+A recorded completion makes the worker's feed an **audit log** with its exact end time. Add `--follow`
+to append new activity until that record arrives, or `--follow --machine <label>` for a saved machine.
+Open panels keep the log and notice a resumed worker; unchanged local files need only a stat check,
+and remote logs are read over SSH at least ten seconds apart.
 
 ### The Feed is the conversation
 
@@ -1232,7 +1236,7 @@ asked for. Tool output stays in the agent's terminal. Review and Overview use th
 store. Agent terminals and permission prompts live in herdr.
 
 Comment and quote actions prepare a draft for an explicit send to the session's live pane;
-unavailable panes leave the draft on the clipboard. In the terminal Observatory detail, `i`
+unavailable panes leave the draft on the clipboard. In the terminal Observatory detail, `c`
 focuses the thin reply box. Enter submits the draft through herdr. New sessions start in herdr
 from the editors' plus menu or `oak agent start --kind claude|codex --cwd <directory>`.
 
@@ -1312,7 +1316,8 @@ count — with the files it touched indented below.
 The verb is aliased as `fleet`. `--json` defaults to **siblings only** (excludes the calling session);
 `--all` folds self back in; and **`--repo`** widens the digest to **every git worktree** of the repo, adding each session's **worktree /
 branch / phase** and a cross-agent **conflicts** count — the same live-conflict data the **Actions** view leads with,
-git-free.
+git-free. With `oak sync`, `--repo` also lists your other machines' sessions of the repository from the local database,
+read-only, under each machine's label (`machines` in `--json`).
 
 ### Metrics — the session by the numbers
 
@@ -1356,21 +1361,24 @@ The three tabs have separate jobs:
 | **Review** | Jump from that conversation to its captured edits. Inspect a diff, Keep or Undo it, and return to the same pinned conversation. |
 
 Observatory’s default view contains active panes and unresolved sessions. Resolving every edit in
-an inactive session archives it; Shift+A includes archived sessions again. Moving the cursor previews
-the header without replacing a pinned conversation, and the Review tab follows it. `h` focuses a live
-pane in herdr; `r` opens its review. The demo has no live pane, so it remains a transcript and review demonstration.
+an inactive session archives it; `B` includes archived sessions again. Moving the cursor previews
+the header without replacing a pinned conversation, and the Review tab follows it. `t` focuses a live
+pane in herdr; `Tab` goes to its review. The demo has no live pane, so it remains a transcript and review demonstration.
 A pinned conversation opens at its newest message and follows the tail; after scrolling back,
 `End` or the `↓ newest` control returns to it.
 
-For a live session, press `i` to focus the reply box. Review comments and quoted replies prepare an
+For a live session, press `c` to focus the reply box. Review comments and quoted replies prepare an
 editable draft there. Enter explicitly submits it through herdr, and a failed send keeps the draft.
-A blocked agent, or a session with no live pane, offers no reply box: those drafts are copied to
-the clipboard, and permission prompts are answered in the herdr tab.
+A blocked agent, an agent with a question waiting, or a session with no live pane, offers no reply
+box: those drafts are copied to the clipboard, and permission prompts are answered in the herdr tab.
 
-Use the configured leader key (`ctrl+a` by default) for OAK navigation while herdr owns the keyboard.
-The leader followed by `o` selects and pins herdr’s focused conversation in Observatory. The plugin’s
-**Open in OAK** action does the same from herdr: it selects the focused pane’s conversation in Observatory. Pane split, resize and zoom
-remain available; their current bindings are listed by `?` and in Options.
+While herdr owns the keyboard, herdr’s own prefix (`ctrl+b` unless its config sets another) then `m`
+returns to OAK’s tabs, the prefix then `M` selects and pins herdr’s focused conversation in Observatory,
+and the prefix then `V` opens Review on it. `F1`, `F2` and `F3` raise the herdr, Observatory and Review
+tabs from any tab, this one included, before herdr sees them, unless herdr’s config binds one. The
+plugin’s **Open in OAK** action does the same as `M` from herdr: it selects the focused pane’s
+conversation in Observatory. Pane split (`|`, `-`), zoom (`z`) and the view picker (`v`) are plain keys
+on the Observatory; `?` lists every binding.
 
 herdr's own tabs take the titles of the sessions in them and follow them when they change, also while
 OAK's terminal app is closed: each session's capture hooks and its status line rename its own tab (a

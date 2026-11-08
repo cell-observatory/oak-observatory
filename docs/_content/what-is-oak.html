@@ -8,7 +8,7 @@
 </div>
 
 <h2>How it works</h2>
-<p>OAK derives everything from two sources that cost no tokens and are invisible to the agent. The <a href="capture.html#transcript">transcript</a> the agent already writes — prompts, tool calls, results, reasoning — is read as evidence, never modified. And a local capture <a href="capture.html#hook">hook</a> snapshots each file before and after a change and appends a record to the observatory's own <a href="capture.html#store">store</a>. From those two, OAK reconstructs what you actually review.</p>
+<p>OAK derives everything from two sources that cost no tokens and are invisible to the agent. The <a href="capture.html#transcript">transcript</a> the agent already writes — prompts, tool calls, results, reasoning — is read as evidence, never modified. And a local capture <a href="capture.html#hook">hook</a> snapshots each file before and after a change and appends a record to the observatory's own <a href="capture.html#store">store</a>. From those two, OAK reconstructs what you actually review. Each machine keeps what it derives from them in a <a href="database-and-sync.html">local database</a>, and <code>oak sync</code> carries those records to your other machines.</p>
 
 <div class="callout info">
   <span class="ico">ℹ</span>
@@ -22,6 +22,7 @@
 
 <h2>One agent, or a fleet</h2>
 <p>Everything hangs off a <a href="sessions-agents.html">session</a> — one conversation with a coding agent. But work rarely stays in one session: an agent <a href="subagents-roles.html">spawns subagents</a>, a <a href="workflows-fleet.html">workflow</a> fans out a dozen at once, and siblings run in parallel <a href="worktrees.html">git worktrees</a> of the same repo. OAK correlates all of them, so a fan-out reads as a single account of who did what — path-only, never mixing one agent's file contents into another's.</p>
+<p>Agents can also run on several of your machines at once. <a href="agents-across-machines.html">Multi-agent work across machines</a> shows how you start, watch and review them from one machine, and how each agent reads what the others did.</p>
 
 <h2>Where you review it</h2>
 <p>The same numbers appear in three places: the <a href="tui.html">terminal app</a>, <a href="editors.html">VS Code</a>, and <a href="editors.html">JetBrains</a> IDEs. A number shown on one surface is the same number acted on everywhere — because all three render one CLI backend.</p>

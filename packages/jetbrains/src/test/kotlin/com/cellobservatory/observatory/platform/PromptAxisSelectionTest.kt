@@ -5,7 +5,6 @@ import com.cellobservatory.observatory.model.SessionPrompt
 import com.cellobservatory.observatory.services.ObservatoryService
 import com.cellobservatory.observatory.settings.ObservatorySettings
 import com.cellobservatory.observatory.ui.ReviewNavBar
-import com.intellij.testFramework.fixtures.BasePlatformTestCase
 
 /**
  * Picking a prompt on the nav bar's Prompt axis is a pick EVERYWHERE.
@@ -15,7 +14,7 @@ import com.intellij.testFramework.fixtures.BasePlatformTestCase
  * on whatever row it had, so the window said one ask was picked while the counter said another. Nothing
  * fails when that happens — the reader simply gets a scope they did not choose.
  */
-class PromptAxisSelectionTest : BasePlatformTestCase() {
+class PromptAxisSelectionTest : ObservatoryPlatformTestCase() {
 
     private fun prompt(id: String, editIds: List<Int>) = SessionPrompt(
         id = id, index = 1, ts = 1_000L, endTs = 2_000L, text = "make it faster", title = "make it faster",

@@ -140,13 +140,17 @@ Copy this shape for any new structured view.
 
 | Task | Command |
 | --- | --- |
-| Install dependencies | `npm ci` — under npm 12 it blocks the install scripts of esbuild, keytar and vsce-sign, which the build does not need; node-pty's is allowed through the `allowScripts` field of the root `package.json`. |
+| Install dependencies | `npm ci` — under npm 12 it blocks the install scripts of esbuild and @vscode/vsce-sign, which the build does not need; node-pty's is allowed through the `allowScripts` field of the root `package.json`. npm 11 prints an `allow-scripts` warning for esbuild and @vscode/vsce-sign and runs their scripts anyway, so the warning is expected. |
 | Build core + tui + CLI | `npm run build` — its last step links `node_modules/.bin/oak`, the tree's CLI that the VS Code smoke test and `./gradlew test` drive; `npm ci` skips that link while the CLI is unbuilt. |
 | After editing `packages/tui` | `npm run build` **including the cli step** — the CLI bundle **inlines** the tui package (esbuild), so a tui-only rebuild leaves `packages/cli/dist` stale and the npm-linked `oak` runs your OLD code with no error anywhere. This has bitten twice; when a TUI change "does nothing", check the bundle first. |
 | After editing a `fold*Facts` derivation | Nothing to remember: the persisted facts' cache key hashes the fold functions' own source (`FOLD_STAMP` in `packages/core/src/derived-transcript.ts`), so an edited fold addresses a different cache file and the next read re-folds. Bump `TRANSCRIPT_FACTS_VERSION` in the same file when the stored SHAPE changes — the version rides the file name (`transcript-facts-v<N>-<key>.json`), and `oak clean [--session <id>]` reclaims the generation a bump supersedes. To force a rebuild by hand, delete `changemap-cache/*/transcript-facts-*.json` under the store (`~/.claude/claude-observatory`). |
 | Build the VS Code bundle | `npm run build:vscode` |
+| Package the VS Code extension | `cd packages/vscode && npm run package`, or `npm run release` for every artifact. The repository builds and tests on Node.js 24 or newer: OAK's local database uses the SQLite built into Node, with full-text search. |
+| After editing what the local database derives | Bump `INGEST_VERSION` in `packages/core/src/index/schema.ts` when `listingFacts` (in `observe.ts`), anything it reads, or what the database writes changes meaning: the next catch-up then derives every session's facts again, and an OAK with an older version leaves that file alone. It is a version, not a hash of the code, because the CLI's bundle, the editors' and core's own build print the same function differently and share one database file. A change the schema cannot absorb by a migration (a new step in `MIGRATIONS`, `packages/core/src/index/schema.ts`) raises `INDEX_FORMAT` in `location.ts` instead, and a new database file is built, carrying the archive over. |
+| After changing what the record log carries | A new column needs no new record format: a reader applies the columns it has (`RECORD_TABLES` in `packages/core/src/index/records.ts` lists what is published, by key). A reader passes over what it does not know, a table's records or a column's values, and never reads them again, so the schema step that adds a table, or a column the rows already read must have, also reads the other machines' record logs again from their start, as version 4 does for `attention` in `schema.ts`. A record whose meaning changes raises `RECORD_FORMAT` there, and an older reader then stops at the first batch in the new format and says to update OAK. Usage tables are also paged to saved machines by `seq` (`usageRecordsSince`), so a new way of writing one must give each row a write sequence. |
+| Compare the local database with the files | `OAK_INDEX=off` lists, searches and answers the inbox from the files, as before the database; `OAK_INDEX=shadow` does that and records where the database would have differed in `shadow.jsonl` beside it (`~/.claude/claude-observatory-index/`). The parity tests run the listing suites with every answer served from the database (`packages/core/test/index.test.js`). |
 | Build the JetBrains plugin | `./gradlew buildPlugin` (in `packages/jetbrains`) |
-| Unit + smoke tests | `npm test` (version, privacy and webview checks → build → build:vscode → `node --test` over the core, CLI, TUI and VS Code suites) |
+| Unit + smoke tests | `npm test` (version, privacy and webview checks → build → build:vscode → `node --test` over the core, CLI, TUI and VS Code suites). The suite's bootstrap (`test/bootstrap.cjs`) sets `OAK_NO_BACKGROUND=1`, so OAK starts none of the detached children it would otherwise start on its own (the account pull, the title, tab and month refreshes, the update check, the change-map warm-up, the terminal app's focus server). A test that exercises one of them clears the variable for that run and waits for the child to finish. It also gives every test process a `HOME` (and `USERPROFILE`) of its own, and fails any test whose OAK store resolves under the account's real home directory, checked before and after each test. |
 | End-to-end CLI + hook | `npm run e2e` (`bash test/e2e.sh`, isolated temp `$HOME`) |
 | JetBrains port tests | `./gradlew test` (in `packages/jetbrains`) |
 | Everything | `npm run test:all` |
@@ -154,13 +158,14 @@ Copy this shape for any new structured view.
 | Rebuild site pages | `node scripts/build-docs.mjs` — sources are in `docs/_content/`; never edit the generated `docs/*.html` pages by hand. |
 | Rebuild the terminal demo | `node scripts/build-tui-demo.mjs` — writes `docs/media/tui-frames.js`. |
 | Refresh TUI screenshots | `CHROME_BIN=/path node scripts/build-tui-shots.mjs [--herdr]` — `CHROME_BIN` names the Chrome/Chromium executable; `--herdr` includes the herdr tab. |
-| Refresh editor screenshots/media | `CHROME_BIN=/path node scripts/render-media.mjs` — `CHROME_BIN` names the Chrome/Chromium executable. |
+| Refresh editor screenshots/media | `CHROME_BIN=/path node scripts/render-media.mjs` — `CHROME_BIN` names the Chrome/Chromium executable. Both media scripts start Chrome through `scripts/chrome.mjs`, in a temporary home with no session bus or desktop, resolving no host name but the Google Fonts the TUI screenshots load: Chrome writes nothing to your home, and fonts installed there do not reach the media. |
 | Run CI's matrix before a push | `bash scripts/ci-local.sh` — the Linux lanes in Docker across CI's Node versions, then this platform's own; `--quick` runs Linux on the oldest Node only, `--native` skips the containers. |
 | Time the hot paths | `node scripts/perf-bench.mjs [edits] [files]` — a synthetic many-edit session in a temporary store (default 3000 edits over 150 files). |
 | Codex I/O-budget check *(optional)* | `npm run test:codex-perf` — deterministic, no model or network |
 | Codex hook-trust probe *(optional)* | `npm run test:codex-probe` — needs a real `codex` binary |
 | VS Code host smoke *(optional)* | launch via VS Code's `--extensionTestsPath test/vscode-host-smoke.cjs` — needs a real VS Code |
-| Live herdr checks *(optional)* | `OAK_LIVE_HERDR=1 npm test` — points the suite at the herdr server in your environment and runs the checks that need one (skipped otherwise); without it every test talks to a missing socket |
+| Live herdr checks *(optional)* | `OAK_LIVE_HERDR=1 npm test` — points the suite at the herdr server in your environment and runs the checks that need one (skipped otherwise); without it no test reaches that server: the suite talks to a socket that does not exist, and the tests that start a server of the installed herdr (`HERDR_BIN`, else `herdr` on `PATH`: the suite runs under a `HOME` of its own, so the herdr OAK installs in yours is found through `PATH` only) give it a home, configuration and socket of their own |
+| Live systemd checks *(optional)* | `OAK_LIVE_SYSTEMD=1 npm test` — starts real transient `systemd-run --user --scope` units, to check that the herdr server OAK starts lands in a user scope of its own outside every login (Linux with a user manager; skipped otherwise) |
 | herdr backend probe *(optional)* | `node test/herdr-probe.js` — needs `herdr` on `PATH` (or `HERDR_BIN`) and runs a sandboxed server of its own |
 | Claude hook probe *(optional)* | `node test/claude-hooks-probe.js` — needs a logged-in `claude` on `PATH` and node-pty, and spends one Haiku turn |
 
@@ -174,7 +179,7 @@ after moving the herdr pin. `test/claude-hooks-probe.js` checks that Claude Code
 hook the installer writes, which unit tests cannot see — run it after changing the hook events or
 matchers.
 
-(The `./gradlew` wrapper still needs a JVM to launch — on a bare macOS, point `JAVA_HOME` at a JDK, e.g.
+(The `./gradlew` wrapper still needs a JDK 17 or newer to launch — on a bare macOS, point `JAVA_HOME` at one, e.g.
 `JAVA_HOME=/opt/homebrew/opt/openjdk@21 ./gradlew …`; the build then provisions its own JDK 21 toolchain.
 Always use the wrapper, never an ambient `gradle` — `scripts/release.sh` forbids the latter.)
 
@@ -220,8 +225,8 @@ To move the pin:
 3. Review the generated protocol changes in `herdr-lock.ts` and `herdr-api.d.ts`; keep adaptation
    inside `core/src/herdr.ts`. Update the plugin minimum version when its API requirements change.
 4. Typecheck and build the affected packages, then run the tests. In a sandbox that disallows Node
-   test workers, use `node --test --test-isolation=none <files>`; live tests skip only when their
-   actual binary or socket prerequisite is unavailable.
+   test workers, use `node --require ./test/bootstrap.cjs --test --test-isolation=none <files>`; live
+   tests skip only when their actual binary or socket prerequisite is unavailable.
 5. Run `oak doctor --fix` on an installation with the previous pin and on a clean installation.
    Verify integrations, the plugin, a real PTY spawn and the focus endpoint. Release checks are
    `npm run version:check`, `npm run check:privacy` and `npm run check:webview`.
@@ -289,11 +294,13 @@ of its own:
 
 1. Branch `release/X.Y.Z` off `dev` and run `node scripts/version.mjs X.Y.Z`. Besides every version
    field, the stamp renames the changelog's `## [Unreleased]` to `## [X.Y.Z] — <date>` under a fresh,
-   empty `[Unreleased]`. That section is what the Release workflow publishes as the release notes.
-   The stamp does not date the release on the site: in `docs/_content/releases.html`, set the
-   entry's `<time datetime="YYYY-MM-DD">YYYY-MM-DD</time>` to the date of the changelog heading, then
-   run `node scripts/build-docs.mjs`. Commit the stamp and the date: the merge in step 2 refuses to
-   run over uncommitted changes.
+   empty `[Unreleased]`. That section is what the Release workflow publishes as the release notes;
+   GitHub takes notes of up to 125,000 characters, so a longer section is published up to the last
+   entry that fits, with a link to the rest in the changelog. The stamp does not date the release on
+   the site: in `docs/_content/releases.html`, set the entry's
+   `<time datetime="YYYY-MM-DD">YYYY-MM-DD</time>` to the date of the changelog heading, then run
+   `node scripts/build-docs.mjs`. Commit the stamp and the date: the merge in step 2 refuses to run
+   over uncommitted changes.
 2. Merge `origin/main` into the branch. Every file both branches changed since their merge base
    conflicts: the version-bearing files on the previous stamp, and the READMEs, site pages and
    CHANGELOG. For 0.10.0, whose merge base is older than the 0.9.5 fixes (they reached `main` as
@@ -347,7 +354,17 @@ before re-stamping (`BASE="${BASE%%-*}"`), so nothing downstream changes.
 
 The updater no longer depends on getting this right — it acts on any DIFFERENCE from the channel's
 newest, in either direction, so a stranded install is pulled back onto the channel rather than
-ignored. The stamp keeps the ordering honest anyway; both belong.
+ignored. The stamp keeps the ordering honest anyway; both belong. An install at `-dev.0` is the
+exception: CI stamps every rolling build `-dev.<run>` from run 1, so a dev.0 version is a build from a
+checkout, a local build. `oak version --check`, the daily nudge, `oak update`, VS Code's update check
+and both editors' version chips call it a local build and offer it nothing; `oak update --force` or
+`--channel` replaces it. The JetBrains IDE's own plugin updates read the plugin repository, which OAK
+cannot steer for one install, so an IDE subscribed to it may still offer the repository's build over a
+local plugin. The one install it never pulls back
+is a CLI linked to a checkout (`./install.sh`, `npm i -g ./packages/cli` and `npm link` all make one):
+installing a release over the link would replace it with a copy, so `oak update` names the checkout
+and you update it with `git pull` and `npm run build`. `oak doctor` warns when a login shell, which
+Codex runs its hooks through, finds another `oak` before it.
 
 **Hotfixes.** A critical fix that must reach STABLE users before the next promote does not ship
 from `dev` (which carries unreleased work). Instead: land the fix on `dev` as usual, then

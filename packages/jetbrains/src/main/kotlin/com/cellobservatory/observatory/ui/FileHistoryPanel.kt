@@ -90,10 +90,12 @@ class FileHistoryPanel(private val project: Project) : SimpleToolWindowPanel(tru
 
     fun rebuild() {
         val file = currentFile
-        val edits = if (file == null) emptyList()
-        else service().log().filter { it.file == ClaudePaths.storeKey(file.path) }.sortedWith(compareBy({ it.ts }, { it.id }))
+        val machine = service().currentMachine()
+        val path = if (machine != null) file?.let { RemoteEditorReview.mountedFile(project, it.path)?.remote } ?: service().selectedRemoteReviewFile() else file?.let { ClaudePaths.storeKey(it.path) }
+        val edits = service().reviewRecords().filter { it.file == path }.sortedWith(compareBy({ it.ts }, { it.id }))
         tree.emptyText.text =
-            if (file == null) "Open a file the agent has edited to see its history"
+            if (machine != null) service().remoteReview()?.error ?: "Select a file in Review on $machine to see its history"
+            else if (file == null) "Open a file the agent has edited to see its history"
             else "No agent edits in ${file.name}"
         root.removeAllChildren()
         for (rec in edits) root.add(DefaultMutableTreeNode(rec))
@@ -137,19 +139,36 @@ class FileHistoryPanel(private val project: Project) : SimpleToolWindowPanel(tru
     )
 
     /** Step the active editor's agent revisions in a current-vs-revision diff (parity with the
-     *  ⌥⌘[ / ⌥⌘] editor actions). Needs a text editor — the diff pane is not one. */
+     *  ⌥⌘X [ / ⌥⌘X ] editor actions). Needs a text editor — the diff pane is not one. */
     private fun stepRevision(dir: Int) {
+        if (service().currentMachine() != null) {
+            val rows = service().reviewRecords().filter { it.file == service().selectedRemoteReviewFile() }.sortedBy { it.id }
+            if (rows.isEmpty()) return
+            val index = rows.indexOfFirst { it.id == selectedEdit()?.id }
+            val rec = rows[Math.floorMod(index + dir, rows.size)]
+            tree.setSelectionRow(rows.indexOf(rec))
+            Diffs.showRemote(project, service().currentMachine()!!, service().currentSession()!!, rec.id)
+            return
+        }
         val editor = FileEditorManager.getInstance(project).selectedTextEditor
             ?: return ReviewOps.notify(project, "Open a file to navigate its agent revisions")
         RevisionNav.step(project, editor, dir)
     }
 
     private fun acceptFile() = withSession { s ->
+        service().currentMachine()?.let {
+            val file = service().selectedRemoteReviewFile() ?: return@withSession
+            ReviewOps.remoteVerb(project, s, "keep", listOf("--under", file)); return@withSession
+        }
         val file = currentFile ?: return@withSession
         ReviewOps.keepAll(project, s, service().log().filter { it.file == ClaudePaths.storeKey(file.path) }, file.name)
     }
 
     private fun revertFile() = withSession { s ->
+        service().currentMachine()?.let {
+            val file = service().selectedRemoteReviewFile() ?: return@withSession
+            ReviewOps.remoteVerb(project, s, "undo", listOf("--under", file)); return@withSession
+        }
         val file = currentFile ?: return@withSession
         ReviewOps.undoAll(project, s, service().log().filter { it.file == ClaudePaths.storeKey(file.path) }, file.name, file.path)
     }
@@ -173,7 +192,7 @@ class FileHistoryPanel(private val project: Project) : SimpleToolWindowPanel(tru
 
         // Reasoning first-line via the cached observe --json payload (same source Timeline uses).
         private fun summaryFor(id: Int): String? =
-            ObserveCache.getInstance(project).payload()?.edits?.find { it.id == id }
+            if (ObservatoryService.getInstance(project).currentMachine() != null) null else ObserveCache.getInstance(project).payload()?.edits?.find { it.id == id }
                 ?.let { it.reasoning?.lineSequence()?.firstOrNull() ?: it.summary }
 
         override fun customizeCellRenderer(

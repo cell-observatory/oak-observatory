@@ -1,6 +1,6 @@
 /* Transcript-to-conversation contract tests. Fixtures are copied into isolated homes; no real
  * Claude/Codex files are read or written. Requires built core + CLI dist, like core.test.js. */
-const { test } = require('node:test');
+const { test, after } = require('node:test');
 const assert = require('node:assert/strict');
 const cp = require('node:child_process');
 const fs = require('node:fs');
@@ -12,8 +12,12 @@ const CLI = path.resolve(__dirname, '../../cli/dist/index.js');
 const FIXTURES = path.join(__dirname, 'fixtures');
 const { workspaceFixture } = require('./fixtures/workspace-fixture.cjs');
 
+// The temp dirs fresh() makes, removed when this file ends (a direct `node --test` run left them behind).
+const tmpDirs = [];
+after(() => { for (const dir of tmpDirs) fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5 }); });
 function fresh() {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-conversation-'));
+  tmpDirs.push(base);
   process.env.CLAUDE_CONFIG_DIR = path.join(base, 'claude');
   process.env.CODEX_HOME = path.join(base, 'codex');
   process.env.HOME = base;
@@ -43,11 +47,11 @@ function codexRollout(cwd, text, session = 'codex-conversation') {
   return file;
 }
 
-function seedEdit(session, file, ts, tool = 'Edit') {
+function seedEdit(session, file, ts, tool = 'Edit', extra = {}) {
   core.ensureStore(session);
   const beforeBlob = core.writeBlob(session, Buffer.from('old'));
   const afterBlob = core.writeBlob(session, Buffer.from('new'));
-  return core.appendLog(session, { ts, tool, file, beforeBlob, afterBlob, status: 'pending' });
+  return core.appendLog(session, { ts, tool, file, beforeBlob, afterBlob, status: 'pending', ...extra });
 }
 
 function updates(result, kind) {
@@ -488,4 +492,83 @@ test('mirror provenance: matching cwd, absent cwd, Codex layout and copied Claud
   assert.deepEqual(core.isMirroredTranscript(unknown), { mirrored: false });
   const rollout = codexRollout(cwd, r.jsonl([r.prompt(0)]));
   assert.equal(core.isMirroredTranscript(rollout).mirrored, false, 'a Codex rollout in its own layout is never a mirror');
+});
+
+const qa = require('./fixtures/queued-asks.cjs');
+const askReader = require('../dist/asks');
+const searchReader = require('../dist/search');
+function queuedFixture(records, session = 'queued-asks') {
+  const { cwd } = fresh();
+  core.ensureStore(session);
+  const file = claudeTranscript(cwd, records.map(r => JSON.stringify(r)).join('\n') + '\n', session);
+  return { cwd, file, session };
+}
+function assertAsks(f, expected) {
+  assert.deepEqual(askReader.askScan(f.file).asks.map(a => [a.ts, a.text]), expected);
+  assert.deepEqual(core.sessionPrompts(f.cwd, f.session).map(a => [a.ts, a.text]), expected);
+  assert.deepEqual(core.conversationEvents(f.session, { root: f.cwd }).events.filter(e => e.update.sessionUpdate === 'user_prompt').map(e => [e.ts, e.update.content.text]), expected);
+  assert.deepEqual(core.liveFeed(f.cwd, f.session, { kind: 'session', id: f.session }, { limit: 1000 }).entries.filter(e => e.kind === 'prompt').map(e => [e.ts, e.promptText]), expected);
+  assert.deepEqual(searchReader.sessionSearchIndex(f.cwd, f.session, f.file).docs.map(d => [d.ts, d.prompt]), expected);
+}
+const expectedAsk = (s, text) => [Date.parse(qa.at(s)), text];
+test('queued asks: absorbed mid-turn delivery owns subsequent work, once and unwrapped', () => {
+  const f = queuedFixture([qa.ask('Start', 0, 'start'),
+    { type: 'queue-operation', operation: 'enqueue', content: 'Change zebracorn', timestamp: qa.at(1) },
+    qa.remove('Change zebracorn', 2, 'mid'), qa.queued('Change zebracorn', 3, 'mid'), qa.blob('Change zebracorn', 4), qa.answer('Changed zebracorn', 5)]);
+  seedEdit(f.session, path.join(f.cwd, 'demo.ts'), Date.parse(qa.at(5)));
+  assertAsks(f, [expectedAsk(0, 'Start'), expectedAsk(3, 'Change zebracorn')]);
+  assert.deepEqual(core.sessionPrompts(f.cwd, f.session).map(p => p.edits), [0, 1]);
+  assert.equal(searchReader.sessionSearchIndex(f.cwd, f.session, f.file).docs[1].response, 'Changed zebracorn');
+});
+test('queued asks: delivered command dedupes across appends by identity, repeated words survive', () => {
+  const f = queuedFixture([qa.remove('Again', 0, 'delivered', 'delivered_to_agent'), qa.queued('Again', 1, 'delivered')]);
+  assertAsks(f, [expectedAsk(1, 'Again')]);
+  const first = core.conversationEvents(f.session, { root: f.cwd });
+  fs.appendFileSync(f.file, [qa.ask('Again', 2, 'ordinary', { promptId: 'delivered' }), qa.ask('Again', 3, 'separate')].map(r => JSON.stringify(r)).join('\n') + '\n');
+  core.clearFsCache();
+  assertAsks(f, [expectedAsk(1, 'Again'), expectedAsk(3, 'Again')]);
+  assert.deepEqual(core.conversationTail(f.session, first.cursor).events.filter(e => e.update.sessionUpdate === 'user_prompt').map(e => e.update.content.text), ['Again']);
+});
+test('queued asks: humanTurn is accepted, task, peer and meta image notes are excluded', () => {
+  const f = queuedFixture([qa.queued('<literal user markup>', 1, 'human', { origin: undefined, humanTurn: true }),
+    qa.queued('task noise', 2, 'task', { commandMode: 'task-notification', origin: { kind: 'task-notification' } }),
+    qa.queued('peer noise', 3, 'peer', { origin: { kind: 'peer' } }),
+    qa.ask('[Image: original 2366x1301, displayed at 1000x550]', 4, 'image', { isMeta: true })]);
+  assertAsks(f, [expectedAsk(1, '<literal user markup>')]);
+});
+test('queued asks: API replay blobs are ignored by prompts, search, Feed, actions and usage', () => {
+  const replay = { type: 'api-request-blob', timestamp: qa.at(2), message: { id: 'replayed', role: 'assistant', usage: { input_tokens: 999, output_tokens: 999 }, content: [
+    { type: 'text', text: 'replayed prose' }, { type: 'tool_use', id: 'replayed-tool', name: 'Read', input: { file_path: '/synthetic' } },
+  ] } };
+  const f = queuedFixture([qa.ask('Start', 0, 'start'), qa.blob('ghost', 1), replay, qa.answer('Real answer', 3)]);
+  assertAsks(f, [expectedAsk(0, 'Start')]);
+  assert.equal(askReader.askScan(f.file).tokenAt.length, 0);
+  assert.equal(core.parseTranscriptActions(f.file).length, 0);
+  assert.equal(core.sessionUsage(f.cwd, f.session).total, 0);
+  assert.equal(core.promptResponse(f.cwd, f.session, core.sessionPrompts(f.cwd, f.session)[0].id).text, 'Real answer');
+  assert.equal(searchReader.sessionSearchIndex(f.cwd, f.session, f.file).docs[0].response, 'Real answer');
+  assert.equal(require('../dist/index/ingest').usageOfLine(replay, f.session, 'fallback'), null);
+  assert.equal(core.liveFeed(f.cwd, f.session, { kind: 'session', id: f.session }, { limit: 1000 }).entries.some(e => e.reasoning === 'replayed prose'), false);
+});
+
+test('queued asks: Codex steering within one native turn keeps separate asks and work windows', () => {
+  const { cwd } = fresh(), session = 'codex-steering';
+  const records = [{ type: 'session_meta', timestamp: qa.at(0), payload: { id: session, cwd } },
+    { type: 'turn_context', timestamp: qa.at(0), payload: { turn_id: 'native-turn', model: 'gpt-5' } }];
+  for (const [s, text, client] of [[1, 'Start', 'first'], [3, 'Change zebracorn', 'second'], [5, 'Change zebracorn', 'third']]) {
+    records.push({ type: 'event_msg', timestamp: qa.at(s), payload: { type: 'user_message', message: text, client_id: client } },
+      { type: 'response_item', timestamp: qa.at(s), payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text }] } });
+  }
+  core.ensureStore(session);
+  const rollout = codexRollout(cwd, records.map(r => JSON.stringify(r)).join('\n') + '\n', session);
+  const file = require('../dist/codex-events').codexTranscriptFile(rollout);
+  const f = { cwd, session, file };
+  for (const [i, s] of [2, 4, 6].entries()) {
+    // Hooks name the native turn, shared by all three human asks.
+    seedEdit(session, path.join(cwd, `file${i}.ts`), Date.parse(qa.at(s)), 'Edit', { promptId: 'native-turn', nativeTurnId: 'native-turn' });
+  }
+  assertAsks(f, [expectedAsk(1, 'Start'), expectedAsk(3, 'Change zebracorn'), expectedAsk(5, 'Change zebracorn')]);
+  const prompts = core.sessionPrompts(cwd, session);
+  assert.equal(new Set(prompts.map(p => p.id)).size, 3);
+  assert.deepEqual(prompts.map(p => p.edits), [1, 1, 1]);
 });

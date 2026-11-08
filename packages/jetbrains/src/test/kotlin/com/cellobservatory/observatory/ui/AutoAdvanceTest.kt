@@ -3,7 +3,7 @@ package com.cellobservatory.observatory.ui
 import com.cellobservatory.observatory.core.ClaudePaths
 import com.cellobservatory.observatory.services.ObservatoryService
 import com.cellobservatory.observatory.settings.ObservatorySettings
-import com.intellij.testFramework.fixtures.BasePlatformTestCase
+import com.cellobservatory.observatory.platform.ObservatoryPlatformTestCase
 import java.nio.file.Files
 import java.nio.file.Path
 
@@ -16,7 +16,7 @@ import java.nio.file.Path
  * `redo = false` must actually move the cursor. Without that, a gate that rejected everything would look
  * like a passing redo test forever.
  */
-class AutoAdvanceTest : BasePlatformTestCase() {
+class AutoAdvanceTest : ObservatoryPlatformTestCase() {
 
     private lateinit var cfg: Path
     private val session = "advance-session"

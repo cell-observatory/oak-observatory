@@ -4,10 +4,9 @@ import com.cellobservatory.observatory.core.ClaudePaths
 import com.cellobservatory.observatory.model.SessionsResult
 import com.cellobservatory.observatory.services.ObservatoryService
 import com.cellobservatory.observatory.settings.ObservatorySettings
-import com.intellij.testFramework.fixtures.BasePlatformTestCase
 import java.nio.file.Files
 
-class SessionSelectionTest : BasePlatformTestCase() {
+class SessionSelectionTest : ObservatoryPlatformTestCase() {
     fun testAnAnsweredEmptyCliListingCannotFallBackToAMirror() {
         val cfg = Files.createTempDirectory("oak-selection-cfg")
         val oldPin = ObservatorySettings.instance.state.session

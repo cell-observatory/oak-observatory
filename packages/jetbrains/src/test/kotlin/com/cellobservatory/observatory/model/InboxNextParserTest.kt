@@ -32,6 +32,23 @@ class InboxNextParserTest {
     }
 
     @Test
+    fun `elsewhere counts the hands waiting on other machines, 0 when absent or unreadable`() {
+        assertEquals(2, InboxNextParser.elsewhere("""{"next":null,"hand":null,"elsewhere":2}"""))
+        assertEquals(0, InboxNextParser.elsewhere("""{"next":null,"hand":null}"""))
+        assertEquals(0, InboxNextParser.elsewhere("""{"next":null,"hand":null,"elsewhere":"two"}"""))
+        assertEquals(0, InboxNextParser.elsewhere("not json"))
+        assertEquals(0, InboxNextParser.elsewhere(null))
+    }
+
+    @Test
+    fun `the jump's message when nobody here waits mirrors core nobodyWaitingHere verbatim`() {
+        // The same three strings core's test pins (packages/core/test/core.test.js).
+        assertEquals("nobody is waiting on you", nobodyWaitingHere(0, "the Sessions tab"))
+        assertEquals("nobody here is waiting on you · 1 on other machine: the Sessions tab lists it", nobodyWaitingHere(1, "the Sessions tab"))
+        assertEquals("nobody here is waiting on you · 2 on other machines: the Sessions tab lists them", nobodyWaitingHere(2, "the Sessions tab"))
+    }
+
+    @Test
     fun `labels mirror core attentionLabel verbatim`() {
         assertEquals("has a question for you", attentionLabel("question"))
         assertEquals("needs your permission", attentionLabel("permission"))

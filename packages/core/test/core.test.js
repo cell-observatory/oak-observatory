@@ -1,10 +1,11 @@
 /* Core correctness tests — run with `node --test`. Uses isolated temp HOME dirs; never touches
    the real ~/.claude. Requires the built dist (npm test builds first). */
-const { test } = require('node:test');
-const assert = require('node:assert');
+const { test, after } = require('node:test');
+const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { gitDir: makeGitDir } = require('../../../test/fixtures/git.cjs');
 const cp = require('child_process');
 
 // These fixtures select stores through freshHome(). Ignore the invoking developer's custom
@@ -19,14 +20,32 @@ const tui = require('../../tui/dist/index.js');
 const CAPTURE = path.resolve(__dirname, '../../cli/dist/capture.js');
 const CLI = path.resolve(__dirname, '../../cli/dist/index.js');
 
+// Every temp dir the helpers below make is removed when this file ends. `npm test` removes its whole
+// temp root anyway, but a direct `node --test` of this file left each one behind in the system's.
+const tmpDirs = [];
+after(() => { for (const dir of tmpDirs) fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5 }); });
+function tmpDir(prefix) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  tmpDirs.push(dir);
+  return dir;
+}
 function freshHome() {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-home-'));
+  const home = tmpDir('cc-home-');
   process.env.HOME = home;
   process.env.USERPROFILE = home; // os.homedir() reads USERPROFILE on Windows, HOME elsewhere
   return home;
 }
 function tmpWork() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), 'cc-work-'));
+  return tmpDir('cc-work-');
+}
+/** The built CLI laid out as an install, outside any checkout: `oak update` leaves a CLI that runs from a
+ *  checkout alone, as the one built here does, so a test of the update itself runs this copy. `version`
+ *  stamps the copy: this tree's own is a local build (dev.0) on `dev`, which `oak update` leaves alone. */
+function installedCli(version) {
+  const pkg = path.join(tmpDir('cc-installed-'), 'oak-observatory');
+  for (const f of ['package.json', 'dist', 'statusline']) fs.cpSync(path.join(__dirname, '../../cli', f), path.join(pkg, f), { recursive: true });
+  if (version) fs.writeFileSync(path.join(pkg, 'package.json'), JSON.stringify({ ...JSON.parse(fs.readFileSync(path.join(pkg, 'package.json'), 'utf8')), version }));
+  return path.join(pkg, 'dist', 'index.js');
 }
 function seedEdit(session, file, before, after) {
   core.ensureStore(session);
@@ -1160,8 +1179,8 @@ function treePending(t) {
 test('groups: a REAL edit inside a phantom chain is never swallowed by the fold', () => {
   // The reason absence is merged rather than merely cancelled. A phantom delete, the file back, a
   // genuine edit, then the phantom pair again: cancelling on the null endpoints alone would mark the
-  // whole run "nothing to review" and hide the real edit inside it — on the live session that buried
-  // 63 Edit/Write records. Merging across absence leaves ONE unit carrying the real change instead.
+  // whole run "nothing to review" and hide the real edit inside it, with every Edit and Write record in
+  // the run. Merging across absence leaves ONE unit carrying the real change instead.
   const S = 'cancel10';
   const F = twoAskStore(S);
   seedEdit(S, F, 'v0\n', null); // phantom delete
@@ -1195,7 +1214,7 @@ test('groups: a dismissed cancelled chain stays hidden — Dismiss must not beco
 
 test('counts: every surface means the same thing by "pending"', () => {
   // One meaning per word. Each of these used to count the raw or uncollapsed set, so a session could
-  // read 652 in the status bar, 1,425 in the map and 132 in the list — all for the same edits.
+  // read three different numbers in the status bar, the map and the list — all for the same edits.
   const S = 'cancel12';
   const F = twoAskStore(S);
   // A chain that genuinely cancels has to be on its OWN file: on the same file, the real edit below
@@ -1258,8 +1277,8 @@ test('capture: overlapping Bash commands do not steal each other’s snapshots',
   // diffed its walk against whatever snapshot the NEXT command had just written. A repo-root walk
   // against a subtree snapshot reports every file outside that subtree as created; the mirror image
   // reports them deleted; and the partner then found no manifest and captured nothing at all.
-  // Measured on the reporting session before the fix: 3,050 of 3,378 records sat in chains that
-  // cancel out, and 3,211 of them came from Bash.
+  // On the session that found this, nearly every record sat in a chain that cancels out, and nearly
+  // all of them came from Bash.
   freshHome();
   const S = 'overlap';
   core.ensureStore(S);
@@ -1811,9 +1830,9 @@ test('units: a later edit reclaims lines a NON-ADJACENT earlier edit produced', 
 });
 
 test('units: a hop persists across processes — a new edit costs its own diff, not every blob in the session (perf, 2026-09-16)', () => {
-  // MEASURED 2026-09-16 on a live 8,745-record session: `oak sessions --json` took 15 s on EVERY poll
+  // On a live session of thousands of records, `oak sessions --json` took seconds on EVERY poll
   // while the agent worked — each new record invalidated the units cache and the recompute re-read
-  // 779 MB of blobs and re-ran scope detection over every one of them (10 of the 15 s). A blob pair's
+  // hundreds of megabytes of blobs and re-ran scope detection over each of them. A blob pair's
   // diff never changes, so each hop (line runs, scope name, pure-block bytes) now lives in the content
   // store beside the deltas, written by the process that derived it, and a recompute pays only for the
   // pair nobody has seen. Proven the only way that proves a DISK cache: fresh processes, no blobs.
@@ -1853,8 +1872,9 @@ test('units: a hop persists across processes — a new edit costs its own diff, 
 test('counts: a collapsed unit\'s synthetic pair persists — the display pair is diffed once, not once per listing (perf, 2026-09-16)', () => {
   // `reviewEdits` collapses a pending unit into ONE synthetic record whose pair is (first member's
   // before, last member's after) — a pair no raw log record carries. The flush pruned the delta store
-  // to raw pairs, so every listing re-diffed those synthetic pairs (~44 on an 8,700-record session,
-  // 830 ms per poll, forever). What a process noted for a record it was shown is live by definition.
+  // to raw pairs, so every listing re-diffed those synthetic pairs (dozens on a session of thousands of
+  // records, most of a second per poll, forever). What a process noted for a record it was shown is
+  // live by definition.
   freshHome();
   delete process.env.CLAUDE_CONFIG_DIR;
   const S = 'u-synth';
@@ -1881,7 +1901,7 @@ test('asks: the transcript scan resumes from a persisted byte cursor — a grown
   const { askScan } = require('../dist/asks.js'); // internal — the grouping layer's scan, not a public verb
   const scan = () => askScan(T).asks.map((a) => a.text);
   assert.deepEqual(scan(), ['first ask', 'second ask']);
-  const cacheFile = path.join(core.rootDir(), 'changemap-cache', S, 'asks-v3.json'); // the version is in the name (2026-09-23)
+  const cacheFile = path.join(core.rootDir(), 'changemap-cache', S, 'asks-v5.json'); // the version is in the name (2026-09-23)
   assert.equal(JSON.parse(fs.readFileSync(cacheFile, 'utf8')).cursor, fs.statSync(T).size, 'the cursor sits at the end of the last complete line');
   // Rewrite the FIRST ask in place (same length, first 64 bytes untouched), append a third ask and an
   // unterminated tail. A full re-read would report the rewritten text; the resumed scan never reads
@@ -3089,6 +3109,144 @@ test('usage: the account pull keeps the cache live WITHOUT a claude session (0.1
   assert.equal(core.dueAccountUsagePull(60_000, 45_000), false, 'a cache a live session is refreshing is not due');
 });
 
+test('usage: an account answer whose 5h window has no reset records the window as ended, as the status line does (2026-10-22)', () => {
+  // A 5h window whose resets_at is null, beside the weekly window an account with rolling limits reports, is no 5h window
+  // running. The pull recorded the share such an answer gave (7 for `{ utilization: 7, resets_at: null }`) stamped now
+  // beside the reset that had passed, which core read as a share from a Claude Code that sends no reset and gave a
+  // countdown estimated from that reset. The status line records 0 stamped now beside the reset it keeps, and so does
+  // the pull: core reads 0% with no countdown. The week and Fable shares beside it still count. (An answer with no 5h
+  // window at all is an account with no five-hour limit: the next test.)
+  const home = freshHome();
+  const cfg = path.join(home, '.claude');
+  fs.mkdirSync(cfg, { recursive: true });
+  const prev = process.env.CLAUDE_CONFIG_DIR;
+  process.env.CLAUDE_CONFIG_DIR = cfg;
+  try {
+    const now = Math.floor(Date.now() / 1000);
+    const passed = now - 3600, r7 = now + 3 * 86400 + 30;
+    // A share above 0 measured after the passed reset, with no reset of its own: core rolls that reset forward for it.
+    const cache = { v: 3, five_pct: 40, five_at: passed + 60, five_reset: passed, week_pct: 10, week_at: now - 600, week_reset: r7, costs: { kept: { usd: 9, at: now - 60 } } };
+    const week = { utilization: 24, resets_at: r7 };
+    const fable = [{ kind: 'weekly_scoped', percent: 4, resets_at: r7, scope: { model: { display_name: 'Fable' } } }];
+    const read = (merged) => {
+      fs.writeFileSync(path.join(cfg, 'statusline-last.json'), JSON.stringify(merged));
+      const u = core.usageLine(home, '');
+      return [u.fiveHourPct, u.fiveReset, u.weekPct, u.fablePct];
+    };
+    assert.deepEqual(read(cache).slice(0, 2), [40, (passed + 18000) * 1000], 'control: core gives that share a countdown rolled from the passed reset');
+    for (const [name, answer] of [
+      ['a share beside no reset', { five_hour: { utilization: 7, resets_at: null }, seven_day: week, limits: fable }],
+      ['a share of 0 beside no reset', { five_hour: { utilization: 0, resets_at: null }, seven_day: week, limits: fable }],
+    ]) {
+      const m = core.applyAccountUsage(cache, answer, now);
+      assert.deepEqual([m.five_pct, m.five_at, m.five_reset], [0, now, passed], `${name}: 0, stamped now, beside the reset the cache keeps`);
+      assert.deepEqual([m.week_pct, m.week_at, m.week_reset, m.fable_pct, m.ts, m.api_ts, m.costs.kept.usd], [24, now, r7, 4, now, now, 9], `${name}: the week and Fable shares still count`);
+      assert.deepEqual(read(m), [0, null, 24, 4], `${name}: core reads the window as ended, 0% with no countdown`);
+    }
+    // With no 5h reset known at all, the same: 0, and still no reset.
+    const first = core.applyAccountUsage({ v: 3 }, { five_hour: { utilization: 7, resets_at: null }, seven_day: week }, now);
+    assert.deepEqual([first.five_pct, first.five_at, 'five_reset' in first], [0, now, false], 'no window, from a first answer');
+    assert.deepEqual(read(first).slice(0, 2), [0, null]);
+    // A reset the cache keeps that is still ahead names a window such an answer does not end, as the line's own pull reads
+    // it: the share recorded in it stands, with its stamp, where a 0 beside that reset read `0% ·1h 0m`.
+    const ahead = now + 3600 + 30;
+    const kept = core.applyAccountUsage({ ...cache, five_pct: 40, five_at: now - 600, five_reset: ahead }, { five_hour: { utilization: 7, resets_at: null }, seven_day: week, limits: fable }, now);
+    assert.deepEqual([kept.five_pct, kept.five_at, kept.five_reset, kept.week_pct, kept.api_ts], [40, now - 600, ahead, 24, now], 'a reset still ahead: its share stands, and the week counts');
+    assert.deepEqual(read(kept), [40, ahead * 1000, 24, 4], 'core reads it as the line\'s own pull leaves it');
+    // Controls: a running 5h window lands with its reset; a share beside no reset with no weekly window either is the
+    // share, as the line takes it; an answer with neither window writes nothing.
+    const r5 = now + 3600;
+    const running = core.applyAccountUsage(cache, { five_hour: { utilization: 7, resets_at: r5 }, seven_day: week, limits: fable }, now);
+    assert.deepEqual([running.five_pct, running.five_at, running.five_reset], [7, now, r5], 'a running window: its share, stamped now, and its reset');
+    assert.deepEqual(read(running), [7, r5 * 1000, 24, 4], 'which core reads with its countdown');
+    assert.equal(core.applyAccountUsage(cache, { five_hour: { utilization: 7, resets_at: null } }, now).five_pct, 7, 'no weekly window beside it: the share');
+    assert.equal(core.applyAccountUsage(cache, { five_hour: { utilization: 7, resets_at: null }, seven_day: { utilization: 24 } }, now).five_pct, 7, 'nor a weekly window with no reset (the line\'s rule asks for its resets_at): the share');
+    assert.equal(core.applyAccountUsage(cache, {}, now), null, 'neither window: nothing to write');
+    assert.equal(core.applyAccountUsage(cache, { five_hour: null, seven_day: null }, now), null, 'neither window, both null: nothing to write');
+  } finally {
+    if (prev === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = prev;
+  }
+});
+
+test('usage: an account answer with no 5h window records no five-hour limit, and core hides the 5h readout (2026-10-30)', () => {
+  // Anthropic's Ultra plan has no five-hour limit once the account is verified, and its usage answer then carries no 5h
+  // window: `five_hour` null or missing, or its utilization null, which Claude Code's own usage view draws no Current
+  // session bar for. The pull read it as a 5h window with nothing running and recorded 0, or, with a utilization of null,
+  // kept the share measured before and took the answer's reset beside it. It records when the account answered so
+  // (five_none_at), and no 5h share or reset; an answer that carries a 5h window records when too (five_seen_at). Only
+  // these answers decide, never a share: core hides the 5h readout while the newest no-limit answer is at least as new as
+  // the newest answer with a 5h window: no share, reset or 5h figure, in the readouts, in the brief the saved machines
+  // read, or on the terminal app's bar, however new the share.
+  const home = freshHome();
+  const cfg = path.join(home, '.claude');
+  fs.mkdirSync(cfg, { recursive: true });
+  const prev = process.env.CLAUDE_CONFIG_DIR;
+  process.env.CLAUDE_CONFIG_DIR = cfg;
+  try {
+    const now = Math.floor(Date.now() / 1000);
+    const ahead = now + 3600 + 30, r7 = now + 3 * 86400 + 30;
+    // A running 5h window recorded ten minutes ago, with its figures: the account as it read before the change.
+    const cache = { v: 3, five_pct: 40, five_at: now - 600, five_reset: ahead, five_tok: 2_400_000, five_total: 6_000_000, five_reads: 9_000_000,
+      five_meas: 1_000_000, meas_at: now - 600, five_cost: 1.5, five_cost_total: 20, week_pct: 10, week_at: now - 600, week_reset: r7 };
+    const week = { utilization: 24, resets_at: r7 };
+    const fable = [{ kind: 'weekly_scoped', percent: 4, resets_at: r7, scope: { model: { display_name: 'Fable' } } }];
+    const read = (merged) => {
+      fs.writeFileSync(path.join(cfg, 'statusline-last.json'), JSON.stringify(merged));
+      const u = core.usageLine(home, ''), b = core.machineUsageBrief(home);
+      return { line: [u.fiveHourPct, u.fiveReset, u.fiveTokens, u.fiveTotal, u.fiveReads, u.fiveMeasuredAll, u.fiveCost, u.fiveCostTotal, u.fiveNoneAt, u.weekPct, u.fablePct, u.rollingLimits],
+        brief: [b.five, b.fiveNoneAt, b.fiveSeenAt, b.week?.pct], bar: core.usageBrief(home).claude.five };
+    };
+    assert.deepEqual(read(cache).line, [40, ahead * 1000, 2_400_000, 6_000_000, 9_000_000, 1_000_000, 1.5, 20, null, 10, null, true], 'control: the window shows, with its figures');
+    for (const [name, answer] of [
+      ['five_hour null', { five_hour: null, seven_day: week, limits: fable }],
+      ['five_hour missing', { seven_day: week, limits: fable }],
+      ['its utilization null', { five_hour: { utilization: null, resets_at: now + 7200 }, seven_day: week, limits: fable }],
+    ]) {
+      const m = core.applyAccountUsage(cache, answer, now);
+      assert.deepEqual([m.five_none_at, 'five_seen_at' in m], [now, false], `${name}: recorded, with when`);
+      assert.deepEqual([m.five_pct, m.five_at, m.five_reset], [40, now - 600, ahead], `${name}: no 0 stamped, and no reset taken from the answer`);
+      assert.deepEqual([m.week_pct, m.week_at, m.fable_pct, m.ts, m.api_ts], [24, now, 4, now, now], `${name}: the week and Fable shares still count`);
+      const r = read(m);
+      assert.deepEqual(r.line, [null, null, null, null, null, null, null, null, now * 1000, 24, 4, true], `${name}: no 5h readout or 5h spend, and when the account said so`);
+      assert.deepEqual(r.brief, [null, now * 1000, null, 24], `${name}: the brief the saved machines read says so too`);
+      assert.deepEqual(r.bar, { pct: null, resetMs: null }, `${name}: the terminal app's bar has no 5h share`);
+      // Nor where the cache keeps no running window (its reset has passed, or it knows none), where the 0 was stamped.
+      const passed = core.applyAccountUsage({ ...cache, five_reset: now - 60 }, answer, now);
+      assert.deepEqual([passed.five_pct, passed.five_at, passed.five_none_at], [40, now - 600, now], `${name}: no 0 beside a passed reset`);
+      const first = core.applyAccountUsage({ v: 3 }, answer, now);
+      assert.deepEqual(['five_pct' in first, 'five_at' in first, 'five_reset' in first, first.five_none_at], [false, false, false, now], `${name}: nor in a first answer`);
+    }
+    // A 5h share measured after that answer (a session's reply the status line recorded) does not bring the window back,
+    // however new: only an answer does.
+    const none = core.applyAccountUsage(cache, { five_hour: null, seven_day: week }, now);
+    // [5h share, its reset, when the account said it has no five-hour limit], as core reads `c`.
+    const five = (c) => { const l = read(c).line; return [l[0], l[1], l[8]]; };
+    assert.deepEqual(five({ ...none, five_pct: 3, five_at: now + 3600 }), [null, null, now * 1000], 'a share measured since does not show');
+    assert.deepEqual(five({ ...none, five_pct: 3, five_at: undefined }), [null, null, now * 1000], 'nor one with no stamp');
+    // A window object with a numeric utilization records that the account has a five-hour limit, and being newer, shows.
+    // With no reset, beside the weekly window, it is a window not running, 0% with no countdown, as before; with one, its
+    // share.
+    const ended = core.applyAccountUsage({ ...none, five_reset: now - 60 }, { five_hour: { utilization: 7, resets_at: null }, seven_day: week }, now + 60);
+    assert.deepEqual([ended.five_seen_at, ended.five_none_at, ended.five_pct, ended.five_at], [now + 60, now, 0, now + 60], 'recorded beside the other, and 0 for a window not running');
+    assert.deepEqual(five(ended), [0, null, null], 'core reads 0% with no countdown');
+    const running = core.applyAccountUsage(none, { five_hour: { utilization: 12, resets_at: ahead }, seven_day: week }, now + 60);
+    assert.deepEqual([running.five_seen_at, running.five_none_at, running.five_pct], [now + 60, now, 12], 'a running window');
+    assert.deepEqual(five(running), [12, ahead * 1000, null], 'which shows with its countdown');
+    assert.deepEqual(read(running).brief.slice(1, 3), [now * 1000, (now + 60) * 1000], 'and the brief carries both answers');
+    // The same second: no limit. A later answer with no 5h window hides it again.
+    assert.deepEqual(five({ ...none, five_seen_at: now }), [null, null, now * 1000], 'a tie goes to no limit');
+    const again = core.applyAccountUsage(running, { five_hour: null, seven_day: week }, now + 120);
+    assert.deepEqual([again.five_none_at, again.five_seen_at, five(again)[0], five(again)[2]], [now + 120, now + 60, null, (now + 120) * 1000], 'hidden again');
+    // An answer with neither window still writes nothing, and one with no weekly window says nothing of the 5h limit.
+    assert.equal(core.applyAccountUsage(cache, { five_hour: null, seven_day: null, limits: fable }, now), null, 'neither window: nothing to write');
+    assert.equal('five_none_at' in core.applyAccountUsage(cache, { five_hour: { utilization: null, resets_at: now + 7200 } }, now), false, 'no weekly window: no record');
+  } finally {
+    if (prev === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = prev;
+  }
+});
+
 test('usage: a token refresh never overwrites a newer rotation, and the keychain write-back keeps the token out of argv', async (t) => {
   const http = require('http');
   const home = freshHome();
@@ -3167,7 +3325,8 @@ test('observe: usageLine normalizes an epoch-seconds reset — and rolls a PAST 
   const u = core.usageLine(cwd, 'nosession');
   assert.equal(u.weekReset, future * 1000, 'epoch seconds scaled to epoch ms');
   // A PAST anchor rolls forward by whole weekly periods (Claude Code 2.1.263 stopped sending
-  // resets_at, so the last-known anchor must keep fixing the cycle) — never passed through stale.
+  // resets_at, and a version that sends none still needs the last-known anchor to fix the cycle;
+  // current versions send it again) — never passed through stale.
   fs.writeFileSync(slp, JSON.stringify({ ctx_pct: 10, ctx_size: 200000, week_pct: 5, week_reset: 1783540800 }));
   const u2 = core.usageLine(cwd, 'nosession');
   const nowMs = Date.now();
@@ -3175,16 +3334,17 @@ test('observe: usageLine normalizes an epoch-seconds reset — and rolls a PAST 
   assert.equal((u2.weekReset - 1783540800 * 1000) % (7 * 86400_000), 0, '…by WHOLE periods from the original anchor');
   // A share measured before its window began is the last window's, so the window shows none until a fresh one
   // arrives; one measured inside it stands, and a cache with no stamp (an older status line) keeps its share.
+  // A 5h window is not periodic: one whose reset passed with its share measured before it has ended (0, no reset).
   const nowSec = Math.floor(nowMs / 1000);
   const windowStart = Math.floor(u2.weekReset / 1000) - 7 * 86400;
-  const fiveAnchor = nowSec - 3 * 3600; // rolls to 2h from now: this 5h window began 3h ago
+  const fiveAnchor = nowSec - 3 * 3600; // a share measured after it rolls it to 2h from now: a window that began 3h ago
   const at = (week, five, fable) => JSON.stringify({ ctx_pct: 10, ctx_size: 200000, week_pct: 77, week_reset: 1783540800, five_pct: 9, five_reset: fiveAnchor,
     week_tok: 88000000, five_tok: 12300000, fable_pct: 3, fable_tok: 5000000, fable_reset: 1783540800, api_ts: nowSec,
     ...(week ? { week_at: week } : {}), ...(five ? { five_at: five } : {}), ...(fable ? { fable_at: fable } : {}) });
   fs.writeFileSync(slp, at(windowStart - 3600, nowSec - 4 * 3600, windowStart - 60));
   const stale = core.usageLine(cwd, 'nosession');
   assert.equal(stale.weekPct, null, 'last week\'s share is not this week\'s');
-  assert.equal(stale.fiveHourPct, null, '…nor the last 5h window\'s');
+  assert.deepStrictEqual([stale.fiveHourPct, stale.fiveReset], [0, null], '…and the last 5h window has ended: 0, with no reset');
   assert.equal(stale.fablePct, null, '…nor the last Fable window\'s, however recent the last pull');
   assert.deepStrictEqual([stale.weekTokens, stale.fiveTokens, stale.fableTokens], [null, null, null], 'the token estimates restate the shares, so they go too');
   assert.ok(stale.weekReset > nowMs, 'the countdown still runs');
@@ -3198,14 +3358,1318 @@ test('observe: usageLine normalizes an epoch-seconds reset — and rolls a PAST 
   assert.strictEqual(core.usageLine(cwd, 'nosession').fablePct, null, 'pulled before this window: not this window\'s');
 });
 
+test('observe: a 5-hour window whose reset has passed reads 0 with no reset in every readout, until a newer window is reported (2026-10-19)', () => {
+  // A 5-hour window starts only with the first message after the last one ended, so its reset rolled forward by whole
+  // periods named a window that may not exist (`5h: 0% 48m` after a night with no use).
+  freshHome();
+  delete process.env.CLAUDE_CONFIG_DIR;
+  const cwd = tmpWork();
+  const slp = path.join(os.homedir(), '.claude', 'statusline-last.json');
+  fs.mkdirSync(path.dirname(slp), { recursive: true });
+  const nowS = Math.floor(Date.now() / 1000);
+  const write = (five) => fs.writeFileSync(slp, JSON.stringify({ v: 3, week_pct: 30, week_at: nowS - 600, week_reset: nowS + 2 * 86400,
+    five_tok: 5700000, five_total: 6000000, five_meas: 4200000, ...five }));
+  // Measured inside the window that reset an hour ago: that window is over.
+  write({ five_pct: 95, five_at: nowS - 3 * 3600, five_reset: nowS - 3600 });
+  const u = core.usageLine(cwd, '');
+  assert.deepStrictEqual([u.fiveHourPct, u.fiveReset, u.fiveTokens, u.fiveMeasuredAll, u.fiveTotal], [0, null, null, null, 6000000],
+    'its share, estimate and measured tokens were the ended window\'s; the budget stands');
+  assert.equal(u.weekPct, 30, 'control: the week, a fixed schedule, is unchanged');
+  // It ends here at its reset, not five minutes later: only the brief leaves a reset that passed less than five minutes ago
+  // to the machine that reads it, which judges it by its own clock.
+  write({ five_pct: 95, five_at: nowS - 3 * 3600, five_reset: nowS - 60 });
+  assert.deepStrictEqual([core.usageLine(cwd, '').fiveHourPct, core.usageLine(cwd, '').fiveReset], [0, null], 'ended a minute ago');
+  const handed = core.machineUsageBrief(cwd).five;
+  assert.deepStrictEqual([handed.pct, handed.reset], [95, (nowS - 60 + 5 * 3600) * 1000], 'the brief rolls it for the machine that reads it');
+  // The brief keeps it, at 0% with no time; the terminal app's bar shows no 5h window at all.
+  const brief = core.usageBrief(cwd);
+  assert.deepStrictEqual(brief.claude.five, { pct: 0, resetMs: null });
+  const bar = tui.statuslineFor({ now: Date.now(), usageBoth: brief, usage: u }, 160, {}, 'none', 1)[0];
+  assert.match(bar, /✳ claude wk: 30% \d/, bar);
+  assert.doesNotMatch(bar, /5h:/, bar);
+  // A share of 0 measured after the anchor is the status line's record of a pull that reported no window: still over.
+  write({ five_pct: 0, five_at: nowS - 60, five_reset: nowS - 3600 });
+  assert.deepStrictEqual([core.usageLine(cwd, '').fiveHourPct, core.usageLine(cwd, '').fiveReset], [0, null]);
+  // Control: a running window is untouched.
+  write({ five_pct: 12, five_at: nowS - 60, five_reset: nowS + 3600 });
+  assert.deepStrictEqual([core.usageLine(cwd, '').fiveHourPct, core.usageLine(cwd, '').fiveReset], [12, (nowS + 3600) * 1000]);
+});
+
+/** A home whose Claude login is `account`, with saved machines' readings in the cache `oak usage --pull-machines`
+ *  writes. Every file is replaced whole (a new inode), as the cache's own writer does, so no read is answered
+ *  from a stale memo however fast the test writes. */
+function machineUsageHome(account = 'acct-1') {
+  freshHome();
+  delete process.env.CLAUDE_CONFIG_DIR;
+  const replace = (file, value) => {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(`${file}.tmp`, JSON.stringify(value));
+    fs.renameSync(`${file}.tmp`, file);
+  };
+  const tag = (id) => require('crypto').scryptSync(id, 'oak-claude-account', 6).toString('hex');
+  const now = Date.now();
+  const nowS = Math.floor(now / 1000);
+  const login = (id) => replace(path.join(os.homedir(), '.claude.json'), id ? { oauthAccount: { accountUuid: id } } : { numStartups: 3 });
+  login(account);
+  // A machine's brief: fresh 5h and weekly shares by default, with their windows' resets, from an OAK whose status line
+  // has measured none of its own turns yet (`own: null`; an older OAK sends no `own` at all).
+  const machine = (label, brief = {}, id = 'acct-1') => ({ label, target: `me@${label}`, brief: { brief: 1, account: tag(id), at: now,
+    five: { pct: 1, reset: now + 3 * 3600_000, at: now - 60_000, tok: 12000, total: 1200000 },
+    week: { pct: 22, reset: now + 2 * 86400_000, at: now - 60_000, tok: 22000000, total: 100000000 },
+    fable: null, month: { tok: 2000000, total: 100000000, reset: now + 9 * 86400_000, reads: 5, cost: null, costTotal: null }, own: null, ...brief } });
+  const store = (...machines) => replace(core.machineUsageCachePath(), { version: 1, attemptedAt: now, machines });
+  // This machine's own cache: by default shares from ten days ago, before every window (the user's case). Its 5-hour
+  // window ended long ago, so it reads 0 with no reset (no window), which any saved machine's running window beats.
+  const old = nowS - 10 * 86400;
+  const local = (fields = {}) => replace(path.join(os.homedir(), '.claude', 'statusline-last.json'), { v: 3, five_pct: 40, five_at: old, five_reset: old + 3600,
+    week_pct: 70, week_at: old, week_reset: old + 86400, month_tok: 0, month_tok_total: 5000000, month_reset: nowS + 5 * 86400, ...fields });
+  return { cwd: tmpWork(), now, nowS, tag, login, machine, store, local };
+}
+
+test('observe: a window this machine has no current share of shows a saved machine\'s reading of the same account, named', () => {
+  const h = machineUsageHome();
+  h.local({ month_tok: 700000 }); // this machine's own month: never added to the saved machine's
+  const before = core.usageLine(h.cwd, 'nosession');
+  assert.deepStrictEqual([before.fiveHourPct, before.fiveReset, before.weekPct, before.machineNote], [0, null, null, ''], 'control: the stale local shares are dropped, and the 5h window has ended');
+  h.store(h.machine('build-box'));
+  const u = core.usageLine(h.cwd, 'nosession');
+  assert.deepStrictEqual([u.fiveHourPct, u.weekPct, u.fiveMachine, u.weekMachine], [1, 22, 'build-box', 'build-box']);
+  assert.deepStrictEqual([u.fiveTokens, u.fiveTotal, u.weekTokens, u.weekTotal], [12000, 1200000, 22000000, 100000000], 'the estimates that restate the shares come with them');
+  assert.ok(u.fiveReset > h.now && u.weekReset > h.now);
+  assert.deepStrictEqual([u.monthTokens, u.monthTokensTotal, u.monthReads, u.monthMachine], [2000000, 100000000, 5, 'build-box'],
+    'the month comes whole from the machine whose week is shown, never added to this machine\'s');
+  assert.equal(u.machineNote, 'build-box');
+  assert.equal(u.rollingLimits, true);
+  const brief = core.usageBrief(h.cwd);
+  assert.deepStrictEqual([brief.claude.five.pct, brief.claude.week.pct, brief.claude.month.pct, brief.claude.machine], [1, 22, 2, 'build-box'], 'the terminal app\'s readout carries it too');
+  // Another account's reading is never this account's.
+  h.store(h.machine('build-box', {}, 'acct-2'));
+  assert.deepStrictEqual([core.usageLine(h.cwd, 'nosession').fiveHourPct, core.usageLine(h.cwd, 'nosession').machineNote], [0, '']);
+  h.store(h.machine('build-box'));
+  assert.equal(core.usageLine(h.cwd, 'nosession').machineUnmatched, false, 'matched to this machine\'s own login');
+});
+
+test('observe: with no Claude Code login here, the readings stand for the one account the saved machines name, never for two', () => {
+  const h = machineUsageHome();
+  h.local();
+  h.login(null); // signed out here, or Claude Code never used here
+  h.store(h.machine('build-box'));
+  const u = core.usageLine(h.cwd, 'nosession');
+  assert.deepStrictEqual([u.fiveHourPct, u.weekPct, u.monthTokens, u.machineNote, u.machineUnmatched], [1, 22, 2000000, 'build-box', true],
+    'the one account the saved machines name: shown, named, and said to be unmatched');
+  // A saved machine with no login names no account: it supplies nothing, and does not stand in the way.
+  const fresher = { five: { pct: 77, reset: h.now + 3 * 3600_000, at: h.now - 1000, tok: null, total: null } };
+  h.store(h.machine('build-box'), h.machine('no-login', { ...fresher, account: null }));
+  assert.deepStrictEqual([core.usageLine(h.cwd, 'nosession').fiveHourPct, core.usageLine(h.cwd, 'nosession').machineNote], [1, 'build-box']);
+  // Two accounts: which is this person's cannot be told from here, and the freshest machine per window would mix them.
+  h.store(h.machine('build-box'), h.machine('lab-box', { ...fresher, week: { pct: 5, reset: h.now + 2 * 86400_000, at: h.now - 1000, tok: null, total: null } }, 'acct-2'));
+  const two = core.usageLine(h.cwd, 'nosession');
+  assert.deepStrictEqual([two.fiveHourPct, two.weekPct, two.machineNote, two.machineUnmatched], [0, null, '', false], 'two accounts named: neither shown');
+  // Control: with a login here, the same two machines give this machine's account alone, matched.
+  h.login('acct-1');
+  const mine = core.usageLine(h.cwd, 'nosession');
+  assert.deepStrictEqual([mine.fiveHourPct, mine.weekPct, mine.machineNote, mine.machineUnmatched], [1, 22, 'build-box', false]);
+  // A login here that neither machine shares still matches nothing.
+  h.login('acct-3');
+  assert.deepStrictEqual([core.usageLine(h.cwd, 'nosession').fiveHourPct, core.usageLine(h.cwd, 'nosession').machineNote], [0, '']);
+  // No `.claude.json` at all is no login; one caught mid-write is not, since this machine may be signed in elsewhere.
+  h.store(h.machine('build-box'));
+  const json = path.join(os.homedir(), '.claude.json');
+  fs.rmSync(json);
+  assert.deepStrictEqual([core.usageLine(h.cwd, 'nosession').fiveHourPct, core.usageLine(h.cwd, 'nosession').machineUnmatched], [1, true], 'no config: no login');
+  fs.writeFileSync(`${json}.tmp`, '{"oauthAccount":{"accountUu');
+  fs.renameSync(`${json}.tmp`, json);
+  assert.deepStrictEqual([core.usageLine(h.cwd, 'nosession').fiveHourPct, core.usageLine(h.cwd, 'nosession').machineNote], [0, ''], 'a torn config: nothing borrowed');
+});
+
+test('observe: a saved machine\'s share is used only when it is the freshest measured inside its window', () => {
+  const h = machineUsageHome();
+  const ago = (min) => h.nowS - min * 60;
+  // This machine measured 20 minutes ago (inside the windows, no longer live); the saved machine 40 minutes ago.
+  const mine = { five_pct: 7, five_at: ago(20), five_reset: h.nowS + 3600, week_pct: 30, week_at: ago(20), week_reset: h.nowS + 86400 };
+  h.local(mine);
+  const at = (min) => ({ five: { pct: 1, reset: h.now + 3 * 3600_000, at: h.now - min * 60_000, tok: null, total: null }, week: { pct: 22, reset: h.now + 2 * 86400_000, at: h.now - min * 60_000, tok: null, total: null } });
+  h.store(h.machine('build-box', at(40)));
+  const older = core.usageLine(h.cwd, 'nosession');
+  assert.deepStrictEqual([older.fiveHourPct, older.weekPct, older.fiveMachine, older.monthMachine, older.machineNote], [7, 30, null, null, ''], 'an older reading elsewhere: this machine\'s stands');
+  h.store(h.machine('build-box', at(10)));
+  assert.deepStrictEqual([core.usageLine(h.cwd, 'nosession').fiveHourPct, core.usageLine(h.cwd, 'nosession').fiveMachine], [1, 'build-box'], 'a fresher one replaces a share that is no longer live');
+  // A share measured here within the last five minutes is live: a fresher one elsewhere does not displace it.
+  h.local({ ...mine, five_at: ago(1), week_at: ago(1) });
+  h.store(h.machine('build-box', at(0)));
+  assert.deepStrictEqual([core.usageLine(h.cwd, 'nosession').fiveHourPct, core.usageLine(h.cwd, 'nosession').machineNote], [7, '']);
+  // Among saved machines the freshest wins.
+  h.local();
+  h.store(h.machine('box-a', { five: { ...at(10).five, pct: 3 } }), h.machine('box-b', { five: { ...at(2).five, pct: 4 } }));
+  assert.deepStrictEqual([core.usageLine(h.cwd, 'nosession').fiveHourPct, core.usageLine(h.cwd, 'nosession').fiveMachine], [4, 'box-b']);
+});
+
+test('observe: the latest window comes first, then the freshest share in it, here or on a saved machine (2026-10-19)', () => {
+  // Not the largest share: a share can drop within a window (a plan upgrade, an early reset, a promotion that raises
+  // the limit), so an offline machine's older, larger share of the same window must not beat a fresher one here.
+  const h = machineUsageHome();
+  const ago = (min) => h.nowS - min * 60;
+  const five = (pct, min, resetH = 3) => ({ pct, reset: h.now + resetH * 3600_000, at: h.now - min * 60_000, tok: null, total: null });
+  const week = (pct, min, resetD = 2) => ({ pct, reset: h.now + resetD * 86400_000, at: h.now - min * 60_000, tok: null, total: null });
+  // This machine measured 7% twenty minutes ago (no longer live); a machine gone offline measured 60% of the same
+  // window ninety minutes ago: the fresher reading, this machine's, stands.
+  h.local({ five_pct: 7, five_at: ago(20), five_reset: h.nowS + 3 * 3600, week_pct: 30, week_at: ago(20), week_reset: h.nowS + 2 * 86400 });
+  h.store(h.machine('offline-box', { five: five(60, 90), week: week(70, 90) }));
+  const own = core.usageLine(h.cwd, 'nosession');
+  assert.deepStrictEqual([own.fiveHourPct, own.weekPct, own.machineNote], [7, 30, ''], 'an older, larger share of the same window elsewhere does not win');
+  // Shares measured here two minutes ago are live: a fresher share of the same 5h window elsewhere does not displace
+  // this machine's, but a later window does, live or not: this machine's week ends in two days, the saved machine's in six.
+  h.local({ five_pct: 7, five_at: ago(2), five_reset: h.nowS + 3 * 3600, week_pct: 30, week_at: ago(2), week_reset: h.nowS + 2 * 86400 });
+  h.store(h.machine('build-box', { five: five(9, 0.5), week: week(5, 30, 6) }));
+  const later = core.usageLine(h.cwd, 'nosession');
+  assert.deepStrictEqual([later.fiveHourPct, later.fiveMachine, later.weekPct, later.weekMachine], [7, null, 5, 'build-box']);
+  // This machine's 5-hour window, ended (its reset passed, its share 0 measured a minute ago), is no window: a running
+  // one elsewhere wins, however long ago it was measured inside it.
+  h.local({ five_pct: 0, five_at: ago(1), five_reset: h.nowS - 3600, week_pct: 30, week_at: ago(1), week_reset: h.nowS + 2 * 86400 });
+  h.store(h.machine('build-box', { five: five(4, 50) }));
+  assert.deepStrictEqual([core.usageLine(h.cwd, 'nosession').fiveHourPct, core.usageLine(h.cwd, 'nosession').fiveMachine], [4, 'build-box']);
+  h.store();
+  assert.deepStrictEqual([core.usageLine(h.cwd, 'nosession').fiveHourPct, core.usageLine(h.cwd, 'nosession').fiveReset], [0, null], 'control: alone, it reads 0 with no reset');
+  // A share here whose window this machine does not know (no reset: a Claude Code that sends none, and no account pull)
+  // is no ended window: live, an older share elsewhere does not displace it, for either window.
+  h.local({ five_pct: 9, five_at: ago(1), five_reset: null, week_pct: 40, week_at: ago(1), week_reset: null });
+  h.store(h.machine('build-box', { five: five(3, 4), week: week(31, 4) }));
+  const unknown = core.usageLine(h.cwd, 'nosession');
+  assert.deepStrictEqual([unknown.fiveHourPct, unknown.fiveMachine, unknown.weekPct, unknown.weekMachine], [9, null, 40, null], 'a live share of an unknown window stands');
+  // Among saved machines, the later window first, then the freshest: box-b's week is a later window than box-a's,
+  // however much older box-b's reading is.
+  h.local();
+  h.store(h.machine('box-a', { five: five(3, 2), week: week(40, 5) }), h.machine('box-b', { five: five(6, 30), week: week(10, 60, 6) }));
+  const two = core.usageLine(h.cwd, 'nosession');
+  assert.deepStrictEqual([two.fiveHourPct, two.fiveMachine, two.weekPct, two.weekMachine], [3, 'box-a', 10, 'box-b']);
+});
+
+test('observe: a share with no reset of its own is ranked by when it was measured, not taken for an ended window (2026-10-19)', () => {
+  // A status line that has never known a reset (Claude Code sent none, and the account's usage was never read there)
+  // records its shares with none. That is not this machine's ended 5-hour window, a share of 0 with no reset: a saved
+  // machine's older reading does not displace it, and a fresher one does, as before the windows were ranked.
+  const h = machineUsageHome();
+  const read = () => { const u = core.usageLine(h.cwd, 'nosession'); return [u.fiveHourPct, u.fiveMachine, u.weekPct, u.weekMachine]; };
+  const own = (min) => h.local({ five_pct: 7, five_at: h.nowS - min * 60, five_reset: undefined, week_pct: 30, week_at: h.nowS - min * 60, week_reset: undefined });
+  const laptop = (min) => h.store(h.machine('laptop', { five: { pct: 20, reset: h.now + 3600_000, at: h.now - min * 60_000, tok: null, total: null },
+    week: { pct: 25, reset: h.now + 2 * 86400_000, at: h.now - min * 60_000, tok: null, total: null } }));
+  laptop(180); // an offline laptop's reading, three hours old
+  own(1);
+  assert.deepStrictEqual(read(), [7, null, 30, null], 'live here: this machine\'s own');
+  own(20);
+  assert.deepStrictEqual(read(), [7, null, 30, null], 'no longer live, but fresher than the laptop\'s: this machine\'s own');
+  laptop(1);
+  assert.deepStrictEqual(read(), [20, 'laptop', 25, 'laptop'], 'control: a fresher reading elsewhere is shown');
+  // Control: the ended 5-hour window, a share of 0 with no reset, is below any running one, however old.
+  h.local({ five_pct: 0, five_at: h.nowS - 60, five_reset: h.nowS - 3600, week_pct: 30, week_at: h.nowS - 60, week_reset: h.nowS + 2 * 86400 });
+  laptop(180);
+  assert.deepStrictEqual(read().slice(0, 2), [20, 'laptop']);
+});
+
+test('observe: 5-hour windows are ranked by when their shares were measured, not by their resets, which can be estimates (2026-10-19)', () => {
+  // The account's window runs for another hour. A saved machine whose status line has not read the account's usage for a
+  // day, while its sessions sent shares with no reset of their own, estimates its reset from a day-old one: four hours
+  // away. Ranked as a later window, its older share replaced this machine's live one, and an older estimate here hid a
+  // fresher reading elsewhere.
+  const h = machineUsageHome();
+  const read = () => { const u = core.usageLine(h.cwd, 'nosession'); return [u.fiveHourPct, u.fiveReset === null ? null : Math.round((u.fiveReset - Date.now()) / 60_000), u.fiveMachine]; };
+  const legacy = { pct: 25, reset: h.now + 4 * 3600_000, at: h.now - 40 * 60_000, tok: null, total: null };
+  const exact = (pct, min) => ({ pct, reset: h.now + 3600_000, at: h.now - min * 60_000, tok: null, total: null });
+  const wk = { week_pct: 30, week_at: h.nowS - 60, week_reset: h.nowS + 2 * 86400 };
+  h.local({ five_pct: 31, five_at: h.nowS - 60, five_reset: h.nowS + 3600, ...wk });
+  h.store(h.machine('legacy-box', { five: legacy }));
+  assert.deepStrictEqual(read(), [31, 60, null], 'a live share here stands');
+  // Among saved machines, the freshest, in either order.
+  h.local({ five_pct: undefined, five_at: undefined, five_reset: undefined, ...wk });
+  for (const order of [['legacy-box', 'exact-box'], ['exact-box', 'legacy-box']]) {
+    h.store(...order.map((label) => h.machine(label, { five: label === 'exact-box' ? exact(30, 1) : legacy })));
+    assert.deepStrictEqual(read(), [30, 60, 'exact-box'], order.join(' then '));
+  }
+  // This machine's own estimate (a share twenty minutes old, after a day-old reset) does not hide a fresher reading.
+  h.local({ five_pct: 31, five_at: h.nowS - 20 * 60, five_reset: h.nowS - 26 * 3600, ...wk });
+  h.store(h.machine('exact-box', { five: exact(33, 1) }));
+  assert.deepStrictEqual(read(), [33, 60, 'exact-box']);
+  // Control: the weekly windows, a fixed schedule, still rank by their resets: a later week replaces a live one here.
+  h.local({ five_pct: 31, five_at: h.nowS - 60, five_reset: h.nowS + 3600, ...wk });
+  h.store(h.machine('box', { week: { pct: 5, reset: h.now + 6 * 86400_000, at: h.now - 30 * 60_000, tok: null, total: null } }));
+  assert.deepStrictEqual([core.usageLine(h.cwd, 'nosession').weekPct, core.usageLine(h.cwd, 'nosession').weekMachine], [5, 'box']);
+});
+
+test('observe: a share of an earlier week, however fresh, does not replace a later one, here or among saved machines (2026-10-19)', () => {
+  // The weekly windows run on a fixed schedule, so a reset half a week or more before another's ends an older week.
+  const h = machineUsageHome();
+  const week = (pct, min, days) => ({ pct, reset: h.now + days * 86400_000, at: h.now - min * 60_000, tok: null, total: null });
+  const read = () => { const u = core.usageLine(h.cwd, 'nosession'); return [u.weekPct, u.weekMachine]; };
+  // This machine's week ends in six days, measured twenty minutes ago; a saved machine's ends in two, measured a minute ago.
+  h.local({ week_pct: 5, week_at: h.nowS - 20 * 60, week_reset: h.nowS + 6 * 86400 });
+  h.store(h.machine('box', { week: week(40, 1, 2) }));
+  assert.deepStrictEqual(read(), [5, null], 'this machine\'s later week stands');
+  // Among saved machines, the later week, in either order.
+  h.local({ week_pct: undefined, week_at: undefined, week_reset: undefined });
+  for (const order of [['late', 'early'], ['early', 'late']]) {
+    h.store(...order.map((label) => h.machine(label, { week: label === 'late' ? week(5, 60, 6) : week(40, 1, 2) })));
+    assert.deepStrictEqual(read(), [5, 'late'], order.join(' then '));
+  }
+});
+
+test('observe: a saved machine\'s share from before its window, or one it cannot date, is never shown', () => {
+  const h = machineUsageHome();
+  h.local(); // this machine's 5h window has ended: where no saved machine's share is shown, the window reads 0
+  const five = (fields) => ({ five: { pct: 1, reset: h.now + 3 * 3600_000, at: h.now - 60_000, tok: null, total: null, ...fields }, week: null, month: null });
+  h.store(h.machine('build-box', five({})));
+  assert.equal(core.usageLine(h.cwd, 'nosession').fiveHourPct, 1, 'control: measured inside its window, it is shown');
+  // The window resets in 3 hours, so it began 2 hours ago: a share measured 3 hours ago is the last window's.
+  h.store(h.machine('build-box', five({ at: h.now - 3 * 3600_000 })));
+  assert.equal(core.usageLine(h.cwd, 'nosession').fiveHourPct, 0, 'measured before its window');
+  // A lapsed reset rolls forward by whole periods first, as this machine's own does.
+  h.store(h.machine('build-box', five({ reset: h.now - 7 * 3600_000 })));
+  assert.equal(core.usageLine(h.cwd, 'nosession').fiveHourPct, 1, 'a past anchor rolls forward');
+  h.store(h.machine('build-box', five({ at: null })));
+  assert.equal(core.usageLine(h.cwd, 'nosession').fiveHourPct, 0, 'no time it was measured');
+  h.store(h.machine('build-box', five({ reset: null })));
+  assert.equal(core.usageLine(h.cwd, 'nosession').fiveHourPct, 0, 'no window to place it in');
+  h.store(h.machine('build-box', five({ at: h.now + 3600_000 })));
+  assert.equal(core.usageLine(h.cwd, 'nosession').fiveHourPct, 0, 'a clock an hour ahead cannot date it');
+});
+
+test('observe: when the 5-hour and weekly shares come from different saved machines, the month comes from the week\'s', () => {
+  const h = machineUsageHome();
+  h.local({ month_tok: 700000 });
+  const at = (min, pct) => ({ pct, reset: h.now + 3 * 3600_000, at: h.now - min * 60_000, tok: null, total: null });
+  const week = (min, pct) => ({ pct, reset: h.now + 2 * 86400_000, at: h.now - min * 60_000, tok: null, total: null });
+  const month = (tok) => ({ tok, total: 100000000, reset: h.now + 9 * 86400_000, reads: null, cost: null, costTotal: null });
+  h.store(h.machine('box-a', { five: at(1, 3), week: week(20, 21), month: month(1000000) }), h.machine('box-b', { five: at(10, 4), week: week(2, 23), month: month(3000000) }));
+  const u = core.usageLine(h.cwd, 'nosession');
+  assert.deepStrictEqual([u.fiveHourPct, u.fiveMachine, u.weekPct, u.weekMachine], [3, 'box-a', 23, 'box-b'], 'control: each window from its freshest machine');
+  assert.deepStrictEqual([u.monthTokens, u.monthMachine, u.machineNote], [3000000, 'box-b', 'box-a: 5h; box-b: wk mo']);
+});
+
+test('observe: a saved machine with no Claude Code login is never used, whatever its shares', () => {
+  const h = machineUsageHome();
+  h.local();
+  const fresh = { five: { pct: 9, reset: h.now + 3 * 3600_000, at: h.now - 1000, tok: null, total: null } };
+  h.store(h.machine('signed-out', { ...fresh, account: null }));
+  assert.deepStrictEqual([core.usageLine(h.cwd, 'nosession').fiveHourPct, core.usageLine(h.cwd, 'nosession').machineNote], [0, ''], 'this machine\'s own window, which has ended');
+  h.store(h.machine('signed-out', fresh));
+  assert.equal(core.usageLine(h.cwd, 'nosession').fiveHourPct, 9, 'control: signed in to the same account, it is used');
+});
+
+test('observe: windows from different machines are each named; the month follows the week', () => {
+  const h = machineUsageHome();
+  // Live here: the week (and so the month). Nothing here for the 5-hour window.
+  h.local({ five_pct: undefined, five_at: undefined, week_pct: 30, week_at: h.nowS - 30, week_reset: h.nowS + 86400, month_tok: 1000000, month_tok_total: 50000000 });
+  h.store(h.machine('build-box', { fable: { pct: 9, reset: h.now + 2 * 86400_000, at: h.now - 60_000, tok: null, total: null, label: 'Fable' } }));
+  const u = core.usageLine(h.cwd, 'nosession');
+  assert.deepStrictEqual([u.fiveHourPct, u.fiveMachine, u.weekPct, u.weekMachine, u.fablePct, u.fableMachine], [1, 'build-box', 30, null, 9, 'build-box']);
+  assert.deepStrictEqual([u.monthTokens, u.monthTokensTotal, u.monthMachine], [1000000, 50000000, null], 'the week is this machine\'s, so the month is too');
+  assert.equal(u.machineNote, 'build-box: 5h fable');
+  assert.equal(u.machineBarNote, '', 'the status bars show neither the 5-hour window nor the per-model cap, so they name no machine');
+  assert.equal(u.machineTipNote, 'build-box: fable', 'their tooltips show the cap and no 5-hour window');
+});
+
+test('observe: a saved machine\'s month whose bill cycle ended after it last answered is not shown', () => {
+  const h = machineUsageHome();
+  h.local({ month_tok: 700000 }); // this machine's own month, in a running cycle
+  // The machine answered before its cycle ended and has not answered since; its week is still this week's.
+  h.store(h.machine('build-box', { month: { tok: 9000000, total: 100000000, reset: h.now - 3600_000, reads: null, cost: null, costTotal: null } }));
+  const u = core.usageLine(h.cwd, 'nosession');
+  assert.deepStrictEqual([u.weekPct, u.weekMachine], [22, 'build-box'], 'control: its week is shown');
+  assert.deepStrictEqual([u.monthTokens, u.monthMachine, u.machineNote], [700000, null, 'build-box: 5h wk'], 'the last cycle\'s month is not this one\'s');
+  h.store(h.machine('build-box'));
+  const running = core.usageLine(h.cwd, 'nosession');
+  assert.deepStrictEqual([running.monthTokens, running.monthMachine], [2000000, 'build-box'], 'control: a month in a running cycle is');
+});
+
+test('observe: a saved machine\'s reading carries when that machine measured the oldest window shown', () => {
+  // A machine that stops answering keeps its last reading, so the readouts date it by that machine's measurement,
+  // never by this machine's cache time, which said "now" for a reading days old.
+  const h = machineUsageHome();
+  h.local({ five_pct: 9, five_at: h.nowS - 30, five_reset: h.nowS + 3600 }); // this machine's own 5h share is live
+  const week = (agoMs) => ({ pct: 22, reset: h.now + 2 * 86400_000, at: h.now - agoMs, tok: null, total: null });
+  h.store(h.machine('build-box', { week: week(2 * 86400_000) }));
+  const u = core.usageLine(h.cwd, 'nosession');
+  assert.deepStrictEqual([u.fiveHourPct, u.fiveMachine, u.weekPct, u.weekMachine], [9, null, 22, 'build-box'], 'control: the week alone is the machine\'s');
+  assert.equal(u.machineAt, h.now - 2 * 86400_000, 'when the machine measured the week, two days ago');
+  // Two windows from saved machines: the older measurement is the one the readouts give.
+  h.local();
+  h.store(h.machine('build-box', { five: { pct: 1, reset: h.now + 3 * 3600_000, at: h.now - 3600_000, tok: null, total: null }, week: week(600_000) }));
+  assert.equal(core.usageLine(h.cwd, 'nosession').machineAt, h.now - 3600_000);
+  // Every window this machine's own: none.
+  h.local({ five_pct: 9, five_at: h.nowS - 30, five_reset: h.nowS + 3600, week_pct: 30, week_at: h.nowS - 30, week_reset: h.nowS + 86400, month_tok: 0 });
+  const own = core.usageLine(h.cwd, 'nosession');
+  assert.deepStrictEqual([own.machineNote, own.machineAt], ['', null]);
+});
+
+test('observe: across saved machines, the newest account answer decides whether the account has a five-hour limit, never a share (2026-10-30)', () => {
+  // One account, several machines. Each machine's account read records when the account last answered with no 5h window
+  // and when it last answered with one, and its brief carries both. The newest of all of them, by this machine's clock,
+  // decides: while it is a no-limit answer, no 5h share shows, this machine's or a saved machine's, however new. Where this
+  // machine's account had answered so, a saved machine's 5h share showed in its place, named.
+  const h = machineUsageHome();
+  const live = { week_pct: 30, week_at: h.nowS - 30, week_reset: h.nowS + 86400, month_tok: 0 };
+  const five = (at, pct = 1) => ({ five: { pct, reset: h.now + 3 * 3600_000, at, tok: 12000, total: 1200000 } });
+  const read = () => {
+    const u = core.usageLine(h.cwd, 'nosession');
+    return [u.fiveHourPct, u.fiveMachine, u.fiveNoneAt, u.fiveTokens, u.fiveTotal, core.usageBrief(h.cwd).claude.five.pct];
+  };
+  // This machine's account answered no five-hour limit ten minutes ago. A saved machine's 5h share a minute old, newer
+  // than that answer, does not bring the readout back.
+  h.local({ ...live, five_none_at: h.nowS - 600 });
+  h.store(h.machine('build-box', five(h.now - 60_000)));
+  assert.deepStrictEqual(read(), [null, null, (h.nowS - 600) * 1000, null, null, null], 'a newer 5h share elsewhere does not bring the readout back');
+  assert.equal(core.usageLine(h.cwd, 'nosession').machineNote, '', 'and names no window from that machine');
+  // That machine's account read has since answered with a 5h window: the newest answer, so the window shows, named.
+  h.store(h.machine('build-box', { ...five(h.now - 60_000), fiveSeenAt: h.now - 120_000 }));
+  assert.deepStrictEqual(read(), [1, 'build-box', null, 12000, 1200000, 1], 'an answer with a 5h window since brings it back');
+  // This machine answered with a 5h window two minutes ago and holds a live share; a saved machine answered no five-hour
+  // limit after that. Its clock runs a minute ahead of this one, so its stamp is read a minute earlier.
+  h.local({ ...live, five_pct: 9, five_at: h.nowS - 30, five_reset: h.nowS + 3600, five_seen_at: h.nowS - 120 });
+  h.store({ ...h.machine('build-box', { five: null, fiveNoneAt: h.now + 60_000 - 30_000 }), skewMs: 60_000 });
+  assert.deepStrictEqual(read(), [null, null, h.now - 30_000, null, null, null], 'a newer no-limit answer elsewhere hides this machine\'s live share');
+  // …but not one older than this machine's answer, another account's, one dated past this clock's tolerance, or any
+  // while the saved machines' readings are off.
+  h.store({ ...h.machine('build-box', { five: null, fiveNoneAt: h.now + 60_000 - 600_000 }), skewMs: 60_000 });
+  assert.deepStrictEqual(read().slice(0, 3), [9, null, null], 'an older one leaves this machine\'s share');
+  h.store(h.machine('build-box', { five: null, fiveNoneAt: h.now - 30_000 }, 'acct-2'));
+  assert.deepStrictEqual(read().slice(0, 3), [9, null, null], 'another account\'s is not this account\'s');
+  h.store(h.machine('build-box', { five: null, fiveNoneAt: h.now + 10 * 60_000 }));
+  assert.deepStrictEqual(read().slice(0, 3), [9, null, null], 'one dated ten minutes ahead of this clock is set aside, as a share would be');
+  h.store(h.machine('build-box', { five: null, fiveNoneAt: h.now - 30_000 }));
+  assert.deepStrictEqual(read().slice(0, 3), [null, null, h.now - 30_000], 'control: the same answer dated now hides it');
+  core.writePrefs({ ...core.readPrefs(), machineUsage: false });
+  try {
+    assert.deepStrictEqual(read().slice(0, 3), [9, null, null], 'with the saved machines\' readings off, theirs is not weighed');
+  } finally {
+    const p = core.readPrefs();
+    delete p.machineUsage;
+    core.writePrefs(p);
+  }
+  // With no saved machine, this machine's two answers decide; the same second goes to no limit.
+  h.store();
+  h.local({ ...live, five_pct: 9, five_at: h.nowS - 30, five_reset: h.nowS + 3600, five_none_at: h.nowS - 120, five_seen_at: h.nowS - 120 });
+  assert.deepStrictEqual(read().slice(0, 3), [null, null, (h.nowS - 120) * 1000], 'a tie: no limit');
+  // The brief carries this machine's two answers for the others, and parses back; an older OAK's brief has neither.
+  h.local({ ...live, five_none_at: h.nowS - 600, five_seen_at: h.nowS - 900 });
+  const brief = core.machineUsageBrief(h.cwd);
+  assert.deepStrictEqual([brief.five, brief.fiveNoneAt, brief.fiveSeenAt], [null, (h.nowS - 600) * 1000, (h.nowS - 900) * 1000]);
+  const parsed = core.parseMachineUsageBrief(JSON.stringify(brief));
+  assert.deepStrictEqual([parsed.fiveNoneAt, parsed.fiveSeenAt], [(h.nowS - 600) * 1000, (h.nowS - 900) * 1000], 'parsed back');
+  const older = { ...brief };
+  delete older.fiveNoneAt;
+  delete older.fiveSeenAt;
+  const old = core.parseMachineUsageBrief(JSON.stringify(older));
+  assert.deepStrictEqual([old.fiveNoneAt, old.fiveSeenAt], [null, null], 'an older OAK\'s brief: neither');
+});
+
+test('machine usage: "machineUsage": false in prefs.json starts no refresh, runs none, and shows no saved machine\'s reading', { skip: process.platform === 'win32' && 'POSIX herdr stub' }, async () => {
+  const h = machineUsageHome();
+  h.local();
+  h.store(h.machine('build-box'));
+  const bin = tmpDir('cc-herdr-bin-');
+  fs.writeFileSync(path.join(bin, 'herdr'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  const was = process.env.PATH;
+  const prefs = core.prefsPath();
+  const asked = [];
+  const refresh = () => core.refreshMachineUsage(async () => { asked.push('list'); return [{ label: 'build-box', target: 'me@build-box', enabled: true }]; },
+    async (m) => { asked.push(m.target); return null; }, { force: true });
+  try {
+    process.env.PATH = bin;
+    const stale = (ms) => { // a cache last refreshed long ago, so a refresh is due
+      fs.writeFileSync(`${core.machineUsageCachePath()}.tmp`, JSON.stringify({ ...JSON.parse(fs.readFileSync(core.machineUsageCachePath(), 'utf8')), attemptedAt: ms }));
+      fs.renameSync(`${core.machineUsageCachePath()}.tmp`, core.machineUsageCachePath());
+    };
+    stale(0);
+    core.writePrefs({ ...core.readPrefs(), machineUsage: false });
+    assert.equal(JSON.parse(fs.readFileSync(prefs, 'utf8')).machineUsage, false, 'off is stored');
+    assert.equal(core.readPrefs().machineUsage, false);
+    assert.equal(core.machineUsageEnabled(), false);
+    assert.equal(core.claimMachineUsagePull(), false, 'off: no poller claims a refresh, so none is kicked');
+    assert.equal(fs.existsSync(`${core.machineUsageCachePath()}.kick`), false);
+    assert.equal(await refresh(), null, 'off: `oak usage --pull-machines` runs nothing');
+    assert.deepEqual(asked, [], '…neither herdr\'s list nor any ssh');
+    const off = core.usageLine(h.cwd, 'nosession');
+    assert.deepStrictEqual([off.fiveHourPct, off.weekPct, off.machineNote], [0, null, ''], 'off: the cached reading is not shown (this machine\'s own 5h window has ended)');
+    // A layout save writes the prefs back whole: the switch survives it.
+    core.writePrefs({ ...core.readPrefs(), layout: { version: 1, active: 'observatory', tabs: {} } });
+    assert.equal(core.readPrefs().machineUsage, false, 'the switch survives a prefs write');
+    // Control: on again (absent, the default, is not stored), each of them runs.
+    core.writePrefs({ ...core.readPrefs(), machineUsage: true });
+    assert.equal(JSON.parse(fs.readFileSync(prefs, 'utf8')).machineUsage, undefined, 'on is the default, so it is not stored');
+    assert.equal(core.usageLine(h.cwd, 'nosession').machineNote, 'build-box', 'control: on, the reading is shown');
+    assert.equal(core.claimMachineUsagePull(), true, 'control: on, a poller claims the refresh');
+    assert.notEqual(await refresh(), null, 'control: on, the refresh runs');
+    assert.deepEqual(asked, ['list', 'me@build-box']);
+  } finally {
+    process.env.PATH = was;
+  }
+});
+
+test('machine usage: a refresh the switch turns off while it lists the machines asks none of them', async () => {
+  machineUsageHome();
+  const asked = [];
+  // herdr's list takes as long as it takes: the switch can be turned off after the refresh began and before any ssh.
+  const refresh = (flip) => core.refreshMachineUsage(async () => {
+    if (flip) core.writePrefs({ ...core.readPrefs(), machineUsage: false });
+    return [{ label: 'build-box', target: 'me@build-box', enabled: true }];
+  }, async (m) => { asked.push(m.target); return null; }, { force: true });
+  assert.notEqual(await refresh(false), null, 'control: on, the refresh runs');
+  assert.deepEqual(asked, ['me@build-box'], 'control: …and asks the machine');
+  asked.length = 0;
+  assert.equal(await refresh(true), null, 'turned off mid-refresh, it stops');
+  assert.deepEqual(asked, [], 'no machine is asked, so no ssh starts');
+});
+
+test('machine usage: the refresh is claimed by one poller a minute, only when due and only where herdr is', { skip: process.platform === 'win32' && 'POSIX herdr stub' }, () => {
+  machineUsageHome();
+  const bin = tmpDir('cc-herdr-bin-');
+  const was = process.env.PATH;
+  try {
+    process.env.PATH = path.join(bin, 'none');
+    assert.equal(core.claimMachineUsagePull(), false, 'no herdr here: no saved machines to read');
+    fs.writeFileSync(path.join(bin, 'herdr'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    process.env.PATH = bin;
+    assert.equal(core.claimMachineUsagePull(), true, 'due, with herdr: claimed');
+    assert.equal(core.claimMachineUsagePull(), false, 'the claim holds off a second poller');
+    fs.rmSync(`${core.machineUsageCachePath()}.kick`);
+    const attempted = (ms) => { // replaced whole, as the refresh writes it
+      fs.writeFileSync(`${core.machineUsageCachePath()}.tmp`, JSON.stringify({ version: 1, attemptedAt: ms, machines: [] }));
+      fs.renameSync(`${core.machineUsageCachePath()}.tmp`, core.machineUsageCachePath());
+    };
+    attempted(Date.now() - 60_000);
+    assert.equal(core.claimMachineUsagePull(), false, 'refreshed a minute ago: not due');
+    attempted(Date.now() - 6 * 60_000);
+    assert.equal(core.claimMachineUsagePull(), true, 'control: six minutes ago is due');
+  } finally {
+    process.env.PATH = was;
+  }
+});
+
+test('machine usage: a refresh asks each enabled target once, keeps a silent machine\'s last answer and drops one no longer saved', async () => {
+  const h = machineUsageHome();
+  const brief = (pct) => JSON.stringify({ ...h.machine('x').brief, five: { pct, reset: h.now + 3600_000, at: h.now, tok: null, total: null } });
+  const asked = [];
+  let answers = { 'me@box-a': brief(3) };
+  const ask = async (m) => { asked.push(m.target); return answers[m.target] ?? null; };
+  let list = [{ label: 'box-a', target: 'me@box-a', enabled: true }, { label: 'box-a-2', target: 'me@box-a', enabled: true },
+    { label: 'box-off', target: 'me@box-off', enabled: false }, { label: 'box-b', target: '-oProxyCommand=x', enabled: true }];
+  const refresh = (opts = { force: true }) => core.refreshMachineUsage(async () => list, ask, opts);
+  let c = await refresh();
+  assert.deepEqual(asked, ['me@box-a'], 'once per target; never a disabled machine or a target that reads as an option');
+  assert.deepEqual(c.machines.map((e) => [e.label, e.brief.five.pct]), [['box-a', 3]]);
+  assert.equal(await refresh({}), null, 'within five minutes an unforced refresh does not run');
+  assert.deepEqual(asked, ['me@box-a'], '…and asks nothing');
+  answers = {};
+  c = await refresh();
+  assert.deepEqual(c.machines.map((e) => [e.label, e.brief.five.pct]), [['box-a', 3]], 'no answer: the last one stands');
+  answers = { 'me@box-a': 'Legacy OAK: use oak help for supported commands\n' };
+  c = await refresh();
+  assert.deepEqual(c.machines.map((e) => e.brief.five.pct), [3], 'an answer that is not a brief changes nothing');
+  c = await core.refreshMachineUsage(async () => null, ask, { force: true });
+  assert.deepEqual(c.machines.map((e) => e.label), ['box-a'], 'herdr\'s list could not be read: every machine keeps its answer');
+  list = [];
+  c = await refresh();
+  assert.deepEqual(c.machines, [], 'a machine no longer saved is no longer read');
+});
+
+test('observe: the brief\'s headline is the tokens counted in the window, and the share times the allowance goes as an estimate (0.11.0)', () => {
+  const h = machineUsageHome();
+  // One weekly window at a 43% share. The status line counted 46,000,000 of this machine's tokens in it, and the
+  // allowance it estimates moves from 107,000,000 to 101,000,000 between two scans, as a calibration does.
+  const week = (total) => ({ week_pct: 43, week_at: h.nowS - 60, week_reset: h.nowS + 3 * 86400, week_total: total, week_tok: Math.round(total * 0.43),
+    week_meas: 46000000, meas_at: h.nowS - 60, week_meas_reset: h.nowS + 3 * 86400 });
+  h.local(week(107000000));
+  const a = core.machineUsageBrief(h.cwd).week;
+  h.local(week(101000000));
+  const b = core.machineUsageBrief(h.cwd).week;
+  assert.deepStrictEqual([a.tok, a.measured, a.est], [46000000, true, { tok: 46010000, total: 107000000 }], 'the count, with the estimate beside it, named');
+  assert.deepStrictEqual([b.tok, b.est.tok], [46000000, 43430000], 'the estimate drops as the allowance does; the headline holds');
+  // A window nothing was counted in keeps the estimate, said to be one.
+  h.local({ ...week(101000000), week_meas: 0 });
+  const c = core.machineUsageBrief(h.cwd).week;
+  assert.deepStrictEqual([c.tok, c.measured], [43430000, false]);
+  // A machine reading this brief draws the estimate beside the share, as every surface does, from `est`.
+  const r = core.parseMachineUsageBrief(JSON.stringify({ ...h.machine('x').brief, week: { ...b, reset: h.now + 3 * 86400_000, at: h.now - 60_000 } }));
+  assert.deepStrictEqual([r.week.tok, r.week.measured, r.week.est.tok], [46000000, true, 43430000]);
+  h.local({ week_pct: 1, week_at: h.nowS - 30 * 86400, week_reset: h.nowS - 29 * 86400 });
+  h.store({ ...h.machine('build-box'), brief: r });
+  assert.deepStrictEqual([core.usageLine(h.cwd, 'nosession').weekTokens, core.usageLine(h.cwd, 'nosession').weekMachine], [43430000, 'build-box']);
+});
+
+test('observe: oak usage --brief carries this machine\'s own readings only, and a month only while its cycle runs', () => {
+  const h = machineUsageHome();
+  h.local();
+  h.store(h.machine('build-box'));
+  assert.equal(core.usageLine(h.cwd, 'nosession').fiveHourPct, 1, 'control: this machine shows the saved machine\'s share');
+  const b = core.machineUsageBrief(h.cwd);
+  // This machine's own shares are ten days old, from windows long gone: the week's goes as it is, with its stamp,
+  // since the machine reading it judges its window by its own clock, and the 5-hour window, whose reset passed ten
+  // days ago, has ended: 0 with no reset, which that machine places in no window. The saved machine's are never
+  // passed on.
+  assert.deepStrictEqual([b.brief, b.account, b.five.pct, b.five.reset, b.five.at, b.week.pct, b.week.at], [1, h.tag('acct-1'), 0, null, (h.nowS - 10 * 86400) * 1000, 70, (h.nowS - 10 * 86400) * 1000],
+    'a reading from elsewhere is never passed on');
+  h.local({ five_pct: 5, five_at: h.nowS - 120, five_reset: h.nowS + 3600, week_pct: 31, week_at: h.nowS - 120, week_reset: h.nowS + 86400 });
+  const own = core.machineUsageBrief(h.cwd);
+  assert.deepStrictEqual([own.five.pct, own.five.at, own.week.pct, own.week.at], [5, (h.nowS - 120) * 1000, 31, (h.nowS - 120) * 1000]);
+  assert.deepStrictEqual([own.month.tok, own.month.total], [0, 5000000], 'a month measured at 0 in a running cycle is sent');
+  h.local({ month_tok: 900000, month_reset: h.nowS - 3600 });
+  assert.equal(core.machineUsageBrief(h.cwd).month, null, 'a month from a cycle that has ended is not');
+  assert.equal(core.parseMachineUsageBrief(JSON.stringify({ fiveHourPct: 5, claudeAccount: {} })), null, 'an older OAK\'s whole usage reading is not a brief');
+  // What another machine sends is checked field by field: a label is a model name or nothing (the editors draw it
+  // in tooltips), and an account is a hash or nothing.
+  const sent = core.parseMachineUsageBrief(JSON.stringify({ ...own, account: 'not-a-hash', fable: { pct: 3, reset: h.now, at: h.now, label: '<img src=x>' } }));
+  assert.deepEqual([sent.account, sent.fable.pct, sent.fable.label, sent.five.pct], [null, 3, null, 5]);
+  assert.equal(core.parseMachineUsageBrief(JSON.stringify({ ...own, fable: { pct: 3, label: 'Fable' } })).fable.label, 'Fable', 'control: a model name passes');
+});
+
+/** A home as machineUsageHome makes it, whose status line last scanned two minutes ago: live 11% and 9% shares of the
+ *  windows that reset at `r5` and `r7`, and its own turns measured in them and in the bill cycle `mo0`..`mo1` (epoch
+ *  seconds): what the laptop measured in the case the user hit. `own` is a saved machine's own figures in the same
+ *  windows (the busy machine's), ms as a brief carries them. */
+function measuredHome() {
+  const h = machineUsageHome();
+  const r5 = h.nowS + 3 * 3600 + 30, r7 = h.nowS + 2 * 86400 + 30, mo0 = h.nowS - 10 * 86400, mo1 = h.nowS + 20 * 86400;
+  h.local({ five_pct: 11, five_at: h.nowS - 60, five_reset: r5, week_pct: 9, week_at: h.nowS - 60, week_reset: r7,
+    meas_at: h.nowS - 120, five_meas: 287_000, five_reads_own: 10_000_000, five_cost_own: 5, five_meas_reset: r5,
+    week_meas: 287_000, week_reads_own: 10_000_000, week_cost_own: 20, week_meas_reset: r7, fable_meas: 1_000, fable_reads_own: 2_000,
+    month_meas: 616_000, month_reads_own: 20_000_000, month_cost_own: 14.71, month_meas_start: mo0, month_meas_end: mo1 });
+  const own = (fields = {}) => ({ host: 'b16b16b16b16', at: h.now - 300_000,
+    five: { tok: 3_920_000, reads: 200_000_000, cost: 60, reset: r5 * 1000 },
+    week: { tok: 15_500_000, reads: 800_000_000, cost: 400, reset: r7 * 1000, fable: 40_000, fableReads: 9_000 },
+    month: { tok: 138_300_000, reads: 6_050_000_000, cost: 4097.5, start: mo0 * 1000, reset: mo1 * 1000 }, ...fields });
+  // The cache `oak usage --pull-machines` writes, with the outcome of each machine asked, which `oak doctor` reads.
+  const store = (...machines) => {
+    const file = core.machineUsageCachePath();
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(`${file}.tmp`, JSON.stringify({ version: 1, attemptedAt: h.now, machines,
+      outcomes: machines.map((e) => ({ label: e.label, target: e.target, at: h.now, status: 'ok' })) }));
+    fs.renameSync(`${file}.tmp`, file);
+  };
+  return { ...h, r5, r7, mo0, mo1, own, store };
+}
+
+test('observe: what a saved machine measured of its own turns counts for this machine\'s estimates for the same account, window and a fresh reading, once per machine', () => {
+  // The user's laptop and build machine share one Claude account. Each learned its tokens per percent from its own
+  // transcripts against the account's share, so the laptop credited the account's whole share to its own few turns and
+  // its budgets came out many times too small. Each brief now carries what its machine measured of its own turns, and
+  // core hands the status line the sum it may add (machineMeasured).
+  const h = measuredHome();
+  const mine = core.machineUsageBrief(h.cwd).own;
+  assert.deepStrictEqual(mine, { host: core.machineHostTag(), at: (h.nowS - 120) * 1000,
+    five: { tok: 287_000, reads: 10_000_000, cost: 5, reset: h.r5 * 1000 },
+    week: { tok: 287_000, reads: 10_000_000, cost: 20, reset: h.r7 * 1000, fable: 1_000, fableReads: 2_000 },
+    month: { tok: 616_000, reads: 20_000_000, cost: 14.71, reset: h.mo1 * 1000, start: h.mo0 * 1000 } },
+  'this machine sends its own figures, by its host hash, with when and in which windows its status line measured them');
+  assert.match(core.machineHostTag(), /^[0-9a-f]{12}$/);
+  assert.equal(core.parseMachineUsageBrief(JSON.stringify(core.machineUsageBrief(h.cwd))).own.month.start, h.mo0 * 1000, 'and a brief reads back whole');
+  const want = { five: { tok: 3_920_000, reads: 200_000_000, cost: 60, reset: h.r5 * 1000, hosts: 'b16b16b16b16' },
+    week: { tok: 15_500_000, reads: 800_000_000, cost: 400, fable: 40_000, fableReads: 9_000, reset: h.r7 * 1000, hosts: 'b16b16b16b16' },
+    month: { tok: 138_300_000, reads: 6_050_000_000, cost: 4097.5, start: h.mo0 * 1000, reset: h.mo1 * 1000, hosts: 'b16b16b16b16' },
+    machines: 'build-box' };
+  const measured = () => core.usageLine(h.cwd, 'nosession').machineMeasured;
+  h.store(h.machine('build-box', { own: h.own() }));
+  assert.deepStrictEqual(measured(), want, 'the same account, the same windows, measured five minutes ago: every window counts');
+  const u = core.usageLine(h.cwd, 'nosession');
+  assert.deepStrictEqual([u.fiveHourPct, u.machineNote], [11, ''], 'control: this machine\'s live shares stand; the figures are added, not shown in their place');
+  // Another account's figures are never added, nor those of a machine with no login.
+  h.store(h.machine('build-box', { own: h.own() }, 'acct-2'));
+  assert.equal(measured(), null, 'another account');
+  h.store(h.machine('build-box', { own: h.own(), account: null }));
+  assert.equal(measured(), null, 'no login there');
+  // An OAK older than these figures sends none: it adds nothing (what `oak doctor` says of it is the next test's).
+  const old = h.machine('build-box');
+  delete old.brief.own;
+  h.store(old);
+  assert.equal(measured(), null, 'an older brief adds nothing');
+  h.store(h.machine('build-box'));
+  assert.deepStrictEqual([measured(), core.diagnoseMachineUsage(h.now)[0].level], [null, 'ok'], 'a current OAK that has measured nothing yet adds nothing, and is fine');
+  // Freshness, by this machine's clock: measured before this machine's window began (its last scan, while this machine
+  // was offline) counts for none of the windows it began after; one that answered last within the window still counts.
+  h.store(h.machine('build-box', { own: h.own({ at: (h.r5 - 5 * 3600 - 60) * 1000 }) }));
+  assert.deepStrictEqual([measured().five, measured().week.tok, measured().month.tok], [null, 15_500_000, 138_300_000], 'measured before the 5h window began');
+  h.store(h.machine('build-box', { own: h.own({ at: (h.r7 - 7 * 86400 - 60) * 1000 }) }));
+  assert.deepStrictEqual([measured().five, measured().week, measured().month.tok], [null, null, 138_300_000], 'measured before the week began');
+  h.store(h.machine('build-box', { own: h.own({ at: (h.mo0 - 60) * 1000 }) }));
+  assert.equal(measured(), null, 'measured before the bill cycle began');
+  h.store(h.machine('build-box', { own: h.own({ at: h.now - 3600_000 }) }));
+  assert.deepStrictEqual(measured(), want, 'an offline machine whose last answer was measured inside the windows still counts: its usage only grows');
+  // A stamp ahead of this clock by more than five minutes cannot be dated; one from a machine whose clock runs ahead is
+  // read less its difference, as its shares are.
+  h.store(h.machine('build-box', { own: h.own({ at: h.now + 10 * 60_000 }) }));
+  assert.equal(measured(), null, 'measured "in the future"');
+  h.store({ ...h.machine('build-box', { own: h.own({ at: h.now + 10 * 60_000 }) }), skewMs: 11 * 60_000 });
+  assert.deepStrictEqual(measured(), want, 'its clock runs eleven minutes ahead: measured a minute ago');
+  // The same window: a 5h measurement of the window before this one, a week of the week before, a month of another bill
+  // cycle (a machine that bills on another day) are not this machine's windows.
+  h.store(h.machine('build-box', { own: h.own({ five: { ...h.own().five, reset: (h.r5 - 5 * 3600) * 1000 } }) }));
+  assert.deepStrictEqual([measured().five, measured().week.tok], [null, 15_500_000], 'the 5h window before this one');
+  h.store(h.machine('build-box', { own: h.own({ week: { ...h.own().week, reset: (h.r7 - 7 * 86400) * 1000 } }) }));
+  assert.deepStrictEqual([measured().five.tok, measured().week], [3_920_000, null], 'last week');
+  // Nor the window after this one: a machine whose clock has already passed this window's reset measured the next one.
+  h.store(h.machine('build-box', { own: h.own({ five: { ...h.own().five, reset: (h.r5 + 5 * 3600) * 1000 }, week: { ...h.own().week, reset: (h.r7 + 7 * 86400) * 1000 } }) }));
+  assert.deepStrictEqual([measured().five, measured().week, measured().month.tok], [null, null, 138_300_000], 'the next 5h window and the next week');
+  h.store(h.machine('build-box', { own: h.own({ month: { ...h.own().month, start: (h.mo0 + 86400) * 1000, reset: (h.mo1 + 86400) * 1000 } }) }));
+  assert.deepStrictEqual([measured().five.tok, measured().month], [3_920_000, null], 'another bill cycle');
+  h.store(h.machine('build-box', { own: h.own({ five: { ...h.own().five, reset: (h.r5 + 30 * 60) * 1000 } }) }));
+  assert.equal(measured().five.tok, 3_920_000, 'control: two resets half an hour apart name one window');
+  // Each machine once: one saved under two targets counts by its freshest figures, and this machine, saved as one of
+  // its own, never.
+  const twice = h.machine('build-box', { own: h.own({ at: h.now - 600_000, five: { ...h.own().five, tok: 1_000_000 } }) });
+  h.store(twice, { ...h.machine('build-box-vpn', { own: h.own() }) });
+  assert.deepStrictEqual(measured(), { ...want, machines: 'build-box-vpn' }, 'the same host under two targets: once, the fresher');
+  h.store(h.machine('build-box', { own: h.own() }), h.machine('self', { own: h.own({ host: core.machineHostTag() }) }));
+  assert.deepStrictEqual(measured(), want, 'this machine\'s own brief, read back from itself, is never added');
+  // Two machines add up, each window by the machines that count for it.
+  h.store(h.machine('build-box', { own: h.own() }), h.machine('lab-box', { own: h.own({ host: 'cafecafecafe', five: null }) }));
+  const two = measured();
+  assert.deepStrictEqual([two.five.tok, two.five.hosts, two.week.tok, two.week.hosts, two.month.cost, two.machines],
+    [3_920_000, 'b16b16b16b16', 31_000_000, 'b16b16b16b16,cafecafecafe', 8195, 'build-box, lab-box']);
+  // Off: nothing is read from the saved machines, these figures included.
+  core.writePrefs({ ...core.readPrefs(), machineUsage: false });
+  assert.equal(measured(), null);
+  core.writePrefs({ ...core.readPrefs(), machineUsage: true });
+});
+
+test('observe: oak usage reads this machine\'s Claude login only for a saved machine whose figures count for one of its windows (2026-10-27)', () => {
+  // The login file names the account the figures must be of, and it can be megabytes: read on every `oak usage`, which
+  // the status line runs each render, it cost 36 ms a call at 8 MB on a machine whose own shares are live, for a saved
+  // machine whose figures dated from before every window and so counted for none.
+  const h = measuredHome();
+  const login = path.join(os.homedir(), '.claude.json');
+  let tick = 0;
+  const reads = (brief) => {
+    h.store(h.machine('build-box', brief));
+    // A new stamp, so the account is not taken from the last read of the file, as in a status line's new process.
+    const t = new Date(Date.now() - ++tick * 60_000);
+    fs.utimesSync(login, t, t);
+    let n = 0;
+    const realRead = fs.readFileSync;
+    fs.readFileSync = function (f, ...rest) { if (String(f) === login) n++; return realRead.call(this, f, ...rest); };
+    try {
+      const counted = core.usageLine(h.cwd, 'nosession').machineMeasured !== null;
+      return [counted, n];
+    } finally {
+      fs.readFileSync = realRead;
+    }
+  };
+  assert.deepStrictEqual(reads({ own: h.own({ at: (h.mo0 - 60) * 1000 }) }), [false, 0], 'figures from before the bill cycle began count for no window: the login is not read');
+  assert.deepStrictEqual(reads({ own: h.own() }), [true, 1], 'control: figures that count are checked against the account, which is read');
+});
+
+test('machine usage: oak doctor says a saved machine\'s usage is left out of the estimates only when the read that took its answer found no figures in it', async () => {
+  // Its OAK sends no figures of its own usage, so the estimates here leave that machine out, and the doctor says so.
+  // An answer an older OAK here stored has no figures whatever OAK sent it: right after this machine was updated, the
+  // doctor told the user to update a machine already updated, until the next read.
+  const h = measuredHome();
+  const old = { ...h.machine('build-box').brief };
+  delete old.own;
+  const row = () => core.diagnoseMachineUsage(h.now).find((r) => r.id === 'machine-usage:build-box');
+  const read = (answer) => core.refreshMachineUsage(async () => [{ label: 'build-box', target: 'me@build-box', enabled: true }], async () => JSON.stringify(answer), { force: true });
+  await read(old);
+  assert.equal(core.usageLine(h.cwd, 'nosession').machineMeasured, null, 'an older brief adds nothing');
+  assert.equal(row().level, 'warn');
+  assert.match(row().detail, /^answered at .*; its OAK is older than this one and does not report its own usage, so the token and dollar estimates here leave that machine's usage out$/);
+  assert.equal(row().fix, 'Update OAK on build-box: run `oak update` there.');
+  await read({ ...old, own: h.own() });
+  assert.deepStrictEqual([row().level, core.usageLine(h.cwd, 'nosession').machineMeasured.machines], ['ok', 'build-box'], 'control: a current brief is fine, and counts');
+  await read({ ...old, own: null });
+  assert.equal(row().level, 'ok', 'a current OAK that has measured nothing yet is fine');
+  // A current machine's answer as an older OAK here stored it, without the figures and without a record of their
+  // absence: no machine is blamed.
+  h.store({ ...h.machine('build-box'), brief: old });
+  assert.equal(row().level, 'ok', 'an answer an older OAK here stored blames no machine');
+});
+
+test('observe: the status bars name only the windows they show, so a per-model cap alone from a saved machine names none there', () => {
+  // The bars show 5h, wk and mo; the per-model weekly cap is in their tooltips and the Stats panels only. With the
+  // cap alone from a saved machine, every bar said `(build-box: fable)` beside windows that were all this machine's.
+  const h = machineUsageHome();
+  const live = { five_pct: 9, five_at: h.nowS - 30, five_reset: h.nowS + 3600, week_pct: 30, week_at: h.nowS - 30, week_reset: h.nowS + 86400, month_tok: 1000000, month_tok_total: 50000000 };
+  const cap = { pct: 9, reset: h.now + 2 * 86400_000, at: h.now - 60_000, tok: null, total: null, label: 'Fable' };
+  h.local(live);
+  h.store(h.machine('build-box', { five: null, week: null, month: null, fable: cap }));
+  const u = core.usageLine(h.cwd, 'nosession');
+  assert.deepStrictEqual([u.fiveHourPct, u.fiveMachine, u.weekPct, u.weekMachine, u.fablePct, u.fableMachine], [9, null, 30, null, 9, 'build-box'], 'control: the cap alone is the machine\'s');
+  assert.equal(u.machineNote, 'build-box: fable', 'the Stats panels, which show the cap, name it');
+  assert.equal(u.machineTipNote, 'build-box: fable', 'and so do the bars\' tooltips');
+  assert.equal(u.machineBarNote, '', 'the bars, which do not, name no machine');
+  assert.equal(core.usageBrief(h.cwd).claude.machine, '', 'nor does the terminal app\'s bar');
+  // Every window a bar shows from the machine and the cap this machine's own: the bars name the machine alone.
+  h.local({ fable_pct: 4, fable_at: h.nowS - 30, fable_reset: h.nowS + 86400, fable_label: 'Fable' });
+  h.store(h.machine('build-box', { fable: cap }));
+  const bars = core.usageLine(h.cwd, 'nosession');
+  assert.deepStrictEqual([bars.fiveMachine, bars.weekMachine, bars.monthMachine, bars.fablePct, bars.fableMachine], ['build-box', 'build-box', 'build-box', 4, null], 'control: the cap is this machine\'s');
+  assert.deepStrictEqual([bars.machineNote, bars.machineBarNote, bars.machineTipNote, core.usageBrief(h.cwd).claude.machine],
+    ['build-box: 5h wk mo', 'build-box', 'build-box: wk mo', 'build-box']);
+});
+
+test('machine usage: a refresh records how each machine answered, keeping one sanitized line at most, and oak doctor says why one gave no reading', async () => {
+  const h = machineUsageHome();
+  h.local();
+  const good = JSON.stringify(h.machine('x').brief);
+  const answers = {
+    'me@good-box': good,
+    'me@old-box': { status: 'old-oak' },
+    'me@chatty-box': `Welcome to chatty-box\n${good}`, // a shell startup file printed first
+    'me@down-box': { status: 'unreachable', detail: 'ssh: connect to host down-box port 22: Connection refused\nand a line never kept' },
+    'me@slow-box': { status: 'timeout' },
+    'me@bare-box': { status: 'no-oak' },
+    'me@odd-box': { status: 'failed', detail: `\u001b[31mError: the store is locked\u001b[0m\u202e\u0007\u200b ${'x'.repeat(400)}` },
+    'me@mute-box': null,
+  };
+  const list = Object.keys(answers).map((target) => ({ label: target.slice(3), target, enabled: true }));
+  const refresh = () => core.refreshMachineUsage(async () => list, async (m) => answers[m.target], { force: true });
+  await refresh();
+  const c = core.readMachineUsage();
+  assert.deepEqual(c.outcomes.map((o) => [o.label, o.status]), [['good-box', 'ok'], ['old-box', 'old-oak'], ['chatty-box', 'not-reading'],
+    ['down-box', 'unreachable'], ['slow-box', 'timeout'], ['bare-box', 'no-oak'], ['odd-box', 'failed'], ['mute-box', 'failed']]);
+  assert.deepEqual(c.machines.map((e) => e.label), ['good-box'], 'control: only the good answer is a reading');
+  const detail = Object.fromEntries(c.outcomes.map((o) => [o.label, o.detail]));
+  assert.equal(detail['down-box'], 'ssh: connect to host down-box port 22: Connection refused', 'one line of what ssh said, never the next');
+  assert.equal(detail['odd-box'], `Error: the store is locked ${'x'.repeat(173)}`, 'its colour, bidi, bell and zero-width characters dropped, and 200 characters at most');
+  assert.deepEqual([detail['good-box'], detail['chatty-box'], detail['mute-box']], [undefined, undefined, undefined], 'no output of a machine is kept beyond that line');
+  assert.ok(!JSON.stringify(c).includes('Welcome') && !JSON.stringify(c).includes('never kept'), 'nothing else of their output reaches the cache');
+  // oak doctor, from the cache alone.
+  const rows = Object.fromEntries(core.diagnoseMachineUsage(h.now).map((r) => [r.id, r]));
+  assert.deepEqual(Object.keys(rows), list.map((m) => `machine-usage:${m.label}`), 'a row for each machine asked');
+  assert.deepEqual([rows['machine-usage:good-box'].level, rows['machine-usage:good-box'].label], ['ok', 'Claude usage from good-box']);
+  assert.match(rows['machine-usage:good-box'].detail, /^answered at /);
+  for (const box of ['old-box', 'chatty-box', 'down-box', 'slow-box', 'bare-box', 'odd-box', 'mute-box']) assert.equal(rows[`machine-usage:${box}`].level, 'warn', box);
+  assert.equal(rows['machine-usage:old-box'].fix, 'Update OAK on old-box: run `oak update` there.');
+  assert.match(rows['machine-usage:chatty-box'].detail, /was not OAK's reading: something there printed to standard output before OAK did, such as a shell startup file/);
+  assert.match(rows['machine-usage:chatty-box'].fix, /^Make the shell startup files on chatty-box print nothing/);
+  assert.match(rows['machine-usage:down-box'].detail, /^could not be reached over ssh at .*: ssh: connect to host down-box port 22: Connection refused$/);
+  assert.match(rows['machine-usage:down-box'].fix, /`ssh me@down-box` connects/);
+  assert.match(rows['machine-usage:slow-box'].detail, /^no answer within 30 s at /);
+  assert.match(rows['machine-usage:bare-box'].fix, /^`oak machine add bare-box me@bare-box` installs OAK there/);
+  assert.match(rows['machine-usage:odd-box'].detail, /failed there at .*: Error: the store is locked/);
+  // A machine that answered before and not now keeps its reading, and its row says so.
+  answers['me@good-box'] = { status: 'timeout' };
+  await refresh();
+  const kept = core.diagnoseMachineUsage(h.now).find((r) => r.id === 'machine-usage:good-box');
+  assert.deepEqual([core.readMachineUsage().machines.map((e) => e.label), kept.level], [['good-box'], 'warn']);
+  assert.match(kept.detail, /^no answer within 30 s at .*; OAK keeps the reading it gave at .* until its shares fall out of their windows$/);
+  // Answered, but signed in to another account or to none: no reading for this machine, and the row says why.
+  answers['me@good-box'] = JSON.stringify(h.machine('x', {}, 'acct-2').brief);
+  answers['me@old-box'] = JSON.stringify({ ...h.machine('x').brief, account: null });
+  answers['me@chatty-box'] = JSON.stringify({ ...h.machine('x').brief, five: null, week: null, fable: null }); // nothing measured there yet
+  await refresh();
+  const rows2 = Object.fromEntries(core.diagnoseMachineUsage(h.now).map((r) => [r.id, r]));
+  assert.match(rows2['machine-usage:good-box'].detail, /; it is signed in to another Claude account, so its readings are not used here$/);
+  assert.match(rows2['machine-usage:old-box'].detail, /; it has no Claude Code login, so it gives no reading of the account$/);
+  assert.match(rows2['machine-usage:chatty-box'].detail, /^answered at .*; it has measured none of the account's shares itself \(no Claude Code session or account read there\), so it gives no reading$/);
+  assert.equal(rows2['machine-usage:chatty-box'].level, 'ok', 'nothing to fix there: it is simply not measuring');
+  // herdr's list could not be read: every machine keeps its last outcome, as it keeps its reading.
+  await core.refreshMachineUsage(async () => null, async () => assert.fail('nothing is asked'), { force: true });
+  assert.equal(core.readMachineUsage().outcomes.length, list.length);
+  // Off: no rows.
+  core.writePrefs({ ...core.readPrefs(), machineUsage: false });
+  assert.deepEqual(core.diagnoseMachineUsage(h.now), []);
+  core.writePrefs({ ...core.readPrefs(), machineUsage: true });
+});
+
+// `oak doctor --markdown`, which both editors open as the setup check, put a check's text in as it was. The row of a
+// machine ssh could not reach keeps a line of what ssh said, which can be a server's banner printed before its login: an
+// image there loaded when the editor showed the report, and a line break and a heading after it made rows that read as
+// OAK's. Each line is escaped; OAK's own code spans stay code spans.
+test('doctor: the setup check\'s Markdown shows what a server, a machine or herdr said as text', async () => {
+  const fixtures = path.join(__dirname, 'fixtures');
+  const checks = JSON.parse(fs.readFileSync(path.join(fixtures, 'doctor-hostile.json'), 'utf8'));
+  const md = core.diagnoseMarkdown(checks);
+  // The JetBrains plugin's tests render this file with the IDE's own Markdown: it must be what core writes.
+  assert.equal(md, fs.readFileSync(path.join(fixtures, 'doctor-hostile.md'), 'utf8'), 'doctor-hostile.md is current: write it again from core.diagnoseMarkdown of doctor-hostile.json');
+  const lines = md.split('\n');
+  assert.deepEqual(lines.filter((l) => l.startsWith('#')), ['# OAK — setup check', '### ⚠️ Claude usage from b!\\[\\](https:\\//evil.example/label.png)x',
+    '### ⚠️ herdr forwarding: box', '### ⚠️ herdr forwarding: underline', '### ✅ safe label with hidden characters'], 'one heading for each check, and none from the text');
+  assert.equal(lines.length, 2 + checks.reduce((n, c) => n + (c.fix ? 5 : 3), 0) + 4, 'each label, detail and fix on one line');
+  for (const raw of ['![', '<img', '<iframe', '<https', 'https://', '//evil', 'www.evil', 'admin@evil', '&lt;', '**bold**', '_em_', '~strike~', '$x^2$', '<!--'])
+    assert.ok(md.split(raw).slice(0, -1).every((before) => before.endsWith('\\')), `${raw} shows only escaped`);
+  assert.ok(!/[\u202e\u200b]/.test(md), 'a bidirectional control and a zero-width space are dropped');
+  for (const kept of ['`ssh me@box`', '`oak doctor --fix`', '``a `b` c``', '~/.ssh/config, my_project, C#'])
+    assert.ok(md.includes(kept), `${kept} is kept as it was`);
+  for (const [line, shown] of [['Run `oak init` with Claude Code CLOSED (a running session reverts mid-session hook edits).', null],
+    ['0.9.3 at /usr/bin/herdr', null], ['PR #42 is open', null], ['1. a list', '1\\. a list'], ['- a list', '\\- a list'], ['---', '\\---'],
+    ['# a heading', '\\# a heading'], ['a label #', 'a label \\#'], ['line one\nline two', 'line one line two'], ['`a` and ` unclosed', '`a` and \\` unclosed'],
+    ['see //evil.example/x', 'see \\//evil.example/x'], ['===', '\\==='], ['--', '\\--'], ['=', '\\=']])
+    assert.equal(core.markdownLine(line), shown ?? line, JSON.stringify(line));
+  // Through the row it came in by: a saved machine's ssh banner, kept as what ssh said.
+  const h = machineUsageHome();
+  h.local();
+  const banner = 'Welcome ![](https://evil.example/p.png) <img src="https://evil.example/q.png"> [renew](https://evil.example/r)';
+  await core.refreshMachineUsage(async () => [{ label: 'box', target: 'me@box', enabled: true }], async () => ({ status: 'unreachable', detail: banner }), { force: true });
+  const report = core.diagnoseMarkdown(core.diagnoseMachineUsage(h.now));
+  assert.match(report, /could not be reached over ssh at .*: Welcome !\\\[\\\]\(https:\\\/\/evil\.example\/p\.png\) \\<img src="https:\\\/\/evil\.example\/q\.png"\\> \\\[renew\\\]\(https:\\\/\/evil\.example\/r\)/, report);
+});
+
+/** Every hidden character, each a code point: the bidirectional controls, the zero-width and other invisible characters,
+ *  the line and paragraph separators, the Hangul fillers and the tag characters (on their own, finishing no flag). */
+const HIDDEN_ALL = '\u00ad\u061c\u115f\u1160\u17b4\u17b5\u200b\u200e\u200f\u2028\u2029\u202a\u202b\u202c\u202d\u202e\u2060\u2061\u2062\u2063\u2064'
+  + '\u2066\u2067\u2068\u2069\u206a\u206b\u206c\u206d\u206e\u206f\u3164\ufeff\uffa0\u{E0001}\u{E0020}\u{E0041}\u{E0067}\u{E007E}\u{E007F}';
+/** U+1F3F4, `text` spelled in tag characters, and the cancel tag: Scotland's flag for `gbsct`. */
+const tagFlag = (text) => `\u{1F3F4}${[...text].map((c) => String.fromCodePoint(0xe0000 + c.codePointAt(0))).join('')}\u{E007F}`;
+const SCOTLAND = tagFlag('gbsct');
+/** What looks like them and is read: flags, emoji, Hangul syllables and jamo, the variation selectors, and Hebrew's
+ *  points and a Mongolian word written with the combining grapheme joiner, the vowel separator and a variation selector. */
+const HIDDEN_KEPT = [`go ${SCOTLAND} team`, `${tagFlag('gbeng')}${SCOTLAND}${tagFlag('gbwls')}`, '\u{1F468}\u200d\u{1F469}\u200d\u{1F467}', '\u{1F44D}\u{1F3FD}',
+  '\u2764\ufe0f', '1\ufe0f\u20e3', '\u{1F1EF}\u{1F1F5}', '\ud55c\uad6d\uc5b4', '\u1112\u1161\u11ab\u1100\u1173\u11af', '\u3131\u314f', '\u8fba\u{E0100}',
+  '\u{1F3F3}\ufe0f\u200d\u{1F308}', '\u05d9\u05b0\u05e8\u05d5\u05bc\u05e9\u05c1\u05b8\u05dc\u05b7\u034f\u05b4\u05dd', '\u182c\u1820\u1837\u180e\u1820', '\u182d\u180b\u1820'];
+
+test('doctor: a line of many code spans is escaped in one pass, however long', () => {
+  // Each backtick run looked for the run that closes it in a copy of the runs after it: a 50,000-character line of short
+  // code spans took half a second, one twice as long nearly three, and a million characters minutes. Nothing is timed
+  // here: the child only has to finish, which that pass did not do in the minute it is given, and this one does at once.
+  const big = '`a` '.repeat(250_000) + '`` b ` c'; // a million characters of code spans, then runs nothing closes
+  const r = cp.spawnSync(process.execPath, ['-e', `const core = require(${JSON.stringify(path.resolve(__dirname, '../dist/index.js'))});
+    process.stdout.write(core.markdownLine(require('fs').readFileSync(0, 'utf8')));`], { input: big, timeout: 60_000, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 });
+  assert.equal(r.status, 0, `markdownLine finished (${r.signal ?? ''} ${r.stderr ?? ''})`);
+  assert.equal(r.stdout, '`a` '.repeat(250_000) + '\\`\\` b \\` c', 'each code span kept, and the runs nothing closes escaped');
+  // …and builds no RegExp for each line: the hidden characters' class is made once.
+  const Real = RegExp;
+  let made = 0;
+  globalThis.RegExp = new Proxy(Real, { construct: (t, args, nt) => (made++, Reflect.construct(t, args, nt)), apply: (t, self, args) => (made++, Reflect.apply(t, self, args)) });
+  try { for (let i = 0; i < 10; i++) core.markdownLine('Welcome `ssh me@box` ![](https://evil.example/p.png) **b**'); } finally { globalThis.RegExp = Real; }
+  assert.equal(made, 0, 'no RegExp built for each line');
+});
+
+test('machine usage: the line kept of what a machine said ends where a character does', async () => {
+  // Cut at 200 code points, a detail whose 200th character was an emoji family or a flag kept the first of its code points.
+  const h = machineUsageHome();
+  h.local();
+  const family = '\u{1F468}\u200d\u{1F469}\u200d\u{1F467}';
+  const answers = { 'me@family-box': { status: 'failed', detail: `${'x'.repeat(199)}${family} and more` },
+    'me@flag-box': { status: 'failed', detail: `${'y'.repeat(199)}${SCOTLAND} and more` } };
+  const list = Object.keys(answers).map((target) => ({ label: target.slice(3), target, enabled: true }));
+  await core.refreshMachineUsage(async () => list, async (m) => answers[m.target], { force: true });
+  const detail = Object.fromEntries(core.readMachineUsage().outcomes.map((o) => [o.label, o.detail]));
+  assert.equal(detail['family-box'], `${'x'.repeat(199)}${family}`, 'the 200th character is the family, whole');
+  assert.equal(detail['flag-box'], `${'y'.repeat(199)}${SCOTLAND}`, 'and the flag, whole');
+  // A character of 100,000 accents, or of 20,000 emoji joined, is one character: 400 code points of it are kept at most.
+  const heavy = { 'me@zalgo-box': { status: 'failed', detail: `a${'\u0301'.repeat(100_000)} tail` },
+    'me@chain-box': { status: 'failed', detail: `${Array(20_000).fill('\u{1F468}').join('\u200d')} tail` } };
+  await core.refreshMachineUsage(async () => Object.keys(heavy).map((target) => ({ label: target.slice(3), target, enabled: true })), async (m) => heavy[m.target], { force: true });
+  const kept = Object.fromEntries(core.readMachineUsage().outcomes.map((o) => [o.label, o.detail]));
+  assert.equal(kept['zalgo-box'], `a${'\u0301'.repeat(399)}`, 'a letter and 399 of its accents');
+  assert.equal([...kept['chain-box']].length, 400, 'and 400 code points of the chain');
+});
+
+test('machine usage and remote titles: a claim, lock or attempt dated in the future (a clock stepped back) holds off no refresh', { skip: process.platform === 'win32' && 'POSIX herdr stub' }, async () => {
+  machineUsageHome();
+  const bin = tmpDir('cc-herdr-bin-');
+  fs.writeFileSync(path.join(bin, 'herdr'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  const was = process.env.PATH;
+  const ahead = (file, ms = 3600_000) => { const t = (Date.now() + ms) / 1000; fs.utimesSync(file, t, t); };
+  const replace = (file, value) => { fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(`${file}.tmp`, JSON.stringify(value)); fs.renameSync(`${file}.tmp`, file); };
+  try {
+    process.env.PATH = bin;
+    const cache = core.machineUsageCachePath();
+    const list = async () => [{ label: 'build-box', target: 'me@build-box', enabled: true }];
+    const ask = async () => null;
+    replace(cache, { version: 1, attemptedAt: 0, machines: [] });
+    // A claim taken a minute ago by a clock an hour ahead of this one.
+    fs.writeFileSync(`${cache}.kick`, '1');
+    ahead(`${cache}.kick`, 3600_000 - 60_000);
+    assert.equal(core.claimMachineUsagePull(), true, 'a claim dated an hour ahead is stale');
+    assert.equal(core.claimMachineUsagePull(), false, 'control: the claim just taken holds');
+    fs.rmSync(`${cache}.kick`);
+    replace(cache, { version: 1, attemptedAt: Date.now() + 3600_000, machines: [] });
+    assert.equal(core.claimMachineUsagePull(), true, 'an attempt dated an hour ahead is not within the five minutes');
+    fs.rmSync(`${cache}.kick`);
+    assert.notEqual(await core.refreshMachineUsage(list, ask), null, '…and an unforced refresh runs');
+    assert.equal(await core.refreshMachineUsage(list, ask), null, 'control: just refreshed, an unforced one does not');
+    for (const pid of [process.pid, null]) { // a live owner's lock, and one caught before its pid was written
+      replace(cache, { version: 1, attemptedAt: 0, machines: [] }); // due
+      fs.writeFileSync(`${cache}.lock`, pid === null ? '' : JSON.stringify({ pid }));
+      assert.equal(core.claimMachineUsagePull(), false, `control: a current lock (${pid ?? 'no pid'}) holds`);
+      ahead(`${cache}.lock`);
+      assert.equal(core.claimMachineUsagePull(), true, `a lock (${pid ?? 'no pid'}) dated an hour ahead is stale`);
+      fs.rmSync(`${cache}.kick`);
+      assert.notEqual(await core.refreshMachineUsage(list, ask, { force: true }), null, '…and the refresh takes it');
+      assert.ok(!fs.existsSync(`${cache}.lock`), '…and releases it');
+    }
+    // A few seconds ahead is a filesystem's clock, never a step: that lock still holds.
+    fs.writeFileSync(`${cache}.lock`, JSON.stringify({ pid: process.pid }));
+    ahead(`${cache}.lock`, 2000);
+    assert.equal(await core.refreshMachineUsage(list, ask, { force: true }), null, 'a lock two seconds ahead holds');
+    fs.rmSync(`${cache}.lock`);
+
+    // Remote Control titles: the same claim, lock and attempt, and the full pass's stamp. Nothing reaches the network.
+    const titles = core.remoteTitlesCachePath();
+    let pages = 0;
+    const opts = { fetch: async () => { pages++; return { ok: true, status: 200, json: async () => ({ data: [], next_cursor: 'more' }) }; }, token: async () => ({ token: 'test-token-not-real', loggedIn: true }) };
+    fs.mkdirSync(path.dirname(titles), { recursive: true });
+    fs.writeFileSync(`${titles}.kick`, '1');
+    ahead(`${titles}.kick`);
+    assert.equal(core.claimRemoteTitlesRefresh(), true, 'titles: a claim dated an hour ahead is stale');
+    fs.rmSync(`${titles}.kick`);
+    replace(titles, { version: 1, titles: {}, fetchedAt: 0, deepAt: 0, attemptedAt: Date.now() + 3600_000 });
+    assert.equal(core.claimRemoteTitlesRefresh(), true, 'titles: an attempt dated an hour ahead is not within the throttle');
+    fs.rmSync(`${titles}.kick`);
+    assert.notEqual(await core.refreshRemoteTitles(opts), null, 'titles: …and an unforced refresh runs');
+    fs.writeFileSync(`${titles}.lock`, JSON.stringify({ pid: process.pid }));
+    assert.equal(await core.refreshRemoteTitles({ ...opts, force: true }), null, 'titles: control: a current lock holds');
+    ahead(`${titles}.lock`);
+    assert.notEqual(await core.refreshRemoteTitles({ ...opts, force: true }), null, 'titles: a lock dated an hour ahead is stale');
+    replace(titles, { version: 1, titles: {}, fetchedAt: 0, deepAt: Date.now() + 86400_000, attemptedAt: 0 });
+    pages = 0;
+    await core.refreshRemoteTitles({ ...opts, force: true });
+    assert.equal(pages, 10, 'titles: a full pass dated a day ahead is not today\'s, so this pass reads every page');
+    pages = 0;
+    await core.refreshRemoteTitles({ ...opts, force: true });
+    assert.equal(pages, 1, 'control: after that full pass, one page');
+  } finally {
+    process.env.PATH = was;
+  }
+});
+
+/** Dates `file` `ms` ahead of now, as a clock stepped back after it was written leaves it. */
+const datedAhead = (file, ms = 3600_000) => { const t = (Date.now() + ms) / 1000; fs.utimesSync(file, t, t); };
+
+test('notify: a claims lock or a claim dated in the future (a clock stepped back) holds off no announcement', () => {
+  freshHome();
+  const prefs = { desktop: true, sound: false, kinds: ['permission', 'question', 'input'], cooldownSeconds: 30 };
+  const lock = path.join(core.rootDir(), 'notify-claims.json.lock');
+  fs.mkdirSync(core.rootDir(), { recursive: true });
+  // A crashed holder's lock dated an hour ahead: until the clock caught up, every hand stayed quiet.
+  fs.writeFileSync(lock, '');
+  datedAhead(lock);
+  assert.equal(core.dueDesktopNotify('n1', 'permission', 100, Date.now(), prefs), false, 'the call that finds it stays quiet…');
+  assert.ok(!fs.existsSync(lock), '…and reclaims it, as it does an old one');
+  assert.equal(core.dueDesktopNotify('n1', 'permission', 100, Date.now(), prefs), true, 'so the next one announces');
+  fs.writeFileSync(lock, '');
+  assert.equal(core.dueDesktopNotify('n9', 'permission', 100, Date.now(), prefs), false);
+  assert.ok(fs.existsSync(lock), 'control: a lock taken just now is a live holder\'s, and stays');
+  fs.rmSync(lock);
+  // A claim recorded before the step: its cooldown muted every new hand of its kind until the clock caught up.
+  fs.writeFileSync(path.join(core.rootDir(), 'notify-claims.json'), JSON.stringify({ n2: { ts: 100, at: Date.now() + 3600_000, kind: 'input' } }));
+  assert.equal(core.dueDesktopNotify('n2', 'input', 100, Date.now(), prefs), false, 'control: the same hand is still never announced twice');
+  assert.equal(core.dueDesktopNotify('n2', 'input', 200, Date.now(), prefs), true, 'a new hand is');
+  assert.equal(core.dueDesktopNotify('n2', 'input', 300, Date.now(), prefs), false, 'control: and the cooldown it starts holds');
+});
+
+test('codex transcript: a lock with no owner dated in the future (a clock stepped back) is reclaimed, not left to stop every conversion', (t) => {
+  const home = freshHome();
+  const prevCodexHome = process.env.CODEX_HOME;
+  process.env.CODEX_HOME = path.join(home, 'codex');
+  t.after(() => { if (prevCodexHome === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = prevCodexHome; });
+  const id = '00000000-0000-4000-8000-0000000000f6';
+  const dir = path.join(home, 'codex', 'sessions', '2026', '10', '17');
+  fs.mkdirSync(dir, { recursive: true });
+  const rollout = path.join(dir, `rollout-2026-10-17T12-00-00-${id}.jsonl`);
+  const at = new Date().toISOString();
+  fs.writeFileSync(rollout, [{ timestamp: at, type: 'session_meta', payload: { id, cwd: home, originator: 'codex-tui', source: 'cli', model_provider: 'openai' } },
+    { timestamp: at, type: 'event_msg', payload: { type: 'user_message', message: 'Tidy the notes.' } }].map((r) => JSON.stringify(r)).join('\n') + '\n');
+  const output = core.codexTranscriptFile(rollout);
+  assert.ok(output && fs.existsSync(output), 'control: the rollout converts');
+  const lock = path.join(path.dirname(output), '.lock');
+  // One converter's lock, caught between its create and its pid's write: a moment old, it is still that converter's.
+  fs.rmSync(output);
+  fs.writeFileSync(lock, '');
+  assert.equal(core.codexTranscriptFile(rollout), null, 'control: a fresh lock with no owner yet is left to its converter');
+  assert.ok(fs.existsSync(lock));
+  // The same lock dated an hour ahead: no conversion ran until the clock caught up.
+  datedAhead(lock);
+  assert.equal(core.codexTranscriptFile(rollout), null, 'the call that finds it converts nothing…');
+  assert.ok(!fs.existsSync(lock), '…and reclaims it');
+  assert.equal(core.codexTranscriptFile(rollout), output, 'so the next call converts');
+  // A moment old by the clock of the file system it is on, which runs ahead of this one (a network share's server):
+  // still that converter's. Read as dated ahead of this clock, it was reclaimed from the converter writing it.
+  fs.rmSync(output);
+  fs.writeFileSync(lock, '');
+  const realNow = Date.now;
+  t.mock.method(Date, 'now', () => realNow() - 8000);
+  try {
+    assert.equal(core.codexTranscriptFile(rollout), null);
+  } finally {
+    t.mock.restoreAll();
+  }
+  assert.ok(fs.existsSync(lock), 'a lock just taken on a file system whose clock runs ahead is left to its converter');
+});
+
+test('store: a torn Bash manifest, or a dead holder\'s session lock, dated in the future (a clock stepped back) is cleared, not kept until the clock catches up', () => {
+  freshHome();
+  const S = 'future-stamps';
+  const F = path.join(tmpWork(), 'f.txt');
+  core.ensureStore(S);
+  // A torn manifest (an older build's write, or a damaged disk's): manifests are written whole, so one that does not
+  // parse is no write in flight. Dated ahead it was never dropped, and kept the session mid-capture, so unreclaimable.
+  const staging = path.join(core.storeDir(S), 'staging');
+  fs.mkdirSync(staging, { recursive: true });
+  const torn = path.join(staging, '__bash__0000-torn.json');
+  fs.writeFileSync(torn, '{"files":{');
+  assert.equal(core.readBashManifest(S), null);
+  assert.ok(fs.existsSync(torn) && core.hasInflightCapture(S), 'control: one written just now is left, as a write in flight');
+  datedAhead(torn);
+  assert.equal(core.readBashManifest(S), null);
+  assert.ok(!fs.existsSync(torn), 'dated ahead, it is dropped');
+  assert.equal(core.hasInflightCapture(S), false, 'so the session is no longer mid-capture');
+  // The session lock: what it records (the holder's pid and its monotonic clock when it took the lock) dates it when
+  // its file is dated ahead. A dead holder's, taken a minute ago, wedged every capture until the clock caught up.
+  const lp = path.join(core.storeDir(S), '.lock');
+  const mono = () => Number(process.hrtime.bigint() / 1_000_000n);
+  const dead = cp.spawnSync(process.execPath, ['-e', '']).pid;
+  const rec = { ts: 1, tool: 'Edit', file: F, beforeBlob: null, afterBlob: null, status: 'pending' };
+  fs.writeFileSync(lp, `${dead}:token:${mono() - 60_000}`);
+  datedAhead(lp);
+  const id = seedEdit(S, F, 'a\n', 'b\n');
+  assert.equal(core.findRecord(S, id).status, 'pending', 'a dead holder\'s lock, a minute old by its monotonic stamp, is broken');
+  // A live holder's, taken a minute ago, is still its own, however its file is dated: it may be mid-append.
+  fs.writeFileSync(lp, `${process.pid}:token:${mono() - 60_000}`);
+  datedAhead(lp);
+  assert.throws(() => core.appendLog(S, rec), /busy/, 'a live holder keeps its lock');
+  // An older build's lock records no monotonic stamp: dated ahead its age is unknown, so it is broken only when its
+  // holder is dead, never taken from one that answers.
+  fs.writeFileSync(lp, String(dead));
+  datedAhead(lp);
+  assert.equal(core.findRecord(S, seedEdit(S, F, 'b\n', 'c\n')).status, 'pending', 'a dead holder\'s, with no stamp, is broken');
+  fs.writeFileSync(lp, String(process.pid));
+  datedAhead(lp);
+  assert.throws(() => core.appendLog(S, rec), /busy/, 'a live holder\'s, with no stamp, is kept');
+  fs.rmSync(lp);
+});
+
+// A store on a file system whose clock runs ahead of this machine's (a network share's server, or the host under a
+// virtual machine's shared folder) dates every file just written there ahead of this clock. Read as taken before a
+// clock step, a live capture's lock on another machine was broken, and two captures wrote at once.
+test('store: a lock dated ahead of this clock alone, as a store whose clock runs ahead dates every lock, holds for its live holder', (t) => {
+  freshHome();
+  const S = 'shared-store-clock';
+  core.ensureStore(S);
+  const F = path.join(tmpWork(), 'f.txt');
+  const lp = path.join(core.storeDir(S), '.lock');
+  const rec = { ts: 1, tool: 'Edit', file: F, beforeBlob: null, afterBlob: null, status: 'pending' };
+  const mono = () => Number(process.hrtime.bigint() / 1_000_000n);
+  const elsewhere = cp.spawnSync(process.execPath, ['-e', '']).pid; // another machine's pid: nothing answers to it here
+  const realNow = Date.now;
+  t.mock.method(Date, 'now', () => realNow() - 6000); // this machine's clock, six seconds behind the store's
+  for (const taken of [mono() - 2 * 3600_000, mono() + 2 * 3600_000]) { // that machine's monotonic clock: another boot's
+    fs.writeFileSync(lp, `${elsewhere}:token:${taken}`);
+    assert.throws(() => core.appendLog(S, rec), /busy/, 'the live holder keeps its lock');
+    assert.equal(fs.readFileSync(lp, 'utf8'), `${elsewhere}:token:${taken}`);
+  }
+  // Control: dated ahead of the store's own clock too, as a clock stepped back leaves it, a dead holder's lock is broken.
+  fs.writeFileSync(lp, `${elsewhere}:token:${mono() - 60_000}`);
+  datedAhead(lp);
+  assert.equal(core.findRecord(S, seedEdit(S, F, 'a\n', 'b\n')).status, 'pending');
+});
+
+test('machine usage, remote titles and notify: on a file system whose clock runs ahead of this one, a claim or lock just taken holds', (t) => {
+  machineUsageHome();
+  const bin = tmpDir('cc-herdr-bin-');
+  // Only found, never run: herdr is looked for as herdr.exe on Windows.
+  fs.writeFileSync(path.join(bin, process.platform === 'win32' ? 'herdr.exe' : 'herdr'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  const was = process.env.PATH;
+  process.env.PATH = bin;
+  t.after(() => { process.env.PATH = was; });
+  const realNow = Date.now;
+  t.mock.method(Date, 'now', () => realNow() - 6000);
+  // Read as dated ahead, every poll claimed a refresh, and each one took the lock from the one before: ten reads of
+  // `oak usage` in three seconds ran ten refreshes, each with its ssh to every saved machine.
+  assert.equal(core.claimMachineUsagePull(), true, 'control: due, and claimed');
+  assert.equal(core.claimMachineUsagePull(), false, 'the claim just taken holds');
+  assert.equal(core.claimRemoteTitlesRefresh(), true, 'control: the titles are due, and claimed');
+  assert.equal(core.claimRemoteTitlesRefresh(), false, 'the titles claim just taken holds');
+  // So does a refresh running elsewhere, its lock just taken: read as dated ahead, a second one was claimed beside it.
+  for (const [cache, claim] of [[core.machineUsageCachePath(), () => core.claimMachineUsagePull()], [core.remoteTitlesCachePath(), () => core.claimRemoteTitlesRefresh()]]) {
+    fs.rmSync(`${cache}.kick`);
+    fs.writeFileSync(`${cache}.lock`, JSON.stringify({ pid: process.pid }));
+    assert.equal(claim(), false, `${path.basename(cache)}: a running refresh holds its lock`);
+    fs.rmSync(`${cache}.lock`);
+    assert.equal(claim(), true, `${path.basename(cache)}: control: once it is done, the next one is claimed`);
+  }
+  const lock = path.join(core.rootDir(), 'notify-claims.json.lock');
+  fs.writeFileSync(lock, '');
+  const prefs = { desktop: true, sound: false, kinds: ['permission'], cooldownSeconds: 30 };
+  assert.equal(core.dueDesktopNotify('n1', 'permission', 100, Date.now(), prefs), false);
+  assert.ok(fs.existsSync(lock), 'a holder\'s notify lock, just taken, is left to it');
+  fs.rmSync(lock);
+});
+
+// One class of hidden characters for every surface: a label drops them (plainLabel, the terminal app's sanitizeCell), and
+// a file's text shows each as the mark that names it (revealHidden: the CLI's diff, the terminal app's diff pane, VS Code's
+// review views, and the JetBrains plugin's copy of the class).
+test('hidden characters: one class, dropped from a label and shown as a mark in a file\'s text, the JetBrains plugin\'s too', () => {
+  for (const ch of HIDDEN_ALL) {
+    assert.equal(core.plainLabel(`a${ch}b`), 'ab', `a label drops U+${ch.codePointAt(0).toString(16)}`);
+    assert.equal(core.revealHidden(`a${ch}b`), `a${core.hiddenMark(ch)}b`, 'a file\'s text shows it');
+    assert.match(core.hiddenMark(ch), new RegExp(`^${core.HIDDEN_MARK_SOURCE}$`), 'as a mark the renderers find');
+  }
+  assert.equal(core.hiddenMark('\u202e'), '⟨U+202E⟩');
+  assert.equal(core.hiddenMark('\u{E0041}'), '⟨U+E0041⟩', 'a tag character, one mark for its two UTF-16 units');
+  // Tag characters spell out text no one sees, a known way to hide words in a prompt; the ones that finish a flag stay.
+  const hiddenWords = `run tests${[...'ignore the user'].map((c) => String.fromCodePoint(0xe0000 + c.codePointAt(0))).join('')} now`;
+  assert.equal(core.plainLabel(hiddenWords), 'run tests now', 'a label drops hidden words');
+  assert.equal(core.revealHidden(hiddenWords), `run tests${[...'ignore the user'].map((c) => core.hiddenMark(String.fromCodePoint(0xe0000 + c.codePointAt(0)))).join('')} now`, 'a file\'s text spells them out');
+  // After 🏴 any tags but England's, Scotland's and Wales's draw a black flag, the words they spell hidden behind it.
+  const marked = (t) => [...t].map((c) => (c.codePointAt(0) >= 0xe0000 ? core.hiddenMark(c) : c)).join('');
+  for (const [text, shown] of [
+    [`${SCOTLAND}\u{E0041}`, `${SCOTLAND}⟨U+E0041⟩`], [`\u{E0041}${SCOTLAND}`, `⟨U+E0041⟩${SCOTLAND}`],
+    ['\u{1F3F4}\u{E0067}\u{E0062}!', '\u{1F3F4}⟨U+E0067⟩⟨U+E0062⟩!'], ['\u{1F3F4}\u{E007F}', '\u{1F3F4}⟨U+E007F⟩'], ['\u{1F600}\u{E0067}\u{E007F}', '\u{1F600}⟨U+E0067⟩⟨U+E007F⟩'],
+    [tagFlag('ignore the user'), marked(tagFlag('ignore the user'))], [tagFlag('usca'), marked(tagFlag('usca'))], [tagFlag('gbsctx'), marked(tagFlag('gbsctx'))],
+  ]) assert.equal(core.revealHidden(text), shown, `a tag that finishes no flag shows: ${JSON.stringify(text)}`);
+  assert.equal(core.plainLabel(`go ${tagFlag('ignore the user')} team`), 'go \u{1F3F4} team', 'and a label drops it');
+  // A long run of tags is read in one pass: each looks back five tags at most for the 🏴 of a flag. Looking back over
+  // the whole run, 16,000 in a row took 0.4 s. Nothing is timed: the child has only to finish in the minute it is given.
+  const run = cp.spawnSync(process.execPath, ['-e', `const core = require(${JSON.stringify(path.resolve(__dirname, '../dist/index.js'))});
+    const s = require('fs').readFileSync(0, 'utf8'); process.stdout.write(core.plainLabel(s) + '|' + core.revealHidden(s).length);`],
+  { input: `a${'\u{E0061}'.repeat(400_000)}b`, timeout: 60_000, encoding: 'utf8' });
+  assert.equal(run.status, 0, `a run of 400,000 tags finished (${run.signal ?? ''} ${run.stderr ?? ''})`);
+  assert.equal(run.stdout, `ab|${2 + 400_000 * '⟨U+E0061⟩'.length}`, 'each tag dropped from a label and shown in a file');
+  // What is drawn as a reader reads it stays, in a label and in a file's text: flags, emoji, Hangul (its syllables and its
+  // letters written as jamo), and the variation selectors that choose how a character is drawn.
+  for (const text of HIDDEN_KEPT) {
+    assert.equal(core.plainLabel(text), text, `a label keeps ${JSON.stringify(text)}`);
+    assert.equal(core.revealHidden(text), text, `a file's text keeps ${JSON.stringify(text)}`);
+  }
+  assert.equal(core.revealHidden('a\u202eb', true), 'a\x1b[2m⟨U+202E⟩\x1b[22mb', 'dimmed for a terminal, the line keeping its colour');
+  // A joiner or non-joiner with only ASCII text beside it hides in an identifier or a string, where it shows: at the end
+  // of one too, where JavaScript reads `isAdmin\u200d` as a second name; an emoji, an Indic conjunct and a Persian word
+  // (one written after a Latin acronym included) are built with them, and keep them.
+  const inIdentifier = ['is\u200dadmin', 'foo\u200cbar', 'a\u200d1', 'a\u200d\u200db', 'x\u200d\u202ey', 'let isAdmin\u200d = true;', 'role === "admin\u200c"', 'a\u200d', '\u200db', '" \u200d "'];
+  const builtWith = ['\u{1F468}\u200d\u{1F469}\u200d\u{1F467}', '\u0915\u094d\u200d\u0937', '\u06a9\u062a\u0627\u0628\u200c\u0647\u0627', '\u00e9\u200d\u00e9', 'PDF\u200c\u0647\u0627', '\u0d28\u0d4d\u200d = 1', 'x = "\u{1F468}\u200d"'];
+  for (const text of inIdentifier) assert.equal(core.revealHidden(text), text.replace(/[\u200c\u200d\u202e]/g, (c) => core.hiddenMark(c)), JSON.stringify(text));
+  for (const text of builtWith) assert.equal(core.revealHidden(text), text, `${JSON.stringify(text)} keeps its joiners`);
+  // So does a variation selector, a combining grapheme joiner and a vowel separator: after an ASCII name each is a second
+  // name (`isAdmin\ufe0f` is not `isAdmin`); and a variation selector after another one chooses nothing, so a run of them,
+  // which spells out text no one sees (one byte each), shows from its second, after an emoji too.
+  for (const ch of ['\ufe0f', '\u{E0100}', '\u180b', '\u034f', '\u180e']) {
+    assert.equal(core.revealHidden(`if (isAdmin${ch}) grant();`), `if (isAdmin${core.hiddenMark(ch)}) grant();`, `U+${ch.codePointAt(0).toString(16)} after a name`);
+    assert.match(core.hiddenMark(ch), new RegExp(`^${core.HIDDEN_MARK_SOURCE}$`), 'as a mark the renderers find');
+  }
+  const bytes = [...'hide'].map((c) => String.fromCodePoint(0xe0100 + c.charCodeAt(0) - 16));
+  assert.equal(core.revealHidden(`\u{1F600}${bytes.join('')}`), `\u{1F600}${bytes[0]}${bytes.slice(1).map((c) => core.hiddenMark(c)).join('')}`, 'a run of selectors after an emoji');
+  assert.equal(core.revealHidden('\u2764\ufe0f\ufe0f'), `\u2764\ufe0f${core.hiddenMark('\ufe0f')}`, 'a second selector after an emoji');
+  assert.equal(core.revealHidden('\u{1F468}\u200d\u202e\u{1F469}'), '\u{1F468}\u200d⟨U+202E⟩\u{1F469}', 'a bidirectional control shows wherever it is');
+  // …and across a highlighter's tags, for VS Code's stacked review, where an escape stands for the ASCII it escapes.
+  const tag = (m) => `<i>${m}</i>`;
+  assert.equal(core.revealHiddenHtml('<span class="k">is</span>\u200d<span>admin</span>', tag), '<span class="k">is</span><i>⟨U+200D⟩</i><span>admin</span>');
+  assert.equal(core.revealHiddenHtml('<b>foo\u200c</b>bar', tag), '<b>foo<i>⟨U+200C⟩</i></b>bar');
+  assert.equal(core.revealHiddenHtml('<b>\u{1F468}</b>\u200d<b>\u{1F469}</b> &lt;\u200db', tag), '<b>\u{1F468}</b>\u200d<b>\u{1F469}</b> &lt;<i>⟨U+200D⟩</i>b');
+  assert.equal(core.revealHiddenHtml('<span class="k">let</span> isAdmin\u200d = <span class="k">true</span>', tag), '<span class="k">let</span> isAdmin<i>⟨U+200D⟩</i> = <span class="k">true</span>');
+  assert.equal(core.revealHiddenHtml('a\u202eb', tag), 'a<i>⟨U+202E⟩</i>b');
+  const kt = fs.readFileSync(path.join(__dirname, '../../jetbrains/src/main/kotlin/com/cellobservatory/observatory/model/Hidden.kt'), 'utf8');
+  assert.equal(/val HIDDEN_IN_TEXT = Regex\("([^"]+)"\)/.exec(kt)?.[1].replace(/\\\\/g, '\\'), core.HIDDEN_SOURCE, 'the JetBrains plugin keeps the same class');
+  assert.match(kt, /fun hiddenMark\(cp: Int\): String = "⟨U\+%04X⟩"\.format\(cp\)/, '…and the same mark, of a code point');
+  assert.equal(/val JOINER_IN_TEXT = Regex\("([^"]+)"\)/.exec(kt)?.[1].replace(/\\\\/g, '\\'), core.JOINER_SOURCE, '…the same joiners');
+  assert.equal(/val ASCII_IN_TEXT = Regex\("([^"]+)"\)/.exec(kt)?.[1].replace(/\\\\/g, '\\'), core.ASCII_SOURCE, '…and the same text a joiner joins nothing beside');
+  // …and its label class is core's plainLabel's (which keeps the joiner and the non-joiner).
+  const panel = fs.readFileSync(path.join(__dirname, '../../jetbrains/src/main/kotlin/com/cellobservatory/observatory/ui/ChangeMapPanel.kt'), 'utf8');
+  assert.equal(/val HIDDEN_IN_LABEL = Regex\("([^"]+)"\)/.exec(panel)?.[1].replace(/\\\\/g, '\\'), core.PLAIN_LABEL_SOURCE, 'the JetBrains plugin drops the same from a label');
+});
+
+test('machine usage: a machine\'s label shows without its control, bidirectional or zero-width characters, wherever core names it', async () => {
+  const h = machineUsageHome();
+  h.local();
+  const hidden = `\u001b\u0007\t${HIDDEN_ALL}`;
+  assert.equal(core.plainLabel(`build${hidden}-box`), 'build-box', 'each of them dropped');
+  assert.equal(core.plainLabel('gpu été 中 \u{1f680}'), 'gpu été 中 \u{1f680}', 'control: what a person reads stays');
+  assert.equal(new RegExp(core.PLAIN_LABEL_SOURCE, 'gu')[Symbol.replace](`a${hidden}b`, ''), 'ab', 'the class VS Code\'s webviews take is the same');
+  for (const text of HIDDEN_KEPT) assert.equal(new RegExp(core.PLAIN_LABEL_SOURCE, 'gu')[Symbol.replace](text, ''), text, `…and keeps ${JSON.stringify(text)}`);
+  // The zero-width joiner stays: an emoji family or an Indic letter is built with it, and it reorders nothing.
+  const family = 'lab \u{1F9D1}\u200d\u{1F4BB} \u{1F468}\u200d\u{1F469}\u200d\u{1F467}';
+  assert.equal(core.plainLabel(family), family, 'an emoji family keeps its joiners');
+  const label = 'build\u202excod\u202c-\u200bbox\u2066\u2069';
+  h.store({ ...h.machine('x'), label });
+  const u = core.usageLine(h.cwd, 'nosession');
+  assert.deepStrictEqual([u.fiveMachine, u.weekMachine, u.monthMachine, u.machineNote, u.machineBarNote, core.usageBrief(h.cwd).claude.machine],
+    ['buildxcod-box', 'buildxcod-box', 'buildxcod-box', 'buildxcod-box', 'buildxcod-box', 'buildxcod-box']);
+  h.store({ ...h.machine('x'), label: family });
+  assert.equal(core.usageLine(h.cwd, 'nosession').machineNote, family, 'a label with an emoji family is named whole');
+  // A label with nothing left to show is named by its target, cleaned the same way.
+  h.store({ ...h.machine('x'), label: '\u202e\u200b', target: 'me@\u200bbuild-box' });
+  assert.equal(core.usageLine(h.cwd, 'nosession').machineNote, 'me@build-box');
+  // …and so are the refresh's own entries and outcomes, and doctor's rows.
+  await core.refreshMachineUsage(async () => [{ label, target: 'me@build-box', enabled: true }], async () => ({ status: 'old-oak' }), { force: true });
+  const row = core.diagnoseMachineUsage(h.now)[0];
+  assert.deepEqual([core.readMachineUsage().outcomes[0].label, row.id, row.label], ['buildxcod-box', 'machine-usage:buildxcod-box', 'Claude usage from buildxcod-box']);
+  assert.match(row.fix, /^Update OAK on buildxcod-box: /);
+});
+
+test('machine usage: each answer is dated against when it arrived, so a machine whose clock is off is read by this one\'s', async (t) => {
+  // A refresh asks a machine whose clock runs `skew` off this one's. Its brief is the one core prints there, built
+  // under that clock from a cache that machine's clock stamped. A clock more than five minutes fast hid a fresh
+  // share as undated (or showed it once it aged), and one off by minutes either way misdated readings near a reset.
+  const MIN = 60_000, H = 3600_000;
+  let offset = 0;
+  const realNow = Date.now;
+  t.mock.method(Date, 'now', () => realNow() + offset);
+  const h = machineUsageHome();
+  h.local();
+  const here = process.env.HOME;
+  const remote = (skew, cache) => {
+    const home = freshHome(); // that machine's own home, signed in to the same account
+    fs.writeFileSync(path.join(home, '.claude.json'), JSON.stringify({ oauthAccount: { accountUuid: 'acct-1' } }));
+    fs.mkdirSync(path.join(home, '.claude'), { recursive: true });
+    fs.writeFileSync(path.join(home, '.claude', 'statusline-last.json'), JSON.stringify({ v: 3, ...cache }));
+    offset = skew;
+    try { return JSON.stringify(core.machineUsageBrief(tmpWork())); } finally { offset = 0; process.env.HOME = process.env.USERPROFILE = here; }
+  };
+  const S = (ms) => Math.floor(ms / 1000);
+  const refresh = (answer) => core.refreshMachineUsage(async () => [{ label: 'build-box', target: 'me@build-box', enabled: true }], async () => answer, { force: true });
+  for (const skew of [6 * MIN, 10 * MIN, -3 * MIN]) {
+    const measured = realNow() - 10_000; // ten seconds before the refresh, real time
+    await refresh(remote(skew, { five_pct: 12, five_at: S(measured + skew), five_reset: S(realNow() + 3 * H), week_pct: 31, week_at: S(measured + skew), week_reset: S(realNow() + 2 * 86400_000) }));
+    const e = core.readMachineUsage().machines[0];
+    assert.ok(Math.abs(e.skewMs - skew) < 5000 && e.rttMs >= 0 && e.rttMs < 5000, `${skew / MIN} min: the clock's difference is recorded within its round trip (${e.skewMs}, ${e.rttMs})`);
+    const seen = [];
+    for (const later of [0, 2 * MIN, 4 * MIN]) { offset = later; seen.push(core.usageLine(h.cwd, 'nosession').fiveHourPct); }
+    offset = 0;
+    assert.deepEqual(seen, [12, 12, 12], `${skew / MIN} min: shown from the start, and every minute after`);
+    const u = core.usageLine(h.cwd, 'nosession');
+    assert.ok(Math.abs(u.machineAt - S(measured) * 1000) < 6000, `${skew / MIN} min: dated by this machine's clock (${(u.machineAt - measured) / 1000} s off)`);
+    const row = core.diagnoseMachineUsage().find((r) => r.id === 'machine-usage:build-box');
+    assert.match(row.detail, new RegExp(`; its clock runs ${Math.abs(skew / MIN)} min ${skew > 0 ? 'ahead of' : 'behind'} this machine's, so OAK dates its readings by this machine's clock$`));
+  }
+  // Near a reset. A clock three minutes slow, its share measured a minute into the window: this window's. That
+  // machine judged it by its own clock and kept it to itself, as measured before the window.
+  let reset = realNow() - 2 * MIN; // the window began two minutes ago
+  await refresh(remote(-3 * MIN, { five_pct: 3, five_at: S(reset + MIN - 3 * MIN), five_reset: S(reset + 5 * H) }));
+  assert.equal(core.usageLine(h.cwd, 'nosession').fiveHourPct, 3, 'slow: measured inside the window, it is shown');
+  // A clock two minutes fast, the last window's 95% measured a minute before the reset: not this window's.
+  reset = realNow() - 30_000;
+  await refresh(remote(2 * MIN, { five_pct: 95, five_at: S(reset - MIN + 2 * MIN), five_reset: S(reset) }));
+  assert.equal(core.usageLine(h.cwd, 'nosession').fiveHourPct, 0, 'fast: the last window\'s share is not shown after the reset (this machine\'s own 5h window has ended)');
+  // The same clock a minute before the reset: that machine rolled the reset to the next window by its clock, and the
+  // share is still this window's, with a minute to run.
+  reset = realNow() + MIN;
+  await refresh(remote(2 * MIN, { five_pct: 95, five_at: S(reset - 2 * MIN + 2 * MIN), five_reset: S(reset) }));
+  const before = core.usageLine(h.cwd, 'nosession');
+  assert.ok(core.readMachineUsage().machines[0].brief.five.reset > reset + 4 * H, 'control: that machine sent the next window\'s reset');
+  assert.equal(before.fiveHourPct, 95, 'fast: still this window\'s');
+  assert.ok(Math.abs(before.fiveReset - realNow() - MIN) < 5000, `…resetting in a minute, not in five hours (${(before.fiveReset - realNow()) / 1000} s)`);
+});
+
+test('machine usage: a share read before that machine\'s clock fell behind (a virtual machine resumed from a pause) keeps the date it was read with', async (t) => {
+  // Its Claude Code measured the 5-hour share (95%) and the week's (88%) a minute before the refresh that read them;
+  // then it paused for eight hours, in which both windows turned over. Resumed, its clock is eight hours behind: read
+  // less that difference, the same shares were dated a minute ago, inside the new windows, and shown for them.
+  const MIN = 60_000, H = 3600_000;
+  let offset = 0;
+  const realNow = Date.now;
+  t.mock.method(Date, 'now', () => realNow() + offset);
+  const h = machineUsageHome();
+  h.local();
+  const T1 = realNow() - MIN;
+  const shares = { five: { pct: 95, at: T1, reset: T1 + 30 * MIN, tok: null, total: null }, week: { pct: 88, at: T1, reset: T1 + 2 * H, tok: null, total: null } };
+  const refresh = (brief) => core.refreshMachineUsage(async () => [{ label: 'vm-box', target: 'me@vm-box', enabled: true }], async () => JSON.stringify(brief), { force: true });
+  await refresh({ ...h.machine('vm-box').brief, at: realNow(), ...shares, month: null });
+  assert.deepStrictEqual([core.usageLine(h.cwd, 'nosession').fiveHourPct, core.usageLine(h.cwd, 'nosession').weekPct], [95, 88], 'control: read before the pause, they are this window\'s');
+  offset = 8 * H; // eight hours on: the pause
+  await refresh({ ...h.machine('vm-box').brief, at: T1 + 2 * MIN, ...shares, month: null });
+  assert.ok(Math.abs(core.readMachineUsage().machines[0].skewMs + 8 * H) < 5 * MIN, 'control: its clock reads about eight hours behind');
+  const u = core.usageLine(h.cwd, 'nosession');
+  assert.deepStrictEqual([u.fiveHourPct, u.weekPct, u.machineNote], [0, null, ''], 'the last windows\' shares are not shown as these windows\' (this machine\'s own 5h window has ended)');
+  // Control: a share it measures now, by the same slow clock, is read less that difference, and shown.
+  const now = realNow() + offset;
+  await refresh({ ...h.machine('vm-box').brief, at: now - 8 * H, five: { pct: 4, at: now - 8 * H - 30_000, reset: now + 2 * H, tok: null, total: null }, week: null, month: null });
+  assert.deepStrictEqual([core.usageLine(h.cwd, 'nosession').fiveHourPct, core.usageLine(h.cwd, 'nosession').fiveMachine], [4, 'vm-box']);
+});
+
 test('sessions: a conversation that edited nothing is still a session', () => {
   // The store is not the census. A session gets a store directory the first time the capture hook
   // fires, so one that only asked, read and ran things never gets one — and every listing built from
-  // `listSessions()` alone could not see it at all. Measured on the repo that found this: 50
-  // transcripts, 31 store directories, 19 real conversations missing from the picker with nothing on
-  // screen to say so.
+  // `listSessions()` alone could not see it at all. In the repository that found this, more than a
+  // third of the conversations were missing from the picker with nothing on screen to say so.
   freshHome();
-  const cfg = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-sess-'));
+  const cfg = tmpDir('cc-sess-');
   process.env.CLAUDE_CONFIG_DIR = cfg;
   try {
     const cwd = path.resolve('/Users/x/proj');
@@ -3259,7 +4723,7 @@ test('sessions: a conversation that edited nothing is still a session', () => {
 
 test('sessions: every workspace is listed, each row saying which one, and bridge pointers are excluded', () => {
   freshHome();
-  const cfg = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-ws-'));
+  const cfg = tmpDir('cc-ws-');
   process.env.CLAUDE_CONFIG_DIR = cfg;
   try {
     const here = path.resolve('/Users/x/proj');
@@ -3312,7 +4776,7 @@ test('paths: CLAUDE_CONFIG_DIR relocates the store, sessions, hooks, and usage t
   // ~/.claude while usage/stats honored CLAUDE_CONFIG_DIR — so relocating the config dir onto a
   // mounted volume only half-worked (edit history reset on rebuild). Now ALL of them follow it.
   const home = freshHome();
-  const cfg = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-cfg-'));
+  const cfg = tmpDir('cc-cfg-');
   process.env.CLAUDE_CONFIG_DIR = cfg;
   try {
     assert.equal(core.claudeConfigDir(), cfg);
@@ -3431,7 +4895,11 @@ test('observe: usageLine keeps the exact cache ctx when the cache is newer than 
   assert.equal(u.ctx.tokens, 78000);
 });
 
-test('stats: computeStats rolls up transcripts + edits into windows and a daily series', () => {
+test('stats: computeStats rolls up transcripts + edits into windows and a daily series', (fallbackTest) => {
+  // These exercise the transcript fallback; database history has its own account-union tests.
+  const databaseMode = process.env.OAK_INDEX;
+  process.env.OAK_INDEX = 'off';
+  fallbackTest.after(() => { if (databaseMode === undefined) delete process.env.OAK_INDEX; else process.env.OAK_INDEX = databaseMode; });
   freshHome();
   delete process.env.CLAUDE_CONFIG_DIR;
   const S = 'statSess';
@@ -3483,7 +4951,11 @@ test('stats: computeStats rolls up transcripts + edits into windows and a daily 
   assert.equal(st.hourly[hr].tokensOutput, 50, 'hourly output tokens');
 });
 
-test('stats: one assistant message split across content-block lines is counted once (no multi-count)', () => {
+test('stats: one assistant message split across content-block lines is counted once (no multi-count)', (fallbackTest) => {
+  // These exercise the transcript fallback; database history has its own account-union tests.
+  const databaseMode = process.env.OAK_INDEX;
+  process.env.OAK_INDEX = 'off';
+  fallbackTest.after(() => { if (databaseMode === undefined) delete process.env.OAK_INDEX; else process.env.OAK_INDEX = databaseMode; });
   freshHome();
   delete process.env.CLAUDE_CONFIG_DIR;
   const S = 'splitSess';
@@ -3515,7 +4987,7 @@ test('stats: one assistant message split across content-block lines is counted o
 
 test('install: --project targets a repo-local settings file, leaving global untouched', () => {
   freshHome();
-  const proj = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-proj-'));
+  const proj = tmpDir('cc-proj-');
   const projSettings = core.projectSettingsPath(proj);
   const cmd = 'claude-observatory capture #claude-observatory-hook';
   const res = core.installHooks(cmd, projSettings);
@@ -3529,7 +5001,7 @@ test('install: --project targets a repo-local settings file, leaving global unto
 
 test('install: a pre-rename claude-observatory hook MIGRATES to oak on re-init (in place, foreign hooks kept)', () => {
   freshHome();
-  const proj = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-mig-'));
+  const proj = tmpDir('oak-mig-');
   const settings = core.projectSettingsPath(proj);
   fs.mkdirSync(path.dirname(settings), { recursive: true });
   // A pre-OAK-rename install: the old command + old marker, beside an unrelated user hook.
@@ -3593,6 +5065,27 @@ test('install: uninstallStatusline reverts ONLY our statusline, never a user cus
   assert.equal(JSON.parse(fs.readFileSync(sp, 'utf8')).statusLine.command, 'my-own-statusline.sh');
 });
 
+test('install: uninstallStatusline also removes what killed renders left beside the cache, by the status line\'s rule (2026-10-21)', () => {
+  // The status line sweeps them only while it runs, so after an uninstall nothing would. By the same rule: more than two
+  // minutes old, so a render still writing keeps its file, and never the lock, which a render may hold.
+  const home = freshHome();
+  delete process.env.CLAUDE_CONFIG_DIR;
+  const cdir = path.join(home, '.claude');
+  const now = Math.floor(Date.now() / 1000);
+  const lock = path.join(cdir, 'statusline-last.json.lock');
+  fs.mkdirSync(path.join(lock, `${now - 600}.900000007.1`), { recursive: true });
+  fs.utimesSync(lock, now - 600, now - 600);
+  const sp = path.join(cdir, 'settings.json');
+  fs.writeFileSync(path.join(cdir, 'statusline.sh'), '#!/bin/bash\n');
+  fs.writeFileSync(sp, JSON.stringify({ statusLine: { type: 'command', command: 'bash ' + path.join(cdir, 'statusline.sh') } }));
+  const l = leftovers(cdir, now);
+  l.seed();
+  const r = core.uninstallStatusline(sp);
+  assert.ok(r.changed && r.scriptRemoved, 'control: ours is reverted');
+  assert.deepEqual(l.left(), l.kept, 'the temporary files and aside lock more than two minutes old are removed, and nothing else');
+  assert.deepEqual(fs.existsSync(lock) && fs.readdirSync(lock), [`${now - 600}.900000007.1`], 'nor the lock, whatever its age');
+});
+
 test('install: hooks merged non-destructively, idempotent, and reversible', () => {
   const home = freshHome();
   fs.mkdirSync(path.join(home, '.claude'), { recursive: true });
@@ -3616,6 +5109,46 @@ test('install: hooks merged non-destructively, idempotent, and reversible', () =
   assert.ok(core.uninstallHooks().changed);
   assert.equal(core.hooksInstalled(), false);
   assert.deepEqual(JSON.parse(fs.readFileSync(sp, 'utf8')).permissions.allow, ['WebSearch']);
+});
+
+test('install: a settings.json that begins with a byte order mark is read past it, and every write keeps it first (2026-10-07)', (t) => {
+  // JSON.parse refuses the mark: `oak init` called such a file invalid JSON, `oak status` found no hooks in it,
+  // `oak uninstall` could not parse it, and the bundled status line's installer rewrote it without the mark.
+  const home = freshHome();
+  delete process.env.CLAUDE_CONFIG_DIR;
+  const dir = path.join(home, '.claude');
+  fs.mkdirSync(dir, { recursive: true });
+  const sp = path.join(dir, 'settings.json');
+  fs.writeFileSync(sp, '\uFEFF' + JSON.stringify({ permissions: { allow: ['WebSearch'] } }, null, 2) + '\n');
+  const marked = () => { const text = fs.readFileSync(sp, 'utf8'); return [text.startsWith('\uFEFF{'), (text.match(/\uFEFF/g) || []).length]; };
+  const cmd = 'oak capture #oak-observatory-hook';
+  assert.equal(core.installHooks(cmd).changed, true);
+  assert.deepEqual(marked(), [true, 1], 'installed, with the mark still first, once');
+  assert.equal(core.hooksInstalled(), true);
+  assert.equal(core.installedHookCommand(), cmd);
+  assert.deepEqual(core.missingHookEvents(sp), []);
+  assert.equal(core.installHooks(cmd).changed, false, 'a re-init finds them');
+  assert.equal(core.diagnose({ cwd: home }).find((c) => c.id === 'settings-json').level, 'ok');
+  assert.deepEqual(JSON.parse(fs.readFileSync(sp + '.bak', 'utf8').slice(1)).permissions, { allow: ['WebSearch'] }, 'the backup is the file as it was');
+  assert.equal(core.uninstallHooks().changed, true);
+  assert.deepEqual([...marked(), core.hooksInstalled()], [true, 1, false]);
+  // The bundled status line: its installer keeps the mark too, and core then knows the status line is ours.
+  if (process.platform === 'win32') return t.skip('executing the installer needs bash and jq');
+  const env = { ...process.env, HOME: home, USERPROFILE: home };
+  const r = cp.spawnSync('bash', [path.resolve(__dirname, '../../cli/statusline/install-statusline.sh')], { env, encoding: 'utf8' });
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(marked(), [true, 1], 'the installer keeps the mark first, once');
+  const settings = JSON.parse(fs.readFileSync(sp, 'utf8').slice(1));
+  assert.deepEqual([settings.permissions, /statusline\.sh/.test(settings.statusLine.command)], [{ allow: ['WebSearch'] }, true]);
+  assert.equal(core.statuslineInstalled(), true);
+  assert.equal(cp.spawnSync('bash', [path.resolve(__dirname, '../../cli/statusline/install-statusline.sh')], { env, encoding: 'utf8' }).status, 0, 'a refresh over ours');
+  assert.deepEqual(marked(), [true, 1]);
+  assert.equal(core.uninstallStatusline(sp).changed, true);
+  assert.deepEqual([...marked(), JSON.parse(fs.readFileSync(sp, 'utf8').slice(1)).statusLine], [true, 1, undefined]);
+  // Control: a file without the mark gets none.
+  fs.writeFileSync(sp, '{}\n');
+  core.installHooks(cmd);
+  assert.equal(fs.readFileSync(sp, 'utf8').startsWith('{'), true);
 });
 
 test('install: isOurCommand uses the stable marker (path-independent) + legacy fallbacks', () => {
@@ -3705,7 +5238,7 @@ test('contract 0.8.0: every machine surface the editors consume emits its docume
   const home = freshHome();
   delete process.env.CLAUDE_CONFIG_DIR;
   const ws = tmpWork();
-  fs.mkdirSync(path.join(ws, '.git'), { recursive: true }); // a plain .git dir → commonDir resolves → fleet/worktree paths engage
+  makeGitDir(path.join(ws, '.git')); // a plain .git dir → commonDir resolves → fleet/worktree paths engage
   const demo = await core.runDemo({ fast: true, cwd: ws });
   const env = { ...process.env, HOME: home, USERPROFILE: home, CLAUDE_OBSERVATORY_SESSION: demo.session };
   const runJson = (args) => JSON.parse(cp.execFileSync('node', [CLI, ...args], { env, cwd: ws, encoding: 'utf8' }));
@@ -3739,7 +5272,7 @@ test('contract 0.8.0: every machine surface the editors consume emits its docume
   hasKeys(cm.edits[0], ['id', 'rel', 'module', 'file', 'added', 'removed', 'status', 'ts', 'agent', 'risk', 'reasoning', 'taskId', 'subagentId', 'workflowId'], 'changemap.edits[]');
   hasKeys(cm.workflows[0], ['id', 'name', 'running', 'rollup', 'files', 'taskIds'], 'changemap.workflows[]');
   hasKeys(cm.agents[0], ['session', 'worktree', 'gitBranch', 'phase', 'lastMs', 'summary', 'files', 'modules'], 'changemap.agents[]');
-  // Per-sibling `edits` is deliberately projected out: 1.95 MB of a 3.30 MB payload that no renderer
+  // Per-sibling `edits` is deliberately projected out: most of the payload, which no renderer
   // read. The ACTIVE session's own top-level edits stay — that is the list tools consume.
   assert.ok(!('edits' in cm.agents[0]), 'changemap.agents[] carries no per-sibling edit list');
   assert.ok(Array.isArray(cm.edits), 'the session\'s own edits are untouched');
@@ -3982,7 +5515,7 @@ test('store: clearResolved keeps a pending edit that shares a blob with a remove
   assert.equal(fs.readFileSync(F, 'utf8'), 'B\n');
 });
 
-test('store: clearResolved on an all-resolved session empties the log, GCs all blobs, resets nextId', () => {
+test('store: clearResolved on an all-resolved session empties the log and GCs all blobs; ids are not reused', () => {
   freshHome();
   const S = 'allresolved';
   const F = path.join(tmpWork(), 'f.txt');
@@ -3993,7 +5526,7 @@ test('store: clearResolved on an all-resolved session empties the log, GCs all b
   assert.equal(core.clearResolved(S), 2);
   assert.equal(core.readLog(S).length, 0, 'log emptied');
   assert.equal(fs.readdirSync(path.join(core.storeDir(S), 'blobs')).length, 0, 'all blobs GCd');
-  assert.equal(core.nextId(S), 1, 'nextId resets to 1 on an empty log');
+  assert.equal(core.nextId(S), 3, 'nextId continues past the cleared edits: a delete confirmed before the clear counted them');
 });
 
 test('undo: a KEPT (non-pending) edit can still be undone', () => {
@@ -4242,8 +5775,8 @@ test('install: the ledger records every file written; uninstall cleans them all;
   delete process.env.CLAUDE_CONFIG_DIR;
   fs.mkdirSync(path.join(home, '.claude'), { recursive: true });
   const cmd = 'claude-observatory capture #claude-observatory-hook';
-  const projA = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-proj-'));
-  const projB = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-proj-'));
+  const projA = tmpDir('cc-proj-');
+  const projB = tmpDir('cc-proj-');
   core.installHooks(cmd); // user scope
   core.installHooks(cmd, core.projectSettingsPath(projA));
   core.installHooks(cmd, core.projectSettingsPath(projB));
@@ -4256,7 +5789,7 @@ test('install: the ledger records every file written; uninstall cleans them all;
   assert.deepEqual(core.allStoreSessionIds(), [], 'the ledger is not a prunable session husk');
   const st = core.installStatus();
   assert.equal(st.length, 3);
-  assert.equal(core.HEALTHY_HOOK_ENTRIES, 8, 'eight events: the capture pair, the attention pair (2026-09-02), the structured pair (2026-09-15), SessionEnd lowering the hand (2026-09-23), PostToolUseFailure claiming a failed tool\'s snapshot (2026-09-26)');
+  assert.equal(core.HEALTHY_HOOK_ENTRIES, 9, 'nine events: the capture pair, the attention pair (2026-09-02), the structured pair (2026-09-15), SessionEnd lowering the hand (2026-09-23), PostToolUseFailure claiming a failed tool\'s snapshot (2026-09-26), SubagentStop lowering a finished subagent\'s prompts (2026-09-29)');
   assert.ok(st.every((r) => r.installed && r.entries === core.HEALTHY_HOOK_ENTRIES), 'healthy: one entry per event per file');
   // One project's repo disappears. Repair reports it, forgets it, and never re-creates it.
   fs.rmSync(projB, { recursive: true, force: true });
@@ -4472,9 +6005,23 @@ function assistantMsg(ts, extra = {}) {
     },
   };
 }
-const statsCachePath = () => path.join(os.homedir(), '.claude', 'claude-observatory', 'stats-cache.json');
+/** The Stats cache this build writes in `dir`, or undefined. Named by its version (so an older build running beside this
+ *  one keeps its own), and found here by that shape rather than by a version written into the test. */
+const statsCacheIn = (dir) => {
+  try {
+    const name = fs.readdirSync(dir).find((n) => /^stats-cache-v\d+\.json$/.test(n));
+    return name && path.join(dir, name);
+  } catch {
+    return undefined;
+  }
+};
+const statsCachePath = () => statsCacheIn(path.join(os.homedir(), '.claude', 'claude-observatory'));
 
-test('stats: cache reused when unchanged, invalidated on mtime change, pruned for deleted files', () => {
+test('stats: cache reused when unchanged, invalidated on mtime change, pruned for deleted files', (fallbackTest) => {
+  // These exercise the transcript fallback; database history has its own account-union tests.
+  const databaseMode = process.env.OAK_INDEX;
+  process.env.OAK_INDEX = 'off';
+  fallbackTest.after(() => { if (databaseMode === undefined) delete process.env.OAK_INDEX; else process.env.OAK_INDEX = databaseMode; });
   const home = freshHome();
   delete process.env.CLAUDE_CONFIG_DIR;
   const now = Date.now();
@@ -4517,7 +6064,11 @@ test('stats: cache reused when unchanged, invalidated on mtime change, pruned fo
   assert.equal(files[B], undefined, 'deleted transcript pruned from the cache');
 });
 
-test('stats: a stale-day hourly block is pruned from the cache on the next day', () => {
+test('stats: a stale-day hourly block is pruned from the cache on the next day', (fallbackTest) => {
+  // These exercise the transcript fallback; database history has its own account-union tests.
+  const databaseMode = process.env.OAK_INDEX;
+  process.env.OAK_INDEX = 'off';
+  fallbackTest.after(() => { if (databaseMode === undefined) delete process.env.OAK_INDEX; else process.env.OAK_INDEX = databaseMode; });
   const home = freshHome();
   delete process.env.CLAUDE_CONFIG_DIR;
   const now = Date.now();
@@ -4531,7 +6082,11 @@ test('stats: a stale-day hourly block is pruned from the cache on the next day',
   assert.equal(st.hourly.reduce((a, h) => a + h.messages, 0), 0, 'no hourly messages for the new day');
 });
 
-test('stats: midnight boundary — 23:xx activity stays in yesterday, not today (injected nowMs)', () => {
+test('stats: midnight boundary — 23:xx activity stays in yesterday, not today (injected nowMs)', (fallbackTest) => {
+  // These exercise the transcript fallback; database history has its own account-union tests.
+  const databaseMode = process.env.OAK_INDEX;
+  process.env.OAK_INDEX = 'off';
+  fallbackTest.after(() => { if (databaseMode === undefined) delete process.env.OAK_INDEX; else process.env.OAK_INDEX = databaseMode; });
   const home = freshHome();
   delete process.env.CLAUDE_CONFIG_DIR;
   const t = new Date();
@@ -4553,7 +6108,11 @@ test('stats: midnight boundary — 23:xx activity stays in yesterday, not today 
   assert.equal(st.hourly.reduce((a, h) => a + h.editsPending + h.messages, 0), 0, 'hourly (today) is empty');
 });
 
-test('stats: daily series is DST-safe — no dropped day (spring) and no double-counted day (fall)', () => {
+test('stats: daily series is DST-safe — no dropped day (spring) and no double-counted day (fall)', (fallbackTest) => {
+  // These exercise the transcript fallback; database history has its own account-union tests.
+  const databaseMode = process.env.OAK_INDEX;
+  process.env.OAK_INDEX = 'off';
+  fallbackTest.after(() => { if (databaseMode === undefined) delete process.env.OAK_INDEX; else process.env.OAK_INDEX = databaseMode; });
   const oldTZ = process.env.TZ;
   try {
     process.env.TZ = 'America/New_York';
@@ -4584,7 +6143,11 @@ test('stats: daily series is DST-safe — no dropped day (spring) and no double-
   }
 });
 
-test('stats: inlined sidechain (subagent) turns are excluded from message/token counts', () => {
+test('stats: inlined sidechain (subagent) turns are excluded from message/token counts', (fallbackTest) => {
+  // These exercise the transcript fallback; database history has its own account-union tests.
+  const databaseMode = process.env.OAK_INDEX;
+  process.env.OAK_INDEX = 'off';
+  fallbackTest.after(() => { if (databaseMode === undefined) delete process.env.OAK_INDEX; else process.env.OAK_INDEX = databaseMode; });
   const home = freshHome();
   delete process.env.CLAUDE_CONFIG_DIR;
   const now = Date.now();
@@ -4605,7 +6168,11 @@ test('stats: inlined sidechain (subagent) turns are excluded from message/token 
   assert.equal(st.hourly[hr].messages, 1, 'hourly main-chain only');
 });
 
-test('stats: malformed usage values (strings) do not poison the sums', () => {
+test('stats: malformed usage values (strings) do not poison the sums', (fallbackTest) => {
+  // These exercise the transcript fallback; database history has its own account-union tests.
+  const databaseMode = process.env.OAK_INDEX;
+  process.env.OAK_INDEX = 'off';
+  fallbackTest.after(() => { if (databaseMode === undefined) delete process.env.OAK_INDEX; else process.env.OAK_INDEX = databaseMode; });
   const home = freshHome();
   delete process.env.CLAUDE_CONFIG_DIR;
   const now = Date.now();
@@ -4620,9 +6187,13 @@ test('stats: malformed usage values (strings) do not poison the sums', () => {
   assert.ok(Number.isFinite(st.windows.month.tokens), 'window sums stay numeric');
 });
 
-test('stats: transcriptFiles honors CLAUDE_CONFIG_DIR for the transcript scan', () => {
+test('stats: transcriptFiles honors CLAUDE_CONFIG_DIR for the transcript scan', (fallbackTest) => {
+  // These exercise the transcript fallback; database history has its own account-union tests.
+  const databaseMode = process.env.OAK_INDEX;
+  process.env.OAK_INDEX = 'off';
+  fallbackTest.after(() => { if (databaseMode === undefined) delete process.env.OAK_INDEX; else process.env.OAK_INDEX = databaseMode; });
   const home = freshHome();
-  const alt = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-cfg-'));
+  const alt = tmpDir('cc-cfg-');
   try {
     process.env.CLAUDE_CONFIG_DIR = alt;
     const now = Date.now();
@@ -4634,8 +6205,8 @@ test('stats: transcriptFiles honors CLAUDE_CONFIG_DIR for the transcript scan', 
     assert.equal(st.daily[29].messages, 1, 'transcripts read from CLAUDE_CONFIG_DIR');
     // Unified config dir: the store (and its stats-cache) now follows CLAUDE_CONFIG_DIR too, instead
     // of splitting the cache into the home ~/.claude while transcripts came from the relocated dir.
-    assert.ok(fs.existsSync(path.join(alt, 'claude-observatory', 'stats-cache.json')), 'cache lives under the relocated store dir');
-    assert.ok(!fs.existsSync(path.join(home, '.claude', 'claude-observatory', 'stats-cache.json')), 'not split back into home ~/.claude');
+    assert.ok(statsCacheIn(path.join(alt, 'claude-observatory')), 'cache lives under the relocated store dir');
+    assert.ok(!statsCacheIn(path.join(home, '.claude', 'claude-observatory')), 'not split back into home ~/.claude');
   } finally {
     delete process.env.CLAUDE_CONFIG_DIR;
   }
@@ -4740,7 +6311,7 @@ function dashFixture(over = {}) {
           {
             id: 'wf_fix',
             name: 'roadmap-deep-eval',
-            description: 'deep eval of the ADO roadmap',
+            description: 'deep eval of the CLI roadmap',
             phases: ['Find', 'Verify'],
             phaseGroups: [{ title: 'Find', done: 2, total: 2 }, { title: 'Verify', done: 1, total: 2 }],
             agents: [
@@ -4798,7 +6369,7 @@ test('session: the terminal front door — repo-scoped inside a repo, machine-wi
   freshHome();
   delete process.env.CLAUDE_CONFIG_DIR;
   const repo = fs.realpathSync(tmpWork());
-  fs.mkdirSync(path.join(repo, '.git')); // a workspace
+  makeGitDir(path.join(repo, '.git')); // a workspace
   const desk = fs.realpathSync(tmpWork()); // no .git — "$HOME/Desktop"
   const write = (cwd, id, ts) => {
     const proj = core.projectDir(cwd);
@@ -4819,6 +6390,9 @@ test('session: the terminal front door — repo-scoped inside a repo, machine-wi
   write(other, 'liveNow0', 2_000_000); // the machine-wide newest, in a different workspace
   assert.equal(core.defaultTuiSession(repo), 'repoOld0', 'inside a repo, the workspace rules — even with newer activity elsewhere');
   assert.equal(core.defaultTuiSession(desk), 'liveNow0', 'outside any repo, the machine-wide newest wins over ancestor leftovers');
+  // `oak tui --root <dir>` NAMES a workspace: its own session, repo or not, never the newest elsewhere.
+  assert.equal(core.defaultTuiSession(desk, true), 'deskStale0', 'a named workspace outside any repo keeps its own session');
+  assert.equal(core.defaultTuiSession(fs.realpathSync(tmpWork()), true), null, 'a named workspace with no session adopts none from elsewhere');
 });
 
 test('tui/claude: the live tail renders — status row, feed rows, and the hint only when quiet', () => {
@@ -4859,16 +6433,16 @@ test('tui/claude: the live tail renders — status row, feed rows, and the hint 
   assert.match(frame, /Edit src\/a\.ts/, 'a tool call lands in the tail');
   assert.match(frame, /now the tests/, 'assistant reasoning lands in the tail');
   assert.match(frame, /Bash npm test/, 'a failed call still shows');
-  assert.ok(!/F1 again/.test(frame), 'a live tail spends no row on the resume hint');
+  assert.ok(!/F8 again/.test(frame), 'a live tail spends no row on the resume hint');
   const quiet = { ...live, views: { ...live.views, feed: { entries: [], mode: 'live' } } };
   const frame2 = tui.renderDashFrame(quiet, { cols: 120, rows: 48, color: false }).join('\n');
-  assert.match(frame2, /F1 again/, 'a quiet tail offers the door back to Claude');
+  assert.match(frame2, /F8 again/, 'a quiet tail offers the door back to Claude');
 });
 
 test('tui/changemap: aggregates by path prefix, so nothing is dropped and every row fits', () => {
   // A top-N ledger looks complete while hiding most of the churn — on a real session its top twenty
-  // rows covered 18.2%. A prefix tree instead guarantees that whatever is not on screen is still
-  // represented by a visible ancestor carrying its totals.
+  // rows covered less than a fifth of it. A prefix tree instead guarantees that whatever is not on
+  // screen is still represented by a visible ancestor carrying its totals.
   const files = [
     { rel: 'packages/core/src/observe.ts', added: 90, removed: 10, cnt: 4, pending: 2, kept: 2, undone: 0, risk: 1 },
     { rel: 'packages/core/src/memory.ts', added: 40, removed: 5, cnt: 2, pending: 0, kept: 2, undone: 0, risk: 0 },
@@ -5320,6 +6894,31 @@ test('codex: hook payloads drive the REAL capture — a Bash pair and a multi-fi
   assert.equal(meta.transcriptPath, base.transcript_path);
 });
 
+test('codex: agent.json is replaced whole (tmp + rename) and private (0600), never rewritten in place (0.11.0)', () => {
+  // Written in place, a reader could find it half written (no Codex session at all), and a new file took the default
+  // mode in a store whose files are all 0600.
+  freshHome();
+  delete process.env.CLAUDE_CONFIG_DIR;
+  const S = 'cx-agent-meta';
+  const cwd = tmpWork();
+  core.ensureStore(S);
+  const file = path.join(core.storeDir(S), 'agent.json');
+  fs.writeFileSync(file, JSON.stringify({ agent: 'codex', cwd, model: 'gpt-old', updated: 1 }));
+  fs.chmodSync(file, 0o644); // as an earlier build left it
+  const renamed = [];
+  const rename = fs.renameSync;
+  fs.renameSync = function (a, b, ...rest) { renamed.push(String(b)); return rename.call(this, a, b, ...rest); };
+  try {
+    core.handleCodexHookPayload({ session_id: S, cwd, hook_event_name: 'SessionStart', source: 'startup', model: 'gpt-new' });
+  } finally {
+    fs.renameSync = rename;
+  }
+  assert.equal(core.readCodexAgentMeta(S).model, 'gpt-new', 'control: the change is recorded');
+  assert.ok(renamed.includes(file), 'the new file is renamed over the old one');
+  if (process.platform !== 'win32') assert.equal(fs.statSync(file).mode & 0o777, 0o600, 'and is private');
+  assert.deepEqual(fs.readdirSync(core.storeDir(S)).filter((n) => n.startsWith('agent.json.')), [], 'no temporary file is left');
+});
+
 test('codex: Stop drops a Pre whose Post never came, so the next edit of that file is clean', () => {
   freshHome();
   const W = tmpWork();
@@ -5500,6 +7099,35 @@ test('models: plain init wires only when nothing chooses the model, and uninstal
   }
 });
 
+test('models: a byte order mark that opens config.toml stays first through init\'s wiring, `models use` and uninstall', () => {
+  // Codex refuses a config.toml that holds the mark anywhere else. Init's keys went in front of it when
+  // a table came first, and a rewritten first line dropped it.
+  const BOM = '\uFEFF';
+  const prevCodexHome = process.env.CODEX_HOME;
+  const ch = tmpWork();
+  process.env.CODEX_HOME = ch;
+  const cfgPath = path.join(ch, 'config.toml');
+  try {
+    const tableFirst = BOM + '[features]\nhooks = true\n';
+    fs.writeFileSync(cfgPath, tableFirst);
+    assert.equal(core.codexModelChoice(), null);
+    core.wireCodexModel('llama3.2:latest', true);
+    assert.equal(fs.readFileSync(cfgPath, 'utf8'),
+      `${BOM}model = "llama3.2:latest" ${core.CODEX_MODEL_MARKER}\nmodel_provider = "ollama" ${core.CODEX_MODEL_MARKER}\n[features]\nhooks = true\n`);
+    assert.equal(core.unwireCodexModel(), 'llama3.2:latest');
+    assert.equal(fs.readFileSync(cfgPath, 'utf8'), tableFirst, 'uninstall restores the file byte for byte, the mark first');
+
+    fs.writeFileSync(cfgPath, BOM + 'model = "gpt-5"\n\n[features]\nhooks = true\n');
+    core.wireCodexModel('qwen3');
+    const used = fs.readFileSync(cfgPath, 'utf8');
+    assert.equal(used, `${BOM}model = "qwen3"\n\nmodel_provider = "ollama"\n[features]\nhooks = true\n`);
+    assert.equal(require('smol-toml').parse(used).model, 'qwen3');
+  } finally {
+    if (prevCodexHome === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = prevCodexHome;
+  }
+});
+
 test('codex: installer — Orca manners on hooks.json, append-only trust state, verifiable uninstall', () => {
   freshHome();
   const prevCodexHome = process.env.CODEX_HOME;
@@ -5562,6 +7190,98 @@ test('codex: installer — Orca manners on hooks.json, append-only trust state, 
     const un2 = core.uninstallCodexHooks(core.isOurCommand);
     assert.equal(un2.hooksJson, 'removed');
     assert.ok(!fs.existsSync(core.codexHooksJsonPath()));
+  } finally {
+    if (prevCodexHome === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = prevCodexHome;
+  }
+});
+
+test('codex: a hook turned off in Codex stays off through a reinstall, and is reported apart from trust', () => {
+  freshHome();
+  const prevCodexHome = process.env.CODEX_HOME;
+  // A Windows path needs TOML escaping; a literal backslash exercises it on POSIX too.
+  const ch = path.join(tmpWork(), 'codex\\home');
+  fs.mkdirSync(ch, { recursive: true });
+  process.env.CODEX_HOME = ch;
+  try {
+    const command = `oak capture --agent codex #${core.HOOK_MARKER}`;
+    core.installCodexHooks(command, core.isOurCommand);
+    const cfg = path.join(ch, 'config.toml');
+    const table = (ev) => `[hooks.state.${JSON.stringify(core.codexHookKey(core.codexHooksJsonPath(), ev, 0))}]`;
+    const states = () => require('smol-toml').parse(fs.readFileSync(cfg, 'utf8')).hooks.state;
+    const state = (ev) => states()[core.codexHookKey(core.codexHooksJsonPath(), ev, 0)];
+    // Turning a hook off in Codex writes `enabled = false` into that hook's state table.
+    const text = fs.readFileSync(cfg, 'utf8');
+    const at = text.indexOf(table('PostToolUse'));
+    assert.ok(at >= 0, 'the TOML-escaped PostToolUse table is found before changing its switch');
+    const end = text.indexOf('\n', text.indexOf('trusted_hash', at));
+    fs.writeFileSync(cfg, text.slice(0, end) + '\nenabled = false' + text.slice(end));
+    let st = core.codexHooksStatus(core.isOurCommand);
+    assert.equal(st.trust, 'trusted', 'every hash still matches: a hook the person turned off is not a trust problem');
+    assert.deepEqual(st.userDisabled, ['PostToolUse']);
+    // An install over it changes nothing, and leaves the switch where it was.
+    const before = fs.readFileSync(cfg, 'utf8');
+    assert.equal(core.installCodexHooks(command, core.isOurCommand).stateWritten, false);
+    assert.equal(fs.readFileSync(cfg, 'utf8'), before);
+    // A hash that drifted is reinstalled, which rewrites OAK's tables: the switch comes along.
+    const drift = (t) => t.replace(/(:stop:0:0"\]\ntrusted_hash = "sha256:)[0-9a-f]{8}/, (_, head) => head + '00000000');
+    fs.writeFileSync(cfg, drift(before));
+    assert.equal(core.codexHooksStatus(core.isOurCommand).trust, 'partial', 'the drifted hash is what reads as untrusted');
+    assert.equal(core.installCodexHooks(command, core.isOurCommand).stateWritten, true);
+    assert.equal(state('PostToolUse').enabled, false, 'the hook the person turned off stays off');
+    assert.equal(state('Stop').enabled, undefined);
+    st = core.codexHooksStatus(core.isOurCommand);
+    assert.equal(st.trust, 'trusted');
+    assert.deepEqual(st.userDisabled, ['PostToolUse']);
+    // A hook turned back on in Codex (`enabled = true`) keeps that too.
+    fs.writeFileSync(cfg, drift(fs.readFileSync(cfg, 'utf8').replace('enabled = false', 'enabled = true')));
+    core.installCodexHooks(command, core.isOurCommand);
+    assert.equal(state('PostToolUse').enabled, true);
+    assert.deepEqual(core.codexHooksStatus(core.isOurCommand).userDisabled, []);
+  } finally {
+    if (prevCodexHome === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = prevCodexHome;
+  }
+});
+
+test('codex: a byte order mark that opens config.toml stays first, once, through install, reinstall and uninstall', () => {
+  freshHome();
+  const prevCodexHome = process.env.CODEX_HOME;
+  const ch = tmpWork();
+  process.env.CODEX_HOME = ch;
+  const BOM = '\uFEFF';
+  const cfg = path.join(ch, 'config.toml');
+  const marked = () => {
+    const text = fs.readFileSync(cfg, 'utf8');
+    assert.ok(text.startsWith(BOM) && text.lastIndexOf(BOM) === 0, JSON.stringify(text.slice(0, 80)));
+    require('smol-toml').parse(text);
+    return text;
+  };
+  try {
+    const command = `oak capture --agent codex #${core.HOOK_MARKER}`;
+    for (const original of [BOM + '[features]\nhooks = true\n', BOM + 'model = "gpt-5"\n']) {
+      fs.writeFileSync(cfg, original);
+      core.installCodexHooks(command, core.isOurCommand);
+      assert.ok(marked().startsWith(original), 'every original byte survives, the mark first');
+      assert.equal(core.codexHooksStatus(core.isOurCommand).trust, 'trusted');
+      core.uninstallCodexHooks(core.isOurCommand);
+      assert.ok(!marked().includes('[hooks.state'));
+    }
+    // OAK's own table first: a file of OAK's tables saved again with the mark. A reinstall rewrites that
+    // table and an uninstall removes it; the mark stayed with it.
+    fs.writeFileSync(cfg, '');
+    core.installCodexHooks(command, core.isOurCommand);
+    fs.writeFileSync(cfg, BOM + fs.readFileSync(cfg, 'utf8').replace(/trusted_hash = "sha256:[0-9a-f]{8}/, 'trusted_hash = "sha256:00000000'));
+    assert.equal(core.installCodexHooks(command, core.isOurCommand).stateWritten, true);
+    marked();
+    assert.equal(core.codexHooksStatus(core.isOurCommand).trust, 'trusted');
+    core.uninstallCodexHooks(core.isOurCommand);
+    assert.equal(marked(), BOM + '\n');
+    // A file of the mark alone, which the blank-line trim took with it.
+    fs.writeFileSync(cfg, BOM);
+    core.installCodexHooks(command, core.isOurCommand);
+    marked();
+    assert.equal(core.codexHooksStatus(core.isOurCommand).trust, 'trusted');
   } finally {
     if (prevCodexHome === undefined) delete process.env.CODEX_HOME;
     else process.env.CODEX_HOME = prevCodexHome;
@@ -5667,6 +7387,158 @@ test('cli: `views --serve` answers batches over stdin — warm worker, one JSON 
   assert.equal(await exited, 0, 'EOF exits 0');
 });
 
+test('cli: `views --serve` follows a store another process moves, and leaves the old location as it was', async () => {
+  // The terminal app's warm worker kept the location it started with: after `oak store --move` it listed
+  // nothing, wrote `session-meta` back into the old location, and the move back there was then refused.
+  freshHome();
+  delete process.env.CLAUDE_CONFIG_DIR;
+  const S = 'serve-moved';
+  const cwd = tmpWork();
+  editHook(S, cwd, path.join(cwd, 'a.ts'), 'one\n', 'two\n');
+  const env = { ...process.env, HOME: os.homedir(), USERPROFILE: os.homedir() };
+  const def = core.rootDir();
+  const dest = path.join(tmpDir('serve-moved-'), 'observatory');
+  const child = cp.spawn('node', [CLI, 'views', '--serve'], { env, stdio: ['pipe', 'pipe', 'pipe'] });
+  let buf = '';
+  const waiters = [];
+  child.stdout.on('data', (d) => {
+    buf += d;
+    let i;
+    while ((i = buf.indexOf('\n')) >= 0 && waiters.length) {
+      const line = buf.slice(0, i);
+      buf = buf.slice(i + 1);
+      waiters.shift()(line);
+    }
+  });
+  const listed = () => new Promise((resolve) => {
+    waiters.push((line) => resolve(JSON.parse(line).list?.edits?.length));
+    child.stdin.write(JSON.stringify({ views: ['list', 'sessions'], args: ['--session', S, '--root', cwd] }) + '\n');
+  });
+  const oak = (...args) => cp.spawnSync('node', [CLI, ...args], { env, encoding: 'utf8' });
+  try {
+    assert.equal(await listed(), 1, 'the worker lists the edit');
+    assert.equal(oak('store', '--move', dest).status, 0, 'another process moves the store');
+    assert.equal(await listed(), 1, 'the same worker lists it from where it went');
+    assert.deepEqual(fs.readdirSync(def), ['prefs.json'], 'and writes nothing where it was');
+    const back = oak('store', '--default');
+    assert.equal(back.status, 0, `so the move back is not refused: ${back.stderr}`);
+    assert.equal(await listed(), 1, 'and the worker follows it back');
+  } finally {
+    const exited = new Promise((resolve) => child.on('exit', resolve));
+    child.stdin.end();
+    await exited;
+  }
+});
+
+test('store: rootDir stats prefs.json once per turn of the event loop, and sees a location written since', async () => {
+  // Called 3,000 times in one warm view batch over a 3,000-edit session: a stat per call put 17 ms on a 50 ms batch.
+  freshHome();
+  const prefs = core.prefsPath();
+  const moved = path.join(tmpDir('root-turn-'), 'observatory');
+  let stats = 0;
+  const realStat = fs.statSync;
+  const count = () => {
+    stats = 0;
+    fs.statSync = function (p, ...rest) {
+      if (String(p) === prefs) stats++;
+      return realStat.call(this, p, ...rest);
+    };
+  };
+  try {
+    count();
+    for (let i = 0; i < 1000; i++) core.rootDir();
+    assert.equal(stats, 1, 'one stat for a thousand calls in one turn');
+    // Written as another process writes it, with no clearRootMemo in this one: the next turn sees it.
+    fs.mkdirSync(path.dirname(prefs), { recursive: true });
+    fs.writeFileSync(`${prefs}.tmp`, JSON.stringify({ storeDir: moved }));
+    fs.renameSync(`${prefs}.tmp`, prefs);
+    await new Promise((resolve) => setImmediate(resolve));
+    count();
+    assert.equal(core.rootDir(), moved, 'the next turn follows the new location');
+    assert.equal(core.rootDir(), moved);
+    assert.equal(stats, 1, 'and stats it once');
+  } finally {
+    fs.statSync = realStat;
+  }
+});
+
+test('store: rootDir follows a location written within one tick of a coarse file system clock, and a new inode alone', async () => {
+  // FAT dates a write to 2 s and HFS+ to 1 s: two writes of one size in one tick, in place or onto a reused inode, left
+  // the stamp as it was, and a running process stayed on the old location.
+  freshHome();
+  const prefs = core.prefsPath();
+  const base = tmpDir('root-coarse-');
+  const [a, b, c] = ['a', 'b', 'c'].map((x) => path.join(base, `store-${x}`)); // one length, so one size
+  const turn = () => new Promise((resolve) => setImmediate(resolve));
+  fs.mkdirSync(path.dirname(prefs), { recursive: true });
+  const tick = new Date(Date.now() - 500); // this second, as such a file system dates it
+  fs.writeFileSync(prefs, JSON.stringify({ storeDir: a }));
+  fs.utimesSync(prefs, tick, tick);
+  await turn();
+  assert.equal(core.rootDir(), a, 'control: the first location');
+  const before = fs.statSync(prefs);
+  fs.writeFileSync(prefs, JSON.stringify({ storeDir: b })); // in place: the inode stays
+  fs.utimesSync(prefs, tick, tick);
+  const after = fs.statSync(prefs);
+  assert.deepEqual([after.ino, after.size, after.mtimeMs], [before.ino, before.size, before.mtimeMs], 'control: the stamp is as it was');
+  await turn();
+  let reads = 0;
+  const realRead = fs.readFileSync;
+  fs.readFileSync = function (f, ...rest) { if (String(f) === prefs) reads++; return realRead.call(this, f, ...rest); };
+  try {
+    assert.equal(core.rootDir(), b, 'a location written in the same tick is followed');
+    for (let i = 0; i < 1000; i++) core.rootDir();
+    assert.ok(reads <= 2, `and read once for the turn, not per call (${reads})`);
+  } finally {
+    fs.readFileSync = realRead;
+  }
+  // Older than any tick, the stamp is trusted: a new inode alone (a rename onto one size and one mtime) moves it.
+  const old = new Date(Date.now() - 60_000);
+  fs.utimesSync(prefs, old, old);
+  await turn();
+  assert.equal(core.rootDir(), b);
+  fs.writeFileSync(`${prefs}.tmp`, JSON.stringify({ storeDir: c }));
+  fs.utimesSync(`${prefs}.tmp`, old, old);
+  const was = fs.statSync(prefs);
+  fs.renameSync(`${prefs}.tmp`, prefs);
+  const now = fs.statSync(prefs);
+  assert.ok(now.ino !== was.ino && now.size === was.size && now.mtimeMs === was.mtimeMs, 'control: only the inode differs');
+  await turn();
+  assert.equal(core.rootDir(), c, 'a new inode alone is a new location');
+});
+
+test('store: a prefs.json that does not parse leaves a running process on the store where it is', async () => {
+  // Read as no preferences, a hand edit saved half done sent every running process to the default location until it
+  // parsed again: Review listed nothing, the views worker wrote its caches there, the focus server stopped and one started
+  // there, and `oak store --default` then refused the default as not empty.
+  freshHome();
+  const prefs = core.prefsPath();
+  const moved = path.join(tmpDir('root-unparsed-'), 'observatory');
+  // Written as another process writes it, with no clearRootMemo in this one.
+  const put = (text) => {
+    fs.mkdirSync(path.dirname(prefs), { recursive: true });
+    fs.writeFileSync(`${prefs}.tmp`, text);
+    fs.renameSync(`${prefs}.tmp`, prefs);
+  };
+  const turn = () => new Promise((resolve) => setImmediate(resolve));
+  put(JSON.stringify({ storeDir: moved }));
+  await turn();
+  assert.equal(core.rootDir(), moved, 'control: the moved location');
+  put(`{"storeDir": ${JSON.stringify(moved)},`);
+  await turn();
+  assert.equal(core.rootDir(), moved, 'a hand edit saved half done leaves the store where it was');
+  put('');
+  await turn();
+  assert.equal(core.rootDir(), moved, 'so does a file caught empty in the middle of a write');
+  put(JSON.stringify({ theme: 'mono' }));
+  await turn();
+  assert.equal(core.rootDir(), path.join(core.claudeConfigDir(), 'claude-observatory'), 'once it parses and names no location, the default');
+  fs.rmSync(prefs);
+  put(`{"storeDir": ${JSON.stringify(moved)},`);
+  core.clearRootMemo();
+  assert.equal(core.rootDir(), path.join(core.claudeConfigDir(), 'claude-observatory'), 'a process that never knew a location has only the default');
+});
+
 test('dashframe: every screen fits its budget at every width', () => {
   for (const screen of ['edits', 'map', 'prompts', 'tasks', 'workflows', 'agents', 'feed', 'audit']) {
     for (const [cols, rows] of [[40, 24], [80, 30], [120, 40], [200, 50]]) {
@@ -5697,7 +7569,7 @@ test('dashframe: the Workflows screen renders the per-phase breakdown, like both
 
   // Header: the run's state, the phase summary, and the DESCRIPTION (not the bare name — that is
   // what the editors show, and it is the half a human recognises).
-  const head = line(/deep eval of the ADO roadmap/);
+  const head = line(/deep eval of the CLI roadmap/);
   assert.ok(head, 'the run header carries the description');
   assert.match(head, /running/, 'and whether it is running');
   assert.match(head, /Find 2\/2 · Verify 1\/2/, 'and the phase summary, joined the way the editors join it');
@@ -5917,10 +7789,10 @@ test('dashframe: selection means something different on each screen, deliberatel
 
 test('watch: recursion is chosen by PLATFORM, never by try/catch', () => {
   // The only instrument that can catch this. Node does not throw for a recursive watch on Linux — since
-  // v19.1 it silently substitutes a per-FILE watcher that opens one handle per file (11,401 measured on
-  // an 11k-file store) and emits a synthetic event for each during its walk. A try/catch waiting to
-  // select the poll fallback therefore never fires, and a runtime probe on a macOS CI machine cannot
-  // observe any of it. A pure predicate can.
+  // v19.1 it silently substitutes a per-FILE watcher that opens one handle per file (thousands on a
+  // store of thousands of files) and emits a synthetic event for each during its walk. A try/catch
+  // waiting to select the poll fallback therefore never fires, and a runtime probe on a macOS CI
+  // machine cannot observe any of it. A pure predicate can.
   assert.equal(core.nativeRecursive('linux'), false, 'Linux must NOT take the recursive path');
   assert.equal(core.nativeRecursive('darwin'), true);
   assert.equal(core.nativeRecursive('win32'), true);
@@ -5945,21 +7817,88 @@ test('watch: the store filter accepts logs and rejects the read path own writes'
   }
 });
 
-test('watch: a missing root degrades to polling and says so', async () => {
+test('watch: a folder that is not there yet is waited for, not reported, and watched once it appears', async () => {
+  // A fresh machine has no projects folder and no store (capture makes it), and a workspace no agent ran in has no
+  // project folder of its own: each was reported as ENOENT on the status row and gave the whole root up to polling,
+  // the projects folder too when only the workspace's own folder was missing. Both ways of watching: a fanout of
+  // folders (Linux), and one recursive watch of the root (macOS, Windows), chosen here by the platform it reports.
+  // Events are asserted for this platform's own way only. Elsewhere Node stands in for the OS's recursive watch, and
+  // unlike the OS's it starts on a folder that is not there; it is made to refuse one, as macOS and Windows do.
+  const own = core.nativeRecursive() ? 'darwin' : 'linux';
+  const realWatch = fs.watch;
+  for (const platform of ['linux', 'darwin']) {
+    freshHome();
+    const root = path.join(tmpWork(), 'not-yet');
+    const seen = [], degrades = [];
+    const real = Object.getOwnPropertyDescriptor(process, 'platform');
+    Object.defineProperty(process, 'platform', { value: platform });
+    if (platform !== own) {
+      fs.watch = function (p, ...rest) {
+        if (!fs.existsSync(p)) throw Object.assign(new Error(`ENOENT: no such file or directory, watch '${p}'`), { code: 'ENOENT' });
+        return realWatch.call(this, p, ...rest);
+      };
+    }
+    let w;
+    try {
+      w = core.createWatcher({
+        roots: [{ dir: root, kind: 'store', relevant: (f) => f !== null && path.basename(f) === 'log.jsonl', fanout: (d) => [d, path.join(d, 's1'), path.join(d, 'never')] }],
+        onChange: (kind) => seen.push(kind),
+        onDegrade: (d, why) => degrades.push(`${d}: ${why}`),
+      });
+    } finally {
+      Object.defineProperty(process, 'platform', real);
+    }
+    try {
+      assert.deepEqual(degrades, [], `${platform}: nothing is reported`);
+      assert.notEqual(w.stats()[0].mode, 'poll', `${platform}: and the root is not given up to polling`);
+      fs.mkdirSync(path.join(root, 's1'), { recursive: true });
+      const want = platform === 'linux' ? 2 : 1; // the root and s1, or the root alone
+      for (const end = Date.now() + 10_000; w.stats()[0].watchers < want && Date.now() < end;) await new Promise((r) => setTimeout(r, 25));
+      assert.equal(w.stats()[0].watchers, want, `${platform}: watched once it appears`);
+      for (let i = 0, end = Date.now() + 10_000; platform === own && !seen.includes('store') && Date.now() < end; i++) {
+        fs.appendFileSync(path.join(root, 's1', 'log.jsonl'), `{"id":${i}}\n`);
+        await new Promise((r) => setTimeout(r, 200));
+      }
+      if (platform === own) assert.ok(seen.includes('store'), `${platform}: and a write in it wakes a refresh`);
+      assert.deepEqual(degrades, [], `${platform}: a folder that never appears is still not reported`);
+    } finally {
+      w.close();
+      fs.watch = realWatch;
+    }
+  }
+});
+
+test('watch: a folder deleted and made again is watched again', { skip: core.nativeRecursive() && 'one recursive watch of the root, not a folder each (Linux)' }, async () => {
+  // A watcher stays on the folder it was given: deleted, it reports a rename of its own name and nothing after, and the
+  // folder made again at that path (a session's folder, the store moved away and back) was never watched again, since
+  // its path still had a watcher. A live view then stopped following that session.
   freshHome();
-  const gone = path.join(tmpWork(), 'no-such-dir');
-  const degrades = [];
+  const root = path.join(tmpWork(), 'store');
+  const s1 = path.join(root, 's1');
+  fs.mkdirSync(s1, { recursive: true });
+  const seen = [];
   const w = core.createWatcher({
-    roots: [{ dir: gone, kind: 'store', relevant: () => true }],
-    onChange: () => {},
-    onDegrade: (d, why) => degrades.push({ d, why }),
+    roots: [{ dir: root, kind: 'store', relevant: (f) => f !== null && path.basename(f) === 'log.jsonl', fanout: (d) => [d, ...(fs.existsSync(path.join(d, 's1')) ? [path.join(d, 's1')] : [])] }],
+    onChange: (kind) => seen.push(kind),
+    onDegrade: (d, why) => assert.fail(`${d}: ${why}`),
   });
   try {
-    // The store directory is created by capture, not by us, so a fresh machine genuinely has none.
-    // Failing silently here would mean a dashboard that never updates and never says why.
-    assert.equal(degrades.length, 1, 'the degradation is announced');
-    assert.equal(degrades[0].why, 'ENOENT');
-    assert.equal(w.stats()[0].mode, 'poll', 'and the root falls back to polling rather than going dark');
+    const wake = async (what) => {
+      seen.length = 0;
+      for (let i = 0, end = Date.now() + 8_000; !seen.length && Date.now() < end; i++) {
+        fs.appendFileSync(path.join(s1, 'log.jsonl'), `{"id":${i}}\n`);
+        await new Promise((r) => setTimeout(r, 200));
+      }
+      assert.ok(seen.length, what);
+    };
+    await wake('control: a write to the folder wakes a refresh');
+    fs.rmSync(s1, { recursive: true });
+    await new Promise((r) => setTimeout(r, 300));
+    fs.mkdirSync(s1);
+    // The write inside it, not the folder's own appearance in the root: a log written there must reach the watcher.
+    for (const end = Date.now() + 10_000; w.stats()[0].watchers < 2 && Date.now() < end;) await new Promise((r) => setTimeout(r, 25));
+    await new Promise((r) => setTimeout(r, core.STORE_DEBOUNCE_MS * 3));
+    await wake('a write to the folder made again wakes one too');
   } finally {
     w.close();
   }
@@ -6027,6 +7966,122 @@ test('textwidth: fitVisible holds the column budget and never leaks an attribute
   // Wrap, never ellipsize — the standing rule for content text.
   assert.deepEqual(tui.wrapVisible('one two three', 7), ['one two', 'three']);
   assert.ok(tui.wrapVisible('aaaaaaaaaa', 4).every((l) => tui.displayWidth(l) <= 4), 'a long word is hard-broken');
+});
+
+test('graphemes: a character ends after its accents, its skin tone, the emoji joined to it, its flag pair or its keycap mark', () => {
+  // A session title cut at 64 UTF-16 units showed `👨‍👩‍�…`: half a family, then half of the next emoji's surrogate pair.
+  // Intl.Segmenter knows where a character ends, and ends the process (SIGSEGV) on a Node with no full ICU data, so the
+  // rule is core's own. Here Intl.Segmenter throws if anything touches it.
+  const file = require.resolve('../dist/graphemes.js');
+  const { Segmenter } = Intl;
+  Intl.Segmenter = function () { throw new Error('Intl.Segmenter was used'); };
+  delete require.cache[file];
+  try {
+    const g = require('../dist/graphemes.js');
+    const hex = (cs) => cs.map((c) => [...c].map((ch) => ch.codePointAt(0).toString(16)).join(' '));
+    const cases = [
+      ['ab👨\u200d👩\u200d👧\u200d👦cd', ['a', 'b', '👨\u200d👩\u200d👧\u200d👦', 'c', 'd'], 'a family, joined by zero-width joiners'],
+      ['ab🇯🇵cd', ['a', 'b', '🇯🇵', 'c', 'd'], 'a flag, two regional indicators'],
+      ['🇯🇵🇺🇸🇺', ['🇯🇵', '🇺🇸', '🇺'], 'regional indicators pair from the first'],
+      ['ab👍🏽cd', ['a', 'b', '👍🏽', 'c', 'd'], 'an emoji and its skin tone'],
+      ['👩🏽\u200d💻!', ['👩🏽\u200d💻', '!'], 'a skin tone inside a joined sequence'],
+      ['ab1\ufe0f\u20e3cd', ['a', 'b', '1\ufe0f\u20e3', 'c', 'd'], 'a keycap: the digit, a variation selector, the enclosing mark'],
+      ['abe\u0301\u0302cd', ['a', 'b', 'e\u0301\u0302', 'c', 'd'], 'a letter and its combining marks'],
+      ['\u0301x', ['\u0301', 'x'], 'a mark with no letter before it is a character of its own'],
+      ['🏴\u{E0067}\u{E0062}\u{E0073}\u{E0063}\u{E0074}\u{E007F}!', ['🏴\u{E0067}\u{E0062}\u{E0073}\u{E0063}\u{E0074}\u{E007F}', '!'], 'a subdivision flag and its tags'],
+      ['a\r\nb', ['a', '\r\n', 'b'], 'a CRLF line break is one'],
+      ['a\u0301\nb', ['a\u0301', '\n', 'b'], 'a line break joins nothing'],
+      ['x\u200d\ny', ['x\u200d', '\n', 'y'], 'a joiner never joins a line break'],
+      ['é\u200d👩', ['é\u200d👩'], 'a joiner keeps the emoji after it, so no cut ends on one that joins'],
+      ['a\u200db\u200d c', ['a\u200d', 'b\u200d', ' ', 'c'], 'a joiner joins no letter or space after it, as in UAX #29'],
+      ['⛹\ufe0f\u200d♀\ufe0f!', ['⛹\ufe0f\u200d♀\ufe0f', '!'], 'nor does it leave out a symbol a joined sequence holds'],
+      ['\u06a9\u062a\u0627\u0628\u200c\u0647\u0627', ['\u06a9', '\u062a', '\u0627', '\u0628\u200c', '\u0647', '\u0627'], 'a non-joiner stays with the letter before it, as in UAX #29'],
+    ];
+    for (const [s, want, what] of cases) assert.deepEqual(hex(g.graphemes(s)), hex(want), what);
+    // Every cut, at every length: a head ends where a character does, and a tail starts where one does.
+    for (const [s] of cases) {
+      const ends = g.graphemes(s).reduce((at, c) => [...at, at[at.length - 1] + c.length], [0]);
+      for (let max = 0; max <= s.length + 1; max++) {
+        assert.equal(g.graphemeHead(s, max), s.slice(0, Math.max(...ends.filter((e) => e <= max))), `the head of ${JSON.stringify(s)} at ${max}`);
+        assert.equal(g.graphemeTail(s, max), s.slice(Math.min(...ends.filter((e) => e >= s.length - max))), `the tail of ${JSON.stringify(s)} at ${max}`);
+      }
+    }
+    // Two readings of one rule: the walk through a text (graphemes, graphemeEnd) and the test at one index from the code
+    // points around it (graphemeHead and graphemeTail, which step over one character instead of walking from the start).
+    // They agree at every index of texts drawn from the pieces above, controls, lone surrogates and astral marks.
+    const pool = ['a', ' ', '\n', '\r', '\x7f', '\x85', 'e\u0301', '\u0301', '\u200d', '\u200c', '\ufe0f', '\u20e3', '1', '👨', '👩', '👍', '🏽', '🇯', '🇵', '🇺',
+      '🏴', '\u{e0067}', '\u{e007f}', '❤', '漢', '\u{1d165}', '\u{e0100}', '\ud83d', '\udc68'];
+    let seed = 57;
+    const rand = (n) => { seed = (seed + 0x6d2b79f5) | 0; let t = Math.imul(seed ^ (seed >>> 15), 1 | seed); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) % n; };
+    let checked = 0;
+    for (let n = 0; n < 4000; n++) {
+      let s = '';
+      for (let k = 1 + rand(12); k > 0; k--) s += pool[rand(pool.length)];
+      const ends = new Set([0]);
+      for (let i = 0; i < s.length; ) ends.add((i = g.graphemeEnd(s, i)));
+      for (let i = 0; i <= s.length; i++, checked++) {
+        assert.equal(g.graphemeHead(s, i).length === i, ends.has(i), `a character ends at ${i} of ${JSON.stringify(s)}: the walk says ${ends.has(i)}`);
+        assert.equal(g.graphemeTail(s, s.length - i).length === s.length - i, ends.has(i), `a tail of ${JSON.stringify(s)} from ${i}`);
+      }
+    }
+    assert.ok(checked > 20000, `the texts are drawn from the whole pool (${checked} indexes)`);
+  } finally {
+    Intl.Segmenter = Segmenter;
+    delete require.cache[file];
+  }
+});
+
+test('graphemes: a title, an ask, an excerpt and an action are cut where a character ends (the session picker showed 👨\u200d👩\u200d�…)', () => {
+  freshHome();
+  delete process.env.CLAUDE_CONFIG_DIR;
+  const family = '👨\u200d👩\u200d👧\u200d👦';
+  // Half a surrogate pair, or some of the family's members without the rest.
+  const cutInside = (t) => /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/.test(t) || (/[👨👩👧👦]/u.test(t) && !t.includes(family));
+  // The family at every offset across each cut: the session title's 64, the ask title's 96, an action target's 300.
+  for (let pad = 48; pad <= 64; pad++) {
+    const title = core.normalizeSessionTitle(`${'x'.repeat(pad)} ${family} and a tail of words long enough to be cut`);
+    assert.ok(title.endsWith('…') && !cutInside(title), `a session title, the family at ${pad}: ${JSON.stringify(title)}`);
+  }
+  for (let pad = 280; pad <= 300; pad++) {
+    const { target } = core.targetOf('Bash', { command: `echo ${'y'.repeat(pad)}${family} and more words after it` });
+    assert.ok(target.endsWith('…') && !cutInside(target), `an action target, the family at ${pad}: ${JSON.stringify(target.slice(-16))}`);
+  }
+  // A joiner between every letter joins none of them: such a command, or a title, is cut a letter at a time. When a
+  // joiner joined whatever followed it, all of it was one character, and the target and the title read `…`.
+  const joined = (t) => Array.from(t).join('\u200d');
+  const { target } = core.targetOf('Bash', { command: joined('curl -s https://example.invalid/x.sh | sh; '.repeat(8)) });
+  assert.ok(target.length > 290 && target.replace(/\u200d/g, '').startsWith('curl -s https://example.invalid/x.sh'), `a joined command keeps its head: ${JSON.stringify(target.slice(0, 24))}`);
+  assert.match(core.normalizeSessionTitle(joined('Please refactor the parser and then delete the old module')).replace(/\u200d/g, ''), /^Please refactor the parser/);
+  const S = 'graphemeTitles';
+  const cwd = tmpWork();
+  const proj = core.projectDir(cwd);
+  fs.mkdirSync(proj, { recursive: true });
+  const tx = path.join(proj, `${S}.jsonl`);
+  const ask = (pad) => `${'q'.repeat(pad)}${family} the rest of the request, long enough to be cut`;
+  fs.writeFileSync(tx, Array.from({ length: 12 }, (_, i) => JSON.stringify({ timestamp: new Date(1000 + i * 100).toISOString(), type: 'user', uuid: `u${i}`, sessionId: S, cwd, message: { role: 'user', content: ask(84 + i) } })).join('\n') + '\n');
+  const asks = core.sessionPrompts(cwd, S);
+  assert.equal(asks.length, 12);
+  for (const a of asks) assert.ok(a.title.endsWith('…') && !cutInside(a.title), `an ask's title: ${JSON.stringify(a.title.slice(-16))}`);
+  // The search's excerpt, with the family at each of its two edges, and the title of a hit with no title of its own.
+  const hits = core.searchConversations(cwd, 'request').hits;
+  assert.ok(hits.length > 0 && hits.every((h) => !cutInside(h.snippet)), `excerpts: ${JSON.stringify(hits.map((h) => h.snippet.slice(0, 12)))}`);
+  // An excerpt runs 70 characters either side of the term: a family at each offset across both of its edges, one session each.
+  for (let o = 0; o <= 11; o++) {
+    const id = `graphemeHit${o}`;
+    fs.writeFileSync(path.join(proj, `${id}.jsonl`), JSON.stringify({ timestamp: new Date(1000).toISOString(), type: 'user', uuid: 'u0', sessionId: id, cwd,
+      message: { role: 'user', content: `${'w'.repeat(10)}${family}${'v'.repeat(59 + o)}needle${o}${'z'.repeat(69 - o)}${family} the end` } }) + '\n');
+    const hit = core.searchConversations(cwd, `needle${o}`).hits[0];
+    assert.ok(hit && !cutInside(hit.snippet), `the excerpt, the family at offset ${o}: ${JSON.stringify(hit?.snippet)}`);
+  }
+  // A title part a previous version cached, cut inside the family, is read again rather than shown.
+  fs.writeFileSync(tx, JSON.stringify({ timestamp: new Date(1000).toISOString(), type: 'user', uuid: 'u0', sessionId: S, cwd, message: { role: 'user', content: `${'x'.repeat(55)} ${family} and then a long tail of words` } }) + '\n');
+  const fresh = core.fastSessionTitle(tx, S);
+  assert.ok(!cutInside(fresh), `read now: ${JSON.stringify(fresh)}`);
+  const sidecar = path.join(core.rootDir(), 'session-meta', `${S}.json`);
+  const kept = JSON.parse(fs.readFileSync(sidecar, 'utf8'));
+  // Version 5 is the one before this cut: its parts could end inside an emoji.
+  fs.writeFileSync(sidecar, JSON.stringify({ ...kept, stamp: kept.stamp.replace(/^\d+\|/, '5|'), parts: { ...kept.parts, prompt: `${'x'.repeat(55)} 👨\u200d👩\u200d\ud83d…` } }));
+  assert.equal(core.fastSessionTitle(tx, S), fresh, 'a part cached by the previous version is read again');
 });
 
 test('memory: fileMemories agrees with fileMemory, and builds the index once', () => {
@@ -6111,8 +8166,8 @@ test('observe: every flag verdict fires, and only for its own trigger', () => {
 test('observe: an XXX-only edit earns the flag but not the follow-up step', () => {
   // The flag matches TODO|FIXME|XXX|HACK; the next step matches TODO|FIXME only. Both verdicts are
   // memoized off the same immutable blob pair, and collapsing them onto one boolean — the obvious
-  // simplification — silently puts "follow up on the TODO" on edits that never mention one. Measured
-  // against a real store, that was 38 invented follow-ups.
+  // simplification — silently puts "follow up on the TODO" on edits that never mention one. On a real
+  // store, that invented dozens of follow-ups.
   freshHome();
   const S = 'flagsplit';
   const marker = path.join(tmpWork(), 'marker.js');
@@ -6259,6 +8314,24 @@ test('semver: compareVersions / isNewer order releases correctly', () => {
   assert.equal(core.isNewer('0.3.0', '0.3.0'), false);
   assert.equal(core.isNewer('0.2.0', '0.3.0'), false, 'an older release is not "newer"');
   assert.deepEqual(core.parseVersion('v1.2.3-beta.1'), [1, 2, 3], 'prerelease suffix ignored');
+});
+
+test('semver: channelReason places an install against its channel in the version menus\' words', () => {
+  assert.equal(core.channelReason('0.11.0', '0.11.0'), 'current');
+  assert.equal(core.channelReason('0.11.0', '0.10.0'), 'update available');
+  assert.equal(core.channelReason('0.11.0', '0.12.0-dev.1'), 'not on this channel', 'an install above the channel is not current');
+  assert.equal(core.channelReason('0.11.0', '0.11.0-dev.3'), 'update available', 'the release is newer than its pre-releases');
+  assert.equal(core.channelReason(null, '0.11.0'), 'current', 'no known release: nothing to differ from');
+  // A local build (dev.0, a version no release carries) is offered nothing, whichever way the channel lies.
+  assert.equal(core.channelReason('0.11.0-dev.15', '0.11.0-dev.0'), 'local build');
+  assert.equal(core.channelReason('0.10.0', '0.11.0-dev.0'), 'local build');
+  assert.equal(core.channelReason(null, '0.11.0-dev.0'), 'local build');
+  assert.equal(core.channelReason('0.11.0-dev.0', '0.11.0-dev.0'), 'current', 'unless the channel serves exactly that');
+});
+
+test('semver: isLocalBuild is a dev.0 version, which CI never publishes', () => {
+  for (const v of ['0.11.0-dev.0', 'v0.11.0-dev.0', '0.11.0-dev.0+abc1234']) assert.equal(core.isLocalBuild(v), true, v);
+  for (const v of ['0.11.0-dev.1', '0.11.0-dev.15', '0.11.0', '0.11.0-dev', '0.11.0-dev.0.1', '0.11.0-rc.0', '', null, undefined]) assert.equal(core.isLocalBuild(v), false, String(v));
 });
 
 test('review: reviewSummary aggregates per file + acceptance rate; markdown exports', () => {
@@ -6773,7 +8846,7 @@ test('workflows: parseWorkflows aggregates a run — name/phases from the script
   assert.equal(w.description, 'A demo workflow', 'description from meta');
   assert.deepEqual(w.phases, ['Plan', 'Build'], 'phase titles from meta.phases');
   assert.equal(w.agentCount, 2);
-  // Summed per-workflow — the user asked explicitly for tokens + time + edits.
+  // Summed per workflow: tokens, time and edits.
   assert.equal(w.tokens, 450, 'Σtokens = 400 + 50');
   assert.equal(w.durationMs, 60000, 'Σtime = 60000 + 0');
   assert.equal(w.edits, 1, 'Σedits = 1 + 0');
@@ -6935,7 +9008,7 @@ test('metrics: sessionUsage sums main-chain tokens (deduped by message id, sidec
   const u = core.sessionUsage(cwd, S);
   // `total` is tokens PROCESSED ONCE: input + output + cacheCreation. It excludes exactly one
   // counter — `cacheRead`, the prompt read back every turn, which made the same context count once
-  // per turn (98.8% of the old blended figure). cacheCreation IS counted: those tokens were really
+  // per turn (nearly all of the old blended figure). cacheCreation IS counted: those tokens were really
   // processed, just written to cache. This definition is chosen to AGREE with Claude Code's own
   // display for the same run, because two tools disagreeing about one number is worse than either
   // being slightly off.
@@ -7488,9 +9561,62 @@ test('store: a forced unlocked-append duplicate id is reconciled on read — byI
 const BARE_FALSE = '[core]\n\tbare = false\n';
 const BARE_TRUE = '[core]\n\tbare = true\n';
 
+test('session: repoRoot ignores empty and incomplete .git directories, including an invalid nearer ancestor', () => {
+  const root = tmpWork();
+  const git = path.join(root, '.git');
+  fs.mkdirSync(git);
+  assert.equal(core.repoRoot(root), null, 'an empty marker is not a repository');
+  fs.writeFileSync(path.join(git, 'HEAD'), 'ref: refs/heads/main\n');
+  assert.equal(core.repoRoot(root), null, 'HEAD alone is not a repository');
+  makeGitDir(git);
+  fs.writeFileSync(path.join(git, 'HEAD'), 'not a reference\n');
+  assert.equal(core.repoRoot(root), null, 'objects and refs need a valid HEAD');
+  fs.writeFileSync(path.join(git, 'HEAD'), 'a'.repeat(40) + '\n');
+  assert.equal(core.repoRoot(root), root, 'a detached HEAD is valid');
+  const nested = path.join(root, 'nested');
+  fs.mkdirSync(path.join(nested, '.git'), { recursive: true });
+  assert.equal(core.repoRoot(nested), root, 'walk past an invalid marker to the valid ancestor');
+  fs.rmSync(path.join(git, 'refs'), { recursive: true });
+  assert.equal(core.repoRoot(root), null, 'refs must still exist on a later call');
+  fs.mkdirSync(path.join(git, 'refs'));
+  fs.rmSync(path.join(git, 'objects'), { recursive: true });
+  assert.equal(core.repoRoot(root), null, 'objects must exist too');
+});
+
+test('session: repoRoot accepts a worktree gitdir file with relative or absolute paths', () => {
+  const root = tmpWork();
+  const common = path.join(root, 'main', '.git');
+  makeGitDir(common);
+  const admin = path.join(common, 'worktrees', 'linked');
+  fs.mkdirSync(admin, { recursive: true });
+  fs.writeFileSync(path.join(admin, 'HEAD'), 'ref: refs/heads/linked\n');
+  fs.writeFileSync(path.join(admin, 'commondir'), '../..\n');
+  const linked = path.join(root, 'linked');
+  const sub = path.join(linked, 'sub');
+  fs.mkdirSync(sub, { recursive: true });
+  for (const target of [admin, path.relative(linked, admin)]) {
+    fs.writeFileSync(path.join(linked, '.git'), `gitdir: ${target}\n`);
+    assert.equal(core.repoRoot(sub), linked);
+    assert.equal(core.commonDir(sub), common);
+  }
+  fs.rmSync(path.join(admin, 'HEAD'));
+  assert.equal(core.repoRoot(sub), null, 'an invalid worktree target is not a repository');
+  fs.writeFileSync(path.join(linked, '.git'), 'unrelated file\n');
+  assert.equal(core.repoRoot(sub), null, 'an ordinary file is not a gitdir pointer');
+});
+
+test('session: repoRoot accepts a symbolic HEAD', { skip: process.platform === 'win32' && 'symlink permissions' }, () => {
+  const root = tmpWork();
+  makeGitDir(path.join(root, '.git'));
+  const head = path.join(root, '.git', 'HEAD');
+  fs.rmSync(head);
+  fs.symlinkSync('refs/heads/unborn', head);
+  assert.equal(core.repoRoot(root), root, 'the unborn branch need not exist');
+});
+
 test('session: repoRoot walks up from a subdir launch to the nearest .git', () => {
   const root = tmpWork();
-  fs.mkdirSync(path.join(root, '.git')); // dir-.git (a main working tree)
+  makeGitDir(path.join(root, '.git')); // dir-.git (a main working tree)
   const foo = path.join(root, 'packages', 'foo');
   fs.mkdirSync(foo, { recursive: true });
   assert.equal(core.repoRoot(foo), root, 'walks up from packages/foo to the repo root');
@@ -7498,10 +9624,35 @@ test('session: repoRoot walks up from a subdir launch to the nearest .git', () =
   assert.equal(core.repoRoot(tmpWork()), null, 'no .git anywhere up the tree → null');
 });
 
+test('session: repoRoot respects inherited Git ceilings in CLI children, while finding repositories below them', () => {
+  const outer = tmpWork();
+  makeGitDir(path.join(outer, '.git'));
+  const ceiling = path.join(outer, 'fixtures');
+  const workspace = path.join(ceiling, 'workspace');
+  fs.mkdirSync(workspace, { recursive: true });
+  const script = `console.log(JSON.stringify(require(${JSON.stringify(path.resolve(__dirname, '../dist'))}).repoRoot(process.cwd())))`;
+  const discover = (cwd, ceilings) => {
+    const r = cp.spawnSync(process.execPath, ['-e', script], { cwd, encoding: 'utf8',
+      env: { ...process.env, GIT_CEILING_DIRECTORIES: ceilings } });
+    assert.equal(r.status, 0, r.stderr);
+    return JSON.parse(r.stdout);
+  };
+  assert.equal(discover(workspace, ''), outer, 'control: the ancestor repository is visible');
+  assert.equal(discover(workspace, [path.join(outer, 'unrelated'), ceiling].join(path.delimiter)), null,
+    'a child inherits the discovery boundary, without the test bootstrap’s filesystem shim');
+  makeGitDir(path.join(ceiling, '.git'));
+  assert.equal(discover(workspace, ceiling), null, 'the ceiling itself is not searched while walking upward');
+  assert.equal(discover(ceiling, ceiling), ceiling, 'a repository in the starting directory still wins');
+  makeGitDir(path.join(workspace, '.git'));
+  const nested = path.join(workspace, 'nested');
+  fs.mkdirSync(nested);
+  assert.equal(discover(nested, ceiling), workspace, 'a repository below the boundary is still found');
+});
+
 test('session: commonDir for a main working tree (dir-.git) returns realpath of .git', () => {
   const root = tmpWork();
   const gitDir = path.join(root, '.git');
-  fs.mkdirSync(gitDir);
+  makeGitDir(gitDir);
   fs.writeFileSync(path.join(gitDir, 'config'), BARE_FALSE);
   const sub = path.join(root, 'sub', 'deep');
   fs.mkdirSync(sub, { recursive: true });
@@ -7515,7 +9666,9 @@ test('session: commonDir resolves a linked worktree (relative commondir) to the 
   const main = path.join(base, 'main');
   const gitDir = path.join(main, '.git');
   const admin = path.join(gitDir, 'worktrees', 'wtA');
+  makeGitDir(gitDir);
   fs.mkdirSync(admin, { recursive: true });
+  fs.writeFileSync(path.join(admin, 'HEAD'), 'ref: refs/heads/worktree\n');
   fs.writeFileSync(path.join(gitDir, 'config'), BARE_FALSE);
   fs.writeFileSync(path.join(admin, 'commondir'), '../..\n'); // relative → resolves to main/.git
   const wt = path.join(base, 'wtA');
@@ -7532,10 +9685,11 @@ test('session: commonDir resolves a linked worktree (relative commondir) to the 
 test('session: commonDir handles an absolute commondir (used as-is, not joined against admin dir)', () => {
   const base = tmpWork();
   const shared = path.join(base, 'shared.git');
-  fs.mkdirSync(shared, { recursive: true });
+  makeGitDir(shared);
   fs.writeFileSync(path.join(shared, 'config'), BARE_FALSE);
   const admin = path.join(base, 'admin', 'wtB'); // admin dir NOT under `shared`, so a wrong join would miss
   fs.mkdirSync(admin, { recursive: true });
+  fs.writeFileSync(path.join(admin, 'HEAD'), 'ref: refs/heads/worktree\n');
   fs.writeFileSync(path.join(admin, 'commondir'), shared + '\n'); // ABSOLUTE common path
   const wt = path.join(base, 'wtB');
   fs.mkdirSync(wt);
@@ -7547,7 +9701,7 @@ test('session: commonDir collapses symlinks via realpath (both sides match)', ()
   const base = tmpWork();
   const real = path.join(base, 'real');
   const gitDir = path.join(real, '.git');
-  fs.mkdirSync(gitDir, { recursive: true });
+  makeGitDir(gitDir);
   fs.writeFileSync(path.join(gitDir, 'config'), BARE_FALSE);
   const link = path.join(base, 'link');
   fs.symlinkSync(real, link); // link → real
@@ -7559,7 +9713,9 @@ test('session: commonDir guards the bare-repo edge (returns null)', () => {
   const base = tmpWork();
   const bare = path.join(base, 'bare.git');
   const admin = path.join(bare, 'worktrees', 'wtC');
+  makeGitDir(bare);
   fs.mkdirSync(admin, { recursive: true });
+  fs.writeFileSync(path.join(admin, 'HEAD'), 'ref: refs/heads/worktree\n');
   fs.writeFileSync(path.join(bare, 'config'), BARE_TRUE);
   fs.writeFileSync(path.join(admin, 'commondir'), '../..\n'); // → bare dir itself
   const wt = path.join(base, 'wtC');
@@ -7586,7 +9742,7 @@ test('session: commonDir returns null for a missing / pruned worktree admin dir'
 test('session: repoKeyForSession memoizes by sessionId (key survives worktree pruning)', () => {
   const root = tmpWork();
   const gitDir = path.join(root, '.git');
-  fs.mkdirSync(gitDir);
+  makeGitDir(gitDir);
   fs.writeFileSync(path.join(gitDir, 'config'), BARE_FALSE);
   const key = fs.realpathSync(gitDir);
   const sid = 'sess-cache-' + Date.now() + '-' + Math.random();
@@ -7636,7 +9792,9 @@ test('fleet: listRepoSiblings unions two worktree dirs of one repo (excludes an 
   const main = path.join(base, 'main');
   const gitDir = path.join(main, '.git');
   const admin = path.join(gitDir, 'worktrees', 'wtA');
+  makeGitDir(gitDir);
   fs.mkdirSync(admin, { recursive: true });
+  fs.writeFileSync(path.join(admin, 'HEAD'), 'ref: refs/heads/worktree\n');
   fs.writeFileSync(path.join(gitDir, 'config'), BARE_FALSE);
   fs.writeFileSync(path.join(admin, 'commondir'), '../..\n');
   const wtA = path.join(base, 'wtA');
@@ -7644,7 +9802,7 @@ test('fleet: listRepoSiblings unions two worktree dirs of one repo (excludes an 
   fs.writeFileSync(path.join(wtA, '.git'), `gitdir: ${admin}\n`);
   // An unrelated repo (its own .git) — must NOT be grouped with main/wtA.
   const other = path.join(base, 'other');
-  fs.mkdirSync(path.join(other, '.git'), { recursive: true });
+  makeGitDir(path.join(other, '.git'));
   assert.equal(core.commonDir(main), core.commonDir(wtA), 'sanity: main + wtA share a commonDir');
   assert.notEqual(core.commonDir(other), core.commonDir(main), 'sanity: other is a different repo');
 
@@ -7810,6 +9968,73 @@ function writePhaseTranscript(dir, name, records, ageMs) {
 const asstToolUse = (id, name, input) => ({ message: { role: 'assistant', content: [{ type: 'tool_use', id, name, input: input || {} }] } });
 const toolResult = (id, isError) => ({ message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, is_error: !!isError }] } });
 const asstEnd = (text) => ({ message: { role: 'assistant', stop_reason: 'end_turn', content: [{ type: 'text', text: text || 'Done.' }] } });
+
+// A pending call is awaiting permission only when the session says so: its permission prompt raises the session's hand,
+// naming the agent that asked. A command that simply runs stays working however long it runs. Staleness decides only
+// where no hook records the session (2026-11-02).
+test('actions: a pending call awaits permission only when the session\'s hand says so; a long command stays working', () => {
+  freshHome();
+  const proj = core.projectDir(tmpWork());
+  fs.mkdirSync(proj, { recursive: true });
+  const S = 'phase-hand';
+  // A failed call, then the call still without a result.
+  const main = writePhaseTranscript(proj, `${S}.jsonl`, [asstToolUse('t0', 'Bash', { command: 'npm ci' }), toolResult('t0', true),
+    asstToolUse('t1', 'Bash', { command: 'npm test' })], 60_000);
+  assert.deepEqual(core.agentPhaseDetail(main), { phase: 'awaiting-permission', confidence: 'heuristic' }, 'no hook records it: staleness is all there is');
+  core.ensureStore(S);
+  assert.deepEqual(core.agentPhaseDetail(main), { phase: 'working', confidence: 'high' }, 'its hooks record it, and no prompt is up: running');
+  core.writeAttention(S, { kind: 'permission', message: 'Bash', ts: Date.now() - 50_000 });
+  assert.deepEqual(core.agentPhaseDetail(main), { phase: 'awaiting-permission', confidence: 'high' }, 'its prompt is up');
+  // A subagent's prompt is its own: its call awaits permission, the main agent's running one does not.
+  core.clearAttention(S);
+  fs.mkdirSync(path.join(proj, S, 'subagents'), { recursive: true });
+  const sub = writePhaseTranscript(path.join(proj, S, 'subagents'), 'agent-a1.jsonl', [asstToolUse('s1', 'Bash', { command: 'rm -rf build' })], 60_000);
+  assert.equal(core.agentPhaseDetail(sub).phase, 'working', 'control: no prompt up');
+  core.writeAttention(S, { kind: 'permission', message: 'Bash', ts: Date.now() - 50_000 }, { key: 'k1', agent: 'a1' });
+  assert.equal(core.agentPhaseDetail(sub).phase, 'awaiting-permission');
+  assert.equal(core.agentPhaseDetail(main).phase, 'working', 'the main agent did not ask');
+  // An input wait under a call still running (an MCP server asking the person): the main agent waits for input.
+  core.writeAttention(S, { kind: 'input', message: 'The server needs a token', ts: Date.now() - 50_000 });
+  assert.deepEqual(core.agentPhaseDetail(main), { phase: 'awaiting-input', confidence: 'high' });
+  assert.equal(core.agentPhaseDetail(sub).phase, 'working', 'its worker\'s call runs on');
+  // The turn or the session ended with the call left without a result (its hooks lowered the hand to idle-done): nothing
+  // runs it now, so it reads as an ended turn, idle and then done. A worker runs on past its parent's turn.
+  core.writeAttention(S, { kind: 'idle-done', message: '', ts: Date.now() - 50_000 });
+  const past = new Date(Date.now() - 10 * 60_000);
+  fs.utimesSync(sub, past, past); // its worker quiet too, so the session works through none of its agents
+  assert.deepEqual(core.agentPhaseDetail(main), { phase: 'idle', confidence: 'heuristic' }, 'ended a minute ago');
+  fs.utimesSync(main, past, past);
+  assert.deepEqual(core.agentPhaseDetail(main), { phase: 'done', confidence: 'heuristic' }, 'ended ten minutes ago');
+  assert.equal(core.agentPhaseDetail(sub).phase, 'working', 'the worker\'s call is its own, and runs on');
+});
+
+// A hand raised before the newest call still without a result is not about that call: the prompt it stood for was
+// answered and the agent went on (Claude Code's hooks report no result of a call outside the capture matcher, such as a
+// WebFetch, so its prompt's hand stays up), or a turn the hooks saw stop went on (another hook refused the stop). Where
+// the records carry no time, the hand stands, as above (2026-11-03).
+test('actions: a hand raised before the newest call still without a result is not about it', () => {
+  freshHome();
+  const proj = core.projectDir(tmpWork());
+  fs.mkdirSync(proj, { recursive: true });
+  const S = 'phase-stale-hand';
+  core.ensureStore(S);
+  const at = (ago) => new Date(Date.now() - ago).toISOString();
+  const call = (id, name, ago) => ({ timestamp: at(ago), ...asstToolUse(id, name) });
+  const result = (id, ago) => ({ timestamp: at(ago), ...toolResult(id) });
+  const phase = (records) => core.agentPhaseDetail(writePhaseTranscript(proj, `${S}.jsonl`, records, 5_000));
+  core.writeAttention(S, { kind: 'permission', message: 'WebFetch', ts: Date.now() - 50_000 });
+  assert.deepEqual(phase([call('f1', 'WebFetch', 55_000)]), { phase: 'awaiting-permission', confidence: 'high' }, 'its prompt, raised after it');
+  assert.deepEqual(phase([call('f1', 'WebFetch', 55_000), result('f1', 40_000), call('r1', 'Read', 30_000)]),
+    { phase: 'working', confidence: 'high' }, 'the fetch was allowed and returned; the call after it runs');
+  assert.deepEqual(phase([call('old', 'Grep', 60_000), call('r1', 'Read', 30_000)]), { phase: 'working', confidence: 'high' },
+    'the newest call decides, not an older one left without a result');
+  assert.deepEqual(phase([call('f1', 'WebFetch', 55_000), call('r2', 'Read', 30_000), result('r2', 20_000)]),
+    { phase: 'awaiting-permission', confidence: 'high' }, 'a call that returned is not one still without a result');
+  core.writeAttention(S, { kind: 'idle-done', message: '', ts: Date.now() - 50_000 });
+  assert.deepEqual(phase([call('f1', 'WebFetch', 55_000)]), { phase: 'idle', confidence: 'heuristic' }, 'left without a result when its turn ended');
+  assert.deepEqual(phase([call('f1', 'WebFetch', 55_000), result('f1', 52_000), call('w2', 'WebFetch', 30_000)]),
+    { phase: 'working', confidence: 'high' }, 'the turn went on after its stop');
+});
 
 test('actions: agentPhase classifies working / awaiting-input / awaiting-permission / errored / idle / done', () => {
   freshHome();
@@ -8209,7 +10434,9 @@ test('taskLog: crossAgentTaskLog unions one logical task across two worktree sib
   const main = path.join(base, 'main');
   const gitDir = path.join(main, '.git');
   const admin = path.join(gitDir, 'worktrees', 'wtA');
+  makeGitDir(gitDir);
   fs.mkdirSync(admin, { recursive: true });
+  fs.writeFileSync(path.join(admin, 'HEAD'), 'ref: refs/heads/worktree\n');
   fs.writeFileSync(path.join(gitDir, 'config'), BARE_FALSE);
   fs.writeFileSync(path.join(admin, 'commondir'), '../..\n');
   const wtA = path.join(base, 'wtA');
@@ -8539,9 +10766,9 @@ test('fscache: a pure parse is memoized per (mtime,size) and invalidates when th
 test('fscache: one transcript is READ ONCE no matter how many derivations want it (read amplification)', () => {
   // The defect this guards: `cachedByFiles` memoizes derived VALUES per kind, so every kind still
   // missed once and each miss did its own `readFileSync(...).split('\n')` of the SAME transcript.
-  // Measured on a real cold `views changemap` before the shared raw-text layer existed: 5,458 whole-file
-  // reads over 2,085 paths, 1,739 MiB delivered for 482 MiB of unique bytes — 3.61x, with the biggest
-  // transcripts opened 6-9 times each. Amplification is invisible to every other test in this file
+  // On a real cold `views changemap` before the shared raw-text layer existed, thousands of whole-file
+  // reads delivered several times the unique bytes, with the biggest transcripts opened several times
+  // each. Amplification is invisible to every other test in this file
   // because the OUTPUT is identical either way; only counting the reads can see it.
   freshHome();
   const cwd = tmpWork();
@@ -8621,8 +10848,8 @@ test('fscache: one transcript is READ ONCE no matter how many derivations want i
 test('fscache: a transcript bigger than the whole budget is still read once (the oversized-file slot)', () => {
   // The regression this guards: the budget's "one file bigger than the whole budget → never retained"
   // rule silently reopened the read amplification it exists to close the moment a single live session
-  // outgrew it. A 102 MiB transcript retains ~204 MiB at 2 B/char, over the 192 MiB cap, so every
-  // derivation re-read and re-split it — measured: feed --json did 1,157 MiB of I/O, the transcript 8x.
+  // outgrew it. A transcript over 96 MiB retains more than the 192 MiB cap at 2 B/char, so every
+  // derivation re-read and re-split it: `feed --json` read such a transcript several times over.
   // A session only grows, so this is the common case. The oversized slot holds exactly that one file.
   freshHome();
   const cwd = tmpWork();
@@ -8971,7 +11198,7 @@ test('demo: the sibling agent makes a fleet — two rows of one repo, one live c
   freshHome();
   delete process.env.CLAUDE_CONFIG_DIR;
   const ws = fs.realpathSync(tmpWork());
-  fs.mkdirSync(path.join(ws, '.git'), { recursive: true }); // commonDir resolves ⇒ fleet correlation engages
+  makeGitDir(path.join(ws, '.git')); // commonDir resolves ⇒ fleet correlation engages
   const res = await core.runDemo({ fast: true, cwd: ws });
   assert.match(res.sibling, /^demo-[0-9a-f]{8}$/, 'the sibling is simulator-owned too, so cleanup reaches it');
 
@@ -9078,7 +11305,7 @@ test('demo: a symlinked workspace resolves to ONE project dir, so the sibling is
   freshHome();
   delete process.env.CLAUDE_CONFIG_DIR;
   const ws = fs.realpathSync(tmpWork());
-  fs.mkdirSync(path.join(ws, '.git'), { recursive: true });
+  makeGitDir(path.join(ws, '.git'));
   // The sibling records under projectDir(workspace), and a project dir is a mangling of the path
   // STRING — so resolving the workspace one way here and another way in cleanup mints two project dirs
   // and strands the sibling where no command can reach it, while --clean reports success.
@@ -9102,7 +11329,7 @@ test('demo: --no-fleet writes exactly one session', async () => {
   freshHome();
   delete process.env.CLAUDE_CONFIG_DIR;
   const ws = fs.realpathSync(tmpWork());
-  fs.mkdirSync(path.join(ws, '.git'), { recursive: true }); // a repo IS resolvable — the opt-out is what declines
+  makeGitDir(path.join(ws, '.git')); // a repo IS resolvable — the opt-out is what declines
   const res = await core.runDemo({ fast: true, cwd: ws, fleet: false });
   assert.equal(res.sibling, null);
   assert.equal(core.listRepoSiblings(ws, res.session).length, 1, 'just this session');
@@ -9128,7 +11355,7 @@ test('demoHeartbeat: bumps every demo transcript and writes nothing', async () =
   freshHome();
   delete process.env.CLAUDE_CONFIG_DIR;
   const ws = fs.realpathSync(tmpWork());
-  fs.mkdirSync(path.join(ws, '.git'), { recursive: true });
+  makeGitDir(path.join(ws, '.git'));
   const res = await core.runDemo({ fast: true, cwd: ws });
   // Backdate both transcripts past the 60s fleet-active window — the state a tour reaches mid-explanation.
   const stale = new Date(Date.now() - 5 * 60 * 1000);
@@ -9174,7 +11401,7 @@ test('tour: demoTour is a complete, well-formed script for both editors', () => 
   // 0.10.0: `feed` joined — the Timeline's Feed tab (the live/audit feed moved there from under
   // the Overview's detail), so the tour's feed step now names its real home.
   const VIEWS = new Set(['overview', 'prompts', 'review', 'stats', 'fileHistory', 'actions', 'observations', 'feed', 'editor']);
-  const TABS = ['sessions', 'fleet', 'workflows', 'tasks', 'processes'];
+  const TABS = ['sessions', 'fleet', 'tasks', 'processes', 'workflows'];
   const ANCHORS = new Set([
     'nav-tabs', 'folders-strip', 'files-ledger', 'summary-bar', 'feed', 'nav-axes', 'accept-prompt',
     'session-label', 'spotlight', 'prompts-list', 'session-picker',
@@ -9906,9 +12133,10 @@ test('capture: losing a file’s final newline is a real edit, not blank-line ch
 });
 
 test('capture: a Bash command that creates ZERO-BYTE files records no "+0 −0" rows', () => {
-  // The shape observed in a real store: 2,241 of 2,446 records had an EMPTY after-blob — postgres
-  // relation stubs from `initdb`, plus .Xauthority, .tig_history, btmp. Every one rendered as
-  // "+0 −0" with nothing behind it, so 91.6% of the review list was rows with nothing to review.
+  // A command run from the home directory can record thousands of files with an EMPTY after-blob (an
+  // `initdb` writes a database's relation stubs, and shells and desktops touch their own files). Every
+  // one rendered as "+0 −0" with nothing behind it, until rows with nothing to review filled most of
+  // the list.
   freshHome();
   const S = 'bash-empty';
   const cwd = tmpWork();
@@ -9953,10 +12181,10 @@ test('capture: an Edit that creates an empty file IS recorded — the guard is B
 });
 
 test('capture: Bash in $HOME snapshots nothing, and SAYS it captured nothing', () => {
-  // The observed damage: a real session that ran `install neovim` from the home directory recorded
-  // 2,445 Bash "edits" — .Xauthority, .CFUserTextEncoding, .bash_history, shell state — against one
-  // real Write. None were changes the agent made. The review list was 99.8% noise and the store held
-  // a snapshot of the user's home directory.
+  // The damage: an install run from the home directory records thousands of Bash "edits" (shell history
+  // and state, desktop files, caches) against the one file the agent wrote. None are changes the agent
+  // made, they bury the review list in noise, and the store holds a snapshot of the user's home
+  // directory.
   freshHome();
   const S = 'bash-home';
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'fakehome-'));
@@ -10224,7 +12452,7 @@ test('format: markdown tokenizer — the CLI slice, unclosed markers stay litera
 
 test('analyze: resolveClaudeBin precedence — configured > env > well-known paths > bare name', () => {
   const home = freshHome();
-  const fakeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-bin-'));
+  const fakeDir = tmpDir('cc-bin-');
   const fakeBin = path.join(fakeDir, 'claude');
   fs.writeFileSync(fakeBin, '#!/bin/sh\n', { mode: 0o755 });
   const OLD = process.env.CLAUDE_BIN;
@@ -10246,7 +12474,7 @@ test('analyze: resolveClaudeBin precedence — configured > env > well-known pat
 
 test('tasks: taskSnaps anchors a create via its result text, then snapshots each update', () => {
   freshHome();
-  const proj = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-tx-'));
+  const proj = tmpDir('cc-tx-');
   const tx = path.join(proj, 't.jsonl');
   fs.writeFileSync(tx, [
     JSON.stringify({ type: 'assistant', timestamp: '2026-07-17T10:00:00Z', message: { role: 'assistant', content: [
@@ -10652,6 +12880,8 @@ test('prompts: a prompt the person PASTED is an ask, a title, a first prompt and
   assert.equal(turns[0].update.content.text, want);
   // Typed words around a paste keep both parts, in order.
   assert.equal(core.unwrapPastedContent('see this:\n<pasted_content id="1">\nlog line\n</pasted_content id="1">\nthanks'), 'see this:\n\nlog line\n\nthanks');
+  // A closer must repeat its opener's attributes: one that does not is text the person pasted, and is kept.
+  assert.equal(core.unwrapPastedContent('<pasted_content id="5">x</pasted_content>y'), '<pasted_content id="5">x</pasted_content>y');
   // A paste whose CONTENTS open with a tag (HTML, XML, a merge marker) is still the person's.
   assert.equal(core.personPromptText('<pasted_content id="2">\n<div class="nav">menu overlaps</div>\n</pasted_content id="2">'), '<div class="nav">menu overlaps</div>');
   assert.equal(core.personPromptText('<pasted_content id="3">\nCaveat: this came from a log\n</pasted_content id="3">'), 'Caveat: this came from a log');
@@ -10722,8 +12952,8 @@ test('capture: a Bash tree over the file cap costs no blobs, and the skip marker
   assert.deepEqual(health.skipReasons.map((r) => r.count), [1]);
   assert.match(health.skipReasons[0].reason, /vendored/);
   // The same tree with `vendored/` gitignored: git would not track it, so the walk does not visit it —
-  // the command captures its real edit instead of overflowing (this repo's JetBrains cache dir carried
-  // 4,427 of 4,970 files and blocked every Bash capture here, 2026-09-23).
+  // the command captures its real edit instead of overflowing (a gitignored JetBrains cache directory
+  // that holds most of a repository's files blocked every Bash capture in it).
   const S2 = 'bash-gitignored';
   fs.writeFileSync(path.join(ws, '.gitignore'), 'vendored/\n');
   core.handleHookPayload({ session_id: S2, cwd: ws, tool_name: 'Bash', tool_input: { command: 'true' }, hook_event_name: 'PreToolUse' });
@@ -11097,7 +13327,7 @@ test('titles: rename > claude.ai title > ai-title > first prompt on every surfac
 });
 
 test('titles: `oak titles` reads claude.ai with the saved login, reports, and switches off (2026-09-24)', async () => {
-  const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cc-titles-')));
+  const home = fs.realpathSync(tmpDir('cc-titles-'));
   const cfg = path.join(home, '.claude');
   fs.mkdirSync(cfg, { recursive: true });
   fs.writeFileSync(path.join(cfg, '.credentials.json'), JSON.stringify({ claudeAiOauth: { accessToken: 'test-token-not-real', expiresAt: Date.now() + 3600_000 } }));
@@ -11125,7 +13355,7 @@ test('titles: `oak titles` reads claude.ai with the saved login, reports, and sw
   const env = { ...process.env, HOME: home, USERPROFILE: home, CLAUDE_CONFIG_DIR: cfg, CLAUDE_OBSERVATORY_NO_UPDATE_CHECK: '1',
     OAK_CODE_SESSIONS_URL: `${base}/v1/code/sessions`, OAK_USAGE_API_URL: `${base}/usage`, OAK_OAUTH_TOKEN_URL: `${base}/token`, CODEX_HOME: path.join(home, 'codex') };
   // ASYNC exec: the mock server lives in this process, and a sync exec would block the loop it answers on.
-  const run = (args) => new Promise((resolve) => cp.execFile('node', [CLI, ...args], { env, cwd, encoding: 'utf8' },
+  const run = (args, extra = {}) => new Promise((resolve) => cp.execFile('node', [CLI, ...args], { env: { ...env, ...extra }, cwd, encoding: 'utf8' },
     (err, stdout, stderr) => resolve({ code: err ? err.code : 0, stdout, stderr })));
   try {
     const r = await run(['titles', '--refresh']);
@@ -11137,6 +13367,16 @@ test('titles: `oak titles` reads claude.ai with the saved login, reports, and sw
     assert.deepEqual([j.enabled, j.status, j.titles], [true, 'ok', 1]);
     const listed = JSON.parse((await run(['sessions', '--json'])).stdout).sessions.find((s) => s.id === 'bridgedFixture');
     assert.equal(listed.title, 'Docs pass', 'the JSON listing both editors render carries it');
+    // A save that is refused (prefs.json not parsing, a hand edit half done) leaves the titles: removed first, they went
+    // while the setting stayed on, and the next poll fetched them again.
+    const prefsFile = path.join(cfg, 'claude-observatory', 'prefs.json');
+    const had = fs.existsSync(prefsFile) ? fs.readFileSync(prefsFile) : null;
+    fs.writeFileSync(prefsFile, '{"theme": "mono",');
+    const refused = await run(['titles', '--off']);
+    assert.equal(refused.code, 1, refused.stdout);
+    assert.match(refused.stderr, /prefs\.json is not valid JSON, so it was left as it is/);
+    assert.ok(fs.existsSync(path.join(cfg, 'claude-observatory', 'remote-cache', 'session-titles.json')), 'the titles stay while the switch is not saved');
+    if (had) fs.writeFileSync(prefsFile, had); else fs.rmSync(prefsFile);
     const off = await run(['titles', '--off']);
     assert.match(off.stdout, /off/);
     assert.ok(!fs.existsSync(path.join(cfg, 'claude-observatory', 'remote-cache', 'session-titles.json')), '--off drops the cache');
@@ -11147,8 +13387,9 @@ test('titles: `oak titles` reads claude.ai with the saved login, reports, and sw
     assert.equal(seen.length, 1);
     await run(['titles', '--on']);
     assert.equal(JSON.parse(fs.readFileSync(path.join(cfg, 'claude-observatory', 'prefs.json'), 'utf8')).remoteTitles, undefined);
-    // The pollers' trigger: `oak usage` claims a refresh and runs it detached.
-    await run(['usage']);
+    // The pollers' trigger: `oak usage` claims a refresh and runs it detached. The only run here that lets OAK
+    // start its background children, which the test bootstrap otherwise turns off.
+    await run(['usage'], { OAK_NO_BACKGROUND: '' });
     const deadline = Date.now() + 8000;
     while (seen.length < 2 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 100));
     assert.equal(seen.length, 2, '`oak usage` (every editor poll) kicked one detached refresh');
@@ -11156,6 +13397,10 @@ test('titles: `oak titles` reads claude.ai with the saved login, reports, and sw
     while (!fs.existsSync(cache) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 100));
     await run(['titles', '--refresh', '--if-due']);
     assert.equal(seen.length, 2, "the pollers' --if-due honours the throttle a person's --refresh skips");
+    // The account pull that `oak usage` also started records its outcome last; wait for it, so it is not still
+    // writing under this HOME when the run removes its root.
+    while (!fs.existsSync(path.join(cfg, 'statusline-last.json.pull-log')) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 100));
+    assert.ok(fs.existsSync(path.join(cfg, 'statusline-last.json.pull-log')), 'the detached account pull finished');
   } finally {
     srv.close();
   }
@@ -11189,6 +13434,8 @@ test('titles: a refresh is launched only through the oak CLI entry the CLI regis
     return Object.assign(new (require('events').EventEmitter)(), { unref() {} });
   };
   const claim = core.remoteTitlesCachePath() + '.kick';
+  const background = process.env.OAK_NO_BACKGROUND;
+  delete process.env.OAK_NO_BACKGROUND; // the bootstrap's switch; spawn is stubbed, so nothing starts
   try {
     core.setOakCliEntry(undefined);
     core.kickRemoteTitles(); // due: a fresh store, titles on, never refreshed
@@ -11204,6 +13451,7 @@ test('titles: a refresh is launched only through the oak CLI entry the CLI regis
   } finally {
     childProcess.spawn = spawn;
     core.setOakCliEntry(undefined);
+    process.env.OAK_NO_BACKGROUND = background;
   }
 });
 
@@ -11791,7 +14039,7 @@ test('fleet: a conversation older than a week is folded, and never the one under
   freshHome();
   delete process.env.CLAUDE_CONFIG_DIR;
   const ws = tmpWork();
-  fs.mkdirSync(path.join(ws, '.git'), { recursive: true }); // plain .git → commonDir resolves → the fleet engages
+  makeGitDir(path.join(ws, '.git')); // plain .git → commonDir resolves → the fleet engages
   const proj = core.projectDir(ws);
   fs.mkdirSync(proj, { recursive: true });
   const NOW = 'liveSess';
@@ -11843,7 +14091,7 @@ test('clean: --completed reaps finished sessions and refuses every live one (0.9
   // process.cwd(), and projectDir() mangles the path it is given — so the CLI would look under a
   // different project dir than the fixture wrote to and find nothing.
   const ws = fs.realpathSync(tmpWork());
-  fs.mkdirSync(path.join(ws, '.git'), { recursive: true });
+  makeGitDir(path.join(ws, '.git'));
   const proj = core.projectDir(ws);
   fs.mkdirSync(proj, { recursive: true });
   const HOUR = 3_600_000; // REAP_QUIET_MS is a DAY — this deletes edit history, so the clock is coarse
@@ -12014,7 +14262,7 @@ test('taskLog: the cross-agent log reads the sibling CACHE, never the raw builde
   freshHome();
   delete process.env.CLAUDE_CONFIG_DIR;
   const ws = fs.realpathSync(tmpWork());
-  fs.mkdirSync(path.join(ws, '.git'), { recursive: true });
+  makeGitDir(path.join(ws, '.git'));
   const proj = core.projectDir(ws);
   fs.mkdirSync(proj, { recursive: true });
   const S = 'tlSess';
@@ -12119,8 +14367,8 @@ test('observe: session line deltas are cached per blob PAIR, so a wrong total ca
 
   // A wrong cached TOTAL must not be permanent. This is why a running total was rejected: resuming from
   // one is inheriting it, so a single bad write is never recomputed and the number is frozen for good
-  // (observed for real: 0 over 2,800 edits). Here the sum is rebuilt in full on the next log change, so
-  // a bad value is bounded by one edit rather than forever.
+  // (observed for real: zero over thousands of edits). Here the sum is rebuilt in full on the next log
+  // change, so a bad value is bounded by one edit rather than forever.
   // A delta computed from a blob that could not be READ must never be cached. blobText returns '' for a
   // missing snapshot so rendering degrades instead of crashing — which makes lineDelta report a plausible
   // wrong number, filed under the INTACT sha. Content-keying makes a hit exact only when the content was
@@ -12207,7 +14455,7 @@ test('changemap: the GC reclaims cache payloads from a superseded version, and s
   // The sibling caches are content-keyed with their own version fields — a name-based sweep must not
   // touch them, or the GC would silently delete the caches this release exists to add.
   // …including the two 2026-09-16 stores: the per-record hops and the transcript's ask-scan cursor.
-  assert.deepEqual(left, [live[0], ...facts, ...prompts, 'asks-v3.json', 'deltas.json', 'hops.json', 'placements.json', 'units-pending.json', 'units-kept.json', 'units-undone.json'].sort(),
+  assert.deepEqual(left, [live[0], ...facts, ...prompts, 'asks-v5.json', 'deltas.json', 'hops.json', 'placements.json', 'units-pending.json', 'units-kept.json', 'units-undone.json'].sort(),
     'the live map and every sibling cache survive');
   assert.equal(core.pruneStaleMaps(S).removed, 0, 'a second sweep finds nothing (it is not re-reaping)');
   assert.deepEqual(core.pruneStaleMaps('noSuchSession'), { removed: 0, bytes: 0 }, 'a session with no cache is not an error');
@@ -12367,7 +14615,8 @@ test('store: a 64 KB tail of nothing but status ops never yields an id an edit a
   assert.ok(tail.length > 2, 'and enough of them for the fast path to trust the sequence');
 
   // Proof that the FAST PATH answered, not the fallback: count the bytes the call reads. The tail read
-  // takes one 64 KB window; a full parse reads the whole file, which here is several times that.
+  // takes one 64 KB window, plus the log's first 128 bytes for the id floor; a full parse reads the
+  // whole file, which here is several times that.
   const realRead = fs.readSync;
   let bytesRead = 0;
   fs.readSync = function (...args) {
@@ -12381,7 +14630,7 @@ test('store: a 64 KB tail of nothing but status ops never yields an id an edit a
   } finally {
     fs.readSync = realRead;
   }
-  assert.ok(bytesRead <= 64 * 1024, `the tail shortcut answered (read ${bytesRead} bytes, not the whole ${fs.statSync(lp).size})`);
+  assert.ok(bytesRead <= 64 * 1024 + 128, `the tail shortcut answered (read ${bytesRead} bytes, not the whole ${fs.statSync(lp).size})`);
   assert.equal(answer, EDITS + 1, 'the next id follows the highest EDIT, not the last status op');
   const rec = core.appendLog(S, {
     tool: 'Edit', file: '/w/after.ts', before: null, after: null, added: 1, removed: 0, status: 'pending', ts: 9_900_000,
@@ -12414,6 +14663,176 @@ test('store: a non-increasing tail falls back to the full parse rather than trus
   assert.equal(full.length, 1501, 'every record survives — the duplicate is renumbered, not dropped');
   assert.equal(new Set(full.map((r) => r.id)).size, full.length, 'and the ids are unique afterwards');
   assert.equal(core.nextId(S), 1502, 'the next id follows the reconciled maximum, not the tail');
+});
+
+/** lastRecordFor as it was until 0.11.0, the answer its tail read must give: a cold full parse (the capture hook is a
+ *  fresh process), newest record first. */
+function lastRecordByFullParse(S, file) {
+  core.clearFsCache();
+  const want = core.canonPath(file);
+  const log = core.readLog(S);
+  for (let i = log.length - 1; i >= 0; i--) if (log[i].file === want) return log[i];
+  return null;
+}
+/** lastRecordFor's answer, and whether it read the whole log to give it (the full parse reads it with readFileSync), from
+ *  a cold start as the capture hook's fresh process makes it. */
+function lastRecordRead(S, file) {
+  core.clearFsCache();
+  const lp = core.logPath(S);
+  const read = fs.readFileSync;
+  let whole = 0;
+  fs.readFileSync = function (p, ...rest) { if (String(p) === lp) whole++; return read.call(this, p, ...rest); };
+  try {
+    return { rec: core.lastRecordFor(S, file), whole };
+  } finally {
+    fs.readFileSync = read;
+  }
+}
+/** A record line as a capture writes one, padded so a few hundred of them pass the 64 KB tail. */
+const padRecord = (id, file, extra = {}) => JSON.stringify({ ts: 1000 + id, tool: 'Edit', file, beforeBlob: null, afterBlob: `after-${id}`,
+  status: 'pending', source: 'hook', note: 'n'.repeat(220), ...extra, id, uid: `uid-${id}` });
+
+test('store: lastRecordFor reads the log TAIL and answers as the full parse does — op lines, the id floor, re-keyed duplicates (0.11.0)', () => {
+  // It runs inside every Edit/Write commit, and parsed the whole log there: 42–46 ms on a 5.4 MB log, each commit.
+  freshHome();
+  delete process.env.CLAUDE_CONFIG_DIR;
+  const S = 'last-tail';
+  core.ensureStore(S);
+  const lp = core.logPath(S);
+  const status = (id, s) => JSON.stringify({ op: 'status', id, status: s, ts: 9000 + id });
+  // The head, which the 64 KB tail does not reach: a rewritten log's id floor, a file recorded there alone (with its
+  // status), a Windows path written with a lower-case drive letter, a file named only inside another record's text, a
+  // duplicate id (§2.7) re-keyed by the full parse, the records after it allocated past the re-key, and op lines of
+  // every kind.
+  const head = [JSON.stringify({ op: 'id-floor', next: 3 }), padRecord(3, '/w/only-in-head.ts'), status(3, 'kept'),
+    padRecord(4, 'c:\\w\\Drive.ts'), padRecord(5, '/w/a.ts', { uncertainty: '/w/named-only.ts' }),
+    JSON.stringify({ op: 'skip', file: '/w/a.ts', reason: 'file too large', ts: 9001 })];
+  for (let id = 6; id <= 60; id++) head.push(padRecord(id, `/w/f${id % 5}.ts`));
+  head.push(padRecord(40, '/w/dup.ts')); // a duplicate of 40: the full parse re-keys it to 61
+  for (let id = 62; id <= 300; id++) head.push(padRecord(id, `/w/f${id % 5}.ts`));
+  head.push(JSON.stringify({ op: 'batch', kind: 'keep', ids: [62, 63], prev: { 62: 'pending', 63: 'pending' }, ts: 9002 }), status(62, 'kept'), status(63, 'kept'));
+  // The tail: records with their status ops and hook evidence after them, the drive letter in upper case, and a run of
+  // status ops last, one of them for a record in the head.
+  const tail = [];
+  for (let id = 301; id <= 520; id++) tail.push(padRecord(id, `/w/f${id % 5}.ts`));
+  tail.push(padRecord(521, 'C:\\w\\Drive.ts'), padRecord(522, '/w/evidence.ts', { source: 'acp', partial: true, beforeBlob: null }),
+    padRecord(523, '/w/foreign-evidence.ts', { source: 'acp' }));
+  tail.push(JSON.stringify({ op: 'capture-evidence', id: 522, uid: 'uid-522', beforeBlob: 'before-522', tool: 'Write', toolCallId: 'call-522', beforeState: 'present' }));
+  tail.push(JSON.stringify({ op: 'capture-evidence', id: 523, uid: 'someone-else', beforeBlob: 'before-523', tool: 'Write', toolCallId: 'call-523', beforeState: 'present' }));
+  tail.push(status(519, 'kept'), status(519, 'undone'), status(520, 'kept'), status(100, 'undone'), status(521, 'kept'));
+  fs.writeFileSync(lp, [...head, ...tail].join('\n') + '\n');
+  assert.ok(Buffer.byteLength(head.join('\n') + '\n') < fs.statSync(lp).size - 64 * 1024, 'control: the head lies wholly before the 64 KB tail');
+  const files = ['/w/only-in-head.ts', 'C:\\w\\Drive.ts', 'c:\\w\\Drive.ts', '/w/named-only.ts', '/w/dup.ts', '/w/evidence.ts', '/w/foreign-evidence.ts',
+    '/w/absent.ts', ...[0, 1, 2, 3, 4].map((n) => `/w/f${n}.ts`)];
+  for (const f of files) assert.deepEqual(lastRecordRead(S, f).rec, lastRecordByFullParse(S, f), `the full parse's answer for ${f}`);
+  // Which ones the tail answered: a record there (its ops folded in), and a file named nowhere in the log.
+  for (const f of ['/w/f0.ts', '/w/f4.ts', 'C:\\w\\Drive.ts', 'c:\\w\\Drive.ts', '/w/evidence.ts', '/w/foreign-evidence.ts', '/w/absent.ts'])
+    assert.equal(lastRecordRead(S, f).whole, 0, `${f} is answered from the tail, without reading the whole log`);
+  assert.deepEqual(['/w/f4.ts', '/w/f0.ts'].map((f) => [lastRecordRead(S, f).rec.id, lastRecordRead(S, f).rec.status]), [[519, 'undone'], [520, 'kept']],
+    'each with its status ops folded in');
+  assert.deepEqual(['beforeBlob', 'tool', 'source', 'partial'].map((k) => lastRecordRead(S, '/w/evidence.ts').rec[k]), ['before-522', 'Write', 'hook', undefined],
+    'and its hook evidence, when the evidence names the record');
+  assert.equal(lastRecordRead(S, '/w/foreign-evidence.ts').rec.source, 'acp', 'and not another record\'s');
+  assert.equal(lastRecordRead(S, 'c:\\w\\Drive.ts').rec.id, 521, 'a drive letter in either case is one file');
+  assert.equal(lastRecordRead(S, '/w/absent.ts').rec, null);
+  // A file named earlier is read by the full parse: its record there, or a mention in another record's text.
+  assert.deepEqual([lastRecordRead(S, '/w/only-in-head.ts').whole, lastRecordRead(S, '/w/only-in-head.ts').rec.status], [1, 'kept']);
+  assert.deepEqual([lastRecordRead(S, '/w/named-only.ts').whole, lastRecordRead(S, '/w/named-only.ts').rec], [1, null]);
+  assert.equal(lastRecordRead(S, '/w/dup.ts').rec.id, 61, 'the re-keyed duplicate keeps the id the full parse gives it');
+  // A duplicate id in the tail itself (two writers that both failed the lock): the tail is not trusted, and the full
+  // parse answers, with the duplicate re-keyed as it always was.
+  fs.appendFileSync(lp, padRecord(510, '/w/late-dup.ts') + '\n');
+  assert.deepEqual(lastRecordRead(S, '/w/late-dup.ts'), { rec: lastRecordByFullParse(S, '/w/late-dup.ts'), whole: 1 });
+  assert.equal(lastRecordRead(S, '/w/late-dup.ts').rec.id, 524, 'the duplicate takes the id after the highest');
+  // A line still being written at the end is skipped, as the full parse skips it.
+  fs.appendFileSync(lp, '{"ts":1,"tool":"Edit","file":"/w/torn.ts","id":9');
+  for (const f of ['/w/torn.ts', '/w/f1.ts']) assert.deepEqual(lastRecordRead(S, f).rec, lastRecordByFullParse(S, f), `the full parse's answer for ${f} past a torn line`);
+  // A log no longer than the tail is parsed whole, as before.
+  const small = 'last-tail-small';
+  core.ensureStore(small);
+  fs.writeFileSync(core.logPath(small), [JSON.stringify({ op: 'id-floor', next: 1 }), padRecord(1, '/w/s.ts'), status(1, 'kept')].join('\n') + '\n');
+  assert.deepEqual(lastRecordRead(small, '/w/s.ts'), { rec: lastRecordByFullParse(small, '/w/s.ts'), whole: 1 });
+  assert.equal(core.lastRecordFor('no-such-session', '/w/x.ts'), null, 'no log, no record');
+});
+
+test('store: lastRecordFor costs a fraction of the full parse on a 5 MB log, for a file in the tail and for one never recorded (0.11.0)', () => {
+  freshHome();
+  delete process.env.CLAUDE_CONFIG_DIR;
+  const S = 'last-tail-timing';
+  core.ensureStore(S);
+  const lines = [];
+  for (let id = 1; id <= 17000; id++) lines.push(padRecord(id, `/w/project/src/module${id % 97}/file${id % 389}.ts`));
+  fs.writeFileSync(core.logPath(S), lines.join('\n') + '\n');
+  assert.ok(fs.statSync(core.logPath(S)).size > 5 * 1024 * 1024, 'control: a log the size the slow commits were measured on');
+  const inTail = '/w/project/src/module26/file272.ts'; // the last record's file
+  assert.deepEqual(core.lastRecordFor(S, inTail), lastRecordByFullParse(S, inTail), 'control: the same answer');
+  // Each call cold, as in the capture hook's fresh process (the full parse is memoized within one), and the three
+  // interleaved, so a moment of load on the machine slows them alike.
+  const ms = { full: [], tail: [], none: [] };
+  const timed = (k, fn) => {
+    core.clearFsCache();
+    const t0 = process.hrtime.bigint();
+    fn();
+    ms[k].push(Number(process.hrtime.bigint() - t0) / 1e6);
+  };
+  for (let i = 0; i < 7; i++) {
+    timed('full', () => { const log = core.readLog(S); for (let j = log.length - 1; j >= 0 && log[j].file !== inTail; j--); });
+    timed('tail', () => core.lastRecordFor(S, inTail));
+    timed('none', () => core.lastRecordFor(S, '/w/project/src/never-recorded.ts'));
+  }
+  const [full, tail, none] = ['full', 'tail', 'none'].map((k) => ms[k].sort((x, y) => x - y)[3]);
+  assert.ok(tail * 4 < full, `a file in the tail: ${tail.toFixed(2)} ms against the full parse's ${full.toFixed(2)} ms`);
+  assert.ok(none * 4 < full, `a file never recorded: ${none.toFixed(2)} ms against the full parse's ${full.toFixed(2)} ms`);
+});
+
+test('store: lastRecordFor never answers from the tail\'s first record, which may be the second copy of a duplicate whose first copy ends just before the tail (0.11.0)', () => {
+  // Two writers that both failed the lock wrote one id twice (§2.7). The full parse re-keys the second copy, and a keep or
+  // undo of it names the new id. With the first copy ending just before the 64 KB tail, the tail's ids still rose from
+  // the second copy, and the tail read gave it the raw id and the status ops of the first copy.
+  freshHome();
+  delete process.env.CLAUDE_CONFIG_DIR;
+  const S = 'last-tail-dup';
+  core.ensureStore(S);
+  const status = (id, s) => JSON.stringify({ op: 'status', id, status: s, ts: 9000 + id });
+  const head = [];
+  for (let id = 1; id <= 40; id++) head.push(padRecord(id, `/w/h${id % 3}.ts`));
+  head.push(padRecord(41, '/w/first-copy.ts'));
+  const headText = head.join('\n') + '\n';
+  // The second copy of 41, which the full parse calls 42 and the person undid as #42, while they kept #41, the first copy.
+  const tail = [padRecord(41, '/w/second-copy.ts'), status(42, 'undone'), status(41, 'kept')];
+  let id = 43;
+  const target = 64 * 1024 - 40; // so the tail's 64 KB start 40 bytes before the first copy's newline
+  const size = () => Buffer.byteLength(tail.join('\n') + '\n');
+  while (size() + 1200 < target) tail.push(padRecord(id++, `/w/t${id % 4}.ts`));
+  const filler = padRecord(id, '/w/t-last.ts', { note: '' });
+  tail.push(padRecord(id, '/w/t-last.ts', { note: 'n'.repeat(target - size() - Buffer.byteLength(filler) - 1) }));
+  fs.writeFileSync(core.logPath(S), headText + tail.join('\n') + '\n');
+  const start = fs.statSync(core.logPath(S)).size - 64 * 1024;
+  assert.ok(start > Buffer.byteLength(headText) - Buffer.byteLength(head.at(-1)) - 1 && start < Buffer.byteLength(headText),
+    'control: the tail starts inside the first copy\'s line, so the second copy is its first record');
+  const full = lastRecordByFullParse(S, '/w/second-copy.ts');
+  assert.deepEqual([full.id, full.status], [42, 'undone'], 'control: the full parse re-keys the second copy, and folds its undo');
+  assert.deepEqual(lastRecordRead(S, '/w/second-copy.ts').rec, full, 'the full parse\'s answer, not the raw id and the first copy\'s keep');
+  assert.deepEqual(lastRecordRead(S, '/w/first-copy.ts').rec, lastRecordByFullParse(S, '/w/first-copy.ts'));
+  // A record later in the tail is still answered from it.
+  assert.deepEqual(lastRecordRead(S, '/w/t-last.ts'), { rec: lastRecordByFullParse(S, '/w/t-last.ts'), whole: 0 });
+});
+
+test('store: lastRecordFor finds a record before the tail whose drive letter is written in the other case (0.11.0)', () => {
+  // canonPath reads `c:` as `C:`, so the search of the bytes before the tail leaves the drive letter out. Searching for
+  // the name as given would miss a record written with the other case, and answer that the log holds none.
+  freshHome();
+  delete process.env.CLAUDE_CONFIG_DIR;
+  const S = 'last-tail-drive';
+  core.ensureStore(S);
+  const lines = [padRecord(1, 'c:\\w\\Head-only.ts')];
+  for (let id = 2; id <= 400; id++) lines.push(padRecord(id, `/w/f${id % 5}.ts`));
+  fs.writeFileSync(core.logPath(S), lines.join('\n') + '\n');
+  assert.ok(fs.statSync(core.logPath(S)).size > 2 * 64 * 1024, 'control: the record lies well before the tail');
+  for (const f of ['C:\\w\\Head-only.ts', 'c:\\w\\Head-only.ts']) {
+    const { rec, whole } = lastRecordRead(S, f);
+    assert.deepEqual([rec && rec.id, rec && rec.file, whole], [1, 'C:\\w\\Head-only.ts', 1], `${f}: found, by the full parse`);
+  }
 });
 
 test('metrics: the usage cursor survives across processes — a cold reader delta-parses instead of re-reading (0.8.6)', () => {
@@ -12452,6 +14871,154 @@ test('metrics: the usage cursor survives across processes — a cold reader delt
   // A replaced (shrunken) transcript must invalidate rather than serve stale totals.
   fs.writeFileSync(file, line('q1', 3, '2026-07-15T11:00:00.000Z') + '\n');
   assert.equal(usage().sessionTokens.input, 3, 'a replaced transcript rescans from zero');
+});
+
+test('usage: a message written as several lines counts at its LARGEST snapshot in every reader — session, Stats, asks, workers, workflows, and their caches (0.11.0)', () => {
+  // Claude Code writes one message as a line per content block, each with the message's usage as it stood then, and a
+  // later line can carry MORE output than the first (76 of 8,978 such messages on real transcripts; none fewer). These
+  // readers kept the first line's, 0.7% short, while the status line and the breakdowns took the largest.
+  const home = freshHome();
+  delete process.env.CLAUDE_CONFIG_DIR;
+  const S = 'largest-snapshot';
+  const cwd = fs.realpathSync(tmpWork());
+  seedEdit(S, path.join(cwd, 'x.ts'), 'a\n', 'b\n'); // a store, beside which the persisted caches are kept
+  const proj = core.projectDir(cwd);
+  fs.mkdirSync(proj, { recursive: true });
+  const file = path.join(proj, `${S}.jsonl`);
+  const now = Date.now();
+  const at = (s) => new Date(now - 60_000 + s * 1000).toISOString();
+  const said = (id, s, usage, content, extra = {}) => JSON.stringify({ type: 'assistant', sessionId: S, cwd, timestamp: at(s), ...extra,
+    message: { id, role: 'assistant', model: 'claude-opus-4-8', usage, content } });
+  const u = (input, output, cc, cr) => ({ input_tokens: input, output_tokens: output, cache_creation_input_tokens: cc, cache_read_input_tokens: cr });
+  // m1: three lines, the last with more output; m2: one line. Largest: in 13, out 92, cache write 100, reads 1050.
+  fs.writeFileSync(file, [JSON.stringify({ type: 'user', sessionId: S, cwd, timestamp: at(0), message: { role: 'user', content: 'build it' } }),
+    said('m1', 1, u(10, 5, 100, 1000), [{ type: 'thinking', thinking: 'plan' }]), said('m1', 2, u(10, 5, 100, 1000), [{ type: 'text', text: 'on it' }])].join('\n') + '\n');
+  // Read once with only the first snapshots, so each persisted cache holds m1 at 5 output tokens…
+  const { askScan } = require('../dist/asks.js');
+  const askTokens = () => { core.clearFsCache(); return askScan(file).tokenAt.reduce((n, e) => n + e.tokens, 0); };
+  assert.equal(core.sessionUsage(cwd, S).output, 5, 'control: the first lines\' output');
+  assert.equal(askTokens(), 115, 'control: the first lines\' tokens');
+  // …then the line with the larger snapshot lands, and m2.
+  fs.appendFileSync(file, [said('m1', 3, u(10, 85, 100, 1000), [{ type: 'tool_use', id: 't1', name: 'Read', input: { file_path: 'x' } }]),
+    said('m2', 4, u(3, 7, 0, 50), [{ type: 'text', text: 'done' }])].join('\n') + '\n');
+  const want = { input: 13, output: 92, cacheRead: 1050, cacheCreation: 100, total: 205 };
+  const session = core.sessionUsage(cwd, S);
+  assert.deepEqual({ input: session.input, output: session.output, cacheRead: session.cacheRead, cacheCreation: session.cacheCreation, total: session.total }, want,
+    'the session: m1 at its largest snapshot, its persisted cursor raised by the difference');
+  const env = { ...process.env, HOME: home, USERPROFILE: home };
+  const fresh = () => JSON.parse(cp.execFileSync(process.execPath, [CLI, 'usage', '--session', S], { env, cwd, encoding: 'utf8' })).sessionTokens;
+  assert.equal(fresh().output, 92, 'and a fresh process, from that cursor');
+  // A cursor of the version before (first snapshots) is not restored: its totals are short.
+  const cursors = path.join(core.rootDir(), 'usage-cursors');
+  const [cursorFile] = fs.readdirSync(cursors).map((n) => path.join(cursors, n));
+  fs.writeFileSync(cursorFile, JSON.stringify({ ...JSON.parse(fs.readFileSync(cursorFile, 'utf8')), v: 2, seen: ['m1', 'm2'], output: 12 }));
+  assert.equal(fresh().output, 92, 'a stale cursor is recomputed, not served');
+  assert.equal(askTokens(), 205, 'the asks: the persisted scan raises m1\'s tokens where it counted them, and adds m2');
+  assert.deepEqual(core.sessionPrompts(cwd, S).map((p) => p.tokens), [205], 'so the ask\'s tokens are the largest snapshots\'');
+  // The prompts projection the version before kept for this same transcript, its tokens first snapshots', is not served.
+  const cacheDir = path.join(core.rootDir(), 'changemap-cache', S);
+  const projection = fs.readdirSync(cacheDir).find((n) => /^prompts-v5-[0-9a-f]{16}\.json$/.test(n));
+  const live = JSON.parse(fs.readFileSync(path.join(cacheDir, projection), 'utf8'));
+  fs.writeFileSync(path.join(cacheDir, projection.replace('-v5-', '-v4-')),
+    JSON.stringify({ ...live, stamp: live.stamp.replace(/^5\|/, '4|'), value: live.value.map((p) => ({ ...p, tokens: 125 })) }));
+  assert.deepEqual(core.sessionPrompts(cwd, S).map((p) => p.tokens), [205], 'a projection of the version before is not served');
+  // A line still being written counts in this answer, and is not kept until it ends.
+  fs.appendFileSync(file, said('m2', 5, u(3, 17, 0, 50), [{ type: 'text', text: 'done, really' }]));
+  assert.equal(askTokens(), 215, 'an unterminated line with a larger snapshot counts in the answer');
+  assert.equal(core.sessionUsage(cwd, S).output, 102, 'in the session\'s too, by what it adds to the snapshot counted');
+  const persisted = JSON.parse(fs.readFileSync(path.join(core.rootDir(), 'changemap-cache', S, 'asks-v5.json'), 'utf8'));
+  assert.equal(persisted.tokenAt.reduce((n, e) => n + e.tokens, 0), 205, 'but is not persisted before its newline');
+  fs.appendFileSync(file, '\n');
+  assert.equal(askTokens(), 215, 'and is once it has one');
+  // Stats, and its per-file cache: one of the version before is not reused.
+  const st = core.computeStats(S, now);
+  assert.deepEqual([st.windows.session.output, st.windows.session.messages], [102, 2], 'Stats: m1 at 85 and m2 at 17, one turn each');
+  const statsFile = statsCacheIn(core.rootDir());
+  const stale = JSON.parse(fs.readFileSync(statsFile, 'utf8'));
+  for (const e of Object.values(stale.files)) for (const d of Object.values(e.days)) d.out = 12;
+  fs.writeFileSync(statsFile, JSON.stringify({ ...stale, v: 2 }));
+  assert.equal(core.computeStats(S, now).windows.session.output, 102, 'a Stats cache of the version before is recomputed');
+  // A worker and a workflow agent, each with a message written as two lines, the second larger.
+  const worker = path.join(proj, S, 'subagents', 'agent-wlarge.jsonl');
+  fs.mkdirSync(path.dirname(worker), { recursive: true });
+  const side = { isSidechain: true, agentId: 'wlarge' };
+  fs.writeFileSync(worker, [said('s1', 6, u(20, 4, 0, 500), [{ type: 'thinking', thinking: 'x' }], side), said('s1', 7, u(20, 40, 0, 500), [{ type: 'text', text: 'y' }], side)].join('\n') + '\n');
+  const digest = () => core.subagentDigests(cwd, S).find((d) => d.agentId === 'wlarge');
+  assert.deepEqual(['tokensIn', 'tokensOut', 'tokensCacheRead', 'tokens'].map((k) => digest()[k]), [20, 40, 500, 60], 'a worker\'s tokens: the larger snapshot');
+  // The worker figures the version before kept beside the session (session-meta), first snapshots', are not served.
+  const sidecar = path.join(core.rootDir(), 'session-meta', `${S}.json`);
+  const meta = JSON.parse(fs.readFileSync(sidecar, 'utf8'));
+  const workerStat = fs.statSync(worker);
+  fs.writeFileSync(sidecar, JSON.stringify({ ...meta,
+    subagentDigestsStamp: meta.subagentDigestsStamp.replace(/^11\|/, '10|'), subagentDigests: meta.subagentDigests.map((d) => ({ ...d, tokensOut: 4, tokens: 24 })),
+    'subVitals:wlargeStamp': `v8|agent-wlarge.jsonl:${workerStat.mtimeMs}:${workerStat.size}`,
+    'subVitals:wlarge': { model: 'Opus 4.8', effort: '', durationMs: 1000, tokens: 24, tokensIn: 20, tokensOut: 4, tokensCacheRead: 500, lastTurnTs: 0 } }));
+  core.clearFsCache();
+  assert.deepEqual([digest().tokensOut, digest().tokens], [40, 60], 'worker figures of the version before are recomputed');
+  const wf = path.join(proj, S, 'subagents', 'workflows', 'wf_large1');
+  fs.mkdirSync(wf, { recursive: true });
+  fs.writeFileSync(path.join(wf, 'journal.jsonl'), [{ type: 'started', key: 'phase-a', agentId: 'a1' }, { type: 'result', key: 'phase-a', agentId: 'a1', result: {} }].map((o) => JSON.stringify(o)).join('\n'));
+  fs.writeFileSync(path.join(wf, 'agent-a1.jsonl'), [said('w1', 8, u(30, 6, 0, 0), [{ type: 'text', text: 'a' }]), said('w1', 9, u(30, 60, 0, 0), [{ type: 'text', text: 'b' }])].join('\n') + '\n');
+  assert.deepEqual(core.parseWorkflows(cwd, S).find((w) => w.id === 'wf_large1').agents.map((a) => a.tokens), [90], 'a workflow agent\'s tokens: the larger snapshot');
+});
+
+test('usage cursors and Stats caches: an older build running beside this one keeps its own files, and neither rebuilds the other\'s (0.11.0)', () => {
+  // Both kept their version INSIDE one file, so an editor window still running an older build and this one each threw
+  // the other's away as another version's at every call and parsed the transcripts again, for as long as the old window
+  // stayed open. The older build is simulated by writing its file, where it kept it, between two calls of this one.
+  const home = freshHome();
+  delete process.env.CLAUDE_CONFIG_DIR;
+  const S = 'twoBuilds';
+  const cwd = fs.realpathSync(tmpWork());
+  fs.mkdirSync(core.projectDir(cwd), { recursive: true });
+  const transcript = path.join(core.projectDir(cwd), `${S}.jsonl`);
+  const now = Date.now();
+  fs.writeFileSync(transcript, JSON.stringify({ ...assistantMsg(now - 1000), sessionId: S, cwd }) + '\n');
+  const root = core.rootDir();
+  const stamp = (f) => {
+    const st = fs.statSync(f);
+    return `${st.ino}:${st.mtimeMs}:${st.size}`;
+  };
+  /** Run `call`, and name the one file it made in `dir`: where this build keeps its own. */
+  const made = (dir, call) => {
+    const before = new Set(fs.existsSync(dir) ? fs.readdirSync(dir) : []);
+    const out = call();
+    const added = fs.readdirSync(dir).filter((n) => !before.has(n));
+    assert.equal(added.length, 1, `positive control: the call made one file in ${dir} (${added})`);
+    return { out, file: path.join(dir, added[0]) };
+  };
+  // Usage, in a new process each call, as the status line runs it: the cursor is read from disk or the transcript is.
+  const env = { ...process.env, HOME: home, USERPROFILE: home };
+  const usage = () => JSON.parse(cp.execFileSync(process.execPath, [CLI, 'usage', '--session', S], { env, cwd, encoding: 'utf8' })).sessionTokens;
+  const cursors = path.join(root, 'usage-cursors');
+  const mine = made(cursors, usage);
+  assert.equal(mine.out.output, 50, 'control: the usage');
+  // Where every build before this one kept the cursor of this transcript (`<hash of its path>.json`), and the state of
+  // one of those cursors: the other version's, which this build must neither serve nor overwrite.
+  const theirs = path.join(cursors, `${crypto.createHash('sha256').update(path.resolve(transcript)).digest('hex').slice(0, 16)}.json`);
+  const olderCursor = JSON.stringify({ v: 2, transcript, mtimeMs: 1, size: 1, offset: 1, seen: ['old'], input: 7, output: 7, cacheRead: 0, cacheCreation: 0,
+    firstTs: 0, lastTs: 0, models: [], lastModel: '', effortRecord: '', effortStub: '', compactions: [] });
+  const ours = stamp(mine.file);
+  for (let call = 1; call <= 2; call++) {
+    fs.writeFileSync(theirs, olderCursor); // the older build's call, between two of this one's
+    assert.deepEqual(usage(), mine.out, `call ${call}: the same usage`);
+    assert.equal(fs.readFileSync(theirs, 'utf8'), olderCursor, `call ${call}: the older build's cursor is left as it wrote it`);
+    assert.equal(stamp(mine.file), ours, `call ${call}: and this build's own is read back, not parsed again and rewritten`);
+  }
+  // Stats: the whole machine's and the Claude-only cache, which builds before kept as stats-cache.json and
+  // stats-cache-claude.json.
+  for (const [claudeOnly, older] of [[false, 'stats-cache.json'], [true, 'stats-cache-claude.json']]) {
+    const own = made(root, () => core.computeStats(undefined, now, claudeOnly));
+    assert.equal(own.out.windows.month.output, 50, 'control: the Stats');
+    const olderStats = JSON.stringify({ v: 2, tz: new Date(now).getTimezoneOffset(), files: {} });
+    const ownStamp = stamp(own.file);
+    for (let call = 1; call <= 2; call++) {
+      fs.writeFileSync(path.join(root, older), olderStats);
+      assert.deepEqual(core.computeStats(undefined, now, claudeOnly), own.out, `${older}, call ${call}: the same Stats`);
+      assert.equal(fs.readFileSync(path.join(root, older), 'utf8'), olderStats, `${older}, call ${call}: the older build's cache is left as it wrote it`);
+      assert.equal(stamp(own.file), ownStamp, `${older}, call ${call}: and this build's own is reused, not rebuilt`);
+    }
+  }
 });
 
 test('processes: background shells are reconstructed with runtime, exit code and output (0.8.7)', () => {
@@ -12565,7 +15132,7 @@ test('feed: each kind tails the file that thing writes, and says what it dropped
   // A feed means a different thing depending on whether its source is still going: follow a live one,
   // read a finished one as the record it is. Renderers key their label and their polling off this.
   assert.equal(proc.mode, 'live', 'a running shell yields a LIVE feed');
-  assert.equal(ag.mode, 'audit', 'a finished agent yields an AUDIT log, and should stop being polled');
+  assert.equal(ag.mode, 'live', 'silence alone cannot end a worker log; wait for recorded completion');
 
   const missing = core.liveFeed(cwd, S, { kind: 'agent', id: 'nope' });
   assert.deepEqual([missing.entries.length, missing.running], [0, false], 'an unknown target is empty, not an error');
@@ -12814,10 +15381,10 @@ test('prompts: the session splits by what the USER asked, and work belongs to th
   assert.equal(rs[0].folders, 1, '…both in the one folder');
   assert.equal(rs[1].files, 1, 'prompt #2 touched only c.js');
   // input(100) + output(50) + cacheCreation(200) = 350, deduped by message id (counted once, not
-  // twice). cacheRead(1000) is EXCLUDED: it is the prompt read back each turn, so counting it made
-  // the same context accumulate per turn — it was 98.8% of the old blended 1350-style figure and
-  // reported millions where Claude Code reported ~128k for the same agent. Matching Claude Code is
-  // the point: two tools disagreeing about one run is worse than either being slightly off.
+  // twice). cacheRead(1000) is EXCLUDED: it is the prompt read back each turn, so counting it made the
+  // same context accumulate per turn — it was nearly all of the old blended figure, which reported
+  // millions where Claude Code reported a small fraction of that for the same agent. Matching Claude
+  // Code is the point: two tools disagreeing about one run is worse than either being slightly off.
   assert.equal(rs[0].tokens, 350, 'tokens processed once: input + output + cacheCreation, deduped by message id');
   assert.equal(rs[1].tokens, 500, 'the second ask gets only the usage in its own window');
   assert.equal(
@@ -12998,9 +15565,9 @@ test('derived: the RISK-FLAG inputs are kept per blob pair — the change map\'s
   assert.equal(core.flagsFor(S, recOf(a), log).some((f) => /TODO|FIXME/i.test(f.message)), false, 'the clean edit earns no TODO flag');
   assert.ok(core.flagsFor(S, recOf(b), log).some((f) => /TODO|FIXME/i.test(f.message)), 'the one that added a TODO does');
 
-  // …and the derivation is KEPT, keyed by the blob pair. Measured on a 978-record session, `flagsFor`
-  // was 71 % of a 4.9 s change-map rebuild — `flagInputs` re-diffing blobs whose bytes had not moved,
-  // in a fresh process every poll, because its memo could not outlive one.
+  // …and the derivation is KEPT, keyed by the blob pair. On a session of hundreds of records,
+  // `flagsFor` was most of a change-map rebuild that took seconds — `flagInputs` re-diffing blobs whose
+  // bytes had not moved, in a fresh process every poll, because its memo could not outlive one.
   const keyOf = (id) => core.pairKeyOf(recOf(id).beforeBlob, recOf(id).afterBlob);
   assert.notEqual(core.contentGet(S, 'flags', keyOf(a)), undefined, 'the clean edit\'s inputs were kept');
   assert.notEqual(core.contentGet(S, 'flags', keyOf(b)), undefined, 'and the flagged one\'s');
@@ -13137,9 +15704,9 @@ test('derived: the expensive answers outlive the process, and only while their i
   seedEdit(S, f, 'a\nb\n', 'a\nb\nc\n');
 
   // THE PERSISTENCE ITSELF. The read commands are SPAWNED — a dashboard poll is a fresh node every
-  // few seconds — so an in-process memo is always empty when it matters. Measured before this: the
-  // review-unit split cost 4.5s and the per-record deltas 3.2s on EVERY poll of a 978-record
-  // session, both already memoized, both correctly keyed, both thrown away at exit.
+  // few seconds — so an in-process memo is always empty when it matters. Before this, the
+  // review-unit split and the per-record deltas each cost seconds on EVERY poll of a session of
+  // hundreds of records, both already memoized, both correctly keyed, both thrown away at exit.
   let built = 0;
   const compute = () => { built += 1; return { n: built }; };
   assert.deepEqual(core.persisted(S, 'probe', 'stamp-1', compute), { n: 1 }, 'the first call computes');
@@ -13260,7 +15827,7 @@ test('cli: clean reaches the GC blind spots — ghost cache dirs, orphaned curso
   delete process.env.CLAUDE_CONFIG_DIR;
   const root = core.rootDir();
   // 1. a changemap-cache dir whose session has NO store dir: the store-id loop never visits it, so its
-  //    superseded-version payloads survived every GC (27 found on a real store). The LIVE-version file
+  //    superseded-version payloads survived every GC (dozens on a real store). The LIVE-version file
   //    must survive — a transcript-only session's warm cache is a working cache, not garbage.
   const cd = path.join(root, 'changemap-cache', 'ghostSess');
   fs.mkdirSync(cd, { recursive: true });
@@ -13268,16 +15835,24 @@ test('cli: clean reaches the GC blind spots — ghost cache dirs, orphaned curso
   // The live version comes from the product, not a literal: hardcoding it made this test fail on
   // the next legitimate MAP_CACHE_VERSION bump, which says nothing about whether clean works.
   fs.writeFileSync(path.join(cd, 'aaaabbbbccccdddd.json'), JSON.stringify({ stamp: core.MAP_CACHE_VERSION + '|live', map: {} }));
-  // 2. usage cursors: filename is a one-way hash of the transcript path, unreachable from any session id.
+  // 2. usage cursors: filename is a one-way hash of the transcript path, unreachable from any session id. Each named as
+  //    this build names its own (`<hash>.v<N>.json`), read off a cursor the real writer made: a name of another
+  //    version is a superseded file, which the test of superseded caches covers.
+  const ucwd = fs.realpathSync(tmpWork());
+  fs.mkdirSync(core.projectDir(ucwd), { recursive: true });
+  fs.writeFileSync(path.join(core.projectDir(ucwd), 'cursorSess.jsonl'), JSON.stringify({ type: 'user', message: { role: 'user', content: 'go' } }) + '\n');
+  core.sessionUsage(ucwd, 'cursorSess');
   const uc = path.join(root, 'usage-cursors');
-  fs.mkdirSync(uc, { recursive: true });
-  fs.writeFileSync(path.join(uc, 'dead00.json'), JSON.stringify({ v: 1, transcript: '/no/such/file.jsonl', seen: [] }));
+  const [made] = fs.readdirSync(uc);
+  const named = /\.v\d+\.json$/.exec(made)?.[0];
+  assert.ok(named, `positive control: the real writer names its cursor by version (${made})`);
+  fs.writeFileSync(path.join(uc, `dead00${named}`), JSON.stringify({ v: 1, transcript: '/no/such/file.jsonl', seen: [] }));
   const liveT = path.join(home, 'live.jsonl');
   fs.writeFileSync(liveT, '');
-  fs.writeFileSync(path.join(uc, 'live00.json'), JSON.stringify({ v: 1, transcript: liveT, seen: [] }));
-  fs.writeFileSync(path.join(uc, 'legacy.json'), JSON.stringify({ v: 1, seen: [] })); // path-less old format
+  fs.writeFileSync(path.join(uc, `live00${named}`), JSON.stringify({ v: 1, transcript: liveT, seen: [] }));
+  fs.writeFileSync(path.join(uc, `legacy${named}`), JSON.stringify({ v: 1, seen: [] })); // path-less: age is all there is
   const old = (Date.now() - 40 * 24 * 3600e3) / 1000;
-  fs.utimesSync(path.join(uc, 'legacy.json'), old, old);
+  fs.utimesSync(path.join(uc, `legacy${named}`), old, old);
   // 3. the artifact no released build ever read.
   fs.writeFileSync(path.join(root, 'blob-memo.json'), 'x'.repeat(1000));
 
@@ -13286,7 +15861,7 @@ test('cli: clean reaches the GC blind spots — ghost cache dirs, orphaned curso
   assert.equal(out.cursors, 2, 'the dead-path cursor and the aged path-less one are reaped');
   assert.ok(!fs.existsSync(path.join(cd, '0123456789abcdef.json')), 'superseded version gone');
   assert.ok(fs.existsSync(path.join(cd, 'aaaabbbbccccdddd.json')), 'live version kept');
-  assert.ok(fs.existsSync(path.join(uc, 'live00.json')), 'a cursor whose transcript exists is never touched');
+  assert.ok(fs.existsSync(path.join(uc, `live00${named}`)) && fs.existsSync(path.join(uc, made)), 'a cursor whose transcript exists is never touched');
   assert.ok(!fs.existsSync(path.join(root, 'blob-memo.json')), 'blob-memo dropped');
   // Scoped clean must NOT sweep the blind spots: `--session x` names one session's store, and machine-
   // wide reaping on a scoped call would surprise exactly the caller who asked for the narrow thing.
@@ -13294,6 +15869,118 @@ test('cli: clean reaches the GC blind spots — ghost cache dirs, orphaned curso
   core.ensureStore('scopedS');
   cp.execFileSync('node', [CLI, 'clean', '--session', 'scopedS', '--json'], { env: { ...process.env, HOME: home, USERPROFILE: home }, encoding: 'utf8' });
   assert.ok(fs.existsSync(path.join(root, 'blob-memo.json')), 'a scoped clean leaves the machine-wide sweeps alone');
+});
+
+test('cli: clean takes the caches an earlier version left — usage cursors and Stats caches of the old names, older asks, prompts and transcript facts — never this build\'s own; a newer build\'s asks, prompts, cursors and Stats caches stay too (0.11.0)', () => {
+  // A version in a cache's NAME means a bump leaves the file of the version before addressed by nothing. Every version
+  // below is read off the file this build's own writer made, never written into the test. (Transcript facts and map
+  // payloads of a NEWER version go as well: pruneStaleMaps takes every one that is not this build's, as it always has.)
+  const home = freshHome();
+  delete process.env.CLAUDE_CONFIG_DIR;
+  const root = core.rootDir();
+  const S = 'supersededCaches';
+  const cwd = fs.realpathSync(tmpWork());
+  fs.mkdirSync(core.projectDir(cwd), { recursive: true });
+  const transcript = path.join(core.projectDir(cwd), `${S}.jsonl`);
+  const now = Date.now();
+  fs.writeFileSync(transcript, [JSON.stringify({ type: 'user', sessionId: S, cwd, timestamp: new Date(now - 2000).toISOString(), message: { role: 'user', content: 'go' } }),
+    JSON.stringify({ ...assistantMsg(now - 1000), sessionId: S, cwd })].join('\n') + '\n');
+  seedEdit(S, path.join(cwd, 'a.ts'), 'x\n', 'y\n');
+  core.cachedChangeMap(cwd, S, { root: cwd, prompts: true });
+  core.sessionUsage(cwd, S);
+  core.computeStats(undefined, now);
+  core.computeStats(undefined, now, true);
+  const cache = path.join(root, 'changemap-cache', S);
+  const cursors = path.join(root, 'usage-cursors');
+  const live = (dir, name) => {
+    const n = fs.readdirSync(dir).find((f) => name.test(f));
+    assert.ok(n, `positive control: this build wrote ${name}`);
+    return { n, v: Number(name.exec(n)[1]) };
+  };
+  const asks = live(cache, /^asks-v(\d+)\.json$/);
+  const prompts = live(cache, /^prompts-v(\d+)-[0-9a-f]{16}\.json$/);
+  const facts = live(cache, /^transcript-facts-v(\d+)-[0-9a-f]{64}\.json$/);
+  const cursor = live(cursors, /^[0-9a-f]{16}\.v(\d+)\.json$/);
+  const stats = live(root, /^stats-cache-v(\d+)\.json$/);
+  const statsClaude = live(root, /^stats-cache-claude-v(\d+)\.json$/);
+  const own = [...fs.readdirSync(cache).map((n) => path.join(cache, n)), ...fs.readdirSync(cursors).map((n) => path.join(cursors, n)),
+    ...fs.readdirSync(root).filter((n) => n.startsWith('stats-cache')).map((n) => path.join(root, n))];
+  const ghost = path.join(root, 'changemap-cache', 'ghostOfOld'); // the caches of a session with no store folder
+  const key = cursor.n.slice(0, 16);
+  // What earlier versions left: the names before a version was in them, and versions before this build's.
+  const superseded = [
+    path.join(cache, `asks-v${asks.v - 1}.json`),
+    path.join(cache, `prompts-v${prompts.v - 1}-${'a'.repeat(16)}.json`),
+    path.join(cache, `transcript-facts-v${facts.v - 1}-${'0'.repeat(64)}.json`),
+    path.join(ghost, `asks-v${asks.v - 1}.json`),
+    path.join(cursors, `${key}.json`),
+    path.join(cursors, `${key}.v${cursor.v - 1}.json`),
+    path.join(root, 'stats-cache.json'),
+    path.join(root, 'stats-cache-claude.json'),
+    path.join(root, `stats-cache-v${stats.v - 1}.json`),
+    path.join(root, `stats-cache-claude-v${statsClaude.v - 1}.json`),
+  ];
+  // What stays besides this build's own: a newer build's, running beside it, and what is not a cache — the comments an
+  // earlier version kept among the caches, which a person wrote.
+  const kept = [
+    path.join(cache, `asks-v${asks.v + 1}.json`),
+    path.join(cache, `prompts-v${prompts.v + 1}-${'b'.repeat(16)}.json`),
+    path.join(cache, 'comments.json'),
+    path.join(ghost, `asks-v${asks.v}.json`),
+    path.join(cursors, `${key}.v${cursor.v + 1}.json`),
+    path.join(root, `stats-cache-v${stats.v + 1}.json`),
+    path.join(root, `stats-cache-claude-v${statsClaude.v + 1}.json`),
+  ];
+  const plant = (files) => {
+    for (const f of files) {
+      fs.mkdirSync(path.dirname(f), { recursive: true });
+      fs.writeFileSync(f, JSON.stringify({ version: 1, v: 1, transcript, comments: [] }));
+    }
+  };
+  const clean = (...args) => JSON.parse(cp.execFileSync(process.execPath, [CLI, 'clean', ...args, '--json'], { env: { ...process.env, HOME: home, USERPROFILE: home }, cwd, encoding: 'utf8' }));
+  const gone = () => superseded.filter((f) => !fs.existsSync(f));
+  const stayed = () => [...own, ...kept].filter((f) => fs.existsSync(f));
+  plant([...superseded, ...kept]);
+  const out = clean();
+  assert.deepEqual(gone(), superseded, 'every file of an earlier version is removed');
+  assert.deepEqual(stayed(), [...own, ...kept], 'and this build\'s own, a newer build\'s and the comments stay');
+  assert.deepEqual([out.staleMaps, out.cursors], [superseded.length, 0], 'each is counted as a superseded cache file, none as an orphaned cursor');
+  // An older build still running writes its own again; the next clean takes them again, and still nothing else.
+  plant(superseded);
+  assert.equal(clean().staleMaps, superseded.length, 'what an older build wrote again is taken again');
+  assert.deepEqual([gone(), stayed()], [superseded, [...own, ...kept]], 'and nothing else');
+  // A clean of one session takes that session's, and leaves the machine-wide caches to a whole clean.
+  plant(superseded);
+  clean('--session', S);
+  assert.deepEqual(gone(), superseded.filter((f) => path.dirname(f) === cache), 'a clean of one session takes only its own');
+});
+
+test('changemap: a read sweeps superseded transcript facts, and leaves an older build\'s asks scan and prompts projection to `oak clean` (0.11.0)', () => {
+  // An editor still running an older build reads and writes its own asks scan and prompts projection: taken at every
+  // read, it would rebuild them at every read. A read that writes a session's facts runs the read path's sweep
+  // (pruneStaleMaps, once per session in a process): the facts generation planted before it, gone after, is the
+  // control that it ran.
+  freshHome();
+  delete process.env.CLAUDE_CONFIG_DIR;
+  const S = 'readSweep';
+  const cwd = fs.realpathSync(tmpWork());
+  fs.mkdirSync(core.projectDir(cwd), { recursive: true });
+  const now = Date.now();
+  fs.writeFileSync(path.join(core.projectDir(cwd), `${S}.jsonl`), [JSON.stringify({ type: 'user', sessionId: S, cwd, timestamp: new Date(now - 2000).toISOString(), message: { role: 'user', content: 'go' } }),
+    JSON.stringify({ ...assistantMsg(now - 1000), sessionId: S, cwd })].join('\n') + '\n');
+  seedEdit(S, path.join(cwd, 'a.ts'), 'x\n', 'y\n');
+  const cache = path.join(core.rootDir(), 'changemap-cache', S);
+  fs.mkdirSync(cache, { recursive: true });
+  const older = {
+    facts: path.join(cache, `transcript-facts-v${require('../dist/derived-transcript.js').TRANSCRIPT_FACTS_VERSION - 1}-${'0'.repeat(64)}.json`),
+    asks: path.join(cache, `asks-v${require('../dist/asks.js').ASKS_CACHE_VERSION - 1}.json`),
+    prompts: path.join(cache, `prompts-v${core.PROMPTS_CACHE_VERSION - 1}-${'a'.repeat(16)}.json`),
+  };
+  for (const f of Object.values(older)) fs.writeFileSync(f, '{}');
+  core.cachedChangeMap(cwd, S, { root: cwd, prompts: true });
+  assert.ok(fs.readdirSync(cache).some((n) => /^transcript-facts-v\d+-[0-9a-f]{64}\.json$/.test(n) && path.join(cache, n) !== older.facts), 'positive control: the read wrote this build\'s facts');
+  assert.equal(fs.existsSync(older.facts), false, 'positive control: and swept a superseded facts generation');
+  assert.deepEqual([fs.existsSync(older.asks), fs.existsSync(older.prompts)], [true, true], 'the older asks scan and prompts projection are left for `oak clean`');
 });
 
 test('actions: outsideCounts — memoized boundary-crossing counts stay exact (0.9.0)', () => {
@@ -13693,9 +16380,10 @@ test('channel: persisted at the store root; resolveReleaseFromList picks per cha
     assert.equal(core.versionOfRelease({ tag_name: 'dev-latest', name: t }), '9.9.9-dev.3',
       `versionOfRelease must extract the version from the workflow title: "${t}"`);
 
-  // The CLI's network-free version surface — what the editors' chip renders instantly.
+  // The CLI's network-free version surface — what the editors' chip renders instantly. An installed copy:
+  // the build in this checkout also names the checkout (`linked`).
   const env = { ...process.env, HOME: home, USERPROFILE: home };
-  const vj = JSON.parse(cp.execFileSync('node', [CLI, 'version', '--json'], { env, encoding: 'utf8' }));
+  const vj = JSON.parse(cp.execFileSync('node', [installedCli(), 'version', '--json'], { env, encoding: 'utf8' }));
   assert.deepEqual(vj, { current: require('../../cli/package.json').version, channel: 'stable' }, 'version --json = installed + channel, no network');
 });
 
@@ -13737,6 +16425,39 @@ test('update: resolveUpdatePlan follows the channel in BOTH directions (0.9.5)',
   assert.equal(one(core.resolveUpdatePlan(LIST, 'dev', at('0.10.0-dev.12'), { switching: true })).reason, 'switching');
   assert.equal(one(core.resolveUpdatePlan(LIST, 'dev', at('0.10.0-dev.12'), { force: true })).reason, 'forced');
   assert.equal(one(core.resolveUpdatePlan(LIST, 'dev', at(null))).reason, 'missing', 'not installed is not "current"');
+
+  // A marketplace serves stable builds and updates its installs itself: on stable, that install is the
+  // editor's, even under --force (two updaters on one install ping-pong versions). On dev it is ours.
+  const gallery = (v) => [{ surface: 'vscode', label: 'Cursor', version: v, marketplace: true }];
+  const managed = core.resolveUpdatePlan(LIST, 'stable', gallery('0.9.4'), { force: true });
+  assert.equal(one(managed).reason, 'managed');
+  assert.deepEqual(managed.actions, [], 'a managed install is reported, never acted on');
+  assert.equal(one(core.resolveUpdatePlan(LIST, 'dev', gallery('0.9.4'))).reason, 'behind', 'the dev channel is GitHub-only, so it is ours');
+
+  // A CLI linked to a checkout (2026-10-06): installing a release over the link replaced it with a copy, and
+  // the hooks ran the release's older code from then on. Its owner updates the checkout; never the update,
+  // whatever the version, the flags or the channel.
+  const linkedCli = (v) => [{ surface: 'cli', label: 'CLI', version: v, linked: '/src/oak' }];
+  for (const [v, opts] of [['0.10.0-dev.0', {}], ['0.10.0', {}], ['0.10.0-dev.12', { switching: true }], ['0.10.0-dev.0', { force: true }]]) {
+    const plan = core.resolveUpdatePlan(LIST, 'dev', linkedCli(v), opts);
+    assert.deepEqual([one(plan).reason, one(plan).linked, plan.actions], ['linked', '/src/oak', []], `${v} ${JSON.stringify(opts)}`);
+  }
+  assert.equal(one(core.resolveUpdatePlan(LIST, 'dev', at('0.10.0-dev.0'))).linked, undefined, 'only a linked surface names a checkout');
+
+  // A local build (2026-10-07): `<target>-dev.0` is the version committed on dev, which CI never publishes, so an
+  // install at it was built from a checkout. The channel's newest is no update to it, in either direction.
+  for (const [channel, kind] of [['dev', 'behind'], ['stable', 'ahead']]) {
+    for (const surface of ['cli', 'vscode', 'jetbrains']) {
+      const local = [{ surface, label: surface, version: '0.10.0-dev.0' }];
+      const plan = core.resolveUpdatePlan(LIST, channel, local);
+      assert.deepEqual([one(plan).reason, plan.actions], ['local', []], `${surface} on ${channel}`);
+      // …unless asked: --force, or the channel named (--channel), the switch included.
+      assert.equal(one(core.resolveUpdatePlan(LIST, channel, local, { force: true })).reason, 'forced');
+      assert.equal(one(core.resolveUpdatePlan(LIST, channel, local, { named: true })).reason, kind, `--channel ${channel}`);
+      assert.equal(one(core.resolveUpdatePlan(LIST, channel, local, { switching: true, named: true })).reason, kind);
+    }
+  }
+  assert.equal(one(core.resolveUpdatePlan([{ tag_name: 'v0.10.0-dev.0', prerelease: false }], 'stable', at('0.10.0-dev.0'))).reason, 'current', 'a channel serving exactly that build');
 
   // POST-PROMOTE: the chip used to take the newest prerelease directly while the updater used
   // resolveReleaseFromList, so the two named different versions. One resolution now, and it says so.
@@ -13797,7 +16518,9 @@ test('cli: the update/switch mechanism WORKS end-to-end — mock releases API, r
       path.join(pkgDir, 'package.json'),
       JSON.stringify({ name, version, bin: Object.fromEntries(bins.map((b) => [b, 'co.js'])) })
     );
-    fs.writeFileSync(path.join(pkgDir, 'co.js'), '#!/usr/bin/env node\nconsole.log(["fake", require("./package.json").version, ...process.argv.slice(2)].join(" "));\n');
+    // As the new release's __after-update does, it reports its components where the old CLI asked.
+    fs.writeFileSync(path.join(pkgDir, 'co.js'), '#!/usr/bin/env node\nconsole.log(["fake", require("./package.json").version, ...process.argv.slice(2)].join(" "));\n' +
+      'if (process.env.OAK_UPDATE_REPORT) require("fs").writeFileSync(process.env.OAK_UPDATE_REPORT, JSON.stringify([{ id: "hooks", label: "Claude Code capture hooks", state: "updated", detail: "repaired by " + require("./package.json").version }]));\n');
     cp.execSync('npm pack --silent', { cwd: pkgDir, env: { ...process.env, npm_config_cache: npmCache, npm_config_update_notifier: 'false' }, stdio: ['ignore', 'ignore', 'ignore'] });
     return path.join(pkgDir, `${name}-${version}.tgz`);
   };
@@ -13842,9 +16565,10 @@ test('cli: the update/switch mechanism WORKS end-to-end — mock releases API, r
   delete env.CLAUDE_CONFIG_DIR;
   // ASYNC exec, deliberately: the mock server lives in THIS process, and a sync exec would block the
   // event loop that has to accept the child's requests — a deadlock that reads as a network timeout.
+  const cli = installedCli();
   const run = (args) =>
     new Promise((resolve, reject) => {
-      cp.execFile('node', [CLI, ...args], { env, encoding: 'utf8' }, (err, stdout, stderr) => {
+      cp.execFile('node', [cli, ...args], { env, encoding: 'utf8' }, (err, stdout, stderr) => {
         if (err) reject(new Error(`${args.join(' ')} failed: ${stderr || stdout || err.message}`));
         else resolve(stdout);
       });
@@ -13879,6 +16603,8 @@ test('cli: the update/switch mechanism WORKS end-to-end — mock releases API, r
     assert.equal(installedPkgJson('claude-observatory'), null, 'the old package is uninstalled first');
     // The herdr pin and the PTY repair are the NEW release's: the installed CLI finishes the update.
     assert.match(sw, /^fake 9\.10\.0-dev\.7 __after-update$/m, 'the update is finished by the CLI it installed');
+    assert.match(sw.slice(sw.indexOf('\nResult\n')), /^  Claude Code capture hooks\s+updated — repaired by 9\.10\.0-dev\.7$/m, "the result table carries the installed CLI's report");
+    assert.match(sw, /^  Claude Code capture hooks\s+checked by the new CLI once it is installed$/m, 'the plan leaves the setup to the CLI that will own it');
     assert.deepEqual(fs.readdirSync(scratch).filter((n) => n.startsWith('oak-observatory-')), [], 'the downloaded tarball is not left in the temp dir');
 
     // 3. And BACK: stable is a semver DOWNGRADE from the dev build — the one case a plain
@@ -13893,8 +16619,20 @@ test('cli: the update/switch mechanism WORKS end-to-end — mock releases API, r
     assert.equal(vj.channel, 'stable');
     assert.equal(vj.stableLatest, '9.9.9');
     assert.equal(vj.devLatest, '9.10.0-dev.7');
-    assert.equal(vj.updateAvailable, core.compareVersions('9.9.9', vj.current) !== 0, 'updateAvailable is any DIFFERENCE from the channel, not just a higher number');
-    assert.equal(vj.stranded, core.compareVersions('9.9.9', vj.current) < 0, 'stranded says which way the difference points');
+    // The CLI under test is this tree's build: a local one (dev.0) is offered nothing, any other is placed on the channel.
+    const local = core.isLocalBuild(vj.current);
+    assert.equal(vj.updateAvailable, !local && core.compareVersions('9.9.9', vj.current) !== 0, 'updateAvailable is any DIFFERENCE from the channel, not just a higher number');
+    assert.equal(vj.stranded, !local && core.compareVersions('9.9.9', vj.current) < 0, 'stranded says which way the difference points');
+    assert.equal(vj.local, local || undefined, 'a local build says so');
+    assert.equal(vj.compared, undefined, 'no --compare, no compared');
+    // `--compare` places another surface's build (JetBrains passes its plugin's) against the same channel.
+    for (const [other, reason] of [['9.9.9', 'current'], ['9.9.8', 'update available'], ['9.10.0-dev.7', 'not on this channel'], ['9.10.0-dev.0', 'local build']]) {
+      const cj = JSON.parse(await run(['version', '--check', '--json', '--compare', other]));
+      assert.deepEqual(cj.compared, { version: other, reason }, `--compare ${other}`);
+    }
+    // With no version it fails, rather than answering without `compared` as if none had been asked for.
+    for (const args of [['--compare'], ['--compare='], ['--compare', '--json']])
+      await assert.rejects(run(['version', '--check', '--json', ...args]), /`--compare` requires a version/, args.join(' '));
   } finally {
     srv.close();
   }
@@ -14008,9 +16746,11 @@ test('cli: an install ABOVE the channel is pulled back onto it, and --json chang
     CLAUDE_OBSERVATORY_NO_UPDATE_CHECK: '1',
   };
   delete env.CLAUDE_CONFIG_DIR;
+  // A build a release can carry: this tree's own may be a local build, which no channel replaces unasked.
+  const cli = installedCli('9.9.9-dev.3');
   const run = (args) =>
     new Promise((resolve, reject) => {
-      cp.execFile('node', [CLI, ...args], { env, encoding: 'utf8' }, (err, stdout, stderr) => {
+      cp.execFile('node', [cli, ...args], { env, encoding: 'utf8' }, (err, stdout, stderr) => {
         if (err) reject(new Error(`${args.join(' ')} failed: ${stderr || stdout || err.message}`));
         else resolve(stdout);
       });
@@ -14031,6 +16771,13 @@ test('cli: an install ABOVE the channel is pulled back onto it, and --json chang
 
     // --json reports the same verdict, structurally, and installs NOTHING.
     const before = installedPkgJson();
+    // A JetBrains IDE with the plugin: its row names its plugins folder, so the IDE can tell its own row.
+    const ide = path.join(home, '.local', 'share', 'JetBrains', 'PyCharm2026.1');
+    fs.mkdirSync(path.join(ide, 'oak-observatory-jetbrains', 'lib'), { recursive: true });
+    const full = JSON.parse(await run(['update', '--json', '--here'])); // --here: never this machine's own herdr
+    assert.deepEqual(full.surfaces.filter((s) => s.surface === 'jetbrains').map((s) => s.pluginsDir), [ide]);
+    assert.equal(full.surfaces.find((s) => s.surface === 'cli').pluginsDir, undefined, 'only a JetBrains row names one');
+    fs.rmSync(path.join(home, '.local', 'share', 'JetBrains'), { recursive: true, force: true });
     const pj = JSON.parse(await run(['update', '--json', '--cli-only']));
     const cliRow = pj.surfaces.find((s) => s.surface === 'cli');
     assert.equal(cliRow.reason, 'ahead', 'the structured hand-off carries the reason, so no editor has to grep prose');
@@ -14180,7 +16927,7 @@ test('spawn: our launch shape does not trigger the DEP0190 deprecation', (t) => 
 test('spawn: a launched command delivers the argv a bare spawn would, spaces and all', () => {
   // The probe lives at a space-free path and only the --root VALUE carries a space: that is the real
   // shape (`spawnCliJson(bin, [.., '--root', cwd])` with a workspace under C:\Users\First Last).
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-spawn-'));
+  const dir = tmpDir('cc-spawn-');
   const probe = path.join(dir, 'argv.js');
   fs.writeFileSync(probe, 'console.log(JSON.stringify(process.argv.slice(2)))');
   const args = ['changemap', '--json', '--root', path.join(dir, 'First Last', 'repo')];
@@ -14216,7 +16963,7 @@ test('spawn: a launched command delivers the argv a bare spawn would, spaces and
 });
 
 test('spawn: the wrappers apply the spec and forward cwd/env/stdio', () => {
-  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cc-wrap-')));
+  const dir = fs.realpathSync(tmpDir('cc-wrap-'));
   const probe = path.join(dir, 'probe.js');
   fs.writeFileSync(
     probe,
@@ -14291,6 +17038,36 @@ test('spawn: the wrappers apply the spec and forward cwd/env/stdio', () => {
         }
       });
     }),
+  ]);
+});
+
+test('spawn: every child is asked to start with no console window on Windows (windowsHide), unless its caller says otherwise', () => {
+  // A console program started by a process with no console of its own opens a window of its own on Windows: VS Code's
+  // extension host has none, nor does a detached refresh or the herdr server OAK starts, and each child of theirs (herdr,
+  // ssh, node, cmd.exe for a .cmd shim) flashed one. Only Windows shows it, so what each entry point hands child_process is
+  // read from the spawn recorder: every route, direct or through the shell, detached or not.
+  const dir = tmpDir('cc-hide-');
+  const log = path.join(dir, 'spawns.jsonl');
+  const script = `const core = require(${JSON.stringify(path.resolve(__dirname, '../dist/index.js'))});
+    const n = process.execPath, a = ['-e', '0'];
+    core.spawnToolSync(n, a, { stdio: 'ignore' });
+    core.spawnToolSync(n, a, { stdio: 'ignore', windowsHide: false });
+    core.spawnToolSync('oak-not-a-command', a, { stdio: 'ignore', platform: 'win32' });
+    core.spawnTool(n, a, { stdio: 'ignore' });
+    core.spawnTool(n, a, { stdio: 'ignore', detached: true });
+    core.spawnTool(n, a, { stdio: 'ignore', detached: true, windowsHide: false });
+    core.execFileTool(n, a, {}, () => {});
+    core.execFileTool(n, a, { detached: true }, () => {});
+    core.execFileTool(n, a, { windowsHide: false }, () => {});`;
+  const r = cp.spawnSync(process.execPath, ['--require', path.resolve(__dirname, '../../tui/test/fixtures/spawn-recorder.cjs'), '-e', script],
+    { env: { ...process.env, OAK_SPAWN_LOG: log }, encoding: 'utf8', timeout: 30000 });
+  assert.equal(r.status, 0, r.stderr);
+  const seen = fs.readFileSync(log, 'utf8').trim().split('\n').map((l) => JSON.parse(l)).map((e) => [e.kind, e.detached, e.windowsHide]);
+  assert.deepEqual(seen, [
+    ['spawnSync', false, true], ['spawnSync', false, false], ['spawnSync', false, true],
+    ['spawn', false, true], ['spawn', true, true], ['spawn', true, false],
+    // execFileTool keeps execFile for a detached child on Windows, where one detached gets a console of its own.
+    ['execFile', false, true], process.platform === 'win32' ? ['execFile', false, true] : ['spawn', true, true], ['execFile', false, false],
   ]);
 });
 
@@ -14417,8 +17194,41 @@ test('failure: a deprecation warning never outranks the real reason (#45)', () =
   assert.equal(core.cliFailureMessage('', dep, 'is the claude-observatory CLI installed?'),
     'is the claude-observatory CLI installed?');
   assert.equal(core.cliFailureMessage(null, undefined, 'fallback'), 'fallback', 'null/undefined are tolerated');
-  // The cap keeps a toast a toast.
-  assert.equal(core.cliFailureMessage('', 'x'.repeat(500), 'f').length, 300);
+  // A long reason is shown whole, never cut short with an ellipsis: a notification wraps it.
+  assert.equal(core.cliFailureMessage('', 'x'.repeat(500), 'f'), 'x'.repeat(500));
+  assert.equal(core.cliFailureMessage(`progress\n⚠ ${'y'.repeat(500)}`, '', 'f'), `⚠ ${'y'.repeat(500)}`);
+});
+
+test('failure: a saved machine\'s reason is one line, Node\'s error line when its `oak` crashed (2026-10-07)', () => {
+  // Real reports from this Node: the file, its source line (a bundle's can be thousands of characters), a caret, the
+  // error's own line and every frame. The error line is the reason, whole.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'crash-'));
+  const crash = (body) => {
+    fs.writeFileSync(path.join(dir, 'oak.js'), body);
+    return require('child_process').spawnSync(process.execPath, [path.join(dir, 'oak.js')], { cwd: dir, encoding: 'utf8' }).stderr;
+  };
+  // Its source line reads as trouble too, as a bundle's lines often do: only the error line is the reason.
+  const typeError = crash(`const DATA = "${'x'.repeat(3000)}", WHY = "could not update"; const plan = undefined; plan.surfaces;\n`);
+  assert.ok(typeError.length > 3000 && typeError.includes('could not update"; const plan'), 'control: the report is long, its source line included');
+  assert.equal(core.failureLine(typeError), "TypeError: Cannot read properties of undefined (reading 'surfaces')");
+  assert.equal(core.failureLine(crash("require('./no-such-module');\n")), "Error: Cannot find module './no-such-module'", 'its require stack is not the reason');
+  // Windows names the file on the drive the crashed `oak` ran in: C:\no\such\file.
+  assert.equal(core.failureLine(crash("require('fs').readFileSync('/no/such/file');\n")), `Error: ENOENT: no such file or directory, open '${path.resolve(dir, '/no/such/file')}'`);
+  assert.match(core.failureLine(crash("import('./nope.mjs').catch((e) => { throw e; });\n")), /^Error \[ERR_MODULE_NOT_FOUND\]: Cannot find module '.*nope\.mjs'/);
+  assert.match(core.failureLine(crash("Promise.reject('a string');\n")), /^\[?UnhandledPromiseRejection: This error originated .*"a string"/);
+  fs.rmSync(dir, { recursive: true, force: true });
+  // An update's log that then crashed again on the read after it: each error once.
+  assert.equal(core.failureLine(`downloading oak …\n${typeError}${typeError}`), "TypeError: Cannot read properties of undefined (reading 'surfaces')");
+  // No crash: the lines that read as trouble, each on its own and joined on one line, without Node's warnings.
+  const dep = '(node:326100) [DEP0190] DeprecationWarning: Passing args to a child process with shell option true\n(Use `node --trace-deprecation ...` to show where the warning was created)\n';
+  assert.equal(core.failureLine(`${dep}downloading oak …\n  ⚠ npm install failed (exit 1)\n✓ VS Code extension 0.10.0 → 0.11.0\n✗ the JetBrains plugin could not be updated\n`),
+    '⚠ npm install failed (exit 1); ✗ the JetBrains plugin could not be updated');
+  // Nothing that reads as trouble: the last lines, where the CLI's own reason comes.
+  assert.equal(core.failureLine('one\ntwo\nthree\noak: no published release found for the repository.\n'), 'two; three; oak: no published release found for the repository.');
+  assert.equal(core.failureLine(`${dep}\n`), '', 'nothing said');
+  assert.equal(core.failureLine(null), '');
+  // Never cut: a long reason stays whole.
+  assert.equal(core.failureLine(`oak: ${'y'.repeat(2000)}`), `oak: ${'y'.repeat(2000)}`);
 });
 
 test('failure: the JetBrains plugin mirrors cliFailureMessage (cross-editor parity)', () => {
@@ -14578,8 +17388,8 @@ test('statusline: the script it GENERATES parses — not just the installer that
   // ends the program. Guard the comments that live in there.
   // From INSIDE the quotes: the delimiters themselves are apostrophes, and they are the two that
   // are supposed to be there.
-  const jqOpen = generated.indexOf("| jq -c --argjson old");
-  const jqFrom = generated.indexOf(String.fromCharCode(39) + '{', jqOpen) + 1;
+  const jqOpen = generated.indexOf("| jq -c -n --arg est5");
+  const jqFrom = generated.indexOf(String.fromCharCode(39) + 'input as $old', jqOpen) + 1;
   assert.ok(jqOpen > 0 && jqFrom > jqOpen, 'the persist still runs through a single-quoted jq program');
   const jqTo = generated.indexOf("}'", jqFrom);
   assert.ok(jqTo > jqFrom, '…and the program is single-quoted');
@@ -14589,14 +17399,20 @@ test('statusline: the script it GENERATES parses — not just the installer that
 
 test('statusline: the month\'s dollar total is marked an estimate like its spend', () => {
   // Both editors and the Stats callout mark every estimated dollar with `~`; the shipped status line
-  // printed `~$893/$3.4k`. Run the line the installer writes, with its own money() formatter.
-  const sh = fs.readFileSync(path.resolve(__dirname, '../../cli/statusline/install-statusline.sh'), 'utf8');
-  const money = sh.split('\n').find((l) => l.startsWith('money() {'));
-  const line = sh.split('\n').find((l) => l.startsWith('_m30=$(money "$cost30")'));
-  assert.ok(money && line, 'the formatter and the month line are still where they were');
-  const run = (cost, total) => cp.spawnSync('bash', ['-c', `${money}\nLORG=; R=; DIM=; _mo=; cost30=${cost}; costt30=${total}\n${line}\nprintf '%s' "$_mo"`], { encoding: 'utf8' }).stdout;
+  // printed `~$893/$3.4k`. Run the lines the installer writes, with its own money() formatter.
+  const sh = fs.readFileSync(path.resolve(__dirname, '../../cli/statusline/install-statusline.sh'), 'utf8').split('\n');
+  const money = sh.find((l) => l.startsWith('money() {'));
+  const from = sh.findIndex((l) => l.startsWith('_m30=$(money "$cost30")'));
+  const to = sh.findIndex((l, i) => i > from && l.startsWith('[ -n "$_m30" ]'));
+  assert.ok(money && from > 0 && to > from, 'the formatter and the month lines are still where they were');
+  const run = (cost, total, spend = '', five = 40) => cp.spawnSync('bash', ['-c', `${money}\nLORG=; R=; DIM=; _mo=; five_pct=${five}; week_pct=; _c5q=; _c7q=; cost30=${cost}; costt30=${total}; spend30=${spend}\n${sh.slice(from, to + 1).join('\n')}\nprintf '%s' "$_mo"`], { encoding: 'utf8' }).stdout;
   assert.equal(run(893, 3400), '~$893/~$3.4k');
   assert.equal(run(893, 0), '~$893', 'control: spend alone, where no budget can be projected');
+  // A plan with no rolling windows (pay-as-you-go API, Enterprise) is charged what Claude Code reported: that spend,
+  // with no ~ and no projected total (2026-11-03). A subscription keeps its estimate whatever was reported.
+  assert.equal(run(893, 3400, '12.50', ''), '$12', 'no rolling windows: the charge');
+  assert.equal(run(893, 3400, '12.50'), '~$893/~$3.4k', 'a subscription: the estimate');
+  assert.equal(run(893, 0, '0.00', ''), '~$893', 'no charge on record: the estimate');
 });
 
 test('statusline: the vendored installer keeps the fixes a sync would silently drop', () => {
@@ -14617,20 +17433,27 @@ test('statusline: the vendored installer keeps the fixes a sync would silently d
   // statusline keeps working, and every surface that reads the cache quietly loses the branch, the
   // think state, the token split, the duration and the plan totals. Proven droppable: removing just
   // these lines left the whole suite green before this block existed.
-  for (const k of ['v', 'branch', 'thinking', 'output_style', 'tok_in', 'tok_out', 'tok_cache', 'dur_ms', 'five_total', 'week_total', 'cost_usd', 'costs']) {
+  for (const k of ['v', 'branch', 'thinking', 'output_style', 'tok_in', 'tok_out', 'tok_cache', 'tok_tree', 'dur_ms', 'five_total', 'week_total', 'cost_usd', 'costs']) {
     assert.match(sh, new RegExp('\\b' + k + ':'), `the cache write keeps ${k}, which the dashboard reads`);
   }
   // …and the calibration that is NOT a ratchet (a one-way max() locked it above the real sample),
   // now ACCOUNT-WIDE: max(local union, own + remote own-figures) — see the account-wide test.
   assert.match(sh, /tpp5 = aU5 \/ p5/, 'the tokens-per-percent calibration stays the measured sample, account-calibrated');
-  assert.match(sh, /aU5 = U5; aU7 = U7/, 'usage is the local transcript union');
+  assert.match(sh, /aU5, aU7, aU7F = U5, U7, nU7F/, 'usage is the local transcript union where it holds more than the account sum');
+  assert.match(sh, /if A5 and not TOT and L5 \+ A5\['tok'\] > U5: aU5/, 'and this machine\'s own turns plus the saved machines\' own where that is more, when the index gave no totals');
+  // THE INDEX TOTALS (0.11.0): `oak usage` counts each message once across every machine its index holds, and the scan
+  // stands aside for them; upstream scans every render it is due.
+  assert.match(sh, /^def _totals\(\):$/m, 'the index totals the line reads must survive a sync');
+  assert.match(sh, /^if TOT and not \(_anchored\(TOT\['five'\], r5, W5\) and _anchored\(TOT\['week'\], r7, W7\)\): TOT = None$/m, 'used only for the windows this render anchors on');
+  assert.match(sh, /for path in \(\[\] if TOT else glob\.glob/, 'and no file is read when they stand');
+  assert.match(sh, /return k if _n\(k\) > _n\(v\) and \(not v or same\(k, v\)\) else v/, 'and a scan given fewer of them than the last takes the last scan\'s, in the same window');
   assert.doesNotMatch(sh, /remote-usage\.json/, 'the retired SSH usage cache is not consumed');
   assert.match(sh, /if \$promo == "-" then ""/, 'the promo sentinel: "-" CLEARS the cached marker when the promo ends — $old-resurrection ran it forever');
   assert.match(sh, /_st2\['cpp5'\] = cpp5/, 'the dollar calibration writes BACK after its post-dump update — without this it reloaded 0 every render');
   // The installer's embedded rate table mirrors pricing.ts — pin a spot rate from each family so
   // a one-sided price update fails loudly here instead of drifting silently.
-  assert.match(sh, /'claude-fable-5', \(10, 50, 12\.5, 0\.25\)/, 'fable rates mirror pricing.ts');
-  assert.match(sh, /'claude-opus-4', \(15, 75, 18\.75, 1\.5\)/, 'opus-4 rates mirror pricing.ts');
+  assert.match(sh, /'claude-fable-5', _c\(10, 12\.5, 20, 1, 50/, 'fable rates mirror pricing.ts');
+  assert.match(sh, /'claude-opus-4', _c\(\*_O4\)/, 'opus-4 rates mirror pricing.ts');
   // The measurement fixes (2026-09-02): one assistant message is written as several transcript
   // lines sharing message.id (blind summing measured 2.5-3x high), and synced-in transcripts made
   // every machine claim the other machines' work (double-counted the moment machines are added).
@@ -14639,19 +17462,21 @@ test('statusline: the vendored installer keeps the fixes a sync would silently d
   assert.match(sh, /ids\[mid\] = \[t, w, e, /, 'and the per-message-id dedup with it (entries carry their timestamp AND cache reads)');
   assert.match(sh, /if st\.get\('v'\) != 2: st = \{\}/, 'and the state-version reset that drops pre-dedup calibration');
   assert.match(sh, /\bv: 3,/, 'and the v3 cache stamp readers gate the cross-machine sum on');
-  // The PAINTED bar (2026-09-15): the figures print ON the field rather than beside it, which is
-  // the whole reason line 3 still fits a narrow pane. Upstream still emits BAR_FULL/BAR_EMPTY, so
-  // a sync reverts the row to the ~25%-wider bracketed form — and packages/tui/src/statusline.ts
-  // would then be drawing a line the shipped script no longer draws.
-  // The share is an UNDERLINE under the figures, not a bar beside them or a painted slab.
-  assert.match(sh, /^ULN=/m, 'the underline the rule is drawn with must survive a sync');
-  assert.match(sh, /^GY=\$'/m, 'and the 256-colour grey the figures use INSTEAD of DIM (dim drags the rule colour down)');
-  assert.doesNotMatch(sh, /58;5;/, 'no SGR 58 — it never reached a real screen and left the rule grey');
+  // The figures print INSIDE the bar rather than beside it, which is the whole reason line 3 still
+  // fits a narrow pane. Upstream still emits BAR_FULL/BAR_EMPTY, so a sync reverts the row to the
+  // ~25%-wider bracketed form — and packages/tui/src/statusline.ts would then be drawing a line the
+  // shipped script no longer draws.
+  // The bar is PAINTED in very dim colours (2026-10-14): a tint per usage colour and a neutral, under
+  // one explicit light ink, at the depth COLORTERM reports. Not an underline, and no caps.
+  assert.match(sh, /^case "\$\{COLORTERM:-\}" in$/m, 'the colour-depth switch the bars are painted by must survive a sync');
+  assert.match(sh, /BINK=\$'\\033\[38;2;228;228;228m'; BREST=\$'\\033\[48;2;30;30;34m'/, 'and the light ink over the dim neutral');
+  assert.match(sh, /BGRN=\$'\\033\[48;2;30;64;40m'; BYEL=\$'\\033\[48;2;60;52;24m'; BRED=\$'\\033\[48;2;74;36;36m'/, 'and the three very dim tints');
+  assert.doesNotMatch(sh, /^(ULN|GY)=/m, 'the underline and the grey figures it needed are gone');
   // THE FIGURES MUST RESTATE THE PERCENTAGE. `est` and `tot` are both projections from the same
   // tokens-per-percent, so est/tot is pct by construction — and every window prints the pair
-  // unconditionally, so a window at 0% reads ~0/59.5M rather than a blank.
+  // unconditionally, so a window at 0% reads ~0 over its budget rather than a blank.
   // A MEASURED numerator over this PROJECTED budget was tried and reverted the same day: it printed
-  // ~4M/59.5M, or 6.7%, beside a bar the account put at 0%.
+  // millions of tokens, several percent of the budget, beside a bar the account put at 0%.
   assert.doesNotMatch(sh, /if not e7: e7 =/, 'no measured fallback for the weekly estimate');
   assert.doesNotMatch(sh, /if not eF: eF =/, 'nor for the per-model weekly estimate');
   assert.doesNotMatch(sh, /if not e5: e5 =/, 'nor for the 5h window');
@@ -14659,10 +17484,9 @@ test('statusline: the vendored installer keeps the fixes a sync would silently d
     assert.match(sh, new RegExp('if \\[ "\\$\\{tot' + w + ':-0\\}" != 0 \\]; then _bt="~\\$\\(human "\\$\\{est' + w + ':-0\\}"\\)/'),
       `the ${w} window prints used/total whenever a budget is known, even at 0%`);
   }
-  assert.match(sh, /^CAPL="▏"; CAPR="▕"/m, 'and the caps that give the bar a visible extent');
-  assert.doesNotMatch(sh, /CAPL=\$'/, 'as LITERAL glyphs — bash 3.2 (stock macOS) prints $\'\\u258f\' verbatim');
+  assert.doesNotMatch(sh, /CAPL=|[▏▕]/, 'no caps: the painted box shows its own extent');
+  assert.doesNotMatch(sh, /\$'[^'\n]*\\u[0-9a-fA-F]{4}/, 'no \\u escape inside $\'…\' — bash 3.2 (stock macOS) prints it verbatim');
   assert.doesNotMatch(sh, /BAR_FULL=/, 'the upstream block-glyph bar must not come back');
-  assert.doesNotMatch(sh, /48;5;236m/, 'and neither must the painted field it replaced');
   // …and the parts that make every bar ONE length: the deferred two-pass build, the width it
   // settles on, and the EXIT trap that still prints a head when the window scan is killed (line 2
   // waits for that width, so without the trap a slow render prints nothing at all).
@@ -14680,13 +17504,26 @@ test('statusline: the vendored installer keeps the fixes a sync would silently d
   assert.match(sh, /statusline-tab-titles\/\$sid/, 'and the record that keeps it to one start per title');
   assert.match(sh, /\(umask 077; mkdir -p "\$\{_tsf%\/\*\}" && chmod 700 "\$\{_tsf%\/\*\}" && \{ \[ ! -e "\$_tsf" \] \|\| chmod 600 "\$_tsf"; \}/,
     'written private: a title is conversation content, also in a record an earlier line left readable');
+  // THE CACHE LOCK (2026-10-20): the read through the rename runs under <cache>.lock, or two renders started together write
+  // each other's reading back. Upstream writes without it.
+  assert.match(sh, /^_lock\(\) \{ local l="\$_LAST\.lock"/m, 'the cache lock must survive a sync');
+  assert.match(sh, /^_lock && _sweep\n_old=\$\(cat "\$_LAST"/m, 'taken before the cache is read, by a render that then sweeps what killed renders left');
+  // THE SWEEP (2026-10-21): their temporary files and aside locks, more than two minutes old. Upstream leaves them.
+  assert.match(sh, /^_sweep\(\) \{ local f t\n {2}for f in "\$_LAST"\.tmp\.\* "\$_LAST"\.lock\.\*\.\*; do$/m, 'the sweep must survive a sync');
+  assert.match(sh, /^\[ -n "\$_lt" \] && printf '%s\\n%s' "\$_old" "\$input" \| jq -c -n /m, 'a render without it writes nothing');
+  assert.match(sh, /&& \[ -d "\$_LAST\.lock\/\$_lt" \] && mv "\$_LAST\.tmp\.\$\$" "\$_LAST"/, 'and one renames only while it still holds it');
+  // A new 5h window scans at once: the last scan's 5h reads were its own window's. Upstream waits for THR.
+  assert.match(sh, /^_due = \(now - last\) >= THR or not st or \(r5 and s5 is not None and abs\(r5 - s5\) > 60\)$/m, 'a new 5h window must still scan at once after a sync');
+  assert.match(sh, /^if _due or \(TOT and _hadfc\):$/m, 'and the totals are taken at the scan cadence, and by the render that drops a scan\'s file map');
+  assert.match(sh, /^        if not TOT and not _due: raise _Wait\(\)$/m, 'and a render between two scans never scans');
+  assert.match(sh, /\[ -z "\$\{_lt:-\}" \] \|\| _unlock/, 'released by the EXIT trap when a render ends holding it');
 });
 
 test('statusline: the embedded scan dedups message lines and counts only THIS machine’s turns (0.10.0)', () => {
-  // MEASURED before the fix (2026-09-02, real transcripts): the blind line sum ran 2.5-3x the truth
+  // Before the fix, on real transcripts, the blind line sum ran several times the truth
   // (one assistant message is written as several lines sharing message.id, the later ones carrying
-  // the completing output_tokens), and 34% of what this box counted was another machine's synced-in
-  // work — so the cross-machine SUM double-counted the account. This runs the exact python the
+  // the completing output_tokens), and a large share of what one machine counted was another machine's
+  // synced-in work — so the cross-machine SUM double-counted the account. This runs the exact python the
   // installer embeds against a fixture that fails under either regression.
   const sh = fs.readFileSync(path.resolve(__dirname, '../../cli/statusline/install-statusline.sh'), 'utf8');
   const lines = sh.split('\n');
@@ -14729,17 +17566,17 @@ test('pricing + breakdown: models are priced by rate card, buckets follow the ac
   // The breakdown's ~$ figures are API list prices — the one thing that must never drift is the
   // math itself: split x rate, cache reads INCLUDED (they are the bulk of real compute value),
   // and an unknown model flagged approx instead of silently priced as something it is not.
-  const opus4 = core.priceUsage('claude-opus-4-20250514', { input: 1_000_000, output: 1_000_000, cacheWrite: 1_000_000, cacheRead: 1_000_000 });
+  const opus4 = core.priceUsage('claude-opus-4-20250514', { input: 1_000_000, output: 1_000_000, cacheWrite: 1_000_000, cacheWrite1h: 0, cacheRead: 1_000_000 });
   assert.equal(Math.round(opus4.usd * 100) / 100, 15 + 75 + 18.75 + 1.5, 'opus 4.0/4.1: $15 in + $75 out + $18.75 write + $1.50 read');
   assert.equal(opus4.approx, false);
   // Opus 4.5+ dropped to the $5 tier (same as Opus 5) — a dated 4.5 id must NOT inherit the 4.0 rate.
-  const opus45 = core.priceUsage('claude-opus-4-5-20251101', { input: 1_000_000, output: 1_000_000, cacheWrite: 1_000_000, cacheRead: 1_000_000 });
+  const opus45 = core.priceUsage('claude-opus-4-5-20251101', { input: 1_000_000, output: 1_000_000, cacheWrite: 1_000_000, cacheWrite1h: 0, cacheRead: 1_000_000 });
   assert.equal(Math.round(opus45.usd * 100) / 100, 5 + 25 + 6.25 + 0.5, 'opus 4.5+: $5 in + $25 out + $6.25 write + $0.50 read');
   assert.equal(opus45.approx, false);
   // Sonnet 3.5 is its own tier ($3/$15), never Haiku 3.5's $0.80 via a 2-segment fallback.
   assert.equal(Math.round(core.priceUsage('claude-3-5-sonnet-20241022', { input: 1_000_000, output: 0, cacheWrite: 0, cacheRead: 0 }).usd * 100) / 100, 3, 'sonnet 3.5 input at $3/M, not haiku $0.80');
-  const fable = core.priceUsage('claude-fable-5', { input: 0, output: 0, cacheWrite: 0, cacheRead: 10_000_000 });
-  assert.equal(Math.round(fable.usd * 100) / 100, 2.5, 'fable cache reads at $0.25/M');
+  const fable = core.priceUsage('claude-fable-5-1', { input: 0, output: 0, cacheWrite: 0, cacheRead: 10_000_000 });
+  assert.equal(Math.round(fable.usd * 100) / 100, 2.5, 'fable 5.1 cache reads at $0.25/M');
   const gpt = core.priceUsage('gpt-5.2-codex', { input: 1_000_000, output: 1_000_000, cacheWrite: 0, cacheRead: 1_000_000 });
   assert.equal(Math.round(gpt.usd * 1000) / 1000, 1.75 + 14 + 0.175);
   assert.equal(core.priceUsage('mystery-model-9', { input: 1, output: 0, cacheWrite: 0, cacheRead: 0 }).approx, true, 'an unknown model is flagged, not silently priced');
@@ -14783,6 +17620,1485 @@ test('pricing + breakdown: models are priced by rate card, buckets follow the ac
   // The promo table answers "is a boost live" both ways — dated, not guessed.
   assert.ok(core.activePromo(Date.UTC(2026, 7, 5)), 'the +50% boost was live in early August');
   assert.equal(core.activePromo(Date.UTC(2026, 8, 20)), null, '…and gone after Sep 14');
+});
+
+test('breakdown by session: a session\'s row is its own turns and carries the figure with every agent it started (0.11.0)', () => {
+  const home = freshHome();
+  const projects = path.join(home, 'projects');
+  const ts = new Date(Date.now() - 3600_000).toISOString();
+  const L = (id, inTok, outTok, cw, cr) =>
+    JSON.stringify({ timestamp: ts, cwd: home, message: { id, model: 'claude-opus-4-8', usage: { input_tokens: inTok, output_tokens: outTok, cache_creation_input_tokens: cw, cache_read_input_tokens: cr } } }) + '\n';
+  const put = (rel, text) => { const fp = path.join(projects, 'p1', rel); fs.mkdirSync(path.dirname(fp), { recursive: true }); fs.writeFileSync(fp, text); };
+  put('sess-parent.jsonl', L('m1', 100, 20, 50, 1000));
+  put('sess-parent/subagents/agent-w1.jsonl', L('m2', 10, 5, 0, 500));
+  put('sess-parent/subagents/workflows/wf_1/agent-w2.jsonl', L('m3', 7, 3, 40, 0));
+  put('sess-alone.jsonl', L('m4', 1, 1, 0, 0));
+  const bd = core.claudeBreakdown('session', Date.now() - 86400_000, null, projects);
+  const by = Object.fromEntries(bd.buckets.map((b) => [b.key, b]));
+  const p = by['sess-parent'];
+  assert.deepEqual([p.tokens, p.cacheRead, p.messages], [170, 1000, 1], 'the session\'s own row is its own turns');
+  assert.deepEqual([p.tree.agents, p.tree.tokens, p.tree.cacheRead, p.tree.messages], [2, 235, 1500, 3], 'with both agents, the workflow\'s a level down too');
+  const r6 = (x) => Math.round(x * 1e6) / 1e6;
+  assert.equal(r6(p.tree.usd), r6(p.usd + by['agent-w1'].usd + by['agent-w2'].usd), 'its dollars with its agents\'');
+  assert.deepEqual(['agent-w1', 'agent-w2'].map((k) => [by[k].parent, by[k].label]), [['sess-parent', 'agent-w1… (agent of sess-par…)'], ['sess-parent', 'agent-w2… (agent of sess-par…)']]);
+  assert.equal(by['sess-alone'].tree, undefined, 'a session that started no agents has its own figure alone');
+  assert.equal(bd.totals.tokens, 170 + 15 + 50 + 2, 'the totals count each turn once, the figure with agents adds none');
+});
+
+test('pricing: other providers are priced only under the provider that billed them (0.11.0)', () => {
+  const M = { input: 1_000_000, output: 1_000_000, cacheWrite: 0, cacheRead: 1_000_000 };
+  const r4 = (x) => Math.round(x * 10000) / 10000;
+  const usd = (model) => r4(core.priceUsage(model, M).usd);
+  // Codex through OpenRouter: `provider:openrouter/<slug>`, at OpenRouter's list prices.
+  assert.equal(usd('provider:openrouter/poolside/laguna-s-2.1'), r4(0.09 + 0.18 + 0.009));
+  assert.equal(usd('provider:openrouter/poolside/laguna-xs-2.1'), r4(0.06 + 0.12 + 0.03));
+  assert.equal(usd('provider:openrouter/thinkingmachines/inkling'), r4(1 + 4.05 + 0.17));
+  assert.equal(usd('provider:openrouter/thinkingmachines/inkling-small'), r4(0.45 + 1.2 + 0.1));
+  assert.equal(core.priceUsage('provider:openrouter/poolside/laguna-s-2.1', M).approx, false, 'a listed price is a reading, not a guess');
+  // The same model from a provider OAK has no price for shows no $: local Ollama, an unlisted
+  // OpenRouter model, and a provider id the table does not know.
+  for (const m of ['provider:ollama/laguna-xs.2:latest', 'provider:ollama/poolside/laguna-s-2.1', 'provider:openrouter/poolside/laguna-m.1',
+    'provider:my-gateway/poolside/laguna-s-2.1', 'poolside/laguna-s-2.1', 'laguna-xs.2',
+    // A provider id named like an Object property (Codex takes any id) is just another unknown one.
+    'provider:constructor/laguna-s-2.1', 'provider:__proto__/laguna-s-2.1']) {
+    const p = core.priceUsage(m, M);
+    assert.equal(p.known, false, `${m} has no price`); assert.equal(p.usd, 0, `${m} carries no invented dollars`);
+  }
+  assert.equal(core.priceUsage('thinkingmachines/inkling', M).known, false, 'the OpenRouter slug without a provider is ambiguous');
+
+  // End to end through both breakdowns: a Claude transcript on a non-Anthropic model (its cache
+  // fields are null) and codex rollouts with custom providers.
+  const home = freshHome();
+  const proj = path.join(home, 'projects', 'p1');
+  fs.mkdirSync(proj, { recursive: true });
+  const ts = new Date(Date.now() - 3600_000).toISOString();
+  fs.writeFileSync(path.join(proj, 'a.jsonl'), JSON.stringify({ timestamp: ts, cwd: home, message: { id: 'm1', model: 'thinkingmachines/inkling',
+    usage: { input_tokens: 1_000_000, output_tokens: 1_000_000, cache_creation_input_tokens: null, cache_read_input_tokens: null } } }) + '\n');
+  const cb = core.claudeBreakdown('model', Date.now() - 86400_000, null, proj);
+  assert.deepEqual(cb.buckets.map((b) => [b.key, Math.round(b.usd * 100) / 100, b.usdKnown]), [['thinkingmachines/inkling', 0, false]]);
+  const cx = path.join(home, 'codex-sessions', '2026', '09', '29');
+  fs.mkdirSync(cx, { recursive: true });
+  const roll = (id, provider, model) => fs.writeFileSync(path.join(cx, `rollout-${id}.jsonl`), [
+    { timestamp: ts, type: 'session_meta', payload: { id, cwd: home, model_provider: provider } },
+    { timestamp: ts, type: 'turn_context', payload: { model, model_provider: provider } },
+    { timestamp: ts, type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 1_000_000, output_tokens: 1_000_000 } } } },
+  ].map((r) => JSON.stringify(r)).join('\n') + '\n');
+  roll('or1', 'openrouter', 'poolside/laguna-s-2.1');
+  roll('ol1', 'ollama', 'laguna-xs.2:latest');
+  const xb = core.codexBreakdown('model', Date.now() - 86400_000, null, path.join(home, 'codex-sessions'));
+  const by = Object.fromEntries(xb.buckets.map((b) => [b.key, b]));
+  assert.equal(Math.round(by['poolside/laguna-s-2.1'].usd * 100) / 100, 0.27);
+  assert.equal(by['poolside/laguna-s-2.1'].usdKnown, true);
+  assert.equal(by['laguna-xs.2:latest'].usdKnown, false, 'the Ollama turn stays unpriced');
+  assert.equal(by['laguna-xs.2:latest'].tokens, 2_000_000, 'but its tokens still count');
+});
+
+test('pricing: each model id at its own row, cache writes by lifetime, long prompts by request (0.11.0)', () => {
+  // claude-opus-5-5 read as Opus 5, Sonnet 5.5 and Fable 5 took a sibling's cache read, Haiku 5.5 and GPT-6 fell to
+  // a fallback, and every cache write was priced at the 5-minute rate.
+  const r6 = (x) => Math.round(x * 1e6) / 1e6;
+  const U = (u) => ({ input: 0, output: 0, cacheWrite: 0, cacheRead: 0, cacheWrite1h: 0, ...u });
+  const at = (model, u) => { const p = core.priceUsage(model, U(u)); return [r6(p.usd), p.approx]; };
+  const M = 1_000_000;
+  assert.deepEqual(at('claude-opus-5-5', { input: M, output: M, cacheWrite: M, cacheRead: M }), [4 + 20 + 5 + 0.2, false], 'Opus 5.5 at its own row');
+  assert.deepEqual(at('claude-opus-5-5-20261101', { input: M }), [4, false], 'a date suffix is the same model');
+  assert.deepEqual(at('claude-opus-5-5[1m]', { input: M }), [4, false], 'and so is a context tag');
+  assert.deepEqual(at('claude-opus-5', { input: M }), [5, false], 'control: Opus 5 keeps its row');
+  assert.deepEqual(at('claude-sonnet-5-5', { cacheRead: 10 * M }), [1, false], 'Sonnet 5.5 reads at $0.10');
+  assert.deepEqual(at('claude-sonnet-5', { cacheRead: 10 * M }), [2, false], 'Sonnet 5 at $0.20');
+  assert.deepEqual(at('claude-fable-5', { cacheRead: 10 * M }), [10, false], 'Fable 5 reads at $1');
+  assert.deepEqual(at('claude-mythos-5', { cacheRead: 10 * M }), [10, false], 'and Mythos 5');
+  assert.deepEqual(at('claude-mythos-5-1', { cacheRead: 10 * M }), [2.5, false], 'Mythos 5.1 at $0.25');
+  // Haiku 5.5: a request whose prompt (input, cache reads and writes) is over 100,000 tokens is priced at the long tier.
+  assert.deepEqual(at('claude-haiku-5-5', { input: 100_000 }), [0.01, false], 'a prompt of 100,000 is the short tier');
+  assert.deepEqual(at('claude-haiku-5-5', { input: 100_001 }), [r6(100_001 * 0.5 / M), false], 'one token more is the long tier');
+  assert.deepEqual(at('claude-haiku-5-5', { input: 50_000, cacheRead: 50_001, output: 1000 }), [r6((50_000 * 0.5 + 50_001 * 0.05 + 1000 * 2.5) / M), false], 'cache reads count toward the prompt');
+  // GPT: over 272K of prompt, the long rates.
+  assert.deepEqual(at('gpt-6-astra', { input: 272_000 }), [2.72, false]);
+  assert.deepEqual(at('gpt-6-astra', { input: 200_000, cacheRead: 72_001 }), [r6((200_000 * 20 + 72_001 * 2) / M), false], '272,001 tokens of prompt');
+  assert.deepEqual(at('gpt-6.1-sol', { input: 100_000, cacheRead: 100_000, output: 10_000 }), [0.31, false]);
+  assert.deepEqual(at('gpt-5-pro', { input: M }), [15, false], 'a -pro model without a long tier');
+  assert.deepEqual(at('gpt-5.5-pro', { input: 100_000, cacheRead: 100_000 }), [6, false], 'a -pro cached token at the input rate');
+  // A version no row lists is priced from its family's newest row below it, and says so.
+  assert.deepEqual(at('claude-opus-5-7', { input: M }), [4, true], 'a newer Opus: the Opus 5.5 row, approx');
+  assert.deepEqual(at('gpt-6.2-sol', { input: 100_000 }), [0.2, true], 'a newer GPT: its suffix\'s newest row, approx');
+  assert.equal(core.priceUsage('claude-opus-5-7', U({ input: 1 })).known, true);
+  // 5-minute and 1-hour writes, each at its own rate; a record without the split is priced at 5 minutes, approx.
+  assert.deepEqual(at('claude-opus-5-5', { cacheWrite: M, cacheWrite1h: 400_000 }), [0.6 * 5 + 0.4 * 8, false]);
+  assert.deepEqual(at('claude-opus-5-5', { cacheWrite: M, cacheWrite1h: undefined }), [5, true], 'no split: 5 minutes, approx');
+  assert.deepEqual(at('gpt-5.4', { input: 100_000, cacheWrite1h: undefined }), [0.25, false], 'no write, nothing to guess');
+  // Fast mode and US-only inference, only where the record says so.
+  assert.deepEqual(at('claude-opus-5-5', { input: M, output: M, cacheRead: M, speed: 'fast' }), [8 + 40 + 0.4, false]);
+  assert.deepEqual(at('claude-opus-4-8', { output: M, speed: 'fast' }), [50, false]);
+  assert.deepEqual(at('claude-sonnet-5-5', { input: M, speed: 'fast' }), [2, false], 'no fast mode on Sonnet');
+  assert.deepEqual(at('claude-opus-5-5', { input: M, geo: 'us' }), [4.4, false], 'US-only: 1.1x on 4.6 and later');
+  assert.deepEqual(at('claude-opus-4-5', { input: M, geo: 'us' }), [5, false], 'and not before');
+  assert.deepEqual(at('claude-haiku-5-5', { input: 100_001, geo: 'us' }), [r6(1.1 * 100_001 * 0.5 / M), false], 'on the long tier too');
+  assert.match(core.PRICE_VERSION, /^[0-9a-f]{12}$/);
+});
+
+test('statusline: the month $ invents nothing for non-Claude models', () => {
+  // The installer's scan prices each transcript line itself. It priced EVERY unknown model at the
+  // Opus 5 tier, so a Claude Code session on Inkling or a local model read as Opus spend.
+  const sh = fs.readFileSync(path.resolve(__dirname, '../../cli/statusline/install-statusline.sh'), 'utf8');
+  const lines = sh.split('\n');
+  const from = lines.findIndex((l) => l.startsWith('def _c('));
+  const to = lines.findIndex((l, i) => i > from && l.startsWith('def scan('));
+  assert.ok(from > 0 && to > from, 'the rate table and _rate are where they were');
+  const probe = ['import re, json', ...lines.slice(from, to), 'print(json.dumps([_rate(m)[:5] for m in json.loads(input())]))'].join('\n');
+  const models = ['thinkingmachines/inkling', 'laguna-xs.2:latest', 'claude-opus-5', 'claude-future-9', 'Opus 9'];
+  const r = cp.spawnSync('python3', ['-c', probe], { input: JSON.stringify(models), encoding: 'utf8' });
+  assert.equal(r.status, 0, r.stderr);
+  // (input, output, 5m write, 1h write, read); an Opus version no row lists takes the newest Opus row below it.
+  assert.deepEqual(JSON.parse(r.stdout), [[0, 0, 0, 0, 0], [0, 0, 0, 0, 0], [5, 25, 6.25, 10, 0.5], [5, 25, 6.25, 10, 0.5], [4, 20, 5, 8, 0.2]]);
+});
+
+test('statusline: _rate prices every model id as core modelRate does', () => {
+  // The installer's month $ reimplements core's pricing in Python. It matched from the start of the id,
+  // so a Bedrock id (us.anthropic.claude-...) added $0 where core prices it, and non-Claude ids went
+  // their own way (gpt-oss unpriced here and priced in core, mythos-1 priced here and unpriced in core).
+  const sh = fs.readFileSync(path.resolve(__dirname, '../../cli/statusline/install-statusline.sh'), 'utf8');
+  const lines = sh.split('\n');
+  const from = lines.findIndex((l) => l.startsWith('def _c('));
+  const to = lines.findIndex((l, i) => i > from && l.startsWith('def scan('));
+  assert.ok(from > 0 && to > from, 'the rate tables and _rate are where they were');
+  const probe = ['import re, json', ...lines.slice(from, to), 'print(json.dumps([list(_rate(m)) for m in json.loads(input())]))'].join('\n');
+  // The whole rate: (input, output, 5m write, 1h write, read, long tier, fast, US-only, approx).
+  const ids = [
+    'claude-fable-5', 'claude-mythos-5', 'claude-opus-5', 'claude-sonnet-5', 'claude-opus-5-20260101',
+    'claude-opus-4-8', 'claude-opus-4-5-20251101', 'claude-opus-4-1-20250805', 'claude-opus-4-20250514',
+    'claude-sonnet-4-5-20250929', 'claude-haiku-4-5-20251001', 'claude-3-5-sonnet-20241022', 'claude-3-5-haiku-20241022',
+    'us.anthropic.claude-sonnet-4-5-20250929-v1:0', 'global.anthropic.claude-opus-4-5-20251101-v1:0',
+    'anthropic.claude-3-5-haiku-20241022-v1:0', 'claude-sonnet-4-5@20250929', 'anthropic/claude-opus-4.8',
+    'Fable 5', 'Opus 4.8', 'Sonnet 4.5', 'opus', 'haiku', 'Opus 9', 'claude-future-9', ' CLAUDE-OPUS-5 ',
+    'gpt-5', 'gpt-5.1', 'gpt-5.2', 'gpt-5.2-codex', 'gpt-5-2025-08-07', 'gpt-4o', 'gpt-oss-120b', 'gpt-oss:20b', 'GPT-OSS 120B', 'o3', 'o4-mini',
+    'omni-1', 'codex-auto-review', 'mythos-1', 'claude-mythos-9',
+    'claude-opus-5-5', 'claude-opus-5-7', 'claude-opus-6', 'claude-opus-4-8[1m]', 'Opus 5.5', 'claude-sonnet-5-5-20261001', 'claude-haiku-5-5',
+    'claude-haiku-6', 'claude-3-7-sonnet-20250219', 'claude-3-opus-20240229', 'Mythos 5', 'fable', 'provider:openrouter/claude-opus-9',
+    'gpt-6-astra', 'gpt-6.1-sol', 'gpt-6.2-sol', 'gpt-7', 'gpt-5.1-codex', 'gpt-5.1-codex-max', 'gpt-5.3-codex', 'gpt-5.5-pro-2026-03-01', 'gpt-4.1',
+    'thinkingmachines/inkling',
+    'provider:openrouter/poolside/laguna-s-2.1', 'provider:openrouter/thinkingmachines/inkling', 'provider:ollama/laguna-xs.2:latest',
+    'provider:openrouter/claude-opus-5', 'provider:openrouter/poolside/laguna-s-2.1:free', 'provider:ollama/laguna-xs.2:free', 'laguna-xs.2:latest', 'qwen3-coder:30b', '<synthetic>', '',
+  ];
+  // Every row of core's tables, read from its source, so a row added to one side cannot drift unseen.
+  const pricing = fs.readFileSync(path.resolve(__dirname, '../src/pricing.ts'), 'utf8');
+  const table = (name) => pricing.split(`const ${name}`)[1].split(/\n\];|\n\};/)[0];
+  const rowIds = (text) => [...text.matchAll(/\['([^']+)'/g)].map((m) => m[1]);
+  const claudeRows = rowIds(table('CLAUDE_RATES'));
+  const gptRows = rowIds(table('GPT_RATES'));
+  const providerRows = [];
+  let provider = null;
+  for (const line of table('PROVIDER_RATES').split('\n')) {
+    provider = /^ {2}([\w-]+): \[/.exec(line)?.[1] ?? provider;
+    for (const id of rowIds(line)) providerRows.push(`provider:${provider}/${id}`);
+  }
+  assert.ok(claudeRows.length >= 21 && gptRows.length >= 22 && providerRows.length >= 4, `control: the rows were read: ${claudeRows} ${gptRows} ${providerRows}`);
+  assert.ok(providerRows.includes('provider:openrouter/poolside/laguna-xs-2.1'), providerRows.join(' '));
+  for (const id of [...claudeRows, ...gptRows, ...providerRows]) if (!ids.includes(id)) ids.push(id);
+  const r = cp.spawnSync('python3', ['-c', probe], { input: JSON.stringify(ids), encoding: 'utf8' });
+  assert.equal(r.status, 0, r.stderr);
+  const got = JSON.parse(r.stdout);
+  const tier = (x) => [x.input, x.output, x.write, x.write1h, x.read];
+  const want = ids.map((id) => { const x = core.modelRate(id);
+    return [...tier(x), x.long ? [x.long.over, ...tier(x.long)] : null, x.fast ? [x.fast.input, x.fast.output] : null, !!x.geo, !!x.approx]; });
+  assert.deepEqual(ids.map((id, i) => [id, got[i]]), ids.map((id, i) => [id, want[i]]));
+  // Control: the table exercises every branch, not only the zero one.
+  assert.deepEqual(core.modelRate('us.anthropic.claude-sonnet-4-5-20250929-v1:0'), { input: 3, output: 15, write: 3.75, write1h: 6, read: 0.3 });
+  assert.equal(core.modelRate('claude-haiku-5-5').long.over, 100_000);
+  assert.equal(core.modelRate('claude-opus-5-7').approx, true);
+  assert.equal(core.modelRate('gpt-4o').input, 1.25);
+  assert.equal(core.modelRate('mythos-1').input, 0);
+  // One answer per id (scan() asks for every usage line): the second ask is the cache's.
+  const memo = cp.spawnSync('python3', ['-c', [...probe.split('\n').slice(0, -1), "_rate('claude-opus-5'); _rate('claude-opus-5')", 'print(_rate.cache_info().hits)'].join('\n')], { input: '[]', encoding: 'utf8' });
+  assert.equal(memo.status, 0, memo.stderr);
+  assert.ok(Number(memo.stdout) >= 1, memo.stdout);
+});
+
+// The context-tag strip and the GPT version read backtracked quadratically on these ids (CodeQL's js/polynomial-redos
+// inputs); the timeout stops a regression instead of hanging the run.
+test('pricing: modelRate stays fast on a long run of `[` or of version digits', () => {
+  for (const id of ['['.repeat(200_000), 'gpt-0' + '0'.repeat(200_000) + '\nx']) {
+    const rate = () => core.modelRate(id);
+    require('node:vm').runInNewContext('rate()', { rate }, { timeout: 2000 });
+  }
+});
+
+test('pricing: gpt-oss, an open-weight model usually run locally, has no price outside a provider\'s table (2026-10-07)', () => {
+  // It took GPT-5's rate as an approximation, while the docs say a local model shows no dollars.
+  const M = { input: 1_000_000, output: 1_000_000, cacheWrite: 0, cacheRead: 0 };
+  for (const m of ['gpt-oss:20b', 'gpt-oss-120b', 'GPT-OSS 120B', 'provider:ollama/gpt-oss:20b', 'provider:openrouter/openai/gpt-oss-120b']) {
+    assert.deepEqual(core.priceUsage(m, M), { usd: 0, approx: true, known: false }, m);
+  }
+  assert.deepEqual(core.priceUsage('gpt-5', M), { usd: 11.25, approx: false, known: true }, 'control: a GPT-5 id keeps its price');
+  assert.equal(core.priceUsage('gpt-4o', M).known, true, 'control: another GPT id keeps the family fallback');
+});
+
+test('pricing: an unlisted provider cannot inherit a Claude model price from its version', () => {
+  const u = { input: 1e6, output: 1e6, cacheWrite: 0, cacheRead: 0 };
+  for (const model of ['provider:ollama/claude-opus-4-8', 'provider:openrouter/claude-opus-5', 'provider:custom/anthropic/claude-haiku-5-5']) {
+    assert.deepEqual(core.priceUsage(model, u), { usd: 0, approx: true, known: false }, model);
+  }
+  assert.deepEqual(core.priceUsage('claude-opus-4-8', u), { usd: 30, approx: false, known: true });
+});
+
+test('pricing: an OpenRouter `:free` variant is priced at nothing, and that price is known', () => {
+  // It read as an unpriced hosted model, which blanked the whole Codex month dollar figure.
+  const u = { input: 1_000_000, output: 1_000_000, cacheWrite: 0, cacheRead: 0 };
+  assert.deepEqual(core.priceUsage('provider:openrouter/poolside/laguna-s-2.1:free', u), { usd: 0, approx: false, known: true });
+  assert.deepEqual(core.priceUsage('provider:openrouter/poolside/laguna-s-2.1', u), { usd: 0.27, approx: false, known: true }, 'control: the paid id');
+  assert.equal(core.priceUsage('provider:ollama/laguna-xs.2:free', u).known, false, 'only OpenRouter names its free variants so');
+  assert.equal(core.priceUsage('provider:openrouter/unknown/model', u).known, false, 'control: an unlisted OpenRouter id stays unpriced');
+});
+
+test('prefs: a byte order mark an editor put first is read past, so the next write keeps every setting', () => {
+  // JSON.parse refuses the mark, so the file read as "no preferences", and the next write (a bill day, a layout)
+  // replaced it with that write alone: the editor, the bill day and a moved store were gone.
+  const home = freshHome();
+  const file = path.join(home, 'prefs.json');
+  fs.writeFileSync(file, '\uFEFF' + JSON.stringify({ editor: 'vim', billDay: 7 }));
+  assert.equal(core.readPrefs(file).editor, 'vim');
+  core.writePrefs({ ...core.readPrefs(file), remoteTitles: false }, file);
+  assert.deepEqual([core.readPrefs(file).editor, core.readPrefs(file).billDay, core.readPrefs(file).remoteTitles], ['vim', 7, false]);
+});
+
+test('prefs: a save keeps what this build cannot read — a key a newer build wrote, an action or a value it lacks', () => {
+  // Every writer rebuilt the file from what this build understands: after the next bill day, titles switch, store move,
+  // tab switch or sort, a key a newer build wrote was gone.
+  const home = freshHome();
+  const file = path.join(home, 'prefs.json');
+  const newer = { theme: 'aurora', futureKey: { a: [1, 2] }, notify: { desktop: false, futureField: 2 }, keys: { keep: 'k', futureAction: 'j', undo: 'toolong' }, billDay: 3 };
+  fs.writeFileSync(file, JSON.stringify(newer));
+  const read = core.readPrefs(file);
+  assert.equal(read.theme, undefined, 'control: this build cannot read the palette');
+  core.writePrefs({ ...read, remoteTitles: false }, file);
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { prefsFormat: 2, ...newer, remoteTitles: false }, 'what the caller left is written back as the file had it');
+  // What the caller changes is written as this build writes it, and the bindings it cannot read stay beside a new one.
+  const p = core.readPrefs(file);
+  delete p.billDay;
+  core.writePrefs({ ...p, theme: 'default', keys: { ...p.keys, keep: 'K' } }, file);
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')),
+    { prefsFormat: 2, futureKey: { a: [1, 2] }, notify: { desktop: false, futureField: 2 }, keys: { keep: 'K', futureAction: 'j', undo: 'toolong' }, remoteTitles: false },
+    'a cleared bill day and a palette chosen here are written, and the rest stays');
+  // Inside `notify`, field by field: changing one of its fields dropped a field a newer build added, a value this build
+  // cannot read, and a kind it does not have.
+  fs.writeFileSync(file, JSON.stringify({ notify: { desktop: false, futureField: 2, kinds: ['permission', 'review'], cooldownSeconds: '1m' } }));
+  const notifyNow = () => JSON.parse(fs.readFileSync(file, 'utf8')).notify;
+  let n = core.readPrefs(file).notify;
+  assert.deepEqual(n, { desktop: false, kinds: ['permission'] }, 'control: this build reads two of them');
+  core.writePrefs({ notify: { ...n, sound: true } }, file);
+  assert.deepEqual(notifyNow(), { desktop: false, sound: true, kinds: ['permission', 'review'], futureField: 2, cooldownSeconds: '1m' }, 'the sound turned on, and the rest kept');
+  n = core.readPrefs(file).notify;
+  core.writePrefs({ notify: { ...n, kinds: [...n.kinds, 'idle-done'], desktop: true } }, file);
+  assert.deepEqual(notifyNow(), { sound: true, kinds: ['permission', 'idle-done', 'review'], futureField: 2, cooldownSeconds: '1m' },
+    'a kind chosen here goes beside the one this build does not have, and a field set to its default is removed');
+  n = core.readPrefs(file).notify;
+  delete n.kinds;
+  core.writePrefs({ notify: { ...n, cooldownSeconds: 45 } }, file);
+  assert.deepEqual(notifyNow(), { sound: true, kinds: ['permission', 'question', 'input', 'review'], futureField: 2, cooldownSeconds: 45 },
+    'kinds put back to the default keep the unknown one, and a value set here replaces the one this build could not read');
+  // A file that does not parse (a hand edit half done) is left as it is, rather than replaced by this one setting.
+  fs.writeFileSync(file, '{"theme": "mono",');
+  assert.throws(() => core.writePrefs({ billDay: 5 }, file), /not valid JSON, so it was left as it is/);
+  assert.equal(fs.readFileSync(file, 'utf8'), '{"theme": "mono",');
+});
+
+test('store: a prefs.json that does not parse stops a move before anything moves', () => {
+  // The new location could not be recorded in it, so the store would move and be looked for where it had been.
+  freshHome();
+  const S = 'store-unparsed';
+  const cwd = tmpWork();
+  editHook(S, cwd, path.join(cwd, 'a.ts'), 'one\n', 'two\n');
+  const dest = path.join(tmpDir('store-unparsed-'), 'observatory');
+  fs.writeFileSync(core.prefsPath(), '{"theme": "mono",');
+  assert.match(core.moveStore(dest).error, /prefs\.json is not valid JSON — correct or remove it first, so the new location can be recorded/);
+  assert.equal(fs.existsSync(dest), false, 'nothing moved');
+  assert.equal(core.readLog(S).length, 1, 'the session is where the product looks for it');
+  assert.equal(fs.readFileSync(core.prefsPath(), 'utf8'), '{"theme": "mono",', 'and the file is as it was');
+  fs.writeFileSync(core.prefsPath(), '{"theme": "mono"}');
+  assert.ok(core.moveStore(dest).moved, 'control: once it parses, the store moves');
+});
+
+test('store: a move across filesystems stands once the copy is made, when the original cannot be removed in full', { skip: process.platform === 'win32' && 'a folder without write permission does not stop a removal there' }, () => {
+  // An agent's capture adding a file while the original was removed stopped the removal part way. Reported as a failure,
+  // the move left the original half removed, prefs.json (kept beside the default store) with it, and the whole copy
+  // where nothing looked for it.
+  freshHome();
+  const S = 'store-exdev';
+  const cwd = tmpWork();
+  editHook(S, cwd, path.join(cwd, 'a.ts'), 'one\n', 'two\n');
+  core.writePrefs({ billDay: 7 });
+  const from = core.rootDir();
+  const dest = path.join(tmpDir('store-exdev-'), 'observatory');
+  // A lock a crashed holder left: copied, it was dated now, and held the session's next capture as a live holder's.
+  const dead = cp.spawnSync(process.execPath, ['-e', '']).pid;
+  fs.writeFileSync(path.join(core.storeDir(S), '.lock'), `${dead}:token:1`);
+  fs.utimesSync(path.join(core.storeDir(S), '.lock'), new Date(Date.now() - 60_000), new Date(Date.now() - 60_000));
+  // A folder the removal cannot empty stands in for that writer.
+  const stuck = path.join(from, 'stuck');
+  fs.mkdirSync(stuck);
+  fs.writeFileSync(path.join(stuck, 'f'), 'x');
+  fs.chmodSync(stuck, 0o500);
+  const realRename = fs.renameSync;
+  fs.renameSync = function (a, ...rest) {
+    if (path.resolve(String(a)) === path.resolve(from)) throw Object.assign(new Error('EXDEV: cross-device link not permitted'), { code: 'EXDEV' });
+    return realRename.call(this, a, ...rest);
+  };
+  let res;
+  try {
+    res = core.moveStore(dest);
+  } finally {
+    fs.renameSync = realRename;
+    fs.chmodSync(stuck, 0o700);
+    if (fs.existsSync(path.join(dest, 'stuck'))) fs.chmodSync(path.join(dest, 'stuck'), 0o700);
+  }
+  assert.equal(res.moved, true, `the move stands: ${JSON.stringify(res)}`);
+  // The copy keeps the store's folders to their owner: copied by Node's native path, they took the default mode (0775).
+  for (const d of [dest, path.join(dest, S), path.join(dest, S, 'blobs')]) assert.equal(fs.statSync(d).mode & 0o777, 0o700, d);
+  assert.equal(fs.existsSync(path.join(dest, S, '.lock')), false, 'and no lock is copied');
+  assert.match(res.left, /could not be removed in full/, 'and what was left behind is said');
+  assert.equal(core.readPrefs().billDay, 7, 'the preferences are where they were');
+  assert.equal(core.readPrefs().storeDir, dest, 'with the new location recorded');
+  assert.equal(core.readLog(S).length, 1, 'and the session is read from where it went');
+});
+
+test('cli: a move prefs.json cannot record is put back, and one that cannot be put back says OAK looks for it where it was', () => {
+  // A hand edit saved half done while the store moved left prefs.json unable to record it. The move stood, and `oak store
+  // --move` said only that prefs.json was left as it was, which read as "not moved"; and once the captures the move held
+  // back ran again, they made the store again where prefs.json still named it.
+  freshHome();
+  delete process.env.CLAUDE_CONFIG_DIR;
+  const S = 'store-unrecorded';
+  const cwd = tmpWork();
+  editHook(S, cwd, path.join(cwd, 'a.ts'), 'one\n', 'two\n');
+  const env = { ...process.env, HOME: os.homedir(), USERPROFILE: os.homedir() };
+  const base = tmpDir('store-unrecorded-');
+  const first = path.join(base, 'one'), second = path.join(base, 'two');
+  assert.equal(cp.spawnSync('node', [CLI, 'store', '--move', first], { env, encoding: 'utf8' }).status, 0, 'control: a first move');
+  assert.equal(JSON.parse(fs.readFileSync(core.prefsPath(), 'utf8')).storeDir, first, 'control: the move recorded where it went');
+  // The hand edit lands once the store is renamed, before the location is recorded; NO_PUT_BACK makes the rename back fail.
+  const preload = path.join(base, 'half-edit.js');
+  fs.writeFileSync(preload, "const fs = require('fs'); const rename = fs.renameSync; fs.renameSync = function (a, b, ...r) { if (process.env.NO_PUT_BACK && String(a) === process.env.HALF_EDIT_AFTER) throw new Error('EBUSY: resource busy'); const out = rename.call(this, a, b, ...r); if (String(b) === process.env.HALF_EDIT_AFTER) fs.writeFileSync(process.env.HALF_EDIT_PREFS, '{\"theme\": \"mono\",'); return out; };\n");
+  const move = (extra) => cp.spawnSync('node', ['--require', preload, CLI, 'store', '--move', second], { env: { ...env, HALF_EDIT_AFTER: second, HALF_EDIT_PREFS: core.prefsPath(), ...extra }, encoding: 'utf8' });
+  let r = move({});
+  assert.equal(r.status, 1, r.stdout);
+  assert.match(r.stderr, /prefs\.json could not record the new location, so the store was left where it was: prefs\.json is not valid JSON/);
+  assert.ok(fs.existsSync(path.join(first, S, 'log.jsonl')) && !fs.existsSync(second), 'the store is back where prefs.json names it');
+  fs.writeFileSync(core.prefsPath(), JSON.stringify({ storeDir: first }));
+  r = move({ NO_PUT_BACK: '1' });
+  assert.equal(r.status, 1, r.stdout);
+  assert.ok(r.stderr.includes(`the store moved to ${second}, but prefs.json could not record it, so OAK looks for it where it was`), r.stderr);
+  assert.ok(r.stderr.includes(`set its "storeDir" to ${second}`), 'and how to record it');
+  assert.ok(fs.existsSync(path.join(second, S, 'log.jsonl')), 'control: the store is there');
+});
+
+/** A capture hook process for one Edit, Pre then Post: resolves with [preMs, postMs], how long each took. */
+function editHookProcess(env, session, cwd, file) {
+  const run = (event) => new Promise((resolve) => {
+    const t = Date.now();
+    const c = cp.spawn(process.execPath, [CLI, 'capture'], { env, cwd, stdio: ['pipe', 'ignore', 'ignore'] });
+    c.on('close', () => resolve(Date.now() - t));
+    c.stdin.end(JSON.stringify({ session_id: session, cwd, tool_name: 'Edit', tool_input: { file_path: file }, tool_use_id: `tu-${path.basename(file)}`, hook_event_name: event }));
+  });
+  fs.writeFileSync(file, `before ${path.basename(file)}\n`);
+  return run('PreToolUse').then(async (pre) => { fs.writeFileSync(file, `after ${path.basename(file)}\n`); return [pre, await run('PostToolUse')]; });
+}
+
+/** The Codex hook for one apply_patch that updates `file` (in `cwd`), Pre then Post, through `oak capture --agent codex`. */
+function codexPatchProcess(env, session, cwd, file) {
+  const name = path.basename(file);
+  const patch = ['*** Begin Patch', `*** Update File: ${name}`, '@@', `-before ${name}`, `+after ${name}`, '*** End Patch'].join('\n');
+  const run = (event) => new Promise((resolve) => {
+    const c = cp.spawn(process.execPath, [CLI, 'capture', '--agent', 'codex'], { env, cwd, stdio: ['pipe', 'ignore', 'ignore'] });
+    c.on('close', resolve);
+    c.stdin.end(JSON.stringify({ session_id: session, cwd, turn_id: 'turn-1', hook_event_name: event, tool_name: 'apply_patch', tool_input: { patch }, tool_use_id: `call-${name}` }));
+  });
+  fs.writeFileSync(file, `before ${name}\n`);
+  return run('PreToolUse').then(async () => { fs.writeFileSync(file, `after ${name}\n`); await run('PostToolUse'); });
+}
+
+test('store: captures that start while the store moves wait for it, and each lands in the new store once', async () => {
+  // A capture that ran during a move wrote where the store was: during the copy of a move to another file system it was
+  // lost with the original, and after a rename it made the old location again and stayed there. Measured with six agents
+  // editing through a move of a 400 MB store from tmpfs to a disk: eight edits of 59 lost.
+  for (const how of ['copy', 'rename']) {
+    const home = freshHome();
+    delete process.env.CLAUDE_CONFIG_DIR;
+    const env = { ...process.env, HOME: home, USERPROFILE: home };
+    const cwd = fs.realpathSync(tmpWork());
+    const sessions = ['mv-a', 'mv-b', 'mv-c'];
+    for (const S of sessions) editHook(S, cwd, path.join(cwd, `${S}-seed.ts`), 'one\n', 'two\n');
+    core.writePrefs({ ...core.readPrefs(), billDay: 7, theme: 'mono' });
+    const from = core.rootDir();
+    const dest = path.join(tmpDir(`store-${how}-`), 'observatory');
+    // The move held open long enough for captures to land in it: across file systems, each part of the copy is slow; on
+    // one, the store sits renamed before its new location is recorded.
+    const preload = path.join(tmpDir('mv-preload-'), 'slow-move.js');
+    fs.writeFileSync(preload, `const fs = require('fs'), path = require('path'); const nap = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+const from = process.env.MOVE_FROM, rename = fs.renameSync, cp = fs.cpSync;
+fs.renameSync = function (a, ...r) { if (path.resolve(String(a)) !== from) return rename.call(this, a, ...r);
+  if (process.env.MOVE_HOW === 'copy') throw Object.assign(new Error('EXDEV: cross-device link not permitted'), { code: 'EXDEV' });
+  const out = rename.call(this, a, ...r); nap(1200); return out; };
+fs.cpSync = function (...a) { fs.appendFileSync(process.env.MOVE_LOCK_LOG, fs.statSync(process.env.MOVE_LOCK).mtimeMs + '\\n'); const out = cp.apply(this, a); nap(600); return out; };\n`);
+    const lock = path.join(core.storeMoveDir(), 'lock');
+    const lockLog = path.join(path.dirname(preload), 'lock-mtimes');
+    const mover = cp.spawn(process.execPath, ['--require', preload, CLI, 'store', '--move', dest], { env: { ...env, MOVE_FROM: path.resolve(from), MOVE_HOW: how, MOVE_LOCK: lock, MOVE_LOCK_LOG: lockLog }, stdio: ['ignore', 'pipe', 'pipe'] });
+    let said = '';
+    mover.stdout.on('data', (d) => (said += d)); mover.stderr.on('data', (d) => (said += d));
+    const moved = new Promise((resolve) => mover.on('close', resolve));
+    // Across file systems, once every session is copied: a capture written where the store was then is lost with it.
+    const due = () => fs.existsSync(lock) && (how === 'rename' || sessions.every((S) => fs.existsSync(path.join(dest, S, 'log.jsonl'))));
+    for (const end = Date.now() + 10000; !due() && Date.now() < end;) await new Promise((r) => setTimeout(r, 10));
+    assert.ok(due(), `${how}: control: the move holds its lock`);
+    const files = sessions.flatMap((S) => [1, 2].map((n) => [S, path.join(cwd, `${S}-${how}-${n}.ts`)]));
+    const codexFile = path.join(cwd, `${how}-codex.py`);
+    const [took] = await Promise.all([Promise.all(files.map(([S, f]) => editHookProcess(env, S, cwd, f))), codexPatchProcess(env, 'mv-codex', cwd, codexFile)]);
+    assert.equal(await moved, 0, `${how}: ${said}`);
+    assert.ok(took.some(([pre]) => pre >= 400), `${how}: control: the captures waited for the move (${JSON.stringify(took)})`);
+    core.clearRootMemo();
+    assert.equal(core.rootDir(), dest, `${how}: the move recorded where it went`);
+    for (const S of sessions) {
+      const names = core.readLog(S).map((r) => path.basename(r.file)).sort();
+      assert.deepEqual(names, [`${S}-${how}-1.ts`, `${S}-${how}-2.ts`, `${S}-seed.ts`], `${how}: every capture is in the new store, once`);
+      assert.deepEqual(core.readSkips(S), [], `${how}: and none was dropped`);
+    }
+    assert.deepEqual(core.readLog('mv-codex').map((r) => path.basename(r.file)), [`${how}-codex.py`], `${how}: a Codex capture waits for the move too`);
+    if (how === 'copy') {
+      // A long copy keeps its lock fresh, part by part: past 15 min unrefreshed, a waiting capture took it for a crashed move's.
+      const at = fs.readFileSync(lockLog, 'utf8').trim().split('\n').map(Number);
+      assert.ok(at.length >= 3 && at.every((t, i) => !i || t > at[i - 1]), `${how}: the move lock is refreshed as the copy goes (${at})`);
+    }
+    assert.deepEqual(fs.readdirSync(from), ['prefs.json'], `${how}: nothing is left where the store was`);
+    const prefs = core.readPrefs();
+    assert.deepEqual([prefs.billDay, prefs.theme], [7, 'mono'], `${how}: the preferences are intact`);
+    assert.deepEqual(fs.readdirSync(core.storeMoveDir()), [], `${how}: the move lock and every registration are gone`);
+  }
+});
+
+test('store: a move waits for a capture that is already running, and takes its edit with it', async () => {
+  // The move's other half: a capture that began before the move took its lock finishes where the store was, before the
+  // move starts. Here the hook is held between its edit's blob and its record.
+  const home = freshHome();
+  delete process.env.CLAUDE_CONFIG_DIR;
+  const env = { ...process.env, HOME: home, USERPROFILE: home };
+  const cwd = fs.realpathSync(tmpWork());
+  const S = 'mv-running';
+  editHook(S, cwd, path.join(cwd, 'seed.ts'), 'one\n', 'two\n');
+  const F = path.join(cwd, 'slow.ts');
+  fs.writeFileSync(F, 'v1\n');
+  const p = { session_id: S, cwd, tool_name: 'Edit', tool_input: { file_path: F }, tool_use_id: 'tu-slow' };
+  assert.equal(cp.spawnSync(process.execPath, [CLI, 'capture'], { env, input: JSON.stringify({ ...p, hook_event_name: 'PreToolUse' }) }).status, 0);
+  fs.writeFileSync(F, 'v2\n');
+  // The hook says when it is held (`held`), and it is held only past the move-lock check its registration comes before:
+  // a move started between the two is one the capture rightly waits for instead, which a slow runner hit. It stays held
+  // until the move holds the lock, and a second more, so a move that waits for it waits that second however slow the run.
+  const slow = tmpDir('mv-slow-hook-'), preload = path.join(slow, 'slow-append.js'), held = path.join(slow, 'held');
+  fs.writeFileSync(preload, `const fs = require('fs'), path = require('path'); const append = fs.appendFileSync; let once = false; fs.appendFileSync = function (f, ...r) { if (!once && path.basename(String(f)) === 'log.jsonl') { once = true; fs.writeFileSync(${JSON.stringify(held)}, ''); const nap = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); for (const end = Date.now() + 30000; !fs.existsSync(${JSON.stringify(path.join(core.storeMoveDir(), 'lock'))}) && Date.now() < end;) nap(10); nap(1000); } return append.call(this, f, ...r); };\n`);
+  const hook = cp.spawn(process.execPath, ['--require', preload, CLI, 'capture'], { env, stdio: ['pipe', 'ignore', 'ignore'] });
+  hook.stdin.end(JSON.stringify({ ...p, hook_event_name: 'PostToolUse' }));
+  const hooked = new Promise((resolve) => hook.on('close', resolve));
+  const registered = () => { try { return fs.readdirSync(core.storeMoveDir()).some((n) => n.startsWith('writer-')); } catch { return false; } };
+  for (const end = Date.now() + 10000; !fs.existsSync(held) && Date.now() < end;) await new Promise((r) => setTimeout(r, 10));
+  assert.ok(fs.existsSync(held) && registered(), 'control: the hook is running');
+  const from = core.rootDir();
+  const dest = path.join(tmpDir('store-running-'), 'observatory');
+  const t0 = Date.now();
+  const res = core.moveStore(dest);
+  const waited = Date.now() - t0;
+  await hooked;
+  assert.ok(res.moved, JSON.stringify(res));
+  assert.ok(waited >= 500, `the move waited for the capture (${waited} ms)`);
+  assert.equal(core.rootDir(), dest);
+  const rec = core.readLog(S).find((r) => r.file === F);
+  assert.ok(rec, 'the running capture\'s edit went with the store');
+  assert.deepEqual([core.blobText(S, rec.beforeBlob), core.blobText(S, rec.afterBlob)], ['v1\n', 'v2\n']);
+  assert.deepEqual(fs.readdirSync(from), ['prefs.json'], 'and nothing but the preferences is left where the store was');
+});
+
+test('store: a capture waits for a move only so long, and the move records what it could not wait for', (t) => {
+  // A move that outlasts the wait costs that capture's edit, which neither location can take meanwhile: the old one is
+  // about to be removed, and the new one is not recorded yet. The capture leaves a note, and the move says so.
+  freshHome();
+  const S = 'mv-missed';
+  const F = path.join(tmpWork(), 'f.ts');
+  editHook(S, path.dirname(F), path.join(path.dirname(F), 'seed.ts'), 'a\n', 'b\n');
+  const lock = path.join(core.storeMoveDir(), 'lock');
+  const mono = () => Number(process.hrtime.bigint() / 1_000_000n);
+  fs.mkdirSync(core.storeMoveDir(), { recursive: true });
+  fs.writeFileSync(lock, `${process.pid}:token:${mono()}`); // a live mover's
+  const realNow = Date.now;
+  let skew = 0;
+  t.mock.method(Date, 'now', () => realNow() + (skew += 4000)); // the wait runs out at once
+  let ran = false;
+  assert.equal(core.captureOutsideMoves(() => { ran = true; }, core.missedCapture({ session_id: S, hook_event_name: 'PostToolUse', tool_name: 'Edit', tool_input: { file_path: F } })), false);
+  t.mock.restoreAll();
+  assert.equal(ran, false, 'the capture did not run while the move held the lock');
+  assert.equal(fs.readFileSync(lock, 'utf8').startsWith(`${process.pid}:`), true, 'and left a live mover\'s lock alone');
+  assert.equal(fs.readdirSync(core.storeMoveDir()).filter((n) => n.startsWith('missed-')).length, 1, 'a note says what it could not wait for');
+  fs.rmSync(lock);
+  // Read by the move once it is done: a skip in the session, where the store went, and a count on its result.
+  const dest = path.join(tmpDir('store-missed-'), 'observatory');
+  const res = core.moveStore(dest);
+  assert.equal(res.missed, 1, JSON.stringify(res));
+  assert.equal(core.missedDuringMove(res.missed), '1 edit could not wait for the move and was not captured; it is recorded as a capture gap in its session');
+  assert.match(core.missedDuringMove(3), /^3 edits could not wait for the move and were not captured; each is/);
+  assert.deepEqual(core.readSkips(S).map((k) => [k.file, k.reason]), [[F, 'the store was being moved, and the move outlasted the 10 s a capture waits for one — edit not captured']]);
+  assert.deepEqual(fs.readdirSync(core.storeMoveDir()), [], 'the note is gone once recorded');
+  // A Pre that could not wait is said by its Post, which finds no before-snapshot: only a Post leaves a note.
+  assert.equal(core.missedCapture({ session_id: S, hook_event_name: 'PreToolUse', tool_name: 'Edit', tool_input: { file_path: F } }), undefined);
+  assert.deepEqual(core.missedCapture({ session_id: S, hook_event_name: 'PostToolUseFailure', tool_name: 'Bash', tool_input: {} }), { session: S, file: '<Bash>' });
+  // Every surface says it: the CLI, on its own line.
+  const note = path.join(core.storeMoveDir(), 'missed-00000000-0000-0000-0000-000000000000.json');
+  fs.writeFileSync(note, JSON.stringify({ session: S, file: F, reason: 'r — edit not captured', ts: 1 }));
+  const back = cp.spawnSync(process.execPath, [CLI, 'store', '--default'], { env: { ...process.env }, encoding: 'utf8' });
+  assert.equal(back.status, 0, back.stderr);
+  assert.match(back.stderr, /note: 1 edit could not wait for the move and was not captured; it is recorded as a capture gap in its session/);
+});
+
+test('store: keeps, undos, redos and comments made while the store moves each land in the new store once', async () => {
+  // Captures paused for a move, but a decision made during one (`oak keep`, `undo`, `redo`, a comment) wrote where the
+  // store was: during a copy, after its session was copied, and the removal of the original then took it. During a
+  // rename, before the new location was recorded, it read a store that was not where prefs.json pointed, and found
+  // nothing to decide: a keep said it kept nothing, an undo that there was no such edit.
+  for (const [how, prefsBefore] of [['copy', true], ['rename', true], ['rename with no preferences', false]]) {
+    const home = freshHome();
+    delete process.env.CLAUDE_CONFIG_DIR;
+    const env = { ...process.env, HOME: home, USERPROFILE: home };
+    const cwd = fs.realpathSync(tmpWork());
+    const [A, B] = ['decide-a', 'decide-b'];
+    const file = (sess, i) => path.join(cwd, `${sess}-${i}.ts`);
+    for (const sess of [A, B]) for (let i = 1; i <= 6; i++) editHook(sess, cwd, file(sess, i), `old ${i}\n`, `new ${i}\n`);
+    assert.equal(core.undoEdit(B, 6).ok, true, `${how}: control: an edit undone before the move, for a redo during it`);
+    assert.ok(core.addComment(A, { unit: 6, text: 'before the move' }), `${how}: control: a comment before the move`);
+    if (prefsBefore) core.writePrefs({ ...core.readPrefs(), billDay: 7 });
+    assert.equal(fs.existsSync(core.prefsPath()), prefsBefore, `${how}: control: preferences before the move, or none`);
+    const from = core.rootDir();
+    const dest = path.join(tmpDir('store-decide-'), 'observatory');
+    // Each part of the copy slow; or, on one file system, the store a while renamed and the preferences a while written
+    // before the new location is recorded. The decisions are made once what they touch is copied, or renamed.
+    const preload = path.join(tmpDir('decide-preload-'), 'slow-move.js');
+    fs.writeFileSync(preload, `const fs = require('fs'), path = require('path'); const nap = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+const from = process.env.MOVE_FROM, copy = process.env.MOVE_HOW === 'copy', rename = fs.renameSync, cp = fs.cpSync, write = fs.writeFileSync;
+fs.renameSync = function (a, ...r) { if (path.resolve(String(a)) !== from) return rename.call(this, a, ...r);
+  if (copy) throw Object.assign(new Error('EXDEV: cross-device link not permitted'), { code: 'EXDEV' });
+  const out = rename.call(this, a, ...r); nap(1000); return out; };
+fs.cpSync = function (...a) { const out = cp.apply(this, a); nap(1000); return out; };
+fs.writeFileSync = function (f, ...r) { const out = write.call(this, f, ...r); if (!copy && path.basename(String(f)).startsWith('prefs.json')) nap(600); return out; };\n`);
+    const lock = path.join(core.storeMoveDir(), 'lock');
+    const mover = cp.spawn(process.execPath, ['--require', preload, CLI, 'store', '--move', dest], { env: { ...env, MOVE_FROM: path.resolve(from), MOVE_HOW: how }, stdio: ['ignore', 'pipe', 'pipe'] });
+    let said = '';
+    mover.stdout.on('data', (d) => (said += d)); mover.stderr.on('data', (d) => (said += d));
+    const moved = new Promise((resolve) => mover.on('close', resolve));
+    const due = () => fs.existsSync(lock) && [A, B].every((x) => fs.existsSync(path.join(dest, x, 'log.jsonl'))) && fs.existsSync(path.join(dest, A, 'comments.json'));
+    for (const end = Date.now() + 15000; !due() && Date.now() < end;) await new Promise((r) => setTimeout(r, 10));
+    assert.ok(due(), `${how}: control: the move holds its lock, and has moved what the decisions touch`);
+    const oak = (...args) => new Promise((resolve) => {
+      const t0 = Date.now();
+      cp.execFile(process.execPath, [CLI, ...args], { env, cwd, encoding: 'utf8' }, (err, stdout, stderr) => resolve({ code: err ? err.code : 0, ms: Date.now() - t0, out: `${stdout}${stderr}` }));
+    });
+    const first = Promise.all([
+      oak('keep', '1', '--session', A), oak('keep', '2', '--session', A), oak('undo', '3', '--session', A), oak('undo', '4', '--session', A),
+      oak('comment', 'add', '--session', A, '--edit', '5', '--text', 'during the move'),
+      oak('keep', '1', '--session', B), oak('undo', '2', '--session', B), oak('redo', '6', '--session', B), oak('keep', '--ids', '3,4', '--session', B),
+    ]);
+    // A second wave once the default folder is back (a move from it renames it away): in the moment it came back with the
+    // old preferences in it, or none, a decision found no store there.
+    for (const end = Date.now() + 15000; !fs.existsSync(path.dirname(core.prefsPath())) && Date.now() < end;) await new Promise((r) => setTimeout(r, 5));
+    const second = Promise.all([oak('keep', '5', '--session', B), oak('undo', '6', '--session', A)]);
+    const runs = [...await first, ...await second];
+    assert.equal(await moved, 0, `${how}: ${said}`);
+    for (const r of runs) assert.equal(r.code, 0, `${how}: ${r.out}`);
+    assert.ok(runs.some((r) => r.ms >= 400), `${how}: control: the decisions waited for the move (${runs.map((r) => r.ms)})`);
+    core.clearRootMemo();
+    assert.equal(core.rootDir(), dest, how);
+    const statuses = (sess) => Object.fromEntries(core.readLog(sess).map((r) => [r.id, r.status]));
+    assert.deepEqual(statuses(A), { 1: 'kept', 2: 'kept', 3: 'undone', 4: 'undone', 5: 'pending', 6: 'undone' }, `${how}: every decision is in the new store`);
+    assert.deepEqual(statuses(B), { 1: 'kept', 2: 'undone', 3: 'kept', 4: 'kept', 5: 'kept', 6: 'pending' }, how);
+    // Once each: one status line per decision, beside the one undo made before the move.
+    const ops = (sess) => fs.readFileSync(core.logPath(sess), 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)).filter((o) => o.op === 'status').map((o) => `${o.id}:${o.status}`);
+    assert.deepEqual(ops(A).sort(), ['1:kept', '2:kept', '3:undone', '4:undone', '6:undone'], how);
+    assert.deepEqual(ops(B).sort(), ['1:kept', '2:undone', '3:kept', '4:kept', '5:kept', '6:pending', '6:undone'], how);
+    assert.deepEqual([3, 4, 6].map((i) => fs.readFileSync(file(A, i), 'utf8')), ['old 3\n', 'old 4\n', 'old 6\n'], `${how}: the undone files are reverted`);
+    assert.equal(fs.readFileSync(file(B, 6), 'utf8'), 'new 6\n', `${how}: and the redone one put back`);
+    assert.deepEqual(core.listComments(A).map((c) => c.text).sort(), ['before the move', 'during the move'], `${how}: and the comment is kept beside the one before`);
+    if (prefsBefore) assert.equal(core.readPrefs().billDay, 7, `${how}: the preferences are intact`);
+    assert.deepEqual(fs.readdirSync(from), ['prefs.json'], `${how}: nothing is left where the store was`);
+    assert.deepEqual(fs.readdirSync(core.storeMoveDir()), [], `${how}: nor any registration`);
+  }
+});
+
+test('cli: a command that records decisions reads and writes the store only while a move would wait for it', () => {
+  // Registered only at its first write, a keep or undo that read the store before a move renamed it, and wrote after,
+  // found nothing to decide: a move waits only for what is registered. So each command is registered before it first
+  // looks in the Claude config folder: its sessions, its preferences, its store.
+  freshHome();
+  delete process.env.CLAUDE_CONFIG_DIR;
+  const env = { ...process.env };
+  const cwd = fs.realpathSync(tmpWork());
+  const S = 'cli-registered';
+  for (let i = 1; i <= 4; i++) editHook(S, cwd, path.join(cwd, `r${i}.ts`), `old ${i}\n`, `new ${i}\n`);
+  core.undoEdit(S, 3);
+  core.setStatusMany(S, [1, 2], 'kept');
+  const cfg = core.claudeConfigDir();
+  const preload = path.join(tmpDir('cli-registered-'), 'first-look.js');
+  fs.writeFileSync(preload, `const fs = require('fs'), path = require('path');
+const cfg = ${JSON.stringify(cfg)}, out = process.env.FIRST_LOOK, moveDir = path.join(cfg, 'claude-observatory-move');
+let looked = false, busy = false;
+const look = (p) => {
+  // The guard's own files (its registration, the move lock) are how it registers, not a look at the store.
+  if (looked || busy || typeof p !== 'string' || !path.resolve(p).startsWith(cfg + path.sep) || path.resolve(p).startsWith(moveDir)) return;
+  busy = true; looked = true;
+  let mine = false;
+  try { mine = fs.readdirSync(moveDir).some((n) => n.startsWith('writer-') && fs.readFileSync(path.join(moveDir, n), 'utf8').startsWith(process.pid + ':')); } catch {}
+  fs.writeFileSync(out, String(mine)); busy = false;
+};
+for (const fn of ['statSync', 'readFileSync', 'existsSync', 'readdirSync', 'openSync', 'lstatSync']) {
+  const real = fs[fn];
+  fs[fn] = function (p, ...r) { look(p); return real.call(this, p, ...r); };
+}\n`);
+  const verbs = [
+    ['keep', '4', '--session', S], ['keep', '--ids', '4', '--session', S], ['undo', '4', '--session', S], ['redo', '3', '--session', S],
+    ['resolve', '--session', S], ['oplog', '--revert-last', '--session', S], ['clean', '--resolved', '--session', S], ['clean', '--older-than', '9999d'],
+    ['task-keep', '1', '--session', S], ['task-undo', '1', '--session', S], ['task-clear', '1', '--session', S], ['assign', '--ids', '4', '--session', S],
+    ['ignore', '--session', S],
+  ];
+  for (const args of verbs) {
+    const out = path.join(path.dirname(preload), `look-${args[0]}-${args[1]}`);
+    cp.spawnSync(process.execPath, ['--require', preload, CLI, ...args], { env: { ...env, FIRST_LOOK: out }, cwd, encoding: 'utf8' });
+    assert.equal(fs.existsSync(out) ? fs.readFileSync(out, 'utf8') : 'never looked', 'true', `\`oak ${args.join(' ')}\` is registered before it first looks`);
+  }
+  // A command that refuses (`fail` exits the process inside its guard) leaves no registration: one left behind held the
+  // next move up until it aged past the stale horizon.
+  const refused = cp.spawnSync(process.execPath, [CLI, 'keep', '999', '--session', S], { env, cwd, encoding: 'utf8' });
+  assert.equal(refused.status, 1, `control: a refusal: ${refused.stderr}`);
+  assert.deepEqual(fs.readdirSync(core.storeMoveDir()).filter((n) => n.startsWith('writer-')), [], 'no registration is left behind');
+  // Control: a command that only reads is not, so the look is seen when it is unregistered.
+  const listed = path.join(path.dirname(preload), 'look-list');
+  cp.spawnSync(process.execPath, ['--require', preload, CLI, 'list', '--session', S], { env: { ...env, FIRST_LOOK: listed }, cwd, encoding: 'utf8' });
+  assert.equal(fs.readFileSync(listed, 'utf8'), 'false', 'control: `oak list` looks unregistered');
+});
+
+/** Run `fn` while a live process holds the store move lock, with the wait for it running out at once. */
+function duringLiveMove(t, fn) {
+  const lock = path.join(core.storeMoveDir(), 'lock');
+  fs.mkdirSync(core.storeMoveDir(), { recursive: true });
+  fs.writeFileSync(lock, `${process.pid}:token:${Number(process.hrtime.bigint() / 1_000_000n)}`);
+  const realNow = Date.now;
+  let skew = 0;
+  t.mock.method(Date, 'now', () => realNow() + (skew += 4000));
+  try {
+    return fn();
+  } finally {
+    t.mock.restoreAll();
+    fs.rmSync(lock, { force: true });
+  }
+}
+
+test('store: every write of a decision waits for a move, and one that outlasts it writes nothing and says so', (t) => {
+  // Each runs through a guard of its own (the log lock, the file lock, and the writes no lock runs): without it, a
+  // decision made during a move wrote where the store was.
+  freshHome();
+  const cwd = tmpWork();
+  const S = 'decide-wait';
+  for (let i = 1; i <= 3; i++) editHook(S, cwd, path.join(cwd, `w${i}.ts`), `old ${i}\n`, `new ${i}\n`);
+  core.addComment(S, { unit: 1, text: 'kept' });
+  core.hideSession('hidden-one');
+  const log = fs.readFileSync(core.logPath(S), 'utf8');
+  const moving = /the store is being moved \(process \d+\) and the move outlasted the 10 s this waits for one, so nothing was recorded/;
+  // The log lock: keep (and undo's and redo's statuses, resolve, an ignore sweep, a clean).
+  assert.throws(() => duringLiveMove(t, () => core.setStatusMany(S, [1, 2], 'kept')), moving);
+  assert.throws(() => duringLiveMove(t, () => core.dropIgnored(S)), moving);
+  assert.equal(fs.readFileSync(core.logPath(S), 'utf8'), log, 'the log is as it was');
+  // The file lock: undo and redo, before they touch the file.
+  const undone = duringLiveMove(t, () => core.undoEdit(S, 2));
+  assert.equal(undone.ok, false);
+  assert.match(undone.message, moving);
+  assert.equal(fs.readFileSync(path.join(cwd, 'w2.ts'), 'utf8'), 'new 2\n', 'the file is untouched');
+  // A deleted session, and the writes no lock runs: a comment, the hidden sessions, a dropped session, the update
+  // channel and the install ledger.
+  assert.throws(() => duringLiveMove(t, () => core.deleteSession(S, { confirmedPending: Infinity })), moving);
+  assert.throws(() => duringLiveMove(t, () => core.addComment(S, { unit: 2, text: 'lost' })), moving);
+  assert.throws(() => duringLiveMove(t, () => core.removeComment(S, core.listComments(S)[0].id)), moving);
+  assert.throws(() => duringLiveMove(t, () => core.clearComments(S)), moving);
+  assert.throws(() => duringLiveMove(t, () => core.markCommentsSent(S, [core.listComments(S)[0].id])), moving);
+  assert.throws(() => duringLiveMove(t, () => core.hideSession('hidden-two')), moving);
+  assert.throws(() => duringLiveMove(t, () => core.unhideSession('hidden-one')), moving);
+  assert.throws(() => duringLiveMove(t, () => core.removeSession(S)), moving);
+  assert.throws(() => duringLiveMove(t, () => core.setUpdateChannel('dev')), moving);
+  const settings = path.join(tmpWork(), 'settings.json');
+  // An install that happened says its ledger was not written, as it does for any ledger failure; so does an uninstall.
+  assert.match(duringLiveMove(t, () => core.installHooks('oak capture #oak', settings)).ledgerError ?? '', moving);
+  const installed = path.join(tmpWork(), 'installed.json');
+  core.installHooks('oak capture #oak', installed);
+  assert.match(duringLiveMove(t, () => core.uninstallHooks(installed)).ledgerError ?? '', moving);
+  assert.ok(core.readLedger().some((e) => e.path === installed), 'control: the ledger still names what was installed');
+  assert.deepEqual(core.listComments(S).map((c) => [c.text, c.sentAt]), [['kept', undefined]], 'the comments are as they were');
+  assert.deepEqual([...core.hiddenSessions()], ['hidden-one'], 'and the hidden sessions');
+  assert.equal(core.readLog(S).length, 3, 'and the session');
+  assert.ok(!core.readLedger().some((e) => e.path === settings), 'and the install ledger');
+  // Control: with no move, each goes through.
+  assert.deepEqual(core.setStatusMany(S, [1], 'kept'), [1]);
+  assert.ok(core.addComment(S, { unit: 2, text: 'after' }));
+  core.hideSession('hidden-two');
+  assert.deepEqual([...core.hiddenSessions()].sort(), ['hidden-one', 'hidden-two']);
+});
+
+test('sessions: a delete that waited for a store move takes the capture lock where the store went (0.11.0)', (t) => {
+  // The capture mutex was named for the store before the wait: a delete that waited out a move locked the session where
+  // the store had been, and a capture after the move, locking it where the store went, could run beside the purge.
+  freshHome();
+  seedEdit('gone', path.join(tmpDir('del-move-'), 'a.ts'), 'a\n', 'b\n');
+  const taken = [];
+  const realOpen = fs.openSync;
+  t.mock.method(fs, 'openSync', function (p, flags, ...rest) {
+    if (flags === 'wx' && path.basename(path.dirname(String(p))) === '.file-locks') taken.push(String(p));
+    return realOpen.call(this, p, flags, ...rest);
+  });
+  const lock = path.join(core.storeMoveDir(), 'lock');
+  fs.mkdirSync(core.storeMoveDir(), { recursive: true });
+  fs.writeFileSync(lock, `${process.pid}:held:${Number(process.hrtime.bigint() / 1_000_000n)}`);
+  let moved = null;
+  let moving = false;
+  const realWait = Atomics.wait;
+  const wait = t.mock.method(Atomics, 'wait', function (...args) {
+    if (moving) return realWait.apply(this, args);
+    moving = true;
+    fs.rmSync(lock, { force: true }); // the move's lock is the move's own from here
+    moved = core.moveStore(path.join(tmpDir('del-move-dest-'), 'store'));
+    return 'timed-out';
+  });
+  try {
+    core.deleteSession('gone', { confirmedPending: Infinity });
+  } finally {
+    wait.mock.restore();
+    fs.rmSync(lock, { force: true });
+  }
+  assert.ok(moved?.moved, `positive control: the move ran while the delete waited (${JSON.stringify(moved)})`);
+  const during = taken[0];
+  taken.length = 0;
+  try {
+    core.deleteSession('gone', { confirmedPending: Infinity }); // after the move: nothing is left to delete, but it locks
+  } catch { /* its lock was taken all the same */ }
+  assert.ok(during && taken[0], `positive control: both deletes took a lock (${during}, ${taken[0]})`);
+  assert.equal(during, taken[0], 'the delete that waited for the move took the capture lock a delete after the move takes');
+  assert.equal(path.dirname(during), path.join(core.rootDir(), '.file-locks'), 'in the store where it went');
+  assert.equal(fs.existsSync(core.storeDir('gone')), false, 'and the session is deleted there');
+});
+
+test('store: a hide or restore that waited for a store move takes the lock of the hidden sessions a change after the move takes', (t) => {
+  // The lock was named for the list's path before the wait: a change that waited for a move locked the list where the
+  // store had been, one made after the move locked it where the store went, and the two ran side by side. The move here
+  // is a real one, run where the waiting change first sleeps; the lock each change takes is recorded as it is made.
+  freshHome();
+  core.hideSession('seed');
+  const taken = [];
+  const realOpen = fs.openSync;
+  t.mock.method(fs, 'openSync', function (p, flags, ...rest) {
+    if (flags === 'wx' && path.basename(path.dirname(String(p))) === '.file-locks') taken.push(String(p));
+    return realOpen.call(this, p, flags, ...rest);
+  });
+  /** Run `change` while a store move to `dest` holds the move lock; the move runs while the change waits for it. */
+  const duringMove = (dest, change) => {
+    const lock = path.join(core.storeMoveDir(), 'lock');
+    fs.mkdirSync(core.storeMoveDir(), { recursive: true });
+    fs.writeFileSync(lock, `${process.pid}:held:${Number(process.hrtime.bigint() / 1_000_000n)}`);
+    let moved = null;
+    let moving = false;
+    const realWait = Atomics.wait;
+    const wait = t.mock.method(Atomics, 'wait', function (...args) {
+      if (moving) return realWait.apply(this, args);
+      moving = true;
+      fs.rmSync(lock, { force: true }); // the move's lock is the move's own from here
+      moved = core.moveStore(dest);
+      return 'timed-out';
+    });
+    try {
+      change();
+    } finally {
+      wait.mock.restore();
+      fs.rmSync(lock, { force: true });
+    }
+    assert.ok(moved?.moved, `positive control: the move ran while the change waited (${JSON.stringify(moved)})`);
+  };
+  for (const [during, after, list] of [
+    [() => core.hideSession('during'), () => core.hideSession('after'), ['after', 'during', 'seed']],
+    [() => core.unhideSession('during'), () => core.unhideSession('after'), ['seed']],
+  ]) {
+    taken.length = 0;
+    duringMove(path.join(tmpDir('hidden-move-'), 'store'), during);
+    after();
+    assert.equal(taken.length, 2, `positive control: each change took a lock (${taken})`);
+    assert.equal(taken[0], taken[1], 'the change that waited for the move took the lock a change made after the move takes');
+    assert.equal(path.dirname(taken[0]), path.join(core.rootDir(), '.file-locks'), 'in the store where it went');
+    assert.deepEqual([...core.hiddenSessions()].sort(), list, 'and both changes reached the list where the store went');
+  }
+});
+
+test('store: the writes inside one capture or decision are one write: a move that began after it waits for all of it', (t) => {
+  // The move waits for the registration the outer one made (drainCaptures). A write inside it that waited for the move
+  // in turn (a capture's log append, a delete's removal of the session) would have waited on itself, out to the end of
+  // its wait, and then failed half done.
+  freshHome();
+  const cwd = tmpWork();
+  const S = 'decide-nested';
+  editHook(S, cwd, path.join(cwd, 'n.ts'), 'a\n', 'b\n');
+  const lock = path.join(core.storeMoveDir(), 'lock');
+  fs.mkdirSync(core.storeMoveDir(), { recursive: true });
+  const realNow = Date.now;
+  let skew = 0;
+  t.mock.method(Date, 'now', () => realNow() + (skew += 4000)); // any wait for the move would run out at once
+  try {
+    const begin = () => fs.writeFileSync(lock, `${process.pid}:token:${Number(process.hrtime.bigint() / 1_000_000n)}`);
+    assert.equal(core.captureOutsideMoves(() => { begin(); core.setStatusMany(S, [1], 'kept'); }), true);
+    fs.rmSync(lock);
+    assert.equal(core.outsideStoreMoves(() => { begin(); return core.setStatusMany(S, [1], 'undone').length; }), 1);
+  } finally {
+    t.mock.restoreAll();
+    fs.rmSync(lock, { force: true });
+  }
+  assert.equal(core.findRecord(S, 1).status, 'undone', 'both writes went through');
+});
+
+test('store: what OAK rebuilds, left where the store was, does not stop it from moving back', () => {
+  // A process that had not followed a move yet (the terminal app's views worker, between two refreshes) wrote its caches
+  // where the store had been, and `oak store --default` then refused the default location as not empty.
+  freshHome();
+  const cwd = tmpWork();
+  const S = 'store-back-again';
+  editHook(S, cwd, path.join(cwd, 'b.ts'), 'one\n', 'two\n');
+  const def = core.rootDir();
+  const away = path.join(tmpDir('store-away-'), 'observatory');
+  assert.ok(core.moveStore(away).moved);
+  // The Stats caches by the names this build gives them (their version is in the name), read off the real writer, and
+  // by the names a newer build running beside it gives its own.
+  writeTranscript(os.homedir(), 'proj-stats', 'statsSess', [assistantMsg(Date.now())]);
+  const databaseMode = process.env.OAK_INDEX;
+  process.env.OAK_INDEX = 'off';
+  try { core.computeStats(undefined, Date.now()); core.computeStats(undefined, Date.now(), true); }
+  finally { if (databaseMode === undefined) delete process.env.OAK_INDEX; else process.env.OAK_INDEX = databaseMode; }
+  const statsNames = fs.readdirSync(away).filter((n) => n.startsWith('stats-cache'));
+  assert.equal(statsNames.length, 2, `positive control: both Stats caches were written (${statsNames})`);
+  for (const n of statsNames) fs.rmSync(path.join(away, n)); // not the store's to carry back here
+  const newerStats = statsNames.map((n) => n.replace(/-v(\d+)\.json$/, (_, v) => `-v${Number(v) + 1}.json`));
+  for (const f of ['changemap-cache/x/placements.json', 'session-meta/x.json', 'usage-cursors/k.json', 'remote-cache/session-titles.json', '.file-locks/abc', 'stats-cache.json', 'stats-cache-claude.json', ...statsNames, ...newerStats, 'oak-server.log', 'herdr-btop.local.lock']) {
+    fs.mkdirSync(path.dirname(path.join(def, f)), { recursive: true });
+    fs.writeFileSync(path.join(def, f), 'stale');
+  }
+  const back = core.moveStore(def);
+  assert.ok(back.moved, `moved back over what was rebuilt there: ${JSON.stringify(back)}`);
+  assert.deepEqual(fs.readdirSync(def).sort(), ['.file-locks', 'prefs.json', S].sort(), 'the stale caches went before the store came back');
+  assert.equal(fs.existsSync(path.join(def, 'changemap-cache', 'x')), false);
+  assert.equal(core.readLog(S).length, 1, 'and the session is there');
+  // Store data where the store is going is still refused: a session, the hidden sessions, the install ledger.
+  for (const data of ['other-session/log.jsonl', 'hidden-sessions.json', 'install-ledger.json']) {
+    const there = path.join(tmpDir('store-full-'), 'observatory');
+    fs.mkdirSync(path.dirname(path.join(there, data)), { recursive: true });
+    fs.writeFileSync(path.join(there, data), '[]');
+    assert.match(core.moveStore(there).error, /is not empty/, data);
+  }
+});
+
+test('store: a move that crashed never holds a capture, and a live one refuses a second move', (t) => {
+  freshHome();
+  const S = 'mv-crashed';
+  const cwd = tmpWork();
+  editHook(S, cwd, path.join(cwd, 'seed.ts'), 'a\n', 'b\n');
+  const lock = path.join(core.storeMoveDir(), 'lock');
+  const mono = () => Number(process.hrtime.bigint() / 1_000_000n);
+  fs.mkdirSync(core.storeMoveDir(), { recursive: true });
+  const dead = cp.spawnSync(process.execPath, ['-e', '']).pid;
+  const ago = (ms) => { const at = new Date(Date.now() - ms); fs.utimesSync(lock, at, at); };
+  // A dead mover's lock, past the session lock's stale horizon; and a live pid's past the horizon no live holder reaches
+  // (a pid reused by another process). Each is broken, and the capture runs at once, on the session lock's own rules.
+  for (const [holder, age] of [[dead, 11_000], [process.pid, 16 * 60_000]]) {
+    fs.writeFileSync(lock, `${holder}:token:${mono() - age}`);
+    ago(age);
+    const t0 = Date.now();
+    let ran = false;
+    assert.equal(core.captureOutsideMoves(() => { ran = true; }), true);
+    assert.ok(ran && Date.now() - t0 < 1000, `a crashed move's lock (${holder === dead ? 'dead' : 'reused'} pid) held nothing`);
+    assert.equal(fs.existsSync(lock), false, 'and it was broken');
+  }
+  // Notes captures left while that move ran are recorded by whoever broke its lock.
+  fs.writeFileSync(lock, `${dead}:token:${mono() - 11_000}`);
+  ago(11_000);
+  fs.writeFileSync(path.join(core.storeMoveDir(), 'missed-11111111-1111-1111-1111-111111111111.json'), JSON.stringify({ session: S, file: '/w/x.ts', reason: 'r — edit not captured', ts: 1 }));
+  core.captureOutsideMoves(() => {});
+  assert.deepEqual(core.readSkips(S).map((k) => k.file), ['/w/x.ts']);
+  // A live move's lock: a second move is refused, and says by whom.
+  fs.writeFileSync(lock, `${process.pid}:token:${mono()}`);
+  const dest = path.join(tmpDir('store-second-'), 'observatory');
+  assert.match(core.moveStore(dest).error, new RegExp(`another store move is in progress \\(process ${process.pid}\\)`));
+  assert.equal(fs.existsSync(dest), false, 'nothing moved');
+  // A dead mover's lock does not stop the next move.
+  fs.writeFileSync(lock, `${dead}:token:${mono() - 11_000}`);
+  ago(11_000);
+  assert.ok(core.moveStore(dest).moved, 'the next move breaks a crashed one\'s lock');
+  assert.equal(core.readLog(S).length, 1);
+});
+
+test('store: a move by copy leaves out the focus server\'s socket, which no copy can take', { skip: process.platform === 'win32' && 'the focus endpoint is a named pipe there' }, async () => {
+  // The terminal app runs a focus server whose socket is in the store's root. Copied entry by entry, the move hit it and was
+  // refused ("Cannot copy a socket file"): every move to another file system, and every move back to the default location
+  // (always a copy, since that folder holds prefs.json), while a terminal app ran or once a server had left its socket.
+  freshHome();
+  const S = 'store-socket';
+  const cwd = tmpWork();
+  editHook(S, cwd, path.join(cwd, 'a.ts'), 'one\n', 'two\n');
+  const from = core.rootDir();
+  const dest = path.join(tmpDir('store-socket-'), 'observatory');
+  const server = require('net').createServer();
+  const here = process.cwd();
+  // Bound by a relative name, since a socket's path is capped near 100 bytes, and closed from the same folder: the close
+  // removes that name relative to the folder it runs in.
+  process.chdir(from);
+  try { await new Promise((resolve, reject) => server.once('error', reject).listen('oak.sock', resolve)); } finally { process.chdir(here); }
+  const realRename = fs.renameSync;
+  fs.renameSync = function (a, ...rest) {
+    if (path.resolve(String(a)) === path.resolve(from)) throw Object.assign(new Error('EXDEV: cross-device link not permitted'), { code: 'EXDEV' });
+    return realRename.call(this, a, ...rest);
+  };
+  let res;
+  try {
+    assert.ok(fs.lstatSync(path.join(from, 'oak.sock')).isSocket(), 'control: a live socket in the store root');
+    res = core.moveStore(dest);
+  } finally {
+    fs.renameSync = realRename;
+    process.chdir(from);
+    try { server.close(); } finally { process.chdir(here); }
+  }
+  assert.equal(res.moved, true, JSON.stringify(res));
+  assert.equal(fs.existsSync(path.join(dest, 'oak.sock')), false, 'the socket is not copied');
+  assert.equal(core.readLog(S).length, 1, 'and the session is read from where it went');
+});
+
+test('store: a move from the default location records where it went when that folder is made again meanwhile', () => {
+  // The default folder comes back in one rename, prefs.json in it. A process that had not followed the store yet (the views
+  // worker, writing a cache where it looked earlier in its turn) could make that folder again in between: the rename back
+  // was refused, the move ended unrecorded, and prefs.json was in neither place OAK reads it.
+  freshHome();
+  delete process.env.CLAUDE_CONFIG_DIR;
+  const S = 'store-remade';
+  const cwd = tmpWork();
+  editHook(S, cwd, path.join(cwd, 'a.ts'), 'one\n', 'two\n');
+  core.writePrefs({ billDay: 7, theme: 'mono' });
+  const from = core.rootDir();
+  const dest = path.join(tmpDir('store-remade-'), 'observatory');
+  const realRename = fs.renameSync;
+  fs.renameSync = function (a, ...rest) {
+    const out = realRename.call(this, a, ...rest);
+    if (path.resolve(String(a)) === path.resolve(from)) {
+      fs.mkdirSync(path.join(from, 'session-meta'), { recursive: true });
+      fs.writeFileSync(path.join(from, 'session-meta', `${S}.json`), '{}');
+    }
+    return out;
+  };
+  let res;
+  try { res = core.moveStore(dest); } finally { fs.renameSync = realRename; }
+  assert.equal(res.moved, true, JSON.stringify(res));
+  assert.equal(res.unrecorded, undefined, JSON.stringify(res));
+  const prefs = JSON.parse(fs.readFileSync(core.prefsPath(), 'utf8'));
+  assert.deepEqual([prefs.storeDir, prefs.billDay, prefs.theme], [dest, 7, 'mono'], 'prefs.json is where OAK reads it, naming where the store went');
+  core.clearRootMemo();
+  assert.equal(core.rootDir(), dest);
+  assert.equal(core.readLog(S).length, 1, 'and the session is read from there');
+  assert.equal(fs.existsSync(path.join(dest, 'prefs.json')), false, 'with no second copy of the preferences');
+});
+
+test('store: a move that cannot start gives up before a capture waiting for it does, and the capture is recorded', async () => {
+  // A move whose drain could not finish (a writer still registered: one held up, or a crashed hook's registration whose pid
+  // answers again) refused only after 30 s, while every capture that started meanwhile waited its 10 s and was dropped, its
+  // note left unread: edits lost although the store never moved.
+  freshHome();
+  delete process.env.CLAUDE_CONFIG_DIR;
+  const S = 'mv-drain';
+  const cwd = fs.realpathSync(tmpWork());
+  editHook(S, cwd, path.join(cwd, 'seed.ts'), 'a\n', 'b\n');
+  const env = { ...process.env, HOME: os.homedir(), USERPROFILE: os.homedir() };
+  const holder = cp.spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { stdio: 'ignore' });
+  const mono = () => Number(process.hrtime.bigint() / 1_000_000n);
+  fs.mkdirSync(core.storeMoveDir(), { recursive: true });
+  fs.writeFileSync(path.join(core.storeMoveDir(), 'writer-00000000-0000-4000-8000-000000000000'), `${holder.pid}:token:${mono()}`);
+  const dest = path.join(tmpDir('store-drain-'), 'observatory');
+  const mover = cp.spawn(process.execPath, [CLI, 'store', '--move', dest], { env, stdio: ['ignore', 'ignore', 'pipe'] });
+  let said = '';
+  mover.stderr.on('data', (d) => (said += d));
+  const moved = new Promise((resolve) => mover.on('close', resolve));
+  try {
+    const lock = path.join(core.storeMoveDir(), 'lock');
+    for (const end = Date.now() + 10000; !fs.existsSync(lock) && Date.now() < end;) await new Promise((r) => setTimeout(r, 10));
+    assert.ok(fs.existsSync(lock), 'control: the move holds its lock, waiting for the writer');
+    // An edit an agent makes meanwhile: each of its hooks waits for the move.
+    const F = path.join(cwd, 'during.ts');
+    fs.writeFileSync(F, 'v1\n');
+    const p = { session_id: S, cwd, tool_name: 'Edit', tool_input: { file_path: F } };
+    const hook = (event) => new Promise((resolve) => {
+      const c = cp.spawn(process.execPath, [CLI, 'capture'], { env, cwd, stdio: ['pipe', 'ignore', 'ignore'] });
+      c.on('close', resolve);
+      c.stdin.end(JSON.stringify({ ...p, hook_event_name: event }));
+    });
+    await hook('PreToolUse');
+    fs.writeFileSync(F, 'v2\n');
+    await hook('PostToolUse');
+    assert.equal(await moved, 1, 'control: the move refused');
+    assert.match(said, /edits were still being recorded/);
+    assert.ok(core.readLog(S).some((r) => r.file === F), `the edit made while the move waited is recorded (skips: ${JSON.stringify(core.readSkips(S))})`);
+    assert.deepEqual(fs.readdirSync(core.storeMoveDir()).filter((n) => n.startsWith('missed-')), [], 'and no capture gave up');
+  } finally {
+    holder.kill();
+    mover.kill();
+  }
+});
+
+test('store: a Bash command whose Pre could not wait for a move is recorded as a capture gap', (t) => {
+  // An edit tool's Pre that could not wait is said by its Post, which finds no before-snapshot. A Bash command's Post finds no
+  // snapshot of its tree and records nothing: a command run through a move that outlasted the wait lost every change it made,
+  // with no gap recorded and the move saying nothing.
+  freshHome();
+  const S = 'mv-bash';
+  const cwd = fs.realpathSync(tmpWork());
+  editHook(S, cwd, path.join(cwd, 'seed.ts'), 'a\n', 'b\n');
+  const lock = path.join(core.storeMoveDir(), 'lock');
+  const mono = () => Number(process.hrtime.bigint() / 1_000_000n);
+  fs.mkdirSync(core.storeMoveDir(), { recursive: true });
+  fs.writeFileSync(lock, `${process.pid}:token:${mono()}`); // a live mover's
+  const bash = (event) => ({ session_id: S, cwd, tool_name: 'Bash', tool_input: { command: 'sed -i s/v1/v2/ built.txt' }, tool_use_id: 'tu-bash', hook_event_name: event });
+  fs.writeFileSync(path.join(cwd, 'built.txt'), 'v1\n');
+  const realNow = Date.now;
+  let skew = 0;
+  t.mock.method(Date, 'now', () => realNow() + (skew += 4000)); // the wait runs out at once
+  const ran = core.captureOutsideMoves(() => core.handleHookPayload(bash('PreToolUse')), core.missedCapture(bash('PreToolUse')));
+  t.mock.restoreAll();
+  assert.equal(ran, false, 'control: the Pre did not run while the move held the lock');
+  fs.rmSync(lock);
+  // The command ran, and its Post once the move was done: with no snapshot of the tree, nothing it changed is recorded.
+  fs.writeFileSync(path.join(cwd, 'built.txt'), 'v2\n');
+  core.handleHookPayload(bash('PostToolUse'));
+  assert.equal(core.readLog(S).filter((r) => r.file.endsWith('built.txt')).length, 0, 'control: the Post records nothing without its Pre');
+  const res = core.moveStore(path.join(tmpDir('store-bash-'), 'observatory'));
+  assert.equal(res.missed, 1, JSON.stringify(res));
+  assert.deepEqual(core.readSkips(S).map((k) => k.file), ['<bash-tree>'], 'the command is a capture gap in its session');
+});
+
+test('store: a read while a move has renamed the store waits for the move, and finds the store where it went', async () => {
+  // In-process callers (the VS Code extension's keep, the views worker) read before any guard. Read in the moment a move had
+  // renamed the store and not yet recorded where, a session had no edits, and a keep kept none.
+  freshHome();
+  delete process.env.CLAUDE_CONFIG_DIR;
+  const S = 'mv-window';
+  const cwd = tmpWork();
+  editHook(S, cwd, path.join(cwd, 'a.ts'), 'one\n', 'two\n');
+  const custom = path.join(tmpDir('store-window-'), 'here');
+  assert.ok(core.moveStore(custom).moved, 'control: the store at a location of its own');
+  const dest = path.join(path.dirname(custom), 'there');
+  const lock = path.join(core.storeMoveDir(), 'lock');
+  fs.mkdirSync(core.storeMoveDir(), { recursive: true });
+  // A live mover in the middle of its move: its lock held, the store renamed, the new location recorded a moment later.
+  const finisher = cp.spawn(process.execPath, ['-e', `const fs = require('fs'); const core = require(${JSON.stringify(path.resolve(__dirname, '../dist/index.js'))});
+    fs.writeFileSync(${JSON.stringify(lock)}, process.pid + ':token:' + Number(process.hrtime.bigint() / 1000000n));
+    fs.renameSync(${JSON.stringify(custom)}, ${JSON.stringify(dest)});
+    process.stdout.write('renamed\\n');
+    setTimeout(() => { core.writePrefs({ ...core.readPrefs(), storeDir: ${JSON.stringify(dest)} }); fs.unlinkSync(${JSON.stringify(lock)}); }, 400);`], { env: { ...process.env }, stdio: ['ignore', 'pipe', 'inherit'] });
+  const done = new Promise((resolve) => finisher.on('close', resolve));
+  await new Promise((resolve) => finisher.stdout.once('data', resolve));
+  await new Promise((resolve) => setImmediate(resolve)); // a new turn, as a command gets
+  const t0 = Date.now();
+  assert.equal(core.readLog(S).length, 1, 'the read waited for the move and found the session where it went');
+  assert.ok(Date.now() - t0 >= 200, 'control: it waited');
+  await done;
+});
+
+test('store: a move by copy keeps its lock fresh while it copies one large entry', () => {
+  // Touched only between the store's top-level entries, the lock aged through the copy of one large session (its blobs on a
+  // slow disk). Past the horizon no live holder reaches it was broken as abandoned, and what a capture then wrote where the
+  // store was went with the original's removal.
+  freshHome();
+  const S = 'store-fresh';
+  const cwd = tmpWork();
+  editHook(S, cwd, path.join(cwd, 'a.ts'), 'one\n', 'two\n');
+  for (let i = 0; i < 600; i++) fs.writeFileSync(path.join(core.storeDir(S), 'blobs', `filler-${i}`), 'x');
+  const from = core.rootDir();
+  const lock = path.join(core.storeMoveDir(), 'lock');
+  const realRename = fs.renameSync, realCp = fs.cpSync, realUtimes = fs.utimesSync;
+  let during = 0, copying = '';
+  fs.renameSync = function (a, ...rest) {
+    if (path.resolve(String(a)) === path.resolve(from)) throw Object.assign(new Error('EXDEV: cross-device link not permitted'), { code: 'EXDEV' });
+    return realRename.call(this, a, ...rest);
+  };
+  fs.cpSync = function (src, ...rest) { copying = path.basename(String(src)); try { return realCp.call(this, src, ...rest); } finally { copying = ''; } };
+  fs.utimesSync = function (p, ...rest) { if (String(p) === lock && copying === S) during++; return realUtimes.call(this, p, ...rest); };
+  let res;
+  try { res = core.moveStore(path.join(tmpDir('store-fresh-'), 'observatory')); } finally { fs.renameSync = realRename; fs.cpSync = realCp; fs.utimesSync = realUtimes; }
+  assert.equal(res.moved, true, JSON.stringify(res));
+  assert.ok(during >= 2, `the lock was touched while the session was being copied (${during} times)`);
+});
+
+test('store: a move lock a minute without a refresh holds nothing up, even with its pid now another live process\'s', () => {
+  // A running move dates its lock as it works. One a crashed move left, its pid since taken by another process, answered
+  // as a live holder's for the session lock's 15 minutes: every capture and decision meanwhile waited its 10 s and gave up.
+  freshHome();
+  delete process.env.CLAUDE_CONFIG_DIR;
+  const S = 'mv-reused';
+  const cwd = fs.realpathSync(tmpWork());
+  editHook(S, cwd, path.join(cwd, 'seed.ts'), 'a\n', 'b\n');
+  const lock = path.join(core.storeMoveDir(), 'lock');
+  const mono = () => Number(process.hrtime.bigint() / 1_000_000n);
+  fs.mkdirSync(core.storeMoveDir(), { recursive: true });
+  const other = cp.spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { stdio: 'ignore' }); // alive, and no mover
+  const plant = (file, takenAgo, datedAgo) => {
+    fs.writeFileSync(file, `${other.pid}:token:${mono() - takenAgo}`);
+    const at = new Date(Date.now() - datedAgo);
+    fs.utimesSync(file, at, at);
+  };
+  try {
+    assert.ok(other.pid > 0 && other.pid !== process.pid && process.kill(other.pid, 0), 'control: its pid answers');
+    plant(lock, 61_000, 61_000);
+    let t0 = Date.now(), ran = false;
+    assert.equal(core.captureOutsideMoves(() => { ran = true; }), true);
+    assert.ok(ran && Date.now() - t0 < 1000, 'a capture runs at once');
+    assert.equal(fs.existsSync(lock), false, 'and breaks the lock');
+    plant(lock, 61_000, 61_000);
+    t0 = Date.now();
+    assert.equal(core.outsideStoreMoves(() => 'kept'), 'kept');
+    assert.ok(Date.now() - t0 < 1000, 'so does a decision');
+    // A move that crashed between renaming the store and recording where: every read looked for it and, the move still
+    // under way as far as it knew, waited its 10 s each turn.
+    const from = core.rootDir(), away = path.join(tmpDir('store-reused-'), 'away');
+    fs.renameSync(from, away);
+    plant(lock, 61_000, 61_000);
+    core.clearRootMemo();
+    t0 = Date.now();
+    assert.equal(core.rootDir(), from);
+    assert.ok(Date.now() - t0 < 1000, `a read does not wait for it (${Date.now() - t0} ms)`);
+    fs.renameSync(away, from);
+    const dest = path.join(tmpDir('store-reused-'), 'observatory');
+    assert.equal(core.moveStore(dest).moved, true, 'and the next move takes it');
+    assert.equal(core.readLog(S).length, 1);
+    // Control: a running move's lock, taken a minute ago and dated a moment ago, still holds.
+    plant(lock, 61_000, 0);
+    assert.match(core.moveStore(path.join(tmpDir('store-reused-'), 'observatory')).error ?? '', new RegExp(`another store move is in progress \\(process ${other.pid}\\)`));
+    fs.rmSync(lock);
+    // The session's own locks keep their rules: the same holder, a minute old, is still working as far as they know.
+    const F = path.join(cwd, 'held.ts');
+    fs.writeFileSync(F, 'x\n');
+    const fileLock = path.join(core.rootDir(), '.file-locks', core.pathKey(core.canonPath(F)));
+    fs.mkdirSync(path.dirname(fileLock), { recursive: true });
+    plant(fileLock, 61_000, 61_000);
+    assert.throws(() => core.withFileMutation(F, () => 'in', 300), /modifying this file/, 'the file mutation lock still waits for it');
+    assert.equal(fs.readFileSync(fileLock, 'utf8').split(':')[0], String(other.pid), 'and leaves it with its holder');
+  } finally {
+    other.kill();
+  }
+});
+
+test('store: a capture or decision that cannot break a move\'s stale lock waits for the move, which may only have been stopped', () => {
+  // A waiter judged the lock of a move stopped a minute stale, and its break refused: the move went on and dated its lock
+  // before the break looked again, or another waiter was breaking it, whose break the move outran so. The capture or
+  // decision ran anyway, writing where the store was while the move still held its lock, and the move then removed the
+  // original with what it wrote.
+  freshHome();
+  delete process.env.CLAUDE_CONFIG_DIR;
+  const dir = core.storeMoveDir(), lock = path.join(dir, 'lock'), claim = `${lock}.break`;
+  const mono = () => Number(process.hrtime.bigint() / 1_000_000n);
+  const dateNow = (p) => { const now = new Date(); fs.utimesSync(p, now, now); };
+  fs.mkdirSync(dir, { recursive: true });
+  const realWrite = fs.writeFileSync;
+  const guards = [['a capture', (run) => core.captureOutsideMoves(run)], ['a decision', (run) => core.outsideStoreMoves(() => (run(), true))]];
+  for (const [how, guard] of guards) for (const breaker of ['this waiter', 'another waiter']) {
+    const what = `${how}, with ${breaker} breaking the lock`;
+    fs.writeFileSync(lock, `${process.pid}:mover-token:${mono() - 61_000}`); // a live move's
+    const ago = new Date(Date.now() - 61_000);
+    fs.utimesSync(lock, ago, ago); // a minute without a refresh
+    if (breaker === 'another waiter') fs.writeFileSync(claim, `${process.pid}:other-waiter:${mono()}`); // its claim to break it
+    let tried = false, dated = false, looks = 0, done = false;
+    fs.writeFileSync = function (f, ...rest) {
+      const name = path.basename(String(f));
+      if (name === 'lock.break' && !tried) {
+        tried = true; // this waiter's claim to break the lock
+        if (breaker === 'this waiter') { dated = true; dateNow(lock); } // the move, going on, dates it first, as touchLock does
+      } else if (tried && name.startsWith('writer-')) {
+        // Each look the waiter takes registers it first. At its first the other waiter's break found the lock dated again,
+        // and let its claim go; by its third the move is done.
+        if (++looks === 1 && breaker === 'another waiter') { dated = true; dateNow(lock); fs.rmSync(claim); }
+        if (looks === 3) { fs.unlinkSync(lock); done = true; }
+      }
+      return realWrite.call(this, f, ...rest);
+    };
+    let ranOnceDone;
+    try {
+      assert.equal(guard(() => { ranOnceDone = done; }), true, what);
+    } finally {
+      fs.writeFileSync = realWrite;
+    }
+    assert.ok(tried, `${what}: control: the waiter went to break the lock`);
+    assert.equal(ranOnceDone, true, `${what}: it waited for the move`);
+    assert.ok(dated, `${what}: control: the move dated its lock meanwhile`);
+    assert.deepEqual(fs.readdirSync(dir), [], `${what}: and left nothing behind`);
+  }
+});
+
+test('store: a move whose lock was taken while it waited for a capture to finish moves nothing', () => {
+  // Stopped for a minute (a suspended `oak store --move`), a move found its lock broken as a crashed one's, and moved the
+  // store without it: a capture that came in then wrote where the store had been, and its edit stayed there.
+  freshHome();
+  delete process.env.CLAUDE_CONFIG_DIR;
+  const S = 'mv-lost-drain';
+  const cwd = fs.realpathSync(tmpWork());
+  editHook(S, cwd, path.join(cwd, 'a.ts'), 'one\n', 'two\n');
+  const from = core.rootDir();
+  const dest = path.join(tmpDir('store-lost-drain-'), 'observatory');
+  const dir = core.storeMoveDir(), lock = path.join(dir, 'lock');
+  const reg = path.join(dir, 'writer-00000000-0000-4000-8000-000000000001');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(reg, `${process.pid}:token:${Number(process.hrtime.bigint() / 1_000_000n)}`); // a capture still being written
+  const realReaddir = fs.readdirSync;
+  let turns = 0;
+  fs.readdirSync = function (p, ...rest) {
+    // The move's second look at the registrations: meanwhile its lock was broken, and the capture it waited for finished.
+    if (path.resolve(String(p)) === path.resolve(dir) && fs.existsSync(reg) && ++turns === 2) { fs.unlinkSync(lock); fs.unlinkSync(reg); }
+    return realReaddir.call(this, p, ...rest);
+  };
+  let res;
+  try { res = core.moveStore(dest); } finally { fs.readdirSync = realReaddir; }
+  assert.equal(turns, 2, 'control: the move waited for the capture');
+  assert.match(res.error ?? '', /^the store was not moved: its lock went 60 s without a refresh/, JSON.stringify(res));
+  assert.equal(fs.existsSync(dest), false, 'nothing moved');
+  core.clearRootMemo();
+  assert.equal(core.rootDir(), from);
+  assert.equal(core.readLog(S).length, 1);
+});
+
+test('store: a move whose lock was taken while it copied undoes the copy, and the edit a capture made meanwhile stays', () => {
+  // One file's copy that outlasts the lock's minute (or a move stopped mid-copy) let a capture in, which wrote where the
+  // store was; the move went on, recorded where it went and removed the original, the capture's edit with it.
+  freshHome();
+  delete process.env.CLAUDE_CONFIG_DIR;
+  const S = 'mv-lost-copy';
+  const cwd = fs.realpathSync(tmpWork());
+  editHook(S, cwd, path.join(cwd, 'a.ts'), 'one\n', 'two\n');
+  const from = core.rootDir();
+  const dest = path.join(tmpDir('store-lost-copy-'), 'observatory');
+  const lock = path.join(core.storeMoveDir(), 'lock');
+  const realRename = fs.renameSync, realCp = fs.cpSync;
+  let recorded = 0;
+  fs.renameSync = function (a, ...rest) {
+    if (path.resolve(String(a)) === path.resolve(from)) throw Object.assign(new Error('EXDEV: cross-device link not permitted'), { code: 'EXDEV' });
+    if (/^prefs\.json\.tmp-/.test(path.basename(String(a)))) recorded++; // a location written to prefs.json
+    return realRename.call(this, a, ...rest);
+  };
+  let broken = false;
+  fs.cpSync = function (src, ...rest) {
+    const out = realCp.call(this, src, ...rest);
+    if (path.basename(String(src)) === S && !broken) {
+      broken = true;
+      fs.unlinkSync(lock); // broken as a crashed move's
+      editHook(S, cwd, path.join(cwd, 'b.ts'), 'three\n', 'four\n'); // and a capture let in, where the store is
+    }
+    return out;
+  };
+  let res;
+  try { res = core.moveStore(dest); } finally { fs.renameSync = realRename; fs.cpSync = realCp; }
+  assert.ok(broken, 'control: the session was copied');
+  assert.match(res.error ?? '', /^could not move the store: its lock went 60 s without a refresh/, JSON.stringify(res));
+  core.clearRootMemo();
+  assert.equal(core.rootDir(), from, 'the store is where it was');
+  assert.deepEqual(core.readLog(S).map((r) => path.basename(r.file)).sort(), ['a.ts', 'b.ts'], 'with the edit made while it copied');
+  assert.deepEqual(fs.existsSync(dest) ? fs.readdirSync(dest) : [], [], 'and no copy is left');
+  // Found once the copy is made, not after the location is recorded and put back: meanwhile prefs.json named the copy,
+  // and a capture let in then wrote to it, and lost its edit with it.
+  assert.equal(recorded, 0, 'prefs.json never named the copy');
+});
+
+test('store: a move whose lock a second move took while it copied undoes the copy, and leaves that move its lock', () => {
+  // The move holds its lock while the lock holds its token: one a second move took over (a lock there, but not this
+  // one's) keeps nothing out for this move, which has to stop as it does when the lock is gone.
+  freshHome();
+  delete process.env.CLAUDE_CONFIG_DIR;
+  const S = 'mv-lost-token';
+  const cwd = fs.realpathSync(tmpWork());
+  editHook(S, cwd, path.join(cwd, 'a.ts'), 'one\n', 'two\n');
+  const from = core.rootDir();
+  const dest = path.join(tmpDir('store-lost-token-'), 'observatory');
+  const lock = path.join(core.storeMoveDir(), 'lock');
+  const realRename = fs.renameSync, realCp = fs.cpSync;
+  fs.renameSync = function (a, ...rest) {
+    if (path.resolve(String(a)) === path.resolve(from)) throw Object.assign(new Error('EXDEV: cross-device link not permitted'), { code: 'EXDEV' });
+    return realRename.call(this, a, ...rest);
+  };
+  let taken = false;
+  fs.cpSync = function (src, ...rest) {
+    const out = realCp.call(this, src, ...rest);
+    if (path.basename(String(src)) === S && !taken) {
+      taken = true; // the second move's lock, in place of this one's
+      fs.writeFileSync(lock, `${process.pid}:second-move:${Number(process.hrtime.bigint() / 1_000_000n)}`);
+    }
+    return out;
+  };
+  let res;
+  try { res = core.moveStore(dest); } finally { fs.renameSync = realRename; fs.cpSync = realCp; }
+  assert.ok(taken, 'control: the lock was taken over while the session was copied');
+  assert.match(res.error ?? '', /^could not move the store: its lock went 60 s without a refresh/, JSON.stringify(res));
+  core.clearRootMemo();
+  assert.equal(core.rootDir(), from, 'the store is where it was');
+  assert.deepEqual(fs.existsSync(dest) ? fs.readdirSync(dest) : [], [], 'and no copy is left');
+  assert.equal(fs.readFileSync(lock, 'utf8').split(':')[1], 'second-move', 'the second move keeps its lock');
+  fs.rmSync(lock);
+});
+
+test('store: a move whose lock was taken while it recorded the new location keeps the store where it was, with the edit a capture made meanwhile', () => {
+  // Stopped a minute between its look after the copy and the record (a suspended `oak store --move`), a move recorded
+  // where it went with its lock broken as a crashed one's: a capture let in meanwhile wrote where the store was, and the
+  // removal of the original took it, and every decision made then.
+  freshHome();
+  delete process.env.CLAUDE_CONFIG_DIR;
+  const S = 'mv-lost-record';
+  const cwd = fs.realpathSync(tmpWork());
+  editHook(S, cwd, path.join(cwd, 'a.ts'), 'one\n', 'two\n');
+  core.writePrefs({ ...core.readPrefs(), billDay: 7 });
+  const from = core.rootDir();
+  const dest = path.join(tmpDir('store-lost-record-'), 'observatory');
+  const lock = path.join(core.storeMoveDir(), 'lock');
+  const realRename = fs.renameSync;
+  let broken = false;
+  fs.renameSync = function (a, ...rest) {
+    if (path.resolve(String(a)) === path.resolve(from)) throw Object.assign(new Error('EXDEV: cross-device link not permitted'), { code: 'EXDEV' });
+    if (/^prefs\.json\.tmp-/.test(path.basename(String(a))) && !broken) {
+      broken = true;
+      fs.unlinkSync(lock); // broken as a crashed move's
+      editHook(S, cwd, path.join(cwd, 'b.ts'), 'three\n', 'four\n'); // and a capture let in, where the store is
+    }
+    return realRename.call(this, a, ...rest);
+  };
+  let res;
+  try { res = core.moveStore(dest); } finally { fs.renameSync = realRename; }
+  assert.ok(broken, 'control: the lock was taken as the new location was recorded');
+  assert.match(res.error ?? '', /^could not move the store: its lock went 60 s without a refresh/, JSON.stringify(res));
+  core.clearRootMemo();
+  assert.equal(core.rootDir(), from, 'the store is where it was');
+  assert.deepEqual([core.readPrefs().storeDir, core.readPrefs().billDay], [undefined, 7], 'and prefs.json says so, with the other settings');
+  assert.deepEqual(core.readLog(S).map((r) => path.basename(r.file)).sort(), ['a.ts', 'b.ts'], 'with the edit made meanwhile');
+  assert.deepEqual(fs.existsSync(dest) ? fs.readdirSync(dest) : [], [], 'and no copy is left');
+});
+
+test('store: a move whose lock another move took meanwhile moves nothing, and the store stays where that move put it', () => {
+  // Stopped a minute as it carried the preferences, a move whose lock a second move took went on as if it held it: the
+  // second move had taken the store away and left the default folder with only prefs.json in it, and this one moved that
+  // folder and recorded it as the store. Every session vanished from view.
+  freshHome();
+  delete process.env.CLAUDE_CONFIG_DIR;
+  const S = 'mv-lost-twice';
+  const cwd = fs.realpathSync(tmpWork());
+  editHook(S, cwd, path.join(cwd, 'a.ts'), 'one\n', 'two\n');
+  core.writePrefs({ ...core.readPrefs(), billDay: 7 });
+  const from = core.rootDir();
+  const other = path.join(tmpDir('store-lost-twice-'), 'observatory');
+  const dest = path.join(tmpDir('store-lost-twice-'), 'observatory');
+  const lock = path.join(core.storeMoveDir(), 'lock');
+  const realExists = fs.existsSync;
+  let moved = false;
+  fs.existsSync = function (p, ...rest) {
+    if (!moved && path.resolve(String(p)) === path.resolve(from)) {
+      // The second move, while this one was stopped: it broke this one's lock, took the store, and put the default
+      // folder back with prefs.json naming where.
+      moved = true;
+      fs.unlinkSync(lock);
+      fs.renameSync(from, other);
+      fs.mkdirSync(from);
+      fs.writeFileSync(path.join(from, 'prefs.json'), JSON.stringify({ billDay: 7, storeDir: other }));
+    }
+    return realExists.call(this, p, ...rest);
+  };
+  let res;
+  try { res = core.moveStore(dest); } finally { fs.existsSync = realExists; }
+  assert.ok(moved, 'control: the second move ran while this one was stopped');
+  assert.match(res.error ?? '', /^the store was not moved: its lock went 60 s without a refresh/, JSON.stringify(res));
+  core.clearRootMemo();
+  assert.equal(core.rootDir(), other, 'the store is where the second move put it');
+  assert.equal(core.readLog(S).length, 1);
+});
+
+test('store: a move that finds the store gone with a move that took its lock records nothing', () => {
+  // Stopped a minute before its look for the store, a move whose lock a second move took found no store where it had
+  // been (the second move had taken it), read that as a new install's first move, and recorded its own empty folder:
+  // every session vanished from view.
+  freshHome();
+  delete process.env.CLAUDE_CONFIG_DIR;
+  const S = 'mv-lost-gone';
+  const cwd = fs.realpathSync(tmpWork());
+  editHook(S, cwd, path.join(cwd, 'a.ts'), 'one\n', 'two\n');
+  const start = path.join(tmpDir('store-lost-gone-'), 'observatory');
+  assert.equal(core.moveStore(start).moved, true, 'control: the store starts where a move put it');
+  const other = path.join(tmpDir('store-lost-gone-'), 'observatory');
+  const dest = path.join(tmpDir('store-lost-gone-'), 'observatory');
+  const lock = path.join(core.storeMoveDir(), 'lock');
+  const realExists = fs.existsSync;
+  let moved = false;
+  fs.existsSync = function (p, ...rest) {
+    if (!moved && path.resolve(String(p)) === path.resolve(start)) {
+      moved = true; // the second move, while this one was stopped: it broke this one's lock, moved the store, and said where
+      fs.unlinkSync(lock);
+      fs.renameSync(start, other);
+      core.writePrefs({ ...core.readPrefs(), storeDir: other });
+    }
+    return realExists.call(this, p, ...rest);
+  };
+  let res;
+  try { res = core.moveStore(dest); } finally { fs.existsSync = realExists; }
+  assert.ok(moved, 'control: the second move ran while this one was stopped');
+  assert.match(res.error ?? '', /^the store was not moved: its lock went 60 s without a refresh/, JSON.stringify(res));
+  core.clearRootMemo();
+  assert.equal(core.rootDir(), other, 'the store is where the second move put it');
+  assert.equal(core.readLog(S).length, 1);
+});
+
+test('store: a renamed store whose old folder a capture made again while the move was stopped says what it left there', () => {
+  // Stopped a minute between its rename and the record, a move let in a capture that found no store where prefs.json
+  // still pointed, made the folder again and wrote there. The rename cannot go back over it; the move said nothing.
+  freshHome();
+  delete process.env.CLAUDE_CONFIG_DIR;
+  const S = 'mv-lost-rename';
+  const cwd = fs.realpathSync(tmpWork());
+  editHook(S, cwd, path.join(cwd, 'a.ts'), 'one\n', 'two\n');
+  const from = core.rootDir();
+  const dest = path.join(tmpDir('store-lost-rename-'), 'observatory');
+  const lock = path.join(core.storeMoveDir(), 'lock');
+  const realRename = fs.renameSync;
+  let broken = false;
+  fs.renameSync = function (a, ...rest) {
+    const out = realRename.call(this, a, ...rest);
+    if (path.resolve(String(a)) === path.resolve(from) && !broken) {
+      broken = true;
+      fs.unlinkSync(lock); // broken as a crashed move's
+      editHook(S, cwd, path.join(cwd, 'b.ts'), 'three\n', 'four\n'); // a capture let in, where prefs.json still points
+    }
+    return out;
+  };
+  let res;
+  try { res = core.moveStore(dest); } finally { fs.renameSync = realRename; }
+  assert.ok(broken, 'control: the lock was taken once the store was renamed');
+  assert.equal(res.moved, true, JSON.stringify(res));
+  assert.match(res.left ?? '', new RegExp(`^${from.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} holds what was recorded while the move was stopped \\(its lock went 60 s`), JSON.stringify(res));
+  core.clearRootMemo();
+  assert.equal(core.rootDir(), dest, 'the store is where it went');
+  assert.ok(fs.readFileSync(path.join(from, S, 'log.jsonl'), 'utf8').includes('b.ts'), 'and the capture made meanwhile is where it was written');
+});
+
+test('prefs: the bill day falls back to the .claude.json Claude Code keeps, which is in CLAUDE_CONFIG_DIR when that is set', () => {
+  // It read the home's file alone, so a relocated config's subscription date never anchored the month.
+  const home = freshHome();
+  const relocated = path.join(home, 'relocated');
+  fs.mkdirSync(relocated);
+  const login = (dir, at) => fs.writeFileSync(path.join(dir, '.claude.json'), JSON.stringify({ oauthAccount: { subscriptionCreatedAt: at, accountUuid: `acct-${at.slice(8, 10)}` } }));
+  login(home, '2026-07-05T10:00:00Z');
+  login(relocated, '2026-07-14T16:59:21Z');
+  const tag = (id) => require('crypto').scryptSync(id, 'oak-claude-account', 6).toString('hex');
+  try {
+    assert.equal(core.billDay({}), 5, 'the home\'s, with no CLAUDE_CONFIG_DIR');
+    process.env.CLAUDE_CONFIG_DIR = relocated;
+    assert.equal(core.billDay({}), 14, 'CLAUDE_CONFIG_DIR\'s when it is set');
+    assert.equal(core.claudeAccountTag(), tag('acct-14'), 'the file the account is read from too');
+  } finally {
+    delete process.env.CLAUDE_CONFIG_DIR;
+  }
 });
 
 test('prefs: billDay round-trips through writePrefs/readPrefs (0.10.0)', () => {
@@ -14862,6 +19178,109 @@ test('statusline: the codex config edit is TOML-safe and refuses a foreign statu
   run();
   const spaced = fs.readFileSync(cfg, 'utf8');
   assert.equal((spaced.match(/^\[\s*tui\s*\]/gm) || []).length, 1, 'a spaced [ tui ] header is reused — a second table is a TOML parse error');
+  // A byte order mark first, then [tui]: that header is found, and the mark stays first, once.
+  fs.writeFileSync(cfg, '\uFEFF[tui]\ntheme = "dark"\n');
+  run();
+  run();
+  const marked = fs.readFileSync(cfg, 'utf8');
+  assert.equal((marked.match(/\[\s*tui\s*\]/g) || []).length, 1, 'no second [tui] after a byte order mark');
+  assert.deepEqual([marked.startsWith(`\uFEFF[tui]${os.EOL}status_line = `), (marked.match(/\uFEFF/g) || []).length], [true, 1]);
+});
+
+test('statusline: uninstall --all removes the Codex status line the installer set, and only that (2026-10-07)', (t) => {
+  // `oak uninstall --all` reverted the Claude status line and left Codex's `# oak-statusline` lines behind,
+  // although its tip says it reverts the bundled status line.
+  const sh = fs.readFileSync(path.resolve(__dirname, '../../cli/statusline/install-statusline.sh'), 'utf8');
+  const lines = sh.split('\n');
+  const from = lines.findIndex((l) => l.includes("<<'PYEOF2'"));
+  const py = lines.slice(from + 1, lines.indexOf('PYEOF2', from + 1)).join('\n');
+  const home = freshHome();
+  const cfg = path.join(home, 'config.toml');
+  const install = () => {
+    const r = cp.spawnSync('python3', ['-', cfg], { input: py, encoding: 'utf8' });
+    if (r.error && r.error.code === 'ENOENT') return false;
+    assert.equal(r.status, 0, r.stderr);
+    return true;
+  };
+  const roundTrip = (before) => {
+    fs.writeFileSync(cfg, before);
+    if (!install()) return null;
+    assert.match(fs.readFileSync(cfg, 'utf8'), /# oak-statusline/);
+    assert.equal(core.uninstallCodexStatusline(cfg), true);
+    return fs.readFileSync(cfg, 'utf8');
+  };
+  // Python writes native line ends. Uninstall preserves those bytes, including on Windows.
+  // A table the installer added, and one of the person's it added its keys to: only our content goes.
+  const plain = 'model = "gpt-5.2"\n';
+  const back = roundTrip(plain);
+  if (back === null) return t.skip('python3 is not installed');
+  assert.equal(back, plain.replace(/\n/g, os.EOL));
+  for (const before of ['model = "gpt-5.2"\n\n[tui]\ntheme = "dark"\n\n[profiles.x]\nmodel = "o3"\n', '\uFEFF[tui]\ntheme = "dark"\n', '\uFEFFmodel = "gpt-5.2"\n', 'model = "gpt-5.2"\n  \n']) {
+    assert.equal(roundTrip(before), before.replace(/\n/g, os.EOL), JSON.stringify(before));
+  }
+  assert.equal(core.uninstallCodexStatusline(cfg), false, 'nothing of ours left: unchanged');
+  // A key the person added under the installer's [tui]: the header stays, so the key is not moved to the root.
+  fs.writeFileSync(cfg, plain);
+  install();
+  fs.appendFileSync(cfg, 'theme = "dark"\n');
+  assert.equal(core.uninstallCodexStatusline(cfg), true);
+  assert.equal(fs.readFileSync(cfg, 'utf8'), `model = "gpt-5.2"${os.EOL}${os.EOL}[tui]  # oak-statusline${os.EOL}theme = "dark"\n`);
+  assert.equal(core.uninstallCodexStatusline(cfg), false);
+  // The same with CRLF line ends, as Windows' Python writes the file (text mode): the installer's table goes with
+  // the blank line before it, and a header with a key the person added under it stays, so that key is not moved
+  // into the table before it, where it can redefine one of theirs.
+  const crlf = (before, added = '') => {
+    fs.writeFileSync(cfg, before);
+    install();
+    fs.writeFileSync(cfg, fs.readFileSync(cfg, 'utf8').replace(/\r?\n/g, '\r\n') + added);
+    assert.equal(core.uninstallCodexStatusline(cfg), true);
+    return fs.readFileSync(cfg, 'utf8');
+  };
+  assert.equal(crlf('model = "gpt-5.2"\r\n'), 'model = "gpt-5.2"\r\n');
+  assert.equal(crlf('model = "gpt-5.2"\r\ntheme = "light"\r\n', 'theme = "dark"\r\n'),
+    'model = "gpt-5.2"\r\ntheme = "light"\r\n\r\n[tui]  # oak-statusline\r\ntheme = "dark"\r\n');
+});
+
+test('statusline: a file cached under an older pricing stamp is priced again; one under the current stamp is reused', (t) => {
+  // The month $ caches each cold transcript's priced ids, stamped `ev`. A pricing change that kept the
+  // stamp left every cached file at its old prices for the rest of the month.
+  if (cp.spawnSync('python3', ['--version']).error) return t.skip('python3 is not installed');
+  const sh = fs.readFileSync(path.resolve(__dirname, '../../cli/statusline/install-statusline.sh'), 'utf8');
+  const lines = sh.split('\n');
+  const from = lines.findIndex((l) => l.includes("<<'PYEOF'"));
+  const py = lines.slice(from + 1, lines.indexOf('PYEOF', from + 1)).join('\n');
+  const home = freshHome();
+  const proj = path.join(home, 'projects', 'p');
+  fs.mkdirSync(proj, { recursive: true });
+  const now = Date.UTC(2026, 8, 20, 12) / 1000;
+  const at = now - 6 * 3600; // cold: older than the 5h window, so its scan is cached
+  const file = path.join(proj, 'a.jsonl');
+  fs.writeFileSync(file, JSON.stringify({ timestamp: new Date(at * 1000).toISOString(), cwd: home, message: { id: 'bedrock1',
+    model: 'us.anthropic.claude-sonnet-4-5-20250929-v1:0', usage: { input_tokens: 1_000_000, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } } }) + '\n');
+  fs.utimesSync(file, at, at);
+  const state = path.join(home, 'usage-state.json');
+  const scan = () => {
+    const r = cp.spawnSync('python3', ['-', state, path.join(home, 'projects'), '10', '0', '20', '0'], {
+      input: py, encoding: 'utf8', env: { ...process.env, HOME: home, USERPROFILE: home, STATUSLINE_SCAN_ALARM: '30', STATUSLINE_NOW: String(now) },
+    });
+    assert.equal(r.status, 0, (r.stderr || '').trim());
+    return JSON.parse(fs.readFileSync(state, 'utf8'));
+  };
+  const tamper = (ev) => {
+    const st = JSON.parse(fs.readFileSync(state, 'utf8'));
+    st.last_scan = 0; // due for a scan
+    st.fc[file].ev = ev;
+    st.fc[file].ids.bedrock1[4] = 999; // a price the current rules never give
+    fs.writeFileSync(state, JSON.stringify(st));
+  };
+  const first = scan();
+  assert.equal(first.CLu30, 3, 'the Bedrock id is priced as Sonnet 4.5');
+  const ev = first.fc[file].ev;
+  assert.ok(Number.isInteger(ev) && ev >= 6, `stamped with the current pricing (${ev})`);
+  tamper(ev);
+  assert.equal(scan().CLu30, 999, 'control: under the current stamp the cached price is reused');
+  tamper(ev - 1);
+  assert.equal(scan().CLu30, 3, 'under an older stamp it is priced again');
 });
 
 test('statusline: the month segment follows the BILL CYCLE, clamped like card billing (0.10.0)', () => {
@@ -14874,11 +19293,11 @@ test('statusline: the month segment follows the BILL CYCLE, clamped like card bi
   const to = lines.indexOf('PYEOF', from + 1);
   const py = lines.slice(from + 1, to).join('\n');
 
-  const run = (home, nowSec, stateName = 'usage-state.json') => {
+  const run = (home, nowSec, stateName = 'usage-state.json', env = {}) => {
     const state = path.join(home, stateName);
     const r = require('child_process').spawnSync('python3', ['-', state, path.join(home, 'projects'), '10', '0', '20', '0'], {
       input: py, encoding: 'utf8',
-      env: { ...process.env, HOME: home, USERPROFILE: home, STATUSLINE_SCAN_ALARM: '30', STATUSLINE_NOW: String(nowSec) },
+      env: { ...process.env, HOME: home, USERPROFILE: home, STATUSLINE_SCAN_ALARM: '30', STATUSLINE_NOW: String(nowSec), ...env },
     });
     if (r.error && r.error.code === 'ENOENT') return null;
     assert.equal(r.status, 0, `scan must run — ${(r.stderr || '').trim()}`);
@@ -14895,6 +19314,10 @@ test('statusline: the month segment follows the BILL CYCLE, clamped like card bi
   assert.equal(st1.mo_start, Date.UTC(2026, 8, 10) / 1000, 'the cycle began on the bill day (Sep 10)');
   assert.equal(st1.mo_end, Date.UTC(2026, 9, 10) / 1000, '…and ends on the next one (Oct 10)');
 
+  // A byte order mark an editor put first: the bill day still anchors the cycle (json.load refused it).
+  fs.writeFileSync(path.join(home, 'claude-observatory', 'prefs.json'), '\uFEFF' + JSON.stringify({ billDay: 10 }));
+  assert.equal(run(home, sep20, 'state-bom.json').mo_start, Date.UTC(2026, 8, 10) / 1000, 'prefs.json with a byte order mark keeps its bill day');
+
   fs.writeFileSync(path.join(home, 'claude-observatory', 'prefs.json'), JSON.stringify({ billDay: 31 }));
   const mar5 = Date.UTC(2026, 2, 5, 12) / 1000; // Mar 5, bill day 31: Feb has 28 days in 2026
   const st2 = run(home, mar5, 'state-clamp.json');
@@ -14908,6 +19331,13 @@ test('statusline: the month segment follows the BILL CYCLE, clamped like card bi
   const st3 = run(home, sep20, 'state-account.json');
   assert.equal(st3.mo_start, Date.UTC(2026, 8, 14) / 1000, 'the account cache anchors the cycle (created the 14th; at Sep 20 the cycle began Sep 14)');
   assert.equal(st3.mo_end, Date.UTC(2026, 9, 14) / 1000, '…ending Oct 14');
+  // With CLAUDE_CONFIG_DIR set, Claude Code keeps the file there, and the status line runs in Claude Code's environment.
+  const relocated = path.join(home, 'relocated');
+  fs.mkdirSync(relocated);
+  fs.renameSync(path.join(home, '.claude.json'), path.join(relocated, '.claude.json'));
+  const st5 = run(home, sep20, 'state-relocated.json', { CLAUDE_CONFIG_DIR: relocated });
+  assert.equal(st5.mo_start, Date.UTC(2026, 8, 14) / 1000, 'the .claude.json in CLAUDE_CONFIG_DIR anchors the cycle');
+  fs.renameSync(path.join(relocated, '.claude.json'), path.join(home, '.claude.json'));
   fs.unlinkSync(path.join(home, '.claude.json'));
   const st4 = run(home, sep20, 'state-calendar.json');
   assert.equal(st4.mo_start, Date.UTC(2026, 8, 1) / 1000, 'no source at all: the calendar month stands');
@@ -14931,12 +19361,17 @@ test('statusline: the month segment follows the BILL CYCLE, clamped like card bi
   assert.ok(stI.U7 >= 777, '…while the weekly window still holds it (the instrument works)');
 });
 
-test('statusline: a PAST cached reset rolls FORWARD — Claude Code 2.1.263 dropped resets_at (0.10.0)', (t) => {
-  // LIVE defect 2026-09-08: the Mac updated to Claude Code 2.1.263 on Sep 4 and its payloads kept
-  // the window percentages but stopped carrying rate_limits.*.resets_at; once the cached anchors
+// What CLAUDE_CONFIG_DIR held when the test below began, for the test after it.
+let rollForwardConfigDir;
+test('statusline: a PAST cached reset rolls FORWARD — Claude Code 2.1.263 dropped resets_at (0.10.0)', async (t) => {
+  rollForwardConfigDir = { value: process.env.CLAUDE_CONFIG_DIR };
+  // From Claude Code 2.1.263 the payloads kept
+  // the window percentages but stopped carrying rate_limits.*.resets_at (current versions send it
+  // again; this is the fallback for those that do not); once the cached anchors
   // lapsed, every surface lost the 5h/wk countdowns. The old anchor still fixes the cycle: roll
-  // it forward by whole periods (exact for the periodic weekly window; the client's own
-  // one-period estimate for 5h), at READ time only — the cache keeps the original anchor.
+  // it forward by whole periods (exact for the periodic weekly window; for 5h, an estimate made only
+  // for a share measured after the anchor, as these are), at READ time only — the cache keeps the
+  // original anchor.
   if (cp.spawnSync('python3', ['--version']).error || cp.spawnSync('jq', ['--version']).error) return t.skip('python3 or jq is not installed');
   const home = freshHome();
   const cdir = path.join(home, '.claude');
@@ -14962,7 +19397,9 @@ test('statusline: a PAST cached reset rolls FORWARD — Claude Code 2.1.263 drop
   const after = JSON.parse(fs.readFileSync(path.join(cdir, 'statusline-last.json'), 'utf8'));
   assert.equal(Number(after.five_reset), a5, 'the write path preserved the 5h anchor');
   assert.equal(Number(after.week_reset), a7, '…and the weekly anchor');
-  // core's usageLine applies the same roll, so the editors' wire carries times again too.
+  // core's usageLine applies the same roll, so the editors' wire carries times again too. CLAUDE_CONFIG_DIR is this
+  // test's alone: left set, it pointed the tests after it at this home's cache, which says 5% for the 5-hour share.
+  t.after(() => { if (rollForwardConfigDir.value === undefined) delete process.env.CLAUDE_CONFIG_DIR; else process.env.CLAUDE_CONFIG_DIR = rollForwardConfigDir.value; });
   process.env.CLAUDE_CONFIG_DIR = cdir;
   const line = core.usageLine(home, 'no-such-session-for-roll');
   const nowMs = Date.now();
@@ -14988,6 +19425,9 @@ test('statusline: a PAST cached reset rolls FORWARD — Claude Code 2.1.263 drop
   }));
   fs.writeFileSync(path.join(cdir, '.credentials.json'), JSON.stringify({ claudeAiOauth: { accessToken: 'test-token-not-real', expiresAt: Date.now() + 3600_000 } }));
   const env2 = { ...env, STATUSLINE_USAGE_API_URL: 'file://' + path.join(home, 'usage-api.json'), STATUSLINE_USAGE_API_TTL: '0' };
+  // The shares the first render recorded (undated in its payload, so stamped then), two minutes back: older than the pull.
+  const first = JSON.parse(fs.readFileSync(path.join(cdir, 'statusline-last.json'), 'utf8'));
+  fs.writeFileSync(path.join(cdir, 'statusline-last.json'), JSON.stringify({ ...first, five_at: now - 120, week_at: now - 120 }));
   const r2 = cp.spawnSync('bash', [path.join(cdir, 'statusline.sh')], { input: payload, env: env2, encoding: 'utf8' });
   assert.equal(r2.status, 0, `statusline renders with the API mock — ${(r2.stderr || '').trim()}`);
   // eslint-disable-next-line no-control-regex
@@ -14999,7 +19439,7 @@ test('statusline: a PAST cached reset rolls FORWARD — Claude Code 2.1.263 drop
   const after2 = JSON.parse(fs.readFileSync(path.join(cdir, 'statusline-last.json'), 'utf8'));
   assert.equal(Number(after2.five_reset), apiFive, 'the API anchor was persisted as the new 5h anchor');
   assert.equal(Number(after2.fable_pct), 2, 'the fable share was cached');
-  assert.equal(Number(after2.week_pct), 29, 'the session\'s own share outranks the account\'s (1)');
+  assert.equal(Number(after2.week_pct), 1, 'the account\'s weekly share, read now, outranks the older one (29), larger or not');
   assert.ok(Math.abs(Number(after2.fable_at) - Date.now() / 1000) < 120, 'the fetched Fable share is stamped');
   assert.equal(String(after2.fable_label), 'Fable', '…with the model name the account reported');
   const line2 = core.usageLine(home, 'no-such-session-for-fable');
@@ -15022,6 +19462,35 @@ test('statusline: a PAST cached reset rolls FORWARD — Claude Code 2.1.263 drop
   assert.equal(r5.status, 0, (r5.stderr || '').trim());
   const after5 = JSON.parse(fs.readFileSync(path.join(cdir, 'statusline-last.json'), 'utf8'));
   assert.deepStrictEqual([Number(after5.week_at), Number(after5.five_at), Number(after5.fable_at)], [now - 8 * 86400, now - 6 * 3600, now - 8 * 86400], 'a carried share keeps when it was measured');
+  // That carried Fable share was measured before its current week began: last week's. The line drops it, as
+  // every other OAK view does (core usageLine), rather than print it beside this week's countdown.
+  // eslint-disable-next-line no-control-regex
+  const l5 = (r5.stdout.split('\n')[2] || '').replace(/\x1b\[[0-9;]*m/g, '');
+  assert.doesNotMatch(l5, /fable/, `no Fable segment for last week's share — got ${JSON.stringify(l5)}`);
+  assert.strictEqual(core.usageLine(home, 'no-such-session-for-fable').fablePct, null, 'the editors and the terminal app drop it too');
+  // Control: a carried share measured inside this week still shows, with no fetch due.
+  fs.writeFileSync(path.join(cdir, 'statusline-last.json'), JSON.stringify({ ...after5, fable_at: now - 3600 }));
+  const r5b = cp.spawnSync('bash', [path.join(cdir, 'statusline.sh')], { input: JSON.stringify(idlePayload), env: { ...env2, STATUSLINE_USAGE_API_TTL: '999999' }, encoding: 'utf8' });
+  assert.equal(r5b.status, 0, (r5b.stderr || '').trim());
+  // eslint-disable-next-line no-control-regex
+  assert.match((r5b.stdout.split('\n')[2] || '').replace(/\x1b\[[0-9;]*m/g, ''), /fable[^|]*\b2% ·\d/, 'this week\'s carried share shows');
+  // Nor does last week's share calibrate the Fable estimate. A python3 stand-in on PATH records the share the
+  // script hands the estimator (its seventh argument after `-`). POSIX only: the stand-in is a shell script.
+  await t.test('last week\'s share is not handed to the Fable calibration', { skip: process.platform === 'win32' && 'POSIX shell stand-in for python3' }, () => {
+    const shim = path.join(home, 'python-shim');
+    const shares = path.join(home, 'python-shares.log');
+    fs.mkdirSync(shim);
+    fs.writeFileSync(path.join(shim, 'python3'), `#!/bin/sh\nprintf '%s\\n' "$8" >> ${JSON.stringify(shares)}\n`, { mode: 0o755 });
+    const handed = (fableAt) => {
+      fs.writeFileSync(path.join(cdir, 'statusline-last.json'), JSON.stringify({ ...after5, fable_at: fableAt }));
+      const rs = cp.spawnSync('bash', [path.join(cdir, 'statusline.sh')], { input: JSON.stringify(idlePayload),
+        env: { ...env2, STATUSLINE_USAGE_API_TTL: '999999', PATH: shim + path.delimiter + env2.PATH }, encoding: 'utf8' });
+      assert.equal(rs.status, 0, (rs.stderr || '').trim());
+      return fs.readFileSync(shares, 'utf8').trim().split('\n').at(-1);
+    };
+    assert.equal(handed(now - 8 * 86400), '0', 'last week\'s carried share is not handed to the calibration');
+    assert.equal(handed(now - 3600), '2', 'control: this week\'s is');
+  });
   // An account with no per-model weekly cap answers without it: the cache is still written, with no Fable share.
   fs.writeFileSync(path.join(home, 'usage-api.json'), JSON.stringify({ five_hour: { utilization: 7, resets_at: apiFive }, seven_day: { utilization: 3, resets_at: apiWeek } }));
   const r6 = cp.spawnSync('bash', [path.join(cdir, 'statusline.sh')], { input: JSON.stringify(idlePayload), env: env2, encoding: 'utf8' });
@@ -15053,8 +19522,13 @@ test('statusline: a PAST cached reset rolls FORWARD — Claude Code 2.1.263 drop
 
 });
 
+test('statusline: the roll-forward test leaves CLAUDE_CONFIG_DIR as it found it', (t) => {
+  if (!rollForwardConfigDir) return t.skip('the roll-forward test did not run');
+  assert.equal(process.env.CLAUDE_CONFIG_DIR, rollForwardConfigDir.value);
+});
+
 test('statusline: message ids recur across FILES — forks/resumes copy history, deduped once (0.10.0)', () => {
-  // MEASURED live 2026-09-03: per-file dedup ran one machine's week +45% and the other's +70% —
+  // Per-file dedup overcounted a machine's week by nearly half or more —
   // a forked or resumed session copies its history into a NEW transcript while the original stays
   // on disk, so the same message.id lives in several files. The dedup must span files, INCLUDING
   // cold ones served from the per-file cache (which therefore stores id maps, not pre-summed
@@ -15265,7 +19739,7 @@ test('install-extensions: installs a LOCAL artifact into a bare JetBrains IDE (0
   // zip/unzip on Windows (extractZip uses PowerShell's Expand-Archive), so demanding a `zip` binary
   // would make this test need MORE of the environment than the code it tests — and windows-latest does
   // not list one.
-  const stage = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-jbzip-'));
+  const stage = tmpDir('cc-jbzip-');
   const zip = path.join(stage, 'oak-observatory-jetbrains-v9.9.9.zip');
   writeStoredZip(zip, [
     ['oak-observatory-jetbrains/lib/oak-observatory-jetbrains-9.9.9.jar', Buffer.from('x')],
@@ -15332,8 +19806,8 @@ test('installers: every install path goes through the CLI, and offers both chann
 
 test('installers: install.ps1 parses as PowerShell', { skip: !hasPwsh() }, () => {
   // A syntax error in this file is invisible until a Windows user pipes it into iex and it half-runs.
-  // pwsh ships on ubuntu-latest and windows-latest runners, so CI checks it even though a mac dev
-  // machine usually cannot.
+  // pwsh ships on the windows-latest runner, so CI checks it even though a mac dev machine usually
+  // cannot.
   const ps1 = path.resolve(__dirname, '../../../install.ps1');
   const script =
     "$e = $null; [void][System.Management.Automation.Language.Parser]::ParseFile('" +
@@ -15546,16 +20020,17 @@ test('layout: the window bar leads the frame, in the order the reader was promis
   // three is something a reader navigates by.
   // SIX chips over six panes: Agent leads (who is working, and the door back to the conversation —
   // renamed from 'Claude' in 0.10.0, since a driven session may be any ACP agent), and Map and Diff
-  // are separate panes with a key each, stacked in the centre column.
+  // are separate panes with a key each, stacked in the centre column. F1 to F3 are OAK's tabs, so the
+  // four windows Review shows are F4 to F7, and the Agent strip and Dashboards, which it hides, F8 and F9.
   assert.deepEqual(
     lay.bar.map((c) => `F${c.key} ${c.title}`),
-    ['F1 Agent', 'F2 Prompts', 'F3 Traces', 'F4 Map', 'F5 Diff', 'F6 Dashboards'],
+    ['F8 Agent', 'F4 Prompts', 'F5 Traces', 'F6 Map', 'F7 Diff', 'F9 Dashboards'],
     'left to right: the agent, what was asked, what it changed, the map of it, the diff, then everything else'
   );
   assert.deepEqual(lay.bar.map((c) => c.pane), ['claude', 'prompts', 'traces', 'map', 'detail', 'dashboards'],
     'and the middle chips are TWO REAL panes — Map above Diff (0.10.0), never faces of one');
   const f = tui.renderDashFrame(paneFixture(), { cols: 140, rows: 36, color: false });
-  assert.match(f[0], /F1 .?Agent.*F2 .?Prompts.*F3 .?Traces.*F4 .?Map.*F5 .?Diff.*F6 .?Dashboards/, 'and row 0 draws it');
+  assert.match(f[0], /F8 .?Agent.*F4 .?Prompts.*F5 .?Traces.*F6 .?Map.*F7 .?Diff.*F9 .?Dashboards/, 'and row 0 draws it');
   assert.match(f[2], /fixture/, 'the session bar follows it — inside its navbar box (bar 0 · edge 1 · row 2 · edge 3)');
   // The digits belong to EDITS now, so no chip may advertise a bare one.
   assert.doesNotMatch(f[0], /(^|\s)[0-9]\s+.?(Prompts|Traces|Dashboards|Diff|Map)/, 'no chip claims a digit');
@@ -15786,7 +20261,7 @@ test('panes: a size that cannot hold a window says what it would take', () => {
   const status = f[f.length - 3];
   assert.match(status, /Diff needs 73 cols/, 'the status row names the cost, rather than the window just being gone');
   // And the window keeps its chip on the bar, so its jump key and counter never disappear.
-  assert.match(f[0], /F5 .?Diff/, 'the Diff pane keeps its chip when minimized');
+  assert.match(f[0], /F7 .?Diff/, 'the Diff pane keeps its chip when minimized');
 });
 
 test('panes: zoom announces itself, and names the edit it is showing', () => {
@@ -15873,8 +20348,8 @@ test('dashframe: a pending confirmation states the verb, the real count, and the
 });
 
 test('fscache: the shared text layer sees an append, and never serves a stale transcript', () => {
-  // The whole point of this layer is that ten derivations read one transcript once instead of 46
-  // times. That is only safe if a GROWING file — the live-session case, which is the case the
+  // The whole point of this layer is that ten derivations read one transcript once instead of dozens
+  // of times. That is only safe if a GROWING file — the live-session case, which is the case the
   // dashboard exists for — is never served from cache after it changes. The stamp is
   // (mtimeMs:size:ino), and size moves on append, so this must hold.
   const fs = require('fs');
@@ -15971,6 +20446,281 @@ test('comments: line comments on a pending edit batch into ONE prompt, delivered
   assert.equal(core.pendingCommentCount(S), 1, 'the comment store survives a cache sweep (authored, never reaped)');
 });
 
+test('comments: a comment the store cannot save fails loudly — core throws, `oak comment add` exits 1 — and is never reported as added (0.11.0)', () => {
+  // The write was "best effort": a failed one was swallowed while addComment returned the comment, so `oak comment add`
+  // printed its id and the comment was gone at the next read.
+  const home = freshHome();
+  delete process.env.CLAUDE_CONFIG_DIR;
+  const S = 'cmt-unsaved';
+  seedEdit(S, path.join(tmpWork(), 'a.ts'), 'a\n', 'b\n');
+  const unit = core.reviewEdits(S)[0].id;
+  // A folder takes the file's name, so the write fails as a full disk would fail it: where comments live now, and among
+  // the caches, where an earlier build wrote them.
+  const places = [core.storeDir(S), path.join(core.rootDir(), 'changemap-cache', S)];
+  for (const dir of places) fs.mkdirSync(path.join(dir, 'comments.json', 'taken'), { recursive: true });
+  assert.throws(() => core.addComment(S, { unit, text: 'lost' }), /could not be saved/, 'core says the comment was not saved');
+  const r = cp.spawnSync(process.execPath, [CLI, 'comment', 'add', '--session', S, '--edit', String(unit), '--text', 'lost too', '--json'],
+    { env: { ...process.env, HOME: home, USERPROFILE: home }, encoding: 'utf8' });
+  assert.equal(r.status, 1, `oak comment add fails: ${r.stdout}${r.stderr}`);
+  assert.match(r.stderr, /oak: .*could not be saved/, 'and says why');
+  assert.equal(r.stdout, '', 'with no comment printed as added');
+  for (const dir of places) fs.rmSync(path.join(dir, 'comments.json'), { recursive: true });
+  // Control: with the name free again, the comment is saved, and only it.
+  assert.ok(core.addComment(S, { unit, text: 'saved' }));
+  assert.deepEqual(core.listComments(S).map((c) => c.text), ['saved'], 'the failed writes saved nothing');
+});
+
+test('comments: a delivered prompt whose comments cannot be marked sent says it was sent — `oak prompt --comment-ids`, `oak comment send` (0.11.0)', { skip: process.platform === 'win32' && 'a POSIX socket stands in for herdr' }, async (t) => {
+  // The mark can fail now (the session's lock, a write that fails), after the prompt went out. Said as "could not be
+  // saved", JetBrains read the exit as an undelivered prompt and offered the draft to send again.
+  const home = freshHome();
+  delete process.env.CLAUDE_CONFIG_DIR;
+  const S = 'cmt-sent-unmarked';
+  seedEdit(S, path.join(tmpWork(), 'a.ts'), 'a\n', 'b\n');
+  const c = core.addComment(S, { unit: core.reviewEdits(S)[0].id, text: 'rename it' });
+  // Read where an earlier build kept them, a folder where they live now: the comments read, and the mark's write fails.
+  const own = path.join(core.storeDir(S), 'comments.json'), legacy = path.join(core.rootDir(), 'changemap-cache', S, 'comments.json');
+  fs.mkdirSync(path.dirname(legacy), { recursive: true });
+  fs.renameSync(own, legacy);
+  fs.mkdirSync(path.join(own, 'taken'), { recursive: true });
+  // A herdr that runs the session in a pane and takes its prompts.
+  const { version, protocol } = require('../dist/herdr-lock').HERDR_LOCK;
+  const sock = path.join(tmpDir('fake-herdr-'), 'h.sock');
+  const delivered = [];
+  const server = require('net').createServer((s) => {
+    let buf = '';
+    s.on('data', (d) => {
+      buf += d;
+      if (!buf.includes('\n')) return;
+      const req = JSON.parse(buf.slice(0, buf.indexOf('\n')));
+      if (req.method === 'agent.prompt') delivered.push(req.params.text);
+      const result = req.method === 'session.snapshot'
+        ? { type: 'session_snapshot', snapshot: { version, protocol, panes: [{ pane_id: 'p1', agent_session: { value: S }, agent_status: 'idle' }], agents: [{ name: 'a1', pane_id: 'p1' }] } }
+        : { type: 'ok' };
+      s.end(JSON.stringify({ id: req.id, result }) + '\n');
+    });
+  });
+  await new Promise((r) => server.listen(sock, r));
+  t.after(() => server.close());
+  const run = (args) => new Promise((resolve) => {
+    const p = cp.spawn(process.execPath, [CLI, ...args], { env: { ...process.env, HOME: home, USERPROFILE: home, HERDR_SOCKET_PATH: sock } });
+    let out = '', err = '';
+    p.stdout.on('data', (d) => (out += d));
+    p.stderr.on('data', (d) => (err += d));
+    p.on('close', (code) => resolve({ code, out, err }));
+  });
+  const prompt = await run(['prompt', '--session', S, '--text', 'fix it', '--comment-ids', c.id, '--json']);
+  assert.deepEqual(delivered, ['fix it'], `control: the prompt was delivered: ${prompt.err}`);
+  assert.equal(prompt.code, 1, 'the mark failed');
+  assert.equal(JSON.parse(prompt.out).sent, true);
+  assert.match(prompt.err, /^oak: sent to the agent, but its review comments were not marked sent, so the next send drafts them again: .*could not be saved/, 'and the reason says the prompt was sent');
+  const send = await run(['comment', 'send', '--session', S]);
+  assert.equal(delivered.length, 2, `control: sent again: ${send.err}`);
+  assert.equal(send.code, 1);
+  assert.match(send.out, /^Sent to the agent\./);
+  assert.match(send.err, /^oak: sent to the agent, but its review comments were not marked sent/, '`oak comment send` says the same');
+  // Control: with the folder gone, the mark lands, and nothing is drafted again.
+  fs.rmSync(own, { recursive: true });
+  const marked = await run(['comment', 'send', '--session', S, '--json']);
+  assert.equal(marked.code, 0, marked.err);
+  assert.ok(core.listComments(S).every((x) => x.sentAt), 'marked sent');
+});
+
+// Nothing sent is a draft kept, said by the exit status in every output mode (75), so an agent driving another agent can
+// tell; 0 only when it went out. A quote without --send is a draft by design, and exits 0 (0.11.0).
+test('prompts: nothing sent keeps a draft and exits 75, in every output mode; sent exits 0 — `oak prompt`, `oak comment send`, `oak quote --send`', { skip: process.platform === 'win32' && 'a POSIX socket stands in for herdr' }, async (t) => {
+  const home = freshHome();
+  delete process.env.CLAUDE_CONFIG_DIR;
+  const S = 'draft-exit';
+  seedEdit(S, path.join(tmpWork(), 'a.ts'), 'a\n', 'b\n');
+  core.addComment(S, { unit: core.reviewEdits(S)[0].id, text: 'rename it' });
+  const transcript = path.join(home, '.claude', 'projects', '-work', `${S}.jsonl`);
+  fs.mkdirSync(path.dirname(transcript), { recursive: true });
+  fs.writeFileSync(transcript, [
+    { type: 'user', cwd: '/work', sessionId: S, message: { role: 'user', content: 'rename it' } },
+    { type: 'assistant', cwd: '/work', sessionId: S, message: { id: 'm1', role: 'assistant', model: 'claude-opus-4-8', content: [{ type: 'text', text: 'Renamed it.' }], usage: { input_tokens: 1, output_tokens: 1 } } },
+  ].map((r) => JSON.stringify(r)).join('\n') + '\n');
+  // A herdr whose pane runs the session, blocked on a dialog until the test says otherwise.
+  const { version, protocol } = require('../dist/herdr-lock').HERDR_LOCK;
+  const sock = path.join(tmpDir('fake-herdr-'), 'h.sock');
+  const delivered = [];
+  let pane = 'blocked';
+  const server = require('net').createServer((s) => {
+    let buf = '';
+    s.on('data', (d) => {
+      buf += d;
+      if (!buf.includes('\n')) return;
+      const req = JSON.parse(buf.slice(0, buf.indexOf('\n')));
+      if (req.method === 'agent.prompt') delivered.push(req.params.text);
+      const result = req.method === 'session.snapshot'
+        ? { type: 'session_snapshot', snapshot: { version, protocol, panes: [{ pane_id: 'p1', agent_session: { value: S }, agent_status: pane }], agents: [{ name: 'a1', pane_id: 'p1' }] } }
+        : { type: 'ok' };
+      s.end(JSON.stringify({ id: req.id, result }) + '\n');
+    });
+  });
+  await new Promise((r) => server.listen(sock, r));
+  t.after(() => server.close());
+  // The clipboard a kept draft goes to: stubs that record what they were given, first on PATH, so a run never reaches
+  // the person's own clipboard.
+  const clipBin = tmpDir('clip-');
+  const clipLog = path.join(clipBin, 'clip.log');
+  for (const name of ['wl-copy', 'xclip', 'xsel', 'pbcopy']) fs.writeFileSync(path.join(clipBin, name), `#!/bin/sh\ncat >> '${clipLog}'\nprintf '\\n--\\n' >> '${clipLog}'\n`, { mode: 0o755 });
+  const run = (args) => new Promise((resolve) => {
+    const p = cp.spawn(process.execPath, [CLI, ...args], { env: { ...process.env, HOME: home, USERPROFILE: home, HERDR_SOCKET_PATH: sock, PATH: `${clipBin}${path.delimiter}${process.env.PATH}` } });
+    let out = '', err = '';
+    p.stdout.on('data', (d) => (out += d));
+    p.stderr.on('data', (d) => (err += d));
+    p.on('close', (code) => resolve({ code, out, err }));
+  });
+  for (const args of [['prompt', '--session', S, '--text', 'fix it'], ['comment', 'send', '--session', S], ['quote', '--session', S, '--send']]) {
+    for (const json of [false, true]) {
+      const r = await run(json ? [...args, '--json'] : args);
+      assert.equal(r.code, 75, `${args.join(' ')}${json ? ' --json' : ''}: ${r.out}${r.err}`);
+      if (json) assert.equal(JSON.parse(r.out).sent, false);
+      else assert.match(r.err, /^Draft retained: The agent is blocked/);
+    }
+  }
+  assert.deepEqual(delivered, [], 'control: nothing was sent');
+  assert.equal(fs.readFileSync(clipLog, 'utf8').split('\n--\n').filter((x) => x === 'fix it').length, 2, 'each kept draft of the prompt went to the clipboard');
+  assert.equal((await run(['quote', '--session', S, '--json'])).code, 0, 'a quote not asked to send is a draft, and no failure');
+  pane = 'idle';
+  const sent = await run(['prompt', '--session', S, '--text', 'fix it', '--json']);
+  assert.equal(sent.code, 0, sent.err);
+  assert.deepEqual(delivered, ['fix it']);
+});
+
+/**
+ * Two writers of one file at once, the first held after it read the file and before its write lands (its rename onto
+ * a file named `name`), the second started meanwhile: resolves with both runs. Without a lock, the second reads, writes
+ * and exits while the first is held, and the first's write then drops what the second added. With one, the second
+ * waits for the first, which is let go once the second has exited or 2.5 s have passed.
+ */
+async function raceHeldWriter(name, first, second) {
+  const box = tmpDir('held-writer-');
+  const hold = path.join(box, 'hold.cjs');
+  fs.writeFileSync(hold, `const fs = require('fs'), path = require('path'), rename = fs.renameSync;
+fs.renameSync = function (a, b, ...r) {
+  if (path.basename(String(b)) === ${JSON.stringify(name)}) {
+    fs.writeFileSync(process.env.HELD, '');
+    for (const end = Date.now() + 15000; !fs.existsSync(process.env.GO) && Date.now() < end;) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+  }
+  return rename.call(this, a, b, ...r);
+};\n`);
+  const env = { ...process.env, HELD: path.join(box, 'held'), GO: path.join(box, 'go') };
+  const run = (args, held) => new Promise((resolve) => {
+    const c = cp.spawn(process.execPath, [...(held ? ['--require', hold] : []), ...args], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = '';
+    c.stdout.on('data', (d) => (out += d));
+    c.stderr.on('data', (d) => (out += d));
+    c.on('close', (code) => resolve({ code, out }));
+  });
+  const a = run(first, true);
+  for (const end = Date.now() + 15000; !fs.existsSync(env.HELD) && Date.now() < end;) await new Promise((r) => setTimeout(r, 10));
+  assert.ok(fs.existsSync(env.HELD), `control: the first writer has read ${name} and holds its write`);
+  const b = run(second, false);
+  await Promise.race([b, new Promise((r) => setTimeout(r, 2500))]);
+  fs.writeFileSync(env.GO, '');
+  return Promise.all([a, b]);
+}
+
+test('comments: two writers at once keep both comments — each change is made under the session\'s lock (0.11.0)', async () => {
+  freshHome();
+  delete process.env.CLAUDE_CONFIG_DIR;
+  const S = 'cmt-race';
+  seedEdit(S, path.join(tmpWork(), 'a.ts'), 'a\n', 'b\n');
+  const unit = String(core.reviewEdits(S)[0].id);
+  const add = (text) => [CLI, 'comment', 'add', '--session', S, '--edit', unit, '--text', text];
+  const runs = await raceHeldWriter('comments.json', add('first'), add('second'));
+  for (const r of runs) assert.equal(r.code, 0, r.out);
+  assert.deepEqual(core.listComments(S).map((c) => c.text).sort(), ['first', 'second'], 'neither write drops the other\'s comment');
+  // A removal and a mark-sent take the same lock: one held while the other runs keeps both changes.
+  const [kept, gone] = core.listComments(S).map((c) => c.id);
+  const [x, y] = await raceHeldWriter('comments.json', [CLI, 'comment', 'rm', '--session', S, '--id', gone], [CLI, 'comment', 'mark-sent', '--session', S, '--ids', kept]);
+  assert.equal(x.code, 0, x.out);
+  assert.equal(y.code, 0, y.out);
+  assert.deepEqual(core.listComments(S).map((c) => [c.id, !!c.sentAt]), [[kept, true]], 'the removal and the mark both stand');
+});
+
+test('comments: they live in the session\'s own folder, are read where an earlier build leaves them until a change carries them over, and go with the session (0.11.0)', () => {
+  // Authored, they were filed among the derived caches (changemap-cache), which nothing replicates or treats as the
+  // session's own data.
+  freshHome();
+  delete process.env.CLAUDE_CONFIG_DIR;
+  const S = 'cmt-where';
+  const F = path.join(tmpWork(), 'a.ts');
+  seedEdit(S, F, 'a\n', 'b\n');
+  const unit = core.reviewEdits(S)[0].id;
+  const own = path.join(core.storeDir(S), 'comments.json');
+  const legacy = path.join(core.rootDir(), 'changemap-cache', S, 'comments.json');
+  fs.mkdirSync(path.dirname(legacy), { recursive: true });
+  fs.writeFileSync(legacy, JSON.stringify({ version: 1, comments: [{ id: 'c-earlier', unit, pair: 'x', file: F, line: 0, text: 'from before', createdAt: 1 }] }));
+  assert.deepEqual(core.listComments(S).map((c) => c.text), ['from before'], 'the earlier location is read while the session has no file of its own');
+  assert.ok(!fs.existsSync(own), 'and reading writes nothing');
+  core.addComment(S, { unit, text: 'new' });
+  assert.deepEqual(JSON.parse(fs.readFileSync(own, 'utf8')).comments.map((c) => c.text), ['from before', 'new'], 'the next write lands in the session\'s folder, carrying the earlier one');
+  assert.ok(!fs.existsSync(legacy), 'and the earlier copy goes, so a comment removed or sent since never comes back');
+  // An older build still running beside this one (an editor not yet reloaded) writes there again, holding what it added
+  // since. Left unread once the session had its own file, those comments were never shown again: they are read beside
+  // the session's own (which wins for an id both hold), and the next change carries them over and removes that file.
+  let olderAt = Date.now() + 1000; // after 'new': listComments orders by file, line, then creation
+  const older = (id, text) => ({ id, unit, pair: 'x', file: F, line: 0, text, createdAt: olderAt++ });
+  const olderWrites = (...comments) => { // as the older build writes it: a temporary file renamed over the old one
+    fs.writeFileSync(`${legacy}.older.tmp`, JSON.stringify({ version: 1, comments }));
+    rename(`${legacy}.older.tmp`, legacy);
+  };
+  const rename = fs.renameSync;
+  olderWrites(older('c-older', 'from an older build'), older('c-earlier', 'a stale copy'));
+  assert.deepEqual(core.listComments(S).map((c) => c.text), ['from before', 'new', 'from an older build'], 'shown beside the session\'s own');
+  assert.equal(core.removeComment(S, 'no-such-comment'), false);
+  assert.ok(fs.existsSync(legacy), 'a change that writes nothing carries nothing, so removes nothing');
+  core.addComment(S, { unit, text: 'later' });
+  assert.deepEqual(JSON.parse(fs.readFileSync(own, 'utf8')).comments.map((c) => c.text), ['from before', 'new', 'from an older build', 'later'],
+    'carried into the session\'s own file by the next change');
+  assert.ok(!fs.existsSync(legacy), 'which removes the file it carried them from');
+  // One the older build writes while a change is being made (it takes no lock) is left there, for the next one to carry.
+  olderWrites(older('c-mid', 'older, before the change'));
+  fs.renameSync = function (a, b, ...rest) {
+    const out = rename.call(this, a, b, ...rest);
+    if (String(b) === own) { fs.renameSync = rename; olderWrites(older('c-mid', 'older, before the change'), older('c-during', 'older, during the change')); }
+    return out;
+  };
+  try {
+    core.removeComment(S, core.listComments(S).find((c) => c.text === 'later').id);
+  } finally {
+    fs.renameSync = rename;
+  }
+  assert.deepEqual(core.listComments(S).map((c) => c.text), ['from before', 'new', 'from an older build', 'older, before the change', 'older, during the change'],
+    'the removal stands, and what the older build wrote meanwhile is kept');
+  for (const id of ['c-older', 'c-mid', 'c-during']) assert.ok(core.removeComment(S, id));
+  assert.ok(!fs.existsSync(legacy), 'carried over, then removed, by the next change');
+  // A store move carries them, in the session's folder.
+  const dest = path.join(tmpDir('cmt-move-'), 'observatory');
+  assert.ok(core.moveStore(dest).moved);
+  assert.ok(fs.existsSync(path.join(dest, S, 'comments.json')), 'moved with the session');
+  assert.deepEqual(core.listComments(S).map((c) => c.text), ['from before', 'new']);
+  // Deleting the session deletes them, from both places.
+  core.removeSession(S);
+  assert.ok(!fs.existsSync(path.join(dest, S)) && !fs.existsSync(path.join(dest, 'changemap-cache', S)), 'a deleted session takes its comments with it');
+  assert.deepEqual(core.listComments(S), []);
+});
+
+test('store: hiding and restoring sessions at once keeps every change — the hidden list is changed under its lock, and stays a bare JSON array (0.11.0)', async () => {
+  // `oak sessions --delete` and an `oak sync` pull both rewrite hidden-sessions.json from what they read: unlocked, the
+  // one that wrote last dropped the other's change, so a deleted session came back or a restored one stayed hidden.
+  freshHome();
+  delete process.env.CLAUDE_CONFIG_DIR;
+  core.hideSession('hidden-before');
+  const file = path.join(core.rootDir(), 'hidden-sessions.json');
+  const coreDist = path.resolve(__dirname, '../dist/index.js');
+  const call = (verb, id) => ['-e', `require(${JSON.stringify(coreDist)}).${verb}(${JSON.stringify(id)})`];
+  const hidden = await raceHeldWriter('hidden-sessions.json', call('hideSession', 'one'), call('hideSession', 'two'));
+  for (const r of hidden) assert.equal(r.code, 0, r.out);
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')).sort(), ['hidden-before', 'one', 'two'], 'both hidden, and the file a bare array of ids');
+  const restored = await raceHeldWriter('hidden-sessions.json', call('hideSession', 'three'), call('unhideSession', 'hidden-before'));
+  for (const r of restored) assert.equal(r.code, 0, r.out);
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')).sort(), ['one', 'three', 'two'], 'the restore stands beside the hide made with it');
+});
+
 test('comments: quoteAgentOutput reads the latest transcript reply without consuming a draft', () => {
   freshHome();
   delete process.env.CLAUDE_CONFIG_DIR;
@@ -16011,10 +20761,40 @@ test('dash: every advertised key is bound, under the name the decoder really emi
     assert.deepEqual({ key: ev.key, ctrl: ev.ctrl }, { key: name, ctrl: true }, `${JSON.stringify(seq)} is ctrl+${name}`);
     assert.ok(tui.KEY_BINDINGS.has(name), `…and ${name} is bound`);
   }
-  // F-keys have several encodings in the wild, and every one has to reach the same binding.
-  for (const seq of ['\x1bOP', '\x1b[11~', '\x1b[1P', '\x1b[P']) {
-    assert.equal(tui.createDecoder().push(seq).find((e) => e.t === 'key').key, 'f1', `${JSON.stringify(seq)} is F1`);
+  // F-keys have several encodings in the wild, and every one has to reach the same binding: xterm's SS3, rxvt's CSI ~,
+  // xterm's and the kitty protocol's CSI with no or an empty modifier, and the Linux console's ESC [ [ (terminfo `linux`).
+  // The console's form left its letter behind as a key: F1 was
+  // `A`, keep-all on Review.
+  const fkeys = { f1: ['\x1bOP', '\x1b[11~', '\x1b[1P', '\x1b[P', '\x1b[1;1P', '\x1b[[A'], f2: ['\x1bOQ', '\x1b[12~', '\x1b[1Q', '\x1b[Q', '\x1b[[B'],
+    f3: ['\x1bOR', '\x1b[13~', '\x1b[13;1~', '\x1b[[C'], f4: ['\x1bOS', '\x1b[14~', '\x1b[[D'], f5: ['\x1b[15~', '\x1b[[E'] };
+  for (const [name, seqs] of Object.entries(fkeys)) for (const seq of seqs) {
+    assert.deepEqual(tui.createDecoder().push(seq).map((e) => e.t === 'key' ? e.key : e.t), [name], `${JSON.stringify(seq)} is ${name}, and nothing else`);
+    // Split at every point, it waits for the rest, then decodes the same.
+    for (let at = 1; at < seq.length; at++) {
+      const d = tui.createDecoder();
+      assert.deepEqual([...d.push(seq.slice(0, at)), ...d.push(seq.slice(at))].map((e) => e.t === 'key' ? e.key : e.t), [name], `${JSON.stringify(seq)} split at ${at}`);
+    }
   }
+  // With a modifier an F-key is another key, as xterm sends it (CSI 1;<mod>P), and an ESC [ [ the console never sends is
+  // read as it was: a reply, then its letter.
+  assert.deepEqual(tui.createDecoder().push('\x1b[1;2Q').map((e) => [e.key, e.shift, e.ctrl, e.alt]), [['f2', true, false, false]]);
+  assert.deepEqual(tui.createDecoder().push('\x1b[13;5~').map((e) => [e.key, e.shift, e.ctrl, e.alt]), [['f3', false, true, false]]);
+  assert.deepEqual(tui.createDecoder().push('\x1b[[F').map((e) => e.t === 'key' ? e.key : e.t), ['reply', 'F']);
+  // Every window key and tab key the frame names is bound, under the name the decoder emits for it.
+  for (const e of tui.BAR_ENTRIES) assert.ok(tui.KEY_BINDINGS.has(`f${e.key}`), `F${e.key} (${e.title}) is bound`);
+  for (const k of Object.keys(tui.TAB_KEYS)) assert.ok(tui.KEY_BINDINGS.has(k), `${k} (the ${tui.TAB_KEYS[k]} tab) is bound`);
+  // The herdr tab's framer keeps the console's F-key whole, so it reaches the decoder, and the program, as one key.
+  const framed = require('../../tui/dist/native-input').createNativeInput();
+  const parts = framed.push(Buffer.from('\x1b[[Bx\x1b[[C'));
+  assert.deepEqual(parts.map((p) => [p.bytes.toString('latin1'), p.events.map((e) => e.key)]), [['\x1b[[B', ['f2']], ['x', ['x']], ['\x1b[[C', ['f3']]]);
+  const torn = require('../../tui/dist/native-input').createNativeInput();
+  assert.deepEqual(torn.push(Buffer.from('\x1b[[')), [], 'a torn console F-key waits for its letter');
+  assert.deepEqual(torn.push(Buffer.from('A')).map((p) => [p.bytes.toString('latin1'), p.events.map((e) => e.key)]), [['\x1b[[A', ['f1']]]);
+  // Any other ESC [ [ is a reply in a part of its own, and the key after it is still one key: F2 a tab key, ctrl+b herdr's
+  // prefix (they went to the program when the reply rode on their part).
+  const other = require('../../tui/dist/native-input').createNativeInput();
+  assert.deepEqual(other.push(Buffer.from('\x1b[[\x1bOQ\x1b[[\x02')).map((p) => [p.bytes.toString('latin1'), p.events.map((e) => e.t === 'key' ? e.key : e.t)]),
+    [['\x1b[[', ['reply']], ['\x1bOQ', ['f2']], ['\x1b[[', ['reply']], ['\x02', ['b']]]);
 
   // And the other direction: every single-key token the frame ADVERTISES must be bound. This is the
   // assertion that would have caught `e $EDITOR` sitting in the key row with no handler.
@@ -16341,7 +21121,8 @@ test('richdiff: a line that begins with -- or ++ is CONTENT, not a file header',
 test('usage: codexUsageLive drops a window whose reset boundary has passed', () => {
   // The IDE status bars render "current" quota. A rollout written before a window rolled over
   // still records the old percentage — after `resets_at` the quota refilled, so showing it would
-  // claim spend that is back. The other window, still inside its boundary, must survive the same
+  // claim spend that is back. A 5-hour window whose reset has passed is over: 0, with no reset
+  // (2026-10-20). The other window, still inside its boundary, must survive the same
   // pass (the positive control: proof this is a filter, not a parser that lost both).
   const home = freshHome();
   const cx = path.join(home, 'codexhome');
@@ -16363,7 +21144,7 @@ test('usage: codexUsageLive drops a window whose reset boundary has passed', () 
     }) + '\n'
   );
   const live = core.codexUsageLive();
-  assert.equal(live.fivePct, null, 'the expired 5h window is dropped, not shown stale');
+  assert.equal(live.fivePct, 0, 'the expired 5h window is over, not shown stale');
   assert.equal(live.fiveReset, null);
   assert.equal(live.weekPct, 21, 'the still-live weekly window survives the same filter');
   assert.ok(live.weekReset > Date.now(), '…with its future reset kept');
@@ -16371,8 +21152,8 @@ test('usage: codexUsageLive drops a window whose reset boundary has passed', () 
   assert.equal(raw.fivePct, 55, 'the raw reader still reports the snapshot as written');
 
   // A JUST-OPENED session writes a rollout with no rate_limits yet — and it is the NEWEST file.
-  // One `codex` launch must not blank the readout (measured live 2026-09-09: a 1-line stub hid
-  // the gpt tab and status chunks on the Mac): the reader walks back to the newest rollout that
+  // One `codex` launch must not blank the readout (a one-line stub hid the gpt tab and the
+  // status chunks): the reader walks back to the newest rollout that
   // actually carries windows.
   const stub = path.join(cx, 'sessions', '2026', '09', '02');
   fs.mkdirSync(stub, { recursive: true });
@@ -16384,12 +21165,219 @@ test('usage: codexUsageLive drops a window whose reset boundary has passed', () 
   delete process.env.CODEX_HOME;
 });
 
+test('usage: GPT\'s 5-hour window reads 0% with no reset once its reset has passed, and a plan without one shows none (2026-10-20)', () => {
+  // Claude's 5-hour window reads 0% with no countdown once its reset has passed with no newer window reported. GPT's
+  // was dropped instead, so its slot left the terminal app's bar, both editors and `oak usage --json`. A plan with no
+  // 5-hour window at all (Codex reports the weekly window alone) still has no 5-hour slot.
+  const home = freshHome();
+  delete process.env.CLAUDE_CONFIG_DIR;
+  const sec = Math.floor(Date.now() / 1000);
+  const week = { used_percent: 22, window_minutes: 10080, resets_at: sec + 3 * 86400 };
+  // Each case is a Codex home of its own holding one session's rollout, whose last reading carries `rl`.
+  const codexWith = (id, rl) => {
+    const day = path.join(home, `codex-${id}`, 'sessions', '2026', '10', '20');
+    fs.mkdirSync(day, { recursive: true });
+    process.env.CODEX_HOME = path.join(home, `codex-${id}`);
+    fs.writeFileSync(path.join(day, `rollout-2026-10-20T00-00-00-${id}.jsonl`), [
+      { type: 'session_meta', payload: { id, cwd: home, model_provider: 'openai' } },
+      { type: 'turn_context', payload: { model: 'gpt-5.2' } },
+      { timestamp: new Date((sec - 7200) * 1000).toISOString(), type: 'event_msg', payload: { type: 'token_count',
+        info: { total_token_usage: { input_tokens: 5000, output_tokens: 100 } }, rate_limits: rl } },
+    ].map((r) => JSON.stringify(r)).join('\n') + '\n');
+  };
+  // Every GPT readout's 5-hour window, as [share, reset]: the panel the status bars read, the one a named session's
+  // Stats panels read, the terminal app's bar, the session's own usage line and the rollout's live reading.
+  const fives = (id) => {
+    const g = core.gptUsagePanel(), s = core.gptUsagePanel(id), b = core.usageBrief(home).gpt.five, u = core.usageLine(home, id), l = core.codexUsageLive();
+    return [[g.fivePct, g.fiveReset], [s.fivePct, s.fiveReset], [b.pct, b.resetMs], [u.fiveHourPct, u.fiveReset], [l.fivePct, l.fiveReset]];
+  };
+  const bar = () => tui.statuslineFor({ now: Date.now(), usageBoth: core.usageBrief(home) }, 160, {}, 'none', 1)[0].trimEnd();
+  // The terminal app's port of the status line, drawn for the session.
+  const port = (id) => tui.statuslineGauges(tui.statuslineDataFor({ now: Date.now(), usage: core.usageLine(home, id), views: {}, session: '' }), 'none', false);
+  try {
+    codexWith('gpt-ended', { primary: { used_percent: 40, window_minutes: 300, resets_at: sec - 600 }, secondary: week });
+    assert.deepStrictEqual(fives('gpt-ended'), Array(5).fill([0, null]), 'every readout: 0, with no reset');
+    assert.equal(core.gptUsagePanel().weekPct, 22, 'the week beside it keeps its share');
+    assert.match(bar(), /^⬡ gpt wk: 22% \d+d \d+h/, 'the bar shows no 5h window');
+    assert.match(port('gpt-ended'), /^5h \[ +\] 0% ~0 {2}wk /, `the port: 0% with no countdown — got ${JSON.stringify(port('gpt-ended'))}`);
+    // Control: a running window keeps its share and its countdown.
+    codexWith('gpt-running', { primary: { used_percent: 40, window_minutes: 300, resets_at: sec + 3600 }, secondary: week });
+    assert.deepStrictEqual(fives('gpt-running'), Array(5).fill([40, (sec + 3600) * 1000]));
+    assert.match(bar(), /^⬡ gpt wk: 22% /);
+    assert.match(port('gpt-running'), /^5h \[[^\]]+\] 40% ·(59|60)m {2}wk /, `the port — got ${JSON.stringify(port('gpt-running'))}`);
+    // A plan with no 5-hour window: no share, and no slot.
+    codexWith('gpt-none', { secondary: week });
+    assert.deepStrictEqual(fives('gpt-none'), Array(5).fill([null, null]), 'no 5-hour window, no share');
+    assert.match(bar(), /^⬡ gpt wk: 22% /, 'nor here');
+  } finally {
+    delete process.env.CODEX_HOME;
+  }
+  // The account's own answer (Codex's account/rateLimits/read), which outranks the rollouts: a 5-hour window whose reset
+  // has passed is over, not absent, where a weekly one whose reset has passed is still left out.
+  const acct = crypto.createHash('sha256').update('fixture-account').digest('hex').slice(0, 16);
+  const answer = (primary, secondary) => core.parseCodexAccountQuota({ accountId: 'fixture-account', rateLimits: { primary, secondary } }, acct);
+  const w7 = { usedPercent: 22, windowDurationMins: 10080, resetsAt: sec + 3 * 86400 };
+  const ended = answer({ usedPercent: 40, windowDurationMins: 300, resetsAt: sec - 600 }, w7);
+  assert.deepStrictEqual([ended.fivePct, ended.fiveReset, ended.weekPct], [0, null, 22], 'an ended 5-hour window: 0, with no reset');
+  const running = answer({ usedPercent: 40, windowDurationMins: 300, resetsAt: sec + 3600 }, w7);
+  assert.deepStrictEqual([running.fivePct, running.fiveReset], [40, (sec + 3600) * 1000], 'control: a running one as it came');
+  const none = answer(null, w7);
+  assert.deepStrictEqual([none.fivePct, none.fiveReset, none.weekPct], [null, null, 22], 'no 5-hour window: none');
+  const weekEnded = answer({ usedPercent: 40, windowDurationMins: 300, resetsAt: sec + 3600 }, { ...w7, resetsAt: sec - 60 });
+  assert.deepStrictEqual([weekEnded.weekPct, weekEnded.weekReset], [null, null], 'a weekly window whose reset has passed is still left out');
+  assert.deepStrictEqual([weekEnded.fivePct, weekEnded.fiveReset], [40, (sec + 3600) * 1000], 'and the running 5-hour window beside it keeps its share');
+});
+
+test('usage: an ended GPT 5-hour window defers to a newer reading of the next window, from any session on this machine', () => {
+  // The rollout read is a named session's (both Stats panels), or the one written last (every status bar). Its 5-hour
+  // window can have ended while another session has read the quota since, in the next window: that reading stands,
+  // where 0% claimed the window had nothing in it. With no newer reading, the ended window is over: 0, no reset.
+  const home = freshHome();
+  delete process.env.CLAUDE_CONFIG_DIR;
+  const sec = Math.floor(Date.now() / 1000);
+  process.env.CODEX_HOME = path.join(home, 'codex-newer');
+  const day = path.join(process.env.CODEX_HOME, 'sessions', '2026', '10', '20');
+  fs.mkdirSync(day, { recursive: true });
+  const week = (p) => ({ used_percent: p, window_minutes: 10080, resets_at: sec + 3 * 86400 });
+  const file = (id) => path.join(day, `rollout-2026-10-20T00-00-00-${id}.jsonl`);
+  const write = (id, readAt, rl, mtime, extra = []) => {
+    const at = (s) => new Date(s * 1000).toISOString();
+    fs.writeFileSync(file(id), [
+      { timestamp: at(readAt), type: 'session_meta', payload: { id, cwd: home, model_provider: 'openai' } },
+      { timestamp: at(readAt), type: 'turn_context', payload: { model: 'gpt-5.2' } },
+      { timestamp: at(readAt), type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 5000, output_tokens: 100 } }, rate_limits: rl } },
+      ...extra,
+    ].map((r) => JSON.stringify(r)).join('\n') + '\n');
+    fs.utimesSync(file(id), mtime, mtime);
+  };
+  const A = '00000000-0000-4000-8000-0000000000a1', B = '00000000-0000-4000-8000-0000000000b1';
+  const endedA = { primary: { used_percent: 40, window_minutes: 300, resets_at: sec - 19 * 3600 }, secondary: week(22) };
+  const five = (g) => [g.fivePct, g.fiveReset];
+  try {
+    write(A, sec - 86400, endedA, sec - 86400);
+    write(B, sec - 600, { primary: { used_percent: 25, window_minutes: 300, resets_at: sec + 3 * 3600 }, secondary: week(30) }, sec - 600);
+    assert.deepStrictEqual(five(core.gptUsagePanel(A)), [25, (sec + 3 * 3600) * 1000], 'a named session whose own window ended');
+    assert.deepStrictEqual([core.usageLine(home, A).fiveHourPct, core.usageLine(home, A).fiveReset], [25, (sec + 3 * 3600) * 1000], 'and its usage line');
+    // A is written to a minute ago, with no reading yet (a turn that has not replied): the rollout written last.
+    write(A, sec - 86400, endedA, sec - 60, [{ timestamp: new Date((sec - 60) * 1000).toISOString(), type: 'event_msg', payload: { type: 'user_message', message: 'go on' } }]);
+    assert.deepStrictEqual(five(core.gptUsagePanel()), [25, (sec + 3 * 3600) * 1000], 'the rollout written last');
+    // Control: no newer reading, so the ended window is over.
+    fs.rmSync(file(B));
+    assert.deepStrictEqual(five(core.gptUsagePanel(A)), [0, null], 'control: no newer reading');
+    assert.deepStrictEqual(five(core.gptUsagePanel()), [0, null]);
+  } finally {
+    delete process.env.CODEX_HOME;
+  }
+});
+
+test('usage: a Codex window that gives its reset in seconds resets that long after the reading, not after now (2026-10-21)', () => {
+  // Older Codex writes `resets_in_seconds`, the seconds a window has left, in place of `resets_at`. It was read as no
+  // reset at all, so the share stood forever: 40% two hours after a reset that was ten minutes away when the reading
+  // was taken. The seconds count from the reading's own timestamp; `resets_at` still wins when both are there.
+  const home = freshHome();
+  delete process.env.CLAUDE_CONFIG_DIR;
+  const sec = Math.floor(Date.now() / 1000);
+  const id = '00000000-0000-4000-8000-0000000000c1';
+  process.env.CODEX_HOME = path.join(home, 'codex-relative');
+  const day = path.join(process.env.CODEX_HOME, 'sessions', '2026', '10', '21');
+  const file = path.join(day, `rollout-2026-10-21T00-00-00-${id}.jsonl`);
+  fs.mkdirSync(day, { recursive: true });
+  // One session, whose last reading was taken at `readAt` (epoch seconds; null: a line with no timestamp).
+  const write = (readAt, primary, secondary) => fs.writeFileSync(file, [
+    { type: 'session_meta', payload: { id, cwd: home, model_provider: 'openai' } },
+    { type: 'turn_context', payload: { model: 'gpt-5.2' } },
+    { ...(readAt === null ? {} : { timestamp: new Date(readAt * 1000).toISOString() }), type: 'event_msg', payload: { type: 'token_count',
+      info: { total_token_usage: { input_tokens: 5000, output_tokens: 100 } }, rate_limits: { primary, secondary } } },
+  ].map((r) => JSON.stringify(r)).join('\n') + '\n');
+  const five = (reset) => ({ used_percent: 40, window_minutes: 300, ...reset });
+  const week = (reset) => ({ used_percent: 22, window_minutes: 10080, ...reset });
+  // Every GPT readout as [5h share, 5h reset, week share, week reset]: the panel the status bars and `oak usage --json`
+  // read, the one a named session's Stats panels read, the terminal app's bar, the session's usage line and the
+  // rollout's live reading.
+  const readouts = () => {
+    const g = core.gptUsagePanel(), s = core.gptUsagePanel(id), b = core.usageBrief(home).gpt, u = core.usageLine(home, id), l = core.codexUsageLive();
+    return [[g.fivePct, g.fiveReset, g.weekPct, g.weekReset], [s.fivePct, s.fiveReset, s.weekPct, s.weekReset],
+      [b.five.pct, b.five.resetMs, b.week.pct, b.week.resetMs], [u.fiveHourPct, u.fiveReset, u.weekPct, u.weekReset],
+      [l.fivePct, l.fiveReset, l.weekPct, l.weekReset]];
+  };
+  const bar = () => tui.statuslineFor({ now: Date.now(), usageBoth: core.usageBrief(home) }, 160, {}, 'none', 1)[0].trimEnd();
+  const port = () => tui.statuslineGauges(tui.statuslineDataFor({ now: Date.now(), usage: core.usageLine(home, id), views: {}, session: '' }), 'none', false);
+  try {
+    // Read two hours ago, ten minutes before both resets: the 5-hour window is over, and the weekly one is left out.
+    write(sec - 7200, five({ resets_in_seconds: 600 }), week({ resets_in_seconds: 600 }));
+    assert.deepStrictEqual(readouts(), Array(5).fill([0, null, null, null]), 'every readout: 0 with no reset, and no week');
+    assert.match(bar(), /^⬡ gpt mo: /, `the bar: no 5h window, and no week — got ${JSON.stringify(bar())}`);
+    assert.doesNotMatch(bar(), /5h:|wk:/, `the bar: no 5h window, and no week — got ${JSON.stringify(bar())}`);
+    assert.match(port(), /^5h \[ +\] 0% ~0 {2}wk — /, `the port — got ${JSON.stringify(port())}`);
+    // Read a minute ago, four hours before the 5-hour reset: its share, with a countdown from the reading.
+    write(sec - 60, five({ resets_in_seconds: 4 * 3600 }), week({ resets_in_seconds: 3 * 86400 }));
+    assert.deepStrictEqual(readouts(), Array(5).fill([40, (sec - 60 + 4 * 3600) * 1000, 22, (sec - 60 + 3 * 86400) * 1000]));
+    assert.match(bar(), /^⬡ gpt wk: 22% 2d 23h/, `the bar — got ${JSON.stringify(bar())}`);
+    assert.match(port(), /^5h \[[^\]]+\] 40% ·3h (58|59)m {2}wk \[[^\]]+\] 22% ·2d 23h/, `the port — got ${JSON.stringify(port())}`);
+    // Both fields: `resets_at` wins, whichever of the two has passed.
+    write(sec - 7200, five({ resets_at: sec + 3600, resets_in_seconds: 600 }), week({ resets_at: sec + 3 * 86400, resets_in_seconds: 600 }));
+    assert.deepStrictEqual(readouts(), Array(5).fill([40, (sec + 3600) * 1000, 22, (sec + 3 * 86400) * 1000]), '`resets_at` still to come');
+    write(sec - 60, five({ resets_at: sec - 30, resets_in_seconds: 4 * 3600 }), week({ resets_at: sec - 30, resets_in_seconds: 3 * 86400 }));
+    assert.deepStrictEqual(readouts(), Array(5).fill([0, null, null, null]), '`resets_at` passed');
+    // Control: a window that gives neither keeps its share with no reset, since nothing says it has ended.
+    write(sec - 7200, five({}), week({}));
+    assert.deepStrictEqual(readouts(), Array(5).fill([40, null, 22, null]), 'no reset given, none made up');
+    // A later line moves nothing: the seconds count from the reading's own line, here two hours before a prompt.
+    write(sec - 7200, five({ resets_in_seconds: 600 }), week({ resets_in_seconds: 600 }));
+    fs.appendFileSync(file, JSON.stringify({ timestamp: new Date(sec * 1000).toISOString(), type: 'event_msg', payload: { type: 'user_message', message: 'next' } }) + '\n');
+    assert.deepStrictEqual(readouts(), Array(5).fill([0, null, null, null]), 'a later line leaves an ended window ended');
+    // A reading with no timestamp has nothing to count from, as one that gives neither: kept, with no reset, however
+    // long ago its rollout was last written.
+    write(null, five({ resets_in_seconds: 600 }), week({ resets_in_seconds: 600 }));
+    fs.utimesSync(file, sec - 7200, sec - 7200);
+    assert.deepStrictEqual(readouts(), Array(5).fill([40, null, 22, null]), 'no timestamp, no reset made up');
+  } finally {
+    delete process.env.CODEX_HOME;
+  }
+});
+
+test('usage: a Codex weekly reset given in seconds starts the GPT week, and the month estimated from it, where `resets_at` does (2026-10-21)', () => {
+  // The week's tokens count from the start of the week its reset ends, not over the last seven days, and the month's
+  // budget is estimated from them: a turn five days ago, before a week that resets in three days began, is last week's.
+  const home = freshHome();
+  delete process.env.CLAUDE_CONFIG_DIR;
+  const sec = Math.floor(Date.now() / 1000), readAt = sec - 60;
+  const id = '00000000-0000-4000-8000-0000000000c2';
+  process.env.CODEX_HOME = path.join(home, 'codex-week');
+  const day = path.join(process.env.CODEX_HOME, 'sessions', '2026', '10', '21');
+  const file = path.join(day, `rollout-2026-10-21T00-00-00-${id}.jsonl`);
+  fs.mkdirSync(day, { recursive: true });
+  const iso = (s) => new Date(s * 1000).toISOString();
+  const count = (at, total, rateLimits) => ({ timestamp: iso(at), type: 'event_msg', payload: { type: 'token_count',
+    info: { total_token_usage: { input_tokens: total, output_tokens: 0 } }, ...(rateLimits ? { rate_limits: rateLimits } : {}) } });
+  const write = (reset) => fs.writeFileSync(file, [
+    { timestamp: iso(sec - 7 * 86400), type: 'session_meta', payload: { id, cwd: home, model_provider: 'openai' } },
+    { timestamp: iso(sec - 7 * 86400), type: 'turn_context', payload: { model: 'gpt-5.2' } },
+    count(sec - 6.5 * 86400, 500_000), count(sec - 5 * 86400, 1_000_000), count(sec - 86400, 1_100_000),
+    count(readAt, 1_150_000, { secondary: { used_percent: 22, window_minutes: 10080, ...reset } }),
+  ].map((r) => JSON.stringify(r)).join('\n') + '\n');
+  const week = () => { const g = core.gptUsagePanel(); return [g.weekReset, g.weekTok, g.weekTotal, g.monthTokTotal]; };
+  try {
+    write({ resets_in_seconds: 3 * 86400 });
+    const given = week();
+    assert.deepStrictEqual(given.slice(0, 2), [(readAt + 3 * 86400) * 1000, 150_000], 'the week since its start, a day and a minute ago');
+    write({ resets_at: readAt + 3 * 86400 });
+    assert.deepStrictEqual(week(), given, 'as when Codex reports the reset\'s time');
+    write({});
+    assert.ok(week()[1] > 150_000, `control: with no reset, the last seven days hold the turn five days ago — ${week()[1]}`);
+  } finally {
+    delete process.env.CODEX_HOME;
+  }
+});
+
 test('usage: codex reports its OWN quota and credit, and money shows where a bar cannot', () => {
   // codex has no installable status line — `tui.status_line` picks from a fixed list of built-in
   // items and runs no command of ours — so its accounts had no 5h/weekly windows at all, not
   // because codex withholds them but because nothing read them. It writes a `RateLimitSnapshot` on
   // every turn that reaches its backend, and the WINDOW DURATION travels beside each percentage.
   const home = freshHome();
+  // Claude's readings come from the fresh home, whatever CLAUDE_CONFIG_DIR an earlier test set.
+  delete process.env.CLAUDE_CONFIG_DIR;
   const cx = path.join(home, 'codexhome');
   fs.mkdirSync(path.join(cx, 'sessions', '2026', '08', '15'), { recursive: true });
   process.env.CODEX_HOME = cx;
@@ -16492,7 +21480,7 @@ test('usage: codex reports its OWN quota and credit, and money shows where a bar
     core.ensureStore(S3);
     const other = core.usageLine(ws2, S3);
     assert.equal(other.fiveHourPct, null, 'a session that is not codex keeps its empty windows');
-    assert.equal(other.usageFrom, undefined, '…and claims no provenance it does not have');
+    assert.equal(other.usageFrom, 'claude', '…and explicitly labels the provider of its empty windows');
     delete process.env.CODEX_HOME;
   }
 
@@ -16518,6 +21506,13 @@ test('usage: codex reports its OWN quota and credit, and money shows where a bar
   assert.doesNotMatch(ent, /5h/, 'no 5h slot at all on a plan with no rolling quota');
   assert.doesNotMatch(ent, /wk/, '…and no wk slot');
   assert.match(ent, /mo .*~\$41[23]/, 'the month segment carries the spend (after its token figure)');
+  // A per-model weekly cap the account does report is shown on such a plan too, as the shell's segment is.
+  const entFable = gauges({
+    ctx: null, fiveHourPct: null, weekPct: null, statuslineCache: true, statuslineVersion: 2, cachedAtMs: 999_000,
+    rollingLimits: false, monthCost: 412.5, monthTokens: 78_000_000, fablePct: 42, fableLabel: 'Fable',
+  });
+  assert.match(entFable, /fable .*42%/, 'the Fable cap is its own segment with no 5h/wk windows');
+  assert.doesNotMatch(entFable, /5h|wk/, '…still without the 5h and wk slots');
   // A SUBSCRIPTION row shows the RAW LEDGER's money never (it lands a long session's whole spend
   // in one window) — only the cache's snapshot-delta figures may ride beside a quota bar
   // (the old no-$ rule is reversed).
@@ -16795,15 +21790,16 @@ test('tui: a tree tab keeps its bottom auto-hidden strip when the status SPEAKS 
 
 test('tui: a tab label MEASURES and DRAWS one width (the click stays on the glyph)', () => {
   const g = tui.glyphs('block');
-  // herdr's strip: `<number> <name>`, no status dot, no agent suffix — the three fixed
-  // tabs are switchers, and agents live in herdr's own bar.
+  // herdr's strip: `<key> <name>`, no status dot, no agent suffix — the three fixed
+  // tabs are switchers, each on its key (F1 to F3), and agents live in herdr's own bar.
   const tabs = [
     { id: 'observatory', name: 'observatory' },
     { id: 'review', name: 'review', session: 's1', agent: 'codex', phase: 'working', active: true },
   ];
   const labels = tabs.map((t, i) => tui.tabLabel(t, i, g));
-  assert.match(labels[0], /^observatory$/, 'a view tab is its name alone — no number, no dot');
-  assert.match(labels[1], /^review$/, 'a session-bound tab reads the same way — no dot, no agent suffix');
+  assert.match(labels[0], /^F2 observatory$/, 'a view tab is its key and its name — no number, no dot');
+  assert.match(labels[1], /^F3 review$/, 'a session-bound tab reads the same way — no dot, no agent suffix');
+  assert.equal(tui.tabLabel({ id: 'shell', name: 'shell' }, 3, g), 'shell', 'a tab with no key of its own is its name alone');
   // tabSpansFor allots displayWidth(label)+2 per tab; tabStrip draws exactly that (both from tabParts),
   // so the click hit-test maps by the span it drew. Pin the invariant the dot + suffix could desync.
   const { spans } = tui.tabSpansFor(labels, 0, 100, 1);
@@ -17070,6 +22066,49 @@ test('panes: the cursor bands ONE subject — a header and its nested edit are t
   assert.equal(bandLines, 2, 'cursor on a wrapped map name bands BOTH of its lines — one subject');
 });
 
+test('panes, pickers: the cursor band covers its whole row, through the colour resets the row carries', () => {
+  // A row with colours of its own closes each with a reset, and the band (`\x1b[7m${row}\x1b[0m`) ended at the first: the
+  // session picker banded a session's time and none of its name at every theme and colour depth, and a Traces file row
+  // its fold arrow alone.
+  /** Each character of a frame line and whether reverse video is on for it, read through the line's SGR. */
+  const cells = (line) => {
+    const out = [];
+    let rev = false;
+    for (const part of line.split(/(\x1b\[[0-9;:]*m)/)) {
+      if (!part.startsWith('\x1b[')) { for (const ch of part) out.push([ch, rev]); continue; }
+      const params = part.slice(2, -1).split(';');
+      for (let i = 0; i < params.length; i++) {
+        const p = params[i].split(':')[0];
+        if (p === '38' || p === '48' || p === '58') { if (!params[i].includes(':')) i += params[i + 1] === '5' ? 2 : params[i + 1] === '2' ? 4 : 0; continue; }
+        if (p === '' || p === '0' || p === '27') rev = false;
+        else if (p === '7') rev = true;
+      }
+    }
+    return out;
+  };
+  const shown = (cs) => cs.map(([ch, rev]) => (rev ? ch : '·')).join('');
+  // The picker: a session with edits, its time dimmed and its counts tinted, each closed with a reset.
+  const row = ` * \x1b[2m16:17:54\x1b[0m  Fix the parser  this machine  \x1b[38;5;71m+2\x1b[0m \x1b[38;5;203m−2\x1b[0m      2 pending`;
+  for (const color of ['256', 'truecolor', '16']) {
+    const f = tui.renderDashFrame(dashFixture({ overlay: { title: 'sessions', lines: [row, '   16:00:00  Another session'], scroll: 0, cursor: 0 } }), { cols: 90, rows: 12, color });
+    const picked = cells(f.find((l) => tui.stripSgr(l).includes('Fix the parser')));
+    const text = tui.stripSgr(row);
+    assert.ok(picked.slice(0, text.length).every(([, rev]) => rev), `${color}: the selected row is banded whole — ${shown(picked.slice(0, text.length))}`);
+    assert.ok(cells(f.find((l) => tui.stripSgr(l).includes('Another session'))).every(([, rev]) => !rev), `${color}: the other row is not`);
+  }
+  // Traces: the cursor on a file row, whose fold arrow and status glyph carry colours of their own.
+  const edits = [{ id: 7, file: '/w/a.ts', rel: 'a.ts', status: 'pending', ts: 1000, added: 1, removed: 0 }];
+  const st = paneFixture({ views: { list: { edits } }, panes: { minimized: new Set(), zoom: null, focus: 'traces', tab: {}, cursor: { traces: 0 }, scroll: {} } });
+  const f = tui.renderDashFrame(st, { cols: 120, rows: 34, color: true });
+  const traces = tui.resolveLayout({ cols: 120, rows: 34, minimized: new Set(), zoom: null, focus: 'traces', tab: {} }).boxes.find((b) => b.id === 'traces');
+  const banded = f.slice(traces.body.y, traces.body.y + traces.body.h).filter((l) => l.includes('\x1b[7m'));
+  assert.ok(banded.some((l) => /a\.ts/.test(tui.stripSgr(l))), 'the cursor is on the file row');
+  for (const l of banded) {
+    const cs = cells(l).slice(traces.body.x + 1, traces.body.x + traces.body.w - 1); // inside the box's │ borders
+    assert.ok(cs.every(([, rev]) => rev), `every cell inside the pane is banded — ${shown(cs)}`);
+  }
+});
+
 test('tui: the clipboard plan, the seen-bit transition, and the archive hint — the re-review pins', () => {
   // clipboardPlan — the copy DECISION, mutation-proven uncovered before this (M3 survived).
   const MAX = tui.OSC52_MAX;
@@ -17130,36 +22169,30 @@ test('tui/statusline: the dashboard draws the SHIPPED statusline, byte for byte'
   // The TUI's statusline is identical to the main one, colours included.
   // These are GOLDEN BYTES, captured from the real generated script
   // (packages/cli/statusline/install-statusline.sh) run against the same inputs — including the
-  // details that only show up in a byte comparison: the bar is a PAINTED FIELD (usage colour as a
-  // background with black ink, grey with white ink past the fill) whose width is the figures it
-  // carries, ctx truncating while the windows round, and 6.3% filling ZERO cells.
+  // details that only show up in a byte comparison: the bar is a PAINTED FIELD (a very dim tint of
+  // the usage colour up to the share, an even dimmer neutral past it, one light ink over both) whose
+  // width is the figures it carries, ctx truncating while the windows round, and 6.3% filling ZERO
+  // cells. The shell-vs-port test below runs both on the same inputs.
   //
   // The 2026-09-15 layout: the session TITLE closes line 1, the CTX gauge opens line 2, and line 3
   // is the quota windows alone. All three are pinned here, because moving a segment between lines
   // is exactly the kind of change that leaves the two surfaces drawing different rows.
-  // The figures are GREY throughout; the usage colour lives on the RULE (SGR 58, a coloured
-  // underline) and on the two CAPS marking where the bar starts and ends — without the caps the
-  // field has no visible extent. The figures are LEFT-aligned: right-aligned put the rule under the
-  // blank padding, where at 37% it stopped before the first digit.
+  // The bar is a PROGRESS BAR holding its figures (2026-10-14): the first pct% of its cells on a very
+  // dim tint of the usage colour, the rest on an even dimmer neutral, one explicit light ink over
+  // both, with no underline and no caps. The figures are centred.
   const t = 1_000_000_000_000;
   const gauges = (d, withCtx, w) => tui.statuslineGauges({ now: t, ...d }, 'truecolor', false, !!withCtx, w || 0);
   const session = (d, w) => tui.statuslineSession({ now: t, ...d }, 'truecolor', false, w || 0);
-  // One capped, ruled field: <colour>▏</><dim><ul><ulcolour>COLOURED</><dim><ul>REST</><colour>▕</>.
-  // The rule runs cap to cap; only its COLOUR stops at the share, which is what lets the figures sit
-  // centred. Spelled out once so the goldens below read as the row does, not as an escape soup.
-  // The rule is the usage colour up to the share and grey past it — and so are the figures it runs
-  // under. NO SGR 58: it is the only way to hold a grey digit over a coloured rule, and it does not
-  // reach a real screen here (the rule rendered grey twice, observed live), so an underline takes
-  // the cell's FOREGROUND. The grey is a 256-colour foreground, never DIM, which dims the rule too.
-  // The caps sit INSIDE the underlined run: ▏ and ▕ draw at the edge of their cell, so leaving
-  // them un-underlined left seven eighths of a cell of bare ground per end.
+  // One painted bar: <ink><tint>FILLED<neutral>REST</>, the tint by the usage colour's SGR digit.
+  // Spelled out once so the goldens below read as the row does, not as an escape soup.
+  const TINT = { 2: '30;64;40', 3: '60;52;24', 1: '74;36;36' };
   const F = (col, coloured, rest) =>
-    `\x1b[3${col}m\x1b[4m▏${coloured}\x1b[38;5;245m${rest}\x1b[3${col}m▕\x1b[0m`;
+    `\x1b[38;2;228;228;228m\x1b[48;2;${TINT[col]}m${coloured}\x1b[48;2;30;30;34m${rest}\x1b[0m`;
 
   // LINE 1 — the title rides at the end, after the path it names.
   assert.equal(
-    tui.statuslineIdentity({ now: t, clock: '09:41', date: 'Sep 15', branch: 'feat/acp', cwdLabel: '~/Github/oak', title: 'painted usage bars' }, 'truecolor'),
-    '09:41 \x1b[2m·\x1b[0m Sep 15 \x1b[2m|\x1b[0m feat/acp \x1b[2m|\x1b[0m ~/Github/oak \x1b[2m|\x1b[0m painted usage bars',
+    tui.statuslineIdentity({ now: t, clock: '09:41', date: 'Sep 15', branch: 'feat/parser', cwdLabel: '~/src/app', title: 'Tidy the fixture parser' }, 'truecolor'),
+    '09:41 \x1b[2m·\x1b[0m Sep 15 \x1b[2m|\x1b[0m feat/parser \x1b[2m|\x1b[0m ~/src/app \x1b[2m|\x1b[0m Tidy the fixture parser',
     'line 1 closes with the session title');
 
   // LINE 2 — the model and its attributes; the ctx window CLOSES the line as a compact used/total
@@ -17182,7 +22215,7 @@ test('tui/statusline: the dashboard draws the SHIPPED statusline, byte for byte'
     gauges({ fivePct: 52.7, weekPct: 86.2, fiveResetMs: t + (10 * 3600 + 25 * 60) * 1000, weekResetMs: t + (3 * 86400 + 10 * 3600) * 1000 }),
     '\x1b[33m5h\x1b[0m '+F('3','     ','     ')+' \x1b[33m53%\x1b[0m \x1b[2m·\x1b[0m\x1b[97m10h 25m\x1b[0m  ' +
       '\x1b[31mwk\x1b[0m '+F('1','         ',' ')+' \x1b[31m86%\x1b[0m \x1b[2m·\x1b[0m\x1b[97m3d 10h\x1b[0m',
-    'the windows ROUND, and an uncalibrated window rules its share across the 10-cell floor');
+    'the windows ROUND, and an uncalibrated window fills its share of the 10-cell floor');
   assert.equal(gauges({}), '\x1b[2m5h —\x1b[0m  \x1b[2mwk —\x1b[0m',
     'nothing measured — the script\'s own em-dash placeholders, never an empty bar posing as zero');
   assert.doesNotMatch(gauges({ ctxPct: 63.4, ctxUsed: 127000, ctxSize: 200000 }), /ctx/,
@@ -17218,35 +22251,31 @@ test('tui/statusline: the dashboard draws the SHIPPED statusline, byte for byte'
     const l2 = tui.statuslineSession({ now: t, ...wide }, 'truecolor', false, m.field, m.label);
     const l3 = tui.statuslineGauges({ now: t, ...wide }, 'truecolor', false, false, m.field, undefined, undefined, m.label);
     // eslint-disable-next-line no-control-regex
-    const fields = [...`${l2}\n${l3}`.matchAll(/\x1b\[3[123]m\x1b\[4m▏(.*?)\x1b\[38;5;245m(.*?)\x1b\[3[123]m▕\x1b\[0m/g)]
+    const fields = [...`${l2}\n${l3}`.matchAll(/\x1b\[38;2;228;228;228m\x1b\[48;2;(?:30;64;40|60;52;24|74;36;36)m(.*?)\x1b\[48;2;30;30;34m(.*?)\x1b\[0m/g)]
       .map((x) => [[...x[1]].length + [...x[2]].length, [...x[1]].length]);
     assert.equal(fields.length, 3, 'no painted bar on line 2 now (ctx is a text figure) — just 5h / wk / mo on line 3');
     assert.deepEqual([...new Set(fields.map((f) => f[0]))], [23],
       `every bar is one width — got ${fields.map((f) => f[0]).join(',')}`);
-    // The rule runs cap to cap; its COLOURED length is the share, counted from the left edge. Three
-    // windows now (5h / wk / mo) — the ctx gauge that used to lead this list left line 2 for a text
-    // figure, so its 37%-of-23 run is gone from the front.
+    // The tinted run is the share of the shared width, counted from the left edge. Three windows
+    // now (5h / wk / mo) — the ctx gauge that used to lead this list left line 2 for a text figure.
     assert.deepEqual(fields.map((f) => f[1]), [10, 16, 1],
-      'the coloured run tracks each share of the shared width');
-    // The caps are UNDERLINED with the rule, not left bare beside it — an un-underlined cap is the
-    // seven-eighths-of-a-cell gap that made the bar look broken at both ends.
+      'the tinted run tracks each share of the shared width');
+    // Painted, not ruled: no underline, no caps, and one ink over both grounds — nothing between
+    // the tint and the neutral changes the colour of a digit, and nothing dims it.
     // eslint-disable-next-line no-control-regex
-    assert.match(l3, /\x1b\[4m▏/, 'the opening cap is inside the underlined run');
+    assert.doesNotMatch(l3, /\x1b\[4m/, 'no underline — the share is a painted ground now');
+    assert.doesNotMatch(l3, /[▏▕]/, 'and no caps — the painted box shows its own extent');
     // eslint-disable-next-line no-control-regex
-    assert.match(l3, /▕\x1b\[0m/, '…and the closing cap is the last cell of it');
-    // The figures past the share are grey via a 256-colour foreground. DIM would drag the rule
-    // colour down with it — that is exactly how a correctly-coloured rule came out grey live.
+    assert.equal([...l3.matchAll(/\x1b\[38;2;228;228;228m\x1b\[48;2;/g)].length, 3, 'each bar opens with its light ink, set explicitly');
     // eslint-disable-next-line no-control-regex
-    assert.match(l3, /\x1b\[38;5;245m/, 'the figures past the share are a 256-colour grey');
-    // SGR 58 is NOT used: it never reached the screen, so the rule takes the cell foreground.
-    // eslint-disable-next-line no-control-regex
-    assert.doesNotMatch(l3, /\x1b\[58[;:]/, 'no SGR 58 — it renders nothing here and hid the colour');
+    assert.equal([...l3.matchAll(/\x1b\[38;2;228;228;228m\x1b\[48;2;[\d;]+m[^\x1b]*\x1b\[48;2;30;30;34m[^\x1b]*\x1b\[0m/g)].length, 3,
+      '…and keeps it to the end: no foreground change inside a bar');
     // eslint-disable-next-line no-control-regex
     assert.doesNotMatch(l3.split(/\x1b\[2m·/)[0], /\x1b\[2m/, 'and no DIM attribute inside a bar');
     // eslint-disable-next-line no-control-regex
-    assert.doesNotMatch(l2, /\x1b\[4m▏/, 'line 2 carries NO painted bar now — the ctx window is a plain used/total figure at its end');
+    assert.doesNotMatch(l2, /\x1b\[48;/, 'line 2 carries NO painted bar now — the ctx window is a plain used/total figure at its end');
     // eslint-disable-next-line no-control-regex
-    assert.doesNotMatch(l3, /\x1b\[2m\|/, 'no divider between the gauges — the caps already bound them');
+    assert.doesNotMatch(l3, /\x1b\[2m\|/, 'no divider between the gauges — each painted bar sets its segment apart');
     assert.deepEqual(tui.statuslineMetrics({ now: t, ctxPct: 37 }, 'truecolor'), { field: 10, label: 3 },
       'nothing calibrated yet: the floor, not a sliver');
   }
@@ -17269,10 +22298,18 @@ test('tui/statusline: the dashboard draws the SHIPPED statusline, byte for byte'
   // an accessibility choice outranks byte-fidelity.
   tui.setTheme('colorblind');
   const themed = tui.ctxSegment({ now: t, ctxPct: 86 }, 'truecolor', true);
+  const ground = (g) => `\x1b[48;2;${g.rgb}m`;
+  const cbBar = `\x1b[38;2;${tui.inks().text.rgb}m${ground(tui.surfaces().raised)}`;
+  const cbRest = ground(tui.surfaces().panel);
+  tui.setTheme('light');
+  const lightBar = tui.ctxSegment({ now: t, ctxPct: 86 }, '256', true);
+  const lightInk = `\x1b[38;5;${tui.inks().text.c256}m\x1b[48;5;${tui.surfaces().raised.c256}m`;
   tui.setTheme(undefined);
   assert.doesNotMatch(themed, /\x1b\[31m/, 'the colorblind palette replaces the raw red');
   assert.match(themed, /\x1b\[38;2;/, 'with its own truecolor hue');
-  assert.match(themed, /\x1b\[4m/, '…carrying the rule that marks the share');
+  assert.ok(themed.includes(cbBar) && themed.includes(cbRest), '…and paints its bar on the theme’s own grounds, under its text ink');
+  assert.doesNotMatch(themed, /48;2;74;36;36/, 'not on the default red tint, a hue the colorblind palette did not choose');
+  assert.ok(lightBar.includes(lightInk), 'the light theme paints a light bar under its dark ink, at 256 colours too');
 
   // The helpers are the script's, not core's near-misses.
   assert.equal(tui.human(1_190_000), '1.1M');
@@ -17284,7 +22321,3048 @@ test('tui/statusline: the dashboard draws the SHIPPED statusline, byte for byte'
   assert.equal(tui.untilStr(t, t), 'now');
 });
 
-test('tui/statusline: the bottom bar is BOTH providers, 5h/wk/mo, each a gauge or a token figure', () => {
+test('tui/statusline: the terminal app compacts a figure as the script does, billions included (2026-10-27)', () => {
+  // A month's cache reads summed across an account's machines pass a billion: the script printed `+6B↺` and the port
+  // `+6070M↺`. Each value runs through the script's own `human`.
+  const sh = fs.readFileSync(path.resolve(__dirname, '../../cli/statusline/install-statusline.sh'), 'utf8').split('\n');
+  const a = sh.findIndex((l) => l.startsWith('human() {'));
+  const b = sh.findIndex((l, i) => i > a && l.endsWith('fi; }'));
+  assert.ok(a > 0 && b > a, 'the script\'s human is where it was');
+  const values = [0, 999, 1000, 127_900, 999_999, 1_000_000, 1_190_000, 999_999_999, 1_000_000_000, 1_234_567_890, 6_070_000_000, 12_900_000_000];
+  const r = cp.spawnSync('bash', [], { input: `${sh.slice(a, b + 1).join('\n')}\n${values.map((v) => `human ${v}; echo`).join('\n')}`, encoding: 'utf8' });
+  assert.equal(r.status, 0, (r.stderr || '').trim());
+  assert.deepEqual(values.map((v) => tui.human(v)), r.stdout.trim().split('\n'));
+  assert.deepEqual([tui.human(6_070_000_000), tui.human(1_234_567_890), tui.human(999_999_999)], ['6B', '1.2B', '999.9M'], 'control: the billions tier is there');
+});
+
+test('tui/statusline: the bars follow the colour depth, and no colour keeps the bracketed bar (2026-10-14)', () => {
+  const t = 1_000_000_000_000;
+  const row = (depth) => tui.statuslineGauges({ now: t, fivePct: 55, fiveEst: 3_300_000, fiveTotal: 6_000_000 }, depth, false, false, 20);
+  // 24-bit grounds and ink at truecolor — the script reads COLORTERM for it, as colorDepth does.
+  assert.equal(row('truecolor'),
+    '\x1b[33m5h\x1b[0m \x1b[38;2;228;228;228m\x1b[48;2;60;52;24m      ~3.3M\x1b[48;2;30;30;34m/6M      \x1b[0m \x1b[33m55%\x1b[0m  \x1b[2mwk —\x1b[0m',
+    '55% of a 20-cell bar is 11 cells of the dim yellow tint, the figures centred across both grounds');
+  // Below it, the script's 256-colour cells: every fill the nearest grey, the hue left to the label and share.
+  for (const depth of ['256', '16']) {
+    const r = row(depth);
+    assert.ok(r.includes('\x1b[38;5;254m\x1b[48;5;236m      ~3.3M\x1b[48;5;234m/6M      \x1b[0m'), `${depth}: the 256-colour cells — ${JSON.stringify(r)}`);
+    // eslint-disable-next-line no-control-regex
+    assert.doesNotMatch(r, /\x1b\[[34]8;2;/, `${depth}: no 24-bit code below truecolor`);
+  }
+  // NO COLOUR: no escape at all, and the bracketed block bar with the figures beside it. A painted
+  // field whose filled part cannot be told from the rest would report nothing.
+  const mono = row('none');
+  // eslint-disable-next-line no-control-regex
+  assert.doesNotMatch(mono, /\x1b/, 'no colour means no escape');
+  assert.equal(mono, '5h [████    ] 55% ~3.3M/6M  wk —', 'the bracketed bar, its figures beside it');
+});
+
+/** The status line the installer writes, cut to what a test of its bars runs: the block that forces a
+ *  UTF-8 locale (the bars slice by character), then the colours, `uc` and `bar`, which sit together. */
+function statuslineBarDefs() {
+  const sh = fs.readFileSync(path.resolve(__dirname, '../../cli/statusline/install-statusline.sh'), 'utf8').split('\n');
+  const from = sh.findIndex((l) => /^cat > "\$CLAUDE_DIR\/statusline\.sh" <<'STATUSLINE_EOF'$/.test(l));
+  const gen = sh.slice(from + 1, sh.indexOf('STATUSLINE_EOF', from + 1));
+  const l0 = gen.findIndex((l) => l.startsWith('_utf8='));
+  const l1 = gen.indexOf('unset _utf8', l0);
+  const a = gen.findIndex((l) => l.startsWith("DIM=$'"));
+  const b = gen.findIndex((l, i) => i > a && l.startsWith('to_epoch() {'));
+  assert.ok(from > 0 && l0 > 0 && l1 > l0 && a > l1 && b > a, 'the locale block, then the colours, uc and bar, still sit where they did');
+  return [...gen.slice(l0, l1 + 1), ...gen.slice(a, b)].join('\n');
+}
+
+/** The shell's `bar` for each [pct, text, width], coloured by its own `uc`, one per line, in one bash run
+ *  under the given COLORTERM (undefined: unset). */
+function shellBars(defs, colorterm, calls, bash = 'bash') {
+  const q = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
+  const env = { ...process.env };
+  delete env.COLORTERM;
+  if (colorterm !== undefined) env.COLORTERM = colorterm;
+  const script = `${defs}\n${calls.map(([p, txt, w]) => `printf '%s\\n' "$(bar ${q(p)} ${q(txt)} ${w} "$(uc ${q(p)})")"`).join('\n')}`;
+  // On stdin, not `bash -c`: the script then reaches bash byte for byte on every platform.
+  const r = cp.spawnSync(bash, [], { input: script, env, encoding: 'utf8' });
+  assert.equal(r.status, 0, (r.stderr || '').trim());
+  return r.stdout.split('\n').slice(0, calls.length);
+}
+
+/** A bash 3.2 to run the status line under, where there is one: /bin/bash on a stock macOS (the CI's macOS
+ *  leg), or OAK_TEST_BASH32 when a 3.2 is built locally. Null elsewhere. */
+function bash32() {
+  const b = process.env.OAK_TEST_BASH32 || '/bin/bash';
+  const v = cp.spawnSync(b, ['--version'], { encoding: 'utf8' });
+  return v.status === 0 && /version 3\./.test(v.stdout || '') ? b : null;
+}
+
+test('statusline: each bar is a progress bar painted in very dim colours, its figures inside (2026-10-14)', () => {
+  const defs = statuslineBarDefs();
+  const INK = '\x1b[38;2;228;228;228m';
+  const REST = '\x1b[48;2;30;30;34m';
+  const TINT = { green: '\x1b[48;2;30;64;40m', yellow: '\x1b[48;2;60;52;24m', red: '\x1b[48;2;74;36;36m' };
+  // A 256-COLOUR HOP keeps the fill: tmux maps a 24-bit colour to its nearest cell for a client it does not
+  // know to be truecolor (its colour_find_rgb, ported), and every tint must land on 236, the neutral on 234.
+  const nearest256 = (r, g, b) => {
+    const q2c = [0, 0x5f, 0x87, 0xaf, 0xd7, 0xff], q = (v) => (v < 48 ? 0 : v < 114 ? 1 : Math.trunc((v - 35) / 40));
+    const [qr, qg, qb] = [q(r), q(g), q(b)], [cr, cg, cb] = [q2c[qr], q2c[qg], q2c[qb]];
+    if (cr === r && cg === g && cb === b) return 16 + 36 * qr + 6 * qg + qb;
+    const avg = Math.trunc((r + g + b) / 3), gi = avg > 238 ? 23 : Math.trunc((avg - 3) / 10), gv = 8 + 10 * gi;
+    const d = (x, y, z) => (x - r) ** 2 + (y - g) ** 2 + (z - b) ** 2;
+    return d(gv, gv, gv) < d(cr, cg, cb) ? 232 + gi : 16 + 36 * qr + 6 * qg + qb;
+  };
+  const rgb = (code) => code.match(/48;2;(\d+);(\d+);(\d+)m/).slice(1).map(Number);
+  assert.deepEqual(Object.values(TINT).map((t) => nearest256(...rgb(t))), [236, 236, 236], 'every tint degrades to the 256 fill');
+  assert.equal(nearest256(...rgb(REST)), 234, 'and the neutral to the 256 neutral');
+  // eslint-disable-next-line no-control-regex
+  const parse = (b) => /^(\x1b\[38;[25];[\d;]+m)(\x1b\[48;[25];[\d;]+m)([^\x1b]*)(\x1b\[48;[25];[\d;]+m)([^\x1b]*)\x1b\[0m$/.exec(b);
+  // THE FILL is the share of the box's cells, whole cells, rounded from the truncated percentage.
+  const pcts = ['0', '4', '5', '6.3', '37', '49.9', '50', '79', '80', '97', '98', '100', '150'];
+  const tc = shellBars(defs, 'truecolor', pcts.map((p) => [p, '', 20]));
+  assert.ok(tc.every(parse), `every bar is ink, tint, cells, neutral, cells, reset — ${JSON.stringify(tc)}`);
+  assert.deepEqual(tc.map((b) => parse(b)[3].length), [0, 1, 1, 1, 7, 10, 10, 16, 16, 19, 20, 20, 20], 'the tinted run is pct% of the 20 cells');
+  assert.deepEqual(tc.map((b) => parse(b)[3].length + parse(b)[5].length), pcts.map(() => 20), 'and the box keeps its width whatever the share');
+  // THE HUE: the label's own thresholds, on the truncated share — green below 50%, yellow from 50%, red from 80%.
+  assert.deepEqual(tc.map((b) => parse(b)[2]), [
+    ...Array(6).fill(TINT.green), TINT.yellow, TINT.yellow, ...Array(5).fill(TINT.red),
+  ], '49.9% is still green, 79% still yellow, 80% red');
+  // ONE LIGHT INK over both grounds, set explicitly: a light terminal's dark default would vanish into the box.
+  assert.deepEqual([...new Set(tc.map((b) => parse(b)[1]))], [INK], 'every bar opens with the light ink');
+  assert.deepEqual([...new Set(tc.map((b) => parse(b)[4]))], [REST], 'and the rest of every bar is the dimmer neutral');
+  // eslint-disable-next-line no-control-regex
+  assert.ok(tc.every((b) => !/\x1b\[4m|[▏▕]/.test(b)), 'no underline and no caps');
+  // THE FIGURES, centred, the multibyte ↺ intact; a box narrower than its figures grows to them.
+  // eslint-disable-next-line no-control-regex
+  const vis = (b) => b.replace(/\x1b\[[0-9;]*m/g, '');
+  const [fig, grown] = shellBars(defs, 'truecolor', [['42', '~6.2M/14.9M +123M↺', 23], ['42', '~6.2M/14.9M +123M↺', 5]]);
+  assert.equal(vis(fig), '  ~6.2M/14.9M +123M↺   ', 'the figures centred in the box');
+  assert.equal(parse(fig)[3], '  ~6.2M/14', '42% of 23 cells is 10, the edge falling between two of them');
+  assert.equal(vis(grown), ' ~6.2M/14.9M +123M↺ ', 'one cell of air each side when the figures outgrow the width');
+  // A charmap report is not proof that bash is slicing characters (Git Bash counted bytes).
+  // Also work when `locale` is absent: the renderer needs only bash's own character probe.
+  for (const locale of ["locale() { echo UTF-8; }", "locale() { return 127; }"]) {
+    const bytes = `export LC_ALL=C\n${locale}\n${defs}`;
+    assert.equal(shellBars(bytes, 'truecolor', [['42', '~6.2M/14.9M +123M↺', 23]])[0], fig,
+      'a byte-counting shell selects a working UTF-8 locale without trusting the locale command');
+  }
+  // COLOUR DEPTH, from COLORTERM: 24-bit for truecolor, the one value Claude Code paints 24-bit for;
+  // otherwise the 256-colour cells, where every fill is the nearest grey and the label and share keep
+  // the hue. Under 24bit Claude Code maps 24-bit codes onto the 256-colour cube (the neutral #5f5f5f,
+  // the red fill the same cell), so that value gets the cells too.
+  assert.equal(shellBars(defs, 'truecolor', [['55', '', 10]])[0], `${INK}${TINT.yellow}      ${REST}    \x1b[0m`, 'COLORTERM=truecolor: 24-bit');
+  for (const ct of [undefined, '', 'yes', '24bit']) {
+    assert.deepEqual(shellBars(defs, ct, [['10', '', 10], ['55', '', 10], ['90', '', 10]]), [
+      '\x1b[38;5;254m\x1b[48;5;236m \x1b[48;5;234m         \x1b[0m',
+      '\x1b[38;5;254m\x1b[48;5;236m      \x1b[48;5;234m    \x1b[0m',
+      '\x1b[38;5;254m\x1b[48;5;236m         \x1b[48;5;234m \x1b[0m',
+    ], `COLORTERM=${ct === undefined ? '(unset)' : JSON.stringify(ct)}: 256 colours`);
+  }
+  // bash 3.2, the /bin/bash of every stock macOS, draws the same bytes.
+  const b32 = bash32();
+  if (b32) {
+    const calls = pcts.map((p) => [p, '~6.2M/14.9M +123M↺', 23]);
+    for (const ct of ['truecolor', undefined]) assert.deepEqual(shellBars(defs, ct, calls, b32), shellBars(defs, ct, calls), `bash 3.2 draws the same bars (${ct || '256'})`);
+  }
+});
+
+test('statusline: the width it wraps by skips colour codes of any length, in a loop, not an extglob (2026-10-14)', () => {
+  // `vw` measures each segment for the wrap at COLUMNS. Its extglob strip, ${1//ESC\[*([0-9;])m/}, slows
+  // with each sequence's length: the bars' 24-bit grounds took it to 5 ms a segment, 15 ms a render
+  // (measured). The loop that replaced it must count exactly what the strip counted.
+  const sh = fs.readFileSync(path.resolve(__dirname, '../../cli/statusline/install-statusline.sh'), 'utf8');
+  assert.doesNotMatch(sh, /\$\{1\/\/\$'\\033'\\\[\*\(\[0-9;\]\)m\/\}/, 'not the extglob strip');
+  const gen = sh.split('\n');
+  const a = gen.findIndex((l) => l.startsWith('vw() {'));
+  const b = gen.findIndex((l, i) => i > a && l.endsWith('"${#o}"; }'));
+  const l0 = gen.findIndex((l) => l.startsWith('_utf8='));
+  assert.ok(a > 0 && b > a && l0 > 0, 'vw and the locale block are where they were');
+  const defs = [...gen.slice(l0, gen.indexOf('unset _utf8', l0) + 1), ...gen.slice(a, b + 1)].join('\n');
+  const E = '\x1b';
+  const cases = [
+    ['abc', 3], ['~6.2M/14.9M +123M↺ ·', 20], [`${E}[38;2;228;228;228m${E}[48;2;30;64;40mab${E}[48;2;30;30;34mc${E}[0m`, 3],
+    [`${E}[m`, 0], [`${E}[2;m x`, 2], [`a${E}[x`, 4], [`a${E}[3a1m`, 7], [`${E}${E}[1mz`, 2], [`ab${E}[`, 4], [`${E}[[1m`, 5],
+  ];
+  const q = (s) => `'${s.replace(/'/g, `'\\''`)}'`;
+  const r = cp.spawnSync('bash', [], { input: `${defs}\n${cases.map(([s]) => `vw ${q(s)}; echo`).join('\n')}`, encoding: 'utf8' });
+  assert.equal(r.status, 0, (r.stderr || '').trim());
+  assert.deepEqual(r.stdout.trim().split('\n').map(Number), cases.map((c) => c[1]),
+    'SGR sequences count nothing, whatever their length; an ESC[ that opens none counts as text');
+});
+
+test('statusline: the terminal app draws the shell\'s bars byte for byte, at every colour depth (2026-10-14)', () => {
+  // statusline.ts is a port of the shell's helpers, and its goldens above are hand-written. This runs
+  // both on the same shares, figures and widths, so neither can drift from the other unseen.
+  const defs = statuslineBarDefs();
+  const t = 1_000_000_000_000;
+  // eslint-disable-next-line no-control-regex
+  const vis = (b) => b.replace(/\x1b\[[0-9;]*m/g, '');
+  const cases = [];
+  for (const pct of [0, 6.3, 37, 49.6, 50, 79.9, 80, 100])
+    for (const [est, total, reads] of [[0, 0, 0], [600_000, 6_000_000, 41_000_000], [115_700_000, 128_500_000, 0]])
+      for (const w of [10, 23]) cases.push({ pct, est, total, reads, w });
+  for (const depth of ['truecolor', '256', '16']) {
+    const mine = cases.map((c) => {
+      const row = tui.statuslineGauges({ now: t, fivePct: c.pct, fiveEst: c.est || null, fiveTotal: c.total || null, fiveReads: c.reads || null }, depth, false, false, c.w);
+      // eslint-disable-next-line no-control-regex
+      const m = /^\x1b\[3[123]m5h\x1b\[0m (.*?) \x1b\[3[123]m\d+%\x1b\[0m/.exec(row);
+      assert.ok(m, `the 5h segment carries a bar: ${JSON.stringify(row)}`);
+      return m[1];
+    });
+    const theirs = shellBars(defs, depth === 'truecolor' ? 'truecolor' : undefined, cases.map((c, i) => [String(c.pct), vis(mine[i]).trim(), c.w]));
+    assert.deepEqual(theirs, mine, `the shell and the terminal app draw the same bars at ${depth}`);
+  }
+});
+
+test('statusline: the quota line it renders carries one bar width, each bar holding its figures (2026-10-14)', (t) => {
+  // The two-pass build end to end: the bars of one line share the widest figures' width, each tinted by its
+  // own share. A calibration fresh enough that no transcript scan runs supplies the figures.
+  const dirOf = (name) => (process.env.PATH || '').split(path.delimiter).find((d) => d && ['', '.exe'].some((x) => fs.existsSync(path.join(d, name + x))));
+  if (!dirOf('python3') || !dirOf('jq')) return t.skip('python3 or jq is not installed');
+  const home = freshHome();
+  const cdir = path.join(home, '.claude');
+  fs.mkdirSync(cdir, { recursive: true });
+  // The tools the line runs, and no `oak`: statuslinePath keeps every oak off the PATH.
+  const env = { ...process.env, HOME: home, USERPROFILE: home, CLAUDE_CONFIG_DIR: cdir, PATH: statuslinePath(dirOf('python3'), dirOf('jq')) };
+  delete env.COLORTERM;
+  delete env.HERDR_PANE_ID;
+  const inst = cp.spawnSync('bash', [path.resolve(__dirname, '../../cli/statusline/install-statusline.sh'), '--force'], { env, encoding: 'utf8' });
+  assert.equal(inst.status, 0, `installer runs — ${(inst.stderr || '').trim()}`);
+  const now = Math.floor(Date.now() / 1000);
+  fs.writeFileSync(path.join(cdir, 'statusline-usage.json'), JSON.stringify({ v: 2, last_scan: now, tpp5: 60000, tpp7: 300000, tppE5: 60000, tppE7: 300000,
+    R5: 41_000_000, R7: 312_000_000, R30: 905_000_000, a30: 70_700_000, mo_start: now - 10 * 86400, mo_end: now + 20 * 86400 + 30, fc: {} }));
+  // Resets half a minute past the hour, so no countdown ticks over between two renders of the line.
+  const payload = JSON.stringify({ session_id: 's', model: { display_name: 'Opus 5' }, cwd: home, transcript_path: '/dev/null',
+    rate_limits: { five_hour: { used_percentage: 10, resets_at: now + 3 * 3600 + 30 }, seven_day: { used_percentage: 85, resets_at: now + 3 * 86400 + 30 } } });
+  const line3 = (extra, bash = 'bash') => {
+    const r = cp.spawnSync(bash, [path.join(cdir, 'statusline.sh')], { input: payload, env: { ...env, ...extra }, encoding: 'utf8' });
+    assert.equal(r.status, 0, (r.stderr || '').trim());
+    return r.stdout.split('\n')[2] || '';
+  };
+  const parse = (l, re) => [...l.matchAll(re)].map((m) => ({ tint: m[1], fill: [...m[2]].length, width: [...m[2]].length + [...m[3]].length, text: (m[2] + m[3]).trim() }));
+  // 5h at 10% (green), wk at 85% (red), and the month at 55% (yellow): 70.7M of 30M x 30/7 days.
+  const want = [
+    { tint: '30;64;40', fill: 2, width: 22, text: '~600k/6M +41M↺' },
+    { tint: '74;36;36', fill: 19, width: 22, text: '~25.5M/30M +312M↺' },
+    { tint: '60;52;24', fill: 12, width: 22, text: '~70.7M/128.5M +905M↺' },
+  ];
+  const tc = line3({ COLORTERM: 'truecolor' });
+  // eslint-disable-next-line no-control-regex
+  assert.deepEqual(parse(tc, /\x1b\[38;2;228;228;228m\x1b\[48;2;([\d;]+)m([^\x1b]*)\x1b\[48;2;30;30;34m([^\x1b]*)\x1b\[0m/g), want,
+    `24-bit: one width (the widest figures plus air), each share tinted by its own threshold — got ${JSON.stringify(tc)}`);
+  // eslint-disable-next-line no-control-regex
+  assert.deepEqual(parse(line3({}), /\x1b\[38;5;254m\x1b\[48;5;(\d+)m([^\x1b]*)\x1b\[48;5;234m([^\x1b]*)\x1b\[0m/g), want.map((w) => ({ ...w, tint: '236' })),
+    'no COLORTERM: the same bars in 256 colours, every fill the nearest grey');
+  // eslint-disable-next-line no-control-regex
+  assert.doesNotMatch(tc, /\x1b\[4m|[▏▕]/, 'no underline and no caps');
+  // The same line under bash 3.2, the /bin/bash of every stock macOS.
+  const b32 = bash32();
+  if (b32) {
+    for (const extra of [{ COLORTERM: 'truecolor' }, {}]) assert.equal(line3(extra, b32), line3(extra), `bash 3.2 renders the same quota line (${extra.COLORTERM || '256'})`);
+  }
+});
+
+test('statusline: a month the line measured with no usage yet is a 0% bar, not a missing one (2026-10-14)', (t) => {
+  // A new bill cycle starts at zero: the scan gives the month a budget (month_tok_total > 0) and counts
+  // nothing in it yet. That 0 was read as "no data" and the segment vanished. A month never measured
+  // or calibrated still shows nothing.
+  const dirOf = (name) => (process.env.PATH || '').split(path.delimiter).find((d) => d && ['', '.exe'].some((x) => fs.existsSync(path.join(d, name + x))));
+  if (!dirOf('python3') || !dirOf('jq')) return t.skip('python3 or jq is not installed');
+  const home = freshHome();
+  const cdir = path.join(home, '.claude');
+  fs.mkdirSync(cdir, { recursive: true });
+  const env = { ...process.env, HOME: home, USERPROFILE: home, CLAUDE_CONFIG_DIR: cdir, COLORTERM: 'truecolor', PATH: statuslinePath(dirOf('python3'), dirOf('jq')) };
+  delete env.HERDR_PANE_ID;
+  const inst = cp.spawnSync('bash', [path.resolve(__dirname, '../../cli/statusline/install-statusline.sh'), '--force'], { env, encoding: 'utf8' });
+  assert.equal(inst.status, 0, `installer runs — ${(inst.stderr || '').trim()}`);
+  const now = Math.floor(Date.now() / 1000);
+  const line3 = (calibrated) => {
+    // No scan runs (last_scan is now), so the month is exactly what this state says: no tokens in it,
+    // and a budget only when the week is calibrated.
+    const tpp = calibrated ? 300000 : 0;
+    fs.writeFileSync(path.join(cdir, 'statusline-usage.json'), JSON.stringify({ v: 2, last_scan: now, tpp5: 60000, tppE5: 60000, tpp7: tpp, tppE7: tpp,
+      a30: 0, mo_start: now - 86400, mo_end: now + 29 * 86400, fc: {} }));
+    fs.rmSync(path.join(cdir, 'statusline-last.json'), { force: true });
+    const r = cp.spawnSync('bash', [path.join(cdir, 'statusline.sh')], { env, encoding: 'utf8',
+      input: JSON.stringify({ session_id: 's', model: { display_name: 'Opus 5' }, cwd: home, transcript_path: '/dev/null',
+        rate_limits: { five_hour: { used_percentage: 3, resets_at: now + 3600 }, seven_day: { used_percentage: 20, resets_at: now + 86400 } } }) });
+    assert.equal(r.status, 0, (r.stderr || '').trim());
+    const cache = JSON.parse(fs.readFileSync(path.join(cdir, 'statusline-last.json'), 'utf8'));
+    return { line: r.stdout.split('\n')[2] || '', cache };
+  };
+  const measured = line3(true);
+  assert.equal(measured.cache.month_tok, 0, 'the month holds no tokens yet…');
+  assert.ok(measured.cache.month_tok_total > 0, '…and the scan gave it a budget: it was measured');
+  // eslint-disable-next-line no-control-regex
+  const mo = /\x1b\[32mmo\x1b\[0m \x1b\[38;2;228;228;228m\x1b\[48;2;30;64;40m\x1b\[48;2;30;30;34m([^\x1b]*)\x1b\[0m \x1b\[32m0%\x1b\[0m/.exec(measured.line);
+  assert.ok(mo, `a measured empty month is a green 0% bar with no tinted cell — got ${JSON.stringify(measured.line)}`);
+  assert.equal(mo[1].trim(), '~0/128.5M', 'reading ~0 over its budget, as the 5h and week windows do at 0%');
+  const never = line3(false);
+  assert.ok(!(never.cache.month_tok_total > 0), 'control: an uncalibrated week projects no month budget');
+  assert.doesNotMatch(never.line, /mo/, 'and a month that was never measured still shows nothing');
+});
+
+test('tui/statusline: a measured month with no usage yet is a 0% bar, as the shell draws it (2026-10-14)', () => {
+  const t = 1_000_000_000_000;
+  const row = (d) => tui.statuslineGauges({ now: t, fivePct: 3, weekPct: 20, ...d }, 'none', false);
+  assert.equal(row({ monthTokens: 0, monthTokensTotal: 128_571_428, monthResetMs: t + 29 * 86400_000 }),
+    '5h [        ] 3%  wk [██      ] 20%  mo [        ] 0% ·29d 0h ~0/128.5M', 'a count of 0 with a budget is a 0% bar');
+  assert.match(tui.statuslineGauges({ now: t, monthTokens: 0, monthTokensTotal: 128_571_428 }, 'truecolor', false),
+    // eslint-disable-next-line no-control-regex
+    /\x1b\[32mmo\x1b\[0m \x1b\[38;2;228;228;228m\x1b\[48;2;30;64;40m\x1b\[48;2;30;30;34m +~0\/128\.5M +\x1b\[0m \x1b\[32m0%\x1b\[0m/, 'painted with no tinted cell');
+  for (const d of [{ monthTokens: null, monthTokensTotal: 128_571_428 }, { monthTokens: 0, monthTokensTotal: null }, { monthTokens: 0, monthTokensTotal: 0 }]) {
+    assert.doesNotMatch(row(d), /mo/, `not measured, nothing shown: ${JSON.stringify(d)}`);
+  }
+  assert.match(row({ monthTokens: 5_000_000, monthTokensTotal: 128_571_428 }), /mo \[        \] 4% ~5M\/128\.5M$/, 'control: a month with usage, as before');
+});
+
+/** The status line the installer writes, in a fresh config dir with the tools it runs and no `oak`, for the
+ *  tests that render its quota line from a seeded cache. `render` seeds the calibration state and the cache,
+ *  runs the line on `input`, and returns line 3 with the cache it left; `port` draws the terminal app's port
+ *  from that cache (core's usageLine, the dashboard's mapping, the widths it measures for both lines). Null
+ *  where python3 or jq is missing. */
+function quotaLineRig(now) {
+  const dirOf = (name) => (process.env.PATH || '').split(path.delimiter).find((d) => d && ['', '.exe'].some((x) => fs.existsSync(path.join(d, name + x))));
+  if (!dirOf('python3') || !dirOf('jq')) return null;
+  const home = freshHome();
+  const cdir = path.join(home, '.claude');
+  fs.mkdirSync(cdir, { recursive: true });
+  const env = { ...process.env, HOME: home, USERPROFILE: home, CLAUDE_CONFIG_DIR: cdir, PATH: statuslinePath(dirOf('python3'), dirOf('jq')) };
+  delete env.COLORTERM;
+  delete env.HERDR_PANE_ID;
+  const inst = cp.spawnSync('bash', [path.resolve(__dirname, '../../cli/statusline/install-statusline.sh'), '--force'], { env, encoding: 'utf8' });
+  assert.equal(inst.status, 0, `installer runs — ${(inst.stderr || '').trim()}`);
+  if (now !== undefined) {
+    // One clock for the shell (its epoch, and the time and day line 1 shows), its Python scan and the terminal port,
+    // even on a slow runner, whose renders straddle a minute: GNU date takes `-d @<epoch>`, BSD date `-r <epoch>`.
+    const file = path.join(cdir, 'statusline.sh');
+    fs.writeFileSync(file, `date() { case "$*" in +%s) echo ${now} ;; +*) command date -d @${now} "$@" 2>/dev/null || command date -r ${now} "$@" ;; *) command date "$@" ;; esac; }\n` +
+      fs.readFileSync(file, 'utf8'));
+    env.STATUSLINE_NOW = String(now);
+  }
+  const render = (state, input, cache, extra = {}, bash = 'bash') => {
+    fs.writeFileSync(path.join(cdir, 'statusline-usage.json'), JSON.stringify(state));
+    fs.writeFileSync(path.join(cdir, 'statusline-last.json'), JSON.stringify(cache));
+    const r = cp.spawnSync(bash, [path.join(cdir, 'statusline.sh')], { input: JSON.stringify(input), env: { ...env, ...extra }, encoding: 'utf8' });
+    assert.equal(r.status, 0, (r.stderr || '').trim());
+    return { line: r.stdout.split('\n')[2] || '', rows: r.stdout.split('\n'), after: JSON.parse(fs.readFileSync(path.join(cdir, 'statusline-last.json'), 'utf8')) };
+  };
+  const port = () => {
+    const prev = process.env.CLAUDE_CONFIG_DIR;
+    process.env.CLAUDE_CONFIG_DIR = cdir;
+    try {
+      const d = tui.statuslineDataFor({ now: now === undefined ? Date.now() : now * 1000, usage: core.usageLine(home, ''), views: {}, session: '' });
+      const m = tui.statuslineMetrics(d, '256');
+      return tui.statuslineGauges(d, '256', false, false, m.field, undefined, undefined, m.label);
+    } finally {
+      if (prev === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = prev;
+    }
+  };
+  return { home, cdir, env, render, port };
+}
+
+test('statusline: a window whose input has no share shows the account pull\'s, else one the cache measured inside the window (2026-10-16)', (t) => {
+  // A session idle since its 5h window reset sends no share for that window until its next API response.
+  // Its line drew `5h —` while the cache, which every session on the machine shares, held a share another
+  // session had measured minutes after the reset, and while its own pull of the account's usage had just
+  // answered. It draws, in order: this render's pull, else the cached share measured inside the current
+  // window, never one from before it, with the bar, figures and cache reads of a share from the input. The
+  // terminal app's port reads the same cache through usageLine and draws the same bytes.
+  const rig = quotaLineRig();
+  if (!rig) return t.skip('python3 or jq is not installed');
+  const now = Math.floor(Date.now() / 1000);
+  // Resets half a minute past the minute, so no countdown ticks over between the line and the port.
+  const r5 = now + 4 * 3600 + 30;
+  const r7 = now + 3 * 86400 + 6 * 3600 + 30;
+  const w5 = r5 - 18000; // where each current window began
+  const w7 = r7 - 604800;
+  // A calibration fresh enough that no transcript scan runs: 60k tokens a 5h percent, 300k a week's.
+  const state = { v: 2, last_scan: now, tpp5: 60000, tpp7: 300000, tppE5: 60000, tppE7: 300000, R5: 41_000_000,
+    a30: 0, mo_start: now - 10 * 86400, mo_end: now + 20 * 86400 + 30, fc: {} };
+  const idle = { session_id: 's', model: { display_name: 'Opus 5' }, cwd: rig.home, transcript_path: '/dev/null' };
+  // The account pull is not due (api_ts is now) unless a case makes it so.
+  const cache = (o) => ({ v: 3, five_reset: r5, week_reset: r7, api_ts: now, ...o });
+  // eslint-disable-next-line no-control-regex
+  const vis = (s) => s.replace(/\x1b\[[0-9;]*m/g, '');
+  const b32 = bash32();
+
+  // Measured inside the window, eight minutes after the reset, by another session's render.
+  const insideCache = cache({ five_pct: 1, five_at: w5 + 480, week_pct: 22, week_at: w7 + 86400 });
+  const inside = rig.render(state, idle, insideCache);
+  assert.match(vis(inside.line), /^5h +~60k\/6M \+41M↺ +1% ·4h 0m {2}wk +~6\.6M\/30M +22% ·3d 6h {2}mo /,
+    `the cached shares, each with its figures, cache reads and countdown — got ${JSON.stringify(vis(inside.line))}`);
+  assert.deepEqual([inside.after.five_at, inside.after.week_at], [w5 + 480, w7 + 86400], 'a carried share keeps the time it was measured');
+  assert.deepEqual([inside.after.five_tok, inside.after.week_tok], [60_000, 6_600_000], 'and the estimate written beside it restates it');
+  assert.equal(rig.port(), inside.line, 'the terminal app draws the same line, byte for byte');
+  if (b32) assert.equal(rig.render(state, idle, insideCache, {}, b32).line, inside.line, 'bash 3.2 draws the same line');
+  // The window's first second is inside it; the second before it belongs to the last window.
+  assert.match(vis(rig.render(state, idle, cache({ five_pct: 1, five_at: w5, week_pct: 22, week_at: w7 })).line),
+    /^5h +~60k\/6M \+41M↺ +1% .*wk +~6\.6M\/30M +22% /, 'a share measured as the window began is this window\'s');
+  const beforeCache = cache({ five_pct: 1, five_at: w5 - 1, week_pct: 22, week_at: w7 - 1 });
+  const before = rig.render(state, idle, beforeCache);
+  assert.match(vis(before.line), /^5h — {2}wk — {2}mo /, `a share from before the window is not shown — got ${JSON.stringify(vis(before.line))}`);
+  assert.equal(rig.port(), before.line, 'nor by the terminal app');
+  if (b32) assert.equal(rig.render(state, idle, beforeCache, {}, b32).line, before.line, 'bash 3.2 draws the same line');
+
+  // This render's account pull outranks a cached share, even one measured inside the window, and even a larger one: it
+  // is the account's own reading, dated now. The account's resets carry fractional seconds (16:59:59.x where the payload
+  // says 17:00:00): the same window.
+  const iso = (s) => new Date((s - 1) * 1000 + 123).toISOString();
+  fs.writeFileSync(path.join(rig.home, 'usage-api.json'), JSON.stringify({ five_hour: { utilization: 3, resets_at: iso(r5) }, seven_day: { utilization: 24, resets_at: iso(r7) } }));
+  fs.writeFileSync(path.join(rig.cdir, '.credentials.json'), JSON.stringify({ claudeAiOauth: { accessToken: 'test-token-not-real', expiresAt: Date.now() + 3600_000 } }));
+  const pull = { STATUSLINE_USAGE_API_URL: 'file://' + path.join(rig.home, 'usage-api.json'), STATUSLINE_USAGE_API_TTL: '0' };
+  const pulled = rig.render(state, idle, { ...insideCache, five_pct: 40, week_pct: 50 }, pull);
+  assert.match(vis(pulled.line), /^5h +~180k\/6M \+41M↺ +3% ·4h 0m {2}wk +~7\.2M\/30M +24% ·3d 6h {2}mo /,
+    `the pull's own shares — got ${JSON.stringify(vis(pulled.line))}`);
+  assert.ok(pulled.after.five_at >= now && pulled.after.week_at >= now, 'stamped as measured now');
+  assert.equal(rig.port(), pulled.line, 'and the terminal app reads them from the cache the pull wrote');
+});
+
+test('usage: the month ends with its dollar figure on every bar, the one the Claude Code status line shows (2026-11-03)', (t) => {
+  // OAK's bars put the month's dollars after its reset, as the status line's own `~$13`: the estimate at today's list
+  // prices on a subscription, and the charge Claude Code reported on a plan with no rolling windows (pay-as-you-go API,
+  // Enterprise), with no ~. No reading, no figure. The text is the status line's: core writes it as its money() does.
+  const src = fs.readFileSync(path.resolve(__dirname, '../../cli/statusline/install-statusline.sh'), 'utf8');
+  const money = /money\(\) \{ LC_ALL=C awk -v v="\$\{1:-0\}" 'BEGIN\{ (.*) \}'; \}/.exec(src);
+  assert.ok(money, 'control: the status line defines money()');
+  // Around every rounding edge: halves (which printf rounds to the even digit), whole dollars, $100 and $1000.
+  const vals = [];
+  for (let i = 1; i <= 4000; i++) vals.push(i / 40);
+  for (let i = 0; i <= 400; i++) vals.push(95 + i / 40, 995 + i / 40, 9_900 + i * 0.5, 1000 + i * 25);
+  const awk = cp.spawnSync('awk', [`{ v = $1; ${money[1]}; printf "\\n" }`], { input: vals.join('\n') + '\n', env: { ...process.env, LC_ALL: 'C' }, encoding: 'utf8' });
+  if (awk.error) t.diagnostic('awk is not installed: the sweep against money() is skipped');
+  else {
+    const want = awk.stdout.split('\n');
+    const wrong = vals.map((v, i) => [v, core.usdText(v), want[i]]).filter(([, a, b]) => a !== b);
+    assert.deepStrictEqual(wrong, [], 'usdText writes every figure as money() does');
+    assert.ok(vals.some((v, i) => v < 100 && `$${v.toFixed(v >= 10 ? 0 : 1)}` !== want[i]), 'control: a plain toFixed rounds some half the other way');
+  }
+  assert.deepStrictEqual([12.5, 13.5, 3.25, 150.7, 1250, 10_040].map(core.usdText), ['$12', '$14', '$3.2', '$150', '$1.2k', '$10.0k']);
+  assert.equal(core.monthUsd({ monthCost: 12.5, monthSpend: 9, rollingLimits: true }), '~$12', 'a subscription: the estimate, whatever was reported');
+  assert.equal(core.monthUsd({ monthCost: 12.5, monthSpend: 9, rollingLimits: false }), '$9.0', 'no rolling windows: the charge');
+  assert.equal(core.monthUsd({ monthCost: 12.5, monthSpend: null, rollingLimits: false }), '~$12', 'with no charge on record, the estimate');
+  assert.deepStrictEqual([core.monthUsd({ monthCost: null }), core.monthUsd({ monthCost: 0, monthSpend: 0, rollingLimits: false })], [null, null],
+    'no reading: no figure, never $0');
+
+  const rig = quotaLineRig();
+  if (!rig) return t.skip('python3 or jq is not installed');
+  const now = Math.floor(Date.now() / 1000);
+  // eslint-disable-next-line no-control-regex
+  const vis = (s) => s.replace(/\x1b\[[0-9;]*m/g, '');
+  // No transcript scan (fresh), no calibration (a plan with no windows has no share to learn a budget from), the month's
+  // list-priced estimate $13.40, and a ledger with $12.50 reported this month (two sessions) and $50 by a session whose
+  // last report fell before the month began.
+  const state = { v: 2, last_scan: now, a30: 0, c30: 13.4, mo_start: now - 10 * 86400, mo_end: now + 20 * 86400 + 30, fc: {} };
+  const cache = { v: 3, api_ts: now, costs: { a: { usd: 10, at: now - 3600 }, b: { usd: 2.5, at: now - 60 }, old: { usd: 50, at: now - 11 * 86400 } } };
+  const input = { session_id: 'b', model: { display_name: 'Opus 5' }, cwd: rig.home, transcript_path: '/dev/null', cost: { total_cost_usd: 2.5 } };
+  const readouts = () => {
+    const prev = process.env.CLAUDE_CONFIG_DIR;
+    process.env.CLAUDE_CONFIG_DIR = rig.cdir;
+    try {
+      const brief = core.usageBrief(rig.home);
+      return { usd: core.monthUsd(core.usageLine(rig.home, '')), brief: brief.claude.month.usd,
+        bar: tui.statuslineFor({ now: Date.now(), usageBoth: { ...brief, gpt: null } }, 160, {}, 'none', 1)[0].trimEnd() };
+    } finally {
+      if (prev === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = prev;
+    }
+  };
+  // Pay-as-you-go: no rolling window in the input or the cache. The month is the charge, $12.50, with no ~.
+  const api = rig.render(state, input, cache);
+  assert.match(vis(api.line), /(^| )\$12( |$)/, `the status line: the charge — got ${JSON.stringify(vis(api.line))}`);
+  assert.doesNotMatch(vis(api.line), /~\$/, 'not an estimate');
+  assert.equal(api.after.month_spend, 12.5, 'the cache records the month\'s reported spend');
+  assert.deepStrictEqual(readouts(), { usd: '$12', brief: '$12', bar: '✳ claude mo: $12' }, 'core and the terminal app\'s bar: the same figure');
+  const b32 = bash32();
+  if (b32) assert.equal(rig.render(state, input, cache, {}, b32).line, api.line, 'bash 3.2 draws the same line');
+  // A subscription: the same ledger, with rolling windows. The month is the estimate, $13.40, written ~$13.
+  const r5 = now + 4 * 3600 + 30, r7 = now + 3 * 86400 + 6 * 3600 + 30;
+  const sub = rig.render({ ...state, tpp5: 60000, tpp7: 300000, tppE5: 60000, tppE7: 300000 }, { ...input, rate_limits: { five_hour: { used_percentage: 4, resets_at: r5 }, seven_day: { used_percentage: 22, resets_at: r7 } } }, cache);
+  assert.match(vis(sub.line), /(^| )~\$13( |$)/, `the status line: the estimate — got ${JSON.stringify(vis(sub.line))}`);
+  assert.doesNotMatch(vis(sub.line), /(^| )\$12/, 'not the reported spend');
+  const s = readouts();
+  assert.deepStrictEqual([s.usd, s.brief], ['~$13', '~$13'], 'core: the same estimate');
+  assert.match(s.bar, /^✳ claude wk: 22% \S+ \S+ · mo: .*~\$13$/, `the bar: the month ends with its figure — got ${JSON.stringify(s.bar)}`);
+  assert.doesNotMatch(s.bar, /5h:/, 'and no 5h window');
+  // No reading: no estimate and nothing reported. The month draws no figure anywhere.
+  const none = rig.render({ ...state, c30: 0 }, { ...input, cost: undefined }, { v: 3, api_ts: now });
+  assert.doesNotMatch(vis(none.line), /\$/, `the status line: no figure — got ${JSON.stringify(vis(none.line))}`);
+  assert.deepStrictEqual([readouts().usd, readouts().brief], [null, null], 'core: none');
+  // GPT: Codex reports no charge, so its month is always the estimate: 8M input tokens of gpt-5.2 at $1.75/M.
+  process.env.CODEX_HOME = path.join(rig.home, 'codex-month');
+  const d = new Date(), two = (n) => String(n).padStart(2, '0');
+  const day = path.join(process.env.CODEX_HOME, 'sessions', String(d.getUTCFullYear()), two(d.getUTCMonth() + 1), two(d.getUTCDate()));
+  fs.mkdirSync(day, { recursive: true });
+  try {
+    assert.equal(core.usageBrief(rig.home).gpt?.month?.usd ?? null, null, 'control: no GPT use, no GPT figure');
+    fs.writeFileSync(path.join(day, `rollout-${d.toISOString().slice(0, 10)}T00-00-00-00000000-0000-4000-8000-0000000000d1.jsonl`), [
+      { type: 'session_meta', payload: { id: '00000000-0000-4000-8000-0000000000d1', cwd: rig.home, model_provider: 'openai' } },
+      { type: 'turn_context', payload: { model: 'gpt-5.2' } },
+      { timestamp: new Date().toISOString(), type: 'event_msg', payload: { type: 'token_count',
+        info: { total_token_usage: { input_tokens: 8_000_000, output_tokens: 0 } },
+        rate_limits: { secondary: { used_percent: 30, window_minutes: 10080, resets_at: now + 3 * 86400 } } } },
+    ].map((r) => JSON.stringify(r)).join('\n') + '\n');
+    const g = core.usageBrief(rig.home).gpt;
+    assert.equal(g.month.usd, '~$14', 'GPT: the estimate');
+    const bar = tui.statuslineFor({ now: Date.now(), usageBoth: { claude: { week: { pct: null, resetMs: null }, month: { pct: null, resetMs: null } }, gpt: g } }, 160, {}, 'none', 1)[0].trimEnd();
+    assert.match(bar, /⬡ gpt wk: 30% \S+ \S+ · mo: .* ~\$14$/, `the bar — got ${JSON.stringify(bar)}`);
+  } finally {
+    delete process.env.CODEX_HOME;
+  }
+});
+
+test('statusline: a share of 0 with no figures reads ~0, on the line and in the terminal app (2026-10-16)', (t) => {
+  // An account reports a per-model cap it has not used at 0%, and with nothing used there is nothing to
+  // estimate: the `fable` bar was drawn empty, which read as a segment with nothing to report. A share of
+  // 0 reads ~0 in every window, ~0/<budget> where a budget is known (as the month at 0% does). A share
+  // above 0 with no figures stays a bare bar: its figures are unknown, not zero.
+  const row = (d) => tui.statuslineGauges({ now: 1_000_000_000_000, ...d }, 'none', false);
+  assert.equal(row({ fivePct: 0, weekPct: 0, fablePct: 0, fableLabel: 'Fable' }),
+    '5h [        ] 0% ~0  fable [        ] 0% ~0  wk [        ] 0% ~0', 'the port: ~0 in every window');
+  assert.equal(row({ fivePct: 0, fiveTotal: 6_000_000, weekPct: 0.4, fablePct: 2 }),
+    '5h [        ] 0% ~0/6M  fable [        ] 2%  wk [        ] 0%', 'over the budget where one is known; a share above 0 keeps its bare bar');
+
+  const rig = quotaLineRig();
+  if (!rig) return t.skip('python3 or jq is not installed');
+  const now = Math.floor(Date.now() / 1000);
+  const r5 = now + 4 * 3600 + 30;
+  const r7 = now + 3 * 86400 + 6 * 3600 + 30;
+  const input = (five, week) => ({ session_id: 's', model: { display_name: 'Opus 5' }, cwd: rig.home, transcript_path: '/dev/null',
+    rate_limits: { five_hour: { used_percentage: five, resets_at: r5 }, seven_day: { used_percentage: week, resets_at: r7 } } });
+  const fable = (pct) => ({ v: 3, fable_pct: pct, fable_at: now, fable_reset: r7, fable_label: 'Fable', api_ts: now });
+  // eslint-disable-next-line no-control-regex
+  const vis = (s) => s.replace(/\x1b\[[0-9;]*m/g, '');
+  // Nothing calibrated: no window has an estimate or a budget.
+  const bare = { v: 2, last_scan: now, a30: 0, fc: {} };
+  const zero = rig.render(bare, input(0, 0), fable(0)).line;
+  assert.match(vis(zero), /^5h +~0 +0% ·4h 0m {2}fable +~0 +0% ·3d 6h {2}wk +~0 +0% ·3d 6h$/, `~0 in every window — got ${JSON.stringify(vis(zero))}`);
+  assert.equal(rig.port(), zero, 'the terminal app draws the same line, byte for byte');
+  const b32 = bash32();
+  if (b32) assert.equal(rig.render(bare, input(0, 0), fable(0), {}, b32).line, zero, 'bash 3.2 draws the same line');
+  const some = rig.render(bare, input(3, 0), fable(2)).line;
+  assert.match(vis(some), /^5h +3% ·4h 0m {2}fable +2% ·3d 6h {2}wk +~0 +0% ·3d 6h$/, `a share above 0 with no figures keeps its bare bar — got ${JSON.stringify(vis(some))}`);
+  assert.equal(rig.port(), some, 'in the terminal app too');
+  // Calibrated: a window at 0% reads ~0 over its budget, as the month at 0% does.
+  const cal = { v: 2, last_scan: now, tpp5: 60000, tpp7: 300000, tppE5: 60000, tppE7: 300000, a30: 0,
+    mo_start: now - 10 * 86400, mo_end: now + 20 * 86400 + 30, fc: {} };
+  const budgets = rig.render(cal, input(0, 0), fable(0)).line;
+  assert.match(vis(budgets), /^5h +~0\/6M +0% ·4h 0m {2}fable +~0 +0% ·3d 6h {2}wk +~0\/30M +0% ·3d 6h {2}mo +~0\/128\.5M +0% ·20d 0h$/,
+    `~0 over each known budget, the month's included — got ${JSON.stringify(vis(budgets))}`);
+  assert.equal(rig.port(), budgets, 'the terminal app draws ~0 over the budget too');
+});
+
+test('statusline: a share is stamped when the render began, so one read just before its window reset is not drawn after it', (t) => {
+  // Claude Code sends a window's share only until the window resets. A render that read one just before the
+  // reset and wrote the cache after it (its estimator ran long) stamped that share inside the next window, where
+  // an idle session's line then drew it as the new window's. A fresh share is stamped when the render began, and the
+  // 5h window it belonged to is over once its reset passes: 0%, with no countdown.
+  const rig = quotaLineRig();
+  if (!rig) return t.skip('python3 or jq is not installed');
+  if (process.platform === 'win32') return t.skip('the slowed python3 below is a POSIX shell script');
+  const py = rig.env.PATH.split(path.delimiter).map((d) => path.join(d, 'python3')).find((f) => fs.existsSync(f));
+  const slow = path.join(rig.home, 'slow-bin');
+  fs.mkdirSync(slow);
+  fs.writeFileSync(path.join(slow, 'python3'), `#!/bin/sh\nsleep 2\nexec '${py}' "$@"\n`, { mode: 0o755 });
+  const now = Math.floor(Date.now() / 1000);
+  const r5 = now + 2; // the 5h window resets while the render below is still in its estimator
+  const r7 = now + 3 * 86400;
+  const state = { v: 2, last_scan: now, tpp5: 60000, tpp7: 300000, tppE5: 60000, tppE7: 300000, a30: 0, fc: {} };
+  const session = { session_id: 's', model: { display_name: 'Opus 5' }, cwd: rig.home, transcript_path: '/dev/null' };
+  const read = rig.render(state, { ...session, rate_limits: { five_hour: { used_percentage: 95, resets_at: r5 }, seven_day: { used_percentage: 40, resets_at: r7 } } },
+    { v: 3, api_ts: now }, { PATH: slow + path.delimiter + rig.env.PATH });
+  assert.ok(Date.now() / 1000 >= r5, 'control: the render outlasted the reset');
+  assert.ok(read.after.five_at < r5 && read.after.week_at < r5, `each share is stamped when the render began, before the reset — got five_at ${read.after.five_at - now} s after it`);
+  // eslint-disable-next-line no-control-regex
+  const vis = (s) => s.replace(/\x1b\[[0-9;]*m/g, '');
+  const idle = rig.render(state, session, read.after).line;
+  assert.match(vis(idle), /^5h +~0\/6M +0% {2}wk +~12M\/30M +40% /, `the last window's share is not drawn after it ended — got ${JSON.stringify(vis(idle))}`);
+});
+
+/** A session's transcript whose last reply (its last assistant entry) is at `at` (epoch seconds), followed by a line
+ *  that is not a reply, and whose mtime is now: an idle transcript is touched without a reply. Returns its path. */
+function repliedTranscript(home, name, at, tail = '') {
+  const file = path.join(home, `${name}.jsonl`);
+  fs.writeFileSync(file, [
+    { type: 'user', timestamp: new Date((at - 5) * 1000).toISOString(), message: { role: 'user', content: 'go on' } },
+    { type: 'assistant', timestamp: new Date(at * 1000 + 123).toISOString(), message: { role: 'assistant', content: [{ type: 'text', text: 'done' }] } },
+    { type: 'system', subtype: 'touch', content: 'not a reply' },
+  ].map((o) => JSON.stringify(o)).join('\n') + '\n' + tail);
+  return file;
+}
+
+test('statusline: only a share dated within five minutes of the render calibrates the estimate, whatever its source (2026-10-19)', (t) => {
+  // A share can predate tokens the scan counts: one measured early in the window, with as many tokens again since, read
+  // twice the tokens-per-percent, and the smoothing kept a share of that in every later figure (the 5h budget read 6.7M
+  // for 6M). So only a share measured within five minutes of the render calibrates: a payload share is dated by its
+  // session's last reply, the cached one by its stamp.
+  const rig = quotaLineRig();
+  if (!rig) return t.skip('python3 or jq is not installed');
+  const now = Math.floor(Date.now() / 1000);
+  const r5 = now + 3 * 3600, w5 = r5 - 18000, r7 = now + 3 * 86400, w7 = r7 - 604800;
+  const dir = path.join(rig.cdir, 'projects', 'p');
+  fs.mkdirSync(dir, { recursive: true });
+  // 60k tokens a 5h percent and 300k a week's: 9M by the time the share was measured (10% and 30%), 600k since.
+  fs.writeFileSync(path.join(dir, 's.jsonl'), [[w7 + 3600, 8_400_000], [w5 + 300, 600_000], [now - 900, 600_000]].map(([at, tok], i) =>
+    JSON.stringify({ type: 'assistant', timestamp: new Date(at * 1000).toISOString(), cwd: rig.home, message: { id: `m${i}`, model: 'claude-opus-5', usage: { input_tokens: tok, output_tokens: 0 } } })).join('\n') + '\n');
+  // $30 spent in the last hour, against a spend baseline six hours old: the dollars-per-percent calibrates too.
+  const prior = { v: 2, last_scan: 0, tpp5: 60000, tpp7: 300000, tppE5: 60000, tppE7: 300000, a30: 0, ch: [[now - 6 * 3600, 0]], fc: {} };
+  const cache = (at) => ({ v: 3, five_reset: r5, week_reset: r7, api_ts: now, five_pct: 10, five_at: at, week_pct: 30, week_at: at,
+    costs: { earlier: { usd: 30, at: now - 3600 } } });
+  const session = (tp, shares) => ({ session_id: 's', model: { display_name: 'Opus 5' }, cwd: rig.home, transcript_path: tp,
+    ...(shares ? { rate_limits: { five_hour: { used_percentage: 10, resets_at: r5 }, seven_day: { used_percentage: 30, resets_at: r7 } } } : {}) });
+  const cal = () => { const s = JSON.parse(fs.readFileSync(path.join(rig.cdir, 'statusline-usage.json'), 'utf8')); return [s.tppE5, s.tppE7, s.cpp5, s.cpp7]; };
+  // eslint-disable-next-line no-control-regex
+  const vis = (s) => s.replace(/\x1b\[[0-9;]*m/g, '');
+  // The cached shares, measured an hour and fifty minutes ago: drawn with the calibrated figures, calibrating nothing.
+  const idle = rig.render(prior, session('/dev/null'), cache(w5 + 600)).line;
+  assert.deepEqual(cal(), [60000, 300000, 0, 0], 'the carried shares calibrate neither tokens nor dollars');
+  assert.match(vis(idle), /^5h +~600k\/6M +10% .*wk +~9M\/30M +30% /, `they are drawn with the calibrated figures — got ${JSON.stringify(vis(idle))}`);
+  // The same shares from a session that last replied six minutes ago, the freshest reading: still too old to calibrate.
+  rig.render(prior, session(repliedTranscript(rig.home, 'six', now - 360), true), cache(w5 + 600));
+  assert.deepEqual(cal(), [60000, 300000, 0, 0], 'a payload share six minutes old calibrates nothing');
+  // Four minutes ago: it calibrates all four.
+  rig.render(prior, session(repliedTranscript(rig.home, 'four', now - 240), true), cache(w5 + 600));
+  const [e5, e7, c5, c7] = cal();
+  assert.ok(e5 !== 60000 && e7 !== 300000 && c5 > 0 && c7 > 0, `a payload share four minutes old calibrates all four — got ${[e5, e7, c5, c7]}`);
+  // So does a cached share measured two minutes ago, whoever measured it.
+  rig.render(prior, session('/dev/null'), cache(now - 120));
+  const [f5, f7] = cal();
+  assert.ok(f5 !== 60000 && f7 !== 300000, `a cached share two minutes old calibrates — got ${[f5, f7]}`);
+});
+
+test('statusline: a window\'s spend is the ledger\'s growth since that window began, the window its tokens count (0.11.0)', (t) => {
+  // The tokens of `own.week` count from the weekly reset, but its dollars were the ledger's growth over the last 604,800
+  // seconds: 3.5 days into a week, the spend of the 3.5 days before the reset landed in it, and the week read twice its
+  // tokens' price. Same for the 5h window.
+  const rig = quotaLineRig();
+  if (!rig) return t.skip('python3 or jq is not installed');
+  const now = Math.floor(Date.now() / 1000);
+  const r5 = now + 2 * 3600 + 30, w5 = r5 - 18000, r7 = now + 3.5 * 86400 + 30, w7 = r7 - 604800;
+  // $100 spent before the week began, $50 since; $8 before the 5h window began, $2 since.
+  const state = { v: 2, last_scan: now, tpp5: 60000, tpp7: 300000, tppE5: 60000, tppE7: 300000, a30: 0, fc: {},
+    ch: [[now - 8 * 86400, 0], [w7 - 600, 100], [w5 - 600, 148], [now - 600, 150]] };
+  const cache = { v: 3, five_reset: r5, week_reset: r7, api_ts: now, costs: { before: { usd: 100, at: w7 - 3600 }, since: { usd: 50, at: now - 60 } } };
+  const session = { session_id: 'since', model: { display_name: 'Opus 5.5' }, cwd: rig.home, transcript_path: '/dev/null',
+    rate_limits: { five_hour: { used_percentage: 10, resets_at: r5 }, seven_day: { used_percentage: 30, resets_at: r7 } } };
+  const r = rig.render(state, session, cache);
+  assert.equal(r.after.week_cost_own, 50, 'the week: only what was spent since its reset');
+  assert.equal(r.after.five_cost_own, 2, 'the 5h window: only what was spent since its reset');
+});
+
+test('statusline: each window draws and keeps its freshest reading, a payload share dated by its session\'s last reply, so an idle session\'s old share neither shows nor lowers it (2026-10-19)', (t) => {
+  // Claude Code keeps its rate limits per process, and the payload says nothing of when they were observed: three
+  // sessions on one machine wrote 49, 0 and 43 into the cache in turn, each stamped as measured now, and an idle one
+  // drew its 0%. A payload share is dated by its session's last reply (the transcript's last assistant entry), never
+  // by the transcript's mtime: an idle transcript is touched without a reply.
+  const rig = quotaLineRig();
+  if (!rig) return t.skip('python3 or jq is not installed');
+  const now = Math.floor(Date.now() / 1000);
+  const r5 = now + 4 * 3600 + 30, r7 = now + 3 * 86400 + 6 * 3600 + 30;
+  const state = { v: 2, last_scan: now, tpp5: 60000, tpp7: 300000, tppE5: 60000, tppE7: 300000, a30: 0, mo_start: now - 10 * 86400, mo_end: now + 20 * 86400 + 30, fc: {} };
+  const session = (tp, five, week, resets = [r5, r7]) => ({ session_id: 's', model: { display_name: 'Opus 5' }, cwd: rig.home, transcript_path: tp,
+    rate_limits: { five_hour: { used_percentage: five, resets_at: resets[0] }, seven_day: { used_percentage: week, resets_at: resets[1] } } });
+  // eslint-disable-next-line no-control-regex
+  const vis = (s) => s.replace(/\x1b\[[0-9;]*m/g, '');
+  const b32 = bash32();
+  const active = repliedTranscript(rig.home, 'active', now - 20);
+  const idle = [repliedTranscript(rig.home, 'idle-a', now - 6 * 86400), repliedTranscript(rig.home, 'idle-b', now - 2 * 86400)];
+  const want = /^5h +~720k\/6M +12% ·4h 0m {2}wk +~14\.7M\/30M +49% ·3d 6h {2}mo /;
+  // In turn: the active session, the idle ones, the active one again, an idle one again.
+  let cache = { v: 3, api_ts: now };
+  for (const [tp, five, week] of [[active, 12, 49], [idle[0], 0, 0], [idle[1], 3, 43], [active, 12, 49], [idle[0], 0, 0]]) {
+    const r = rig.render(state, session(tp, five, week), cache);
+    assert.match(vis(r.line), want, `the render of ${path.basename(tp)} draws the active session's shares — got ${JSON.stringify(vis(r.line))}`);
+    assert.deepEqual([r.after.five_pct, r.after.five_at, r.after.week_pct, r.after.week_at], [12, now - 20, 49, now - 20], 'and the cache keeps them, dated by the active session\'s reply');
+    assert.equal(rig.port(), r.line, 'the terminal app draws the same line');
+    cache = r.after;
+  }
+  if (b32) assert.equal(rig.render(state, session(idle[0], 0, 0), cache, {}, b32).line, rig.render(state, session(idle[0], 0, 0), cache).line, 'bash 3.2 draws the same line');
+  // A later window's share replaces the last window's whatever its date: the 5h window that ended an hour ago, the week
+  // that ended a day ago, against an idle session's reply in the new windows.
+  const later = rig.render(state, session(idle[1], 3, 2), { ...cache, five_at: now - 6 * 3600, five_reset: now - 3600, week_at: now - 8 * 86400, week_reset: now - 86400 });
+  assert.match(vis(later.line), /^5h +~180k\/6M +3% ·4h 0m {2}wk +~600k\/30M +2% ·3d 6h /, `the new windows' shares — got ${JSON.stringify(vis(later.line))}`);
+  assert.deepEqual([later.after.five_pct, later.after.five_reset, later.after.week_pct, later.after.week_reset], [3, r5, 2, r7], 'with their resets');
+  // With no python3 (Git Bash on Windows often has none) there is no estimate and no pull, and the same rule holds.
+  if (process.platform === 'win32') return;
+  const nopy = path.join(rig.home, 'no-python');
+  fs.mkdirSync(nopy);
+  const jq = rig.env.PATH.split(path.delimiter).find((d) => fs.existsSync(path.join(d, 'jq')));
+  for (const dir of ['/usr/bin', '/bin', jq]) {
+    for (const name of fs.existsSync(dir) ? fs.readdirSync(dir) : []) {
+      if (!/^python/.test(name) && !fs.existsSync(path.join(nopy, name))) fs.symlinkSync(path.join(dir, name), path.join(nopy, name));
+    }
+  }
+  const bare = rig.render(state, session(idle[0], 0, 0), cache, { PATH: nopy });
+  assert.match(vis(bare.line), /^5h +12% ·4h 0m {2}wk +49% ·3d 6h/, `no python3: the idle session draws the active one's shares — got ${JSON.stringify(vis(bare.line))}`);
+  assert.deepEqual([bare.after.five_pct, bare.after.five_at, bare.after.week_pct, bare.after.week_at], [12, now - 20, 49, now - 20], 'and keeps them');
+  const bareNew = rig.render(state, session(repliedTranscript(rig.home, 'active-later', now - 5), 13, 50), cache, { PATH: nopy });
+  assert.deepEqual([bareNew.after.five_pct, bareNew.after.five_at, bareNew.after.week_pct], [13, now - 5, 50], 'a fresher reply\'s shares are recorded, dated by it');
+});
+
+test('statusline: a session waiting on a subagent dates its shares by the subagent\'s last reply, so an idle session\'s older one does not replace them (2026-10-19)', (t) => {
+  // Claude Code writes a subagent's turns to its own transcript (<session>/subagents/agent-<id>.jsonl) and updates the
+  // session's rate limits from every API response, the subagent's included. While a session waits on one, its own
+  // transcript's last reply is the spawn: its live shares were dated as old as the spawn and lost to an idle session's
+  // later reply, and the session doing the work drew the idle session's older shares.
+  const rig = quotaLineRig();
+  if (!rig) return t.skip('python3 or jq is not installed');
+  const now = Math.floor(Date.now() / 1000);
+  const r5 = now + 4 * 3600 + 30, r7 = now + 3 * 86400 + 6 * 3600 + 30;
+  const state = { v: 2, last_scan: now, tpp5: 60000, tpp7: 300000, tppE5: 60000, tppE7: 300000, a30: 0, mo_start: now - 10 * 86400, mo_end: now + 20 * 86400 + 30, fc: {} };
+  const session = (tp, five, week) => ({ session_id: 's', model: { display_name: 'Opus 5' }, cwd: rig.home, transcript_path: tp,
+    rate_limits: { five_hour: { used_percentage: five, resets_at: r5 }, seven_day: { used_percentage: week, resets_at: r7 } } });
+  // eslint-disable-next-line no-control-regex
+  const vis = (s) => s.replace(/\x1b\[[0-9;]*m/g, '');
+  const waiting = repliedTranscript(rig.home, 'waiting', now - 1800); // its last reply spawned the subagent
+  const sub = path.join(rig.home, 'waiting', 'subagents');
+  fs.mkdirSync(sub, { recursive: true });
+  repliedTranscript(sub, 'agent-a1', now - 30);
+  const idle = repliedTranscript(rig.home, 'idle', now - 1500);
+  const first = rig.render(state, session(idle, 21, 45), { v: 3, api_ts: now });
+  const live = rig.render(state, session(waiting, 37, 51), first.after);
+  assert.match(vis(live.line), /^5h +~2\.2M\/6M +37% .*wk +~15\.3M\/30M +51% /, `the waiting session draws its own shares — got ${JSON.stringify(vis(live.line))}`);
+  assert.deepEqual([live.after.five_pct, live.after.five_at, live.after.week_pct, live.after.week_at], [37, now - 30, 51, now - 30], 'dated by the subagent\'s reply');
+  const back = rig.render(state, session(idle, 21, 45), live.after);
+  assert.match(vis(back.line), /^5h +~2\.2M\/6M +37% /, `and the idle session draws them too — got ${JSON.stringify(vis(back.line))}`);
+  // Of several subagent transcripts, the newest by mtime is read (one ls, however many there are), a workflow agent's
+  // included: an older one, listed first by name, does not date the shares.
+  const many = repliedTranscript(rig.home, 'many', now - 1800);
+  const subs = path.join(rig.home, 'many', 'subagents');
+  fs.mkdirSync(path.join(subs, 'workflows', 'wf_1'), { recursive: true });
+  fs.utimesSync(repliedTranscript(subs, 'agent-0older', now - 1700), now - 1700, now - 1700);
+  fs.utimesSync(repliedTranscript(path.join(subs, 'workflows', 'wf_1'), 'agent-w1', now - 25), now - 20, now - 20);
+  const fan = rig.render(state, session(many, 38, 52), back.after);
+  assert.deepEqual([fan.after.five_pct, fan.after.five_at, fan.after.week_pct, fan.after.week_at], [38, now - 25, 52, now - 25],
+    'dated by the newest subagent transcript, a workflow agent\'s');
+  // A subagent that finished before the session's own last reply does not date it back: the later reply does.
+  const done = repliedTranscript(rig.home, 'done', now - 15);
+  fs.mkdirSync(path.join(rig.home, 'done', 'subagents'), { recursive: true });
+  fs.utimesSync(repliedTranscript(path.join(rig.home, 'done', 'subagents'), 'agent-d1', now - 3000), now - 3000, now - 3000);
+  const own = rig.render(state, session(done, 39, 53), fan.after);
+  assert.deepEqual([own.after.five_pct, own.after.five_at, own.after.week_pct, own.after.week_at], [39, now - 15, 53, now - 15], 'dated by the session\'s own later reply');
+  // A session whose own transcript holds no reply in its last megabyte (the spawn lies further back, behind a large tool
+  // result) is dated by its subagent's reply all the same, and a subagent's reply stamped ahead of this clock counts as now.
+  const bulk = Array.from({ length: 1300 }, (_, i) => JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'tool_result', content: 'x'.repeat(1000) + i }] } })).join('\n') + '\n';
+  const buried = repliedTranscript(rig.home, 'buried', now - 1800, bulk);
+  fs.mkdirSync(path.join(rig.home, 'buried', 'subagents'), { recursive: true });
+  repliedTranscript(path.join(rig.home, 'buried', 'subagents'), 'agent-b1', now - 10);
+  const deep = rig.render(state, session(buried, 40, 54), own.after);
+  assert.deepEqual([deep.after.five_pct, deep.after.five_at, deep.after.week_pct, deep.after.week_at], [40, now - 10, 54, now - 10], 'dated by the subagent\'s reply where the session\'s own is past the tail');
+  const ahead = repliedTranscript(rig.home, 'ahead', now - 1800);
+  fs.mkdirSync(path.join(rig.home, 'ahead', 'subagents'), { recursive: true });
+  repliedTranscript(path.join(rig.home, 'ahead', 'subagents'), 'agent-c1', now + 3600);
+  const future = rig.render(state, session(ahead, 41, 55), deep.after).after;
+  assert.ok(future.five_at >= now && future.five_at <= now + 60 && future.week_at === future.five_at, `a subagent reply ahead of the clock is dated now — got ${future.five_at - now} s from now`);
+});
+
+test('statusline: the newest subagent transcript is found among more names than a command line holds, whatever ls reads from the environment (2026-10-19)', (t) => {
+  // The newest was found by one `ls -t` given every name. Past the system's limit on a command line (ARG_MAX: on Linux a
+  // quarter of the stack limit) that ls never ran, and with QUOTING_STYLE set GNU ls quoted the name it printed: either
+  // way the session was dated by its own last reply, the spawn, and nothing said so.
+  const rig = quotaLineRig();
+  if (!rig) return t.skip('python3 or jq is not installed');
+  if (process.platform === 'win32') return t.skip('ulimit and QUOTING_STYLE are POSIX');
+  const now = Math.floor(Date.now() / 1000);
+  const r5 = now + 4 * 3600 + 30, r7 = now + 3 * 86400 + 6 * 3600 + 30;
+  const state = { v: 2, last_scan: now, tpp5: 60000, tpp7: 300000, tppE5: 60000, tppE7: 300000, a30: 0, mo_start: now - 10 * 86400, mo_end: now + 20 * 86400 + 30, fc: {} };
+  const input = (tp) => JSON.stringify({ session_id: 's', model: { display_name: 'Opus 5' }, cwd: rig.home, transcript_path: tp,
+    rate_limits: { five_hour: { used_percentage: 37, resets_at: r5 }, seven_day: { used_percentage: 51, resets_at: r7 } } });
+  // An idle session's shares, recorded from its reply 25 minutes ago: newer than the spawn, older than the subagent's.
+  const idle = { v: 3, api_ts: now, five_pct: 21, five_at: now - 1500, five_reset: r5, week_pct: 45, week_at: now - 1500, week_reset: r7 };
+  const tp = repliedTranscript(rig.home, 'many', now - 1800);
+  const subs = path.join(rig.home, 'many', 'subagents');
+  fs.mkdirSync(subs, { recursive: true });
+  const name = (i) => path.join(subs, `agent-${String(i).padStart(6, '0')}${'0'.repeat(34)}.jsonl`);
+  const n = Math.ceil(330 * 1024 / (name(0).length + 1)); // their names, together, past the 256 KiB a 1 MiB stack allows
+  const old = fs.readFileSync(repliedTranscript(rig.home, 'old', now - 3000));
+  for (let i = 0; i < n; i++) { fs.writeFileSync(name(i), old); fs.utimesSync(name(i), now - 3000, now - 3000); }
+  fs.utimesSync(repliedTranscript(subs, 'agent-newest', now - 30), now - 20, now - 20);
+  const render = (args, extra = {}) => {
+    fs.writeFileSync(path.join(rig.cdir, 'statusline-usage.json'), JSON.stringify(state));
+    fs.writeFileSync(path.join(rig.cdir, 'statusline-last.json'), JSON.stringify(idle));
+    const r = cp.spawnSync('bash', args, { input: input(tp), env: { ...rig.env, ...extra }, encoding: 'utf8' });
+    assert.equal(r.status, 0, (r.stderr || '').trim());
+    const after = JSON.parse(fs.readFileSync(path.join(rig.cdir, 'statusline-last.json'), 'utf8'));
+    return [after.five_pct, after.five_at, after.week_pct, after.week_at];
+  };
+  const script = path.join(rig.cdir, 'statusline.sh');
+  assert.deepEqual(render([script], { QUOTING_STYLE: 'c' }), [37, now - 30, 51, now - 30], 'QUOTING_STYLE set: dated by the newest subagent transcript');
+  if (process.platform === 'linux') {
+    assert.ok(fs.readdirSync(subs).reduce((a, f) => a + path.join(subs, f).length + 1, 0) > 256 * 1024, 'control: the names pass the limit');
+    assert.deepEqual(render(['-c', 'ulimit -s 1024 && exec bash "$1"', '_', script]), [37, now - 30, 51, now - 30], 'past ARG_MAX: dated by the newest subagent transcript');
+  }
+});
+
+test('statusline: the account pull, dated now, replaces an older share of its window even when lower, and only a later reply replaces it (2026-10-19)', (t) => {
+  // A share can drop within a window: a plan upgrade, an early reset, a promotion that raises the limit. Kept to the
+  // largest share, the line would have shown the old one for the rest of the window, against the account's own word.
+  const rig = quotaLineRig();
+  if (!rig) return t.skip('python3 or jq is not installed');
+  const now = Math.floor(Date.now() / 1000);
+  const r5 = now + 4 * 3600 + 30, r7 = now + 3 * 86400 + 6 * 3600 + 30;
+  const state = { v: 2, last_scan: now, tpp5: 60000, tpp7: 300000, tppE5: 60000, tppE7: 300000, a30: 0, mo_start: now - 10 * 86400, mo_end: now + 20 * 86400 + 30, fc: {} };
+  const session = (tp, five, week) => ({ session_id: 's', model: { display_name: 'Opus 5' }, cwd: rig.home, transcript_path: tp,
+    ...(five === undefined ? {} : { rate_limits: { five_hour: { used_percentage: five, resets_at: r5 }, seven_day: { used_percentage: week, resets_at: r7 } } }) });
+  // eslint-disable-next-line no-control-regex
+  const vis = (s) => s.replace(/\x1b\[[0-9;]*m/g, '');
+  fs.writeFileSync(path.join(rig.cdir, '.credentials.json'), JSON.stringify({ claudeAiOauth: { accessToken: 'test-token-not-real', expiresAt: Date.now() + 3600_000 } }));
+  fs.writeFileSync(path.join(rig.home, 'usage-api.json'), JSON.stringify({ five_hour: { utilization: 10, resets_at: r5 }, seven_day: { utilization: 30, resets_at: r7 } }));
+  const pull = { STATUSLINE_USAGE_API_URL: 'file://' + path.join(rig.home, 'usage-api.json'), STATUSLINE_USAGE_API_TTL: '0' };
+  // The cache holds 49% of the week, measured ten minutes ago; the account now says 30%.
+  const pulled = rig.render(state, session('/dev/null'), { v: 3, api_ts: 0, five_pct: 12, five_at: now - 600, five_reset: r5, week_pct: 49, week_at: now - 600, week_reset: r7 }, pull);
+  assert.match(vis(pulled.line), /^5h +~600k\/6M +10% ·4h 0m {2}wk +~9M\/30M +30% ·3d 6h /, `the pull's shares — got ${JSON.stringify(vis(pulled.line))}`);
+  assert.deepEqual([pulled.after.five_pct, pulled.after.week_pct, pulled.after.week_at >= now], [10, 30, true], 'recorded, dated now');
+  // The pull a minute ago: an idle session's 49% from a reply six days ago, and the active session's from a reply two
+  // minutes ago, both older, leave it; the active session's next reply, thirty seconds ago, replaces it.
+  const afterPull = { ...pulled.after, five_at: now - 60, week_at: now - 60, api_ts: now };
+  for (const [name, ago] of [['idle', 6 * 86400], ['before-pull', 120]]) {
+    const r = rig.render(state, session(repliedTranscript(rig.home, name, now - ago), 12, 49), afterPull);
+    assert.match(vis(r.line), /^5h +~600k\/6M +10% .*wk +~9M\/30M +30% /, `${name}: the pull's shares stand — got ${JSON.stringify(vis(r.line))}`);
+    assert.deepEqual([r.after.week_pct, r.after.week_at], [30, now - 60], name);
+  }
+  const reply = rig.render(state, session(repliedTranscript(rig.home, 'after-pull', now - 30), 11, 31), afterPull);
+  assert.match(vis(reply.line), /^5h +~660k\/6M +11% .*wk +~9\.3M\/30M +31% /, `the later reply's shares — got ${JSON.stringify(vis(reply.line))}`);
+  assert.deepEqual([reply.after.five_pct, reply.after.five_at, reply.after.week_pct, reply.after.week_at], [11, now - 30, 31, now - 30], 'dated by that reply');
+  assert.equal(rig.port(), reply.line, 'the terminal app draws the same line');
+});
+
+test('statusline: a cached share stamped ahead of this clock counts as measured now, and more than five minutes ahead as undated (2026-10-19)', (t) => {
+  // A clock set back (a machine correcting its time) leaves the cache's stamps ahead of it. Dated in the future, the
+  // cached share outranked every reading until the clock caught up. A stamp ahead counts as now, as a reply's does: the
+  // account pull, dated now too, then replaces a smaller share by the rule for equal dates. Counted as now, a stamp an
+  // hour ahead still outranked every session's reply until the clock passed it: more than five minutes ahead, the time
+  // core gives a saved machine's clock, it dates nothing. Its share is still the window's, as OAK's other readouts take
+  // it: dropped as another window's, the line drew `5h —` and ended the 5h window where they drew the share.
+  const rig = quotaLineRig();
+  if (!rig) return t.skip('python3 or jq is not installed');
+  const now = Math.floor(Date.now() / 1000);
+  const r5 = now + 4 * 3600 + 30, r7 = now + 3 * 86400 + 6 * 3600 + 30;
+  const state = { v: 2, last_scan: now, tpp5: 60000, tpp7: 300000, tppE5: 60000, tppE7: 300000, a30: 0, mo_start: now - 10 * 86400, mo_end: now + 20 * 86400 + 30, fc: {} };
+  const session = (tp, five, week) => ({ session_id: 's', model: { display_name: 'Opus 5' }, cwd: rig.home, transcript_path: tp,
+    ...(five === undefined ? {} : { rate_limits: { five_hour: { used_percentage: five, resets_at: r5 }, seven_day: { used_percentage: week, resets_at: r7 } } }) });
+  // eslint-disable-next-line no-control-regex
+  const vis = (s) => s.replace(/\x1b\[[0-9;]*m/g, '');
+  fs.writeFileSync(path.join(rig.cdir, '.credentials.json'), JSON.stringify({ claudeAiOauth: { accessToken: 'test-token-not-real', expiresAt: Date.now() + 3600_000 } }));
+  fs.writeFileSync(path.join(rig.home, 'usage-api.json'), JSON.stringify({ five_hour: { utilization: 30, resets_at: r5 }, seven_day: { utilization: 60, resets_at: r7 } }));
+  const pull = { STATUSLINE_USAGE_API_URL: 'file://' + path.join(rig.home, 'usage-api.json'), STATUSLINE_USAGE_API_TTL: '0' };
+  const ahead = (s, api) => ({ v: 3, api_ts: api, five_pct: 10, five_at: now + s, five_reset: r5, week_pct: 50, week_at: now + s, week_reset: r7 });
+  // A minute ahead: as now, so the pull replaces the smaller share.
+  const r = rig.render(state, session('/dev/null'), ahead(60, 0), pull);
+  assert.match(vis(r.line), /^5h +~1\.8M\/6M +30% .*wk +~18M\/30M +60% /, `the pull's shares — got ${JSON.stringify(vis(r.line))}`);
+  assert.deepEqual([r.after.five_pct, r.after.week_pct], [30, 60], 'and they are recorded');
+  assert.ok(r.after.five_at >= now && r.after.five_at <= now + 60 && r.after.week_at === r.after.five_at, `dated now — got ${r.after.five_at - now} s from now`);
+  // An hour ahead: undated, so a reply ten seconds old replaces it, where a stamp counted as now outranked the reply.
+  const reply = rig.render(state, session(repliedTranscript(rig.home, 'replied', now - 10), 35, 65), ahead(3600, now));
+  assert.match(vis(reply.line), /^5h +~2\.1M\/6M +35% .*wk +~19\.5M\/30M +65% /, `the reply's shares — got ${JSON.stringify(vis(reply.line))}`);
+  assert.deepEqual([reply.after.five_pct, reply.after.five_at, reply.after.week_pct, reply.after.week_at], [35, now - 10, 65, now - 10], 'recorded, dated by the reply');
+  // With no reading of its own, a session draws the share an hour ahead, as the terminal app does, and a 5h reset that
+  // passed since it was measured does not end its window.
+  const lone = rig.render(state, session('/dev/null'), ahead(3600, now));
+  assert.match(vis(lone.line), /^5h +~600k\/6M +10% .*wk +~15M\/30M +50% /, `the cached shares — got ${JSON.stringify(vis(lone.line))}`);
+  assert.equal(rig.port(), lone.line, 'the terminal app draws the same line');
+  const passed = rig.render(state, session('/dev/null'), { ...ahead(3600, now), five_reset: now - 30 });
+  assert.match(vis(passed.line), /^5h +~600k\/6M +10% ·4h \d+m /, `the window it was measured in runs on — got ${JSON.stringify(vis(passed.line))}`);
+  assert.equal(rig.port(), passed.line, 'as the terminal app draws it');
+});
+
+test('statusline: a reading recorded while a render ran, stamped ahead of this clock, counts as now, and more than five minutes ahead as undated (2026-10-19)', async (t) => {
+  // The cache write ranks a reading another writer recorded since the render read the cache by the pick's rule. A minute
+  // ahead it counts as now, so this render's pull, dated now, stands; an hour ahead it dates nothing, so this render's
+  // reply-dated share replaces it, where counted as now it would have stood.
+  const rig = quotaLineRig();
+  if (!rig) return t.skip('python3 or jq is not installed');
+  if (process.platform === 'win32') return t.skip('the slowed python3 below is a POSIX shell script');
+  const py = rig.env.PATH.split(path.delimiter).map((d) => path.join(d, 'python3')).find((f) => fs.existsSync(f));
+  const slow = path.join(rig.home, 'slow-bin');
+  fs.mkdirSync(slow);
+  fs.writeFileSync(path.join(slow, 'python3'), `#!/bin/sh\nsleep 3\nexec '${py}' "$@"\n`, { mode: 0o755 });
+  const now = Math.floor(Date.now() / 1000);
+  const r5 = now + 4 * 3600 + 30, r7 = now + 3 * 86400 + 6 * 3600 + 30;
+  const state = { v: 2, last_scan: now, tpp5: 60000, tpp7: 300000, tppE5: 60000, tppE7: 300000, a30: 0, mo_start: now - 10 * 86400, mo_end: now + 20 * 86400 + 30, fc: {} };
+  const session = (tp, five, week) => ({ session_id: 's', model: { display_name: 'Opus 5' }, cwd: rig.home, transcript_path: tp,
+    ...(five === undefined ? {} : { rate_limits: { five_hour: { used_percentage: five, resets_at: r5 }, seven_day: { used_percentage: week, resets_at: r7 } } }) });
+  // eslint-disable-next-line no-control-regex
+  const vis = (s) => s.replace(/\x1b\[[0-9;]*m/g, '');
+  fs.writeFileSync(path.join(rig.cdir, '.credentials.json'), JSON.stringify({ claudeAiOauth: { accessToken: 'test-token-not-real', expiresAt: Date.now() + 3600_000 } }));
+  fs.writeFileSync(path.join(rig.home, 'usage-api.json'), JSON.stringify({ five_hour: { utilization: 30, resets_at: r5 }, seven_day: { utilization: 60, resets_at: r7 } }));
+  const pull = { STATUSLINE_USAGE_API_URL: 'file://' + path.join(rig.home, 'usage-api.json'), STATUSLINE_USAGE_API_TTL: '0' };
+  const cached = (api) => ({ v: 3, api_ts: api, five_pct: 20, five_at: now - 600, five_reset: r5, week_pct: 40, week_at: now - 600, week_reset: r7 });
+  // The render starts and its estimator takes three seconds; meanwhile another writer records a reading stamped ahead.
+  const race = async (input, extra, start, meanwhile) => {
+    fs.writeFileSync(path.join(rig.cdir, 'statusline-usage.json'), JSON.stringify(state));
+    fs.writeFileSync(path.join(rig.cdir, 'statusline-last.json'), JSON.stringify(start));
+    const rendered = new Promise((resolve) => {
+      let out = '';
+      const p = cp.spawn('bash', [path.join(rig.cdir, 'statusline.sh')], { env: { ...rig.env, ...extra, PATH: slow + path.delimiter + rig.env.PATH } });
+      p.stdout.on('data', (d) => { out += d; });
+      p.on('close', () => resolve(out.split('\n')[2] || ''));
+      p.stdin.end(JSON.stringify(input));
+    });
+    await new Promise((r) => setTimeout(r, 1000));
+    fs.writeFileSync(path.join(rig.cdir, 'statusline-last.json'), JSON.stringify({ ...start, ...meanwhile }));
+    const line = await rendered;
+    return { line, after: JSON.parse(fs.readFileSync(path.join(rig.cdir, 'statusline-last.json'), 'utf8')) };
+  };
+  // This render's pull against a reading stamped a minute ahead, recorded meanwhile: the pull stands.
+  const a = await race(session('/dev/null'), pull, cached(0), { five_pct: 10, five_at: now + 60, week_pct: 50, week_at: now + 60 });
+  assert.match(vis(a.line), /^5h +~1\.8M\/6M +30% /, `control: the render drew its pull — got ${JSON.stringify(vis(a.line))}`);
+  assert.deepEqual([a.after.five_pct, a.after.week_pct], [30, 60], 'the pull stands against a reading a minute ahead');
+  // This render's reply-dated share against a reading stamped an hour ahead, recorded meanwhile: the share replaces it.
+  const b = await race(session(repliedTranscript(rig.home, 'replied', now - 10), 35, 65), {}, cached(now), { five_pct: 10, five_at: now + 3600, week_pct: 50, week_at: now + 3600 });
+  assert.match(vis(b.line), /^5h +~2\.1M\/6M +35% /, `control: the render drew its reply's share — got ${JSON.stringify(vis(b.line))}`);
+  assert.deepEqual([b.after.five_pct, b.after.five_at, b.after.week_pct, b.after.week_at], [35, now - 10, 65, now - 10], 'the reply-dated share replaces a reading an hour ahead');
+  // A render stopped for longer than five minutes (Ctrl-Z, a machine asleep) began that long before a reading another
+  // session recorded meanwhile by a clock that is right: ahead of the render's start, not of the clock, so it stands.
+  // The render's start reads 400 s early here, as if it had begun before such a stop.
+  const realDate = rig.env.PATH.split(path.delimiter).map((d) => path.join(d, 'date')).find((f) => fs.existsSync(f));
+  const mark = path.join(rig.home, 'render-began');
+  fs.writeFileSync(path.join(slow, 'date'), `#!/bin/sh\nif [ "$1" = +%s ] && [ ! -e '${mark}' ]; then : > '${mark}'; echo $(( $('${realDate}' +%s) - 400 )); else exec '${realDate}' "$@"; fi\n`, { mode: 0o755 });
+  const t1 = Math.floor(Date.now() / 1000);
+  const c = await race(session(repliedTranscript(rig.home, 'before-stop', t1 - 410), 35, 65), {}, cached(now), { five_pct: 40, five_at: t1, week_pct: 60, week_at: t1 });
+  assert.ok(fs.existsSync(mark), 'control: the render began 400 s early');
+  assert.match(vis(c.line), /^5h +~2\.1M\/6M +35% /, `control: the render drew its own share — got ${JSON.stringify(vis(c.line))}`);
+  assert.deepEqual([c.after.five_pct, c.after.five_at, c.after.week_pct, c.after.week_at], [40, t1, 60, t1], 'a reading recorded while the render was stopped stands');
+});
+
+test('statusline: a render that finishes last keeps a newer reading another render recorded while it ran (2026-10-19)', async (t) => {
+  // Each render picks from the cache it read at its start and writes at its end, seconds later when its estimator scans.
+  // Two sessions rendering together: the one that finished last wrote its older reading over the newer one the other had
+  // just recorded, and over the account pull's (whose next pull was then five minutes away).
+  const rig = quotaLineRig();
+  if (!rig) return t.skip('python3 or jq is not installed');
+  if (process.platform === 'win32') return t.skip('the slowed python3 below is a POSIX shell script');
+  const py = rig.env.PATH.split(path.delimiter).map((d) => path.join(d, 'python3')).find((f) => fs.existsSync(f));
+  const slow = path.join(rig.home, 'slow-bin');
+  fs.mkdirSync(slow);
+  fs.writeFileSync(path.join(slow, 'python3'), `#!/bin/sh\nsleep 3\nexec '${py}' "$@"\n`, { mode: 0o755 });
+  const now = Math.floor(Date.now() / 1000);
+  const r5 = now + 4 * 3600 + 30, r7 = now + 3 * 86400 + 6 * 3600 + 30;
+  const state = { v: 2, last_scan: now, tpp5: 60000, tpp7: 300000, tppE5: 60000, tppE7: 300000, a30: 0, mo_start: now - 10 * 86400, mo_end: now + 20 * 86400 + 30, fc: {} };
+  const session = (tp, five, week) => ({ session_id: 's', model: { display_name: 'Opus 5' }, cwd: rig.home, transcript_path: tp,
+    rate_limits: { five_hour: { used_percentage: five, resets_at: r5 }, seven_day: { used_percentage: week, resets_at: r7 } } });
+  // eslint-disable-next-line no-control-regex
+  const vis = (s) => s.replace(/\x1b\[[0-9;]*m/g, '');
+  const cache = { v: 3, api_ts: now, five_pct: 12, five_at: now - 600, five_reset: r5, week_pct: 40, week_at: now - 600, week_reset: r7 };
+  fs.writeFileSync(path.join(rig.cdir, 'statusline-usage.json'), JSON.stringify(state));
+  fs.writeFileSync(path.join(rig.cdir, 'statusline-last.json'), JSON.stringify(cache));
+  // A session that replied two minutes ago starts first, and its estimator takes three seconds.
+  const slowRender = new Promise((resolve) => {
+    let out = '';
+    const p = cp.spawn('bash', [path.join(rig.cdir, 'statusline.sh')], { env: { ...rig.env, PATH: slow + path.delimiter + rig.env.PATH } });
+    p.stdout.on('data', (d) => { out += d; });
+    p.on('close', () => resolve(out.split('\n')[2] || ''));
+    p.stdin.end(JSON.stringify(session(repliedTranscript(rig.home, 'earlier', now - 120), 20, 45)));
+  });
+  await new Promise((r) => setTimeout(r, 1000));
+  // A session that replied ten seconds ago renders, and records its reading, meanwhile.
+  const fresh = rig.render(state, session(repliedTranscript(rig.home, 'later', now - 10), 25, 50), cache);
+  assert.deepEqual([fresh.after.five_pct, fresh.after.five_at], [25, now - 10], 'control: the newer reading is recorded');
+  const slowLine = await slowRender;
+  assert.match(vis(slowLine), /^5h +~1\.2M\/6M +20% /, `control: the slow render picked its own share before the other one wrote — got ${JSON.stringify(vis(slowLine))}`);
+  const after = JSON.parse(fs.readFileSync(path.join(rig.cdir, 'statusline-last.json'), 'utf8'));
+  assert.deepEqual([after.five_pct, after.five_at, after.week_pct, after.week_at], [25, now - 10, 50, now - 10], 'the render that finished last kept the newer reading');
+  // The estimate beside a kept share is the one written with it: the slow render's restated its own older share, and
+  // OAK's readouts drew ~1.2M/6M beside 25%.
+  assert.deepEqual([after.five_tok, after.five_total, after.week_tok, after.week_total], [1_500_000, 6_000_000, 15_000_000, 30_000_000], 'and the estimate that restates it');
+  assert.match(vis(rig.port()), /^5h +~1\.5M\/6M +25% .*wk +~15M\/30M +50% /, 'the terminal app draws the kept shares with their own estimates');
+  // So does a render that drew the cached shares, as an idle session's does every minute, and so writes none of its own.
+  const idleRender = new Promise((resolve) => {
+    let out = '';
+    const p = cp.spawn('bash', [path.join(rig.cdir, 'statusline.sh')], { env: { ...rig.env, PATH: slow + path.delimiter + rig.env.PATH } });
+    p.stdout.on('data', (d) => { out += d; });
+    p.on('close', () => resolve(out.split('\n')[2] || ''));
+    p.stdin.end(JSON.stringify(session(repliedTranscript(rig.home, 'idle', now - 7200), 12, 40)));
+  });
+  await new Promise((r) => setTimeout(r, 1000));
+  const newer = rig.render(state, session(repliedTranscript(rig.home, 'newer', now - 5), 30, 55), after);
+  assert.deepEqual([newer.after.five_pct, newer.after.five_at], [30, now - 5], 'control: the newer reading is recorded');
+  assert.match(vis(await idleRender), /^5h +~1\.5M\/6M +25% /, 'control: the idle session drew the cached shares');
+  const drawn = JSON.parse(fs.readFileSync(path.join(rig.cdir, 'statusline-last.json'), 'utf8'));
+  assert.deepEqual([drawn.five_pct, drawn.five_tok, drawn.week_pct, drawn.week_tok], [30, 1_800_000, 55, 16_500_000], 'a render that drew the cached shares leaves the newer ones their own estimates');
+});
+
+test('statusline: an undated share a render picked does not replace a dated one another render recorded while it ran (2026-10-19)', async (t) => {
+  // A share the render cannot date is recorded only where the cache holds nothing for its window. A render that found
+  // nothing there at its start, and wrote seconds later, stamped its undated share now over the dated one another
+  // session had recorded meanwhile, which every session then drew as the newest reading.
+  const rig = quotaLineRig();
+  if (!rig) return t.skip('python3 or jq is not installed');
+  if (process.platform === 'win32') return t.skip('the slowed python3 below is a POSIX shell script');
+  const py = rig.env.PATH.split(path.delimiter).map((d) => path.join(d, 'python3')).find((f) => fs.existsSync(f));
+  const slow = path.join(rig.home, 'slow-bin');
+  fs.mkdirSync(slow);
+  fs.writeFileSync(path.join(slow, 'python3'), `#!/bin/sh\nsleep 3\nexec '${py}' "$@"\n`, { mode: 0o755 });
+  const now = Math.floor(Date.now() / 1000);
+  const r5 = now + 4 * 3600 + 30, r7 = now + 3 * 86400 + 6 * 3600 + 30;
+  const state = { v: 2, last_scan: now, tpp5: 60000, tpp7: 300000, tppE5: 60000, tppE7: 300000, a30: 0, mo_start: now - 10 * 86400, mo_end: now + 20 * 86400 + 30, fc: {} };
+  const session = (tp, five, week) => ({ session_id: 's', model: { display_name: 'Opus 5' }, cwd: rig.home, transcript_path: tp,
+    rate_limits: { five_hour: { used_percentage: five, resets_at: r5 }, seven_day: { used_percentage: week, resets_at: r7 } } });
+  // eslint-disable-next-line no-control-regex
+  const vis = (s) => s.replace(/\x1b\[[0-9;]*m/g, '');
+  const cache = { v: 3, api_ts: now, five_reset: r5, week_reset: r7 }; // nothing yet for either window
+  fs.writeFileSync(path.join(rig.cdir, 'statusline-usage.json'), JSON.stringify(state));
+  fs.writeFileSync(path.join(rig.cdir, 'statusline-last.json'), JSON.stringify(cache));
+  const slowRender = new Promise((resolve) => {
+    let out = '';
+    const p = cp.spawn('bash', [path.join(rig.cdir, 'statusline.sh')], { env: { ...rig.env, PATH: slow + path.delimiter + rig.env.PATH } });
+    p.stdout.on('data', (d) => { out += d; });
+    p.on('close', () => resolve(out.split('\n')[2] || ''));
+    p.stdin.end(JSON.stringify(session('/dev/null', 30, 60))); // no transcript to date it by
+  });
+  await new Promise((r) => setTimeout(r, 1000));
+  const fresh = rig.render(state, session(repliedTranscript(rig.home, 'dated', now - 10), 35, 65), cache);
+  assert.deepEqual([fresh.after.five_pct, fresh.after.five_at], [35, now - 10], 'control: the dated reading is recorded');
+  assert.match(vis(await slowRender), /^5h +~1\.8M\/6M +30% /, 'control: the slow render drew its undated share, the only one at its start');
+  const after = JSON.parse(fs.readFileSync(path.join(rig.cdir, 'statusline-last.json'), 'utf8'));
+  assert.deepEqual([after.five_pct, after.five_at, after.week_pct, after.week_at], [35, now - 10, 65, now - 10], 'the dated reading stands');
+  // A reading recorded meanwhile with the share the render read at its start, newly dated, is one recorded since too:
+  // the write tells them apart by share and stamp, not by share alone.
+  const held = { v: 3, api_ts: now, five_pct: 30, five_at: now - 600, five_reset: r5, week_pct: 60, week_at: now - 600, week_reset: r7 };
+  fs.writeFileSync(path.join(rig.cdir, 'statusline-last.json'), JSON.stringify(held));
+  const second = new Promise((resolve) => {
+    const p = cp.spawn('bash', [path.join(rig.cdir, 'statusline.sh')], { env: { ...rig.env, PATH: slow + path.delimiter + rig.env.PATH } });
+    p.on('close', resolve);
+    p.stdin.end(JSON.stringify(session(repliedTranscript(rig.home, 'earlier', now - 120), 30, 60)));
+  });
+  await new Promise((r) => setTimeout(r, 1000));
+  const same = rig.render(state, session(repliedTranscript(rig.home, 'later', now - 10), 30, 60), held);
+  assert.deepEqual([same.after.five_pct, same.after.five_at], [30, now - 10], 'control: the same share, newly dated, is recorded');
+  await second;
+  const restamped = JSON.parse(fs.readFileSync(path.join(rig.cdir, 'statusline-last.json'), 'utf8'));
+  assert.deepEqual([restamped.five_pct, restamped.five_at, restamped.week_pct, restamped.week_at], [30, now - 10, 60, now - 10], 'the newer stamp stands');
+});
+
+test('statusline: of two renders that ran together, the cache keeps the later window, whichever finished last and whatever their dates (2026-10-19)', async (t) => {
+  // A render that finds a window ended records 0 for the 5h window (and an undated share for the week), dated now. A
+  // session whose reply had just begun the next windows records its shares of them, dated by that reply, a moment
+  // earlier. By date alone, whichever wrote last decided: the ended window's 0 was kept beside the new window's reset,
+  // and later renders kept it as the newer reading. The later window wins, as it does when a render picks its readings.
+  const rig = quotaLineRig();
+  if (!rig) return t.skip('python3 or jq is not installed');
+  if (process.platform === 'win32') return t.skip('the slowed python3 below is a POSIX shell script');
+  const py = rig.env.PATH.split(path.delimiter).map((d) => path.join(d, 'python3')).find((f) => fs.existsSync(f));
+  const slow = path.join(rig.home, 'slow-bin');
+  fs.mkdirSync(slow);
+  fs.writeFileSync(path.join(slow, 'python3'), `#!/bin/sh\nsleep 3\nexec '${py}' "$@"\n`, { mode: 0o755 });
+  const now = Math.floor(Date.now() / 1000);
+  // Both windows reset ten minutes ago; the next ones end five hours and a week after a reply five seconds ago began them.
+  const ended = now - 600, r5 = now - 5 + 18000, r7 = ended + 604800;
+  const state = { v: 2, last_scan: now, tpp5: 60000, tpp7: 300000, tppE5: 60000, tppE7: 300000, a30: 0, mo_start: now - 10 * 86400, mo_end: now + 20 * 86400 + 30, fc: {} };
+  const cache = { v: 3, api_ts: now, five_pct: 40, five_at: now - 2 * 3600, five_reset: ended, week_pct: 70, week_at: now - 2 * 86400, week_reset: ended };
+  // A session sending shares with no reset (as an account pull that reports no 5h window does for that one) finds both
+  // windows ended; one whose reply five seconds ago began the next ones sends them with their resets.
+  const endedSession = { session_id: 's', model: { display_name: 'Opus 5' }, cwd: rig.home, transcript_path: '/dev/null',
+    rate_limits: { five_hour: { used_percentage: 0 }, seven_day: { used_percentage: 0 } } };
+  const nextSession = { session_id: 's', model: { display_name: 'Opus 5' }, cwd: rig.home, transcript_path: repliedTranscript(rig.home, 'next', now - 5),
+    rate_limits: { five_hour: { used_percentage: 3, resets_at: r5 }, seven_day: { used_percentage: 2, resets_at: r7 } } };
+  // eslint-disable-next-line no-control-regex
+  const vis = (s) => s.replace(/\x1b\[[0-9;]*m/g, '');
+  const shares = (a) => [a.five_pct, a.five_at, a.five_reset, a.week_pct, a.week_at, a.week_reset];
+  const next = [3, now - 5, r5, 2, now - 5, r7];
+  // The first render starts, and its estimator takes three seconds; the other renders and records its reading meanwhile.
+  const race = async (first, second) => {
+    fs.writeFileSync(path.join(rig.cdir, 'statusline-usage.json'), JSON.stringify(state));
+    fs.writeFileSync(path.join(rig.cdir, 'statusline-last.json'), JSON.stringify(cache));
+    const slowRender = new Promise((resolve) => {
+      let out = '';
+      const p = cp.spawn('bash', [path.join(rig.cdir, 'statusline.sh')], { env: { ...rig.env, PATH: slow + path.delimiter + rig.env.PATH } });
+      p.stdout.on('data', (d) => { out += d; });
+      p.on('close', () => resolve(out.split('\n')[2] || ''));
+      p.stdin.end(JSON.stringify(first));
+    });
+    await new Promise((r) => setTimeout(r, 1000));
+    const fast = rig.render(state, second, cache);
+    return { fast, slowLine: await slowRender, after: JSON.parse(fs.readFileSync(path.join(rig.cdir, 'statusline-last.json'), 'utf8')) };
+  };
+  // The render that found the windows ended finishes last: the next windows' shares stand, with their resets.
+  const a = await race(endedSession, nextSession);
+  assert.deepEqual(shares(a.fast.after), next, 'control: the next windows\' shares are recorded');
+  assert.match(vis(a.slowLine), /^5h +~0\/6M +0% {2}wk +~0\/30M +0% /, `control: the slow render found the windows ended before the other one wrote — got ${JSON.stringify(vis(a.slowLine))}`);
+  assert.deepEqual(shares(a.after), next, 'the later windows\' shares stand, with their resets');
+  // The other way round: the render with the next windows' shares finishes last, after an ended window's later 0.
+  const b = await race(nextSession, endedSession);
+  assert.equal(b.fast.after.five_pct, 0, 'control: the ended window\'s 0 is recorded');
+  assert.match(vis(b.slowLine), /^5h +~180k\/6M +3% /, `control: the slow render drew the next window — got ${JSON.stringify(vis(b.slowLine))}`);
+  assert.deepEqual(shares(b.after), next, 'it records them over the ended window\'s 0, which is of an earlier window');
+});
+
+test('statusline: two renders writing the cache together leave it whole (2026-10-19)', async (t) => {
+  // Every render wrote the cache through one temporary file name and renamed it. A second render truncated the file the
+  // first was about to rename, then wrote into it after the rename, and a longer first write left its tail behind the
+  // second's: the cache stopped parsing, and the next render rebuilt it from nothing, the spend ledger and every
+  // recorded share lost.
+  const rig = quotaLineRig();
+  if (!rig) return t.skip('python3 or jq is not installed');
+  if (process.platform === 'win32') return t.skip('the slowed jq below is a POSIX shell script');
+  const jq = rig.env.PATH.split(path.delimiter).map((d) => path.join(d, 'jq')).find((f) => fs.existsSync(f));
+  const slow = path.join(rig.home, 'slow-jq');
+  fs.mkdirSync(slow);
+  // The cache write, the one jq call given `--arg est5`, is held open for a second.
+  fs.writeFileSync(path.join(slow, 'jq'), `#!/bin/sh\nfor a in "$@"; do if [ "$a" = est5 ]; then sleep 1; break; fi; done\nexec '${jq}' "$@"\n`, { mode: 0o755 });
+  const now = Math.floor(Date.now() / 1000);
+  const r5 = now + 4 * 3600 + 30, r7 = now + 3 * 86400 + 6 * 3600 + 30;
+  fs.writeFileSync(path.join(rig.cdir, 'statusline-usage.json'), JSON.stringify({ v: 2, last_scan: now, tpp5: 60000, tpp7: 300000, tppE5: 60000, tppE7: 300000, a30: 0, fc: {} }));
+  fs.writeFileSync(path.join(rig.cdir, 'statusline-last.json'), JSON.stringify({ v: 3, api_ts: now, costs: { kept: { usd: 9, at: now - 60 } } }));
+  const session = (cwd, five) => ({ session_id: 's' + five, model: { display_name: 'Opus 5' }, cwd, transcript_path: '/dev/null',
+    rate_limits: { five_hour: { used_percentage: five, resets_at: r5 }, seven_day: { used_percentage: 40, resets_at: r7 } } });
+  const start = (input) => new Promise((resolve) => {
+    const p = cp.spawn('bash', [path.join(rig.cdir, 'statusline.sh')], { env: { ...rig.env, PATH: slow + path.delimiter + rig.env.PATH } });
+    p.on('close', resolve);
+    p.stdin.end(JSON.stringify(input));
+  });
+  const first = start(session(path.join(rig.home, 'x'.repeat(400)), 25)); // the longer write
+  await new Promise((r) => setTimeout(r, 500));
+  await Promise.all([first, start(session(rig.home, 26))]);
+  const text = fs.readFileSync(path.join(rig.cdir, 'statusline-last.json'), 'utf8');
+  let cache = null;
+  assert.doesNotThrow(() => { cache = JSON.parse(text); }, `the cache parses — got ${text.length} bytes`);
+  assert.equal(cache.costs.kept.usd, 9, 'and keeps what it held');
+  assert.deepEqual(fs.readdirSync(rig.cdir).filter((f) => f.includes('.tmp') || f.endsWith('.lock')), [], 'no temporary file or lock is left behind');
+  // Each render's temporary file has its own name, so a write that fails (here jq refuses the cache write) removes its
+  // own: none is left to pile up beside the cache.
+  const failing = path.join(rig.home, 'failing-jq');
+  fs.mkdirSync(failing);
+  fs.writeFileSync(path.join(failing, 'jq'), `#!/bin/sh\nfor a in "$@"; do if [ "$a" = est5 ]; then exit 3; fi; done\nexec '${jq}' "$@"\n`, { mode: 0o755 });
+  const failed = cp.spawnSync('bash', [path.join(rig.cdir, 'statusline.sh')], { input: JSON.stringify(session(rig.home, 27)), env: { ...rig.env, PATH: failing + path.delimiter + rig.env.PATH }, encoding: 'utf8' });
+  assert.equal(failed.status, 0, (failed.stderr || '').trim());
+  assert.deepEqual(fs.readdirSync(rig.cdir).filter((f) => f.includes('.tmp')), [], 'a failed write leaves no temporary file');
+  assert.ok(!fs.existsSync(path.join(rig.cdir, 'statusline-last.json.lock')), 'nor the cache\'s lock');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(rig.cdir, 'statusline-last.json'), 'utf8')).costs.kept.usd, 9, 'and the cache as it was');
+  // Nor does a render ended inside its write (a runner's timeout): no later render would write over a name of its own.
+  const ended = cp.spawn('bash', [path.join(rig.cdir, 'statusline.sh')], { env: { ...rig.env, PATH: slow + path.delimiter + rig.env.PATH }, detached: true });
+  ended.stdin.end(JSON.stringify(session(rig.home, 28)));
+  await new Promise((r) => setTimeout(r, 700)); // inside the held write
+  assert.ok(fs.readdirSync(rig.cdir).some((f) => f.includes('.tmp')), 'control: the write is under way');
+  process.kill(-ended.pid, 'SIGTERM');
+  await new Promise((r) => ended.on('close', r));
+  await new Promise((r) => setTimeout(r, 1500)); // past the held jq's second, had it outlived the render
+  assert.deepEqual(fs.readdirSync(rig.cdir).filter((f) => f.includes('.tmp')), [], 'a render ended inside its write leaves no temporary file');
+  assert.ok(!fs.existsSync(path.join(rig.cdir, 'statusline-last.json.lock')), 'and releases the cache\'s lock');
+});
+
+test('statusline: a cache past 128 KiB is still written, as it reaches jq on its standard input (2026-10-30)', (t) => {
+  // Linux refuses any one argument over 128 KiB (MAX_ARG_STRLEN), and the whole cache went to the write as one
+  // (--argjson old): a month's spend ledger over many sessions made every render's write fail, and the cache stopped
+  // changing, silently.
+  const rig = quotaLineRig();
+  if (!rig) return t.skip('python3 or jq is not installed');
+  const now = Math.floor(Date.now() / 1000);
+  const costs = Object.fromEntries(Array.from({ length: 2000 }, (_, i) => [`${String(i).padStart(8, '0')}-aaaa-4bbb-8ccc-dddddddddddd`, { usd: 1.23456789 + i, at: now - i * 60 }]));
+  const cache = { v: 3, api_ts: now, costs };
+  assert.ok(JSON.stringify(cache).length > 131_072, 'control: past the limit');
+  const input = { session_id: 'big', model: { display_name: 'Opus 5' }, cwd: rig.home, transcript_path: '/dev/null', cost: { total_cost_usd: 4.5 },
+    rate_limits: { five_hour: { used_percentage: 12, resets_at: now + 3600 }, seven_day: { used_percentage: 30, resets_at: now + 86400 } } };
+  const after = rig.render({ v: 2, last_scan: now, a30: 0, fc: {} }, input, cache).after;
+  assert.deepStrictEqual([after.five_pct, after.week_pct, after.costs.big.usd, Object.keys(after.costs).length], [12, 30, 4.5, 2001], 'written, with the ledger whole');
+  const b32 = bash32(); // stock macOS's bash, where there is one
+  if (b32) {
+    const again = rig.render({ v: 2, last_scan: now, a30: 0, fc: {} }, input, cache, {}, b32).after;
+    assert.deepStrictEqual([again.five_pct, again.week_pct, again.costs.big.usd, Object.keys(again.costs).length], [12, 30, 4.5, 2001], 'and under bash 3.2');
+  }
+});
+
+/** Run the rig's status line on `input` in the background, as every session does every minute: resolves with its exit
+ *  code, its output and how long it ran in ms. */
+function startRender(rig, input, extra = {}, bash = 'bash') {
+  return new Promise((resolve) => {
+    const t0 = Date.now();
+    let out = '';
+    const p = cp.spawn(bash, [path.join(rig.cdir, 'statusline.sh')], { env: { ...rig.env, ...extra } });
+    p.stdout.on('data', (d) => { out += d; });
+    p.on('close', (code) => resolve({ code, out, ms: Date.now() - t0 }));
+    p.stdin.end(JSON.stringify(input));
+  });
+}
+
+/** The cache lock's tests: a calibration fresh enough that no scan runs, a cache holding an older reading and another
+ *  session's spend, and `session`, the payload of a session that replied `ago` seconds back with those shares and spend.
+ *  `reset` puts both files back and removes the lock. */
+function lockFixture(rig) {
+  const now = Math.floor(Date.now() / 1000);
+  const r5 = now + 4 * 3600 + 30, r7 = now + 3 * 86400 + 6 * 3600 + 30;
+  const state = { v: 2, last_scan: now, tpp5: 60000, tpp7: 300000, tppE5: 60000, tppE7: 300000, a30: 0, mo_start: now - 10 * 86400, mo_end: now + 20 * 86400 + 30, fc: {} };
+  const cache = { v: 3, api_ts: now, five_pct: 12, five_at: now - 600, five_reset: r5, week_pct: 40, week_at: now - 600, week_reset: r7, costs: { kept: { usd: 9, at: now - 60 } } };
+  const session = (id, ago, five, week, usd) => ({ session_id: id, model: { display_name: 'Opus 5' }, cwd: rig.home,
+    transcript_path: repliedTranscript(rig.home, id, now - ago), cost: { total_cost_usd: usd },
+    rate_limits: { five_hour: { used_percentage: five, resets_at: r5 }, seven_day: { used_percentage: week, resets_at: r7 } } });
+  const lock = path.join(rig.cdir, 'statusline-last.json.lock');
+  const file = path.join(rig.cdir, 'statusline-last.json');
+  const reset = () => {
+    fs.writeFileSync(path.join(rig.cdir, 'statusline-usage.json'), JSON.stringify(state));
+    fs.writeFileSync(file, JSON.stringify(cache));
+    fs.rmSync(lock, { recursive: true, force: true });
+  };
+  return { now, cache, session, lock, reset, read: () => JSON.parse(fs.readFileSync(file, 'utf8')) };
+}
+
+test('statusline: two renders started together each keep what the other recorded (2026-10-20)', async (t) => {
+  // Every session renders every minute, and a render rewrites the whole cache from the copy it read just before. Of two
+  // started together, the one that renamed last put back what the other had just recorded: an idle session's write undid
+  // the share and its date the active session had just recorded, and the spend either had reported (19 times in 20 on a
+  // Mac). The read through the rename runs under the cache's lock, so the second to write reads what the first wrote.
+  const rig = quotaLineRig();
+  if (!rig) return t.skip('python3 or jq is not installed');
+  const f = lockFixture(rig);
+  const active = f.session('active', 10, 25, 50, 2.5);
+  const idle = f.session('idle', 7200, 12, 40, 1.25); // its reply is older than the cached share, so it draws that share
+  // eslint-disable-next-line no-control-regex
+  const vis = (s) => s.replace(/\x1b\[[0-9;]*m/g, '');
+  // A render that waits past its patience for the other's lock writes nothing, by design (the test below this one), and the
+  // cache then holds only the other's reading and spend. A slow runner gets there: with the two renders starved of CPU on
+  // Linux, the first held the lock for about a second and the second gave up after two, and the cache lost a reading or a
+  // spend, as it did on a Windows runner. So each render notes whether it still held the lock once its write was done, and
+  // a pair in which one did not is rendered again, up to ten times as many pairs as the runs ask for, in all: starved so,
+  // the 12 runs rendered 2 to 17 pairs again, one of them ten times in a row. What a pair left in the cache is checked once
+  // both wrote.
+  const script = path.join(rig.cdir, 'statusline.sh');
+  const src = fs.readFileSync(script, 'utf8');
+  assert.equal(src.split('\n_unlock\n').length, 2, 'control: the render releases the lock here, once, after its write');
+  fs.writeFileSync(script, src.replace('\n_unlock\n', '\n[ -n "$_lt" ] && [ -d "$_LAST.lock/$_lt" ] && echo held > "$OAK_TEST_HELD"\n_unlock\n'));
+  const held = (input) => path.join(rig.home, `held-${input.session_id}`);
+  let again = 0;
+  const together = async (bash, runs) => {
+    const allowed = again + 10 * runs;
+    for (let i = 1; i <= runs; i++) {
+      for (;;) {
+        f.reset();
+        const pair = i % 2 ? [active, idle] : [idle, active];
+        for (const input of pair) fs.rmSync(held(input), { force: true });
+        const renders = await Promise.all(pair.map((input) => startRender(rig, input, { OAK_TEST_HELD: held(input) }, bash)));
+        for (const r of renders) {
+          assert.equal(r.code, 0, `run ${i}`);
+          assert.match(vis(r.out.split('\n')[2] || ''), /^5h /, `run ${i}: each render draws its quota line`);
+        }
+        const both = pair.every((input) => fs.existsSync(held(input)));
+        if (both) {
+          const after = f.read();
+          assert.deepEqual([after.five_pct, after.five_at, after.week_pct, after.week_at], [25, f.now - 10, 50, f.now - 10], `run ${i}: the newer reading stands`);
+          assert.deepEqual([after.costs.active?.usd, after.costs.idle?.usd, after.costs.kept?.usd], [2.5, 1.25, 9], `run ${i}: and every session's spend`);
+        }
+        assert.deepEqual(fs.readdirSync(rig.cdir).filter((n) => /\.(tmp|lock)/.test(n)), [], `run ${i}: no lock or temporary file is left`);
+        if (both) break;
+        assert.ok(++again <= allowed, `run ${i}: ${10 * runs} pairs were rendered again, the most ${runs} runs allow, each because one render ended without the lock and wrote nothing`);
+      }
+    }
+  };
+  await together('bash', process.platform === 'win32' ? 4 : 12);
+  const b32 = bash32();
+  if (b32) {
+    const v = cp.spawnSync(b32, ['-c', 'printf %s "$BASH_VERSION"'], { encoding: 'utf8' }).stdout;
+    assert.match(v, /^3\.2\./, 'control: the renders below run under bash 3.2');
+    await together(b32, 6);
+    t.diagnostic(`bash ${v}: 6 pairs of renders`);
+  }
+  t.diagnostic(`${again} pairs rendered again, a render in each having ended without the lock`);
+});
+
+test('statusline: a render waits about a second for a held cache lock, then writes nothing and still draws its line (2026-10-20)', async (t) => {
+  // The lock is held by another render: its token was taken this second, or it has no token yet (its holder is between
+  // its two mkdirs). The render waits about a second (50 tries 20 ms apart, never past 2 s) and, without the lock, writes
+  // nothing: the next render, a minute on, writes what it would have. It draws its line all the same. A render holds the
+  // lock only while its token is the only one, so a lock another render took while this one made its own is held too.
+  const rig = quotaLineRig();
+  if (!rig) return t.skip('python3 or jq is not installed');
+  const f = lockFixture(rig);
+  const input = f.session('waiting', 10, 25, 50, 2.5);
+  // eslint-disable-next-line no-control-regex
+  const vis = (s) => s.replace(/\x1b\[[0-9;]*m/g, '');
+  const entries = () => (fs.existsSync(f.lock) ? fs.readdirSync(f.lock).map((n) => n.replace(/^\d+\./, 'T.')) : null);
+  // The wait is timed inside the render, around the lock's wait alone. A render's whole time is mostly process starts,
+  // which on a Windows runner (about 4 s a render) vary by more than the wait: a render with the lock held, which waits
+  // and skips the write, ran 217 ms and once 1272 ms shorter than the same render with it free.
+  const script = path.join(rig.cdir, 'statusline.sh');
+  const src = fs.readFileSync(script, 'utf8');
+  assert.ok(src.includes('\n_lock && _sweep\n'), 'control: the render takes the lock here');
+  fs.writeFileSync(script, src.replace('\n_lock && _sweep\n', '\nTIMEFORMAT=%3R; { time _lock; } 2>> "$OAK_TEST_LOCK_WAITS" && _sweep\n'));
+  rig.env.OAK_TEST_LOCK_WAITS = path.join(rig.home, 'lock-waits');
+  const waits = () => (fs.existsSync(rig.env.OAK_TEST_LOCK_WAITS) ? fs.readFileSync(rig.env.OAK_TEST_LOCK_WAITS, 'utf8').trim().split('\n')
+    .map((l) => Math.round(Number(l.replace(',', '.')) * 1000)) : []);
+  f.reset();
+  const base = await startRender(rig, input); // the same render with the lock free
+  assert.equal(f.read().five_pct, 25, 'control: with the lock free, the render writes');
+  assert.equal(waits().length, 1, 'control: the render timed its lock');
+  const held = async (name, setup, extra = {}, bash = 'bash') => {
+    f.reset();
+    setup();
+    const before = entries();
+    const timed = waits().length;
+    const r = await startRender(rig, input, extra, bash);
+    assert.equal(r.code, 0, name);
+    assert.match(vis(r.out.split('\n')[2] || ''), /^5h +~1\.5M\/6M +25% /, `${name}: the line is drawn — got ${JSON.stringify(vis(r.out))}`);
+    assert.equal(waits().length, timed + 1, `${name}: control: the render timed its lock`);
+    const waited = waits().at(-1);
+    assert.ok(waited >= 600 && waited <= 3000, `${name}: it waited about a second, and no longer — ${waited} ms for the lock, in a render of ${r.ms} ms (${base.ms} ms with the lock free)`);
+    assert.deepEqual(f.read(), f.cache, `${name}: and wrote nothing`);
+    return { before, after: entries() };
+  };
+  const token = () => fs.mkdirSync(path.join(f.lock, `${Math.floor(Date.now() / 1000)}.99999.1`), { recursive: true });
+  let r = await held('a token taken this second', token);
+  assert.deepEqual(r.after, r.before, 'the lock is left to its holder');
+  r = await held('no token yet', () => fs.mkdirSync(f.lock));
+  assert.deepEqual(r.after, [], 'the lock is left to its holder');
+  const b32 = bash32();
+  if (b32) await held('a token taken this second, under bash 3.2', token, {}, b32);
+  if (process.platform === 'win32') return; // the mkdir below is a POSIX shell script
+  // The render makes the lock, and before its token goes in, another render removes it, empty, and takes it with its own.
+  const realMkdir = rig.env.PATH.split(path.delimiter).map((d) => path.join(d, 'mkdir')).find((p) => fs.existsSync(p));
+  const fake = path.join(rig.home, 'taken-meanwhile');
+  fs.mkdirSync(fake);
+  const mark = path.join(rig.home, 'taken');
+  fs.writeFileSync(path.join(fake, 'mkdir'), `#!/bin/sh\nif [ "$1" = '${f.lock}' ] && [ ! -e '${mark}' ]; then\n  : > '${mark}'; '${realMkdir}' "$1" || exit 1\n  rmdir "$1" && '${realMkdir}' "$1" "$1/$(date +%s).99999.2"; exit 0\nfi\nexec '${realMkdir}' "$@"\n`, { mode: 0o755 });
+  r = await held('a lock taken while this render made its own', () => {}, { PATH: fake + path.delimiter + rig.env.PATH });
+  assert.ok(fs.existsSync(mark), 'control: the lock was taken meanwhile');
+  assert.deepEqual(r.after, ['T.99999.2'], 'and is left to the render that took it');
+});
+
+test('statusline: a stale cache lock is broken, and never a lock taken since it was judged (2026-10-20)', (t) => {
+  // A render killed while it holds the lock leaves it behind (the next test kills one). A token 5 s old, or 5 s ahead of
+  // the clock (one set back), or a lock with no token for 5 s by its own time, is a holder that died: the render removes
+  // it and writes. It removes the token by its name and then the lock only if it is empty, so a lock another render took
+  // after this one judged the old one stale, which holds that render's token, stands: removed, the two would write at once.
+  const rig = quotaLineRig();
+  if (!rig) return t.skip('python3 or jq is not installed');
+  const f = lockFixture(rig);
+  const input = f.session('breaking', 10, 25, 50, 2.5);
+  const render = (setup, extra = {}, bash = 'bash') => {
+    f.reset();
+    setup();
+    const r = cp.spawnSync(bash, [path.join(rig.cdir, 'statusline.sh')], { input: JSON.stringify(input), env: { ...rig.env, ...extra }, encoding: 'utf8' });
+    assert.equal(r.status, 0, (r.stderr || '').trim());
+    return f.read();
+  };
+  const b32 = bash32();
+  for (const [name, setup] of [
+    ['a token a minute old', () => fs.mkdirSync(path.join(f.lock, `${f.now - 60}.99999.1`), { recursive: true })],
+    ['a token an hour ahead of the clock', () => fs.mkdirSync(path.join(f.lock, `${f.now + 3600}.99999.1`), { recursive: true })],
+    ['no token for a minute', () => { fs.mkdirSync(f.lock); fs.utimesSync(f.lock, f.now - 60, f.now - 60); }],
+  ]) {
+    for (const bash of b32 ? ['bash', b32] : ['bash']) {
+      const after = render(setup, {}, bash);
+      assert.deepEqual([after.five_pct, after.five_at, after.costs.breaking?.usd, after.costs.kept?.usd], [25, f.now - 10, 2.5, 9], `${name}: broken, and the render wrote (${bash})`);
+      assert.ok(!fs.existsSync(f.lock), `${name}: and released it (${bash})`);
+    }
+  }
+  if (process.platform === 'win32') return; // the rm and rmdir below are POSIX shell scripts
+  // A stale lock this render cannot remove (another user's, as a render run under sudo leaves it) is renamed aside, and
+  // the render writes: left in place, it kept every later render from writing. Root removes it anyway, so not as root.
+  if (process.getuid?.() !== 0) {
+    for (const bash of b32 ? ['bash', b32] : ['bash']) {
+      const after = render(() => { fs.mkdirSync(path.join(f.lock, `${f.now - 60}.99999.1`), { recursive: true }); fs.chmodSync(f.lock, 0o555); }, {}, bash);
+      const left = fs.existsSync(f.lock);
+      if (left) fs.chmodSync(f.lock, 0o755);
+      const aside = fs.readdirSync(rig.cdir).filter((n) => n.startsWith('statusline-last.json.lock.'));
+      for (const n of aside) { fs.chmodSync(path.join(rig.cdir, n), 0o755); fs.rmSync(path.join(rig.cdir, n), { recursive: true, force: true }); }
+      assert.deepEqual([after.five_pct, after.costs.breaking?.usd, left], [25, 2.5, false], `a stale lock it cannot remove is renamed aside, and the render writes (${bash})`);
+      assert.equal(aside.length, 1, `control: the lock could not be removed where it was (${bash})`);
+    }
+  }
+  // Between this render judging the lock stale and removing it, another render removes it and takes it: the first removal
+  // this render makes on the lock waits for that.
+  const real = (name) => rig.env.PATH.split(path.delimiter).map((d) => path.join(d, name)).find((p) => fs.existsSync(p));
+  const fake = path.join(rig.home, 'taken-since');
+  fs.mkdirSync(fake);
+  const mark = path.join(rig.home, 'taken');
+  for (const name of ['rm', 'rmdir']) {
+    fs.writeFileSync(path.join(fake, name), `#!/bin/sh\ncase "$*" in *'${f.lock}'*) if [ ! -e '${mark}' ]; then\n  : > '${mark}'; '${real('rm')}' -rf '${f.lock}'; '${real('mkdir')}' -p '${f.lock}/'"$(date +%s)".99999.3\nfi ;; esac\nexec '${real(name)}' "$@"\n`, { mode: 0o755 });
+  }
+  const after = render(() => fs.mkdirSync(path.join(f.lock, `${f.now - 60}.99999.1`), { recursive: true }), { PATH: fake + path.delimiter + rig.env.PATH });
+  assert.ok(fs.existsSync(mark), 'control: the lock was taken between this render judging it and removing it');
+  assert.deepEqual(fs.existsSync(f.lock) && fs.readdirSync(f.lock).map((n) => n.replace(/^\d+\./, 'T.')), ['T.99999.3'], 'the lock taken since stands, with its token');
+  assert.deepEqual(after, f.cache, 'and this render, without it, wrote nothing');
+});
+
+test('statusline: a render killed inside its write leaves a lock the first render 5 s on breaks (2026-10-20)', async (t) => {
+  // SIGKILL runs no trap, so the lock stays, its holder gone. Within 5 s a render takes it for held, as it must a live
+  // holder's (whose write takes milliseconds): it waits about a second and writes nothing. The first render after breaks it.
+  const rig = quotaLineRig();
+  if (!rig) return t.skip('python3 or jq is not installed');
+  if (process.platform === 'win32') return t.skip('the slowed jq and the process group below are POSIX');
+  const f = lockFixture(rig);
+  f.reset();
+  const jq = rig.env.PATH.split(path.delimiter).map((d) => path.join(d, 'jq')).find((p) => fs.existsSync(p));
+  const slow = path.join(rig.home, 'slow-jq');
+  fs.mkdirSync(slow);
+  fs.writeFileSync(path.join(slow, 'jq'), `#!/bin/sh\nfor a in "$@"; do if [ "$a" = est5 ]; then sleep 5; break; fi; done\nexec '${jq}' "$@"\n`, { mode: 0o755 });
+  const killed = cp.spawn('bash', [path.join(rig.cdir, 'statusline.sh')], { env: { ...rig.env, PATH: slow + path.delimiter + rig.env.PATH }, detached: true });
+  const closed = new Promise((r) => killed.on('close', r));
+  killed.stdin.end(JSON.stringify(f.session('killed', 120, 20, 45, 1)));
+  const writing = () => fs.readdirSync(rig.cdir).some((n) => n.includes('.tmp'));
+  for (const end = Date.now() + 10_000; !writing() && Date.now() < end;) await new Promise((r) => setTimeout(r, 50));
+  assert.ok(writing(), 'control: the render is inside its write');
+  process.kill(-killed.pid, 'SIGKILL');
+  await closed;
+  const left = fs.readdirSync(f.lock);
+  assert.equal(left.length, 1, 'the killed render left its lock, with its token');
+  const input = f.session('next', 10, 25, 50, 2.5);
+  const early = await startRender(rig, input);
+  assert.ok(early.ms >= 900, `a render within 5 s waits for it — ${early.ms} ms`);
+  assert.deepEqual(f.read(), f.cache, 'and writes nothing');
+  assert.deepEqual(fs.readdirSync(f.lock), left, 'nor breaks it');
+  const taken = Number(left[0].split('.')[0]);
+  await new Promise((r) => setTimeout(r, Math.max(0, (taken + 6) * 1000 - Date.now())));
+  const late = await startRender(rig, input);
+  assert.equal(late.code, 0);
+  const after = f.read();
+  assert.deepEqual([after.five_pct, after.five_at, after.costs.next?.usd, after.costs.kept?.usd], [25, f.now - 10, 2.5, 9], 'the first render 5 s on breaks it and writes');
+  assert.ok(!fs.existsSync(f.lock), 'and releases it');
+});
+
+test('statusline: a render stopped until its lock went stale writes nothing over the render that broke it (2026-10-20)', async (t) => {
+  // A render stopped while it holds the lock (Ctrl-Z, a machine asleep) has lost it once its token is 5 s old: another
+  // render breaks it and writes. Resumed, the stopped render holds a write made from the cache as it read it before, and
+  // renames it only while its token is still there: it writes nothing over the newer reading, and draws its line.
+  const rig = quotaLineRig();
+  if (!rig) return t.skip('python3 or jq is not installed');
+  if (process.platform === 'win32') return t.skip('the slowed jq and the process group below are POSIX');
+  const f = lockFixture(rig);
+  f.reset();
+  const jq = rig.env.PATH.split(path.delimiter).map((d) => path.join(d, 'jq')).find((p) => fs.existsSync(p));
+  const slow = path.join(rig.home, 'slow-jq');
+  fs.mkdirSync(slow);
+  fs.writeFileSync(path.join(slow, 'jq'), `#!/bin/sh\nfor a in "$@"; do if [ "$a" = est5 ]; then sleep 1; break; fi; done\nexec '${jq}' "$@"\n`, { mode: 0o755 });
+  // eslint-disable-next-line no-control-regex
+  const vis = (s) => s.replace(/\x1b\[[0-9;]*m/g, '');
+  const stopped = cp.spawn('bash', [path.join(rig.cdir, 'statusline.sh')], { env: { ...rig.env, PATH: slow + path.delimiter + rig.env.PATH }, detached: true });
+  let out = '';
+  stopped.stdout.on('data', (d) => { out += d; });
+  const closed = new Promise((r) => stopped.on('close', r));
+  stopped.stdin.end(JSON.stringify(f.session('stopped', 120, 20, 45, 1)));
+  const writing = () => fs.readdirSync(rig.cdir).some((n) => n.includes('.tmp'));
+  for (const end = Date.now() + 10_000; !writing() && Date.now() < end;) await new Promise((r) => setTimeout(r, 50));
+  assert.ok(writing(), 'control: the render is inside its write');
+  process.kill(-stopped.pid, 'SIGSTOP');
+  try {
+    // Its token turns 5 s old: renamed to the age it would have, rather than waited for.
+    const [tok] = fs.readdirSync(f.lock);
+    const [taken, ...rest] = tok.split('.');
+    fs.renameSync(path.join(f.lock, tok), path.join(f.lock, [Number(taken) - 60, ...rest].join('.')));
+    await startRender(rig, f.session('later', 10, 25, 50, 2.5));
+    assert.deepEqual([f.read().five_pct, f.read().costs.later?.usd], [25, 2.5], 'control: another render broke the lock and wrote');
+  } finally {
+    // Resumed whatever failed above: a render left stopped holds this file's process open, and the whole run never ends.
+    process.kill(-stopped.pid, 'SIGCONT');
+  }
+  await closed;
+  assert.match(vis(out.split('\n')[2] || ''), /^5h +~1\.2M\/6M +20% /, `the resumed render draws its line — got ${JSON.stringify(vis(out))}`);
+  const after = f.read();
+  assert.deepEqual([after.five_pct, after.five_at, after.costs.later?.usd, after.costs.stopped], [25, f.now - 10, 2.5, undefined], 'and writes nothing over the newer reading');
+  assert.deepEqual(fs.readdirSync(rig.cdir).filter((n) => /\.(tmp|lock)/.test(n)), [], 'nor leaves its temporary file or a lock');
+});
+
+/** OAK's account pull writes the status line's cache through rewriteStatuslineCache, under the line's own lock. `merge(i)`
+ *  is the pull's merge of an account answer whose Fable share is i: a render keeps that share from the cache it read,
+ *  since it records one only from a pull of its own, and none is due. */
+function pullWriter(f) {
+  const { rewriteStatuslineCache } = require('../dist/statusline-lock.js');
+  const file = path.join(path.dirname(f.lock), 'statusline-last.json');
+  const merge = (i) => (cache) => core.applyAccountUsage(cache, { five_hour: { utilization: 10, resets_at: f.cache.five_reset },
+    seven_day: { utilization: 30, resets_at: f.cache.week_reset }, limits: [{ kind: 'weekly_scoped', percent: i, resets_at: f.cache.week_reset }] });
+  return { write: (m) => rewriteStatuslineCache(file, m), merge };
+}
+/** A synchronous wait, for a writer that holds the lock in its merge while a render runs. */
+const holdMs = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+
+test('usage: OAK\'s account pull writes the status line\'s cache under its lock, so a render and the pull racing keep both readings (2026-10-22)', async (t) => {
+  // The pull read the cache, merged the account's answer and renamed it over the cache with no lock, while every render
+  // reads and rewrites the cache under the cache's lock: of a render and a pull finishing together, the one that renamed
+  // last put back what the other had read before it, the render's session spend or the pull's shares. The pull now takes
+  // the same lock by the same protocol (statusline-lock.ts), so whichever writes second reads what the first wrote. Each
+  // writer records what only it knows: the render its session's spend, the pull the account's Fable share.
+  const rig = quotaLineRig();
+  if (!rig) return t.skip('python3 or jq is not installed');
+  const f = lockFixture(rig);
+  const pull = pullWriter(f);
+  const both = (what, i, w, r) => {
+    assert.equal(r.code, 0, `${what}: the render ran`);
+    assert.equal(w, 'written', `${what}: the pull wrote`);
+    const after = f.read();
+    assert.deepEqual([after.costs[`r${i}`]?.usd, after.fable_pct, after.costs.kept?.usd], [i + 0.5, i, 9], `${what}: the render's spend and the pull's share both stand`);
+    assert.deepEqual(fs.readdirSync(rig.cdir).filter((n) => /\.(tmp|lock)/.test(n)), [], `${what}: no lock or temporary file is left`);
+  };
+  // Started together, as a detached pull and a session's render are, at offsets across the render's run.
+  const runs = process.platform === 'win32' ? 4 : 12;
+  for (let i = 1; i <= runs; i++) {
+    f.reset();
+    const render = startRender(rig, f.session(`r${i}`, 10, 25, 50, i + 0.5));
+    await new Promise((r) => setTimeout(r, (i * 37) % 160));
+    const w = await pull.write(pull.merge(i));
+    both(`run ${i}`, i, w, await render);
+  }
+  if (process.platform === 'win32') return; // the slowed jq and the mkdir below are POSIX shell scripts
+  const real = (name) => rig.env.PATH.split(path.delimiter).map((d) => path.join(d, name)).find((p) => fs.existsSync(p));
+  const b32 = bash32();
+  // The render holds the lock through its write, slowed here, and the pull comes meanwhile: it waits, then writes.
+  const slow = path.join(rig.home, 'slow-jq');
+  fs.mkdirSync(slow);
+  fs.writeFileSync(path.join(slow, 'jq'), `#!/bin/sh\nfor a in "$@"; do if [ "$a" = est5 ]; then sleep 0.6; break; fi; done\nexec '${real('jq')}' "$@"\n`, { mode: 0o755 });
+  const writing = () => fs.readdirSync(rig.cdir).some((n) => n.startsWith('statusline-last.json.tmp.'));
+  let i = 20;
+  for (const bash of b32 ? ['bash', b32] : ['bash']) {
+    i++;
+    f.reset();
+    const render = startRender(rig, f.session(`r${i}`, 10, 25, 50, i + 0.5), { PATH: slow + path.delimiter + rig.env.PATH }, bash);
+    for (const end = Date.now() + 10_000; !writing() && Date.now() < end;) await new Promise((r) => setTimeout(r, 5));
+    assert.ok(writing(), `control: the render is inside its write (${bash})`);
+    const t0 = Date.now();
+    const w = await pull.write(pull.merge(i));
+    assert.ok(Date.now() - t0 >= 100, `the pull waited for the render's lock (${bash}) — ${Date.now() - t0} ms`);
+    both(`the render holding the lock (${bash})`, i, w, await render);
+  }
+  // The pull holds the lock, here for 300 ms more once a render has tried it: the render waits, then writes.
+  const tried = path.join(rig.home, 'tried');
+  const marking = path.join(rig.home, 'marking');
+  fs.mkdirSync(marking);
+  fs.writeFileSync(path.join(marking, 'mkdir'), `#!/bin/sh\n[ "$1" = '${f.lock}' ] && : > '${tried}'\nexec '${real('mkdir')}' "$@"\n`, { mode: 0o755 });
+  const input = path.join(rig.home, 'input.json');
+  for (const bash of b32 ? ['bash', b32] : ['bash']) {
+    i++;
+    f.reset();
+    fs.rmSync(tried, { force: true });
+    fs.writeFileSync(input, JSON.stringify(f.session(`r${i}`, 10, 25, 50, i + 0.5)));
+    let render;
+    const w = await pull.write((cache) => {
+      // Inside the lock, which this process holds without yielding: the render's input is a file, not a pipe it writes.
+      const fd = fs.openSync(input, 'r');
+      const p = cp.spawn(bash, [path.join(rig.cdir, 'statusline.sh')], { env: { ...rig.env, PATH: marking + path.delimiter + rig.env.PATH }, stdio: [fd, 'ignore', 'ignore'] });
+      fs.closeSync(fd);
+      render = new Promise((resolve) => p.on('close', (code) => resolve({ code })));
+      for (const end = Date.now() + 10_000; !fs.existsSync(tried) && Date.now() < end;) holdMs(5);
+      assert.ok(fs.existsSync(tried), `control: the render tried the lock while the pull held it (${bash})`);
+      holdMs(300);
+      return pull.merge(i)(cache);
+    });
+    both(`the pull holding the lock (${bash})`, i, w, await render);
+  }
+});
+
+test('usage: OAK\'s account pull waits about a second for a held cache lock without blocking, then writes nothing (2026-10-22)', async () => {
+  // As a render does: the lock is held by another writer, whose token was taken this second, or which has no token yet
+  // (it is between its two mkdirs). The pull waits about a second (50 tries 20 ms apart, never past 2 s) and writes
+  // nothing; the next pull, or the line's own, writes what it would have. It waits on timers, so the process it runs in
+  // goes on meanwhile. It holds the lock only while its token is the only one, so a lock another writer took while it made
+  // its own is held too.
+  const { rewriteStatuslineCache } = require('../dist/statusline-lock.js');
+  const cdir = path.join(freshHome(), '.claude');
+  fs.mkdirSync(cdir, { recursive: true });
+  const file = path.join(cdir, 'statusline-last.json');
+  const lock = `${file}.lock`;
+  const cache = { v: 3, five_pct: 12, costs: { kept: { usd: 9, at: 1 } } };
+  const merge = (c) => ({ ...c, fable_pct: 4 });
+  const entries = () => (fs.existsSync(lock) ? fs.readdirSync(lock).map((n) => n.replace(/^\d+\./, 'T.')) : null);
+  fs.writeFileSync(file, JSON.stringify(cache));
+  assert.equal(await rewriteStatuslineCache(file, merge), 'written', 'control: with the lock free, the pull writes');
+  assert.deepEqual([JSON.parse(fs.readFileSync(file, 'utf8')).fable_pct, fs.existsSync(lock)], [4, false], 'control: and releases the lock');
+  const held = async (name, setup) => {
+    fs.writeFileSync(file, JSON.stringify(cache));
+    fs.rmSync(lock, { recursive: true, force: true });
+    setup();
+    const before = entries();
+    let ticks = 0;
+    const tick = setInterval(() => { ticks++; }, 10);
+    const t0 = Date.now();
+    const w = await rewriteStatuslineCache(file, merge);
+    const ms = Date.now() - t0;
+    clearInterval(tick);
+    assert.equal(w, 'busy', `${name}: the pull did not get the lock`);
+    assert.ok(ms >= 900 && ms <= 3000, `${name}: it waited about a second, and no longer — ${ms} ms`);
+    assert.ok(ticks >= 20, `${name}: on timers, so its process went on — ${ticks} ticks of 10 ms in ${ms} ms`);
+    assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), cache, `${name}: and wrote nothing`);
+    assert.deepEqual(fs.readdirSync(cdir).filter((n) => n.includes('.tmp')), [], `${name}: no temporary file`);
+    return { before, after: entries() };
+  };
+  let r = await held('a token taken this second', () => fs.mkdirSync(path.join(lock, `${Math.floor(Date.now() / 1000)}.99999.1`), { recursive: true }));
+  assert.deepEqual(r.after, r.before, 'the lock is left to its holder');
+  r = await held('no token yet', () => fs.mkdirSync(lock));
+  assert.deepEqual(r.after, [], 'the lock is left to its holder');
+  // The pull makes the lock, and before its token goes in, another writer removes it, empty, and takes it with its own.
+  const mkdir = fs.mkdirSync;
+  let taken = false;
+  fs.mkdirSync = function (p, ...rest) {
+    if (p === lock && !taken) {
+      taken = true;
+      mkdir.call(fs, p);
+      fs.rmdirSync(p);
+      mkdir.call(fs, path.join(p, `${Math.floor(Date.now() / 1000)}.99999.2`), { recursive: true });
+      return undefined;
+    }
+    return mkdir.call(fs, p, ...rest);
+  };
+  try {
+    r = await held('a lock taken while the pull made its own', () => {});
+  } finally {
+    fs.mkdirSync = mkdir;
+  }
+  assert.ok(taken, 'control: the lock was taken meanwhile');
+  assert.deepEqual(r.after, ['T.99999.2'], 'and is left to the writer that took it');
+});
+
+test('usage: OAK\'s account pull breaks a stale cache lock by the status line\'s rules, and never a lock taken since (2026-10-22)', async () => {
+  // A writer killed while it holds the lock leaves it behind. A token 5 s old, or 5 s ahead of the clock (one set back),
+  // or a lock with no token for 5 s by its own time, is a holder that died: the pull removes it and writes, as a render
+  // does. It removes the token by its name and then the lock only if it is empty, so a lock another writer took after the
+  // pull judged the old one stale, which holds that writer's token, stands. A stale lock it cannot remove is renamed aside.
+  const { rewriteStatuslineCache } = require('../dist/statusline-lock.js');
+  const cdir = path.join(freshHome(), '.claude');
+  fs.mkdirSync(cdir, { recursive: true });
+  const file = path.join(cdir, 'statusline-last.json');
+  const lock = `${file}.lock`;
+  const now = Math.floor(Date.now() / 1000);
+  const cache = { v: 3, five_pct: 12, costs: { kept: { usd: 9, at: 1 } } };
+  const pull = async (setup) => {
+    fs.writeFileSync(file, JSON.stringify(cache));
+    fs.rmSync(lock, { recursive: true, force: true });
+    setup();
+    return rewriteStatuslineCache(file, (c) => ({ ...c, fable_pct: 4 }));
+  };
+  const asides = () => fs.readdirSync(cdir).filter((n) => n.startsWith('statusline-last.json.lock.'));
+  for (const [name, setup] of [
+    ['a token a minute old', () => fs.mkdirSync(path.join(lock, `${now - 60}.99999.1`), { recursive: true })],
+    ['a token an hour ahead of the clock', () => fs.mkdirSync(path.join(lock, `${now + 3600}.99999.1`), { recursive: true })],
+    ['no token for a minute', () => { fs.mkdirSync(lock); fs.utimesSync(lock, now - 60, now - 60); }],
+    ['an entry named as no token', () => fs.mkdirSync(path.join(lock, 'not-a-token'), { recursive: true })],
+    // A file is no token either, and rmdir cannot remove it: the lock is renamed aside, and removed.
+    ['a file in the lock', () => { fs.mkdirSync(lock); fs.writeFileSync(path.join(lock, `${now - 60}.99999.1`), ''); }],
+  ]) {
+    assert.equal(await pull(setup), 'written', `${name}: broken, and the pull wrote`);
+    assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { ...cache, fable_pct: 4 }, `${name}: what it wrote`);
+    assert.deepEqual([fs.existsSync(lock), asides()], [false, []], `${name}: and released it, leaving nothing aside`);
+  }
+  // A stale lock the pull cannot remove (another user's, as a render run under sudo leaves it) is renamed aside, under the
+  // name the line's sweep removes, and the pull writes. Root removes it anyway, so not as root.
+  if (process.platform !== 'win32' && process.getuid?.() !== 0) {
+    const w = await pull(() => { fs.mkdirSync(path.join(lock, `${now - 60}.99999.1`), { recursive: true }); fs.chmodSync(lock, 0o555); });
+    const left = asides();
+    for (const n of left) { fs.chmodSync(path.join(cdir, n), 0o755); fs.rmSync(path.join(cdir, n), { recursive: true, force: true }); }
+    assert.deepEqual([w, JSON.parse(fs.readFileSync(file, 'utf8')).fable_pct, fs.existsSync(lock)], ['written', 4, false], 'a stale lock it cannot remove is renamed aside, and the pull writes');
+    assert.equal(left.length, 1, 'control: the lock could not be removed where it was');
+    assert.match(left[0], /^statusline-last\.json\.lock\.\d+\.\d+$/, 'and is named as the line\'s sweep removes it');
+  }
+  // Between the pull judging the lock stale and removing it, another writer removes it and takes it: the pull's first
+  // removal on the lock waits for that.
+  fs.writeFileSync(file, JSON.stringify(cache));
+  fs.rmSync(lock, { recursive: true, force: true });
+  fs.mkdirSync(path.join(lock, `${now - 60}.99999.1`), { recursive: true });
+  const rmdir = fs.rmdirSync, rm = fs.rmSync;
+  let taken = false;
+  const takeFirst = (p) => {
+    if (taken || !String(p).startsWith(lock)) return;
+    taken = true;
+    rm.call(fs, lock, { recursive: true, force: true });
+    fs.mkdirSync(path.join(lock, `${Math.floor(Date.now() / 1000)}.99999.3`), { recursive: true });
+  };
+  fs.rmdirSync = function (p, ...rest) { takeFirst(p); return rmdir.call(fs, p, ...rest); };
+  fs.rmSync = function (p, ...rest) { takeFirst(p); return rm.call(fs, p, ...rest); };
+  let w;
+  try {
+    w = await rewriteStatuslineCache(file, (c) => ({ ...c, fable_pct: 4 }));
+  } finally {
+    fs.rmdirSync = rmdir;
+    fs.rmSync = rm;
+  }
+  assert.ok(taken, 'control: the lock was taken between the pull judging it and removing it');
+  assert.deepEqual(fs.existsSync(lock) && fs.readdirSync(lock).map((n) => n.replace(/^\d+\./, 'T.')), ['T.99999.3'], 'the lock taken since stands, with its token');
+  assert.deepEqual([w, JSON.parse(fs.readFileSync(file, 'utf8'))], ['busy', cache], 'and the pull, without it, wrote nothing');
+});
+
+test('usage: OAK\'s account pull and the status line take each other\'s cache lock as their own (2026-10-22)', async (t) => {
+  // One lock, one protocol, both ways. A render's lock held through its write is waited for, and the pull writes nothing;
+  // one a render killed inside its write left is broken once 5 s old. The pull's own, held while it is stopped (a machine
+  // asleep) until its token is 5 s old, is broken by the next render, which writes; resumed, the pull renames only while
+  // its token is still there, so it writes nothing over that render's reading.
+  const rig = quotaLineRig();
+  if (!rig) return t.skip('python3 or jq is not installed');
+  const f = lockFixture(rig);
+  const pull = pullWriter(f);
+  const mine = `statusline-last.json.tmp.${process.pid}`;
+  const b32 = bash32();
+  for (const bash of b32 ? ['bash', b32] : ['bash']) {
+    f.reset();
+    const w = await pull.write((cache) => {
+      const [tok] = fs.readdirSync(f.lock);
+      assert.match(tok, new RegExp(`^\\d+\\.${process.pid}\\.\\d+$`), `the pull's token is <second taken>.<pid>.<random> (${bash})`);
+      const [taken, ...rest] = tok.split('.');
+      fs.renameSync(path.join(f.lock, tok), path.join(f.lock, [Number(taken) - 60, ...rest].join('.'))); // aged, not waited for
+      const r = cp.spawnSync(bash, [path.join(rig.cdir, 'statusline.sh')], { input: JSON.stringify(f.session('later', 10, 25, 50, 2.5)), env: rig.env, encoding: 'utf8' });
+      assert.equal(r.status, 0, (r.stderr || '').trim());
+      assert.equal(f.read().costs.later?.usd, 2.5, `control: a render broke the pull's stale lock and wrote (${bash})`);
+      return pull.merge(3)(cache);
+    });
+    const after = f.read();
+    assert.deepEqual([w, after.costs.later?.usd, after.fable_pct ?? null, after.costs.kept?.usd], ['lost', 2.5, null, 9], `the pull, which lost the lock, wrote nothing over the render's reading (${bash})`);
+    assert.deepEqual(fs.readdirSync(rig.cdir).filter((n) => /\.(tmp|lock)/.test(n)), [], `nor left its temporary file or a lock (${bash})`);
+  }
+  if (process.platform === 'win32') return; // the slowed jq and the process group below are POSIX
+  const jq = rig.env.PATH.split(path.delimiter).map((d) => path.join(d, 'jq')).find((p) => fs.existsSync(p));
+  const slow = path.join(rig.home, 'slow-jq');
+  fs.mkdirSync(slow);
+  fs.writeFileSync(path.join(slow, 'jq'), `#!/bin/sh\nfor a in "$@"; do if [ "$a" = est5 ]; then sleep 3; break; fi; done\nexec '${jq}' "$@"\n`, { mode: 0o755 });
+  const writing = () => fs.readdirSync(rig.cdir).some((n) => n.startsWith('statusline-last.json.tmp.'));
+  const inside = async (detached) => {
+    const p = cp.spawn('bash', [path.join(rig.cdir, 'statusline.sh')], { env: { ...rig.env, PATH: slow + path.delimiter + rig.env.PATH }, detached });
+    const closed = new Promise((r) => p.on('close', (code) => r({ code })));
+    p.stdin.end(JSON.stringify(f.session('held', 10, 25, 50, 1.5)));
+    for (const end = Date.now() + 10_000; !writing() && Date.now() < end;) await new Promise((r) => setTimeout(r, 20));
+    assert.ok(writing(), 'control: the render is inside its write, holding the lock');
+    return { p, closed };
+  };
+  // A live render's lock: the pull waits about a second, writes nothing, and leaves it; the render then writes.
+  f.reset();
+  const live = await inside(false);
+  const t0 = Date.now();
+  const w = await pull.write(pull.merge(5));
+  assert.equal(w, 'busy', 'a live render\'s lock is held');
+  assert.ok(Date.now() - t0 >= 900, `the pull waited for it — ${Date.now() - t0} ms`);
+  assert.equal((await live.closed).code, 0);
+  const rendered = f.read();
+  assert.deepEqual([rendered.costs.held?.usd, rendered.fable_pct ?? null], [1.5, null], 'the render wrote, and the pull nothing');
+  // A render killed inside its write left its lock: once its token is 5 s old the pull breaks it and writes.
+  f.reset();
+  const killed = await inside(true);
+  process.kill(-killed.p.pid, 'SIGKILL');
+  await killed.closed;
+  const [tok] = fs.readdirSync(f.lock);
+  const [taken, ...rest] = tok.split('.');
+  fs.renameSync(path.join(f.lock, tok), path.join(f.lock, [Number(taken) - 60, ...rest].join('.')));
+  assert.equal(await pull.write(pull.merge(6)), 'written', 'the killed render\'s lock, 5 s old, is broken');
+  const after = f.read();
+  assert.deepEqual([after.fable_pct, after.costs.kept?.usd, after.costs.held], [6, 9, undefined], 'and the pull wrote');
+  assert.deepEqual([fs.existsSync(f.lock), fs.existsSync(path.join(rig.cdir, mine))], [false, false], 'and released it, leaving no temporary file of its own');
+});
+
+test('usage: OAK\'s account pull releases the cache lock and leaves no temporary file whatever happens (2026-10-22)', async () => {
+  // An answer with nothing to write, a merge that throws, a temporary file that cannot be written and a rename that fails:
+  // each releases the lock, as a render's EXIT trap does, and removes the pull's temporary file. A lock left held would
+  // keep every render from writing until it was 5 s old.
+  const { rewriteStatuslineCache } = require('../dist/statusline-lock.js');
+  const cdir = path.join(freshHome(), '.claude');
+  fs.mkdirSync(cdir, { recursive: true });
+  const file = path.join(cdir, 'statusline-last.json');
+  const tmp = `${file}.tmp.${process.pid}`;
+  const cache = { v: 3, five_pct: 12 };
+  const left = () => fs.readdirSync(cdir).filter((n) => /\.(tmp|lock)/.test(n));
+  fs.writeFileSync(file, JSON.stringify(cache));
+  assert.equal(await rewriteStatuslineCache(file, () => null), 'unchanged', 'nothing to write');
+  assert.deepEqual([JSON.parse(fs.readFileSync(file, 'utf8')), left()], [cache, []], 'nothing written, nothing left');
+  await assert.rejects(rewriteStatuslineCache(file, () => { throw new Error('merge failed'); }), /merge failed/);
+  assert.deepEqual([JSON.parse(fs.readFileSync(file, 'utf8')), left()], [cache, []], 'a merge that throws: nothing left');
+  fs.mkdirSync(tmp);
+  await assert.rejects(rewriteStatuslineCache(file, (c) => ({ ...c, fable_pct: 4 })));
+  assert.deepEqual([JSON.parse(fs.readFileSync(file, 'utf8')), left()], [cache, [path.basename(tmp)]], 'a temporary file that cannot be written: the lock released');
+  fs.rmdirSync(tmp);
+  fs.rmSync(file);
+  fs.mkdirSync(path.join(file, 'x'), { recursive: true }); // a rename onto a directory that is not empty fails
+  await assert.rejects(rewriteStatuslineCache(file, (c) => ({ ...c, fable_pct: 4 })));
+  assert.deepEqual(left(), [], 'a rename that fails: the temporary file removed and the lock released');
+});
+
+test('usage: OAK\'s account pull renames only while its token is the lock\'s, and leaves a lock taken from it to its taker (2026-10-22)', async () => {
+  // The pull renames its temporary file over the cache only while it holds the lock, its token the lock's only entry, and
+  // releases it after. Taken from it (stopped 5 s inside, its lock broken and taken by a render still writing), it renames
+  // nothing and leaves that render's lock and token as they are. The 5 s is the line's: a token 2 s old or ahead holds,
+  // one 6 s old or ahead does not.
+  const { rewriteStatuslineCache } = require('../dist/statusline-lock.js');
+  const cdir = path.join(freshHome(), '.claude');
+  fs.mkdirSync(cdir, { recursive: true });
+  const file = path.join(cdir, 'statusline-last.json');
+  const lock = `${file}.lock`;
+  const cache = { v: 3, five_pct: 12 };
+  const merge = (c) => ({ ...c, fable_pct: 4 });
+  const reset = () => { fs.writeFileSync(file, JSON.stringify(cache)); fs.rmSync(lock, { recursive: true, force: true }); };
+  reset();
+  const rename = fs.renameSync;
+  let atRename = null;
+  fs.renameSync = function (a, b, ...rest) { if (b === file) atRename = fs.readdirSync(lock); return rename.call(fs, a, b, ...rest); };
+  let w;
+  try {
+    w = await rewriteStatuslineCache(file, merge);
+  } finally {
+    fs.renameSync = rename;
+  }
+  assert.equal(w, 'written');
+  assert.equal(atRename?.length, 1, 'held through the rename');
+  assert.match(atRename[0], new RegExp(`^\\d+\\.${process.pid}\\.\\d+$`), 'by the pull\'s own token');
+  assert.equal(fs.existsSync(lock), false, 'and released after it');
+  reset();
+  const theirs = `${Math.floor(Date.now() / 1000)}.99999.4`;
+  w = await rewriteStatuslineCache(file, (c) => {
+    const [mine] = fs.readdirSync(lock);
+    fs.rmdirSync(path.join(lock, mine));
+    fs.rmdirSync(lock);
+    fs.mkdirSync(path.join(lock, theirs), { recursive: true });
+    return merge(c);
+  });
+  assert.deepEqual([w, JSON.parse(fs.readFileSync(file, 'utf8')), fs.existsSync(lock) && fs.readdirSync(lock)], ['lost', cache, [theirs]], 'lost: nothing renamed, and the taker\'s lock and token stand');
+  assert.deepEqual(fs.readdirSync(cdir).filter((n) => n.includes('.tmp')), [], 'and no temporary file is left');
+  for (const [age, want] of [[2, 'busy'], [-2, 'busy'], [6, 'written'], [-6, 'written']]) {
+    reset();
+    fs.mkdirSync(path.join(lock, `${Math.floor(Date.now() / 1000) - age}.99999.5`), { recursive: true });
+    assert.equal(await rewriteStatuslineCache(file, merge), want, `a token ${Math.abs(age)} s ${age > 0 ? 'old' : 'ahead'}: ${want}`);
+  }
+  fs.rmSync(lock, { recursive: true, force: true });
+});
+
+/** What a killed render leaves beside the cache, and names the sweep must leave, each [name, a directory?, mtime, swept?].
+ *  A directory gets a token inside, as an aside lock has. `seed` puts them back; `left` lists those still there. */
+function leftovers(cdir, now) {
+  const old = now - 600;
+  const entries = [
+    ['statusline-last.json.tmp.900000001', false, old, true], // a render killed inside its write ten minutes ago
+    ['statusline-last.json.lock.900000002.17', true, old, true], // a stale lock renamed aside, its token still in it
+    ['statusline-last.json.tmp.900000008', false, now - 140, true], // past two minutes
+    ['statusline-last.json.tmp.900000009', false, now - 100, false], // not yet
+    ['statusline-last.json.tmp.900000010', false, now + 600, true], // dated ahead: written before the clock was set back
+    ['statusline-last.json.tmp.900000003', false, now, false], // a live render's, being written
+    ['statusline-last.json.lock.900000004.18', true, now, false], // renamed aside a moment ago
+    ['statusline-last.json.tmp', false, old, false], // not a render's name (0.10.0 wrote one shared name)
+    ['statusline-usage.json.tmp', false, old, false], // the scan's own
+    ['statusline-last.json.lock.keep', true, old, false], // not an aside lock's name
+    ['statusline-last.json.tmp.900000005', true, old, false], // a directory, not a temporary file
+    ['statusline-last.json.lock.900000006.19', false, old, false], // a file, not an aside lock
+  ];
+  const seed = () => {
+    for (const [name, dir, at] of entries) {
+      const p = path.join(cdir, name);
+      fs.rmSync(p, { recursive: true, force: true });
+      if (dir) fs.mkdirSync(path.join(p, `${at - 60}.900000002.9`), { recursive: true });
+      else fs.writeFileSync(p, '{"v":3,"five_pct":');
+      fs.utimesSync(p, at, at);
+    }
+  };
+  const left = () => entries.map(([name]) => name).filter((n) => fs.existsSync(path.join(cdir, n)));
+  return { kept: entries.filter((e) => !e[3]).map(([name]) => name), seed, left };
+}
+
+test('statusline: the render that takes the cache lock removes what killed renders left beside the cache, and nothing else (2026-10-21)', (t) => {
+  // SIGKILL runs no trap: a render killed inside its write left its temporary file beside the cache, and _aside a stale
+  // lock it renamed but could not remove, or was killed before removing. Nothing removed either. The render that takes
+  // the lock removes those more than two minutes old, and never a live render's temporary file, which lives for its
+  // write, nor the lock, which this render holds while it sweeps, nor anything else in the directory.
+  const rig = quotaLineRig();
+  if (!rig) return t.skip('python3 or jq is not installed');
+  const f = lockFixture(rig);
+  const input = f.session('sweeping', 10, 25, 50, 2.5);
+  const l = leftovers(rig.cdir, f.now);
+  const b32 = bash32();
+  if (b32) {
+    const v = cp.spawnSync(b32, ['-c', 'printf %s "$BASH_VERSION"'], { encoding: 'utf8' }).stdout;
+    assert.match(v, /^3\.2\./, 'control: the second render runs under bash 3.2');
+    t.diagnostic(`bash ${v}: a second render`);
+  }
+  for (const bash of b32 ? ['bash', b32] : ['bash']) {
+    f.reset();
+    l.seed();
+    const r = cp.spawnSync(bash, [path.join(rig.cdir, 'statusline.sh')], { input: JSON.stringify(input), env: rig.env, encoding: 'utf8' });
+    assert.equal(r.status, 0, (r.stderr || '').trim());
+    assert.equal(r.stderr, '', `nothing on stderr (${bash})`);
+    assert.deepEqual(l.left(), l.kept, `the temporary files and aside lock more than two minutes old are removed, and nothing else (${bash})`);
+    const after = f.read();
+    assert.deepEqual([after.five_pct, after.costs.sweeping?.usd, after.costs.kept?.usd], [25, 2.5, 9], `the render kept its lock through the sweep, and wrote (${bash})`);
+    assert.ok(!fs.existsSync(f.lock), `and released it (${bash})`);
+  }
+});
+
+test('statusline: the sweep keeps every path one word, in a config directory whose path has a space (2026-10-21)', (t) => {
+  // A Windows home is `/c/Users/First Last`. Split at the space, a leftover's path would also name `First`, beside the
+  // home, and `rm -rf` would remove it.
+  const rig = quotaLineRig();
+  if (!rig) return t.skip('python3 or jq is not installed');
+  const cdir = path.join(rig.home, 'First Last', '.claude');
+  const split = path.join(rig.home, 'First');
+  fs.mkdirSync(cdir, { recursive: true });
+  fs.mkdirSync(split);
+  fs.writeFileSync(path.join(split, 'keep'), '');
+  fs.copyFileSync(path.join(rig.cdir, 'statusline.sh'), path.join(cdir, 'statusline.sh'));
+  const f = lockFixture({ ...rig, cdir });
+  const l = leftovers(cdir, f.now);
+  f.reset();
+  l.seed();
+  const r = cp.spawnSync('bash', [path.join(cdir, 'statusline.sh')], { input: JSON.stringify(f.session('sweeping', 10, 25, 50, 2.5)),
+    env: { ...rig.env, CLAUDE_CONFIG_DIR: cdir }, cwd: rig.home, encoding: 'utf8' });
+  assert.equal(r.status, 0, (r.stderr || '').trim());
+  assert.ok(fs.existsSync(path.join(split, 'keep')), 'nothing at a path the space would split off is removed');
+  assert.equal(f.read().five_pct, 25, 'control: the render took the lock and wrote');
+  assert.deepEqual(l.left(), l.kept, 'and the leftovers more than two minutes old are, and nothing else');
+});
+
+test('statusline: only the render holding the cache lock sweeps, it starts no process while there is nothing to sweep, and it reads the age where stat has no -c (2026-10-21)', async (t) => {
+  // The sweep runs under the lock: no other render renames a temporary file meanwhile, and two never sweep at once. Its
+  // globs are bash's own, so a render with nothing to sweep, or only an aside lock it cannot change (another user's, as
+  // sudo leaves it, which would otherwise start a process every write), starts none; macOS's stat has no -c, and the
+  // age comes from its -f %m, as _lock reads a lock's.
+  const rig = quotaLineRig();
+  if (!rig) return t.skip('python3 or jq is not installed');
+  const f = lockFixture(rig);
+  const input = f.session('sweeping', 10, 25, 50, 2.5);
+  const old = f.now - 600;
+  const tmp = path.join(rig.cdir, 'statusline-last.json.tmp.900000001');
+  const leave = () => { fs.writeFileSync(tmp, '{"v":3,"five_pct":'); fs.utimesSync(tmp, old, old); };
+  // Another render holds the lock, its token taken this second: this one waits, writes nothing and sweeps nothing.
+  f.reset();
+  leave();
+  const token = path.join(f.lock, `${Math.floor(Date.now() / 1000)}.99999.1`);
+  fs.mkdirSync(token, { recursive: true });
+  const held = await startRender(rig, input);
+  assert.equal(held.code, 0);
+  assert.deepEqual(f.read(), f.cache, 'control: without the lock, the render wrote nothing');
+  assert.ok(fs.existsSync(tmp), 'and swept nothing');
+  assert.ok(fs.existsSync(token), 'and left the lock to its holder');
+  if (process.platform === 'win32') return; // the stat and rm below are POSIX shell scripts
+  const real = (name) => rig.env.PATH.split(path.delimiter).map((d) => path.join(d, name)).find((p) => fs.existsSync(p));
+  const render = (dir, setup) => {
+    f.reset();
+    fs.rmSync(tmp, { force: true });
+    setup();
+    const r = cp.spawnSync('bash', [path.join(rig.cdir, 'statusline.sh')], { input: JSON.stringify(input), env: { ...rig.env, PATH: dir + path.delimiter + rig.env.PATH }, encoding: 'utf8' });
+    assert.equal(r.status, 0, (r.stderr || '').trim());
+    assert.equal(r.stderr, '', 'nothing on stderr');
+    assert.equal(f.read().five_pct, 25, 'control: the render took the lock and wrote');
+  };
+  // Every stat and rm a render starts, logged: a render of this fixture starts none but the sweep's.
+  const counted = path.join(rig.home, 'counted');
+  fs.mkdirSync(counted);
+  const log = path.join(rig.home, 'started.log');
+  for (const name of ['stat', 'rm']) fs.writeFileSync(path.join(counted, name), `#!/bin/sh\necho "${name} $*" >> '${log}'\nexec '${real(name)}' "$@"\n`, { mode: 0o755 });
+  const started = (setup) => {
+    fs.rmSync(log, { force: true });
+    render(counted, setup);
+    return fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n') : [];
+  };
+  assert.deepEqual(started(() => {}), [], 'nothing to sweep: no process started for it');
+  const swept = started(leave);
+  assert.ok(swept.some((s) => s.startsWith('stat ')) && swept.some((s) => s.startsWith('rm ')), `control: the sweep's processes are seen — ${JSON.stringify(swept)}`);
+  assert.ok(!fs.existsSync(tmp), 'control: and it swept');
+  // An aside lock this user cannot change, here a directory it may not write; root changes anything, so not as root.
+  if (process.getuid?.() !== 0) {
+    const aside = path.join(rig.cdir, 'statusline-last.json.lock.900000002.17');
+    try {
+      const none = started(() => {
+        fs.mkdirSync(path.join(aside, `${old}.900000002.9`), { recursive: true });
+        fs.utimesSync(aside, old, old);
+        fs.chmodSync(aside, 0o555);
+      });
+      assert.deepEqual(none, [], 'an aside lock it cannot change starts no process');
+      assert.ok(fs.existsSync(aside), 'control: and stays');
+    } finally {
+      fs.chmodSync(aside, 0o755);
+      fs.rmSync(aside, { recursive: true, force: true });
+    }
+  }
+  // A stat that answers as macOS's does: no -c, and -f %m for the modification time (read with whichever the real
+  // one takes, as on the macOS runner the real one is macOS's).
+  const bsd = path.join(rig.home, 'bsd-stat');
+  fs.mkdirSync(bsd);
+  const asked = path.join(rig.home, 'bsd-stat.log');
+  fs.writeFileSync(path.join(bsd, 'stat'), `#!/bin/sh\necho "$*" >> '${asked}'\ncase "$1" in\n` +
+    `  -f) [ "$2" = %m ] || exit 1; shift 2; '${real('stat')}' -c %Y "$@" 2>/dev/null || exec '${real('stat')}' -f %m "$@" ;;\n` +
+    `  *) echo "stat: illegal option -- \${1#-}" >&2; echo "usage: stat [-FLnq] [-f format | -l | -r | -s | -x] [-t timefmt] [file ...]" >&2; exit 1 ;;\nesac\n`, { mode: 0o755 });
+  const fresh = path.join(rig.cdir, 'statusline-last.json.tmp.900000003');
+  render(bsd, () => { leave(); fs.writeFileSync(fresh, '{"v":3,"five_pct":'); });
+  assert.deepEqual([fs.existsSync(tmp), fs.existsSync(fresh)], [false, true], 'the old one is swept, the live one kept');
+  assert.match(fs.readFileSync(asked, 'utf8'), /^-f %m .*statusline-last\.json\.tmp\.900000001$/m, 'control: its age came from -f %m');
+});
+
+test('statusline: a payload share with no reply in the last megabyte of its transcript is undated: below every dated reading, recorded only where nothing else is (2026-10-19)', (t) => {
+  // The reply is read from the transcript's tail alone, whatever its size; a share it cannot date ranks below every
+  // dated reading of its window, and is recorded, stamped now, only where the cache holds nothing for that window.
+  const rig = quotaLineRig();
+  if (!rig) return t.skip('python3 or jq is not installed');
+  const now = Math.floor(Date.now() / 1000);
+  const r5 = now + 4 * 3600 + 30, r7 = now + 3 * 86400 + 6 * 3600 + 30;
+  const state = { v: 2, last_scan: now, tpp5: 60000, tpp7: 300000, tppE5: 60000, tppE7: 300000, a30: 0, mo_start: now - 10 * 86400, mo_end: now + 20 * 86400 + 30, fc: {} };
+  const session = (tp) => ({ session_id: 's', model: { display_name: 'Opus 5' }, cwd: rig.home, ...(tp ? { transcript_path: tp } : {}),
+    rate_limits: { five_hour: { used_percentage: 50, resets_at: r5 }, seven_day: { used_percentage: 49, resets_at: r7 } } });
+  // eslint-disable-next-line no-control-regex
+  const vis = (s) => s.replace(/\x1b\[[0-9;]*m/g, '');
+  // A reply a minute ago, then more than a megabyte of tool output: past the tail, so the share is undated.
+  const toolOutput = Array.from({ length: 1300 }, (_, i) => JSON.stringify({ type: 'user', message: { role: 'user', content: [{ type: 'tool_result', content: 'x'.repeat(1000) + i }] } })).join('\n') + '\n';
+  const buried = repliedTranscript(rig.home, 'buried', now - 60, toolOutput);
+  assert.ok(fs.statSync(buried).size > 1300000, 'control: the reply lies more than a megabyte from the end');
+  // Measured two days ago, still inside the week: the dated cached share outranks the undated one.
+  const cached = { v: 3, api_ts: now, week_pct: 30, week_at: now - 2 * 86400, week_reset: r7 };
+  for (const tp of [buried, '/dev/null', undefined]) {
+    const r = rig.render(state, session(tp), cached);
+    assert.match(vis(r.line), /^5h +~3M\/6M +50% ·4h 0m {2}wk +~9M\/30M +30% /,
+      `${tp}: the undated 5h share is the only one; the week's dated one wins — got ${JSON.stringify(vis(r.line))}`);
+    assert.deepEqual([r.after.five_pct, r.after.five_at >= now, r.after.week_pct, r.after.week_at], [50, true, 30, now - 2 * 86400],
+      'the undated 5h share, alone, is recorded stamped now; the week keeps its dated share');
+  }
+  // Control: the same reply within the last megabyte dates the share, which then wins.
+  const near = rig.render(state, session(repliedTranscript(rig.home, 'near', now - 60)), cached);
+  assert.deepEqual([near.after.week_pct, near.after.week_at], [49, now - 60]);
+  // A cached share from before the window, beside the window's reset, is nothing for the window either: the cache write
+  // does not rank again a reading the pick already set aside.
+  const stale = rig.render(state, session('/dev/null'), { ...cached, five_pct: 40, five_at: r5 - 18000 - 60, five_reset: r5 });
+  assert.deepEqual([stale.after.five_pct, stale.after.five_at >= now], [50, true], 'the undated share is recorded over the last window\'s');
+});
+
+test('statusline: a reply dates the share whatever follows it, lines that nest an assistant record or one still being written, and with a +00:00 offset (2026-10-19)', (t) => {
+  // The reply is read from the end of the transcript's last megabyte. An agent's progress and a tool's structured result
+  // each nest an assistant record: when the last three lines that named one were such lines, the share was undated, below
+  // every dated reading. A timestamp with +00:00 in place of Z was undated too. Read from the end, the first line is the
+  // last one, which Claude Code may still be writing: it is skipped like the line the tail cuts in two.
+  const rig = quotaLineRig();
+  if (!rig) return t.skip('python3 or jq is not installed');
+  const now = Math.floor(Date.now() / 1000);
+  const r5 = now + 4 * 3600 + 30, r7 = now + 3 * 86400 + 6 * 3600 + 30;
+  const state = { v: 2, last_scan: now, tpp5: 60000, tpp7: 300000, tppE5: 60000, tppE7: 300000, a30: 0, mo_start: now - 10 * 86400, mo_end: now + 20 * 86400 + 30, fc: {} };
+  const session = (tp) => ({ session_id: 's', model: { display_name: 'Opus 5' }, cwd: rig.home, transcript_path: tp,
+    rate_limits: { five_hour: { used_percentage: 25, resets_at: r5 }, seven_day: { used_percentage: 50, resets_at: r7 } } });
+  const cached = { v: 3, api_ts: now, five_pct: 12, five_at: now - 600, five_reset: r5, week_pct: 40, week_at: now - 600, week_reset: r7 };
+  const iso = (s) => new Date(s * 1000 + 123).toISOString();
+  const reply = (ts) => JSON.stringify({ type: 'assistant', timestamp: ts, message: { role: 'assistant', content: [{ type: 'text', text: 'on it' }] } });
+  const progress = (s) => JSON.stringify({ type: 'progress', timestamp: iso(s),
+    data: { type: 'agent_progress', message: { type: 'assistant', timestamp: iso(s), message: { role: 'assistant', content: [{ type: 'text', text: 'working' }] } } } });
+  const result = (s) => JSON.stringify({ type: 'user', timestamp: iso(s), message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't', content: 'ok' }] },
+    toolUseResult: { structuredContent: { records: [{ type: 'assistant', text: 'quoted' }] } } });
+  const nested = path.join(rig.home, 'nested.jsonl');
+  fs.writeFileSync(nested, [reply(iso(now - 300)), reply(iso(now - 40)), progress(now - 30), result(now - 25), progress(now - 20), result(now - 15), progress(now - 10)].join('\n') + '\n');
+  assert.equal(fs.readFileSync(nested, 'utf8').split('\n').filter((l) => l.includes('"type":"assistant"')).length, 7, 'control: five lines after the last reply name an assistant record');
+  const dated = rig.render(state, session(nested), cached);
+  assert.deepEqual([dated.after.five_pct, dated.after.five_at, dated.after.week_pct, dated.after.week_at], [25, now - 40, 50, now - 40], 'dated by the last reply before them');
+  const offset = path.join(rig.home, 'offset.jsonl');
+  fs.writeFileSync(offset, reply(iso(now - 40).replace('Z', '+00:00')) + '\n');
+  const off = rig.render(state, session(offset), cached);
+  assert.deepEqual([off.after.five_pct, off.after.five_at, off.after.week_pct, off.after.week_at], [25, now - 40, 50, now - 40], 'a +00:00 offset is dated');
+  const writing = path.join(rig.home, 'writing.jsonl');
+  fs.writeFileSync(writing, reply(iso(now - 40)) + '\n' + reply(iso(now - 5)).slice(0, 60));
+  assert.ok(fs.readFileSync(writing, 'utf8').split('\n')[1].includes('"type":"assistant"'), 'control: the line being written names an assistant record');
+  const partial = rig.render(state, session(writing), cached);
+  assert.deepEqual([partial.after.five_pct, partial.after.five_at, partial.after.week_pct, partial.after.week_at], [25, now - 40, 50, now - 40], 'dated by the reply before the line being written');
+});
+
+test('statusline: the reply read stops by recursing over its input, never by first() or limit() around a try, which jq 1.6 does not stop (2026-10-19)', () => {
+  // Under jq 1.6 (Debian 12, Ubuntu 22.04), a try inside first() or limit() catches the break that ends it: the read
+  // printed every reply in the tail, one per line, and the share went undated. jq 1.7 stops either way, so a run here
+  // cannot tell the two apart: the program's form is checked instead.
+  const lines = fs.readFileSync(path.resolve(__dirname, '../../cli/statusline/install-statusline.sh'), 'utf8').split('\n');
+  const at = lines.findIndex((l) => l.startsWith('_lr() {'));
+  assert.ok(at > 0, 'the reply read is where it was');
+  const read = lines.slice(at, at + 3).join('\n');
+  assert.match(read, /def r: \(try input catch null\) as \$l/, 'it recurses over input');
+  assert.doesNotMatch(read, /\bfirst\(|\blimit\(|\blabel\b/, 'no first(), limit() or label in the reply read');
+});
+
+test('statusline: the reading rules no other test reaches: equal dates, a reply ahead of the clock, a week-only payload, a cut line, the weekly roll (2026-10-19)', (t) => {
+  const rig = quotaLineRig();
+  if (!rig) return t.skip('python3 or jq is not installed');
+  const now = Math.floor(Date.now() / 1000);
+  const r5 = now + 4 * 3600 + 30, w5 = r5 - 18000, r7 = now + 3 * 86400 + 6 * 3600 + 30;
+  const state = { v: 2, last_scan: now, tpp5: 60000, tpp7: 300000, tppE5: 60000, tppE7: 300000, a30: 0, mo_start: now - 10 * 86400, mo_end: now + 20 * 86400 + 30, fc: {} };
+  const limits = (five, week, resets = true) => ({
+    ...(five === undefined ? {} : { five_hour: { used_percentage: five, ...(resets ? { resets_at: r5 } : {}) } }),
+    ...(week === undefined ? {} : { seven_day: { used_percentage: week, ...(resets ? { resets_at: r7 } : {}) } }) });
+  const session = (tp, rl) => ({ session_id: 's', model: { display_name: 'Opus 5' }, cwd: rig.home, transcript_path: tp, ...(rl ? { rate_limits: rl } : {}) });
+  const cache = (o) => ({ v: 3, api_ts: now, five_reset: r5, week_reset: r7, ...o });
+  const shares = (a) => [a.five_pct, a.five_at, a.week_pct, a.week_at];
+  // eslint-disable-next-line no-control-regex
+  const vis = (s) => s.replace(/\x1b\[[0-9;]*m/g, '');
+  const at20 = repliedTranscript(rig.home, 'at20', now - 20);
+  // Equally dated: the larger share, compared to its decimals, either way round.
+  assert.deepEqual(shares(rig.render(state, session(at20, limits(12.5, 49.75)), cache({ five_pct: 12.25, five_at: now - 20, week_pct: 49.5, week_at: now - 20 })).after),
+    [12.5, now - 20, 49.75, now - 20], 'equal dates: the larger share is recorded');
+  assert.deepEqual(shares(rig.render(state, session(at20, limits(12.25, 49.5)), cache({ five_pct: 12.5, five_at: now - 20, week_pct: 49.75, week_at: now - 20 })).after),
+    [12.5, now - 20, 49.75, now - 20], 'equal dates: a smaller share leaves the cache');
+  // A reply stamped ahead of this clock is dated now, never in the future, where it would outrank every later reading.
+  const ahead = rig.render(state, session(repliedTranscript(rig.home, 'ahead', now + 3600), limits(30, 60)), cache({})).after;
+  assert.ok(ahead.five_at >= now && ahead.five_at <= now + 60 && ahead.week_at === ahead.five_at, `dated now — got ${ahead.five_at - now} s from now`);
+  // A payload with the weekly share alone (Claude Code drops a window whose reset passed) is dated too.
+  assert.deepEqual(shares(rig.render(state, session(at20, limits(undefined, 50)), cache({ week_pct: 49, week_at: now - 100 })).after).slice(2),
+    [50, now - 20], 'a week-only payload is dated by its reply and wins');
+  // A transcript whose last megabyte opens inside a reply (Claude Code writes the type after the message): that cut
+  // line is skipped, and the reply after it still dates the share.
+  const cut = require('path').join(rig.home, 'cut.jsonl');
+  fs.writeFileSync(cut, [
+    { parentUuid: 'p', message: { role: 'assistant', content: [{ type: 'text', text: 'x'.repeat(1100000) }] }, type: 'assistant', timestamp: new Date((now - 50) * 1000).toISOString() },
+    { parentUuid: 'p', message: { role: 'assistant', content: [{ type: 'text', text: 'done' }] }, type: 'assistant', timestamp: new Date((now - 20) * 1000).toISOString() },
+  ].map((o) => JSON.stringify(o)).join('\n') + '\n');
+  assert.deepEqual(shares(rig.render(state, session(cut, limits(13, 51)), cache({ five_pct: 12, five_at: now - 40, week_pct: 50, week_at: now - 40 })).after),
+    [13, now - 20, 51, now - 20], 'the reply after the cut line dates the share');
+  // A share with no reset of its own replied before the current window began is the last window's.
+  const before = rig.render(state, session(repliedTranscript(rig.home, 'before', w5 - 600), limits(7, 40, false)), cache({ week_pct: 40, week_at: now - 100 }));
+  assert.match(vis(before.line), /^5h — /, `the last window's share is not drawn — got ${JSON.stringify(vis(before.line))}`);
+  assert.equal(before.after.five_pct ?? null, null, '…nor recorded');
+  // The weekly window runs on a fixed schedule: once its reset passes it rolls, and a share from before it is not drawn.
+  const rolled = rig.render(state, session('/dev/null'), { v: 3, api_ts: now, week_pct: 40, week_at: now - 8 * 86400, week_reset: now - 86400 });
+  assert.match(vis(rolled.line), /^5h — {2}wk — /, `a new week with no share yet — got ${JSON.stringify(vis(rolled.line))}`);
+  // An undated share never calibrates the estimate: a scan with one (no transcript to date it by) leaves it as it was.
+  const dir = require('path').join(rig.cdir, 'projects', 'p');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(require('path').join(dir, 's.jsonl'), JSON.stringify({ type: 'assistant', timestamp: new Date((now - 900) * 1000).toISOString(), cwd: rig.home,
+    message: { id: 'm0', model: 'claude-opus-5', usage: { input_tokens: 900000, output_tokens: 0 } } }) + '\n');
+  rig.render({ ...state, last_scan: 0 }, session('/dev/null', limits(10, 30)), { v: 3, api_ts: now });
+  const cal = JSON.parse(fs.readFileSync(require('path').join(rig.cdir, 'statusline-usage.json'), 'utf8'));
+  assert.deepEqual([cal.tppE5, cal.tppE7], [60000, 300000], 'the undated shares calibrate nothing');
+});
+
+test('statusline: a 5h window whose reset has passed is over: 0% with no countdown on the line, in core and in the brief (2026-10-19)', (t) => {
+  // A 5h window starts only with the first message after the last one ended. Rolling a passed reset forward by whole
+  // periods named a window that did not exist: after a night with no use the line drew `5h … 0% · 48m` for a window
+  // that had begun a minute earlier and would reset in five hours, and another machine's bar drew the same from this
+  // machine's brief. Once nothing reports a newer window, the share is 0 with no countdown.
+  const rig = quotaLineRig();
+  if (!rig) return t.skip('python3 or jq is not installed');
+  const now = Math.floor(Date.now() / 1000);
+  const r7 = now + 3 * 86400 + 6 * 3600 + 30;
+  const state = { v: 2, last_scan: now, tpp5: 60000, tpp7: 300000, tppE5: 60000, tppE7: 300000, a30: 0, mo_start: now - 10 * 86400, mo_end: now + 20 * 86400 + 30, fc: {} };
+  const idle = { session_id: 's', model: { display_name: 'Opus 5' }, cwd: rig.home, transcript_path: '/dev/null' };
+  const replied = (name, ago) => repliedTranscript(rig.home, name, now - ago);
+  // eslint-disable-next-line no-control-regex
+  const vis = (s) => s.replace(/\x1b\[[0-9;]*m/g, '');
+  const b32 = bash32();
+  const core5 = () => {
+    const prev = process.env.CLAUDE_CONFIG_DIR;
+    process.env.CLAUDE_CONFIG_DIR = rig.cdir;
+    try {
+      const u = core.usageLine(rig.home, '');
+      const b = core.machineUsageBrief(rig.home);
+      return [u.fiveHourPct, u.fiveReset, b.five.pct, b.five.reset];
+    } finally {
+      if (prev === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = prev;
+    }
+  };
+  // The window's reset passed ten minutes ago; its share was measured before that. No pull is due. (Within a clock's
+  // tolerance of a reset, the brief leaves such a share to the machine that reads it, which judges it by its own clock.)
+  const endedCache = { v: 3, api_ts: now, five_pct: 95, five_at: now - 3 * 3600, five_reset: now - 600, week_pct: 22, week_at: now - 600, week_reset: r7 };
+  const ended = rig.render(state, idle, endedCache);
+  assert.match(vis(ended.line), /^5h +~0\/6M +0% {2}wk +~6\.6M\/30M +22% ·3d 6h /, `0%, and no countdown — got ${JSON.stringify(vis(ended.line))}`);
+  assert.deepEqual([ended.after.five_pct, ended.after.five_at, ended.after.five_reset], [95, now - 3 * 3600, now - 600], 'the cache keeps what it measured, as it was');
+  assert.equal(rig.port(), ended.line, 'the terminal app draws the same line');
+  assert.deepStrictEqual(core5(), [0, null, 0, null], 'core reads the window as over, and so does the brief another machine reads');
+  if (b32) assert.equal(rig.render(state, idle, endedCache, {}, b32).line, ended.line, 'bash 3.2 draws the same line');
+  // An account pull whose 5h window has a null resets_at, no 5h window running, says the same, stamped now, and its week
+  // and Fable shares still count. (An answer with no 5h window at all is an account with no five-hour limit: below.)
+  fs.writeFileSync(path.join(rig.cdir, '.credentials.json'), JSON.stringify({ claudeAiOauth: { accessToken: 'test-token-not-real', expiresAt: Date.now() + 3600_000 } }));
+  const pull = { STATUSLINE_USAGE_API_URL: 'file://' + path.join(rig.home, 'usage-api.json'), STATUSLINE_USAGE_API_TTL: '0' };
+  const week = { utilization: 24, resets_at: r7 };
+  const fable = [{ kind: 'weekly_scoped', percent: 4, resets_at: r7, scope: { model: { display_name: 'Fable' } } }];
+  for (const answer of [{ five_hour: { utilization: 7, resets_at: null }, seven_day: week, limits: fable }, { five_hour: { utilization: 0, resets_at: null }, seven_day: week, limits: fable }]) {
+    fs.writeFileSync(path.join(rig.home, 'usage-api.json'), JSON.stringify(answer));
+    const none = rig.render(state, idle, { ...endedCache, api_ts: 0 }, pull);
+    assert.match(vis(none.line), /^5h +~0\/6M +0% {2}fable +4% ·3d 6h {2}wk +~7\.2M\/30M +24% ·3d 6h /, `${JSON.stringify(answer)}: the pull's week and Fable — got ${JSON.stringify(vis(none.line))}`);
+    assert.deepEqual([none.after.five_pct, none.after.five_at >= now, none.after.week_pct, none.after.fable_pct, none.after.api_ts >= now], [0, true, 24, 4, true], JSON.stringify(answer));
+    assert.deepStrictEqual(core5(), [0, null, 0, null], 'core reads no window either');
+  }
+  // A cached share above 0 measured after the passed reset, with no reset of its own, rolls the anchor forward, but not
+  // once this render's pull answers that no 5h window runs: 0, stamped now, as OAK's own pull records that answer.
+  const later = { ...endedCache, api_ts: 0, five_pct: 40, five_at: now - 540 };
+  fs.writeFileSync(path.join(rig.home, 'usage-api.json'), JSON.stringify({ five_hour: { utilization: 7, resets_at: null }, seven_day: week, limits: fable }));
+  const over = rig.render(state, idle, later, pull);
+  assert.match(vis(over.line), /^5h +~0\/6M +0% {2}fable /, `a share measured after the reset, and a pull with no window — got ${JSON.stringify(vis(over.line))}`);
+  assert.deepEqual([over.after.five_pct, over.after.five_at >= now], [0, true], 'recorded as OAK\'s pull records it');
+  assert.deepStrictEqual(core5(), [0, null, 0, null], 'core reads it as over');
+  if (b32) assert.equal(rig.render(state, idle, later, pull, b32).line, over.line, 'bash 3.2 draws the same line');
+  // Control: with no pull, that share still rolls the anchor forward.
+  assert.match(vis(rig.render(state, idle, { ...later, api_ts: now }).line), /^5h +~2\.4M\/6M +40% ·4h \d+m /, 'no pull: the share rolls');
+  // With no 5h reset known at all, a null resets_at still means no window: 0, not the share beside it.
+  fs.writeFileSync(path.join(rig.home, 'usage-api.json'), JSON.stringify({ five_hour: { utilization: 7, resets_at: null }, seven_day: week }));
+  const first = rig.render(state, idle, { v: 3, api_ts: 0 }, pull);
+  assert.match(vis(first.line), /^5h +~0\/6M +0% {2}wk +~7\.2M\/30M +24% ·3d 6h /, `no window, from a first pull — got ${JSON.stringify(vis(first.line))}`);
+  assert.deepStrictEqual([first.after.five_pct, first.after.five_reset], [0, null]);
+  // Control: an answer with neither window (an account without rolling limits) is still not used.
+  fs.writeFileSync(path.join(rig.home, 'usage-api.json'), JSON.stringify({ five_hour: null, seven_day: null }));
+  const unused = rig.render(state, idle, { ...endedCache, api_ts: 0 }, pull);
+  assert.deepEqual([unused.after.api_ts, unused.after.week_pct, unused.after.five_pct], [0, 22, 95], 'nothing of it is written');
+  // A share with no reset of its own from a session whose last reply came before the passed anchor is the ended
+  // window's: no countdown is estimated for it.
+  const stale = rig.render(state, { ...idle, transcript_path: replied('legacy-idle', 2 * 3600), rate_limits: { five_hour: { used_percentage: 5 } } },
+    { v: 3, api_ts: now, five_pct: 1, five_at: now - 3 * 3600, five_reset: now - 30, week_pct: 22, week_at: now - 600, week_reset: r7 });
+  assert.match(vis(stale.line), /^5h +~0\/6M +0% {2}wk /, `an idle session's share from the ended window — got ${JSON.stringify(vis(stale.line))}`);
+  // A share above 0 measured after the passed anchor, with no reset of its own (a Claude Code that sends none): its
+  // window is estimated by rolling the anchor forward, and the estimate is drawn on it as before. (Undated, as here, it
+  // counts as measured after it.)
+  const legacy = rig.render(state, { ...idle, rate_limits: { five_hour: { used_percentage: 5 }, seven_day: { used_percentage: 22 } } },
+    { v: 3, api_ts: now, five_pct: 1, five_at: now - 3 * 3600, five_reset: now - 30, week_reset: r7 });
+  assert.match(vis(legacy.line), /^5h +~300k\/6M +5% ·4h 59m {2}wk +~6\.6M\/30M +22% ·3d 6h /, `the legacy share, its estimate and a rolled countdown — got ${JSON.stringify(vis(legacy.line))}`);
+  assert.deepEqual([legacy.after.five_pct, legacy.after.five_reset], [5, now - 30], 'the cache keeps the anchor, never the rolled estimate');
+  const [pct, reset] = core5();
+  assert.ok(pct === 5 && reset === (now - 30 + 18000) * 1000, `core rolls it the same way — got ${[pct, reset]}`);
+  assert.equal(rig.port(), legacy.line, 'and the terminal app draws the same line');
+});
+
+test('statusline: an account with no five-hour limit draws no 5h segment, on the line, in core and in the terminal app (2026-10-30)', (t) => {
+  // An account usage answer with the weekly window and no 5h window (`five_hour` null or missing, or its utilization
+  // null) is an account with no five-hour limit, as a verified Ultra account answers. The line's pull read it as no 5h
+  // window running and drew `5h ~0/6M 0%`, or, with a utilization of null, the share kept from before beside the
+  // answer's reset. It records when the account answered so (five_none_at), and when it answered with a 5h window
+  // (five_seen_at), and draws no 5h segment, with no gap where it was, while the newest of those answers is a no-limit
+  // one. Only answers decide, never a share: no session's share, cached share or saved machine's share brings the window
+  // back, however new; an answer with a 5h window does, here or, through core, on a saved machine.
+  const now = Math.floor(Date.now() / 1000);
+  t.mock.method(Date, 'now', () => now * 1000);
+  const rig = quotaLineRig(now);
+  if (!rig) return t.skip('python3 or jq is not installed');
+  const r5 = now + 4 * 3600 + 30, r7 = now + 3 * 86400 + 6 * 3600 + 30;
+  const state = { v: 2, last_scan: now, tpp5: 60000, tpp7: 300000, tppE5: 60000, tppE7: 300000, a30: 0, mo_start: now - 10 * 86400, mo_end: now + 20 * 86400 + 30, fc: {} };
+  const idle = { session_id: 's', model: { display_name: 'Opus 5' }, cwd: rig.home, transcript_path: '/dev/null' };
+  // eslint-disable-next-line no-control-regex
+  const vis = (s) => s.replace(/\x1b\[[0-9;]*m/g, '');
+  const b32 = bash32();
+  // [5h share, its reset, no five-hour limit since] as core reads the cache, and [5h share, its two answers] as the brief sends them.
+  const core5 = () => withRigConfig(rig, () => {
+    const u = core.usageLine(rig.home, ''), b = core.machineUsageBrief(rig.home);
+    return [u.fiveHourPct, u.fiveReset, u.fiveNoneAt, b.five?.pct ?? null, b.fiveNoneAt, b.fiveSeenAt];
+  });
+  // A running 5h window recorded ten minutes ago: the account as it read before the change.
+  const before = { v: 3, api_ts: 0, five_pct: 40, five_at: now - 600, five_reset: r5, week_pct: 10, week_at: now - 600, week_reset: r7 };
+  fs.writeFileSync(path.join(rig.cdir, '.credentials.json'), JSON.stringify({ claudeAiOauth: { accessToken: 'test-token-not-real', expiresAt: Date.now() + 3600_000 } }));
+  const pull = { STATUSLINE_USAGE_API_URL: 'file://' + path.join(rig.home, 'usage-api.json'), STATUSLINE_USAGE_API_TTL: '0' };
+  const answer = (a) => fs.writeFileSync(path.join(rig.home, 'usage-api.json'), JSON.stringify(a));
+  const week = { utilization: 24, resets_at: r7 };
+  const fable = [{ kind: 'weekly_scoped', percent: 4, resets_at: r7, scope: { model: { display_name: 'Fable' } } }];
+  assert.match(vis(rig.render(state, idle, { ...before, api_ts: now }).line), /^5h +~2\.4M\/6M +40% ·4h 0m {2}wk /, 'control: the window draws');
+  for (const [name, a] of [['five_hour null', { five_hour: null, seven_day: week, limits: fable }], ['five_hour missing', { seven_day: week, limits: fable }],
+    ['its utilization null', { five_hour: { utilization: null, resets_at: r5 + 3600 }, seven_day: week, limits: fable }]]) {
+    answer(a);
+    const r = rig.render(state, idle, before, pull);
+    assert.match(vis(r.line), /^fable +4% ·3d 6h {2}wk +~7\.2M\/30M +24% ·3d 6h {2}mo /, `${name}: no 5h segment, and no gap — got ${JSON.stringify(vis(r.line))}`);
+    assert.deepEqual([r.after.five_none_at >= now, r.after.five_seen_at ?? null, r.after.five_pct, r.after.five_at, r.after.five_reset, r.after.week_pct, r.after.fable_pct],
+      [true, null, 40, now - 600, r5, 24, 4], `${name}: recorded with when, with no 0 and no reset from the answer, and the week and Fable count`);
+    assert.equal(rig.port(), r.line, `${name}: the terminal app draws the same line`);
+    assert.deepStrictEqual(core5(), [null, null, r.after.five_none_at * 1000, null, r.after.five_none_at * 1000, null], `${name}: core and the brief say so`);
+    if (b32) assert.equal(rig.render(state, idle, before, pull, b32).line, r.line, `${name}: bash 3.2 draws the same line`);
+  }
+  // A weekly window with a share and no reset is the weekly window too, as OAK's pull reads it: beside a `five_hour` null
+  // or missing, the line dropped the whole answer, and drew the share kept from before.
+  for (const [name, a] of [['five_hour null', { five_hour: null, seven_day: { utilization: 24, resets_at: null }, limits: fable }],
+    ['five_hour missing', { seven_day: { utilization: 0, resets_at: null }, limits: fable }]]) {
+    answer(a);
+    const r = rig.render(state, idle, before, pull);
+    assert.match(vis(r.line), /^fable +4% ·3d 6h {2}wk +~3M\/30M +10% ·3d 6h {2}mo /, `${name}, a week with no reset: no 5h segment — got ${JSON.stringify(vis(r.line))}`);
+    assert.deepEqual([r.after.five_none_at >= now, r.after.five_pct, r.after.five_at], [true, 40, now - 600], `${name}, a week with no reset: recorded with when, and no 5h share`);
+    assert.ok('five_none_at' in core.applyAccountUsage(before, a, now), `${name}, a week with no reset: as OAK's pull records it`);
+    assert.equal(rig.port(), r.line, `${name}, a week with no reset: the terminal app draws the same line`);
+    assert.deepStrictEqual(core5().slice(0, 3), [null, null, r.after.five_none_at * 1000], `${name}, a week with no reset: core says so`);
+  }
+  // Recorded five minutes ago, with no pull due. No share brings the window back, however new: a session's from a reply
+  // before it or a minute ago, or one the cache recorded since. None of them is recorded either.
+  const none = { ...before, api_ts: now, five_none_at: now - 300 };
+  const session = (ago, pct) => ({ ...idle, transcript_path: repliedTranscript(rig.home, `replied-${ago}`, now - ago),
+    rate_limits: { five_hour: { used_percentage: pct, resets_at: r5 }, seven_day: { used_percentage: 25, resets_at: r7 } } });
+  for (const [what, input, cache, wk] of [['a share from an older reply', session(3600, 33), none, /^wk +~3M\/30M +10% ·3d 6h {2}mo /],
+    ['a share from a reply a minute ago', session(60, 33), none, /^wk +~7\.5M\/30M +25% ·3d 6h {2}mo /],
+    ['a share the cache recorded since', idle, { ...none, five_pct: 21, five_at: now - 60 }, /^wk +~3M\/30M +10% ·3d 6h {2}mo /]]) {
+    const r = rig.render(state, input, cache);
+    assert.match(vis(r.line), wk, `${what}: no 5h segment — got ${JSON.stringify(vis(r.line))}`);
+    assert.deepEqual([r.after.five_pct, r.after.five_at, r.after.five_none_at], [cache.five_pct, cache.five_at, now - 300], `${what}: nor recorded`);
+    assert.equal(rig.port(), r.line, `${what}: the terminal app draws the same line`);
+  }
+  // An answer with a 5h window recorded after it brings the window back, with the cached share; one at the same second
+  // does not.
+  const seen = rig.render(state, idle, { ...none, five_seen_at: now - 60 });
+  assert.match(vis(seen.line), /^5h +~2\.4M\/6M +40% ·4h 0m {2}wk /, `an answer with a 5h window since — got ${JSON.stringify(vis(seen.line))}`);
+  assert.equal(rig.port(), seen.line, 'the terminal app draws the same line');
+  const tie = rig.render(state, idle, { ...none, five_seen_at: now - 300 });
+  assert.match(vis(tie.line), /^wk /, `the same second — got ${JSON.stringify(vis(tie.line))}`);
+  assert.equal(rig.port(), tie.line, 'the terminal app draws the same line');
+  // So does a pull that carries a 5h window: recorded beside the other, which stays.
+  answer({ five_hour: { utilization: 12, resets_at: r5 }, seven_day: week });
+  const back = rig.render(state, idle, { ...none, api_ts: 0 }, pull);
+  assert.match(vis(back.line), /^5h +~720k\/6M +12% ·4h 0m {2}wk /, `the pull's window — got ${JSON.stringify(vis(back.line))}`);
+  assert.deepEqual([back.after.five_seen_at >= now, back.after.five_none_at, back.after.five_pct], [true, now - 300, 12], 'recorded, the other kept');
+  assert.deepStrictEqual(core5().slice(0, 3), [12, r5 * 1000, null]);
+  // Saved machines. A saved machine's 5h share, which core read before this render's pull answered no five-hour limit, is
+  // not drawn: that pull is the newest answer there is.
+  seedMachines(rig, savedMachine('build-box', { week: null, fable: null, month: null }));
+  const lent = rigAccount(rig, before);
+  assert.deepStrictEqual([lent.fiveHourPct, lent.fiveMachine], [1, 'build-box'], 'control: core shows the saved machine\'s share');
+  answer({ five_hour: null, seven_day: week });
+  const own = rig.render(state, idle, before, { ...pull, ...oakStandIn(rig, { sessionTokens: null, claudeAccount: lent }).env });
+  assert.match(vis(own.line), /^wk +~7\.2M\/30M +24% ·3d 6h {2}mo /, `this render's pull is the newest answer — got ${JSON.stringify(vis(own.line))}`);
+  assert.equal(rig.port(), own.line, 'the terminal app draws the same line, once the pull is recorded');
+  // A saved machine's account answered no five-hour limit after this machine's answered with a 5h window: core's reading,
+  // which weighs both, hides this machine's live share. With no oak, the line has its own answers alone.
+  seedMachines(rig, savedMachine('build-box', { five: null, fiveNoneAt: Date.now() - 30_000, fable: null, month: null }));
+  const mine = { ...before, api_ts: now, five_pct: 9, five_at: now - 120, five_reset: r5, five_seen_at: now - 120 };
+  const told = rigAccount(rig, mine);
+  assert.deepStrictEqual([told.fiveHourPct, told.fiveNoneAt > (now - 120) * 1000], [null, true], 'control: core takes the saved machine\'s newer answer');
+  const hidden = rig.render(state, idle, mine, oakStandIn(rig, { sessionTokens: null, claudeAccount: told }).env);
+  assert.doesNotMatch(vis(hidden.line), /5h/, `core's reading hides this machine's live share — got ${JSON.stringify(vis(hidden.line))}`);
+  assert.equal(rig.port(), hidden.line, 'the terminal app draws the same line');
+  assert.match(vis(rig.render(state, idle, mine).line), /^5h +~540k\/6M +9% /, 'control: with no oak, this machine\'s own answers');
+  // And the other way: this machine's account answered no five-hour limit, and a saved machine's answered with a 5h window
+  // since. Core's reading brings the window back, from that machine's share; with no oak, or an oak from before core said
+  // so, the line has its own answer alone and draws none.
+  seedMachines(rig, savedMachine('build-box', { fiveSeenAt: Date.now() - 60_000, week: null, fable: null, month: null }));
+  const mixed = rigAccount(rig, none);
+  assert.deepStrictEqual([mixed.fiveHourPct, mixed.fiveMachine, mixed.fiveNoneAt], [1, 'build-box', null], 'control: core takes the saved machine\'s newer answer');
+  const shown = rig.render(state, idle, none, oakStandIn(rig, { sessionTokens: null, claudeAccount: mixed }).env);
+  assert.match(vis(shown.line), /^\(build-box: 5h\) {2}5h +~12k\/1\.2M +1% ·3h 0m {2}wk /, `core's reading draws that machine's share — got ${JSON.stringify(vis(shown.line))}`);
+  assert.equal(rig.port(), shown.line, 'the terminal app draws the same line');
+  assert.match(vis(rig.render(state, idle, none).line), /^wk /, 'control: with no oak, none');
+  const older = { ...mixed };
+  delete older.fiveNoneAt;
+  assert.match(vis(rig.render(state, idle, none, oakStandIn(rig, { sessionTokens: null, claudeAccount: older }).env).line), /^wk /,
+    'an oak from before: the line has its own answer alone, and draws no saved machine\'s share');
+});
+
+test('statusline: an ended 5h window draws no cache reads, on the line, in core and in the terminal app (2026-10-20)', (t) => {
+  // An ended 5h window read `5h ~0/6M +30M↺ 0%`: its estimate was cleared, but not the cache reads beside it, which
+  // were the ended window's (with no reset to anchor on, the scan counts the last five hours). A running window keeps
+  // the reads of its own window.
+  const rig = quotaLineRig();
+  if (!rig) return t.skip('python3 or jq is not installed');
+  const now = Math.floor(Date.now() / 1000);
+  const r7 = now + 3 * 86400 + 6 * 3600 + 30;
+  // The last scan's reads: 30M in the 5h window it anchored, 90M in the week.
+  const state = { v: 2, last_scan: now, tpp5: 60000, tpp7: 300000, tppE5: 60000, tppE7: 300000, R5: 30_000_000, R7: 90_000_000,
+    a30: 0, mo_start: now - 10 * 86400, mo_end: now + 20 * 86400 + 30, fc: {} };
+  const idle = { session_id: 's', model: { display_name: 'Opus 5' }, cwd: rig.home, transcript_path: '/dev/null' };
+  // eslint-disable-next-line no-control-regex
+  const vis = (s) => s.replace(/\x1b\[[0-9;]*m/g, '');
+  const coreReads = () => {
+    const prev = process.env.CLAUDE_CONFIG_DIR;
+    process.env.CLAUDE_CONFIG_DIR = rig.cdir;
+    try {
+      const u = core.usageLine(rig.home, '');
+      return [u.fiveHourPct, u.fiveReads, u.weekReads];
+    } finally {
+      if (prev === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = prev;
+    }
+  };
+  // The 5h window reset ten minutes ago; its share and reads were measured before that.
+  const endedCache = { v: 3, api_ts: now, five_pct: 95, five_at: now - 3 * 3600, five_reset: now - 600, five_reads: 30_000_000,
+    week_pct: 22, week_at: now - 600, week_reset: r7, week_reads: 90_000_000 };
+  const ended = rig.render(state, idle, endedCache);
+  assert.match(vis(ended.line), /^5h +~0\/6M +0% {2}wk +~6\.6M\/30M \+90M↺ +22% ·3d 6h /,
+    `no reads beside the ended window, and the week keeps its own — got ${JSON.stringify(vis(ended.line))}`);
+  assert.deepStrictEqual(coreReads(), [0, null, 90_000_000], 'core leaves them out as well');
+  assert.equal(rig.port(), ended.line, 'the terminal app draws the same line');
+  const b32 = bash32();
+  if (b32) {
+    assert.match(cp.spawnSync(b32, ['-c', 'printf %s "$BASH_VERSION"'], { encoding: 'utf8' }).stdout, /^3\.2\./, 'control: the shell below is bash 3.2');
+    assert.equal(rig.render(state, idle, endedCache, {}, b32).line, ended.line, 'bash 3.2 draws the same line');
+  }
+  // Control: a running window draws its reads, and core reads them.
+  const running = rig.render(state, idle, { ...endedCache, five_pct: 10, five_at: now - 600, five_reset: now + 3600 + 30 });
+  assert.match(vis(running.line), /^5h +~600k\/6M \+30M↺ +10% ·1h 0m {2}wk /, `a running window's reads — got ${JSON.stringify(vis(running.line))}`);
+  assert.deepStrictEqual(coreReads(), [10, 30_000_000, 90_000_000]);
+  assert.equal(rig.port(), running.line, 'in the terminal app too');
+  // A running window at 0% (one just begun) keeps its reads: what clears them is the window having ended, not its share.
+  const begun = rig.render(state, idle, { ...endedCache, five_pct: 0, five_at: now - 60, five_reset: now + 5 * 3600 - 120 + 30 });
+  assert.match(vis(begun.line), /^5h +~0\/6M \+30M↺ +0% ·4h 58m {2}wk /, `a window just begun keeps its reads — got ${JSON.stringify(vis(begun.line))}`);
+  // A share above 0 with no reset of its own, measured after the passed anchor (a Claude Code that sends none) rolls the
+  // window forward: a running window, which keeps its reads.
+  const rolled = rig.render(state, { ...idle, rate_limits: { five_hour: { used_percentage: 5 }, seven_day: { used_percentage: 22 } } },
+    { ...endedCache, five_pct: 1, five_reset: now - 30 });
+  assert.match(vis(rolled.line), /^5h +~300k\/6M \+30M↺ +5% ·4h 59m {2}wk /, `a rolled window keeps its reads — got ${JSON.stringify(vis(rolled.line))}`);
+  // THE SCAN anchors the 5h window at its start while the window runs, and at the last five hours with no reset known
+  // or an ended one. Reads four hours and half an hour ago: the window running for three hours holds the second alone,
+  // the ended window draws neither, and a share whose window's start is unknown (no reset anywhere) draws both.
+  const dir = path.join(rig.cdir, 'projects', 'p');
+  fs.mkdirSync(dir, { recursive: true });
+  const reply = (id, ago, reads) => JSON.stringify({ type: 'assistant', timestamp: new Date((now - ago) * 1000).toISOString(), cwd: rig.home,
+    message: { id, model: 'claude-opus-5', usage: { input_tokens: 10, output_tokens: 10, cache_read_input_tokens: reads } } });
+  fs.writeFileSync(path.join(dir, 's.jsonl'), [reply('m1', 4 * 3600, 10_000_000), reply('m2', 1800, 20_000_000)].join('\n') + '\n');
+  const scanned = (cache, input = idle) => vis(rig.render({ ...state, last_scan: 0 }, input, cache).line);
+  const inWindow = scanned({ ...endedCache, five_pct: 10, five_at: now - 600, five_reset: now + 2 * 3600 + 30 });
+  assert.match(inWindow, /^5h +\S+ \+20M↺ +10% ·2h 0m /, `running: its own window's reads — got ${JSON.stringify(inWindow)}`);
+  const over = scanned(endedCache);
+  assert.match(over, /^5h +~0\/\S+ +0% {2}wk /, `ended: none — got ${JSON.stringify(over)}`);
+  const unknown = scanned({ v: 3, api_ts: now }, { ...idle, rate_limits: { five_hour: { used_percentage: 5 }, seven_day: { used_percentage: 22, resets_at: r7 } } });
+  assert.match(unknown, /^5h +\S+ \+30M↺ +5% {2}wk /, `no reset known: the last five hours' — got ${JSON.stringify(unknown)}`);
+});
+
+test('statusline: a new 5h window scans at once, rather than drawing the last window\'s cache reads for up to ten minutes', (t) => {
+  // A scan runs every ten minutes, and the 5h reads it saves are its window's. A window that began a minute after it
+  // drew those reads (`+30M↺` beside a window a minute old) until the next scan. A known 5h reset other than the one the
+  // last scan anchored on (s5) scans now; a state saved before s5 waits for its scan, as before.
+  const rig = quotaLineRig();
+  if (!rig) return t.skip('python3 or jq is not installed');
+  const now = Math.floor(Date.now() / 1000);
+  const r7 = now + 3 * 86400 + 6 * 3600 + 30;
+  const dir = path.join(rig.cdir, 'projects', 'p');
+  fs.mkdirSync(dir, { recursive: true });
+  const reply = (id, ago, reads) => JSON.stringify({ type: 'assistant', timestamp: new Date((now - ago) * 1000).toISOString(), cwd: rig.home,
+    message: { id, model: 'claude-opus-5', usage: { input_tokens: 10, output_tokens: 10, cache_read_input_tokens: reads } } });
+  // The last window's reads, four hours and an hour ago, and the new window's, thirty seconds ago.
+  fs.writeFileSync(path.join(dir, 's.jsonl'), [reply('m1', 4 * 3600, 10_000_000), reply('m2', 3600, 20_000_000), reply('m3', 30, 5_000_000)].join('\n') + '\n');
+  // The last scan ran a minute ago, with the window ended (no reset: the last five hours), and saved 30M of reads.
+  const state = { v: 2, last_scan: now - 60, s5: 0, tpp5: 60000, tpp7: 300000, tppE5: 60000, tppE7: 300000, R5: 30_000_000, R7: 90_000_000,
+    a30: 0, mo_start: now - 10 * 86400, mo_end: now + 20 * 86400 + 30, fc: {} };
+  const cache = { v: 3, api_ts: now, five_pct: 40, five_at: now - 3 * 3600, five_reset: now - 600, week_pct: 22, week_at: now - 600, week_reset: r7 };
+  // A session's reply opened the next window a minute ago: 1%, reset five hours on, set mid-minute so the bash 3.2
+  // render a second or two later draws the same countdown.
+  const input = { session_id: 's', model: { display_name: 'Opus 5' }, cwd: rig.home, transcript_path: '/dev/null',
+    rate_limits: { five_hour: { used_percentage: 1, resets_at: now + 18000 - 30 }, seven_day: { used_percentage: 22, resets_at: r7 } } };
+  // eslint-disable-next-line no-control-regex
+  const vis = (s) => s.replace(/\x1b\[[0-9;]*m/g, '');
+  const fresh = rig.render(state, input, cache);
+  assert.match(vis(fresh.line), /^5h +~60k\/6M \+5M↺ +1% ·4h 5[89]m /, `the new window's reads alone — got ${JSON.stringify(vis(fresh.line))}`);
+  const st = JSON.parse(fs.readFileSync(path.join(rig.cdir, 'statusline-usage.json'), 'utf8'));
+  assert.deepStrictEqual([st.s5, st.R5, st.last_scan >= now], [now + 18000 - 30, 5_000_000, true], 'scanned now, anchored on the new window');
+  const b32 = bash32();
+  if (b32) assert.equal(rig.render(state, input, cache, {}, b32).line, fresh.line, 'bash 3.2 draws the same line');
+  // Control: a state saved before s5 waits for its scan, as before.
+  const { s5, ...older } = state;
+  assert.equal(s5, 0);
+  assert.match(vis(rig.render(older, input, cache).line), /^5h +~60k\/6M \+30M↺ +1% /, 'a state with no s5 draws its saved reads');
+});
+
+/** Runs `fn` with the rig's config dir as core's: its readouts, the saved machines' cache and the store are keyed on
+ *  CLAUDE_CONFIG_DIR. */
+function withRigConfig(rig, fn) {
+  const prev = process.env.CLAUDE_CONFIG_DIR;
+  process.env.CLAUDE_CONFIG_DIR = rig.cdir;
+  try {
+    return fn();
+  } finally {
+    if (prev === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = prev;
+  }
+}
+
+/** What `oak usage --json` reports of the account (`claudeAccount`, core's usageLine) with `cache` as this machine's
+ *  status line cache, as the line's own call reads it: before the render writes the cache. */
+function rigAccount(rig, cache) {
+  fs.writeFileSync(path.join(rig.cdir, 'statusline-last.json'), JSON.stringify(cache));
+  return withRigConfig(rig, () => core.usageLine(rig.home, ''));
+}
+
+/** Saved machines' readings of the Claude account in the rig's cache, as `oak usage --pull-machines` writes it (a new
+ *  file each time, so no read is answered from a stale memo). The rig has no Claude Code login, so core takes them for
+ *  the one account they name. */
+function seedMachines(rig, ...machines) {
+  withRigConfig(rig, () => {
+    const file = core.machineUsageCachePath();
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(`${file}.tmp`, JSON.stringify({ version: 1, attemptedAt: Date.now(), machines, outcomes: [] }));
+    fs.renameSync(`${file}.tmp`, file);
+  });
+}
+
+/** A saved machine and its reading of the account (what its `oak usage --brief --json` printed): fresh shares of its
+ *  running 5h and weekly windows and of the per-model cap, and its month, each reset half a minute past the minute so
+ *  no countdown ticks over between the line and the terminal app's port. `windows` replaces any of them (null: none). */
+function savedMachine(label, windows = {}) {
+  const now = Date.now();
+  const reset = (s) => (Math.floor(now / 1000) + s + 30) * 1000;
+  return { label, target: `me@${label}`, skewMs: 0, brief: { brief: 1, account: 'abcdef012345', at: now,
+    five: { pct: 1, reset: reset(3 * 3600), at: now - 60_000, tok: 12_000, total: 1_200_000 },
+    week: { pct: 30, reset: reset(2 * 86400), at: now - 60_000, tok: 30_000_000, total: 100_000_000 },
+    fable: { pct: 4, reset: reset(2 * 86400), at: now - 60_000, tok: 400_000, total: 10_000_000, label: 'Fable' },
+    month: { tok: 2_000_000, total: 100_000_000, reset: reset(9 * 86400), reads: 5_000_000, cost: null, costTotal: null },
+    ...windows } };
+}
+
+/** A stand-in `oak` for the rig's line: it records each call and answers `usage --session` with `answer`, what
+ *  `oak usage --json` prints (an object, or text that is no JSON object), and any other call with nothing. */
+function oakStandIn(rig, answer) {
+  const bin = path.join(rig.home, 'oak-bin');
+  const file = path.join(rig.home, 'oak-usage.json');
+  const calls = path.join(rig.home, 'oak-calls.log');
+  fs.mkdirSync(bin, { recursive: true });
+  fs.writeFileSync(file, typeof answer === 'string' ? answer : JSON.stringify(answer));
+  fs.writeFileSync(path.join(bin, 'oak'), `#!/bin/sh\nprintf '%s\\n' "$*" >> '${calls}'\ncase "$*" in "usage --session "*) cat '${file}' ;; esac\n`, { mode: 0o755 });
+  fs.rmSync(calls, { force: true });
+  return { env: { PATH: bin + path.delimiter + rig.env.PATH }, calls: () => (fs.existsSync(calls) ? fs.readFileSync(calls, 'utf8').split('\n').filter(Boolean) : []) };
+}
+
+/** The laptop's own cache in the case the user hit: shares measured sixteen days ago, its 5h window long over, no pull
+ *  due (its account pull could not read a login there; here none is due). */
+function staleLaptopCache(nowS) {
+  const old = nowS - 16 * 86400;
+  return { v: 3, api_ts: nowS, five_pct: 40, five_at: old, five_reset: old + 3600, week_pct: 70, week_at: old, week_reset: old + 86400,
+    fable_pct: 9, fable_at: old, fable_reset: old + 86400, fable_label: 'Fable' };
+}
+
+/** A cache as two renders wrote it, without what differs between any two: when each wrote, and the ledger's times. */
+const cacheFields = (c) => ({ ...c, ts: 0, costs: Object.fromEntries(Object.entries(c.costs || {}).map(([k, v]) => [k, { ...v, at: 0 }])) });
+
+test('statusline: a window this machine has no current share of draws the saved machine\'s reading OAK shows, named, and records none of it (2026-10-22)', (t) => {
+  // The user's laptop: its sessions idle (no rate_limits), its own account pull unable to read a login, its cached
+  // shares sixteen days old. OAK's readouts there showed the account's 5h, weekly and Fable shares from a saved machine
+  // of the same account, and named it, while this line drew `5h 0%` and `wk —`, although the `oak usage` call it makes
+  // on every render carried that reading.
+  const rig = quotaLineRig();
+  if (!rig) return t.skip('python3 or jq is not installed');
+  const nowS = Math.floor(Date.now() / 1000);
+  const state = { v: 2, last_scan: nowS, tpp5: 60000, tpp7: 300000, tppE5: 60000, tppE7: 300000, R7: 90_000_000, a30: 0,
+    mo_start: nowS - 10 * 86400, mo_end: nowS + 20 * 86400 + 30, fc: {} };
+  const idle = { session_id: 's', model: { display_name: 'Opus 5' }, cwd: rig.home, transcript_path: '/dev/null' };
+  const cache = staleLaptopCache(nowS);
+  // eslint-disable-next-line no-control-regex
+  const vis = (s) => s.replace(/\x1b\[[0-9;]*m/g, '');
+  seedMachines(rig, savedMachine('build-box'));
+  const account = rigAccount(rig, cache);
+  assert.deepStrictEqual([account.fiveHourPct, account.fiveMachine, account.weekPct, account.weekMachine, account.fablePct, account.fableMachine,
+    account.monthTokens, account.monthMachine, account.machineNote], [1, 'build-box', 30, 'build-box', 4, 'build-box', 2_000_000, 'build-box', 'build-box'],
+  'control: core shows every window from the saved machine, and names it');
+  // No oak: this machine's own readings, as before.
+  const own = rig.render(state, idle, cache);
+  assert.match(vis(own.line), /^5h +~0\/6M +0% {2}wk — {2}mo +~0\/128\.5M +0% ·20d 0h$/, `no oak — got ${JSON.stringify(vis(own.line))}`);
+  // With oak: what core shows, from the one call the line already makes, under one dim name ahead of the windows.
+  const oak = oakStandIn(rig, { sessionTokens: { input: 0, output: 0, cacheRead: 0, total: 0 }, claudeAccount: account, claudeMachineNote: account.machineNote });
+  const lent = rig.render(state, idle, cache, oak.env);
+  assert.match(vis(lent.line), /^\(build-box\) {2}5h +~12k\/1\.2M +1% ·3h 0m {2}fable +~400k\/10M +4% ·2d 0h {2}wk +~30M\/100M \+90M↺ +30% ·2d 0h {2}mo +~2M\/100M \+5M↺ +2% ·9d 0h$/,
+    `the saved machine's shares, countdowns and figures, beside this machine's own cache reads as core keeps them — got ${JSON.stringify(vis(lent.line))}`);
+  assert.ok(lent.line.startsWith('\x1b[2m(build-box)\x1b[0m  '), `the name is dim, as on OAK's bars — got ${JSON.stringify(lent.line.slice(0, 30))}`);
+  assert.deepEqual(oak.calls(), ['usage --session s'], 'one oak process: the call each render already made');
+  // Recorded: none of it. The cache is the one the line writes with no oak, and its shares, stamps and resets are this
+  // machine's as they were, so the brief it gives the other machines reports its own measurements alone.
+  assert.deepStrictEqual(cacheFields(lent.after), cacheFields(own.after), 'the cache is the one written with no oak');
+  for (const k of ['five_pct', 'five_at', 'five_reset', 'week_pct', 'week_at', 'week_reset', 'fable_pct', 'fable_at', 'fable_reset', 'fable_label', 'api_ts']) {
+    assert.deepStrictEqual(lent.after[k], cache[k], `${k} is this machine's own, as it was`);
+  }
+  assert.deepStrictEqual([lent.after.five_tok, lent.after.week_tok, lent.after.fable_tok, lent.after.month_tok], [0, 0, 0, 0], 'and no estimate restates a share it lent');
+  assert.equal(rig.port(), lent.line, 'the terminal app draws the same line, byte for byte');
+  const b32 = bash32();
+  if (b32) {
+    assert.match(cp.spawnSync(b32, ['-c', 'printf %s "$BASH_VERSION"'], { encoding: 'utf8' }).stdout, /^3\.2\./, 'control: the shell below is bash 3.2');
+    assert.equal(rig.render(state, idle, cache, oak.env, b32).line, lent.line, 'bash 3.2 draws the same line');
+  }
+});
+
+test('statusline: a saved machine\'s reading never calibrates the estimate (2026-10-22)', (t) => {
+  // The estimate runs before the line takes a saved machine's reading. This machine scanned tokens of the per-model
+  // cap's family in every window, so the saved machine's week (30%) and Fable (4%) shares would calibrate the
+  // tokens-per-percent if they reached the estimator; its own shares are sixteen days old and calibrate nothing.
+  const rig = quotaLineRig();
+  if (!rig) return t.skip('python3 or jq is not installed');
+  const nowS = Math.floor(Date.now() / 1000);
+  const dir = path.join(rig.cdir, 'projects', 'p');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 's.jsonl'), JSON.stringify({ type: 'assistant', timestamp: new Date((nowS - 600) * 1000).toISOString(), cwd: rig.home,
+    message: { id: 'm1', model: 'claude-fable-5', usage: { input_tokens: 6_000_000, output_tokens: 0 } } }) + '\n');
+  // No scan yet: this render scans.
+  const state = { v: 2, last_scan: 0, tpp5: 60000, tpp7: 300000, tppE5: 60000, tppE7: 300000, tppF: 100000, a30: 0, fc: {} };
+  const idle = { session_id: 's', model: { display_name: 'Opus 5' }, cwd: rig.home, transcript_path: '/dev/null' };
+  const cal = () => { const s = JSON.parse(fs.readFileSync(path.join(rig.cdir, 'statusline-usage.json'), 'utf8')); return [s.tpp5, s.tpp7, s.tppE5, s.tppE7, s.tppF, s.cpp5, s.cpp7]; };
+  seedMachines(rig, savedMachine('build-box'));
+  const account = rigAccount(rig, staleLaptopCache(nowS));
+  rig.render(state, idle, staleLaptopCache(nowS));
+  const without = cal();
+  assert.deepStrictEqual(without.slice(0, 5), [60000, 300000, 60000, 300000, 100000], 'control: with no oak, nothing calibrates');
+  const lent = rig.render(state, idle, staleLaptopCache(nowS), oakStandIn(rig, { sessionTokens: null, claudeAccount: account }).env);
+  // eslint-disable-next-line no-control-regex
+  assert.match(lent.line.replace(/\x1b\[[0-9;]*m/g, ''), /^\(build-box\) {2}5h .* 1% .*fable .* 4% .*wk .* 30% /, 'control: the render drew the saved machine\'s shares');
+  assert.deepStrictEqual(cal(), without, 'and calibrated exactly what it calibrates with no oak');
+});
+
+test('statusline: with no saved machine named, an older oak, an oak that answers no JSON object, or no oak, the line draws as before (2026-10-22)', (t) => {
+  const rig = quotaLineRig();
+  if (!rig) return t.skip('python3 or jq is not installed');
+  const nowS = Math.floor(Date.now() / 1000);
+  const state = { v: 2, last_scan: nowS, tpp5: 60000, tpp7: 300000, tppE5: 60000, tppE7: 300000, R7: 90_000_000, a30: 0,
+    mo_start: nowS - 10 * 86400, mo_end: nowS + 20 * 86400 + 30, fc: {} };
+  const idle = { session_id: 's', model: { display_name: 'Opus 5' }, cwd: rig.home, transcript_path: '/dev/null' };
+  // A running 5h window measured a minute ago, and a week sixteen days old.
+  const cache = { ...staleLaptopCache(nowS), five_pct: 12, five_at: nowS - 60, five_reset: nowS + 4 * 3600 + 30 };
+  const own = rig.render(state, idle, cache);
+  // eslint-disable-next-line no-control-regex
+  const vis = (s) => s.replace(/\x1b\[[0-9;]*m/g, '');
+  assert.match(vis(own.line), /^5h +~720k\/6M +12% ·4h 0m {2}wk — {2}mo /, `control: no oak — got ${JSON.stringify(vis(own.line))}`);
+  const account = rigAccount(rig, cache);
+  assert.deepStrictEqual([account.fiveMachine, account.weekMachine, account.fableMachine, account.monthMachine, account.machineNote], [null, null, null, null, ''],
+    'control: no saved machine, so core names none');
+  const zero = { input: 0, output: 0, cacheRead: 0, total: 0 };
+  for (const [what, answer] of [['no machine named', { sessionTokens: zero, claudeAccount: account }], ['an oak with no claudeAccount', { sessionTokens: zero }],
+    ['an answer that is no JSON', 'oak: the store is locked'], ['JSON that is no object', '[1,2,3]']]) {
+    const oak = oakStandIn(rig, answer);
+    const r = rig.render(state, idle, cache, oak.env);
+    assert.deepEqual(oak.calls(), ['usage --session s'], `${what}: control, the stand-in answered`);
+    assert.deepEqual(r.rows.slice(1), own.rows.slice(1), `${what}: lines 2 and 3 as with no oak`);
+    assert.deepStrictEqual(cacheFields(r.after), cacheFields(own.after), `${what}: and the same cache`);
+  }
+  // The session's own token split still comes off the same read.
+  const r = rig.render(state, idle, cache, oakStandIn(rig, { sessionTokens: { input: 1200, output: 340, cacheRead: 56000, total: 57540 }, claudeAccount: account }).env);
+  assert.match(vis(r.rows[1]), /^Opus 5 · ↑1k ↓340 ↺56k$/, `line 2 carries the session's tokens — got ${JSON.stringify(vis(r.rows[1]))}`);
+  assert.equal(r.after.tok_cache, 56000);
+  assert.equal(r.line, own.line, 'and line 3 is unchanged');
+  // Where core names no machine, the line's own reading stands, also where core's differs: a session that replied ten
+  // minutes ago carries fresher shares than the cache, which core read.
+  const shared = { ...cache, five_pct: 12, five_at: nowS - 1800, week_pct: 22, week_at: nowS - 2 * 3600, week_reset: nowS + 2 * 86400 + 30 };
+  const replied = { ...idle, transcript_path: repliedTranscript(rig.home, 'replied', nowS - 600),
+    rate_limits: { five_hour: { used_percentage: 15, resets_at: nowS + 4 * 3600 + 30 }, seven_day: { used_percentage: 45, resets_at: nowS + 2 * 86400 + 30 } } };
+  const mine = rigAccount(rig, shared);
+  assert.deepStrictEqual([mine.fiveHourPct, mine.weekPct, mine.machineNote], [12, 22, ''], 'control: core shows the cache\'s shares, and names no machine');
+  const r2 = rig.render(state, replied, shared, oakStandIn(rig, { sessionTokens: null, claudeAccount: mine }).env);
+  assert.match(vis(r2.line), /^5h +~900k\/6M +15% ·4h 0m {2}wk +~13\.5M\/30M \+90M↺ +45% ·2d 0h {2}mo /, `the session's shares — got ${JSON.stringify(vis(r2.line))}`);
+  assert.equal(r2.line, rig.render(state, replied, shared).line, 'as with no oak');
+});
+
+test('statusline: a narrow pane compacts the line before it wraps it, never cuts the title, and labels the tokens with the agents (0.11.0)', (t) => {
+  // The title was cut at 48 characters on every width, and a narrow pane wrapped the bars and line 2 before it gave up
+  // anything. Now the gauges go to text, then lose their token figures, and only then wrap; line 2 drops its parts from
+  // the output style up and keeps the model and the context figure on one row; the title wraps at its spaces. A session
+  // that started agents shows its own tokens and its tokens with them, each labelled.
+  // One clock for every render: rows drawn a minute apart differ in the time line 1 shows.
+  const nowS = Math.floor(Date.now() / 1000);
+  const rig = quotaLineRig(nowS);
+  if (!rig) return t.skip('python3 or jq is not installed');
+  const state = { v: 2, last_scan: nowS, tpp5: 60000, tpp7: 300000, tppE5: 60000, tppE7: 300000, R5: 41_000_000, a30: 0,
+    mo_start: nowS - 10 * 86400, mo_end: nowS + 20 * 86400 + 30, fc: {} };
+  const r5 = nowS + 4 * 3600 + 30;
+  const r7 = nowS + 3 * 86400 + 6 * 3600 + 30;
+  const cache = { v: 3, api_ts: nowS, five_reset: r5, week_reset: r7, five_pct: 37, five_at: nowS - 60, week_pct: 62, week_at: nowS - 60 };
+  const title = 'Investigate the intermittent upload failure on the staging cluster after the storage migration';
+  const input = { session_id: 's', session_name: title, cwd: rig.home, transcript_path: '/dev/null', model: { display_name: 'Opus 5' },
+    effort: { level: 'high' }, thinking: { enabled: true }, output_style: { name: 'Explanatory' }, cost: { total_duration_ms: 3_723_000 },
+    context_window: { used_percentage: 42, total_input_tokens: 80_000, total_output_tokens: 4_000, context_window_size: 200_000 },
+    rate_limits: { five_hour: { used_percentage: 37, resets_at: r5 }, seven_day: { used_percentage: 62, resets_at: r7 } } };
+  const oak = oakStandIn(rig, { sessionTokens: { input: 1_200_000, output: 84_000, cacheRead: 41_000_000, total: 1_284_000 },
+    sessionTreeTokens: { agents: 3, input: 3_600_000, output: 310_000, cacheRead: 96_000_000, total: 3_910_000 } });
+  // eslint-disable-next-line no-control-regex
+  const vis = (s) => s.replace(/\x1b\[[0-9;]*m/g, '');
+  const rows = (cols) => rig.render(state, input, cache, { ...oak.env, ...(cols ? { COLUMNS: String(cols) } : {}) }).rows.filter(Boolean).map(vis);
+  const full = rows(0);
+  assert.equal(full.length, 3, `no width: three rows — got ${JSON.stringify(full)}`);
+  assert.ok(full[0].endsWith(` | ${title}`), `the whole title — got ${JSON.stringify(full[0])}`);
+  assert.equal(full[1], 'Opus 5 · high · think · Explanatory · own ↑1.2M ↓84k ↺41M · with 3 agents ↑3.6M ↓310k ↺96M · ◷1h02m · 84k/200k 42%',
+    'the own tokens and the tokens with the agents, each labelled');
+  assert.match(full[2], /^5h +~2\.2M\/6M \+41M↺ +37% ·4h 0m {2}wk +~18\.6M\/30M +62% ·3d 6h {2}mo /, 'the gauges with their bars');
+  assert.deepEqual(rows(207), full, 'a window wide enough for every row draws them as with no width');
+  const at = {};
+  for (const cols of [120, 90, 70, 50, 30]) {
+    at[cols] = rows(cols);
+    for (const r of at[cols]) assert.ok([...r].length <= cols, `${cols} columns: no row wider than the window — got ${JSON.stringify(r)}`);
+    assert.ok(at[cols].join(' ').includes(title), `${cols} columns: every word of the title, in order — got ${JSON.stringify(at[cols])}`);
+    assert.ok(at[cols].some((r) => r.startsWith('Opus 5') && r.endsWith('84k/200k 42%')), `${cols} columns: the context figure on the model's row`);
+  }
+  assert.ok(at[120].includes(full[1]) && at[120].includes(full[2]), '120 columns: lines 2 and 3 as wide');
+  assert.ok(at[90].includes('Opus 5 · high · own ↑1.2M ↓84k ↺41M · with 3 agents ↑3.6M ↓310k ↺96M · 84k/200k 42%'),
+    `90 columns: line 2 drops the output style, think and the duration — got ${JSON.stringify(at[90])}`);
+  assert.ok(at[90].some((r) => /^5h ~2\.2M\/6M \+41M↺ 37% ·4h 0m {2}wk ~18\.6M\/30M 62% ·3d 6h {2}mo /.test(r)),
+    `90 columns: the gauges as text, without their bars, on one row — got ${JSON.stringify(at[90])}`);
+  assert.ok(at[70].includes('Opus 5 · high · own ↑1.2M ↓84k ↺41M · 84k/200k 42%'), `70 columns: then the tokens with the agents — got ${JSON.stringify(at[70])}`);
+  assert.ok(at[70].some((r) => /^5h 37% ·4h 0m {2}wk 62% ·3d 6h {2}mo 0% ·20d 0h$/.test(r)), `70 columns: then without their token figures — got ${JSON.stringify(at[70])}`);
+  assert.ok(at[30].includes('5h 37% ·4h 0m  wk 62% ·3d 6h') || at[30].includes('5h 37% ·4h 0m'), `30 columns: only then do they wrap — got ${JSON.stringify(at[30])}`);
+  // A word wider than the window is broken at its edge rather than cut by Claude Code: `intermittent` at 10 columns.
+  const ten = rows(10);
+  const head = ten.slice(0, ten.findIndex((r) => r.startsWith('Opus 5')));
+  for (const r of head) assert.ok([...r].length <= 10, `10 columns: no row of line 1 wider than the window — got ${JSON.stringify(head)}`);
+  assert.ok(head.join('').replace(/ /g, '').includes(title.replace(/ /g, '')), `10 columns: the whole title — got ${JSON.stringify(head)}`);
+  // The terminal app's port of line 2 reads the tokens from the cache the render wrote, the figures the line drew (not
+  // the context window's 80k), and draws the same bytes; the session row gives it the model, effort and duration.
+  const wide = rig.render(state, input, cache, oak.env);
+  assert.deepEqual([wide.after.tok_in, wide.after.tok_out, wide.after.tok_cache, wide.after.tok_tree],
+    [1_200_000, 84_000, 41_000_000, { agents: 3, input: 3_600_000, output: 310_000, cacheRead: 96_000_000 }], 'the cache keeps what line 2 drew');
+  const prev = process.env.CLAUDE_CONFIG_DIR;
+  process.env.CLAUDE_CONFIG_DIR = rig.cdir;
+  let d;
+  try {
+    d = tui.statuslineDataFor({ now: Date.now(), usage: core.usageLine(rig.home, ''), session: 's',
+      views: { sessions: { sessions: [{ id: 's', model: 'Opus 5', effort: 'high', durationMs: 3_723_000 }] } } });
+  } finally {
+    if (prev === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = prev;
+  }
+  assert.equal(tui.statuslineSession({ ...d, ctxPct: 42, ctxUsed: 84_000, ctxSize: 200_000 }, '256', false), wide.rows[1], 'the terminal app draws line 2 byte for byte');
+  // A session that started none clears the tree a session before it left, and its line has no labels.
+  const alone = rig.render(state, input, cache, oakStandIn(rig, { sessionTokens: { input: 1_200_000, output: 84_000, cacheRead: 41_000_000, total: 1_284_000 } }).env);
+  assert.equal(alone.after.tok_tree, null, 'no tree for a session with no agents');
+  assert.equal(vis(alone.rows[1]), 'Opus 5 · high · think · Explanatory · ↑1.2M ↓84k ↺41M · ◷1h02m · 84k/200k 42%', 'and its tokens unlabelled');
+});
+
+test('statusline: a saved machine named for the week lends the week and its month, named with them, and the line keeps its own ended 5h window (2026-10-22)', (t) => {
+  const rig = quotaLineRig();
+  if (!rig) return t.skip('python3 or jq is not installed');
+  const nowS = Math.floor(Date.now() / 1000);
+  const state = { v: 2, last_scan: nowS, tpp5: 60000, tpp7: 300000, tppE5: 60000, tppE7: 300000, R7: 90_000_000, a30: 0,
+    mo_start: nowS - 10 * 86400, mo_end: nowS + 20 * 86400 + 30, fc: {} };
+  const idle = { session_id: 's', model: { display_name: 'Opus 5' }, cwd: rig.home, transcript_path: '/dev/null' };
+  // This machine's 5h window ended ten minutes ago; its week is sixteen days old; it has no per-model cap.
+  const cache = { ...staleLaptopCache(nowS), five_pct: 95, five_at: nowS - 3 * 3600, five_reset: nowS - 600 };
+  for (const k of ['fable_pct', 'fable_at', 'fable_reset', 'fable_label']) delete cache[k];
+  seedMachines(rig, savedMachine('build-box', { five: null, fable: null }));
+  const account = rigAccount(rig, cache);
+  assert.deepStrictEqual([account.fiveHourPct, account.fiveMachine, account.weekMachine, account.fablePct, account.monthMachine, account.machineNote],
+    [0, null, 'build-box', null, 'build-box', 'build-box: wk mo'], 'control: core takes the week and its month from the saved machine');
+  const oak = oakStandIn(rig, { sessionTokens: null, claudeAccount: account });
+  const r = rig.render(state, idle, cache, oak.env);
+  // eslint-disable-next-line no-control-regex
+  const vis = (s) => s.replace(/\x1b\[[0-9;]*m/g, '');
+  assert.match(vis(r.line), /^\(build-box: wk mo\) {2}5h +~0\/6M +0% {2}wk +~30M\/100M \+90M↺ +30% ·2d 0h {2}mo +~2M\/100M \+5M↺ +2% ·9d 0h$/,
+    `the 5h window ended here (0%, no countdown), the week and month from the saved machine, named — got ${JSON.stringify(vis(r.line))}`);
+  assert.deepStrictEqual([r.after.five_pct, r.after.five_at, r.after.week_pct, r.after.week_at, r.after.week_tok], [95, nowS - 3 * 3600, 70, nowS - 16 * 86400, 0],
+    'the cache keeps this machine\'s own');
+  assert.equal(rig.port(), r.line, 'the terminal app draws the same line, byte for byte');
+  const b32 = bash32();
+  if (b32) {
+    assert.match(cp.spawnSync(b32, ['-c', 'printf %s "$BASH_VERSION"'], { encoding: 'utf8' }).stdout, /^3\.2\./, 'control: the shell below is bash 3.2');
+    assert.equal(rig.render(state, idle, cache, oak.env, b32).line, r.line, 'bash 3.2 draws the same line');
+  }
+  // Two saved machines, one window each: each machine named with its windows, on the line and in the terminal app.
+  seedMachines(rig, savedMachine('box-a', { week: null, fable: null, month: null }), savedMachine('box-b', { five: null, fable: null }));
+  const two = rigAccount(rig, cache);
+  assert.equal(two.machineNote, 'box-a: 5h; box-b: wk mo', 'control: core names both');
+  const r2 = rig.render(state, idle, cache, oakStandIn(rig, { sessionTokens: null, claudeAccount: two }).env);
+  assert.match(vis(r2.line), /^\(box-a: 5h; box-b: wk mo\) {2}5h +~12k\/1\.2M +1% ·3h 0m {2}wk /, `got ${JSON.stringify(vis(r2.line))}`);
+  assert.equal(rig.port(), r2.line, 'the terminal app names them the same way');
+  // A name is drawn without control characters, which would break the line's read or reach the terminal: core drops
+  // them from a machine's label, and the line does not rely on it.
+  const r3 = rig.render(state, idle, cache, oakStandIn(rig, { sessionTokens: null, claudeAccount: { ...two, fiveMachine: 'box\n\u001b[2J-a\u0007' } }).env);
+  // eslint-disable-next-line no-control-regex
+  assert.doesNotMatch(r3.line.replace(/\x1b\[[0-9;]*m/g, ''), /[\x00-\x1f\x7f]/, `no control character reaches the line — got ${JSON.stringify(r3.line)}`);
+  assert.match(vis(r3.line), /^\(box\[2J-a: 5h; box-b: wk mo\) {2}5h +~12k\/1\.2M +1% ·3h 0m {2}wk +~30M\/100M /, 'and every field after the name is read where it was');
+});
+
+test('statusline: a share this render measured within five minutes stands over a saved machine\'s that core named before it was recorded (2026-10-22)', (t) => {
+  // core reads the cache before this render writes it: on the first render after this machine's session replies, it
+  // still names the saved machine for windows this render has just measured. Core keeps this machine's share while it
+  // is under five minutes old, and so does the line; the month goes with the week. The per-model cap this render did
+  // not measure is the saved machine's, named alone, and once this render's shares are recorded the terminal app
+  // draws the same line.
+  const rig = quotaLineRig();
+  if (!rig) return t.skip('python3 or jq is not installed');
+  const nowS = Math.floor(Date.now() / 1000);
+  const state = { v: 2, last_scan: nowS, tpp5: 60000, tpp7: 300000, tppE5: 60000, tppE7: 300000, R7: 90_000_000, a30: 0,
+    mo_start: nowS - 10 * 86400, mo_end: nowS + 20 * 86400 + 30, fc: {} };
+  seedMachines(rig, savedMachine('build-box'));
+  const account = rigAccount(rig, staleLaptopCache(nowS));
+  assert.equal(account.machineNote, 'build-box', 'control: before this render, core names the saved machine for every window');
+  const active = { session_id: 's', model: { display_name: 'Opus 5' }, cwd: rig.home, transcript_path: repliedTranscript(rig.home, 'active', nowS - 20),
+    rate_limits: { five_hour: { used_percentage: 7, resets_at: nowS + 4 * 3600 + 30 }, seven_day: { used_percentage: 33, resets_at: nowS + 2 * 86400 + 30 } } };
+  const r = rig.render(state, active, staleLaptopCache(nowS), oakStandIn(rig, { sessionTokens: null, claudeAccount: account }).env);
+  // eslint-disable-next-line no-control-regex
+  const vis = (s) => s.replace(/\x1b\[[0-9;]*m/g, '');
+  assert.match(vis(r.line), /^\(build-box: fable\) {2}5h +~420k\/6M +7% ·4h 0m {2}fable +~400k\/10M +4% ·2d 0h {2}wk +~9\.9M\/30M \+90M↺ +33% ·2d 0h {2}mo +~0\/128\.5M +0% ·20d 0h$/,
+    `this render's 5h and week, its own month, the saved machine's cap — got ${JSON.stringify(vis(r.line))}`);
+  assert.deepStrictEqual([r.after.five_pct, r.after.five_at, r.after.week_pct, r.after.week_at], [7, nowS - 20, 33, nowS - 20], 'recorded as this machine\'s, dated by the reply');
+  assert.equal(rig.port(), r.line, 'the terminal app, reading what this render recorded, draws the same line');
+});
+
+test('statusline: a share this machine measured hours ago inside its window gives way to the saved machine\'s fresher one, as core shows it (2026-10-22)', (t) => {
+  // The laptop's week was measured this morning, inside the current week, and its 5h share a minute ago; the saved
+  // machine measured the week a minute ago. core keeps the live 5h share and shows the saved machine's week, which is
+  // fresher than the laptop's out-of-date one, and so does the line: a share dated more than five minutes ago does not
+  // stand, whichever window it is.
+  const rig = quotaLineRig();
+  if (!rig) return t.skip('python3 or jq is not installed');
+  const nowS = Math.floor(Date.now() / 1000);
+  const state = { v: 2, last_scan: nowS, tpp5: 60000, tpp7: 300000, tppE5: 60000, tppE7: 300000, R7: 90_000_000, a30: 0,
+    mo_start: nowS - 10 * 86400, mo_end: nowS + 20 * 86400 + 30, fc: {} };
+  const idle = { session_id: 's', model: { display_name: 'Opus 5' }, cwd: rig.home, transcript_path: '/dev/null' };
+  const cache = { v: 3, api_ts: nowS, five_pct: 12, five_at: nowS - 60, five_reset: nowS + 4 * 3600 + 30,
+    week_pct: 22, week_at: nowS - 3 * 3600, week_reset: nowS + 2 * 86400 + 30 };
+  seedMachines(rig, savedMachine('build-box', { fable: null }));
+  const account = rigAccount(rig, cache);
+  assert.deepStrictEqual([account.fiveHourPct, account.fiveMachine, account.weekPct, account.weekMachine, account.monthMachine], [12, null, 30, 'build-box', 'build-box'],
+    'control: core keeps this machine\'s live 5h share and shows the saved machine\'s fresher week, with its month');
+  const r = rig.render(state, idle, cache, oakStandIn(rig, { sessionTokens: null, claudeAccount: account }).env);
+  // eslint-disable-next-line no-control-regex
+  const vis = (s) => s.replace(/\x1b\[[0-9;]*m/g, '');
+  assert.match(vis(r.line), /^\(build-box: wk mo\) {2}5h +~720k\/6M +12% ·4h 0m {2}wk +~30M\/100M \+90M↺ +30% ·2d 0h {2}mo +~2M\/100M \+5M↺ +2% ·9d 0h$/,
+    `this machine's live 5h, the saved machine's week and month, named — got ${JSON.stringify(vis(r.line))}`);
+  assert.deepStrictEqual([r.after.week_pct, r.after.week_at], [22, nowS - 3 * 3600], 'the cache keeps this machine\'s own week');
+  assert.equal(rig.port(), r.line, 'the terminal app draws the same line, byte for byte');
+});
+
+test('statusline: a saved machine\'s later week replaces this machine\'s live share, and a 5h share of 0 with no reset is no window, as in core (2026-10-22)', (t) => {
+  // core's two exceptions to a live share standing (fillFromMachines): a share of a later weekly window replaces this
+  // machine's, live or not (an early reset that a saved machine has read and this machine's last reply had not), and a
+  // 5h share of 0 with no reset (an account pull that found no 5h window, on a cache that has never known one) is no
+  // window, below any running one. The line follows both, so it draws what the terminal app draws.
+  const rig = quotaLineRig();
+  if (!rig) return t.skip('python3 or jq is not installed');
+  const nowS = Math.floor(Date.now() / 1000);
+  const state = { v: 2, last_scan: nowS, tpp5: 60000, tpp7: 300000, tppE5: 60000, tppE7: 300000, R7: 90_000_000, a30: 0,
+    mo_start: nowS - 10 * 86400, mo_end: nowS + 20 * 86400 + 30, fc: {} };
+  // eslint-disable-next-line no-control-regex
+  const vis = (s) => s.replace(/\x1b\[[0-9;]*m/g, '');
+  const now = Date.now();
+  seedMachines(rig, savedMachine('build-box', { five: null, fable: null, month: null,
+    week: { pct: 2, reset: (nowS + 6 * 86400 + 23 * 3600 + 30) * 1000, at: now - 60_000, tok: 2_000_000, total: 100_000_000 } }));
+  const cache = { v: 3, api_ts: nowS, week_pct: 80, week_at: nowS - 3 * 3600, week_reset: nowS + 2 * 86400 + 30 };
+  const active = { session_id: 's', model: { display_name: 'Opus 5' }, cwd: rig.home, transcript_path: repliedTranscript(rig.home, 'active', nowS - 20),
+    rate_limits: { seven_day: { used_percentage: 81, resets_at: nowS + 2 * 86400 + 30 } } };
+  const r = rig.render(state, active, cache, oakStandIn(rig, { sessionTokens: null, claudeAccount: rigAccount(rig, cache) }).env);
+  assert.equal(rig.port(), r.line, `the later week, as the terminal app draws it after this render — got ${JSON.stringify(vis(r.line))}`);
+  assert.match(vis(r.line), /^\(build-box: wk\) {2}5h — {2}wk +~2M\/100M \+90M↺ +2% ·6d 23h /, `got ${JSON.stringify(vis(r.line))}`);
+  assert.deepStrictEqual([r.after.week_pct, r.after.week_at], [81, nowS - 20], 'the cache keeps this machine\'s own share, dated by the reply');
+  // A 5h share of 0 with no reset known, measured a minute ago.
+  seedMachines(rig, savedMachine('build-box', { week: null, fable: null, month: null }));
+  const none = { v: 3, api_ts: nowS, five_pct: 0, five_at: nowS - 60 };
+  const idle = { session_id: 's', model: { display_name: 'Opus 5' }, cwd: rig.home, transcript_path: '/dev/null' };
+  const account = rigAccount(rig, none);
+  assert.deepStrictEqual([account.fiveHourPct, account.fiveMachine], [1, 'build-box'], 'control: core shows the saved machine\'s running 5h window');
+  const r2 = rig.render(state, idle, none, oakStandIn(rig, { sessionTokens: null, claudeAccount: account }).env);
+  assert.equal(rig.port(), r2.line, `the saved machine's running window, as the terminal app draws it — got ${JSON.stringify(vis(r2.line))}`);
+  assert.match(vis(r2.line), /^\(build-box: 5h\) {2}5h +~12k\/1\.2M +1% ·3h 0m /, `got ${JSON.stringify(vis(r2.line))}`);
+});
+
+/** The two machines of the case the user hit, on one Claude account, each a status line rig with its own transcripts,
+ *  login, bill day and calibration as it stood: a build machine that ran 3.92M tokens in the 5h window, 15.5M in the
+ *  week and 138.3M in the bill cycle, and a laptop that ran 0.287M, 0.287M and 0.616M, whose transcripts also hold
+ *  16.4M of turns run under another home this cycle. The account reads 11% (5h, resetting at `r5`) and 9% (week, `r7`)
+ *  on both. `render(m, extra)` runs a machine's line on the state and cache it last wrote, with turns counted as its
+ *  own by the home they ran under (`m.home`, as the scan reads a turn's cwd), and returns the line, the cache and the
+ *  state; `as(m, fn)` runs core as that machine (its config dir and home, which name it: machineHostTag); `brief(m)` is
+ *  what its `oak __usage-brief` prints; `pull(m, label, b)` puts a brief in its saved machines' cache. Null where python3
+ *  or jq is missing. */
+function accountMachines() {
+  const big = quotaLineRig(), lap = quotaLineRig();
+  if (!big || !lap) return null;
+  const now = Math.floor(Date.now() / 1000);
+  const r5 = now + 3 * 3600 + 30, r7 = now + 3 * 86400 + 30;
+  // Both bill on the same day, twenty days ago, so the cycle holds the month's turns.
+  const billDay = new Date((now - 20 * 86400) * 1000).getUTCDate();
+  const turn = (id, ago, cwd, cw, out, cr) => JSON.stringify({ type: 'assistant', timestamp: new Date((now - ago) * 1000).toISOString(), cwd,
+    message: { id, model: 'claude-opus-5', usage: { input_tokens: 0, output_tokens: out, cache_creation_input_tokens: cw, cache_read_input_tokens: cr } } });
+  const setup = (rig, home, turns, cal, ledger) => {
+    fs.mkdirSync(path.join(rig.cdir, 'projects', 'p'), { recursive: true });
+    fs.mkdirSync(path.join(rig.cdir, 'claude-observatory'), { recursive: true });
+    fs.writeFileSync(path.join(rig.cdir, 'claude-observatory', 'prefs.json'), JSON.stringify({ billDay }));
+    fs.writeFileSync(path.join(rig.cdir, '.claude.json'), JSON.stringify({ oauthAccount: { accountUuid: 'acct-shared' } }));
+    fs.writeFileSync(path.join(rig.cdir, 'projects', 'p', 's.jsonl'), turns.join('\n') + '\n');
+    // The calibration each had learned (tokens and dollars per percent), its spend ledger (Claude Code's reported
+    // spend: $60 in the last five hours and $400 in the week on the build machine, $5 and $20 on the laptop), no
+    // scan yet, so the first render scans, and no account pull due.
+    fs.writeFileSync(path.join(rig.cdir, 'statusline-usage.json'), JSON.stringify({ v: 2, last_scan: 0, fc: {}, ...cal,
+      ch: [[now - 8 * 86400, 0], [now - 6 * 3600, ledger.base]] }));
+    fs.writeFileSync(path.join(rig.cdir, 'statusline-last.json'), JSON.stringify({ v: 3, api_ts: now, costs: { s0: { usd: ledger.usd, at: now - 60 } } }));
+    return { rig, home };
+  };
+  const machines = {
+    big: setup(big, '/home/fx-build', [
+      turn('b5', 3600, '/home/fx-build/p', 3_600_000, 320_000, 200_000_000),
+      turn('b7', 2 * 86400, '/home/fx-build/p', 10_600_000, 980_000, 600_000_000),
+      turn('b30', 10 * 86400, '/home/fx-build/p', 113_000_000, 9_800_000, 5_250_000_000),
+    ], { tpp5: 356_364, tppE5: 381_000, tpp7: 1_722_222, tppE7: 1_785_000 }, { base: 340, usd: 400 }),
+    lap: setup(lap, '/Users/fx-laptop', [
+      turn('l5', 3600, '/Users/fx-laptop/p', 270_000, 17_000, 10_000_000),
+      turn('l30', 10 * 86400, '/Users/fx-laptop/p', 300_000, 29_000, 10_000_000),
+      turn('f30', 12 * 86400, '/home/elsewhere/p', 15_000_000, 1_384_000, 435_000_000),
+    ], { tpp5: 26_091, tppE5: 19_300, tpp7: 31_889, tppE7: 21_500 }, { base: 15, usd: 20 }),
+  };
+  const as = (m, fn) => {
+    const prev = [process.env.CLAUDE_CONFIG_DIR, process.env.HOME, process.env.USERPROFILE];
+    process.env.CLAUDE_CONFIG_DIR = m.rig.cdir;
+    process.env.HOME = process.env.USERPROFILE = m.rig.home;
+    try {
+      return fn();
+    } finally {
+      if (prev[0] === undefined) delete process.env.CLAUDE_CONFIG_DIR; else process.env.CLAUDE_CONFIG_DIR = prev[0];
+      process.env.HOME = prev[1];
+      if (prev[2] === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = prev[2];
+    }
+  };
+  const read = (m, f) => JSON.parse(fs.readFileSync(path.join(m.rig.cdir, f), 'utf8'));
+  const render = (m, extra = {}, bash) => {
+    const input = { session_id: 's', model: { display_name: 'Opus 5' }, cwd: m.rig.home, transcript_path: repliedTranscript(m.rig.home, 'live', Math.floor(Date.now() / 1000) - 30),
+      rate_limits: { five_hour: { used_percentage: 11, resets_at: r5 }, seven_day: { used_percentage: 9, resets_at: r7 } } };
+    // These homes name synthetic transcript origins. Git Bash must not convert USERPROFILE to a path under its
+    // install directory: native Python would then recognize no home and count the other machine's turns as ours.
+    const r = m.rig.render(read(m, 'statusline-usage.json'), input, read(m, 'statusline-last.json'),
+      { HOME: m.home, USERPROFILE: m.home, MSYS2_ENV_CONV_EXCL: 'USERPROFILE', ...extra }, bash);
+    return { ...r, state: read(m, 'statusline-usage.json') };
+  };
+  const brief = (m) => as(m, () => core.machineUsageBrief(m.rig.home));
+  const pull = (m, label, b) => as(m, () => seedMachines(m.rig, { label, target: `me@${label}`, skewMs: 0, rttMs: 40, brief: b }));
+  // What `oak usage --session` prints there, for the line's one `oak` call: core's readout of the account.
+  const oak = (m) => oakStandIn(m.rig, { sessionTokens: null, claudeAccount: as(m, () => core.usageLine(m.rig.home, '')) });
+  // The next render scans, as the next one after ten minutes does.
+  const rescan = (m) => fs.writeFileSync(path.join(m.rig.cdir, 'statusline-usage.json'), JSON.stringify({ ...read(m, 'statusline-usage.json'), last_scan: 0 }));
+  return { ...machines, now, r5, r7, as, read, render, brief, pull, oak, rescan };
+}
+
+/** A machine's figures as its cache holds them after a render: what every OAK readout on it draws. */
+const shownFigures = (c) => ({ five: [c.five_tok, c.five_total, c.five_reads], week: [c.week_tok, c.week_total, c.week_reads],
+  month: [c.month_tok, c.month_tok_total, c.month_reads, c.month_cost, c.month_cost_total], dollars: [c.five_cost_total, c.week_cost_total] });
+const monthPct = (c) => (100 * c.month_tok) / c.month_tok_total;
+
+test('statusline: two machines on one account calibrate their estimates against the account\'s usage and show the same budgets and month (2026-10-27)', (t) => {
+  // The user's laptop drew budgets more than ten times smaller than the build machine's, and its month at 100% beside
+  // the other's 17%, though both read the same shares: each learned its tokens per percent from its own transcripts
+  // against the account's share.
+  const two = accountMachines();
+  if (!two) return t.skip('python3 or jq is not installed');
+  const { big, lap } = two;
+  // eslint-disable-next-line no-control-regex
+  const vis = (s) => s.replace(/\x1b\[[0-9;]*m/g, '');
+  // Before either machine has the other's figures: each calibrates on its own transcripts, as before.
+  const b1 = two.render(big), l1 = two.render(lap);
+  assert.ok(monthPct(b1.after) > 17 && monthPct(b1.after) < 19, `control: the build machine's month — ${monthPct(b1.after)}%`);
+  assert.ok(monthPct(l1.after) > 100, `control: the laptop's month is over its own budget, as its own reading showed it — ${monthPct(l1.after)}%`);
+  assert.match(vis(l1.line), /mo +~17M\/10M \+455M↺ +100% /, `control: the defect — got ${JSON.stringify(vis(l1.line))}`);
+  assert.ok(b1.after.five_total > 15 * l1.after.five_total, `control: budgets ${b1.after.five_total} and ${l1.after.five_total} differ fifteenfold`);
+  // The pull: each machine's brief, which now carries what it measured of its own turns, reaches the other.
+  const bb = two.brief(big), lb = two.brief(lap);
+  assert.notEqual(bb.own.host, lb.own.host, 'the fixtures represent two distinct machines on Windows too');
+  assert.deepStrictEqual([bb.own.five.tok, bb.own.week.tok, bb.own.month.tok, lb.own.five.tok, lb.own.week.tok, lb.own.month.tok],
+    [3_920_000, 15_500_000, 138_300_000, 287_000, 287_000, 616_000], 'each sends its own turns alone: the laptop\'s 16.4M from another home stay out');
+  two.pull(big, 'laptop', lb);
+  two.pull(lap, 'build-box', bb);
+  two.rescan(big);
+  two.rescan(lap);
+  const bo = two.oak(big), lo = two.oak(lap);
+  const b2 = two.render(big, bo.env), l2 = two.render(lap, lo.env);
+  assert.deepEqual([bo.calls(), lo.calls()], [['usage --session s'], ['usage --session s']], 'one oak process a render, the one the line already started');
+  assert.deepStrictEqual(shownFigures(l2.after), shownFigures(b2.after), 'both machines show the same estimates, budgets, cache reads, month and dollars');
+  assert.equal(vis(l2.line), vis(b2.line), 'and draw the same line');
+  assert.equal(l2.after.month_tok, 138_300_000 + 616_000, 'the month is the two machines\' own turns, each counted once');
+  assert.equal(l2.after.five_total, Math.trunc(((3_920_000 + 287_000) / 11) * 100), 'the 5h budget is the account\'s tokens over the account\'s share');
+  assert.equal(l2.after.week_total, Math.trunc(((15_500_000 + 287_000) / 9) * 100), 'and so is the week\'s');
+  assert.ok(monthPct(l2.after) > 17 && monthPct(l2.after) < 19, `the laptop's month reads the account's ${monthPct(l2.after)}%, not 100%`);
+  assert.ok(l2.after.month_cost > 4000 && l2.after.month_cost_total > 20000, `and its dollars the build machine's range — ${l2.after.month_cost}/${l2.after.month_cost_total}`);
+  assert.deepStrictEqual([l2.state.n5, l2.state.n7, b2.state.n5, b2.state.n7], [1, 1, 1, 1], 'each calibrated with the other machine in its sum, starting the smoothing over');
+  assert.match(vis(l2.line), /^5h +~4\.2M\/38\.2M \+210M↺ +11% ·3h 0m {2}wk +~15\.7M\/175\.4M \+810M↺ +9% ·3d 0h {2}mo +~138\.9M\/776\.8M \+6B↺ +18% ·\d+d \d+h {2}~\$4\.1k\/~\$23\.0k$/,
+    `got ${JSON.stringify(vis(l2.line))}`);
+  // Every OAK readout there reads the same cache: core, the terminal app and the brief the other machine borrows.
+  const coreSays = (m) => two.as(m, () => { const u = core.usageLine(m.rig.home, ''); return [u.fiveTotal, u.weekTotal, u.monthTokens, u.monthTokensTotal, u.monthCost, u.monthCostTotal]; });
+  assert.deepStrictEqual(coreSays(lap), coreSays(big), 'core reads the same figures on both');
+  assert.deepStrictEqual([two.as(lap, () => core.usageLine(lap.rig.home, '').machineMeasured.machines), two.as(big, () => core.usageLine(big.rig.home, '').machineMeasured.machines)],
+    ['build-box', 'laptop'], 'and names the machine whose usage they include');
+  assert.equal(two.as(lap, () => lap.rig.port()), l2.line, 'the terminal app draws the line the shell drew');
+  const b32 = bash32();
+  if (b32) {
+    two.rescan(lap);
+    assert.equal(two.render(lap, two.oak(lap).env, b32).line, l2.line, 'bash 3.2 draws the same line');
+  }
+});
+
+test('statusline: a saved machine adds to the estimates only for the same account and window, from a current OAK; otherwise the line calibrates as before (2026-10-27)', (t) => {
+  const two = accountMachines();
+  if (!two) return t.skip('python3 or jq is not installed');
+  const { big, lap } = two;
+  two.render(big);
+  two.render(lap);
+  const bb = two.brief(big);
+  const from = JSON.parse(fs.readFileSync(path.join(lap.rig.cdir, 'statusline-usage.json'), 'utf8'));
+  const cache = JSON.parse(fs.readFileSync(path.join(lap.rig.cdir, 'statusline-last.json'), 'utf8'));
+  // The laptop's next scan, from the same state and cache each time, with `brief` as the build machine's last answer.
+  const prep = (brief) => {
+    fs.writeFileSync(path.join(lap.rig.cdir, 'statusline-usage.json'), JSON.stringify({ ...from, last_scan: 0 }));
+    fs.writeFileSync(path.join(lap.rig.cdir, 'statusline-last.json'), JSON.stringify(cache));
+    fs.rmSync(two.as(lap, () => core.machineUsageCachePath()), { force: true });
+    if (brief) two.pull(lap, 'build-box', brief);
+  };
+  const next = (brief, oakAnswer) => {
+    prep(brief);
+    const oak = oakAnswer ? oakStandIn(lap.rig, oakAnswer) : two.oak(lap);
+    return two.render(lap, oak.env).after;
+  };
+  const alone = next(null);
+  assert.ok(monthPct(alone) > 100, 'control: with no saved machine, the laptop calibrates on its own turns, as before');
+  const summed = next(bb);
+  assert.ok(monthPct(summed) < 19, 'control: the build machine\'s own figures are added');
+  // Each machine counts its own turns alone, so a transcript synced from the build machine is counted once: the laptop
+  // holding a copy of its 5h turn adds the build machine's own figures, not the copy as well. Where this machine holds
+  // more than the sum (turns synced in from a machine OAK does not read), its own count stands.
+  const synced = path.join(lap.rig.cdir, 'projects', 'p', 'synced.jsonl');
+  const copy = (id, cwd, cw) => JSON.stringify({ type: 'assistant', timestamp: new Date((two.now - 3600) * 1000).toISOString(), cwd,
+    message: { id, model: 'claude-opus-5', usage: { input_tokens: 0, output_tokens: 320_000, cache_creation_input_tokens: cw, cache_read_input_tokens: 200_000_000 } } });
+  fs.writeFileSync(synced, copy('b5', '/home/fx-build/p', 3_600_000) + '\n');
+  const once = next(bb);
+  assert.deepStrictEqual([once.five_total, once.five_reads], [summed.five_total, summed.five_reads], 'a synced copy of the build machine\'s turn is not counted twice');
+  fs.writeFileSync(synced, copy('t5', '/home/third/p', 6_000_000) + '\n');
+  assert.equal(next(bb).five_total, Math.trunc(((287_000 + 6_320_000) / 11) * 100), 'a third machine\'s 6.32M synced in: the 6.6M this machine holds, over the 4.2M sum');
+  fs.rmSync(synced);
+  const old = { ...bb };
+  delete old.own;
+  assert.deepStrictEqual(shownFigures(next(old)), shownFigures(alone), 'an older OAK\'s brief, with no figures of its own, adds nothing');
+  const tag = require('crypto').scryptSync('acct-other', 'oak-claude-account', 6).toString('hex');
+  assert.deepStrictEqual(shownFigures(next({ ...bb, account: tag })), shownFigures(alone), 'another account\'s figures are never added');
+  // A stale reading: the build machine's last scan was before this 5h window began. Its week and month still count.
+  const stale = next({ ...bb, own: { ...bb.own, at: (two.r5 - 5 * 3600 - 600) * 1000 } });
+  assert.deepStrictEqual([stale.five_total, stale.week_total, stale.month_tok], [alone.five_total, summed.week_total, summed.month_tok],
+    'the 5h budget calibrates on the laptop alone; the week and month on both');
+  // Another window: a 5h figure of the window before this one, and a month of another bill cycle.
+  const other = next({ ...bb, own: { ...bb.own, five: { ...bb.own.five, reset: bb.own.five.reset - 5 * 3600_000 },
+    month: { ...bb.own.month, start: bb.own.month.start + 86400_000, reset: bb.own.month.reset + 86400_000 } } });
+  assert.deepStrictEqual([other.five_total, other.week_total, other.month_tok], [alone.five_total, summed.week_total, alone.month_tok],
+    'the 5h window and the month the laptop is not in add nothing; the week still does');
+  // The line checks the window itself: figures core matched to the window its cache last named, which is not the one
+  // this render scans (a window that began since), add nothing.
+  prep(bb);
+  const account = two.as(lap, () => core.usageLine(lap.rig.home, ''));
+  const mm = account.machineMeasured;
+  assert.ok(mm.five && mm.week && mm.month, 'control: core matched every window');
+  const moved = next(null, { sessionTokens: null, claudeAccount: { ...account, machineMeasured: { ...mm,
+    five: { ...mm.five, reset: mm.five.reset - 5 * 3600_000 }, month: { ...mm.month, start: mm.month.start - 86400_000 } } } });
+  assert.deepStrictEqual([moved.five_total, moved.week_total, moved.month_tok], [alone.five_total, summed.week_total, alone.month_tok],
+    'a sum for another 5h window or bill cycle than the scan\'s adds nothing');
+  // Dollars: the spend each machine's sessions reported calibrates the dollars per percent, summed the same way.
+  assert.deepStrictEqual([alone.five_cost_total, summed.five_cost_total, summed.week_cost_total], [45, 590, 4666],
+    'the 5h and weekly dollar budgets: the laptop\'s own $5 and $20, then the account\'s $65 and $420, per percent');
+  assert.equal(Math.round(summed.month_cost * 100), Math.round((4097.5 + 14.71) * 100), 'and the month adds both machines\' list-priced turns');
+  // The month refresh OAK starts on a machine used from an editor alone renders the line with no session id (`{"cwd":
+  // …}`, as kickMonthRefresh sends it): it makes the line's one oak call too, without --session, and its scan adds the
+  // build machine's month. The session tokens that call reports belong to no session of this render and are not drawn.
+  const bin = path.join(lap.rig.home, 'oak-month');
+  const calls = path.join(lap.rig.home, 'oak-month.log');
+  const answer = path.join(lap.rig.home, 'oak-month.json');
+  fs.mkdirSync(bin, { recursive: true });
+  fs.writeFileSync(path.join(bin, 'oak'), `#!/bin/sh\nprintf '%s\\n' "$*" >> '${calls}'\ncase "$*" in usage) cat '${answer}' ;; esac\n`, { mode: 0o755 });
+  const refresh = (bash) => {
+    prep(bb);
+    fs.writeFileSync(answer, JSON.stringify({ sessionTokens: { input: 1200, output: 340, cacheRead: 56000, total: 57540 }, claudeAccount: two.as(lap, () => core.usageLine(lap.rig.home, '')) }));
+    fs.rmSync(calls, { force: true });
+    const r = lap.rig.render({ ...from, last_scan: 0 }, { cwd: lap.rig.home }, cache,
+      { HOME: lap.home, USERPROFILE: lap.home, MSYS2_ENV_CONV_EXCL: 'USERPROFILE', PATH: bin + path.delimiter + lap.rig.env.PATH }, bash);
+    return { ...r, calls: fs.readFileSync(calls, 'utf8').trim().split('\n') };
+  };
+  const monthly = refresh();
+  assert.deepEqual(monthly.calls, ['usage'], 'one oak call, with no session');
+  assert.deepStrictEqual([monthly.after.month_tok, monthly.after.month_cost], [summed.month_tok, summed.month_cost], 'the month refresh records the account\'s month');
+  assert.doesNotMatch(monthly.rows[1] || '', /↑/, 'and draws no session tokens');
+  const b32 = bash32();
+  if (b32) assert.deepStrictEqual(refresh(b32).after.month_tok, summed.month_tok, 'bash 3.2 makes the same call');
+});
+
+test('statusline: a scan given none of the saved machines\' figures the last scan summed takes that scan\'s, for one scan only (2026-10-27)', (t) => {
+  // Within a window a saved machine's figures do not leave: one that stops answering keeps its last. A scan whose `oak
+  // usage` gave none (the call failed, or read the login file caught mid-write) summed this machine's turns alone: the
+  // laptop's month read the 17M its transcripts hold, not the account's 139M, for the ten minutes until the next scan,
+  // and each budget lost a tenth, more the fuller the window, which took the smoothing most of an hour to win back.
+  const two = accountMachines();
+  if (!two) return t.skip('python3 or jq is not installed');
+  const { big, lap } = two;
+  two.render(big);
+  two.render(lap);
+  two.pull(lap, 'build-box', two.brief(big));
+  two.rescan(lap);
+  const account = two.as(lap, () => core.usageLine(lap.rig.home, ''));
+  assert.ok(account.machineMeasured.five && account.machineMeasured.week && account.machineMeasured.month, 'control: the build machine counts in every window');
+  const summed = two.render(lap, oakStandIn(lap.rig, { sessionTokens: null, claudeAccount: account }).env);
+  assert.ok(monthPct(summed.after) > 17, `control: the month is the account's — ${monthPct(summed.after)}%`);
+  const without = oakStandIn(lap.rig, { sessionTokens: null, claudeAccount: { ...account, machineMeasured: null } }).env;
+  two.rescan(lap);
+  const gap = two.render(lap, without);
+  assert.deepStrictEqual(shownFigures(gap.after), shownFigures(summed.after), 'the next scan, given none, keeps the account\'s figures');
+  // The scan after that, a quarter of an hour on, sums this machine's turns alone: a machine taken off the list, or
+  // signed in to another account, leaves the sum after one scan.
+  const state = two.read(lap, 'statusline-usage.json');
+  for (const k of ['k_five', 'k_week', 'k_month']) state[k][0] -= 900;
+  fs.writeFileSync(path.join(lap.rig.cdir, 'statusline-usage.json'), JSON.stringify({ ...state, last_scan: 0 }));
+  const later = two.render(lap, without);
+  assert.equal(later.after.month_tok, 17_000_000, 'then the month is what the laptop\'s transcripts hold, as with no saved machine');
+});
+
+test('statusline: the figures the last scan summed stand in for fewer only in the window they were measured for (2026-10-27)', (t) => {
+  // Two machines' 5h figures, then one machine's of the 5h window that began since: the last scan's two are of the window
+  // that ended, so the one of this window stands, where taking the two left this window none at all.
+  if (cp.spawnSync('python3', ['--version']).error) return t.skip('python3 is not installed');
+  const sh = fs.readFileSync(path.resolve(__dirname, '../../cli/statusline/install-statusline.sh'), 'utf8');
+  const lines = sh.split('\n');
+  const from = lines.findIndex((l) => l.includes("<<'PYEOF'"));
+  const py = lines.slice(from + 1, lines.indexOf('PYEOF', from + 1)).join('\n');
+  const home = freshHome();
+  fs.mkdirSync(path.join(home, 'projects', 'p'), { recursive: true });
+  const now = Math.floor(Date.now() / 1000);
+  // This machine's one turn, ten minutes ago: in the window that ends in five minutes, before the next one began.
+  fs.writeFileSync(path.join(home, 'projects', 'p', 's.jsonl'), JSON.stringify({ timestamp: new Date((now - 600) * 1000).toISOString(), cwd: home,
+    message: { id: 'm1', model: 'claude-opus-5', usage: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 100_000, cache_read_input_tokens: 0 } } }) + '\n');
+  const state = path.join(home, 'usage-state.json');
+  const r1 = now + 300, r2 = now + 540 + 5 * 3600; // the window ending, and the one that begins at now + 540
+  const sum = (hosts, reset, tok) => JSON.stringify({ five: { tok, reads: 0, cost: 0, reset: reset * 1000, hosts }, week: null, month: null, machines: 'x' });
+  const scan = (at, r5, measured) => {
+    const r = cp.spawnSync('python3', ['-', state, path.join(home, 'projects'), '20', String(r5), '0', '0', '0', '', measured], {
+      input: py, encoding: 'utf8', env: { ...process.env, HOME: home, USERPROFILE: home, STATUSLINE_SCAN_ALARM: '30', STATUSLINE_NOW: String(at) },
+    });
+    assert.equal(r.status, 0, (r.stderr || '').trim());
+    return JSON.parse(fs.readFileSync(state, 'utf8'));
+  };
+  const first = scan(now, r1, sum('aaaaaaaaaaaa,bbbbbbbbbbbb', r1, 5_000_000));
+  assert.equal(first.a5, 5_100_000, 'control: this machine and the two summed');
+  const again = (r5, measured) => {
+    fs.writeFileSync(state, JSON.stringify({ ...first, last_scan: 0 }));
+    return scan(now + 600, r5, measured).a5;
+  };
+  assert.equal(again(r1, sum('aaaaaaaaaaaa', r1, 2_000_000)), 5_100_000, 'control: one of the two, for the same window: the last scan\'s two stand in');
+  assert.equal(again(r1, ''), 5_100_000, 'control: and for none');
+  assert.equal(again(r2, sum('aaaaaaaaaaaa', r2, 2_000_000)), 2_000_000, 'one, for the window that began since: it stands');
+});
+
+test('tui/statusline: the bottom bar is BOTH providers, wk/mo, each a gauge or a token figure', () => {
   // The 2026-09-16 redesign: the bottom bar dropped the identity/session/ctx rows for a compact
   // per-provider usage readout. usageChip is the unit — a share paints the gauge, gpt's allowance-less
   // month prints its token count, and an unmeasured window is a plain em-dash (never an empty bar
@@ -17315,15 +25393,14 @@ test('tui/statusline: the bottom bar is BOTH providers, 5h/wk/mo, each a gauge o
   const wide = tui.statuslineFor(state, 160, {}, 'none', 1);
   assert.equal(wide.length, 1, 'ONE combined line — claude and gpt together');
   const line = wide[0].replace(/\s+$/, '');
-  assert.match(line, /✳ claude .*5h: 26%.*wk: 23%.*mo: 5%/, 'claude: 5h/wk/mo shares, bar-less');
-  // gpt's five window has no data (this plan has no 5h window), so it is DROPPED — not shown as an
-  // em-dash. Only wk (share) and mo (token count) remain.
-  assert.match(line, /⬡ gpt .*wk: 13%.*mo: 820k/, 'gpt: wk share + mo token count');
-  assert.doesNotMatch(line, /⬡ gpt[^|]*5h/, 'gpt 5h is DROPPED (no window), not rendered as `5h —`');
+  assert.match(line, /✳ claude wk: 23%.*mo: 5%/, 'claude: wk/mo shares, bar-less, and no 5h (2026-11-03: no bar shows it)');
+  // gpt: wk (share) and mo (token count); no 5h either, with or without a window.
+  assert.match(line, /⬡ gpt wk: 13%.*mo: 820k/, 'gpt: wk share + mo token count');
+  assert.doesNotMatch(line, /5h:/, 'no 5h on the bar, for either provider');
   // Too narrow for the resets: it compacts (drops them) rather than wrapping or dropping a provider.
-  const tight = tui.statuslineFor(state, 90, {}, 'none', 1);
+  const tight = tui.statuslineFor(state, 60, {}, 'none', 1);
   assert.equal(tight.length, 1, 'still one line when narrow');
-  assert.match(tight[0], /claude.*5h: 26%.*gpt/, 'both providers survive the compaction (resets dropped first)');
+  assert.match(tight[0], /claude wk: 23%.*gpt/, 'both providers survive the compaction (resets dropped first)');
   assert.doesNotMatch(tight[0].replace(/\s+$/, ''), /4h|100h|600h/, 'the reset stamps are what got dropped');
 
   // No claude cache → its windows are null and the readout says how to get them.
@@ -17382,7 +25459,7 @@ test('usage: the token windows are MEASURED across machines, and say whose they 
   // on a local one. Two causes, both pinned here.
   //
   // (1) The shipped statusline calibrated tokens-per-percent with `max()` — a ONE-WAY RATCHET. On a
-  //     real host it locked at 896,991 tokens/% against a current sample of 783,342, and the 5h and
+  //     real host it locked well above the current sample, and the 5h and
   //     week windows disagreed about the same account's budget. It can never come down.
   const sh = fs.readFileSync(path.resolve(__dirname, '../../cli/statusline/install-statusline.sh'), 'utf8');
   assert.doesNotMatch(sh, /tpp5 = max\(tpp5/, 'the 5h calibration is no longer a one-way ratchet');
@@ -17550,8 +25627,8 @@ test('usage: the token windows are MEASURED across machines, and say whose they 
   }
 
   // ALL THREE SURFACES, one number. The aggregate is useless if only the terminal reads it: the
-  // same session would show "12.4M tok across 2 machines" in the terminal and "~5.2M/8.9M" — this
-  // machine's tokens over an account-wide percent — in both editors, with nothing saying why.
+  // same session would show the tokens of both machines in the terminal and, in both editors, this
+  // machine's tokens over an account-wide percent, with nothing saying why.
   {
     const ext = fs.readFileSync(path.resolve(__dirname, '../../vscode/src/extension.ts'), 'utf8');
     const kt = fs.readFileSync(
@@ -17600,9 +25677,9 @@ test('tui: the theme setting actually changes the colours, and degrades safely',
 });
 
 test('tui: the row memo is fast AND cannot serve a stale frame', () => {
-  // rowsFor enumerates every row of the session — 2,730 for a 546-file one — and a pane draws about
-  // 43. Measured at EIGHT calls per frame (paneVisible and paneRowCount, per pane), on a frame that
-  // re-renders per keystroke. Memoising it took a full frame from 2.50ms to 0.48ms.
+  // rowsFor enumerates every row of the session — thousands for one of hundreds of files — and a pane
+  // draws a few dozen. Measured at EIGHT calls per frame (paneVisible and paneRowCount, per pane), on a
+  // frame that re-renders per keystroke. Memoising it made a full frame several times faster.
   //
   // A memo is a correctness risk before it is a speed-up, so every input that changes a rendered row
   // is asserted to invalidate it. The dangerous one is `now`: rows carry ages.
@@ -17909,9 +25986,9 @@ test('tui: an empty pane names its TAB, and says when a view never arrived', () 
       panes: { minimized: new Set(), zoom: null, focus: 'dashboards', tab: { dashboards: tab }, cursor: {}, scroll: {} },
     });
     const f = tui.renderDashFrame(st, { cols: 130, rows: 36, color: false });
-    // The PANE HEADER — the boxed title `┌─ F6 Dashboards ─…` — not the window bar at row 0, which also
-    // says "F6 …Dashboards" and would have this reading the Prompts pane's message instead.
-    const at = f.findIndex((l) => /┌─ F6 Dashboards /.test(l));
+    // The PANE HEADER — the boxed title `┌─ F9 Dashboards ─…` — not the window bar at row 0, which also
+    // says "F9 …Dashboards" and would have this reading the Prompts pane's message instead.
+    const at = f.findIndex((l) => /┌─ F9 Dashboards /.test(l));
     assert.ok(at >= 0, `the Dashboards pane header is on screen: ${JSON.stringify(f.slice(0, 3))}`);
     return f.slice(at + 1).find((l) => /has no data|nothing on/.test(l))?.trim() ?? '';
   };
@@ -18041,12 +26118,13 @@ test('keymap: every verb has a DOOR, and no two differ only by case', () => {
   assert.deepEqual(undocumented.map((r) => r.action), [],
     'every rebindable verb must be named in the key row or the keys screen — the options window’s KEYS list does not count');
 
-  // …and no two verbs may differ only by CASE. `a`/`A` and `u`/`U` are the exception and stay: those
-  // teach one rule — lowercase acts on the selection, uppercase on everything the window lists — which
-  // is learnable. `r`/`R` (refresh / redo) and `s`/`S` (session / sort) taught nothing; they were two
+  // …and no two verbs may differ only by CASE. `a`/`A` and `u`/`U` are the exception and stay: `a`/`A`
+  // is the selection and everything the window lists, and `u`/`U` is undo and redo — each pair one verb
+  // the reader can learn. `r`/`R` (refresh / redo) and `s`/`S` (session / sort) taught nothing; they were two
   // unrelated verbs a shift key apart, which is the mistake the `o`-not-`M` note in prefs.ts already
   // called out and which the table beneath it then repeated four times.
-  const PAIRS = new Set(['keep|keepAll', 'undo|undoAll']);
+  // `undo|redo` too: u and U are undo and redo, as in Helix and Kakoune — one verb and its inverse. (privacy-ok: the editor)
+  const PAIRS = new Set(['keep|keepAll', 'redo|undo']);
   const byLower = new Map();
   for (const r of core.REBINDABLE) {
     const k = r.fallback.toLowerCase();
@@ -18058,6 +26136,328 @@ test('keymap: every verb has a DOOR, and no two differ only by case', () => {
     assert.ok(PAIRS.has(name),
       `${group.map((r) => `${r.fallback} ${r.action}`).join(' and ')} differ only by case on “${k}” — one letter, two unrelated verbs`);
   }
+});
+
+test('herdr prefix: read from herdr’s config; OAK takes m, M and V after it only while herdr leaves them unbound', () => {
+  const none = core.herdrPrefixFrom('');
+  assert.deepEqual([none.label, none.prefix, none.oak], ['ctrl+b', { key: 'b', ctrl: true }, ['m', 'M', 'V']], 'herdr’s default prefix');
+  // Review's key is V because herdr's own defaults bind R and r (reload_config and resize_mode, herdr 0.9.1's
+  // `--default-config`), and leave V unbound.
+  assert.deepEqual([core.HERDR_DEFAULT_PREFIX_BINDINGS.reload_config, core.HERDR_DEFAULT_PREFIX_BINDINGS.resize_mode], ['R', 'r']);
+  assert.ok(!Object.values(core.HERDR_DEFAULT_PREFIX_BINDINGS).includes('V'), 'herdr binds nothing to V after its prefix');
+  const v = core.herdrPrefixFrom('[keys]\nnew_tab = "prefix+shift+v"\n');
+  assert.deepEqual([v.oak, v.taken.V], [['m', 'M'], 'new_tab'], 'V is herdr’s once its config binds it');
+  const cfg = core.herdrPrefixFrom('[ui]\nprefix = "ctrl+q"\n[keys]\n# prefix = "ctrl+z"\nprefix = "ctrl+g" # the reader’s\ndetach = "prefix+m"\n');
+  assert.deepEqual([cfg.label, cfg.prefix], ['ctrl+g', { key: 'g', ctrl: true }], 'the [keys] prefix, not a comment or another table’s');
+  assert.deepEqual(cfg.oak, ['M', 'V'], 'm is herdr’s once the config binds it');
+  assert.equal(cfg.taken.m, 'detach');
+  // shift spellings, arrays and custom commands count too; a default the reader moved off frees nothing OAK claims.
+  assert.deepEqual(core.herdrPrefixFrom('[keys]\nnew_tab = ["prefix+shift+m", "prefix+c"]\n').oak, ['m', 'V']);
+  assert.deepEqual(core.herdrPrefixFrom('[[keys.command]]\nkey = "prefix+M"\ncommand = "lazygit"\n').oak, ['m', 'V']);
+  assert.deepEqual(core.herdrPrefixFrom('[keys]\ndetach = "prefix+x"\n').oak, ['m', 'M', 'V']);
+  // Named keys and punctuation, as herdr spells them.
+  assert.deepEqual(core.parseHerdrKey('f12'), { key: 'f12' });
+  assert.deepEqual(core.parseHerdrKey('minus'), { key: '-' });
+  assert.deepEqual(core.parseHerdrKey('esc'), { key: 'escape' });
+  assert.deepEqual(core.parseHerdrKey('alt+shift+tab'), { key: 'backtab', alt: true });
+  // A super chord reaches a terminal app from a terminal that reports keys with the kitty keyboard protocol, and herdr reads
+  // cmd and command as super.
+  assert.deepEqual(core.parseHerdrKey('cmd+k'), { key: 'k', super: true });
+  assert.equal(core.herdrPrefixFrom('[keys]\nprefix = "super+b"\n').prefix, null);
+  // Dotted keys and inline tables are TOML too, and herdr reads them.
+  const dotted = core.herdrPrefixFrom('keys.prefix = "ctrl+g"\nkeys . "detach" = "prefix+m"\n');
+  assert.deepEqual([dotted.label, dotted.oak, dotted.taken.m], ['ctrl+g', ['M', 'V'], 'detach']);
+  const inline = core.herdrPrefixFrom('keys = { prefix = "ctrl+a", new_tab = ["prefix+M", "prefix+c"] } # the reader’s\n');
+  assert.deepEqual([inline.label, inline.oak, inline.taken.M], ['ctrl+a', ['m', 'V'], 'new_tab']);
+  assert.deepEqual(core.herdrPrefixFrom('[keys]\ncommand = [{ key = "prefix+m", command = "lazygit" }]\n').oak, ['M', 'V']);
+  assert.equal(core.herdrPrefixFrom('[ui]\nkeys.prefix = "ctrl+z"\n').label, 'ctrl+b', 'a dotted key under another table is that table’s');
+  // A bracket or comma inside a quoted value neither opens, closes nor splits the inline table.
+  const quotedBrackets = core.herdrPrefixFrom('keys = { prefix = "ctrl+]", detach = \'prefix+m\', new_tab = "prefix+[,}" }\n');
+  assert.deepEqual([quotedBrackets.label, quotedBrackets.taken.m], ['ctrl+]', 'detach']);
+  assert.equal(core.herdrPrefixFrom('[keys]\ncommand = [{ key = "prefix+m", command = "lazygit" }]\n').taken.m, 'a custom command');
+  // Nesting: herdr 0.9.1 and 0.9.3 read inline tables 50 deep, and refuse 20000 deep with "config parse error,
+  // using defaults", so their prefix is then ctrl+b. Either answer comes at once, without overflowing the stack.
+  const nested = (n) => 'keys = { prefix = "ctrl+g", x = ' + '{ a = '.repeat(n) + '1' + ' }'.repeat(n) + ' }\n';
+  assert.equal(core.herdrPrefixFrom(nested(50)).label, 'ctrl+g');
+  const started = Date.now();
+  assert.equal(core.herdrPrefixFrom(nested(20000)).label, 'ctrl+b', 'herdr runs on its defaults');
+  assert.ok(Date.now() - started < 500, `${Date.now() - started} ms`);
+});
+
+test('herdr prefix: read as TOML, as herdr reads it — bindings over several lines, `"""` strings, several prefixes, a file that does not parse (2026-10-07)', () => {
+  // A binding array written one entry per line, as herdr's own default config shows arrays: herdr 0.9.1 binds
+  // prefix+m here (it opens a new tab), and OAK claimed it.
+  const multiLine = core.herdrPrefixFrom('[keys]\nnew_tab = [\n  "prefix+m",\n  "prefix+c",\n]\n');
+  assert.deepEqual([multiLine.oak, multiLine.taken.m], [['M', 'V'], 'new_tab']);
+  // A `"""` string spans lines, and what it holds is text, not keys: a command's script that names a table and
+  // a prefix leaves herdr's prefix alone.
+  const script = core.herdrPrefixFrom('[[keys.command]]\nkey = "prefix+g"\ncommand = """\n[keys]\nprefix = "ctrl+z"\n"""\n');
+  assert.deepEqual([script.label, script.oak], ['ctrl+b', ['m', 'M', 'V']]);
+  // herdr 0.9.2 and later take several prefixes (checked: each one opens its prefix mode); 0.9.1 refuses the list and
+  // runs on its defaults (the next test). Without herdr's version OAK follows the newer herdr and names each one.
+  const two = core.herdrPrefixFrom('[keys]\nprefix = ["ctrl+space", "ctrl+s"]\n');
+  assert.deepEqual([two.prefixes, two.prefix, two.label], [[{ key: ' ', ctrl: true }, { key: 's', ctrl: true }], { key: ' ', ctrl: true }, 'ctrl+space or ctrl+s']);
+  const superList = core.herdrPrefixFrom('keys = { prefix = ["super+b", "ctrl+s"] }\n');
+  assert.deepEqual([superList.prefixes, superList.prefix], [[{ key: 'b', super: true }, { key: 's', ctrl: true }], { key: 's', ctrl: true }], 'super+b only through the kitty protocol');
+  // An empty list is herdr's "invalid keybinding: keys.prefix; using fallback ctrl+b", the rest still read; a prefix
+  // of another type is a parse error, and herdr runs on its defaults: its binding of m is not read either.
+  const empty = core.herdrPrefixFrom('[keys]\nprefix = []\ndetach = "prefix+m"\n');
+  assert.deepEqual([empty.label, empty.taken.m], ['ctrl+b', 'detach']);
+  assert.equal(core.herdrPrefixFrom('[keys]\nprefix = ""\n').label, 'ctrl+b', 'an empty prefix too (herdr 0.9.3: using fallback ctrl+b)');
+  const wrongType = core.herdrPrefixFrom('[keys]\nprefix = 5\nnew_tab = "prefix+m"\n');
+  assert.deepEqual([wrongType.label, wrongType.oak], ['ctrl+b', ['m', 'M', 'V']]);
+  // A file herdr cannot parse leaves it on its defaults, whatever parsed before the error.
+  const broken = core.herdrPrefixFrom('[keys]\nprefix = "ctrl+g"\ndetach = "prefix+m"\n[ui\n');
+  assert.deepEqual([broken.label, broken.oak], ['ctrl+b', ['m', 'M', 'V']]);
+  // herdr's detach as the help names it: the default, a rebind after the prefix or on its own, and unbound.
+  assert.equal(core.herdrPrefixFrom('').detach, 'ctrl+b q');
+  assert.equal(core.herdrPrefixFrom('[keys]\nprefix = "ctrl+a"\ndetach = "prefix+shift+d"\n').detach, 'ctrl+a shift+d', 'as herdr\'s keybinds list names it');
+  assert.equal(core.herdrPrefixFrom('[keys]\ndetach = ["ctrl+alt+d", "prefix+q"]\n').detach, 'ctrl+alt+d');
+  assert.equal(core.herdrPrefixFrom('[keys]\ndetach = ""\n').detach, null);
+  // The help names herdr's own detach, not the default's.
+  const help = (toml) => tui.helpLines({}, core.herdrPrefixFrom(toml)).join('\n');
+  assert.match(help(''), /after ctrl\+b every other key is herdr's own: ctrl\+b q detaches its client, and/);
+  assert.match(help('[keys]\ndetach = "prefix+d"\n'), /ctrl\+b d detaches its client/);
+  assert.match(help('[keys]\ndetach = ""\n'), /after ctrl\+b every other key is herdr's own, and/);
+  // The hints name every prefix, and a list holding ctrl+q leaves OAK's quit on its own tabs.
+  assert.match(tui.herdrHints('ctrl+space or ctrl+s')[0], /ctrl\+space or ctrl\+s are herdr's prefixes · ctrl\+space or ctrl\+s m OAK's tabs · F1–F3 herdr\/Observatory\/Review · ctrl\+q ×2 quit/);
+  assert.match(tui.herdrHints('ctrl+b or ctrl+q')[0], /quit on OAK's tabs$/);
+});
+
+test('herdr prefix: a config herdr refuses or repairs leaves OAK where it leaves herdr (2026-10-07)', () => {
+  // Each answer here is herdr's own, from `herdr config check` and its prefix mode in 0.9.1, 0.9.2 and 0.9.3.
+  const read = (toml, version) => { const p = core.herdrPrefixFrom(toml, version); return [p.label, p.oak.join('')]; };
+  // A binding in [keys] of the wrong type is a parse error to herdr, which then runs on its defaults: ctrl+b, and m unbound.
+  // Each file is TOML: it is the type that sends herdr, and OAK, back to the defaults.
+  const valid = '[keys]\nprefix = "ctrl+a"\nnew_tab = "prefix+m"\n';
+  assert.deepEqual(read(valid), ['ctrl+a', 'MV']);
+  for (const body of ['detach = 5', 'detach = ["prefix+q", 5]', 'switch_tab = true', 'fullscreen = { a = 1 }', 'command = "lazygit"',
+    '[[keys.command]]\nkey = 5\ncommand = "lazygit"', '[keys.command]\nkey = "prefix+g"\ncommand = "lazygit"', 'remote_image_paste = ["ctrl+v"]']) {
+    assert.doesNotThrow(() => require('smol-toml').parse(valid + body), body);
+    assert.deepEqual(read(`${valid}${body}\n`), ['ctrl+b', 'mMV'], body);
+  }
+  assert.deepEqual(read('[keys]\nprefix = ["ctrl+a", 5]\n'), ['ctrl+b', 'mMV']);
+  // A key herdr does not know it ignores, whatever its type ("unknown config key … ignoring key").
+  assert.deepEqual(read(`${valid}bogus = 5\n`), ['ctrl+a', 'MV']);
+  // A prefix herdr cannot read it drops, and with none left it falls back to ctrl+b ("using fallback"); a prefix it reads that
+  // reaches a terminal app only through the kitty keyboard protocol (cmd+b) stays its prefix, named as herdr names it (super,
+  // or cmd on macOS), and the key row then offers no key back to OAK's tabs.
+  for (const spec of ['ctrl+foo', 'C-b', '^b', 'ctrl-a', 'opt+b', '+', 'ctrl++', 'ctrl+question', 'ctrl+home', 'ctrl+f256', ' ']) {
+    assert.equal(core.herdrPrefixFrom(`[keys]\nprefix = ${JSON.stringify(spec)}\n`).label, 'ctrl+b', spec);
+  }
+  assert.equal(core.herdrPrefixFrom('[keys]\nprefix = ["ctrl+foo", "ctrl+a"]\n').label, 'ctrl+a');
+  assert.equal(core.herdrPrefixFrom('[keys]\nprefix = ["ctrl+foo", "C-b"]\n').label, 'ctrl+b');
+  const cmd = core.herdrPrefixFrom('[keys]\nprefix = "cmd+b"\n');
+  assert.deepEqual([cmd.prefix, cmd.label], [null, process.platform === 'darwin' ? 'cmd+b' : 'super+b']);
+  // Which specs herdr reads: modifiers first, in any case, then one key (one character, f0 to f255, or a name of herdr's).
+  const reads = { 'ctrl+a': true, 'Ctrl+A': true, 'control+a': true, 'ctrl + a': true, 'cmd+b': true, 'hyper+b': true, 'option+b': true, 'meta+b': true,
+    'ctrl+up': true, 'ctrl+f0': true, 'ctrl+F255': true, 'ctrl+f01': true, 'ctrl+plus': true, 'ctrl+bs': true, 'ctrl+quote': true, 'ctrl+percent': true,
+    'ctrl+é': true, 'ctrl+foo': false, 'C-b': false, 'opt+b': false, 'win+b': false, '+': false, 'ctrl++': false, 'ctrl+': false, '': false,
+    'ctrl+question': false, 'ctrl+dot': false, 'ctrl+equal': false, 'ctrl+pipe': false, 'ctrl+home': false, 'ctrl+delete': false, 'backtab': false,
+    'ctrl+f256': false, 'ctrl+a+b': false, 'prefix+a': false, 'ctrl+é': false };
+  assert.deepEqual(Object.fromEntries(Object.keys(reads).map((s) => [s, core.herdrReadsKey(s)])), reads);
+  // herdr before 0.9.2 takes a single prefix: a list is a parse error there, and the whole file falls back, its m included.
+  const list = '[keys]\nprefix = ["ctrl+a", "ctrl+e"]\nnew_tab = "prefix+m"\n';
+  assert.deepEqual(read(list, '0.9.1'), ['ctrl+b', 'mMV']);
+  assert.deepEqual(read(list, '0.9.2'), ['ctrl+a or ctrl+e', 'MV']);
+  assert.deepEqual(read(list), ['ctrl+a or ctrl+e', 'MV'], 'an unknown version reads as the newest herdr');
+  assert.deepEqual(read('[keys]\nprefix = []\n', '0.9.1'), ['ctrl+b', 'mMV']);
+  // clear_pane came in 0.9.2: 0.9.1 ignores it as an unknown key, whatever its type.
+  assert.deepEqual(read('[keys]\nprefix = "ctrl+a"\nclear_pane = 5\n', '0.9.1'), ['ctrl+a', 'mMV']);
+  assert.deepEqual(read('[keys]\nprefix = "ctrl+a"\nclear_pane = 5\n', '0.9.2'), ['ctrl+b', 'mMV']);
+});
+
+test('herdr prefix: the bytes a terminal without the kitty protocol sends for it', () => {
+  const bytes = (spec) => core.legacyKeyBytes(core.parseHerdrKey(spec));
+  assert.deepEqual(['ctrl+b', 'ctrl+space', 'ctrl+]', 'ctrl+\\', 'ctrl+_', 'ctrl+h', 'ctrl+j', 'alt+b', 'ctrl+alt+h'].map(bytes),
+    ['\x02', '\x00', '\x1d', '\x1c', '\x1f', '\x08', '\x0a', '\x1bb', '\x1b\x08']);
+  // herdr 0.9.1 to 0.9.3 read 0x09, 0x0d, ESC and DEL as tab, enter, esc and backspace, and NUL and 0x1f as ctrl+space and
+  // ctrl+_, so none of them enters prefix mode for ctrl+i, ctrl+m, ctrl+[, ctrl+?, ctrl+@ or ctrl+/; and OAK's input framer
+  // splits ESC from a control byte after it, so ctrl+alt+b never arrives as one key.
+  assert.deepEqual(['ctrl+i', 'ctrl+m', 'ctrl+[', 'ctrl+?', 'ctrl+@', 'ctrl+/', 'ctrl+alt+b', 'ctrl+alt+space'].map(bytes), Array(8).fill(null));
+  // Tab, enter, backspace and esc are the bytes herdr reads as them, never 0x08 or LF (ctrl+h and ctrl+j to herdr, though OAK's
+  // decoder names them backspace and enter); alt puts ESC in front, except before esc: herdr never reads ESC ESC as alt+esc.
+  assert.deepEqual(['tab', 'enter', 'backspace', 'bs', 'esc', 'alt+tab', 'alt+enter', 'alt+backspace'].map(bytes),
+    ['\t', '\r', '\x7f', '\x7f', '\x1b', '\x1b\t', '\x1b\r', '\x1b\x7f']);
+  assert.deepEqual(['alt+esc', 'ctrl+tab', 'ctrl+enter', 'ctrl+backspace', 'ctrl+esc', 'shift+enter', 'shift+backspace', 'super+tab'].map(bytes), Array(8).fill(null));
+  assert.equal(bytes('f12'), null, 'an F-key has no single legacy form');
+  assert.equal(bytes('shift+tab'), null, 'nor shift+tab, which is matched on its escape sequence');
+  assert.equal(bytes('ctrl+1'), null);
+  // The hint: a prefix of ctrl+q is herdr's there, so OAK's quit is on its own tabs.
+  assert.match(tui.herdrHints('ctrl+q')[0], /quit on OAK's tabs/);
+  assert.doesNotMatch(tui.herdrHints('ctrl+q').join('\n'), /Q ×2/);
+  assert.match(tui.herdrHints('ctrl+b')[0], /ctrl\+q ×2 quit/);
+});
+
+test('herdr prefix: a capital letter is shift, as herdr reads it, and ctrl+shift on a letter has no byte of its own (2026-10-07)', () => {
+  // herdr 0.9.1 and 0.9.3 enter prefix mode for `Ctrl+A` on ctrl+shift+a as the kitty keyboard protocol reports it
+  // (97;6u, 65;5u, 65;6u), never on ctrl+a (0x01, 97;5u); `alt+A` is alt+shift+a there too (ESC A, 65;3u, 97;4u).
+  for (const spec of ['Ctrl+A', 'ctrl+A', 'ctrl+shift+a', 'CTRL+SHIFT+A']) assert.deepEqual(core.parseHerdrKey(spec), { key: 'A', ctrl: true }, spec);
+  assert.deepEqual(core.parseHerdrKey('ctrl+a'), { key: 'a', ctrl: true });
+  assert.deepEqual(core.parseHerdrKey('alt+A'), { key: 'A', alt: true });
+  // Without the protocol ctrl+shift+a sends 0x01, the byte of ctrl+a: OAK cannot tell the two apart from those bytes.
+  const bytes = (spec) => core.legacyKeyBytes(core.parseHerdrKey(spec));
+  assert.deepEqual(['ctrl+A', 'ctrl+alt+A', 'ctrl+a', 'alt+A'].map(bytes), [null, null, '\x01', '\x1bA']);
+  // Such a prefix is followed only where the terminal reports keys with the protocol. The key row says what it says for
+  // any prefix OAK cannot follow: alone, there is no key back to OAK's tabs; in a list, the others are named.
+  const upper = core.herdrPrefixFrom('[keys]\nprefix = "Ctrl+A"\nnew_tab = "prefix+m"\n');
+  assert.deepEqual([upper.prefixes, upper.prefix, upper.label, upper.oak], [[{ key: 'A', ctrl: true }], null, 'ctrl+shift+a', ['M', 'V']]);
+  assert.equal(upper.detach, 'ctrl+shift+a q');
+  const both = core.herdrPrefixFrom('[keys]\nprefix = ["ctrl+A", "ctrl+s"]\n');
+  assert.deepEqual([both.prefixes, both.prefix, both.label, both.detach], [[{ key: 'A', ctrl: true }, { key: 's', ctrl: true }], { key: 's', ctrl: true }, 'ctrl+s', 'ctrl+s q']);
+  // A capital letter after the prefix, or with alt, has bytes of its own: those prefixes are followed as before.
+  const alt = core.herdrPrefixFrom('[keys]\nprefix = "alt+A"\n');
+  assert.deepEqual([alt.prefix, alt.label], [{ key: 'A', alt: true }, 'alt+shift+a']);
+});
+
+test('herdr prefix: shift on a key that is not a letter is part of it, and each prefix is named as herdr names it (2026-10-08)', () => {
+  // herdr 0.9.1 to 0.9.3 enter prefix mode for `ctrl+shift+space` only on 32;6u, never on NUL or 32;5u, and for `ctrl+space`
+  // never on 32;6u; for `shift+f5` only on CSI 15;2~, and for `f5` never on it; `ctrl+shift+minus` only on 45;6u.
+  const parse = (spec) => core.parseHerdrKey(spec);
+  assert.deepEqual(['ctrl+shift+space', 'shift+f5', 'ctrl+shift+minus', 'shift+tab', 'alt+shift+x', 'Super+B', 'command+b', 'meta+b', 'hyper+ctrl+b'].map(parse), [
+    { key: ' ', ctrl: true, shift: true }, { key: 'f5', shift: true }, { key: '-', ctrl: true, shift: true }, { key: 'backtab' }, { key: 'X', alt: true },
+    { key: 'B', super: true }, { key: 'b', super: true }, { key: 'b', alt: true }, { key: 'b', ctrl: true, hyper: true }]);
+  // A terminal without the kitty keyboard protocol sends ctrl+shift+space as NUL, the byte of ctrl+space, and herdr does not
+  // take NUL for it; it never reads ESC before [ ] O P X ^ or _ as alt on that key (ESC P opens a control string).
+  const bytes = (spec) => core.legacyKeyBytes(parse(spec));
+  assert.deepEqual(['ctrl+shift+space', 'ctrl+space', 'shift+f5', 'super+b', 'alt+shift+b', 'alt+shift+y'].map(bytes), [null, '\x00', null, null, '\x1bB', '\x1bY']);
+  assert.deepEqual(['alt+shift+x', 'alt+shift+p', 'alt+shift+o', 'alt+[', 'alt+]', 'alt+^', 'alt+_'].map(bytes), [null, null, null, null, null, null, null]);
+  // Which prefixes are followed from any terminal: the key row offers only those as the way back to OAK's tabs.
+  const read = (spec) => { const p = core.herdrPrefixFrom(`[keys]\nprefix = ${JSON.stringify(spec)}\n`); return [p.label, p.prefix !== null]; };
+  const SUPER = process.platform === 'darwin' ? 'cmd' : 'super';
+  assert.deepEqual(Object.fromEntries(['ctrl+space', 'ctrl+shift+space', 'Ctrl+A', 'ctrl+B', 'alt+B', 'alt+shift+x', 'shift+f5', 'ctrl+shift+f5',
+    'ctrl+minus', 'shift+tab', 'super+ctrl+b', 'Hyper+Ctrl+Alt+Super+B', 'command+b', 'option+b', 'ctrl+up'].map((s) => [s, read(s)])), {
+    'ctrl+space': ['ctrl+space', true], 'ctrl+shift+space': ['ctrl+shift+space', false], 'Ctrl+A': ['ctrl+shift+a', false], 'ctrl+B': ['ctrl+shift+b', false],
+    'alt+B': ['alt+shift+b', true], 'alt+shift+x': ['alt+shift+x', false], 'shift+f5': ['shift+f5', true], 'ctrl+shift+f5': ['ctrl+shift+f5', true],
+    'ctrl+minus': ['ctrl+-', false], 'shift+tab': ['shift+tab', true], 'super+ctrl+b': [`ctrl+${SUPER}+b`, false],
+    'Hyper+Ctrl+Alt+Super+B': [`ctrl+alt+shift+${SUPER}+hyper+b`, false], 'command+b': [`${SUPER}+b`, false], 'option+b': ['alt+b', true], 'ctrl+up': ['ctrl+up', false],
+  });
+  // herdr's detach as its keybinds list names it (`prefix+shift+d`), after the prefix as herdr names that, however the
+  // config spells it.
+  assert.equal(core.herdrPrefixFrom('[keys]\nprefix = "Ctrl+A"\ndetach = "prefix+shift+d"\n').detach, 'ctrl+shift+a shift+d');
+  assert.deepEqual(['prefix+D', 'prefix+Shift+D', 'prefix+minus', 'Ctrl+Alt+D'].map((spec) => core.herdrPrefixFrom(`[keys]\ndetach = "${spec}"\n`).detach),
+    ['ctrl+b shift+d', 'ctrl+b shift+d', 'ctrl+b -', 'ctrl+alt+shift+d']);
+  // The help: a prefix OAK follows only through the protocol keeps its m, M and V rows, and says F2, F3 or a click leaves from
+  // any other terminal, as the key row does; a prefix OAK does not follow at all leaves only by a click.
+  const help = (toml) => tui.helpLines({}, core.herdrPrefixFrom(toml)).join('\n');
+  const upper = help('[keys]\nprefix = "Ctrl+A"\n');
+  assert.match(upper, /ctrl\+shift\+a m {6}from the herdr tab, back to the OAK tab you were last on/);
+  assert.match(upper, /\(all three only from a terminal that reports keys with the kitty keyboard protocol;\n {24}from any other, F2 or F3, or a click on OAK's tab bar, leaves the herdr tab\)/);
+  assert.match(upper, /after ctrl\+shift\+a every other key is herdr's own: ctrl\+shift\+a q detaches its client/);
+  const arrow = help('[keys]\nprefix = "ctrl+up"\n');
+  assert.match(arrow, /click OAK's tab bar from the herdr tab, back to OAK's tabs: OAK does not follow herdr's prefix \(ctrl\+up\)/);
+  assert.doesNotMatch(arrow, /ctrl\+up m/);
+  assert.doesNotMatch(help(''), /kitty keyboard protocol|click OAK's tab bar/, 'a prefix followed from any terminal needs no click');
+});
+
+test('herdr prefix: a named key whose modifiers a terminal without the kitty protocol drops is not offered as the way back', () => {
+  // herdr 0.9.1 to 0.9.3 never enter prefix mode for these from such a terminal (it sends tab, enter, DEL, ESC or CSI Z for
+  // them, and ESC ESC for alt+esc), and do for alt alone on the others (ESC first) and for F-keys with modifiers (CSI 1;5P,
+  // CSI 24;2~).
+  const followed = (spec) => core.herdrPrefixFrom(`[keys]\nprefix = ${JSON.stringify(spec)}\n`).prefix !== null;
+  const specs = ['ctrl+tab', 'shift+enter', 'ctrl+backspace', 'ctrl+enter', 'ctrl+esc', 'ctrl+shift+tab', 'alt+shift+tab', 'alt+esc',
+    'alt+enter', 'alt+tab', 'alt+backspace', 'tab', 'esc', 'shift+tab', 'ctrl+f5', 'shift+f12'];
+  assert.deepEqual(specs.map(followed), [false, false, false, false, false, false, false, false, true, true, true, true, true, true, true, true]);
+  // alt+esc is followed through the protocol only: the key row and the help then say to click, from any other terminal.
+  assert.match(tui.helpLines({}, core.herdrPrefixFrom('[keys]\nprefix = "alt+esc"\n')).join('\n'), /alt\+esc m {11}from the herdr tab[^]*\(all three only from a terminal that reports keys with the kitty keyboard protocol;/);
+  // A super chord after the prefix is not herdr's binding of the plain key: m and M stay OAK's.
+  assert.deepEqual(core.herdrPrefixFrom('[keys]\nnew_tab = ["prefix+super+m", "prefix+hyper+shift+m"]\n').oak, ['m', 'M', 'V']);
+});
+
+test('herdr prefix: herdr\'s key names quote, double_quote, percent and bs, and the detach binding herdr takes (2026-10-08)', () => {
+  // herdr 0.9.1 to 0.9.3 read these names, in any case, as ', ", % and backspace (`herdr config check`; its prefix row names
+  // the prefix ctrl+', ctrl+", alt+% and ctrl+backspace). OAK fell back to ctrl+b for ctrl+double_quote, and followed none.
+  const read = (spec) => { const p = core.herdrPrefixFrom(`[keys]\nprefix = ${JSON.stringify(spec)}\n`); return [p.label, p.prefixes]; };
+  assert.deepEqual(['ctrl+quote', 'ctrl+double_quote', 'Ctrl+Double-Quote', 'alt+percent', 'ctrl+BS', 'alt+bs'].map(read), [
+    ["ctrl+'", [{ key: "'", ctrl: true }]], ['ctrl+"', [{ key: '"', ctrl: true }]], ['ctrl+"', [{ key: '"', ctrl: true }]],
+    ['alt+%', [{ key: '%', alt: true }]], ['ctrl+backspace', [{ key: 'backspace', ctrl: true }]], ['alt+backspace', [{ key: 'backspace', alt: true }]]]);
+  assert.equal(core.herdrReadsKey('ctrl+double_quote'), true);
+  // herdr disables a detach binding it cannot read (`prefix+question`, `PREFIX+d`: it reads `prefix+` in lower case only), a
+  // prefix after the prefix ("reserved keybinding"), and a printable key without the prefix ("unsafe direct keybinding"); it
+  // takes the next binding in a list, and with none left detach is unbound (its keybinds overlay says `unset`). The help then
+  // names no detach key.
+  const detach = (toml) => core.herdrPrefixFrom(`[keys]\n${toml}\n`).detach;
+  assert.deepEqual(['detach = "prefix+question"', 'detach = "PREFIX+d"', 'detach = "q"', 'detach = "shift+q"', 'detach = "space"', 'detach = "é"',
+    'detach = "prefix+ctrl+b"', 'prefix = ["ctrl+a", "ctrl+s"]\ndetach = "prefix+ctrl+s"', 'prefix = "Ctrl+A"\ndetach = "prefix+ctrl+shift+a"',
+    'prefix = "ctrl+up"\ndetach = "prefix+ctrl+up"', 'detach = "prefix+1..9"'].map(detach), Array(11).fill(null));
+  assert.deepEqual(['detach = ["prefix+question", "q", "prefix+d"]', 'detach = "enter"', 'detach = "alt+q"', 'detach = "prefix+ q"', 'detach = "prefix+bs"',
+    'detach = "prefix+percent"', 'detach = "prefix+quote"', 'prefix = "alt+percent"\ndetach = "prefix+double_quote"', 'detach = "prefix+up"'].map(detach),
+  ['ctrl+b d', 'enter', 'alt+q', 'ctrl+b q', 'ctrl+b backspace', 'ctrl+b %', "ctrl+b '", 'alt+% "', 'ctrl+b up']);
+  const help = (toml) => tui.helpLines({}, core.herdrPrefixFrom(toml)).join('\n');
+  assert.match(help('[keys]\ndetach = "prefix+question"\n'), /after ctrl\+b every other key is herdr's own, and/);
+  assert.doesNotMatch(help('[keys]\ndetach = "prefix+question"\n'), /ctrl\+b \? detaches/);
+  // A binding of m written `PREFIX+m` is one herdr disables: m stays OAK's.
+  assert.deepEqual(core.herdrPrefixFrom('[keys]\nnew_tab = "PREFIX+m"\n').oak, ['m', 'M', 'V']);
+});
+
+test('herdr prefix: with m, M and V all herdr\'s, the help says to click, as the key row and the status row do (2026-10-08)', () => {
+  const help = (toml) => tui.helpLines({}, core.herdrPrefixFrom(toml)).join('\n');
+  const all = '[keys]\nnew_tab = ["prefix+m", "prefix+shift+m", "prefix+shift+v"]\n';
+  assert.match(help(all), /ctrl\+b m {12}your herdr config binds it \(new_tab\), so it is herdr's\n {4}ctrl\+b M {12}your herdr config binds it \(new_tab\), so it is herdr's\n {4}ctrl\+b V {12}your herdr config binds it \(new_tab\), so it is herdr's\n {4}click OAK's tab bar from the herdr tab, back to OAK's tabs: your herdr config binds m, M and V; F2 or F3 leaves it too\n/);
+  // A prefix followed only through the kitty protocol: no note that m, M and V work there, under rows that say all are herdr's.
+  const kittyAll = help(`[keys]\nprefix = "super+b"\n${all.slice(7)}`);
+  assert.match(kittyAll, /click OAK's tab bar from the herdr tab, back to OAK's tabs: your herdr config binds m, M and V/);
+  assert.doesNotMatch(kittyAll, /kitty keyboard protocol/);
+  // With some of them herdr's, the note speaks of the others, and names F2 and F3, which leave the herdr tab from any terminal.
+  const kittyOne = help('[keys]\nprefix = "super+b"\nnew_tab = "prefix+m"\n');
+  assert.match(kittyOne, /\n {24}\(both only from a terminal that reports keys with the kitty keyboard protocol;\n {24}from any other, F2 or F3, or a click on OAK's tab bar, leaves the herdr tab\)/);
+  assert.doesNotMatch(kittyOne, /binds m, M and V/);
+  const kittyTwo = help('[keys]\nprefix = "super+b"\nnew_tab = ["prefix+m", "prefix+shift+m"]\nnext_tab = ["f2", "f3"]\n');
+  assert.match(kittyTwo, /\n {24}\(only from a terminal that reports keys with the kitty keyboard protocol;\n {24}from any other, click OAK's tab bar to leave the herdr tab\)/);
+  assert.doesNotMatch(help(''), /click OAK's tab bar/, 'a prefix followed from any terminal, with m, M and V OAK\'s, needs no click');
+});
+
+test('tab keys: F1 to F3 are OAK\'s on the herdr tab unless herdr\'s config binds them — as its prefix, on their own or after the prefix (2026-10-23)', () => {
+  // On their own (`tabTaken`, herdr's prefix among them), and after the prefix (`taken`, beside m, M and V).
+  const taken = (toml) => core.herdrPrefixFrom(toml).tabTaken;
+  const after = (toml) => Object.fromEntries(Object.entries(core.herdrPrefixFrom(toml).taken).filter(([k]) => /^f/.test(k)));
+  assert.deepEqual(core.OAK_TAB_KEYS, ['f1', 'f2', 'f3']);
+  assert.deepEqual(taken(''), {}, 'herdr 0.9.1 binds no F-key by default');
+  assert.deepEqual(taken('[keys]\nprefix = "f2"\n'), { f2: 'its prefix' });
+  assert.deepEqual(taken('[keys]\nprefix = ["ctrl+b", "F3"]\n'), { f3: 'its prefix' }, 'one of several prefixes, in any case');
+  const both = '[keys]\nnext_tab = "f3"\nnew_tab = "prefix+f1"\n';
+  assert.deepEqual([taken(both), after(both)], [{ f3: 'next_tab' }, { f1: 'new_tab' }], 'on its own, and after the prefix, each where it is bound');
+  assert.deepEqual(taken('[[keys.command]]\nkey = "F2"\ncommand = "lazygit"\n'), { f2: 'a custom command' });
+  // With a modifier it is another key, which OAK never takes; F4 and up are not OAK's tab keys.
+  const chords = '[keys]\nprefix = "shift+f2"\nnext_tab = ["ctrl+f1", "prefix+alt+f3", "prefix+shift+f2", "f4", "prefix+f5"]\n';
+  assert.deepEqual([taken(chords), after(chords)], [{}, {}]);
+  // A config herdr refuses leaves it on its defaults, and OAK on its own.
+  assert.deepEqual(taken('[keys]\nnext_tab = "f2"\ndetach = 5\n'), {});
+  // The help names a tab key herdr's config keeps, and why.
+  const help = tui.helpLines({}, core.herdrPrefixFrom(both)).join('\n');
+  assert.match(help, /F3: your herdr config binds it \(next_tab\), so on the herdr tab it is herdr's/);
+  assert.match(help, /ctrl\+b F1: your herdr config binds it \(new_tab\), so it is herdr's/);
+});
+
+test('herdr tab hints: the status after the prefix and the key row name F1 to F3, fit 40 columns whole, and follow what herdr\'s config takes (2026-10-23)', () => {
+  const fit = (tiers, cols) => tiers.find((t) => tui.displayWidth(t) <= cols - 1);
+  const all = ['f1', 'f2', 'f3'];
+  const status = (oak, tabs = all, label = 'ctrl+b') => tui.herdrPrefixHints(label, oak, tabs);
+  assert.equal(fit(status(['m', 'M', 'V']), 120), "ctrl+b — m OAK tabs · M Observatory · V Review · F1–F3 herdr/Observatory/Review · any other key is herdr's");
+  // Narrower, whole parts go, the keys last: every tier is whole segments, never a cut word.
+  assert.equal(fit(status(['m', 'M', 'V']), 60), 'ctrl+b — m OAK tabs · M Observatory · V Review · F1–F3');
+  assert.equal(fit(status(['m', 'M', 'V']), 40), 'ctrl+b — m/M/V · F1–F3 OAK tabs');
+  assert.equal(fit(status(['m', 'M', 'V'], all, 'ctrl+space or ctrl+s'), 40), 'm/M/V · F1–F3 OAK tabs', 'a long prefix name goes before the keys do');
+  // herdr's config takes m, M or V: the key goes from every tier.
+  for (const [oak, gone] of [[['M', 'V'], /\bm\b/], [['m', 'V'], /\bM\b/], [['m', 'M'], /\bV\b/]]) {
+    for (const cols of [120, 80, 60, 40]) {
+      const line = fit(status(oak), cols);
+      assert.ok(line && /F1–F3/.test(line), `${oak} at ${cols}: ${line}`);
+      assert.doesNotMatch(line.replace(/^ctrl\+b — /, ''), gone, `${oak} at ${cols}: ${line}`);
+    }
+  }
+  assert.equal(fit(status(['M', 'V'], ['f1', 'f3']), 120), "ctrl+b — M Observatory · V Review · F1/F3 herdr/Review · any other key is herdr's");
+  assert.equal(fit(status([], []), 120), "ctrl+b — click OAK's tab bar to leave · any other key is herdr's");
+  // The key row: F1–F3 on every tier but the last, which is the quit alone.
+  const rows = tui.herdrHints('ctrl+b');
+  assert.equal(fit(rows, 120), "herdr's tab bar below starts agents · ctrl+b is herdr's prefix · ctrl+b m OAK's tabs · F1–F3 OAK tabs · ctrl+q ×2 quit");
+  assert.equal(fit(rows, 40), 'ctrl+b m or F1–F3 OAK tabs · ^Q ×2 quit');
+  assert.ok(rows.slice(0, -1).every((r) => /F1–F3/.test(r)), rows.join('\n'));
+  assert.equal(fit(tui.herdrHints('ctrl+b', false, 'V', ['f2', 'f3']), 40), 'ctrl+b V or F2/F3 OAK tabs · ^Q ×2 quit', 'herdr took m and M, and F1');
+  assert.equal(fit(tui.herdrHints('ctrl+b', false, null), 40), 'F1–F3 OAK tabs · ^Q ×2 quit', 'herdr took m, M and V');
+  assert.equal(fit(tui.herdrHints('ctrl+b', false, null, []), 40), 'click a tab to leave · ^Q ×2 quit', 'and every tab key');
+  // Inside tmux the prefix's note still fits at 140 columns, with the tab keys.
+  assert.equal(fit(tui.herdrHints('ctrl+b', true), 140), "ctrl+b is herdr's prefix (twice if tmux uses it too) · ctrl+b m OAK's tabs · F1–F3 OAK tabs · ctrl+q ×2 quit");
 });
 
 test('options: every preference that PERSISTS has a row to change it', () => {
@@ -18077,7 +26477,8 @@ test('options: every preference that PERSISTS has a row to change it', () => {
     startFocus: 'detail', startFace: 'diff', sort: 'churn', storeDir: '/tmp/obs-store',
     keys: { keep: 'K' }, theme: 'light',
   }, file);
-  const persisted = Object.keys(JSON.parse(fs.readFileSync(file, 'utf8')));
+  // Every key but the mark of a file this build wrote (`prefsFormat`), which is no preference.
+  const persisted = Object.keys(JSON.parse(fs.readFileSync(file, 'utf8'))).filter((k) => k !== core.PREFS_FORMAT_KEY);
   assert.ok(persisted.length >= 10, `the fixture must actually persist something, got ${JSON.stringify(persisted)}`);
 
   // `store` is passed because that row is shown only when the caller knows the resolved root.
@@ -18128,7 +26529,7 @@ test('prefs: a hand-edited file degrades to defaults rather than breaking the da
     glyphs: 'block',
     mouse: 'yes',               // not a boolean
     refreshSeconds: 0,          // would spin: each refresh spawns a child process
-    keys: { keep: 'K', undo: 'toolong', nosuchaction: 'x' },
+    keys: { keep: 'Z', undo: 'toolong', nosuchaction: 'x', redo: 'R' }, // R: the Observatory's resolve, reserved
   }));
   const p = core.readPrefs(file);
   assert.equal(p.editor, 'code -w', 'trimmed, and arguments survive');
@@ -18136,12 +26537,27 @@ test('prefs: a hand-edited file degrades to defaults rather than breaking the da
   assert.equal(p.glyphs, 'block');
   assert.equal(p.mouse, undefined, 'a non-boolean is dropped');
   assert.equal(p.refreshSeconds, 1, 'and a zero interval is floored, never honoured');
-  assert.deepEqual(p.keys, { keep: 'K' }, 'a multi-character bind and an unknown action are both dropped');
+  assert.deepEqual(p.keys, { keep: 'Z' }, 'a multi-character bind, an unknown action and a reserved key are all dropped');
+  // …from the live keymap. The reserved one is the reader's saved choice (an older build allowed R): it is
+  // kept aside and written back, so the first save does not delete it before the options window names it.
+  assert.deepEqual(p.blockedKeys, { redo: 'R' });
+  assert.equal(core.keymap(p).get('U'), 'redo', 'redo runs on its default meanwhile');
+  core.writePrefs(p, file);
+  // Written back as the file has them: the bindings this build cannot read stay for a build that can.
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')).keys, { keep: 'Z', undo: 'toolong', nosuchaction: 'x', redo: 'R' }, 'written back as read');
+  const chosen = tui.setOption(p, 'key:redo', 'Q');
+  assert.equal(chosen.blockedKeys, undefined, 'a key chosen in the options window replaces it');
+  core.writePrefs(chosen, file);
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')).keys, { keep: 'Z', redo: 'Q', undo: 'toolong', nosuchaction: 'x' });
+  const row = tui.optionRows(p).find((r) => r.id === 'key:redo');
+  assert.equal(row.value, 'U');
+  assert.match(row.problem, /your saved key R is now kept for the frame itself, so U runs this/);
 
   // Writing keeps only what DIFFERS from the default: a file full of today's defaults would freeze
   // them into every future version, and the reader never asked for that.
+  fs.rmSync(file);
   core.writePrefs({ color: 'auto', glyphs: 'ascii', mouse: true, refreshSeconds: 3, keys: { keep: 'a', undo: 'Z' } }, file);
-  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { glyphs: 'ascii', keys: { undo: 'Z' } });
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { prefsFormat: 2, glyphs: 'ascii', keys: { undo: 'Z' } });
 
   // A rebind onto a key another action already owns is REPORTED, not silently swallowed.
   const clash = { keys: { keep: 'u' } };
@@ -18182,8 +26598,15 @@ test('options: every row is reachable, changeable, and says what it costs', () =
 
   // A captured key is applied; rebinding back to the default REMOVES the override rather than
   // persisting a value identical to it.
-  const bound = tui.setOption({}, 'key:keep', 'K');
-  assert.equal(bound.keys.keep, 'K');
+  const bound = tui.setOption({}, 'key:keep', 'Z');
+  assert.equal(bound.keys.keep, 'Z');
+  // A key the frame keeps for itself is refused with the reason, never saved: the Observatory's R and X,
+  // Space, a digit, `:`.
+  for (const reserved of ['R', 'X', ' ', '1', ':', 'c']) {
+    const refused = tui.setOption({}, 'key:keep', reserved);
+    assert.match(refused.__reject ?? '', /kept for the frame itself/, `${JSON.stringify(reserved)} is refused`);
+    assert.equal(refused.keys, undefined);
+  }
   assert.equal(tui.setOption(bound, 'key:keep', 'a').keys, undefined, 'back to the default clears the entry');
   assert.deepEqual(tui.setOption({}, 'key:keep', 'nope'), {}, 'a non-single-key capture changes nothing');
 
@@ -18199,12 +26622,77 @@ test('options: every row is reachable, changeable, and says what it costs', () =
   }
 });
 
+test('options: the terminal app saves every key an option changes, and no key set elsewhere', () => {
+  // The app saves only its own keys (APP_PREF_KEYS) over prefs.json as it is then. An option whose key the list lacks
+  // would never be saved; a key set elsewhere in the list would be written back from the copy the app read at start.
+  const own = new Set(tui.APP_PREF_KEYS);
+  const env = { store: '/tmp/obs-store', file: '/tmp/prefs.json', editors: [{ command: 'vim', label: 'Vim' }, { command: 'code', label: 'VS Code' }] };
+  const changed = new Set();
+  for (const p of [{}, { editor: 'vim', color: '256', mouse: false, syntax: false, refreshSeconds: 9, notify: { desktop: false, sound: true }, keys: { keep: 'k' }, blockedKeys: { undo: 'c' } }]) {
+    for (const row of tui.optionRows(p, env).filter((r) => r.kind !== 'heading')) {
+      for (const next of [tui.applyOption(p, row.id, 1, env), tui.applyOption(p, row.id, -1, env), tui.setOption(p, row.id, 'z'), tui.setOption(p, row.id, 'emacs -nw')]) {
+        for (const k of new Set([...Object.keys(p), ...Object.keys(next)])) if (k !== '__reject' && JSON.stringify(next[k]) !== JSON.stringify(p[k])) changed.add(k);
+      }
+    }
+  }
+  assert.ok(changed.size >= 10, `control: the rows changed ${[...changed]}`);
+  assert.deepEqual([...changed].filter((k) => !own.has(k)), [], 'an option changes a key the app does not save');
+  // The Store row (a move) and the layout are saved by the app itself; the bill days and the two switches are set elsewhere.
+  for (const k of ['storeDir', 'layout']) assert.ok(own.has(k), `${k} is the app's own`);
+  for (const k of ['billDay', 'gptBillDay', 'remoteTitles', 'machineUsage']) assert.ok(!own.has(k), `${k} is set elsewhere`);
+});
+
+test('options: the SYNC section says sync\'s state and leaves its settings to the CLI; it shows only where sync is in use or a machine is saved', () => {
+  const env = { store: '/tmp/obs-store', file: '/tmp/prefs.json' };
+  assert.ok(!tui.optionRows({}, env).some((r) => r.label === 'SYNC'), 'no section for a machine that has neither');
+  const { syncView } = require('../../tui/test/fixtures/observatory');
+  const status = syncView({ exclude: { machines: ['old-box'], projects: ['git:github.com/org/lib'] } });
+  const sync = { status, machines: ['build-box'], project: { key: 'git:github.com/org/app', folder: '/w/app' }, now: Date.parse('2026-09-18T14:01:00Z') };
+  const rows = tui.optionRows({}, { ...env, sync });
+  const mine = rows.filter((r) => r.id.startsWith('sync.'));
+  // Each value a word that fits its column; what it names is in the detail, which wraps.
+  assert.deepEqual(mine.map((r) => [r.id, r.value]), [['sync.setup', 'folder'], ['sync.restore', ''], ['sync.now', 'partial'], ['sync.last', ''],
+    ['sync.machine:build-box', 'on'], ['sync.machine:old-box', 'off'], ['sync.project', 'on'], ['sync.project:git:github.com/org/lib', 'off']]);
+  const row = (id) => mine.find((r) => r.id === id);
+  // The backup's path and key, and the run's refusal of its record with the next step, in the CLI's words.
+  assert.equal(row('sync.setup').detail, `${status.backup.path} · key a11b-f2dc-f733-a548 · ${status.last.machines[1].text}`);
+  assert.match(row('sync.setup').help, /runs `oak sync setup` here/);
+  assert.match(row('sync.restore').help, /oak sync setup --restore/);
+  // The run's time, and the last run in a line: each machine's line and the warnings are the overlay's (`oak sync status`).
+  assert.equal(row('sync.now').detail, `last run ${core.relTime(status.last.at, sync.now)}`);
+  assert.equal(row('sync.last').detail, '2 machines · 1 failed · 1 warning');
+  assert.match(row('sync.now').help, /enter again stops a run started here/);
+  assert.equal(row('sync.project').detail, '/w/app (git:github.com/org/app)');
+  // No reinstall row while the backup's record is this machine's; a section with nothing set up yet still offers setup.
+  // Nor while the backup is another folder: the refusal a run left for the one before says nothing of it.
+  const moved = tui.optionRows({}, { ...env, sync: { ...sync, status: { ...status, backup: { kind: 'folder', path: '/mnt/other' } } } });
+  assert.ok(!moved.some((r) => r.id === 'sync.restore'), 'no reinstall row for a folder no longer the backup');
+  assert.ok(!moved.find((r) => r.id === 'sync.setup').detail.includes('failed'), 'and its refusal is not the backup\'s');
+  status.last.machines[1] = { ...status.last.machines[1], status: 'ok', record: undefined };
+  assert.ok(!tui.optionRows({}, { ...env, sync }).some((r) => r.id === 'sync.restore'));
+  const fresh = tui.optionRows({}, { ...env, sync: { ...sync, status: null } }).filter((r) => r.id.startsWith('sync.'));
+  assert.deepEqual(fresh.map((r) => [r.id, r.value]).slice(0, 2), [['sync.setup', 'none'], ['sync.now', 'not run yet']]);
+  // Drawn whole at every width: the refusal, its help, a long machine's label and every value wrap or fit, never cut.
+  // (The window saves none of these rows: the app hands each to the CLI, which the probe's sync checks hold.)
+  const long = 'workstation-build-cluster-node-07';
+  const wide = tui.optionRows({}, { ...env, sync: { ...sync, status: syncView(), machines: ['build-box', long] } });
+  const at = wide.findIndex((r) => r.id === 'sync.setup');
+  for (const cols of [40, 80, 160]) {
+    const out = tui.renderOptions(wide, at, cols, at - 1, 400, tui.glyphs('ascii'), 'none');
+    for (const l of out) assert.ok(tui.displayWidth(l) <= cols, `${cols}: "${l}" is over budget`);
+    // Whole: every character there in order, wherever a line broke (a long name breaks inside itself).
+    const flat = (t) => t.replace(/\s+/g, '');
+    const text = flat(out.join(''));
+    for (const whole of [status.last.machines[1].text, row('sync.setup').help, `Sync with ${long} on`, 'Sync now partial']) assert.ok(text.includes(flat(whole)), `${cols}: ${whole.slice(0, 40)}… is whole`);
+  }
+});
+
 test('panes: an overlay is a layer over the windows, not a different product', () => {
   // The top row used to repaint as the retired eight-screen nav the moment an overlay opened, so
   // pressing `s` or `?` told the reader their windows had vanished.
   const st = paneFixture({ overlay: { title: 'switch session', lines: [' a', ' b'], scroll: 0, cursor: 0 } });
   const f = tui.renderDashFrame(st, { cols: 120, rows: 20, color: false });
-  assert.match(f[0], /F3 .?Traces/, 'the window bar survives an overlay');
+  assert.match(f[0], /F5 .?Traces/, 'the window bar survives an overlay');
   assert.doesNotMatch(f[0], /\b[5-8]\s+(Feed|Audit|Map)\b/, 'and the retired screen nav does not come back');
   assert.doesNotMatch(f[f.length - 1], /1-8 screens|j\/k/, 'nor does its key row');
 });
@@ -18570,7 +27058,7 @@ test('panes: the Detail navbar is clickable exactly where it is drawn', () => {
 test('panes: prev/next step the REVIEW — edit to edit, through folded groups', () => {
   // The buttons used to step the cursor row by row. With groups FOLDED by default the cursor landed
   // on multi-edit headers, `followTracesDiff` saw a multi-id row and CLEARED the diff — both
-  // buttons read as dead in any real session (field report, 2026-08-14). The step is over edit IDS
+  // buttons read as dead in any real session. The step is over edit IDS
   // seen THROUGH the folds: a folded header's `ids` are its members.
   const rows = [
     { ids: [1, 2], key: 'fa.ts', openPath: 'edits:a.ts', cells: 'a.ts (folded)' }, // folded, 2 edits
@@ -18688,7 +27176,7 @@ test('doctor: "writable" and "the setting persists" are separate claims', () => 
 // reader's own personal layer; one test below covers that layer on purpose.
 
 function ignoreWork(files) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cc-ign-'));
+  const root = tmpDir('cc-ign-');
   for (const [rel, body] of Object.entries(files)) {
     const p = path.join(root, rel);
     fs.mkdirSync(path.dirname(p), { recursive: true });
@@ -19160,7 +27648,13 @@ test('sweep: the on-disk map cache follows the sweep, not the ignore file', () =
   fs.writeFileSync(ig, 'b.ts\n');
   assert.equal(units(), 2, 'the rule alone changes nothing that is already recorded');
 
+  // The count the terminal app's refresh asks with: read-only, from the core and the CLI's --dry-run.
+  assert.equal(core.countIgnored(S), 1, 'one recorded edit is now covered');
+  const dry = JSON.parse(cp.execFileSync('node', [CLI, 'ignore', '--dry-run', '--session', S, '--json'], { env: { ...process.env }, encoding: 'utf8', cwd }));
+  assert.deepEqual(dry, { session: S, wouldDrop: 1 });
+  assert.equal(units(), 2, 'counting dropped nothing');
   assert.equal(core.dropIgnored(S).dropped, 1, 'the sweep is what removes it');
+  assert.equal(core.countIgnored(S), 0, 'and nothing is left to count');
   assert.equal(units(), 1, 'and the cached map follows, because the sweep rewrote the log it keys on');
   assert.equal(core.reviewEdits(S)[0].file, path.join(cwd, 'a.ts'), 'to the OTHER file, not a stale answer');
 });
@@ -19174,7 +27668,7 @@ test('ignore: the dash renders no ignore counters, because there are none to ren
   const mapFrame = tui.renderDashFrame({ ...base, panes: { ...base.panes, tab: { detail: 1 } } }, opts);
   assert.ok(!mapFrame.some((l) => /observatoryignore/.test(l)), 'no notice on the change-map header');
   const listFrame = tui.renderDashFrame(base, opts);
-  const title = listFrame.find((l) => /F3 Traces/.test(l));
+  const title = listFrame.find((l) => /F5 Traces/.test(l));
   assert.ok(title, 'positive control: the Traces title IS in the frame');
   assert.ok(!/hidden/.test(title), 'and it carries no hidden count');
 });
@@ -19282,7 +27776,7 @@ test('panes: a review verb on a window that is not open says so, instead of cras
     paneFixture({ panes: { minimized: new Set(['traces']), zoom: null, focus: 'traces', tab: {}, cursor: {}, scroll: {}, sizes: {} } }),
     { cols: 150, rows: 40, color: false },
   )[0];
-  assert.match(bar, /F3 .Traces/, 'the minimized window is still named and still reachable');
+  assert.match(bar, /F5 .Traces/, 'the minimized window is still named and still reachable');
 
   // The sizes where a pane folds by default are the ones a reader actually runs at.
   for (const [cols, rows] of [[120, 20], [100, 16], [80, 14]]) {
@@ -19397,6 +27891,41 @@ test('options: the editor row offers what this machine HAS, and steps through ex
     'a one-member cycle steps to itself rather than dividing by zero');
 });
 
+test('prefs: remoteEditorLaunch opens a saved machine\'s file there over ssh -t, or here through Remote-SSH', { skip: process.platform === 'win32' && 'POSIX sh' }, () => {
+  const file = "/home/me/work/it's my \"file\" $HOME.txt";
+  const tty = core.remoteEditorLaunch('nvim', 'me@box', file);
+  assert.equal(tty.kind, 'tty');
+  assert.deepEqual(tty.args.slice(0, 2), ['-t', 'me@box']);
+  assert.equal(tty.command, 'ssh');
+  // The remote shell runs the one command string, as sshd does: the path arrives whole and unexpanded,
+  // and the editor is found on the PATH `--machine` gives a remote command.
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-remote-editor-'));
+  after(() => fs.rmSync(home, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(home, '.local/bin'), { recursive: true });
+  fs.writeFileSync(path.join(home, '.local/bin/nvim'), `#!${process.execPath}\nprocess.stdout.write(JSON.stringify(process.argv.slice(2)));\n`, { mode: 0o755 });
+  const ran = cp.spawnSync('/bin/sh', ['-c', tty.args[2]], { env: { HOME: home, PATH: '/usr/bin:/bin' }, encoding: 'utf8' });
+  assert.equal(ran.status, 0, ran.stderr);
+  assert.deepEqual(JSON.parse(ran.stdout), [file]);
+  assert.deepEqual(core.remoteEditorLaunch('emacs -nw', 'box', '/a').args[2].split(' ').slice(-3), ["'emacs'", "'-nw'", "'/a'"], 'every word of the command');
+  // This machine's path to the editor means nothing there: the remote's PATH finds it by name.
+  for (const editor of ['/opt/homebrew/bin/nvim -u NONE', 'C:\\tools\\nvim.exe -u NONE', 'nvim.exe -u NONE']) {
+    assert.deepEqual(core.remoteEditorLaunch(editor, 'box', '/a').args[2].split(' ').slice(-4), ["'nvim'", "'-u'", "'NONE'", "'/a'"], editor);
+  }
+  // VS Code and Cursor connect from here: --goto makes an extension-less path a file, and a folder ends in /.
+  assert.deepEqual(core.remoteEditorLaunch('code -n', 'me@box', '/w/Makefile'),
+    { command: 'code', args: ['-n', '--remote', 'ssh-remote+me@box', '--goto', '/w/Makefile'], kind: 'gui' });
+  assert.deepEqual(core.remoteEditorLaunch('cursor', 'box', '/w/src', true).args, ['--remote', 'ssh-remote+box', '/w/src/']);
+  // What cannot open a file there: another GUI editor, a command the table does not know, a terminal
+  // editor on a folder, and a target ssh would read as an option.
+  for (const [editor, dir] of [['zed', false], ['subl', false], ['idea', false], ['nvim', true]]) {
+    assert.equal(core.remoteEditorKind(editor, dir), null, editor);
+    assert.equal(core.remoteEditorLaunch(editor, 'box', '/w/a', dir), null, editor);
+  }
+  assert.equal(core.remoteEditorLaunch('nvim', '-oProxyCommand=x', '/w/a'), null);
+  assert.equal(core.remoteEditorKind('/opt/homebrew/bin/nvim'), 'tty');
+  assert.equal(core.remoteEditorKind('code-insiders'), 'gui');
+});
+
 test('prefs: editorKind separates fork-and-return GUIs from editors that take the terminal', () => {
   // The launcher's whole branch hangs on this one answer: suspend-and-wait for a terminal editor,
   // spawn-detached-never-blink for a GUI one. Keyed on the BINARY, so every spelling a user
@@ -19405,7 +27934,7 @@ test('prefs: editorKind separates fork-and-return GUIs from editors that take th
   const offered = core.detectEditors({ path: '/x', win: false, isExec: () => true });
   assert.deepEqual(
     offered.filter((e) => core.editorKind(e.command) === 'gui').map((e) => e.command),
-    ['code', 'code-insiders', 'cursor', 'windsurf', 'zed', 'subl', 'mate'],
+    ['code', 'code-insiders', 'cursor', 'windsurf', 'idea', 'idea64', 'pycharm', 'webstorm', 'goland', 'clion', 'rider', 'phpstorm', 'rubymine', 'rustrover', 'datagrip', 'zed', 'subl', 'mate'],
     'the windowed editors, offered bare — no wait flags left anywhere');
   assert.ok(offered.some((e) => e.command === 'vim' && core.editorKind(e.command) === 'tty'),
     'and the terminal ones are tty');
@@ -19418,6 +27947,140 @@ test('prefs: editorKind separates fork-and-return GUIs from editors that take th
   // flashes for a GUI one, while a wrong 'gui' would detach vim from the screen it needs — a hang.
   assert.equal(core.editorKind('emacsclient -nw'), 'tty');
   assert.equal(core.editorKind(''), 'tty');
+});
+
+test('prefs: resolveGuiEditor picks what W opens — the GUI editor setting, a GUI prefs.editor/$VISUAL/$EDITOR, this terminal\'s editor, the first on PATH', () => {
+  const on = new Set(['nvim', 'code', 'cursor']);
+  const detected = core.detectEditors({ path: '/x', win: false, isExec: (f) => on.has(path.basename(String(f))) });
+  assert.deepEqual(detected.map((e) => e.command), ['nvim', 'code', 'cursor']);
+  const pick = (p, env = {}, d = detected) => core.resolveGuiEditor(p, env, d);
+  // The Mac case: the terminal editor is nvim, nothing in the environment, two GUI editors installed.
+  assert.deepEqual(pick({ editor: 'nvim' }), { command: 'code', source: 'path' }, 'the first GUI editor on PATH, in the table order');
+  // 1. The setting wins over everything else, and is taken as written.
+  assert.deepEqual(pick({ editor: 'code', guiEditor: 'cursor' }, { VISUAL: 'zed', TERM_PROGRAM: 'vscode' }), { command: 'cursor', source: 'setting' });
+  assert.deepEqual(pick({ guiEditor: 'cursor --new-window' }), { command: 'cursor --new-window', source: 'setting' });
+  // A terminal editor (or a command the table does not know) in the setting is refused, never skipped past.
+  for (const bad of ['vim', 'nvim', 'emacs -nw', 'emacsclient -c']) assert.equal(pick({ guiEditor: bad }), null, bad);
+  // 2. prefs.editor, then $VISUAL, then $EDITOR, the first that is a GUI editor.
+  assert.deepEqual(pick({ editor: 'subl' }, { VISUAL: 'zed' }), { command: 'subl', source: 'editor' });
+  assert.deepEqual(pick({ editor: 'nvim' }, { VISUAL: 'zed', EDITOR: 'mate' }), { command: 'zed', source: 'VISUAL' });
+  assert.deepEqual(pick({ editor: 'nvim' }, { VISUAL: 'vim', EDITOR: '/usr/local/bin/mate -w' }), { command: '/usr/local/bin/mate -w', source: 'EDITOR' });
+  // 3. The GUI editor whose integrated terminal this is, when it is on PATH.
+  const cursorTerm = { TERM_PROGRAM: 'vscode', CURSOR_TRACE_ID: '0123abcd' };
+  assert.deepEqual(pick({ editor: 'nvim' }, cursorTerm), { command: 'cursor', source: 'terminal' });
+  const vsTerm = { TERM_PROGRAM: 'vscode', VSCODE_GIT_ASKPASS_MAIN: '/usr/share/code/resources/app/extensions/git/dist/askpass-main.js' };
+  const cursorFirst = [{ command: 'cursor', label: 'Cursor' }, { command: 'code', label: 'VS Code' }];
+  assert.deepEqual(pick({}, vsTerm, cursorFirst), { command: 'code', source: 'terminal' }, 'VS Code\'s own terminal beats the PATH order');
+  assert.deepEqual(pick({}, { ...cursorTerm, VISUAL: 'zed' }), { command: 'zed', source: 'VISUAL' }, 'a configured GUI editor comes first');
+  assert.deepEqual(pick({}, cursorTerm, [{ command: 'code', label: 'VS Code' }]), { command: 'code', source: 'path' },
+    'an editor whose command is not on PATH cannot be run, so the PATH decides');
+  // 4. Nothing GUI anywhere: null, and the caller refuses with the message that names the setting.
+  assert.equal(pick({ editor: 'nvim' }, { VISUAL: 'vim' }, [{ command: 'nvim', label: 'Neovim' }]), null);
+  assert.match(core.GUI_EDITOR_REFUSAL, /GUI editor/);
+  assert.match(core.GUI_EDITOR_REFUSAL, /prefs\.guiEditor/);
+  for (const s of ['setting', 'editor', 'VISUAL', 'EDITOR', 'terminal', 'path']) assert.ok(core.GUI_EDITOR_SOURCE[s], s);
+});
+
+test('prefs: integratedTerminalEditor reads the markers VS Code and its forks put in their terminals', () => {
+  const askpass = (dir) => `${dir}/extensions/git/dist/askpass-main.js`;
+  // VS Code sets TERM_PROGRAM=vscode in every integrated terminal (workbench: TERM_PROGRAM="vscode"), and its git
+  // extension adds VSCODE_GIT_ASKPASS_MAIN, a path inside the app that is running, so a fork's path names the fork.
+  assert.equal(core.integratedTerminalEditor({ TERM_PROGRAM: 'vscode' }), 'code');
+  assert.equal(core.integratedTerminalEditor({ TERM_PROGRAM: 'vscode', VSCODE_GIT_ASKPASS_MAIN: askpass('/usr/share/code/resources/app') }), 'code');
+  assert.equal(core.integratedTerminalEditor({ TERM_PROGRAM: 'vscode', VSCODE_GIT_ASKPASS_MAIN: askpass('/Applications/Cursor.app/Contents/Resources/app') }), 'cursor');
+  assert.equal(core.integratedTerminalEditor({ TERM_PROGRAM: 'vscode', VSCODE_GIT_ASKPASS_MAIN: askpass('/opt/Windsurf/resources/app') }), 'windsurf');
+  // Cursor and Windsurf also set their own trace ids (askpass is absent when git is off in the editor).
+  assert.equal(core.integratedTerminalEditor({ TERM_PROGRAM: 'vscode', CURSOR_TRACE_ID: 'abc' }), 'cursor');
+  assert.equal(core.integratedTerminalEditor({ TERM_PROGRAM: 'vscode', WINDSURF_TRACE_ID: 'abc' }), 'windsurf');
+  // Not an editor's terminal: another TERM_PROGRAM (a multiplexer, iTerm) or none, whatever else leaked through.
+  for (const env of [{}, { TERM_PROGRAM: 'iTerm.app' }, { TERM_PROGRAM: 'tmux', CURSOR_TRACE_ID: 'abc' }, { VSCODE_GIT_ASKPASS_MAIN: askpass('/Applications/Cursor.app/Contents/Resources/app') }]) {
+    assert.equal(core.integratedTerminalEditor(env), '', JSON.stringify(env));
+  }
+});
+
+test('prefs: guiEditor is its own setting, read and written beside editor', () => {
+  assert.equal(core.parsePrefs({ guiEditor: '  cursor  ', editor: 'nvim' }).guiEditor, 'cursor');
+  assert.equal(core.parsePrefs({ editor: 'nvim' }).editor, 'nvim');
+  for (const bad of [3, '', '   ', null, ['cursor']]) assert.equal('guiEditor' in core.parsePrefs({ guiEditor: bad }), false, JSON.stringify(bad));
+  const dir = tmpDir('oak-gui-editor-');
+  const file = path.join(dir, 'prefs.json');
+  core.writePrefs({ editor: 'nvim', guiEditor: 'cursor' }, file);
+  const back = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.equal(back.editor, 'nvim');
+  assert.equal(back.guiEditor, 'cursor');
+  assert.deepEqual(core.readPrefs(file).guiEditor, 'cursor');
+  core.writePrefs({ editor: 'nvim', guiEditor: '' }, file);
+  assert.equal('guiEditor' in JSON.parse(fs.readFileSync(file, 'utf8')), false, 'blank is Auto, stored as absent');
+  assert.ok(tui.APP_PREF_KEYS.includes('guiEditor'), 'the terminal app saves it');
+});
+
+test('tui: the options window has a Terminal editor row and a GUI editor row stepping Auto plus the GUI editors found here', () => {
+  const editors = [{ command: 'nvim', label: 'Neovim' }, { command: 'code', label: 'VS Code' }, { command: 'cursor', label: 'Cursor' }];
+  const env = { editors, gui: { command: 'code', source: 'path' } };
+  const rows = tui.optionRows({ editor: 'nvim' }, env);
+  const at = rows.findIndex((r) => r.id === 'editor');
+  const term = rows[at];
+  const gui = rows[at + 1];
+  assert.equal(term.label, 'Terminal editor');
+  assert.match(term.help, /terminal editor/i);
+  assert.match(term.help, /`e`/);
+  assert.deepEqual(term.choices, ['', 'nvim', 'code', 'cursor'], 'the terminal editor row keeps what it offered');
+  assert.equal(gui.id, 'guiEditor', 'the GUI editor row sits right under it');
+  assert.equal(gui.kind, 'text');
+  assert.equal(gui.label, 'GUI editor');
+  assert.match(gui.value, /^auto/);
+  assert.match(gui.value, /code/, 'Auto says what it resolves to now');
+  assert.match(gui.help, /W/);
+  assert.equal(gui.problem, undefined);
+  assert.deepEqual(gui.choices, ['', 'code', 'cursor'], 'Auto, then only the GUI editors found here');
+  assert.deepEqual(tui.guiEditorChoices({}, env), gui.choices, 'and the stepper walks the same list');
+
+  let p = tui.applyOption({ editor: 'nvim' }, 'guiEditor', 1, env);
+  assert.deepEqual(p, { editor: 'nvim', guiEditor: 'code', keys: undefined });
+  p = tui.applyOption(p, 'guiEditor', 1, env);
+  assert.equal(p.guiEditor, 'cursor');
+  assert.equal(p.editor, 'nvim', 'the terminal editor is left alone');
+  assert.equal(tui.optionRows(p, env).find((r) => r.id === 'guiEditor').value, 'cursor');
+  p = tui.applyOption(p, 'guiEditor', 1, env);
+  assert.equal('guiEditor' in p, false, 'past the last it wraps to Auto, stored as absent');
+  assert.equal(tui.applyOption({}, 'guiEditor', -1, env).guiEditor, 'cursor', 'and left steps back from Auto');
+
+  // Enter types any command; a typed one joins the list so stepping off it can return.
+  const typed = tui.setOption({}, 'guiEditor', '  zed  ');
+  assert.equal(typed.guiEditor, 'zed');
+  assert.deepEqual(tui.guiEditorChoices(typed, env), ['', 'code', 'cursor', 'zed']);
+  assert.equal('guiEditor' in tui.setOption(typed, 'guiEditor', ''), false, 'blank is Auto');
+  // A terminal editor typed here is flagged on the row, as W will refuse it.
+  assert.match(tui.optionRows({ guiEditor: 'vim' }, env).find((r) => r.id === 'guiEditor').problem, /terminal editor/);
+  // Nothing to resolve to: the row says W will refuse.
+  const none = tui.optionRows({}, { editors: [editors[0]], gui: null }).find((r) => r.id === 'guiEditor');
+  assert.equal(none.value, 'auto');
+  assert.match(none.problem, /W will refuse/);
+  assert.deepEqual(none.choices, ['']);
+});
+
+test('tui: firstChangedLine is the post-edit line W opens an edit at, and guiEditorFileArgs says it in each editor\'s own syntax', () => {
+  // A replacement: the first added line.
+  assert.equal(tui.firstChangedLine('--- a/b.ts\n+++ b/b.ts\n@@ -1,3 +1,3 @@\n one\n-two\n+TWO\n three\n'), 2);
+  // Coloured, as the CLI prints it: the same line.
+  assert.equal(tui.firstChangedLine('@@ -10,3 +10,4 @@\n ctx\n\x1b[32m+new\x1b[0m\n ctx\n'), 11);
+  // A pure removal: where the removed line was, which is now the line after it.
+  assert.equal(tui.firstChangedLine('@@ -4,3 +4,2 @@\n four\n-five\n six\n'), 5);
+  // A removal of the first lines, and of a whole file (+0,0): line 1, never 0.
+  assert.equal(tui.firstChangedLine('@@ -1,2 +1,1 @@\n-gone\n kept\n'), 1);
+  assert.equal(tui.firstChangedLine('@@ -1,2 +0,0 @@\n-a\n-b\n'), 1);
+  // The second hunk's change when the first has none to show (only context), and nothing at all: 0, no line.
+  assert.equal(tui.firstChangedLine('@@ -1,1 +1,1 @@\n same\n@@ -20,2 +20,2 @@\n x\n-y\n+Y\n'), 21);
+  assert.equal(tui.firstChangedLine(''), 0);
+  // VS Code and its forks take --goto file:line (VS Code 1.144's cli.js: goto, alias g, args file:line[:character]);
+  // IntelliJ's launcher --line N file (CommandLineProcessor.parseArgs, IDEA 2025.2); any other GUI editor the file.
+  assert.deepEqual(core.guiEditorFileArgs('code', '/w/b.ts', 2), ['--goto', '/w/b.ts:2']);
+  assert.deepEqual(core.guiEditorFileArgs('cursor --new-window', '/w/b.ts', 2), ['--goto', '/w/b.ts:2']);
+  assert.deepEqual(core.guiEditorFileArgs('/opt/idea/bin/idea', '/w/b.ts', 7), ['--line', '7', '/w/b.ts']);
+  assert.deepEqual(core.guiEditorFileArgs('zed', '/w/b.ts', 2), ['/w/b.ts']);
+  assert.deepEqual(core.guiEditorFileArgs('code', '/w/b.ts', 0), ['/w/b.ts'], 'no line, no --goto');
+  assert.equal(core.isJetBrainsEditor('pycharm'), true);
+  assert.equal(core.isJetBrainsEditor('code'), false);
 });
 
 test('tui: colour and glyphs degrade sensibly on Linux, macOS, WSL and Windows', () => {
@@ -19502,10 +28165,11 @@ test('store: the location is shown, movable, and the move takes the history AND 
   core.writePrefs({ ...core.readPrefs(), theme: 'light' });
 
   const before = core.rootDir();
-  const dest = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'store-dest-')), 'observatory');
+  const dest = path.join(tmpDir('store-dest-'), 'observatory');
   const res = core.moveStore(dest);
   assert.ok(res.moved, `move failed: ${JSON.stringify(res)}`);
-  core.writePrefs({ ...core.readPrefs(), storeDir: dest });
+  // Recorded by the move, while captures wait for it: recorded after it, they found the store where it had been.
+  assert.equal(core.readPrefs().storeDir, dest, 'the move records where it went');
 
   assert.equal(core.rootDir(), dest, 'rootDir follows the setting');
   assert.equal(core.readLog(S).length, 1, 'the history came with it');
@@ -19519,9 +28183,7 @@ test('store: the location is shown, movable, and the move takes the history AND 
   // makes the return trip impossible — which it did, until prefs.json stopped counting as store data.
   const back = core.moveStore(before);
   assert.ok(back.moved, `move back failed: ${JSON.stringify(back)}`);
-  const p = core.readPrefs();
-  delete p.storeDir;
-  core.writePrefs(p);
+  assert.equal(core.readPrefs().storeDir, undefined, 'and a move back to the default removes the setting');
   assert.equal(core.rootDir(), before, 'back to the default');
   assert.equal(core.readLog(S).length, 1, 'still one record');
   assert.equal(core.readPrefs().theme, 'light', 'settings survived the return trip too');
@@ -19529,13 +28191,28 @@ test('store: the location is shown, movable, and the move takes the history AND 
   // Refusals, each with its own reason.
   assert.match(core.moveStore(core.rootDir()).error, /already there/);
   assert.match(core.moveStore(path.join(core.rootDir(), 'inner')).error, /inside the current store/);
-  const busy = fs.mkdtempSync(path.join(os.tmpdir(), 'store-busy-'));
+  const busy = tmpDir('store-busy-');
   fs.writeFileSync(path.join(busy, 'something.txt'), 'x');
   assert.match(core.moveStore(busy).error, /not empty/);
+  // From a scratch folder: refused or not, nothing lands in the folder the suite runs in.
+  const here = process.cwd();
+  process.chdir(tmpDir('store-relative-'));
+  try {
+    assert.match(core.moveStore('relative/obs').error, /is relative/, 'and a location prefs.json could not hold is never recorded');
+  } finally {
+    process.chdir(here);
+  }
   // A relative path would resolve against whatever directory the caller started in.
   assert.match(core.parseStorePath('relative/path').error, /relative/);
   assert.equal(core.parseStorePath('/abs/path').dir, '/abs/path');
   assert.match(core.parseStorePath('   ').error, /nothing to set/);
+  // So is a `~name/…` one: only the home is expanded, so `oak store --move ~x/obs` put the store in the folder the command
+  // ran in, and each capture then kept its own in the agent's project folder.
+  for (const p of ['~x/obs', '~obs', '~user\\obs']) assert.match(core.parseStorePath(p).error ?? '', /is relative/, p);
+  for (const p of ['~', '~/obs', '~\\obs']) assert.equal(core.parseStorePath(p).dir, p, p);
+  fs.writeFileSync(core.prefsPath(), JSON.stringify({ storeDir: '~x/obs' }));
+  core.clearRootMemo();
+  assert.equal(core.rootDir(), path.join(core.claudeConfigDir(), 'claude-observatory'), 'and one written by hand is not a location');
 });
 
 test('options: start focus round-trips and retired remotes are ignored', () => {
@@ -19602,7 +28279,7 @@ test('ignore: a session whose edits are ALL ignored renders as empty, and says n
   const base = paneFixture();
   const empty = { ...base, views: { ...base.views, list: { edits: [] } } };
   const frame = tui.renderDashFrame(empty, { cols: 150, rows: 34, color: false });
-  assert.ok(frame.find((l) => /F3 Traces/.test(l)), 'positive control: the pane is rendered');
+  assert.ok(frame.find((l) => /F5 Traces/.test(l)), 'positive control: the pane is rendered');
   assert.ok(!frame.some((l) => /observatoryignore/.test(l)),
     'no ignore notice — nothing was filtered, so there is nothing to explain');
 });
@@ -19715,7 +28392,7 @@ test('attention: the hooks record who is waiting, the tail names the question, t
   assert.equal(row2.attention?.kind, 'input', 'an answered question is no longer one');
 });
 
-// Stale permission waits (herdr-status investigation, 2026-09-27): a permitted call goes Pre →
+// Stale permission waits: a permitted call goes Pre →
 // PermissionRequest → Post, and nothing on that path lowered the hand, so a session said "needs your
 // permission" until some later edit or prompt. Neither agent puts the call id on PermissionRequest
 // (Claude Code 2.1.283 and Codex 0.156.1 both omit `tool_use_id` there), so a prompt is tied to its
@@ -20018,6 +28695,11 @@ test('needs you: the hand ranking, the once-per-machine desktop claim, the notif
   assert.equal(core.nextAttention([{ id: 'x', attention: null }], null), null, 'nobody waiting → null');
   assert.equal(core.attentionLabel('permission'), 'needs your permission');
   assert.equal(core.attentionLabel('idle-done'), 'finished its turn');
+  // What a jump says when none waits here: the other machines' hands are answered there, so it names where they are listed.
+  // JetBrains mirrors these strings verbatim (InboxNextParserTest).
+  assert.equal(core.nobodyWaitingHere(0, 'the Sessions tab'), 'nobody is waiting on you');
+  assert.equal(core.nobodyWaitingHere(1, 'the Sessions tab'), 'nobody here is waiting on you · 1 on other machine: the Sessions tab lists it');
+  assert.equal(core.nobodyWaitingHere(2, 'the Sessions tab'), 'nobody here is waiting on you · 2 on other machines: the Sessions tab lists them');
 
   // 2. THE DESKTOP CLAIM: once per hand per machine; inside the cooldown only a MORE urgent wait
   //    announces; the reader's kinds decide; desktop off silences everything.
@@ -20060,6 +28742,12 @@ test('needs you: the hand ranking, the once-per-machine desktop claim, the notif
   assert.ok(!ps.args.some((a) => a.includes('Start-Process') || a.includes('a & b')), 'no text of the notification in the script');
   assert.ok(!ps.args.some((a) => a.includes('"')), 'no double quote for cmd.exe to strip');
   assert.match(ps.args[3], /\$e::Escape\(\$env:OAK_TOAST_TITLE\).*\$e::Escape\(\$env:OAK_TOAST_BODY\)/, 'PowerShell XML-escapes both itself');
+  // Windows drops a desktop app's toast unless a Start-menu shortcut (or registry key) registers its app id;
+  // Windows PowerShell's shortcut registers this one, and nothing registered the bare 'OAK' used before.
+  // The GUID is Windows' System32 known-folder id, split only so the privacy check, which reads any UUID
+  // in a test as a session id, does not flag it.
+  const psAppId = '{1AC14E77-02E7-4E5D' + '-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe';
+  assert.ok(ps.args[3].endsWith(`::CreateToastNotifier('${psAppId}').Show([Windows.UI.Notifications.ToastNotification]::new($x))`), ps.args[3]);
   assert.equal(core.notifierArgv('none', 't', 'b'), null);
   const savedPath = process.env.PATH;
   process.env.PATH = home; // nothing on PATH
@@ -20133,6 +28821,835 @@ test('notify: on Windows the toast text travels in the environment, and PowerShe
   assert.ok(!args.join(' ').includes('Start-Process'), 'never on the command line');
 });
 
+// Codex runs its PermissionRequest hook even when its Auto-review, not the person, answers the prompt: the
+// desktop was told a session needed permission after the call it asked about had been approved and had run.
+test('notify: a permission prompt is posted only if it still stands after its grace; other waits at once', async (t) => {
+  const real = Object.getOwnPropertyDescriptor(process, 'platform');
+  const spawn = cp.spawn;
+  const savedPath = process.env.PATH;
+  const calls = [];
+  const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-grace-bin-'));
+  fs.writeFileSync(path.join(bin, 'notify-send'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  Object.defineProperty(process, 'platform', { ...real, value: 'linux' });
+  process.env.PATH = bin;
+  cp.spawn = (file, args) => { calls.push({ file, args }); const { EventEmitter } = require('events'); const c = new EventEmitter(); c.unref = () => {}; return c; };
+  t.after(() => { Object.defineProperty(process, 'platform', real); cp.spawn = spawn; process.env.PATH = savedPath; fs.rmSync(bin, { recursive: true, force: true }); });
+  freshHome();
+  const young = Date.now() - core.PERMISSION_GRACE_MS + 200;
+  const row = (id, title) => ({ id, title, agent: 'codex', attention: core.readAttention(id) });
+  core.writeAttention('grace-approved', { kind: 'permission', message: 'apply_patch', ts: young });
+  core.writeAttention('grace-standing', { kind: 'permission', message: 'apply_patch', ts: young });
+  const later = [];
+  assert.equal(core.announceAttention(row('grace-approved', 'Approved'), Date.now(), (sent) => later.push(['approved', sent])), false, 'not at once');
+  assert.equal(core.announceAttention(row('grace-standing', 'Standing'), Date.now(), (sent) => later.push(['standing', sent])), false, 'not at once');
+  assert.equal(calls.length, 0);
+  core.clearAttention('grace-approved'); // the hook of the call Auto-review approved lowers the hand
+  await new Promise((r) => setTimeout(r, 500));
+  assert.deepEqual(later.sort(), [['approved', false], ['standing', true]]);
+  assert.equal(calls.length, 1, 'one notification, for the prompt still waiting');
+  assert.ok(calls[0].args.includes('OAK: Standing'), calls[0].args.join(' '));
+  assert.equal(core.announceAttention(row('grace-standing', 'Standing')), false, 'the same prompt is never posted twice');
+  core.writeAttention('grace-input', { kind: 'input', message: '', ts: Date.now() });
+  assert.equal(core.announceAttention(row('grace-input', 'Input')), true, 'an input wait is posted at once');
+  core.writeAttention('grace-old', { kind: 'permission', message: 'Bash', ts: Date.now() - core.PERMISSION_GRACE_MS });
+  assert.equal(core.announceAttention(row('grace-old', 'Old')), true, 'a prompt already past its grace is posted at once');
+  assert.equal(core.announceDelayMs({ kind: 'permission', ts: Date.now() + 3_600_000 }), core.PERMISSION_GRACE_MS, 'a clock set back waits no longer than the grace');
+});
+
+// Another machine's hand (a `syncedHands` row) came through its record log: claimed under that machine, since a session id
+// can repeat across machines, posted at once (no file here says whether it stands), naming the machine, and with no
+// click that would focus a pane here.
+test('notify: another machine\'s hand is announced once per machine and hand, at once, naming its machine', (t) => {
+  const real = Object.getOwnPropertyDescriptor(process, 'platform');
+  const spawn = cp.spawn;
+  const savedPath = process.env.PATH;
+  const calls = [];
+  const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-remote-hand-bin-'));
+  for (const n of ['notify-send', 'terminal-notifier']) fs.writeFileSync(path.join(bin, n), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  Object.defineProperty(process, 'platform', { ...real, value: 'linux' });
+  process.env.PATH = bin;
+  cp.spawn = (file, args) => { calls.push({ file, args }); const { EventEmitter } = require('events'); const c = new EventEmitter(); c.unref = () => {}; return c; };
+  core.setOakCliEntry('/opt/oak/cli.js');
+  t.after(() => { Object.defineProperty(process, 'platform', real); cp.spawn = spawn; process.env.PATH = savedPath; core.setOakCliEntry(undefined); fs.rmSync(bin, { recursive: true, force: true }); });
+  freshHome();
+  const ts = Date.now() - 1000; // inside a permission prompt's grace
+  const remote = { id: 'same-id', title: 'There', agent: 'claude', attention: { kind: 'permission', message: 'Bash', ts }, host: 'aaaaaaaaaaaa', machine: 'build-box' };
+  assert.equal(core.announceAttention(remote), true, 'posted at once');
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].args.at(-1), 'needs your permission — Bash · on build-box', calls[0].args.join(' '));
+  assert.equal(core.announceAttention(remote), false, 'never twice');
+  assert.equal(core.dueDesktopNotify('same-id@aaaaaaaaaaaa', 'permission', ts), false, 'nor by another surface on this machine');
+  // Another machine's hand of the same session id, and this machine's own, are hands of their own.
+  assert.equal(core.announceAttention({ ...remote, host: 'bbbbbbbbbbbb', machine: 'gpu-box' }), true);
+  core.writeAttention('same-id', { kind: 'input', message: '', ts });
+  assert.equal(core.announceAttention({ id: 'same-id', title: 'Here', agent: 'claude', attention: core.readAttention('same-id') }), true);
+  assert.equal(calls.length, 3);
+  // Its pop in a surface's own window is at once too.
+  let shown = 0;
+  core.whenHandDue('same-id', { kind: 'permission', ts: Date.now() }, () => shown++, Date.now(), 'aaaaaaaaaaaa');
+  assert.equal(shown, 1);
+  // A claim another surface held the lock for decided nothing: this surface's next look announces it.
+  const lock = path.join(core.rootDir(), 'notify-claims.json.lock');
+  fs.writeFileSync(lock, '');
+  const busy = { ...remote, id: 'busy-id' };
+  assert.equal(core.announceAttention(busy), false, 'the lock was held');
+  fs.rmSync(lock);
+  assert.equal(core.announceAttention(busy), true, 'looked at again once it is free');
+  assert.equal(calls.length, 4);
+  // On macOS, terminal-notifier groups it and focuses nothing: `oak focus` finds this machine's panes.
+  Object.defineProperty(process, 'platform', { ...real, value: 'darwin' });
+  process.env.HERDR_ENV = '1';
+  t.after(() => { delete process.env.HERDR_ENV; });
+  core.setTerminalNotifierDirs([]);
+  t.after(() => core.setTerminalNotifierDirs(undefined));
+  assert.equal(core.announceAttention({ ...remote, id: 'mac-remote' }), true);
+  assert.ok(!calls.at(-1).args.includes('-execute') && !calls.at(-1).args.includes('-group'), calls.at(-1).args.join(' '));
+});
+
+test('notify: the grace timer never holds a process open', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-grace-exit-'));
+  const script = `const core = require(${JSON.stringify(path.join(__dirname, '../dist/index.js'))});
+core.writeAttention('grace-exit', { kind: 'permission', message: 'Bash', ts: Date.now() });
+process.stdout.write(String(core.announceAttention({ id: 'grace-exit', title: 'x', agent: 'claude', attention: core.readAttention('grace-exit') })));`;
+  const started = Date.now();
+  const r = cp.spawnSync(process.execPath, ['-e', script], { env: { ...process.env, HOME: home, USERPROFILE: home, CLAUDE_CONFIG_DIR: path.join(home, 'claude'), PATH: home }, encoding: 'utf8', timeout: 20_000 });
+  fs.rmSync(home, { recursive: true, force: true });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.stdout, 'false');
+  assert.ok(Date.now() - started < core.PERMISSION_GRACE_MS - 1000, `exited in ${Date.now() - started} ms`);
+});
+
+// A Codex rollout as Codex 0.159 writes one under Auto-review: session_meta, then per turn a
+// turn_context naming the approval settings, and megabytes of tool output after it. A settings change
+// inside a thread is a thread_settings_applied event.
+function autoReviewRollout(dir, records) {
+  const file = path.join(dir, `rollout-2026-09-29T14-18-10-${Math.random().toString(16).slice(2)}.jsonl`);
+  const at = (i) => new Date(Date.UTC(2026, 8, 29, 21, 43, i)).toISOString();
+  fs.writeFileSync(file, records.map((r, i) => JSON.stringify({ timestamp: at(i), ordinal: i, ...r }) + '\n').join(''));
+  return file;
+}
+const turnContext = (approval_policy, approvals_reviewer) => ({ type: 'turn_context', payload: { turn_id: 't1', cwd: '/work', approval_policy, approvals_reviewer, sandbox_policy: { type: 'workspace-write' } } });
+const settingsApplied = (approval_policy, approvals_reviewer) => ({ type: 'event_msg', payload: { type: 'thread_settings_applied', thread_id: 's', thread_settings: { model: 'gpt-5', approval_policy, approvals_reviewer } } });
+// A tool output that quotes the settings as text: escaped quotes, so never read as the setting.
+const quotedOutput = { type: 'response_item', payload: { type: 'custom_tool_call_output', call_id: 'c1', output: '"approvals_reviewer":"user" and ' + 'x'.repeat(3 << 20) } };
+function linkRollout(session, file) {
+  core.ensureStore(session);
+  fs.writeFileSync(path.join(core.storeDir(session), 'agent.json'), JSON.stringify({ agent: 'codex', transcriptPath: file, updated: 1 }));
+}
+
+test('notify: Codex sessions under Auto-review are told apart by the rollout\'s last approval settings', () => {
+  freshHome();
+  const dir = tmpWork();
+  const meta = { type: 'session_meta', payload: { id: 's', cwd: '/work', cli_version: '0.159.0' } };
+  const cases = [
+    ['auto-review, on-request', [meta, turnContext('on-request', 'auto_review'), quotedOutput], true],
+    ['the legacy guardian_subagent spelling', [meta, turnContext('on-request', 'guardian_subagent')], true],
+    ['granular approvals', [meta, turnContext({ granular: { sandbox_approval: true } }, 'auto_review')], true],
+    ['the person reviews', [meta, turnContext('on-request', 'user'), quotedOutput], false],
+    // Codex also writes the key into an MCP approval's metadata (codex_protocol::mcp_approval_meta), which
+    // is not the thread's setting.
+    ['an MCP call\'s approval metadata', [meta, turnContext('on-request', 'auto_review'), { type: 'event_msg', payload: { type: 'item_completed', item: { type: 'McpToolCall', _meta: { approvals_reviewer: 'user' } } } }], true],
+    ['switched to the person inside the thread', [meta, turnContext('on-request', 'auto_review'), settingsApplied('on-request', 'user')], false],
+    ['switched to Auto-review for the next turn', [meta, turnContext('on-request', 'user'), turnContext('on-request', 'auto_review')], true],
+    ['untrusted: Codex routes nothing to the reviewer', [meta, turnContext('untrusted', 'auto_review')], false],
+    ['no settings recorded', [meta, quotedOutput], false],
+  ];
+  for (const [name, records, want] of cases) {
+    const session = `auto-review-${cases.findIndex((c) => c[0] === name)}`;
+    linkRollout(session, autoReviewRollout(dir, records));
+    assert.equal(core.codexAutoReview(session), want, name);
+    assert.equal(core.permissionWaitMs(session), want ? core.AUTO_REVIEW_WAIT_MS : core.PERMISSION_GRACE_MS, name);
+  }
+  // A torn last line (Codex still writing it) is skipped for the complete record before it.
+  const torn = autoReviewRollout(dir, [meta, turnContext('on-request', 'auto_review')]);
+  fs.appendFileSync(torn, '{"timestamp":"2026-09-29T21:44:00.000Z","type":"turn_context","payload":{"approval_policy":"on-request","approvals_reviewer":"us');
+  linkRollout('auto-review-torn', torn);
+  assert.equal(core.codexAutoReview('auto-review-torn'), true, 'a torn line is not the setting');
+  // The rollout grows: a later turn under the person is read, not the memo of the earlier size.
+  fs.appendFileSync(torn, '\n' + JSON.stringify(turnContext('on-request', 'user')) + '\n');
+  assert.equal(core.codexAutoReview('auto-review-torn'), false, 'the grown rollout is read again');
+  // Not a Codex session, or a rollout that is gone: the person's grace.
+  assert.equal(core.codexAutoReview('auto-review-claude'), false);
+  linkRollout('auto-review-gone', path.join(dir, 'missing.jsonl'));
+  assert.equal(core.codexAutoReview('auto-review-gone'), false);
+  assert.equal(core.permissionWaitMs(), core.PERMISSION_GRACE_MS);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// The settings are found wherever the chunked backward read splits the file, in a turn_context the size
+// Codex 0.159 writes (its permission profile and collaboration mode make it several KB), and no further
+// back than ROLLOUT_SCAN_BYTES: an older Codex records none, and was read whole on every hand.
+test('notify: the Auto-review settings are found across a chunk boundary, in a full-size line, and only within the scan cap', () => {
+  freshHome();
+  const dir = tmpWork();
+  const rec = (o) => JSON.stringify({ timestamp: '2026-09-29T21:43:00.000Z', ...o }) + '\n';
+  const filler = (bytes) => { const empty = rec({ type: 'response_item', payload: { type: 'function_call_output', call_id: 'c', output: '' } }); return empty.replace('"output":""', `"output":"${'y'.repeat(bytes - empty.length)}"`); };
+  // A turn_context as Codex 0.159 writes one: the approval settings early in it, KBs after them.
+  const full = (reviewer) => rec({ type: 'turn_context', payload: { turn_id: 't2', cwd: '/work', approval_policy: 'on-request', approvals_reviewer: reviewer,
+    sandbox_policy: { type: 'workspace-write' }, permission_profile: { entries: Array.from({ length: 40 }, (_, i) => ({ path: `/work/dir${i}`, access: 'write' })) },
+    collaboration_mode: { mode: 'default', settings: { developer_instructions: 'z'.repeat(12_000) } }, model: 'gpt-5', effort: 'high' } });
+  const earlier = rec(turnContext('on-request', 'user'));
+  const line = full('auto_review');
+  assert.ok(line.length > 12_000, 'control: a full-size line');
+  // The key straddles the first 1 MiB chunk read back from the end.
+  const key = line.indexOf('"approvals_reviewer":"');
+  const tail = (1 << 20) + 5 - (line.length - key);
+  const straddle = path.join(dir, 'straddle.jsonl');
+  fs.writeFileSync(straddle, earlier + line + filler(tail));
+  assert.equal(fs.statSync(straddle).size - (earlier.length + key), (1 << 20) + 5, 'control: the key starts 5 bytes before the chunk boundary and ends after it');
+  linkRollout('ar-straddle', straddle);
+  assert.equal(core.codexAutoReview('ar-straddle'), true, 'the key across the boundary, not the earlier turn');
+  const big = path.join(dir, 'fullsize.jsonl');
+  fs.writeFileSync(big, earlier + line + filler(2000));
+  linkRollout('ar-fullsize', big);
+  assert.equal(core.codexAutoReview('ar-fullsize'), true, 'a full-size line is read whole');
+  // Beyond the cap: not read, so the person's grace.
+  const far = path.join(dir, 'far.jsonl');
+  fs.writeFileSync(far, line);
+  for (let n = 0; n < core.ROLLOUT_SCAN_BYTES; n += 1 << 20) fs.appendFileSync(far, filler(1 << 20));
+  linkRollout('ar-far', far);
+  assert.equal(core.codexAutoReview('ar-far'), false, 'settings further back than ROLLOUT_SCAN_BYTES are not read');
+  assert.equal(core.ROLLOUT_SCAN_BYTES, 32 << 20);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// Whether a Codex turn is still running, for the pane herdr calls blocked while Codex works on with a question
+// waiting (paneAgentState): the rollout's last task_started with no task_complete or turn_aborted after it.
+test('codex: a rollout\'s last turn reads as running until it ends, wherever the read splits it, and a grown rollout is read only where it grew', () => {
+  freshHome();
+  const dir = tmpWork();
+  const lines = fs.readFileSync(path.join(__dirname, 'fixtures', 'conversation-codex.jsonl'), 'utf8').trimEnd().split('\n');
+  let n = 0;
+  const write = (records, tail = '\n') => { const f = path.join(dir, `rollout-${n++}.jsonl`); fs.writeFileSync(f, records.join('\n') + tail); return f; };
+  const event = (type) => JSON.stringify({ timestamp: '2026-10-23T10:00:00.000Z', type: 'event_msg', payload: { type, turn_id: 'fixture-turn' } });
+  const output = (text) => JSON.stringify({ timestamp: '2026-10-23T10:00:01.000Z', type: 'response_item', payload: { type: 'function_call_output', call_id: 'c', output: text } });
+  assert.equal(lines[13], JSON.stringify(JSON.parse(lines[13])), 'control: the fixture is written as Codex writes, compact');
+  assert.equal(JSON.parse(lines[13]).payload.type, 'task_started', 'control: line 13 starts the second turn');
+  assert.equal(core.codexTurnOpen(write(lines)), false, 'both of the fixture\'s turns completed');
+  assert.equal(core.codexTurnOpen(write(lines.slice(0, 14))), true, 'the second turn just started');
+  assert.equal(core.codexTurnOpen(write(lines.slice(0, 17))), true, 'mid-turn, after a tool\'s output');
+  assert.equal(core.codexTurnOpen(write([...lines.slice(0, 17), event('turn_aborted')])), false, 'an interrupt ends it');
+  assert.equal(core.codexTurnOpen(write(lines.slice(0, 1))), false, 'a rollout with no turn');
+  assert.equal(core.codexTurnOpen(write([...lines.slice(0, 14), output('{"type":"task_complete"}')])), true, 'a tool\'s output quoting an end is not one');
+  const nested = JSON.stringify({ type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'task_complete' }] } });
+  assert.equal(core.codexTurnOpen(write([...lines.slice(0, 14), nested])), true, 'nor is a record that holds the key inside another');
+  assert.equal(core.codexTurnOpen(path.join(dir, 'missing.jsonl')), null, 'a rollout that cannot be read cannot say');
+  // The start's line across the edge of the first chunk read back from the end (64 KiB).
+  const head = `${lines[0]}\n${event('task_complete')}\n`, start = event('task_started');
+  const filler = output('x'.repeat((64 << 10) - Math.ceil(start.length / 2) - 2 - output('').length));
+  const straddle = write([head + start, filler]);
+  const edge = fs.statSync(straddle).size - (64 << 10);
+  assert.ok(head.length < edge && edge < head.length + start.length, 'control: the start\'s line crosses the chunk boundary');
+  assert.equal(core.codexTurnOpen(straddle), true, 'the start across the boundary, not the earlier end');
+  // A long turn: read back to its start once, then only where it grew.
+  const long = write([lines[0], event('task_complete'), event('task_started'), ...Array.from({ length: 4 }, () => output('y'.repeat(1 << 20)))]);
+  assert.equal(core.codexTurnOpen(long), true);
+  const realRead = fs.readSync;
+  let bytesRead = 0;
+  const counted = (fn) => {
+    bytesRead = 0;
+    fs.readSync = function (...args) { const got = realRead.apply(fs, args); bytesRead += got; return got; };
+    try { return fn(); } finally { fs.readSync = realRead; }
+  };
+  fs.appendFileSync(long, output('z'.repeat(2000)) + '\n');
+  assert.equal(counted(() => core.codexTurnOpen(long)), true, 'still running');
+  assert.ok(bytesRead < 8 * 1024, `the appended record is read, not the turn (${bytesRead} bytes)`);
+  fs.appendFileSync(long, event('task_complete').slice(0, 40));
+  assert.equal(core.codexTurnOpen(long), true, 'an end still being written is not one yet');
+  fs.appendFileSync(long, event('task_complete').slice(40) + '\n');
+  assert.equal(counted(() => core.codexTurnOpen(long)), false, 'once whole, the turn has ended');
+  assert.ok(bytesRead < 8 * 1024, `…read where it grew (${bytesRead} bytes)`);
+  fs.appendFileSync(long, `${event('task_started')}\n${output('w')}\n`);
+  assert.equal(core.codexTurnOpen(long), true, 'the next turn runs');
+  // A finished turn's end is its last record: read cold, it costs one small chunk, not a megabyte.
+  const finished = write([lines[0], event('task_started'), output('t'.repeat(2 << 20)), event('task_complete')]);
+  assert.equal(counted(() => core.codexTurnOpen(finished)), false);
+  assert.ok(bytesRead < 128 << 10, `a finished turn is read from its end (${bytesRead} bytes)`);
+  // Rewritten in place (the same inode, larger, or the same size and newer): read whole again.
+  const rewritten = write([lines[0], event('task_started'), output('a')]);
+  assert.equal(core.codexTurnOpen(rewritten), true);
+  fs.writeFileSync(rewritten, [lines[0], event('task_complete'), output('b'.repeat(400)), output('c')].join('\n') + '\n');
+  assert.equal(core.codexTurnOpen(rewritten), false, 'a larger file whose earlier bytes changed is read again whole');
+  const same = fs.readFileSync(rewritten, 'utf8').replace('"type":"task_complete"', '"type":"task_started" ');
+  fs.writeFileSync(rewritten, same);
+  const later = Date.now() / 1000 + 5;
+  fs.utimesSync(rewritten, later, later);
+  assert.equal(core.codexTurnOpen(rewritten), true, 'so is one of the same size with a newer mtime');
+  // No further back than ROLLOUT_SCAN_BYTES, even for a rollout read before.
+  const far = write([lines[0], event('task_started'), output('v')]);
+  assert.equal(core.codexTurnOpen(far), true);
+  for (let at = 0; at <= core.ROLLOUT_SCAN_BYTES; at += 1 << 20) fs.appendFileSync(far, output('u'.repeat(1 << 20)) + '\n');
+  assert.equal(core.codexTurnOpen(far), null, 'a start further back than the scan cannot be seen');
+  fs.appendFileSync(far, event('task_complete') + '\n');
+  assert.equal(core.codexTurnOpen(far), false, 'an end after it can');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// The memo of what each rollout's last read found is bounded (1024 rollouts): a long-lived listing that has seen more
+// forgets the one it read longest ago, so it is read again, while the newest is still answered without a read.
+test('codex: the rollout turn memo keeps the 1024 rollouts read most recently', () => {
+  freshHome();
+  const dir = tmpWork();
+  const files = Array.from({ length: 1025 }, (_, i) => {
+    const f = path.join(dir, `rollout-${i}.jsonl`);
+    fs.writeFileSync(f, `${JSON.stringify({ type: 'event_msg', payload: { type: 'task_started' } })}\n`);
+    return f;
+  });
+  for (const f of files) assert.equal(core.codexTurnOpen(f), true);
+  const realRead = fs.readSync;
+  const bytesFor = (f) => {
+    let n = 0;
+    fs.readSync = function (...args) { const got = realRead.apply(fs, args); n += got; return got; };
+    try { assert.equal(core.codexTurnOpen(f), true); } finally { fs.readSync = realRead; }
+    return n;
+  };
+  assert.equal(bytesFor(files[1024]), 0, 'the newest is remembered');
+  assert.ok(bytesFor(files[0]) > 0, 'the oldest was forgotten, and is read again');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// A Codex subagent's hooks name the subagent's own rollout (on its SubagentStop, its parent's). Recorded
+// as the session's, it would have Auto-review read from the wrong thread.
+test('codex: a subagent\'s hook never replaces the session\'s rollout', () => {
+  freshHome();
+  const dir = tmpWork();
+  const main = path.join(dir, 'main.jsonl');
+  fs.writeFileSync(main, JSON.stringify({ timestamp: new Date().toISOString(), ...turnContext('on-request', 'auto_review') }) + '\n');
+  const sub = path.join(dir, 'sub.jsonl');
+  fs.writeFileSync(sub, JSON.stringify({ timestamp: new Date().toISOString(), ...turnContext('on-request', 'user') }) + '\n');
+  const codex = require('../dist/codex.js');
+  const base = { session_id: 'sub-rollout', cwd: dir, turn_id: 'turn-1' };
+  codex.handleCodexHookPayload({ ...base, transcript_path: main, hook_event_name: 'PermissionRequest', tool_name: 'Bash', tool_input: { command: 'ls' } });
+  assert.equal(codex.readCodexAgentMeta('sub-rollout').transcriptPath, main, 'control: the main agent\'s hook records the session\'s rollout');
+  codex.handleCodexHookPayload({ ...base, agent_id: 'sub1', transcript_path: sub, hook_event_name: 'PermissionRequest', tool_name: 'Bash', tool_input: { command: 'make' } });
+  codex.handleCodexHookPayload({ ...base, agent_id: 'sub1', transcript_path: sub, hook_event_name: 'SubagentStop' });
+  assert.equal(codex.readCodexAgentMeta('sub-rollout').transcriptPath, main, 'a subagent\'s hook never replaces the session\'s rollout');
+  assert.equal(core.codexAutoReview('sub-rollout'), true, 'so Auto-review is read from the session\'s own thread');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// `oak notify --session` sat out the whole wait (up to 90 s) even for a prompt answered at once, and read
+// the wait twice, so a rollout that changed meanwhile stamped the claim up to 85 s in the future.
+test('notify: announceWhenDue waits in one-second looks, ends as soon as the hand is down, and reads the wait once', async (t) => {
+  const real = Object.getOwnPropertyDescriptor(process, 'platform');
+  const spawn = cp.spawn;
+  const savedPath = process.env.PATH;
+  const calls = [];
+  const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-due-bin-'));
+  fs.writeFileSync(path.join(bin, 'notify-send'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  Object.defineProperty(process, 'platform', { ...real, value: 'linux' });
+  process.env.PATH = bin;
+  cp.spawn = (file, args) => { calls.push({ file, args }); const { EventEmitter } = require('events'); const c = new EventEmitter(); c.unref = () => {}; return c; };
+  t.after(() => { Object.defineProperty(process, 'platform', real); cp.spawn = spawn; process.env.PATH = savedPath; fs.rmSync(bin, { recursive: true, force: true }); });
+  freshHome();
+  const dir = tmpWork();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  let slept = [];
+  let during = () => {};
+  const sleep = async (ms) => { slept.push(ms); during(slept.length); };
+  const row = (id) => ({ id, title: id, agent: 'codex', attention: core.readAttention(id) });
+  const total = () => slept.reduce((x, y) => x + y, 0);
+  // Stamped an hour ahead of this machine's clock: the whole wait, then posted — Auto-review's, and the grace.
+  const auto = path.join(dir, 'auto.jsonl');
+  fs.writeFileSync(auto, JSON.stringify({ timestamp: new Date().toISOString(), ...turnContext('on-request', 'auto_review') }) + '\n');
+  linkRollout('due-auto-ahead', auto);
+  core.writeAttention('due-auto-ahead', { kind: 'permission', message: 'Bash', ts: Date.now() + 3_600_000 });
+  assert.equal(await core.announceWhenDue(row('due-auto-ahead'), sleep), true);
+  assert.equal(total(), core.AUTO_REVIEW_WAIT_MS, 'the Auto-review wait, whatever the clock');
+  assert.ok(slept.every((ms) => ms <= 1000), 'in looks about a second apart');
+  slept = [];
+  core.writeAttention('due-ahead', { kind: 'permission', message: 'Bash', ts: Date.now() + 3_600_000 });
+  assert.equal(await core.announceWhenDue(row('due-ahead'), sleep), true);
+  assert.equal(total(), core.PERMISSION_GRACE_MS);
+  // Answered three seconds in: done at the next look, nothing posted.
+  slept = [];
+  core.writeAttention('due-answered', { kind: 'permission', message: 'Bash', ts: Date.now() });
+  during = (n) => { if (n === 3) core.clearAttention('due-answered'); };
+  assert.equal(await core.announceWhenDue(row('due-answered'), sleep), false);
+  assert.equal(slept.length, 3, 'it stopped at the first look after the hand came down');
+  // The session turns to Auto-review during the wait: the wait read at the start holds, and the claim is
+  // stamped now, not at the end of a longer wait.
+  slept = [];
+  const person = path.join(dir, 'person.jsonl');
+  fs.writeFileSync(person, JSON.stringify({ timestamp: new Date().toISOString(), ...turnContext('on-request', 'user') }) + '\n');
+  linkRollout('due-switched', person);
+  core.writeAttention('due-switched', { kind: 'permission', message: 'Bash', ts: Date.now() });
+  during = (n) => { if (n === 1) fs.appendFileSync(person, JSON.stringify(turnContext('on-request', 'auto_review')) + '\n'); };
+  assert.equal(await core.announceWhenDue(row('due-switched'), sleep), true);
+  assert.ok(total() > core.PERMISSION_GRACE_MS - 1000 && total() <= core.PERMISSION_GRACE_MS, `the wait read once (${total()} ms)`);
+  assert.equal(core.codexAutoReview('due-switched'), true, 'control: the session did switch');
+  const claims = JSON.parse(fs.readFileSync(path.join(core.rootDir(), 'notify-claims.json'), 'utf8'));
+  assert.ok(claims['due-switched'].at <= Date.now(), 'claimed now, not in the future');
+  // The last look, after the last sleep: a hand lowered during it is not posted.
+  slept = [];
+  core.writeAttention('due-last', { kind: 'permission', message: 'Bash', ts: Date.now() + 3_600_000 });
+  during = (n) => { if (n === core.PERMISSION_GRACE_MS / 1000) core.clearAttention('due-last'); };
+  assert.equal(await core.announceWhenDue(row('due-last'), sleep), false, 'lowered in the last sleep');
+  assert.equal(slept.length, core.PERMISSION_GRACE_MS / 1000, 'control: it came down during the last sleep');
+  // Another kind of hand is posted at once.
+  slept = [];
+  core.writeAttention('due-input', { kind: 'input', message: '', ts: Date.now() });
+  assert.equal(await core.announceWhenDue(row('due-input'), sleep), true);
+  assert.equal(slept.length, 0);
+  assert.equal(calls.length, 4);
+  // Another machine's permission prompt (`oak notify --session --host`, JetBrains' path) is posted at once: that machine
+  // published it once it stood its wait there; and a claims lock another surface holds is waited out, briefly.
+  slept = [];
+  const lock = path.join(core.rootDir(), 'notify-claims.json.lock');
+  fs.writeFileSync(lock, '');
+  during = (n) => { if (n === 2) fs.rmSync(lock); };
+  const remote = { id: 'due-remote', title: 'There', agent: 'claude', attention: { kind: 'permission', message: 'Bash', ts: Date.now() }, host: 'aaaaaaaaaaaa', machine: 'build-box' };
+  assert.equal(await core.announceWhenDue(remote, sleep), true);
+  assert.equal(slept.length, 2, 'two looks while the lock was held, no grace');
+  assert.equal(calls.length, 5);
+  assert.match(calls.at(-1).args.at(-1), /· on build-box$/);
+});
+
+// On a Mac, Codex sessions under Auto-review raised "needs your permission" while running fine: Codex
+// runs its PermissionRequest hook before its reviewer decides, and the hand came down only when the
+// approved call finished, most of them well past the five-second grace. The reviewer, not
+// the person, answers there, and Codex hands a prompt to the person only when the review cannot run.
+test('notify: a permission prompt under Codex Auto-review waits AUTO_REVIEW_WAIT_MS, not the grace', async (t) => {
+  const real = Object.getOwnPropertyDescriptor(process, 'platform');
+  const spawn = cp.spawn;
+  const savedPath = process.env.PATH;
+  const calls = [];
+  const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-review-bin-'));
+  fs.writeFileSync(path.join(bin, 'notify-send'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  Object.defineProperty(process, 'platform', { ...real, value: 'linux' });
+  process.env.PATH = bin;
+  cp.spawn = (file, args) => { calls.push({ file, args }); const { EventEmitter } = require('events'); const c = new EventEmitter(); c.unref = () => {}; return c; };
+  t.after(() => { Object.defineProperty(process, 'platform', real); cp.spawn = spawn; process.env.PATH = savedPath; fs.rmSync(bin, { recursive: true, force: true }); });
+  freshHome();
+  const dir = tmpWork();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const rollout = autoReviewRollout(dir, [{ type: 'session_meta', payload: { id: 's' } }, turnContext('on-request', 'auto_review')]);
+  const row = (id) => ({ id, title: id, agent: 'codex', attention: core.readAttention(id) });
+  // Past the grace and inside the review wait: held back; a Claude session's prompt of the same age posts.
+  const reviewing = Date.now() - 6000;
+  for (const id of ['review-past-grace', 'review-due', 'review-answered']) linkRollout(id, rollout);
+  core.writeAttention('review-past-grace', { kind: 'permission', message: 'Bash', ts: reviewing });
+  core.writeAttention('review-claude', { kind: 'permission', message: 'Bash', ts: reviewing });
+  const later = [];
+  assert.equal(core.announceAttention(row('review-past-grace'), Date.now(), (sent) => later.push(['past-grace', sent])), false, 'not posted six seconds in');
+  assert.equal(core.announceAttention(row('review-claude')), true, 'control: the person\'s prompt of the same age posts');
+  core.clearAttention('review-past-grace'); // the approved call's result lowers it, so its timer posts nothing
+  // Near the end of the wait: posted if it still stands (the reviewer handed it on), not if it came down.
+  const nearly = Date.now() - core.AUTO_REVIEW_WAIT_MS + 300;
+  core.writeAttention('review-due', { kind: 'permission', message: 'Bash', ts: nearly });
+  core.writeAttention('review-answered', { kind: 'permission', message: 'Bash', ts: nearly });
+  assert.equal(core.announceAttention(row('review-due'), Date.now(), (sent) => later.push(['due', sent])), false);
+  assert.equal(core.announceAttention(row('review-answered'), Date.now(), (sent) => later.push(['answered', sent])), false);
+  core.clearAttention('review-answered');
+  await new Promise((r) => setTimeout(r, 700));
+  assert.deepEqual(later.sort(), [['answered', false], ['due', true]]);
+  assert.deepEqual(calls.map((c) => c.args.find((a) => a.startsWith('OAK: '))), ['OAK: review-claude', 'OAK: review-due']);
+});
+
+// A prompt that went up and came down while its timer ran, then went up again for another call, is a
+// new hand with a new ts: the old timer must not post it (its own timer does).
+test('notify: the grace timer posts only the hand it was armed for (ts and kind)', async (t) => {
+  const real = Object.getOwnPropertyDescriptor(process, 'platform');
+  const spawn = cp.spawn;
+  const savedPath = process.env.PATH;
+  const calls = [];
+  const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-still-bin-'));
+  fs.writeFileSync(path.join(bin, 'notify-send'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  Object.defineProperty(process, 'platform', { ...real, value: 'linux' });
+  process.env.PATH = bin;
+  cp.spawn = (file, args) => { calls.push({ file, args }); const { EventEmitter } = require('events'); const c = new EventEmitter(); c.unref = () => {}; return c; };
+  t.after(() => { Object.defineProperty(process, 'platform', real); cp.spawn = spawn; process.env.PATH = savedPath; fs.rmSync(bin, { recursive: true, force: true }); });
+  freshHome();
+  const ts = Date.now() - core.PERMISSION_GRACE_MS + 300;
+  const armed = { kind: 'permission', message: 'Bash', ts };
+  core.writeAttention('still-newer', armed);
+  core.writeAttention('still-kind', armed);
+  assert.equal(core.handStillUp('still-newer', armed), true, 'control: the hand as armed');
+  const later = [];
+  core.announceAttention({ id: 'still-newer', title: 'Newer', agent: 'claude', attention: armed }, Date.now(), (sent) => later.push(['newer', sent]));
+  core.announceAttention({ id: 'still-kind', title: 'Kind', agent: 'claude', attention: armed }, Date.now(), (sent) => later.push(['kind', sent]));
+  core.clearAttention('still-newer');
+  core.writeAttention('still-newer', { kind: 'permission', message: 'Bash', ts: ts + 1 }); // the next prompt, a moment later
+  core.clearAttention('still-kind');
+  core.writeAttention('still-kind', { kind: 'input', message: '', ts }); // same ts, another kind of wait
+  assert.equal(core.handStillUp('still-newer', armed), false);
+  assert.equal(core.handStillUp('still-kind', armed), false);
+  await new Promise((r) => setTimeout(r, 700));
+  assert.deepEqual(later.sort(), [['kind', false], ['newer', false]]);
+  assert.equal(calls.length, 0);
+});
+
+// The pop a surface shows in its own window (the terminal app's toast, VS Code's message, and through
+// `oak notify`'s `stillUp`, JetBrains' balloon) waits as the desktop does: a permission prompt pops only
+// once its wait ends with it still up, so one answered at the agent's terminal or by Auto-review never does.
+test('notify: whenHandDue pops another kind at once, and a permission prompt once its wait ends with it still up', async (t) => {
+  freshHome();
+  const shown = [];
+  const pop = (what) => () => shown.push(what);
+  core.whenHandDue('pop-input', { kind: 'input', ts: Date.now() }, pop('input'));
+  assert.deepEqual(shown, ['input'], 'an input wait pops at once');
+  const ts = Date.now();
+  const prompt = { kind: 'permission', message: 'Bash', ts };
+  for (const id of ['pop-standing', 'pop-answered']) core.writeAttention(id, prompt);
+  const nearly = ts + core.PERMISSION_GRACE_MS - 60; // a clock 60 ms short of the end of the wait
+  core.whenHandDue('pop-standing', prompt, pop('standing'), nearly);
+  core.whenHandDue('pop-answered', prompt, pop('answered'), nearly);
+  assert.deepEqual(shown, ['input'], 'neither prompt pops at once');
+  core.clearAttention('pop-answered');
+  await new Promise((r) => setTimeout(r, 400));
+  assert.deepEqual(shown, ['input', 'standing'], 'only the prompt still up pops, once its wait ends');
+  core.whenHandDue('pop-standing', prompt, pop('past'), ts + core.PERMISSION_GRACE_MS);
+  assert.deepEqual(shown.at(-1), 'past', 'a prompt past its wait pops at once');
+  // Under Codex's Auto-review the wait is the review's, not the grace.
+  const dir = tmpWork();
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  linkRollout('pop-reviewed', autoReviewRollout(dir, [{ type: 'session_meta', payload: { id: 's' } }, turnContext('on-request', 'auto_review')]));
+  core.writeAttention('pop-reviewed', prompt);
+  core.whenHandDue('pop-reviewed', prompt, pop('reviewed'), ts + core.PERMISSION_GRACE_MS);
+  await new Promise((r) => setTimeout(r, 50));
+  assert.deepEqual(shown.at(-1), 'past', 'a reviewed prompt past the grace still waits');
+});
+
+// A subagent's call (it shares its parent's session) starting while the parent waits on a permission
+// prompt lowered the prompt, so the grace timer found it gone and it was never announced. Each call of a
+// prompt keeps the agent that asked for it: another agent's start leaves it up, the asker's lowers it.
+test('attention: another agent\'s call starting leaves a permission prompt up; the asking agent\'s own next call lowers it', async (t) => {
+  freshHome();
+  for (const [agent, handle] of [['claude', (p) => core.handleHookPayload(p)], ['codex', (p) => require('../dist/codex.js').handleCodexHookPayload(p)]]) {
+    const sid = `start-lowers-${agent}`;
+    const base = { session_id: sid, cwd: tmpWork(), transcript_path: '/nonexistent', ...(agent === 'codex' ? { turn_id: 'turn-1' } : { prompt_id: 'turn-1' }) };
+    const rm = { tool_name: 'Bash', tool_input: { command: 'rm -rf build' } };
+    handle({ ...base, hook_event_name: 'PermissionRequest', ...rm });
+    const up = core.readAttention(sid);
+    assert.equal(up?.kind, 'permission', agent);
+    handle({ ...base, agent_id: 'sub1', hook_event_name: 'PreToolUse', tool_name: 'Read', tool_input: { file_path: '/etc/hostname' } });
+    assert.deepEqual(core.readAttention(sid), up, `${agent}: a subagent's call starting leaves the parent's prompt up`);
+    handle({ ...base, hook_event_name: 'PreToolUse', ...rm });
+    assert.equal(core.readAttention(sid), null, `${agent}: the call it waits on starting lowers it`);
+    // A subagent's prompt: the parent's call starting leaves it up, and the subagent's next call lowers it.
+    handle({ ...base, agent_id: 'sub1', hook_event_name: 'PermissionRequest', ...rm });
+    const subUp = core.readAttention(sid);
+    handle({ ...base, hook_event_name: 'PreToolUse', tool_name: 'Read', tool_input: { file_path: '/etc/hosts' } });
+    assert.deepEqual(core.readAttention(sid), subUp, `${agent}: the parent's call leaves the subagent's prompt up`);
+    handle({ ...base, agent_id: 'sub1', hook_event_name: 'PreToolUse', tool_name: 'Read', tool_input: { file_path: '/etc/hosts' } });
+    assert.equal(core.readAttention(sid), null, `${agent}: the asking agent acting again lowers it`);
+    // A prompt that names no call (Claude's Notification never does) is lowered by any call's start,
+    // a subagent's included.
+    core.writeAttention(sid, { kind: 'permission', message: 'Claude needs your permission to use Bash', ts: Date.now() - 10 });
+    handle({ ...base, hook_event_name: 'PreToolUse', tool_name: 'Read', tool_input: { file_path: '/etc/hostname' } });
+    assert.equal(core.readAttention(sid), null, `${agent}: a prompt naming no call is lowered by any start`);
+    core.writeAttention(sid, { kind: 'permission', message: 'Claude needs your permission to use Bash', ts: Date.now() - 10 });
+    handle({ ...base, agent_id: 'sub1', hook_event_name: 'PreToolUse', tool_name: 'Read', tool_input: { file_path: '/etc/hostname' } });
+    assert.equal(core.readAttention(sid), null, `${agent}: a subagent's start lowers a prompt naming no call`);
+    // Claude Code restates a prompt as a Notification that carries no agent: the call keeps its asker.
+    handle({ ...base, agent_id: 'sub1', hook_event_name: 'PermissionRequest', ...rm });
+    handle({ ...base, hook_event_name: 'Notification', notification_type: 'permission_prompt', message: 'Claude needs your permission to use Bash' });
+    const restated = core.readAttention(sid);
+    handle({ ...base, hook_event_name: 'PreToolUse', tool_name: 'Read', tool_input: { file_path: '/etc/hosts' } });
+    assert.deepEqual(core.readAttention(sid), restated, `${agent}: after a restatement, the parent's call still leaves the subagent's prompt up`);
+    handle({ ...base, agent_id: 'sub1', hook_event_name: 'PreToolUse', tool_name: 'Read', tool_input: { file_path: '/etc/hosts' } });
+    assert.equal(core.readAttention(sid), null, `${agent}: and the subagent's next call lowers it`);
+    // Two askers on one hand: each agent's start answers only the calls it asked for.
+    const other = { tool_name: 'Bash', tool_input: { command: 'rm -rf dist' } };
+    handle({ ...base, hook_event_name: 'PermissionRequest', ...rm });
+    handle({ ...base, agent_id: 'sub1', hook_event_name: 'PermissionRequest', ...other });
+    const both = core.readAttention(sid);
+    handle({ ...base, agent_id: 'sub1', hook_event_name: 'PreToolUse', tool_name: 'Read', tool_input: { file_path: '/etc/hosts' } });
+    assert.deepEqual(core.readAttention(sid), both, `${agent}: the subagent's start leaves the parent's prompt up`);
+    handle({ ...base, agent_id: 'sub1', hook_event_name: 'PermissionRequest', ...other });
+    handle({ ...base, hook_event_name: 'PreToolUse', tool_name: 'Read', tool_input: { file_path: '/etc/hosts' } });
+    assert.equal(core.readAttention(sid)?.kind, 'permission', `${agent}: the parent's start leaves the subagent's prompt up`);
+    handle({ ...base, agent_id: 'sub1', hook_event_name: 'PreToolUse', tool_name: 'Read', tool_input: { file_path: '/etc/hosts' } });
+    assert.equal(core.readAttention(sid), null, `${agent}: the subagent's start then lowers what is left`);
+  }
+  // …so the prompt the parallel call left standing is announced after its grace.
+  const real = Object.getOwnPropertyDescriptor(process, 'platform');
+  const spawn = cp.spawn;
+  const savedPath = process.env.PATH;
+  const calls = [];
+  const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-start-bin-'));
+  fs.writeFileSync(path.join(bin, 'notify-send'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  Object.defineProperty(process, 'platform', { ...real, value: 'linux' });
+  process.env.PATH = bin;
+  cp.spawn = (file, args) => { calls.push({ file, args }); const { EventEmitter } = require('events'); const c = new EventEmitter(); c.unref = () => {}; return c; };
+  t.after(() => { Object.defineProperty(process, 'platform', real); cp.spawn = spawn; process.env.PATH = savedPath; fs.rmSync(bin, { recursive: true, force: true }); });
+  const sid = 'start-lowers-announced';
+  const base = { session_id: sid, cwd: tmpWork(), transcript_path: '/nonexistent' };
+  core.handleHookPayload({ ...base, hook_event_name: 'PermissionRequest', tool_name: 'Bash', tool_use_id: 'toolu_A', tool_input: { command: 'rm -rf build' } }, Date.now() - core.PERMISSION_GRACE_MS + 400);
+  const a = core.readAttention(sid);
+  const later = [];
+  assert.equal(core.announceAttention({ id: sid, title: 'demo', agent: 'claude', attention: { ...a, ts: a.ts } }, a.ts + core.PERMISSION_GRACE_MS - 400, (sent) => later.push(sent)), false);
+  core.handleHookPayload({ ...base, agent_id: 'sub1', hook_event_name: 'PreToolUse', tool_name: 'Read', tool_use_id: 'toolu_B', tool_input: { file_path: '/etc/hostname' } });
+  await new Promise((r) => setTimeout(r, 900));
+  assert.deepEqual(later, [true], 'the prompt still waiting was announced');
+  assert.equal(calls.length, 1);
+});
+
+// A subagent whose call was denied (or yielded) reports no result for it, and nothing of the subagent runs
+// again: its prompt stood until the parent's turn ended. SubagentStop (Claude Code and Codex both name the
+// subagent in it) lowers what that subagent asked for, and nothing else.
+test('attention: SubagentStop lowers the prompts the finished subagent raised, and only those', () => {
+  freshHome();
+  for (const [agent, handle] of [['claude', (p) => core.handleHookPayload(p)], ['codex', (p) => require('../dist/codex.js').handleCodexHookPayload(p)]]) {
+    const sid = `subagent-stop-${agent}`;
+    const base = { session_id: sid, cwd: tmpWork(), transcript_path: '/nonexistent', ...(agent === 'codex' ? { turn_id: 'turn-1' } : { prompt_id: 'turn-1' }) };
+    const stop = (id) => handle({ ...base, agent_id: id, agent_type: 'default', hook_event_name: 'SubagentStop', stop_hook_active: false, agent_transcript_path: '/nonexistent-sub' });
+    const rm = { tool_name: 'Bash', tool_input: { command: 'pip install av' } };
+    handle({ ...base, agent_id: 'sub1', hook_event_name: 'PermissionRequest', ...rm });
+    const up = core.readAttention(sid);
+    stop('sub2');
+    assert.deepEqual(core.readAttention(sid), up, `${agent}: another subagent finishing leaves it up`);
+    stop('sub1');
+    assert.equal(core.readAttention(sid), null, `${agent}: the asking subagent finishing lowers it`);
+    // The parent's prompt beside it stays up.
+    handle({ ...base, hook_event_name: 'PermissionRequest', tool_name: 'Bash', tool_input: { command: 'rm -rf build' } });
+    handle({ ...base, agent_id: 'sub1', hook_event_name: 'PermissionRequest', ...rm });
+    const two = core.readAttention(sid);
+    stop('sub1');
+    assert.deepEqual(core.readAttention(sid), two, `${agent}: the parent's prompt stays up`);
+    handle({ ...base, hook_event_name: 'PreToolUse', tool_name: 'Read', tool_input: { file_path: '/etc/hosts' } });
+    assert.equal(core.readAttention(sid), null, `${agent}: control: the parent's start then lowers it`);
+    // A prompt that names no call cannot be told apart, so it stays; so does a wait for input.
+    core.writeAttention(sid, { kind: 'permission', message: 'Claude needs your permission to use Bash', ts: Date.now() - 10 });
+    stop('sub1');
+    assert.equal(core.readAttention(sid)?.kind, 'permission', `${agent}: a prompt naming no call stays`);
+  }
+  assert.ok(core.CAPTURE_HOOK_EVENTS.includes('SubagentStop'), 'Claude Code sends it to the capture hook');
+  assert.equal(core.matcherFor('SubagentStop'), '*', 'every agent type');
+  // A prompt as OAK 0.10 stored it (bare call keys) is read, and its call's result still lowers it.
+  const sid = 'subagent-stop-legacy';
+  const call = { session_id: sid, cwd: tmpWork(), prompt_id: 'turn-1', tool_name: 'Bash', tool_input: { command: 'make' } };
+  core.ensureStore(sid);
+  fs.writeFileSync(path.join(core.storeDir(sid), 'attention.json'), JSON.stringify({ kind: 'permission', message: 'Bash', ts: Date.now() - 10, calls: [require('../dist/capture.js').toolCallKey(call)] }));
+  core.handleHookPayload({ ...call, hook_event_name: 'PreToolUse', agent_id: 'sub1', tool_name: 'Read', tool_input: { file_path: '/etc/hosts' } });
+  assert.equal(core.readAttention(sid)?.kind, 'permission', 'a subagent\'s start leaves the main agent\'s call up');
+  core.handleHookPayload({ ...call, hook_event_name: 'PostToolUse', tool_response: {} });
+  assert.equal(core.readAttention(sid), null, 'its call\'s result lowers it');
+  // A prompt as an earlier 0.11 build stored it (each call with the command it ran) reads cleanly: the
+  // command is ignored, and the calls still lower it.
+  const dev = 'subagent-stop-cmd';
+  const main = { session_id: dev, cwd: tmpWork(), prompt_id: 'turn-1', tool_name: 'Bash', tool_input: { command: 'npm run dev' } };
+  const subCall = { ...main, tool_input: { command: 'make' } };
+  const key = require('../dist/capture.js').toolCallKey;
+  core.ensureStore(dev);
+  const devTs = Date.now() - 10;
+  fs.writeFileSync(path.join(core.storeDir(dev), 'attention.json'), JSON.stringify({ kind: 'permission', message: 'Bash', ts: devTs,
+    calls: [{ key: key(main), cmd: 'npm run dev' }, { key: key(subCall), agent: 'sub1', cmd: 'make' }] }));
+  assert.deepEqual(core.readAttention(dev), { kind: 'permission', message: 'Bash', ts: devTs });
+  core.handleHookPayload({ session_id: dev, cwd: main.cwd, agent_id: 'sub1', agent_type: 'default', hook_event_name: 'SubagentStop', stop_hook_active: false });
+  assert.equal(core.readAttention(dev)?.kind, 'permission', 'the subagent stopping leaves the main agent\'s call up');
+  core.handleHookPayload({ ...main, hook_event_name: 'PostToolUse', tool_response: {} });
+  assert.equal(core.readAttention(dev), null, 'its call\'s result lowers it');
+  // It captures nothing, so it never queues on the capture mutex behind another call's tree walk.
+  const busy = 'subagent-stop-busy';
+  const base = { session_id: busy, cwd: tmpWork(), prompt_id: 'turn-1' };
+  core.handleHookPayload({ ...base, agent_id: 'sub1', hook_event_name: 'PermissionRequest', tool_name: 'Bash', tool_input: { command: 'make' } });
+  const lock = path.join(core.rootDir(), '.file-locks', core.pathKey(path.join(fs.realpathSync(core.storeDir(busy)), '__capture-operation')));
+  fs.mkdirSync(path.dirname(lock), { recursive: true });
+  fs.writeFileSync(lock, `${process.pid}:held`);
+  try {
+    const t0 = Date.now();
+    core.handleHookPayload({ ...base, agent_id: 'sub1', agent_type: 'default', hook_event_name: 'SubagentStop', stop_hook_active: false });
+    assert.ok(Date.now() - t0 < 1000, `it returned at once with the mutex held (${Date.now() - t0} ms)`);
+    assert.equal(core.readAttention(busy), null, 'and lowered the subagent\'s prompt');
+    assert.deepEqual(core.readSkips(busy), [], 'nothing was reported as a capture it could not make');
+  } finally {
+    fs.rmSync(lock, { force: true });
+  }
+});
+
+// terminal-notifier groups by the session and a click focuses it; both ride on the session that
+// announceAttention hands desktopNotify. On macOS a terminal that posts OSC 9 is preferred, and one
+// that closed between the check and the post falls back to terminal-notifier.
+test('notify: a hand announced on macOS reaches terminal-notifier with its session; a closed terminal falls back to it', (t) => {
+  const real = Object.getOwnPropertyDescriptor(process, 'platform');
+  const spawn = cp.spawn;
+  const openSync = fs.openSync;
+  const savedPath = process.env.PATH;
+  const saved = {};
+  for (const k of ['TERM_PROGRAM', 'LC_TERMINAL', 'KITTY_WINDOW_ID', 'HERDR_ENV', 'TMUX', 'STY', 'ZELLIJ', 'OAK_TAB', 'ALACRITTY_WINDOW_ID']) { saved[k] = process.env[k]; delete process.env[k]; }
+  const calls = [];
+  const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-tn-announce-'));
+  fs.writeFileSync(path.join(bin, 'terminal-notifier'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  Object.defineProperty(process, 'platform', { ...real, value: 'darwin' });
+  process.env.PATH = bin;
+  cp.spawn = (file, args) => { calls.push({ file, args }); const { EventEmitter } = require('events'); const c = new EventEmitter(); c.unref = () => {}; return c; };
+  core.setOakCliEntry('/opt/oak/cli.js');
+  core.setTerminalNotifierDirs([]);
+  t.after(() => {
+    Object.defineProperty(process, 'platform', real); cp.spawn = spawn; fs.openSync = openSync; process.env.PATH = savedPath;
+    core.setOakCliEntry(undefined);
+    core.setTerminalNotifierDirs(undefined);
+    for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+    fs.rmSync(bin, { recursive: true, force: true });
+  });
+  freshHome();
+  process.env.HERDR_ENV = '1'; // a herdr pane: no terminal of its own posts
+  core.writeAttention('tn-announced', { kind: 'input', message: 'Which file?', ts: Date.now() });
+  assert.equal(core.announceAttention({ id: 'tn-announced', title: 'Fix it', agent: 'codex', attention: core.readAttention('tn-announced') }), true);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].file, path.join(bin, 'terminal-notifier'));
+  const args = calls[0].args;
+  assert.equal(args[args.indexOf('-group') + 1], 'oak-tn-announced', args.join(' '));
+  assert.match(args[args.indexOf('-execute') + 1], /focus --session 'tn-announced'$/);
+  // iTerm2, whose tty answers the check and has gone by the post.
+  delete process.env.HERDR_ENV;
+  process.env.TERM_PROGRAM = 'iTerm.app';
+  const ttyFile = path.join(bin, 'tty');
+  let opens = 0;
+  fs.openSync = (p, ...rest) => (p === '/dev/tty' ? (opens++ === 0 ? openSync(ttyFile, 'w') : (() => { throw Object.assign(new Error('ENXIO'), { code: 'ENXIO' }); })()) : openSync(p, ...rest));
+  assert.deepEqual(core.desktopNotify('OAK: x', 'needs your permission', { session: 'tn-announced' }), { sent: true, via: 'terminal-notifier' });
+  assert.equal(opens, 2, 'control: the terminal was checked, then written to');
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].file, path.join(bin, 'terminal-notifier'));
+  // …and a terminal still there takes it, with nothing spawned.
+  fs.openSync = (p, ...rest) => (p === '/dev/tty' ? openSync(ttyFile, 'w') : openSync(p, ...rest));
+  assert.deepEqual(core.desktopNotify('OAK: y', 'b'), { sent: true, via: 'osc9' });
+  assert.equal(calls.length, 2);
+  assert.match(fs.readFileSync(ttyFile, 'utf8'), /\x1b\]9;OAK: y: b\x07/);
+});
+
+// JetBrains posts through `oak notify --session`, which sits out the wait before it answers; the
+// plugin's budget for that call must cover the longest wait, or the post is killed with it.
+test('notify: the permission waits are pinned, and JetBrains\' budget for `notify --session` covers the longest', () => {
+  assert.equal(core.PERMISSION_GRACE_MS, 5000);
+  assert.equal(core.AUTO_REVIEW_WAIT_MS, 90_000);
+  const kt = fs.readFileSync(path.resolve(__dirname, '../../jetbrains/src/main/kotlin/com/cellobservatory/observatory/core/ObservatoryCli.kt'), 'utf8');
+  const budget = /fun notifyHand\([^]*?timeoutMs = ([\d_]+)/.exec(kt);
+  assert.ok(budget, 'control: the plugin\'s notifyHand budget was read');
+  assert.ok(Number(budget[1].replace(/_/g, '')) >= core.AUTO_REVIEW_WAIT_MS + 5000, `budget ${budget[1]} ms`);
+});
+
+// Inside herdr (which drops OSC 9) OAK posted through osascript, and macOS files those under Script Editor:
+// a click opened Script Editor. terminal-notifier posts as itself, and its click can run a command.
+test('notify: on macOS terminal-notifier is preferred over osascript, and its argv carries no text as code', (t) => {
+  // Homebrew's directories are the machine's: none here, so only the PATH each case names is searched.
+  core.setTerminalNotifierDirs([]);
+  t.after(() => core.setTerminalNotifierDirs(undefined));
+  const tnBin = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-tn-argv-'));
+  t.after(() => fs.rmSync(tnBin, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(tnBin, 'terminal-notifier'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  const tn = (title, body, opts) => core.notifierArgv('terminal-notifier', title, body, { env: { PATH: tnBin, __CFBundleIdentifier: 'com.googlecode.iterm2' }, cli: '/opt/oak/cli.js', ...opts });
+  const full = tn('OAK: Fix the parser', 'codex · needs your permission — apply_patch', { session: 'fixture-session', sound: true });
+  assert.deepEqual(full, { file: path.join(tnBin, 'terminal-notifier'), args: [
+    '-title', 'OAK: Fix the parser', '-message', 'codex · needs your permission — apply_patch',
+    '-group', 'oak-fixture-session', '-activate', 'com.googlecode.iterm2',
+    '-execute', `exec '${process.execPath}' '/opt/oak/cli.js' focus --session 'fixture-session'`, '-sound', 'Glass'] });
+  const bare = core.notifierArgv('terminal-notifier', 'OAK', 'Click me', { env: {}, cli: '/opt/oak/cli.js' });
+  assert.deepEqual(bare.args, ['-title', 'OAK', '-message', 'Click me'], 'no session: no group and no click action; no app: nothing to activate');
+  assert.deepEqual(core.notifierArgv('terminal-notifier', 'OAK', 'x', { env: {}, session: 'fixture-session' }).args.includes('-execute'), false, 'no oak CLI entry (an editor host): no click action');
+  // Hostile text: a value that reads as a property list or an option stays a plain string, and a session
+  // id or app id that is not one is dropped rather than passed on.
+  const hostile = tn('(a, b)', '-execute rm', { session: "x'; touch /tmp/pwned; '", env: { __CFBundleIdentifier: 'com.x; rm -rf ~' } });
+  assert.deepEqual(hostile.args, ['-title', '\u200b(a, b)', '-message', '\u200b-execute rm']);
+  assert.equal(tn('OAK: "quoted" $(id) `id`', 'b').args[1], 'OAK: "quoted" $(id) `id`', 'argv, never a shell: the title is passed as it is');
+  // The click command is shell source: run it through sh with a CLI path built to break out of quoting.
+  if (process.platform !== 'win32') {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "oak-tn-'$(x)`y`-"));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const cli = path.join(dir, "cli'; touch pwned; '.js");
+    fs.writeFileSync(cli, `require('fs').writeFileSync(${JSON.stringify(path.join(dir, 'argv.json'))}, JSON.stringify(process.argv.slice(2)));`);
+    const exec = tn('t', 'b', { session: 'fixture-session', cli }).args.at(-1);
+    const r = cp.spawnSync('/bin/sh', ['-c', exec], { cwd: dir, encoding: 'utf8' });
+    assert.equal(r.status, 0, r.stderr);
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dir, 'argv.json'), 'utf8')), ['focus', '--session', 'fixture-session']);
+    assert.equal(fs.existsSync(path.join(dir, 'pwned')), false, 'nothing in the path ran');
+    // A relocated CLAUDE_CONFIG_DIR decides where `oak focus` finds the app, and the click runs in
+    // terminal-notifier's environment, which has none: the command carries it.
+    const envCli = path.join(dir, 'env.js');
+    fs.writeFileSync(envCli, `require('fs').writeFileSync(${JSON.stringify(path.join(dir, 'env.json'))}, JSON.stringify(process.env.CLAUDE_CONFIG_DIR ?? null));`);
+    const cfg = path.join(dir, "it's $(x) config");
+    const withCfg = core.notifierArgv('terminal-notifier', 't', 'b', { env: { CLAUDE_CONFIG_DIR: cfg }, cli: envCli, session: 'fixture-session' }).args.at(-1);
+    const clean = { ...process.env };
+    delete clean.CLAUDE_CONFIG_DIR;
+    assert.equal(cp.spawnSync('/bin/sh', ['-c', withCfg], { cwd: dir, env: clean }).status, 0);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(dir, 'env.json'), 'utf8')), cfg);
+    const without = core.notifierArgv('terminal-notifier', 't', 'b', { env: {}, cli: envCli, session: 'fixture-session' }).args.at(-1);
+    assert.equal(cp.spawnSync('/bin/sh', ['-c', without], { cwd: dir, env: clean }).status, 0);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(dir, 'env.json'), 'utf8')), null, 'unset: nothing added');
+  }
+
+  // The choice on macOS: terminal-notifier on PATH wins over osascript; without it, osascript as before.
+  const real = Object.getOwnPropertyDescriptor(process, 'platform');
+  const spawn = cp.spawn;
+  const savedPath = process.env.PATH;
+  const saved = {};
+  for (const k of ['TERM_PROGRAM', 'LC_TERMINAL', 'KITTY_WINDOW_ID', 'HERDR_ENV']) { saved[k] = process.env[k]; delete process.env[k]; }
+  process.env.HERDR_ENV = '1'; // a herdr pane: no terminal of its own posts
+  const calls = [];
+  const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-tn-bin-'));
+  Object.defineProperty(process, 'platform', { ...real, value: 'darwin' });
+  cp.spawn = (file, args) => { calls.push({ file, args }); const { EventEmitter } = require('events'); const c = new EventEmitter(); c.unref = () => {}; return c; };
+  t.after(() => {
+    Object.defineProperty(process, 'platform', real); cp.spawn = spawn; process.env.PATH = savedPath;
+    for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+    fs.rmSync(bin, { recursive: true, force: true });
+  });
+  process.env.PATH = bin;
+  const withoutIt = core.desktopNotifier();
+  assert.ok(withoutIt === 'osascript' || withoutIt === 'none', `without terminal-notifier: ${withoutIt}`);
+  fs.writeFileSync(path.join(bin, 'terminal-notifier'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  assert.equal(core.desktopNotifier(), 'terminal-notifier');
+  assert.deepEqual(core.desktopNotify('OAK: x', 'needs your permission', { session: 'fixture-session' }), { sent: true, via: 'terminal-notifier' });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].file, path.join(bin, 'terminal-notifier'));
+  assert.deepEqual(calls[0].args.slice(0, 6), ['-title', 'OAK: x', '-message', 'needs your permission', '-group', 'oak-fixture-session']);
+});
+
+// An editor launched from the Dock can run without Homebrew's directory on PATH: the scan missed
+// terminal-notifier and the post went through osascript, which macOS files under Script Editor.
+test('notify: on macOS terminal-notifier off PATH is found in Homebrew\'s directories and spawned by its absolute path', (t) => {
+  const real = Object.getOwnPropertyDescriptor(process, 'platform');
+  const spawn = cp.spawn;
+  const savedPath = process.env.PATH;
+  const saved = {};
+  for (const k of ['TERM_PROGRAM', 'LC_TERMINAL', 'KITTY_WINDOW_ID', 'HERDR_ENV', 'TMUX', 'STY', 'ZELLIJ', 'OAK_TAB', 'ALACRITTY_WINDOW_ID']) { saved[k] = process.env[k]; delete process.env[k]; }
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-tn-fallback-'));
+  const onPathDir = path.join(dir, 'path');
+  const brew = path.join(dir, 'brew');
+  fs.mkdirSync(onPathDir);
+  fs.mkdirSync(brew);
+  const calls = [];
+  Object.defineProperty(process, 'platform', { ...real, value: 'darwin' });
+  cp.spawn = (file, args) => { calls.push({ file, args }); const { EventEmitter } = require('events'); const c = new EventEmitter(); c.unref = () => {}; return c; };
+  t.after(() => {
+    Object.defineProperty(process, 'platform', real); cp.spawn = spawn; process.env.PATH = savedPath;
+    core.setTerminalNotifierDirs(undefined);
+    for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  process.env.HERDR_ENV = '1'; // no terminal of its own posts, as in an editor's extension host
+  process.env.PATH = onPathDir;
+  core.setTerminalNotifierDirs(['', 'relative/bin', brew]);
+  assert.equal(core.terminalNotifierPath(), null, 'control: installed nowhere');
+  assert.notEqual(core.desktopNotifier(), 'terminal-notifier');
+  // A relative PATH entry names a folder that depends on the working folder: skipped, even with the tool in it.
+  const rel = path.join(dir, 'rel'); fs.mkdirSync(rel);
+  fs.writeFileSync(path.join(rel, 'terminal-notifier'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  // Read from the folder that holds it: on Windows the temp folder can be on another drive than this one, and no
+  // relative path leads there.
+  const cwd = process.cwd();
+  process.chdir(dir);
+  try {
+    process.env.PATH = 'rel';
+    assert.ok(fs.existsSync(path.join(process.env.PATH, 'terminal-notifier')), 'control: from here the entry names the tool');
+    assert.equal(core.terminalNotifierPath(), null, 'a relative PATH entry is skipped');
+  } finally { process.chdir(cwd); }
+  process.env.PATH = onPathDir;
+  const tool = path.join(brew, 'terminal-notifier');
+  fs.writeFileSync(tool, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  assert.equal(core.terminalNotifierPath(), tool);
+  assert.equal(core.desktopNotifier(), 'terminal-notifier');
+  assert.deepEqual(core.desktopNotify('OAK: x', 'needs your permission', { session: 'fixture-session' }), { sent: true, via: 'terminal-notifier' });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].file, tool, 'spawned by its absolute path, not looked up on PATH');
+  // PATH comes first.
+  const first = path.join(onPathDir, 'terminal-notifier');
+  fs.writeFileSync(first, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  assert.equal(core.terminalNotifierPath(), first);
+  assert.equal(core.notifierArgv('terminal-notifier', 't', 'b', { env: process.env }).file, first);
+});
+
 // The WinRT half needs a Windows desktop; the XML half is the same script with the portable XmlDocument,
 // run wherever PowerShell exists (the CI runners have it), with text that tries to run a command.
 const onPathT = (name) => (process.env.PATH || '').split(path.delimiter).some((d) => d && (fs.existsSync(path.join(d, name)) || fs.existsSync(path.join(d, name + '.exe'))));
@@ -20175,15 +29692,18 @@ test('macOS notifications come from the terminal OAK runs in, not Script Editor:
   assert.equal(core.osc9Seq('a\x07b', 'c\x1b]9;d\ne'), '\x1b]9;a b: c ]9;d e\x07');
   // 3. A process with NO terminal (an editor's extension host, the CLI JetBrains spawns) keeps osascript,
   //    even when the terminal it was started from left TERM_PROGRAM behind. desktopNotifier decides
-  //    without posting anything; `detached` starts the child in a new session, with no terminal.
+  //    without posting anything; `detached` starts the child in a new session, with no terminal. No
+  //    terminal-notifier is in its reach (an empty PATH, no fallback folders), which a Mac may have installed.
   if (process.platform === 'win32') return;
-  const script = `const core = require(${JSON.stringify(path.resolve(__dirname, '../dist/index.js'))}); Object.defineProperty(process, 'platform', { value: 'darwin' }); process.stdout.write(core.desktopNotifier());`;
-  const env = { ...process.env, TERM_PROGRAM: 'iTerm.app' };
+  const script = `const core = require(${JSON.stringify(path.resolve(__dirname, '../dist/index.js'))}); Object.defineProperty(process, 'platform', { value: 'darwin' }); core.setTerminalNotifierDirs([]); process.stdout.write(core.desktopNotifier());`;
+  const bare = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-no-tn-'));
+  const env = { ...process.env, TERM_PROGRAM: 'iTerm.app', PATH: bare };
   for (const k of ['TMUX', 'STY', 'ZELLIJ', 'HERDR_ENV', 'OAK_TAB', 'ALACRITTY_WINDOW_ID']) delete env[k];
   const child = cp.spawn(process.execPath, ['-e', script], { env, detached: true, stdio: ['ignore', 'pipe', 'inherit'] });
   let out = '';
   child.stdout.on('data', (d) => (out += d));
   await new Promise((resolve) => child.on('close', resolve));
+  fs.rmSync(bare, { recursive: true, force: true });
   assert.ok(out === 'osascript' || out === 'none', `no terminal → osascript, never OSC 9 (got "${out}")`);
 });
 
@@ -20219,6 +29739,31 @@ test('auto-title link: a hook under OAK_TAB records the tab, the listing carries
     if (saved === undefined) delete process.env.OAK_TAB;
     else process.env.OAK_TAB = saved;
   }
+});
+
+// The version is in the search index's name, so a bump leaves the earlier one in every session's store, where nothing
+// reads it: `oak clean` reclaims it, as it does the change map's superseded caches, and keeps the one the writer makes.
+test('search: clean reclaims the search indexes of an earlier version and keeps the live one', () => {
+  const home = freshHome();
+  delete process.env.CLAUDE_CONFIG_DIR;
+  const S = 'staleSearch';
+  const cwd = fs.realpathSync(tmpWork());
+  const proj = core.projectDir(cwd);
+  fs.mkdirSync(proj, { recursive: true });
+  fs.writeFileSync(path.join(proj, S + '.jsonl'), JSON.stringify({ timestamp: new Date(1000).toISOString(), type: 'user', cwd, message: { role: 'user', content: 'find the heron' } }) + '\n');
+  seedEdit(S, path.join(cwd, 'a.ts'), 'x\n', 'y\n'); // a session with edits, which clean never prunes as an empty stub
+  assert.equal(core.searchConversations(cwd, 'heron').hits.length, 1);
+  const dir = path.join(core.rootDir(), 'changemap-cache', S);
+  const live = fs.readdirSync(dir).filter((n) => n.startsWith('search-index'));
+  assert.equal(live.length, 1, 'positive control: the real writer made the live index');
+  // An earlier version's among the caches, and those versions before 0.11.0 kept in the session's own folder.
+  fs.writeFileSync(path.join(dir, 'search-index-v3.json'), '{"v":3,"docs":[]}');
+  for (const n of ['search-index.json', 'search-index-v3.json']) fs.writeFileSync(path.join(core.storeDir(S), n), '{"v":3,"docs":[]}');
+  const out = JSON.parse(cp.execFileSync('node', [CLI, 'clean', '--json'], { env: { ...process.env, HOME: home, USERPROFILE: home }, encoding: 'utf8' }));
+  assert.equal(out.staleMaps, 3, 'every earlier one reclaimed');
+  assert.deepEqual(fs.readdirSync(dir).filter((n) => n.startsWith('search-index')), live, 'the live index kept');
+  assert.deepEqual(fs.readdirSync(core.storeDir(S)).filter((n) => n.startsWith('search-index')), [], 'none left in the session\'s folder');
+  assert.equal(core.searchConversations(cwd, 'heron').hits.length, 1, 'and still answers');
 });
 
 test('search: every conversation, ranked — AND terms, ask over answer, a persisted index that grows from a byte cursor', () => {
@@ -20258,7 +29803,7 @@ test('search: every conversation, ranked — AND terms, ask over answer, a persi
 
   // 2. The index persists per session and grows from a byte cursor: an appended turn is folded in
   //    without re-reading the file, a trailing partial line waits for its newline.
-  const idxPath = path.join(core.storeDir(A), 'search-index-v3.json'); // the version is in the name (2026-09-23)
+  const idxPath = path.join(core.rootDir(), 'changemap-cache', A, 'search-index-v5.json'); // the version is in the name (2026-09-23; v4 2026-10-30)
   const idx1 = JSON.parse(fs.readFileSync(idxPath, 'utf8'));
   assert.equal(idx1.docs.length, 2);
   const sizeBefore = fs.statSync(path.join(projDir, `${A}.jsonl`)).size;
@@ -20283,6 +29828,76 @@ test('search: every conversation, ranked — AND terms, ask over answer, a persi
   core.hideSession(B);
   assert.equal(core.searchConversations('/work/find', 'release').hits.length, 0, 'a deleted session is out of the search');
   core.unhideSession(B);
+});
+
+/** A conversation OAK only read: a transcript under ~/.claude/projects, and no store folder. */
+function readOnlyConversation(home, S, cwd) {
+  const projDir = path.join(home, '.claude', 'projects', cwd.replace(/\//g, '-'));
+  fs.mkdirSync(projDir, { recursive: true });
+  const transcript = path.join(projDir, `${S}.jsonl`);
+  const ask = (text, ts) => fs.appendFileSync(transcript, JSON.stringify({ type: 'user', cwd, sessionId: S, timestamp: new Date(ts).toISOString(), message: { role: 'user', content: text } }) + '\n');
+  return { transcript, ask };
+}
+
+test('search: a session OAK only read keeps its index among the caches — no store folder made, kept by `oak clean`, not read again (0.11.0)', () => {
+  // Each search made the session a store folder to keep the index in, `oak clean` removed that folder (an empty husk)
+  // with the index in it, and the next search read the whole transcript again.
+  const home = freshHome();
+  delete process.env.CLAUDE_CONFIG_DIR;
+  const S = 'only-read-sess';
+  const { ask } = readOnlyConversation(home, S, '/work/only-read');
+  ask('index the heron', 1_700_000_000_000);
+  const first = core.searchConversations('/work/only-read', 'heron');
+  assert.deepEqual([first.hits.length, first.indexed], [1, 1], 'control: the first search builds the index');
+  assert.ok(!fs.existsSync(core.storeDir(S)), 'no store folder is made for a session OAK only read');
+  assert.ok(fs.existsSync(path.join(core.rootDir(), 'changemap-cache', S, 'search-index-v5.json')), 'its index is among the derived caches');
+  const cleaned = cp.spawnSync(process.execPath, [CLI, 'clean', '--json'], { env: { ...process.env, HOME: home, USERPROFILE: home }, encoding: 'utf8' });
+  assert.equal(cleaned.status, 0, cleaned.stderr);
+  const again = core.searchConversations('/work/only-read', 'heron');
+  assert.deepEqual([again.hits.length, again.indexed], [1, 0], 'after `oak clean`, the next search reads none of the transcript again');
+});
+
+test('search: an index an earlier build kept in the session\'s folder is not read, and is retired once when this build first indexes the session (0.11.0)', () => {
+  // Its format is an earlier one (v4 folds every text block of an answer), so the session is indexed again, among the caches.
+  const home = freshHome();
+  delete process.env.CLAUDE_CONFIG_DIR;
+  const S = 'moved-index-sess';
+  const { transcript, ask } = readOnlyConversation(home, S, '/work/moved-index');
+  ask('first heron', 1_700_000_000_000);
+  core.ensureStore(S);
+  fs.writeFileSync(path.join(core.storeDir(S), 'keep.txt'), 'the session\'s own'); // so its folder stays
+  const legacy = path.join(core.storeDir(S), 'search-index-v3.json');
+  const live = path.join(core.rootDir(), 'changemap-cache', S, 'search-index-v5.json');
+  // An index only the earlier build could answer from: its one ask is not in the transcript.
+  fs.writeFileSync(legacy, JSON.stringify({ v: 3, transcript, bytes: fs.statSync(transcript).size, docs: [{ ts: 1_700_000_000_000, prompt: 'zebraquux kept by the earlier index', response: '' }] }));
+  const r1 = core.searchConversations('/work/moved-index', 'zebraquux');
+  assert.deepEqual([r1.hits.length, r1.indexed], [0, 1], 'the earlier index is not read: the session is indexed from its transcript');
+  assert.ok(fs.existsSync(live) && !fs.existsSync(legacy), 'the new index is among the caches, and the earlier one is retired');
+  assert.ok(fs.existsSync(core.storeDir(S)), 'a folder that holds more than the index stays');
+  assert.equal(core.searchConversations('/work/moved-index', 'heron').hits.length, 1, 'control: the new index answers');
+  // An older build still running beside this one writes its index there again: it is left alone at the next write.
+  fs.writeFileSync(legacy, JSON.stringify({ v: 3, transcript, bytes: 0, docs: [] }));
+  ask('second heron', 1_700_000_060_000);
+  assert.equal(core.searchConversations('/work/moved-index', 'heron').indexed, 1, 'control: the new index is written again');
+  assert.ok(fs.existsSync(legacy), 'the earlier index is retired once, at the first write, not at every write');
+});
+
+test('search: a folder an earlier build made only for the index of a session OAK only read goes when this build first indexes the session, so `oak clean` keeps the new index (0.11.0)', () => {
+  // Left behind, `oak clean` removed the folder as a husk, and with it the session's derived caches, the new index among
+  // them: the next search read the whole transcript again, once more after the upgrade.
+  const home = freshHome();
+  delete process.env.CLAUDE_CONFIG_DIR;
+  const S = 'husk-index-sess';
+  const { transcript, ask } = readOnlyConversation(home, S, '/work/husk-index');
+  ask('heron in a husk', 1_700_000_000_000);
+  fs.mkdirSync(core.storeDir(S), { recursive: true }); // what the earlier build's search made: the folder, and its index
+  fs.writeFileSync(path.join(core.storeDir(S), 'search-index-v3.json'), JSON.stringify({ v: 3, transcript, bytes: fs.statSync(transcript).size, docs: [{ ts: 1_700_000_000_000, prompt: 'heron in a husk', response: '' }] }));
+  assert.equal(core.searchConversations('/work/husk-index', 'heron').indexed, 1, 'control: the session is indexed again');
+  assert.ok(!fs.existsSync(core.storeDir(S)), 'the folder the earlier index alone held goes');
+  const cleaned = cp.spawnSync(process.execPath, [CLI, 'clean', '--json'], { env: { ...process.env, HOME: home, USERPROFILE: home }, encoding: 'utf8' });
+  assert.equal(cleaned.status, 0, cleaned.stderr);
+  const again = core.searchConversations('/work/husk-index', 'heron');
+  assert.deepEqual([again.hits.length, again.indexed], [1, 0], 'after `oak clean`, the next search reads none of the transcript again');
 });
 
 test('panes: the change map’s row list depends on the pane WIDTH, so a resolver must pass it', () => {
@@ -20616,6 +30231,33 @@ test('prefs: sort keys — four of them, and the legacy names migrate', () => {
   assert.equal(core.SORT_LABEL['time-asc'], 'Time (oldest first)');
 });
 
+// The search index keeps an ask's first 8 KB and an answer's first 32 KB, and an oversized hook value is kept to its first
+// 256 KB: each cut at a UTF-16 index, so one that fell inside an emoji kept the first half of its surrogate pair, which
+// a hit's ask and excerpt then ended with.
+test('search and capture: an ask, an answer or a hook value past its cap is cut where a character ends', () => {
+  const home = freshHome();
+  delete process.env.CLAUDE_CONFIG_DIR;
+  const projDir = path.join(home, '.claude', 'projects', '-work-capped');
+  fs.mkdirSync(projDir, { recursive: true });
+  const S = 'capped-sess';
+  const ask = `${'a'.repeat(8 * 1024 - 1)}\u{1F600} and the tail`;
+  const answer = `capped ${'b'.repeat(32 * 1024 - 8)}\u{1F600} and the tail`;
+  fs.writeFileSync(path.join(projDir, `${S}.jsonl`), [
+    JSON.stringify({ type: 'user', cwd: '/work/capped', sessionId: S, timestamp: '2026-09-15T10:00:00Z', message: { role: 'user', content: ask } }),
+    JSON.stringify({ type: 'assistant', cwd: '/work/capped', sessionId: S, timestamp: '2026-09-15T10:00:01Z', message: { role: 'assistant', id: 'm1', content: [{ type: 'text', text: answer }] } }),
+  ].join('\n') + '\n');
+  const [hit] = core.searchConversations('/work/capped', 'capped').hits;
+  assert.ok(hit, 'control: the answer is found');
+  assert.equal(hit.prompt, 'a'.repeat(8 * 1024 - 1), 'the ask ends before the emoji its cap fell inside');
+  const [doc] = JSON.parse(fs.readFileSync(path.join(core.rootDir(), 'changemap-cache', S, 'search-index-v5.json'), 'utf8')).docs;
+  assert.equal(doc.response, answer.slice(0, 32 * 1024 - 1), 'and so does the answer');
+  assert.ok(doc.prompt.isWellFormed() && doc.response.isWellFormed() && hit.snippet.isWellFormed());
+  // A hook value past 256 KB, kept to its first 256 KB with a marker after it.
+  core.appendCaptureEvent(S, 'turn_start', { prompt: `${'c'.repeat(256 * 1024 - 1)}\u{1F600}${'d'.repeat(10)}` });
+  const kept = core.readCaptureEvents(S, ['turn_start'])[0].payload.prompt;
+  assert.equal(kept, `${'c'.repeat(256 * 1024 - 1)}\n[Observatory: oversized event value truncated]`);
+});
+
 test('capture journal: editless native sessions retain their hook lifecycle evidence during pruning', () => {
   freshHome();
   const session = 'hook-only-retention';
@@ -20881,6 +30523,26 @@ test('text parsers stay linear on the polynomial-ReDoS inputs CodeQL reported', 
     () => notice('<task-notification>' + '<status>'.repeat(60_000)), []);
   await linear('the same notice through the background-shell fold',
     () => { const f = core.newProcessFacts(); core.foldProcessFacts(f, { type: 'queue-operation', operation: 'enqueue', timestamp: '2026-09-28T10:00:00.000Z', content: '<task-notification><task-id>x</task-id>' + '<status>'.repeat(60_000) }); return f.byId.size >= 0; }, true);
+  // Three more of the same shape, not flagged by CodeQL; the old forms took 2.5-5 s at these sizes.
+  await linear('markdownTitle: a heading whose blank run ends in a bare CR',
+    () => core.markdownTitle('# ' + ' '.repeat(60_000) + '\rx'), null);
+  await linear('parseIgnoreFile: a long blank run inside a pattern',
+    () => core.parseIgnoreFile('a' + ' '.repeat(60_000) + 'x', 'f').length, 1);
+  await linear('unwrapPastedContent: a prompt of unclosed openers',
+    () => core.unwrapPastedContent('<pasted_content>'.repeat(40_000)).length, 16 * 40_000);
+  // The two below hold unwrapPastedContent's remembered `>`: without it each tag searches the same stretch
+  // again, about 2 s at this size (115 ms at 40 000 tags, under the bound), against 10-20 ms with it.
+  await linear('unwrapPastedContent: openers with no closing bracket',
+    () => core.unwrapPastedContent('<pasted_content'.repeat(150_000) + '>').length, 15 * 150_000 + 1);
+  await linear('unwrapPastedContent: closers with no closing bracket',
+    () => core.unwrapPastedContent('<pasted_content>' + '</pasted_content'.repeat(150_000) + '>'), '</pasted_content'.repeat(150_000 - 1));
+  assert.equal(core.markdownTitle('\uFEFF## Task (a1):  Fix the thing ##\nbody'), 'Fix the thing');
+  assert.equal(core.markdownTitle('#######  x'), null);
+  assert.equal(core.parseIgnoreFile('  a\\  ', 'f')[0].re.test('a '), true, 'an escaped trailing blank stays');
+  assert.equal(core.parseIgnoreFile('  a  \t', 'f')[0].re.test('a'), true, 'unescaped trailing blanks go');
+  assert.equal(core.unwrapPastedContent('<pasted_content id="1">a</pasted_content>b</pasted_content id="1">c'), 'a</pasted_content>bc');
+  assert.equal(core.unwrapPastedContent('<pasted_contents>a</pasted_contents>'), '<pasted_contents>a</pasted_contents>');
+  assert.equal(core.unwrapPastedContent('<pasted_content>a<pasted_content>b</pasted_content>c</pasted_content>'), 'a<pasted_content>bc</pasted_content>');
   // The rewrites keep every match: a closed id after unclosed openers, and the first closed status.
   assert.deepEqual(notice('<task-notification>\n<task-id>a<task-id>b</task-id>\n<task-id> c </task-id><status>killed</status><status>x'),
     [['a<task-id>b', { status: 'killed', ts: Date.parse('2026-09-28T10:00:00.000Z') }], ['c', { status: 'killed', ts: Date.parse('2026-09-28T10:00:00.000Z') }]]);
@@ -20890,4 +30552,13 @@ test('text parsers stay linear on the polynomial-ReDoS inputs CodeQL reported', 
   assert.equal(core.fileCategory('src/pkg_test_util.go'), 'tests');
   assert.equal(core.fileCategory('src/latest_test_x'), 'other', 'no extension, no test_ match');
   assert.deepEqual(core.mdClassify('#  '), { kind: 'h', depth: 1, text: '' });
+});
+
+test('machineSshEnv: an ssh to a saved machine carries none of this machine\'s store or agent identity, and asks nothing in a dialog', () => {
+  const keep = { PATH: '/usr/bin', HOME: '/home/u', TERM: 'xterm', DISPLAY: ':0', SSH_ASKPASS: '/usr/bin/ssh-askpass' };
+  const drop = { CLAUDE_CODE_ENTRYPOINT: 'cli', CLAUDECODE: '1', CLAUDE_CONFIG_DIR: '/c', CODEX_HOME: '/x', CODEX_THREAD_ID: 't',
+    CLAUDE_OBSERVATORY_SESSION: 's', CLAUDE_CHANGES_SESSION: 'legacy', HERDR_SOCKET_PATH: '/h.sock', XDG_CONFIG_HOME: '/xdg' };
+  assert.deepEqual(core.machineSshEnv({ ...keep, ...drop }), { ...keep, SSH_ASKPASS_REQUIRE: 'never' });
+  // Whatever the caller asked for: `force` or `prefer` would open the dialog even with a terminal to ask on.
+  for (const asked of ['force', 'prefer']) assert.equal(core.machineSshEnv({ ...keep, SSH_ASKPASS_REQUIRE: asked }).SSH_ASKPASS_REQUIRE, 'never', asked);
 });

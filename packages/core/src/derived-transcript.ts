@@ -15,7 +15,7 @@ import { newProcessFacts, foldProcessFacts, ProcessFacts } from './processes';
 
 // Bump whenever any of the constituent folds changes its stored shape or interpretation. The version
 // is part of the cache FILE NAME, so `pruneStaleMaps` can reclaim the generation a bump supersedes.
-export const TRANSCRIPT_FACTS_VERSION = 11; // 9: subagent facts keep each background task's completion notice (`ended`); 10: every id in a notice, the latest enqueue, and each agent's last turn (`vitals.lastTurnTs`); 11: a meta user record is a turn
+export const TRANSCRIPT_FACTS_VERSION = 17; // 9: subagent facts keep each background task's completion notice (`ended`); 10: every id in a notice, the latest enqueue, and each agent's last turn (`vitals.lastTurnTs`); 11: a meta user record is a turn; 12: an agent's usage counts each message id once (`subagents.usageIds`); 13: at its largest snapshot (`usageIds` maps each id to it); 14: foreground worker completion time; 16: worker shells and Codex exec sessions; 17: a worker's shell ends from its queued-command attachment
 const VERSION = TRANSCRIPT_FACTS_VERSION;
 const GUARD_BYTES = 128;
 // Two guards proved only that the first and last 128 bytes of the parsed region survived, so an
@@ -70,7 +70,7 @@ function emptyFacts(): TranscriptFacts {
 function fold(facts: TranscriptFacts, line: Buffer, includeSidechain: boolean, offset: number): void {
   let o: any;
   try { o = JSON.parse(line.toString('utf8')); } catch { return; }
-  if (!o || typeof o !== 'object' || Array.isArray(o)) return;
+  if (!o || typeof o !== 'object' || Array.isArray(o) || o.type === 'api-request-blob') return;
   foldSubagentFacts(facts.subagents, o);
   foldProcessFacts(facts.processes, o);
   foldActionFacts(facts.actions, o, includeSidechain, offset, line.length);
@@ -110,7 +110,14 @@ function cacheSlot(transcript: string, includeSidechain: boolean): { file: strin
 }
 function identity(st: fs.Stats): string { return `${st.dev}:${st.ino}`; }
 function sameSource(c: Cursor, st: fs.Stats): boolean {
-  return c.dev === st.dev && c.ino === st.ino && c.size === st.size && c.mtimeMs === st.mtimeMs && c.ctimeMs === st.ctimeMs;
+  return c.dev === st.dev && samePath(c, st);
+}
+/** A PATH's stat against the cursor, which an open file's stat wrote: all but `dev`. On Windows 11 24H2 and Server
+ *  2025, libuv 1.49–1.50 (Node 22.16.0, 24.0–24.1) reads a path's st_dev from a misordered FILE_STAT_BASIC_INFORMATION
+ *  and an open file's from the volume serial, so the two never agreed: no read was stable, and the facts were neither
+ *  saved nor remembered (libuv 1.51.0 fixed it). A path names the file read while its `ino` and times are the same. */
+function samePath(c: Cursor, st: fs.Stats): boolean {
+  return c.ino === st.ino && c.size === st.size && c.mtimeMs === st.mtimeMs && c.ctimeMs === st.ctimeMs;
 }
 function guard(fd: number, position: number, length: number): Buffer {
   const buf = Buffer.alloc(length);
@@ -133,7 +140,7 @@ function guards(fd: number, cursor: number): string {
   return h.digest('hex');
 }
 function validFacts(f: TranscriptFacts): boolean {
-  return !!f && f.subagents?.spawns instanceof Map && f.subagents.meta instanceof Map && f.subagents.ended instanceof Map &&
+  return !!f && f.subagents?.spawns instanceof Map && f.subagents.meta instanceof Map && f.subagents.ended instanceof Map && f.subagents.usageIds instanceof Map &&
     Array.isArray(f.subagents.todos) && typeof f.subagents.vitals?.firstTs === 'number' && typeof f.subagents.vitals.lastTurnTs === 'number' &&
     f.processes?.byToolUse instanceof Map && f.processes.byId instanceof Map &&
     f.processes.stopped instanceof Map && Array.isArray(f.processes.pendingEnd) &&
@@ -209,7 +216,7 @@ export function transcriptFacts(file: string, includeSidechain = false): Transcr
   if (!st.isFile()) return emptyFacts();
   const key = `${rootDir()}\0${transcript}\0${includeSidechain}`;
   const hit = uncached ? undefined : memory.get(key);
-  if (hit && sameSource(hit.cursor, st)) {
+  if (hit && samePath(hit.cursor, st)) {
     memory.delete(key); memory.set(key, hit);
     return hit.value;
   }
@@ -253,7 +260,7 @@ export function transcriptFacts(file: string, includeSidechain = false): Transcr
     const data = serialize(c);
     // Do not stamp a partial read or a concurrently replaced/rewritten file as a successful scan.
     let stable = position === st.size && sameSource(c, fs.fstatSync(fd));
-    try { stable = stable && sameSource(c, fs.statSync(transcript)); } catch { stable = false; }
+    try { stable = stable && samePath(c, fs.statSync(transcript)); } catch { stable = false; }
     if (slot && lease && stable && !unchanged) save(slot, lease, deflateRawSync(data, { level: 1 }));
     let value = c.facts;
     // A valid newline-less final record participates in this answer only. Reparse it exactly once

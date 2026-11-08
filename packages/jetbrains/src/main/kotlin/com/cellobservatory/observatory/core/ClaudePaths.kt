@@ -64,7 +64,7 @@ object ClaudePaths {
             val text = java.nio.file.Files.readString(fallback.resolve("prefs.json"))
             val o = com.google.gson.JsonParser.parseString(text).asJsonObject
             val raw = o.get("storeDir")?.takeIf { it.isJsonPrimitive }?.asString?.trim().orEmpty()
-            if (raw.isEmpty()) fallback else Paths.get(expandHome(raw))
+            if (raw.isEmpty() || !isStorePath(raw)) fallback else Paths.get(expandHome(raw))
         }.getOrDefault(fallback)
         rootCache = now to dir
         return dir
@@ -74,6 +74,23 @@ object ClaudePaths {
     fun forgetRoot() {
         rootCache = null
     }
+
+    /** True when oak sync's backup is a folder (prefs.json `sync.backup.kind`, which the CLI writes), which keeps its
+     *  copy of a deleted session's store: what a delete's confirmation says depends on it (deleteWords). Read straight
+     *  from prefs.json, as [rootDir] reads the store's place, so the dialog asks nothing of the CLI before it opens. A
+     *  prefs.json an OAK older than 0.11.0 rewrote (it lacks the `prefsFormat` mark every later OAK writes, which that
+     *  OAK drops with `sync`) and that holds no `sync` is read as oak sync's copy of it holds it (`sync/settings.json`),
+     *  which the CLI writes back at its next listing or sync run (core keptPrefs). */
+    fun folderBackup(): Boolean = runCatching {
+        val prefs = com.google.gson.JsonParser.parseString(java.nio.file.Files.readString(configDir().resolve("claude-observatory").resolve("prefs.json"))).asJsonObject
+        val o = if (prefs.has("prefsFormat") || prefs.has("sync")) prefs
+            else runCatching { com.google.gson.JsonParser.parseString(java.nio.file.Files.readString(rootDir().resolve("sync").resolve("settings.json"))).asJsonObject }.getOrDefault(prefs)
+        o.getAsJsonObject("sync")?.getAsJsonObject("backup")?.get("kind")?.asString == "folder"
+    }.getOrDefault(false)
+
+    /** Absolute, or the home (`~`, `~/…`), as core's isAbsoluteStorePath: any other path resolves against the folder the
+     *  process started in, so the IDE would look for the store where no other surface does. */
+    private fun isStorePath(p: String): Boolean = p == "~" || p.startsWith("~/") || p.startsWith("~\\") || Paths.get(p).isAbsolute
 
     /** `~` is the reader's own shorthand in that setting; every path below wants a real one. */
     private fun expandHome(p: String): String = when {

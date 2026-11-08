@@ -27,6 +27,7 @@ import { parseTranscriptActions } from './actions';
 import { findSubagentsDir } from './subagents';
 import { cachedByFiles, readLines, readText } from './fscache';
 import { friendlyModel } from './format';
+import { graphemeHead } from './graphemes';
 /**
  * Freshness window for a workflow's `running` gate. Deliberately WIDER than the fleet's 60s
  * FLEET_ACTIVE_MS: a workflow agent deep in a long reasoning turn appends nothing to its transcript for
@@ -210,7 +211,7 @@ function agentMetricsUncached(jsonlPath: string): AgentMetrics {
   let model = '';
   let effort = '';
   const activityTs: number[] = [];
-  const seen = new Set<string>();
+  const seen = new Map<string, number>(); // each message id counted, with the tokens it counts
   for (const line of lines) {
     const t = line.trim();
     if (!t) continue;
@@ -220,6 +221,7 @@ function agentMetricsUncached(jsonlPath: string): AgentMetrics {
     } catch {
       continue;
     }
+    if (o?.type === 'api-request-blob') continue;
     const ts = toMs(o.timestamp ?? o.ts);
     if (ts > 0) {
       if (!firstTs || ts < firstTs) firstTs = ts;
@@ -232,19 +234,26 @@ function agentMetricsUncached(jsonlPath: string): AgentMetrics {
     const m = o.message;
     if (!m || m.role !== 'assistant') continue;
     if (typeof m.model === 'string' && m.model) model = m.model; // the agent's model (last non-empty wins)
-    // Claude Code splits one assistant message across lines sharing a message.id + identical usage —
-    // count each id's usage once (same dedupe Stats uses) so a multi-block message isn't multiplied.
+    // Claude Code splits one assistant message across lines sharing a message.id, each with the usage
+    // as it stood when the line was written (a later one can carry more output, never less) — count
+    // each id's usage once, at its largest snapshot (same dedupe Stats uses) so a multi-block message
+    // isn't multiplied, and a larger later snapshot adds only the difference.
     const id = typeof m.id === 'string' ? m.id : null;
-    if (id === null || !seen.has(id)) {
-      if (id !== null) seen.add(id);
-      const u = m.usage || {};
-      // NEW tokens only. Adding the cache counters made the same context count once per turn,
-      // so this row reported millions where Claude Code's own view reported ~128k for the very
-      // same agent. Two tools reporting different numbers for one run is worse than either being
-      // slightly off — the reader cannot tell which to trust. Cache traffic is surfaced
-      // separately (SessionTokens.cacheRead/cacheCreation), never folded in here.
-      tokens += num(u.output_tokens) + num(u.input_tokens) + num(u.cache_creation_input_tokens);
+    const u = m.usage || {};
+    // NEW tokens only. Adding the cache counters made the same context count once per turn,
+    // so this row reported millions where Claude Code's own view reported ~128k for the very
+    // same agent. Two tools reporting different numbers for one run is worse than either being
+    // slightly off — the reader cannot tell which to trust. Cache traffic is surfaced
+    // separately (SessionTokens.cacheRead/cacheCreation), never folded in here.
+    const tk = num(u.output_tokens) + num(u.input_tokens) + num(u.cache_creation_input_tokens);
+    const prev = id === null ? undefined : seen.get(id);
+    if (prev === undefined) {
+      if (id !== null) seen.set(id, tk);
+      tokens += tk;
       if (ts > 0) activityTs.push(ts); // one tick per assistant turn → the run's activity sparkline
+    } else if (tk > prev) {
+      tokens += tk - prev;
+      seen.set(id as string, tk);
     }
     if (!Array.isArray(m.content)) continue;
     for (const b of m.content) {
@@ -291,7 +300,7 @@ function readAgentPrompt(transcriptPath: string): string | null {
     if (nl < 0) return null; // first line longer than the window — skip rather than mis-parse
     const o = JSON.parse(chunk.slice(0, nl));
     // Only the agent's PROMPT (its first user line) identifies it — never assistant output.
-    if (o?.type !== 'user' && o?.message?.role !== 'user') return null;
+    if (o?.type === 'api-request-blob' || (o?.type !== 'user' && o?.message?.role !== 'user')) return null;
     const content = o?.message?.content;
     if (typeof content === 'string') return content;
     if (Array.isArray(content)) {
@@ -317,8 +326,7 @@ function derivePromptLabels(wfDir: string, agentIds: Iterable<string>): Map<stri
     if (!text) continue;
     // A wide window: fan-out preambles (shared context pasted into every sibling) can run kilobytes
     // before the line that actually distinguishes the agent.
-    const lines = text
-      .slice(0, 48000)
+    const lines = graphemeHead(text, 48000)
       .split('\n')
       .map((l) => l.trim())
       .filter((l) => l.length >= 8)
@@ -335,7 +343,7 @@ function derivePromptLabels(wfDir: string, agentIds: Iterable<string>): Map<stri
     const pick = total > 1
       ? lines.find((l) => freq.get(l) === 1) ?? lines.find((l) => (freq.get(l) ?? 0) < total)
       : lines[0];
-    if (pick) out.set(id, pick.length > 72 ? pick.slice(0, 71) + '…' : pick);
+    if (pick) out.set(id, pick.length > 72 ? graphemeHead(pick, 71) + '…' : pick);
   }
   return out;
 }

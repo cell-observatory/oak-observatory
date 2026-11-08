@@ -73,10 +73,10 @@ class ObservatorySettings : PersistentStateComponent<ObservatorySettings.State> 
         var overviewSplitNarrow: Float = 0.38f
 
         /**
-         * Fold the Overview's five left-nav tabs into two, each rendering its members as side-by-side
-         * columns: Sessions · Fleet, and Workflows · Tasks · Processes.
+         * Show the Overview's five nav members as side-by-side columns in one tab:
+         * Sessions · Workers · Processes · Tasks · Workflows.
          *
-         * Off by default — it trades width for seeing a pair at once, and the change map on the right is
+         * Off by default — it trades width for seeing all five at once, and the change map on the right is
          * what most readers are here for. Persisted, like every other layout choice on that panel.
          */
         var overviewGroupedNav: Boolean = false
@@ -107,9 +107,7 @@ class ObservatorySettings : PersistentStateComponent<ObservatorySettings.State> 
          * from the left. Shared by both windows' groups; see
          * [com.cellobservatory.observatory.model.ColumnLayout.dividerKey].
          *
-         * A map rather than a field per divider because the members of a group change at runtime (the
-         * Overview's Processes column appears only once the CLI answers for it) and because both windows
-         * feed it. Missing key = the shipped default, so an older settings file simply starts from it.
+         * A map rather than a field per divider because both windows feed it. Missing key = the shipped default, so an older settings file simply starts from it.
          */
         var columnSplits: MutableMap<String, Float> = LinkedHashMap()
 
@@ -164,7 +162,7 @@ class ObservatoryConfigurable : Configurable {
     private val revealNextOnResolve =
         JBCheckBox("After keeping or reverting one edit, open the next edit still awaiting review")
     private val overviewGroupedNav =
-        JBCheckBox("Group all tabs side by side (Sessions · Workers · Workflows · Tasks · Processes)")
+        JBCheckBox("Group all tabs side by side (Sessions · Workers · Processes · Tasks · Workflows)")
     /** Label ⟷ stored value for the review-surface combo. A combo of raw values would put "floating" on
      *  screen, which says nothing about where the chrome appears. */
     private val surfaceLabels = linkedMapOf(
@@ -176,6 +174,42 @@ class ObservatoryConfigurable : Configurable {
     private val editorReviewSurface =
         com.intellij.openapi.ui.ComboBox(surfaceLabels.values.toTypedArray())
     private var panel: JPanel? = null
+
+    // oak sync's state and its changes, through the CLI (SyncOps). Its truth is prefs.json, which only the CLI writes for
+    // sync, so this page keeps no copy of it, and Apply and Reset leave it alone.
+    private val syncHead = com.intellij.ui.TitledSeparator("Sync across machines (oak sync)")
+    private val syncText = com.intellij.ui.components.JBLabel().apply { setAllowAutoWrapping(true); setCopyable(true) }
+    private val syncRecord = javax.swing.JButton("This Machine Is a Reinstall…")
+    private val syncButtons = JPanel(java.awt.FlowLayout(java.awt.FlowLayout.LEFT, 0, 0)).apply {
+        add(javax.swing.JButton("Sync Now").apply { addActionListener { com.cellobservatory.observatory.ui.SyncOps.syncNow(syncProject(it)) } })
+        add(javax.swing.JButton("Set Up or Change the Backup…").apply { addActionListener { com.cellobservatory.observatory.ui.SyncOps.setup(syncProject(it)) } })
+        add(javax.swing.JButton("Machines and Projects…").apply { addActionListener { com.cellobservatory.observatory.ui.SyncOps.chooseSynced(syncProject(it)) } })
+        add(syncRecord.apply { addActionListener { com.cellobservatory.observatory.ui.SyncOps.takeRecordOver(syncProject(it)) } })
+    }
+    private var syncWatch: com.intellij.openapi.Disposable? = null
+    /** Whether a machine is saved here (`oak machine list`); null until it answers. With none, and sync not in use, the
+     *  section is not shown: a machine that never chose to sync is shown nothing new. */
+    @Volatile private var syncSaved: Boolean? = null
+    /** The project the sync actions report in: the one whose window this page was opened from (its data context), else,
+     *  this page being the application's, the first one open. */
+    private fun syncProject(e: java.awt.event.ActionEvent): com.intellij.openapi.project.Project? =
+        (e.source as? java.awt.Component)?.let { com.intellij.openapi.actionSystem.CommonDataKeys.PROJECT.getData(com.intellij.ide.DataManager.getInstance().getDataContext(it)) }
+            ?: com.intellij.openapi.project.ProjectManager.getInstance().openProjects.firstOrNull()
+    private fun showSync() {
+        val v = com.cellobservatory.observatory.ui.SyncOps.view
+        val shown = v?.inUse == true || syncSaved == true
+        listOf(syncHead, syncText, syncButtons).forEach { it.isVisible = shown }
+        syncRecord.isVisible = v?.backupLine?.record != null
+        syncText.text = "<html>" + when {
+            v == null -> "oak sync's state comes from the oak CLI (oak sync status); it has not answered yet."
+            !v.inUse -> "Sync is not set up here. Set it up to share memory, plans, skills, agents and commands with the saved machines, " +
+                "and to choose where sessions are backed up."
+            else -> (listOf("Backup: ${v.backupText}", "Last run: ${v.runText}") + listOfNotNull(v.lastError?.let { "the run stopped: $it" }) +
+                v.lines.map { "${it.label}: ${it.said}" } +
+                listOfNotNull(v.conflicts.size.takeIf { it > 0 }?.let { "$it open conflict${if (it == 1) "" else "s"}: the Overview's Sessions tab has ${if (it == 1) "it" else "them"}" }) +
+                v.warnings.map { "warning: $it" }).joinToString("<br>") { com.cellobservatory.observatory.ui.escHtml(it) }
+        } + "</html>"
+    }
 
     /** The stored value the combo is showing, defaulting to `floating` — the same reading of an
      *  unrecognized value that [ObservatorySettings.State.floatingSurface] takes. */
@@ -196,10 +230,26 @@ class ObservatoryConfigurable : Configurable {
             .addLabeledComponent("Review controls in the editor:", editorReviewSurface, 1, false)
             .addComponent(revealNextOnResolve)
             .addComponent(overviewGroupedNav)
+            .addComponent(syncHead)
+            .addComponent(syncText)
+            .addComponent(syncButtons)
             .addComponentFillVertically(JPanel(), 0)
             .panel
         reset()
+        syncWatch = com.intellij.openapi.util.Disposer.newDisposable("OAK settings: sync").also { com.cellobservatory.observatory.ui.SyncOps.addListener(it) { showSync() } }
+        showSync()
+        com.cellobservatory.observatory.ui.SyncOps.refresh(force = true)
+        // Off the EDT: herdr's list. Told in any modality, since this page is a modal dialog's.
+        com.intellij.openapi.application.ApplicationManager.getApplication().executeOnPooledThread {
+            val saved = com.cellobservatory.observatory.core.ObservatoryCli.machineLabels(null).isNotEmpty()
+            com.intellij.openapi.application.ApplicationManager.getApplication().invokeLater({ syncSaved = saved; showSync() }, com.intellij.openapi.application.ModalityState.any())
+        }
         return panel!!
+    }
+
+    override fun disposeUIResources() {
+        syncWatch?.let { com.intellij.openapi.util.Disposer.dispose(it) }
+        syncWatch = null
     }
 
     override fun isModified(): Boolean {

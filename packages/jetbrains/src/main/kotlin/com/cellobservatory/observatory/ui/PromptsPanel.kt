@@ -44,6 +44,17 @@ class PromptsPanel(private val project: Project) : JPanel(BorderLayout()) {
     companion object Registry {
         private val live = java.util.concurrent.ConcurrentHashMap<Project, PromptsPanel>()
         fun of(project: Project): PromptsPanel? = live[project]
+        /** What the empty list says. The three states kept apart, as everywhere else: nothing read yet · the
+         *  CLI answered nothing (or said why it could list nothing — its own words) · this session genuinely
+         *  has no recorded ask. Only the last is an observation. */
+        internal fun emptyText(res: PromptsResult?, attempted: Boolean): String = when {
+            res?.error != null -> "No prompts to list — the oak CLI answered: ${res.error}"
+            res != null -> "No prompts recorded yet — this fills in with every prompt you send"
+            !attempted -> "Reading this session’s prompts…"
+            else -> "The oak CLI on PATH did not answer `prompts --json` — update it to list your prompts"
+        }
+        private const val DESC = "What you asked for, in order. Select one to scope the Overview beside it — its fleet, " +
+            "runs, tasks, shells and change map narrow to the work that ask caused."
         internal fun remember(project: Project, panel: PromptsPanel) {
             live[project] = panel
             com.intellij.openapi.util.Disposer.register(project) { live.remove(project, panel) }
@@ -97,10 +108,7 @@ class PromptsPanel(private val project: Project) : JPanel(BorderLayout()) {
         foreground = UIUtil.getContextHelpForeground()
         border = JBUI.Borders.empty(3, 8, 2, 8)
     }
-    private val desc = JBLabel(
-        "<html>What you asked for, in order. Select one to scope the Overview beside it — its fleet, " +
-            "runs, tasks, shells and change map narrow to the work that ask caused.</html>"
-    ).apply {
+    private val desc = JBLabel("<html>$DESC</html>").apply {
         font = JBUI.Fonts.label().deriveFont(Font.PLAIN, JBUI.Fonts.label().size2D - 1f)
         foreground = UIUtil.getContextHelpForeground()
         border = JBUI.Borders.empty(0, 8, 4, 8)
@@ -231,13 +239,14 @@ class PromptsPanel(private val project: Project) : JPanel(BorderLayout()) {
         responseHead.text = "#${r.index} · reading the agent's response…"
         responseText.text = ""
         val session = service().currentSession() ?: return
+        val machine = service().currentMachine()
         val workDir = project.basePath
         com.intellij.openapi.application.ApplicationManager.getApplication().executeOnPooledThread {
-            val json = com.cellobservatory.observatory.core.ObservatoryCli.promptResponseJson(session, r.id, workDir)
+            val json = com.cellobservatory.observatory.core.ObservatoryCli.onMachine(machine) { com.cellobservatory.observatory.core.ObservatoryCli.promptResponseJson(session, r.id, workDir) }
             val resp = json?.let { com.cellobservatory.observatory.model.PromptsParser.parseResponse(it) }
                 ?: PromptResponse(r.id, r.index, "", 0, 0)
             com.intellij.openapi.application.ApplicationManager.getApplication().invokeLater {
-                if (project.isDisposed || responseWanted != r.id) return@invokeLater // selection moved on
+                if (project.isDisposed || responseWanted != r.id || service().currentMachine() != machine || service().currentSession() != session) return@invokeLater // selection moved on
                 responseCache[r.id] = resp
                 paintResponse(r, resp)
             }
@@ -256,21 +265,21 @@ class PromptsPanel(private val project: Project) : JPanel(BorderLayout()) {
 
     /** Paint the list. Newest ask FIRST — it is the one the reader is still thinking about — while each
      *  row keeps its own #index, so the numbering a person counts by is never renumbered by the sort. */
+    private var responseTarget = ""
     private fun repaint(res: PromptsResult?) {
+        border = service().currentMachine()?.let { javax.swing.BorderFactory.createTitledBorder("On $it") } ?: JBUI.Borders.empty()
+        val target = service().currentSession().orEmpty() + service().machineSuffix()
+        if (target != responseTarget) { responseCache.clear(); responseWanted = null; responseTarget = target }
+
         val keepId = service().selectedPromptId
         syncing = true
         try {
             model.clear()
             res?.prompts?.asReversed()?.forEach { model.addElement(it) }
             last = res
-            // The three states kept apart, as everywhere else: nothing read yet · the CLI answered
-            // nothing · this session genuinely has no recorded ask. Only the last is an observation.
-            list.emptyText.text = when {
-                res != null -> "No prompts recorded yet — this fills in with every prompt you send"
-                !service().promptsAttempted -> "Reading this session’s prompts…"
-                else -> "The oak CLI on PATH did not answer `prompts --json` — update it to list your prompts"
-            }
-            val s = res?.summary
+            list.emptyText.text = emptyText(res, service().promptsAttempted)
+            desc.text = "<html>$DESC" + (res?.note?.let { "<br>" + com.intellij.openapi.util.text.StringUtil.escapeXmlEntities(it) } ?: "") + "</html>"
+            val s = res?.takeIf { it.error == null }?.summary // a refusal counts nothing
             head.text = if (s == null) "" else
                 "${s.total} ask${if (s.total == 1) "" else "s"} · ${s.withEdits} with edits · ${s.edits} edit${if (s.edits == 1) "" else "s"}"
             // Re-select the scoped ask against the FRESH rows (and let it go if it vanished with a

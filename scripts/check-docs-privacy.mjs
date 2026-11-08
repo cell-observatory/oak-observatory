@@ -45,7 +45,9 @@ const TEST_DIRS = ['test', 'packages/core/test', 'packages/tui/test', 'packages/
 const TESTS = TEST_DIRS.filter((d) => existsSync(join(ROOT, d))).flatMap((d) => walk(d, /\.(c?js|mjs|ts|kt|sh|jsonl?|txt|md)$/i));
 
 const escapeRegex = value => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-const machineNames = [hostname(), '\x6eova', '\x6eebula'].filter(Boolean);
+// Real machine and file-share names (a share named in a mount table names the machine as surely), written as escapes
+// so that this file does not spell them out.
+const machineNames = [hostname(), '\x6eova', '\x6eebula', '\x68elix', '\x70rfs'].filter(Boolean);
 const RULES = [
   {
     id: 'machine-name',
@@ -113,10 +115,11 @@ const TEST_RULES = [
   ...RULES.filter((r) => ['machine-name', 'session-link', 'transcript-path'].includes(r.id)),
   {
     id: 'real-session-id',
-    // Tests need UUID-shaped ids and write them zero-padded (`00000000-0000-4000-8000-00000000dead`).
-    // A random v4 UUID contains `0000` about once in 6,000, so one without it is taken for a real session.
-    re: /\b(?![0-9a-f-]*0000)[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/gi,
-    why: 'that looks like a real Claude Code or Codex session id — write a zero-padded placeholder (00000000-0000-4000-8000-…)',
+    // Tests need UUID-shaped ids and write them with a zero second group (`00000000-0000-4000-8000-00000000dead`,
+    // `0199a000-0000-7000-8000-…` for Codex). Any `0000` used to pass, so a real id with only its tail zeroed
+    // did, keeping the first 8 hex every surface displays; a random UUID has this second group once in 65,536.
+    re: /\b[0-9a-f]{8}-(?!0000-)[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/gi,
+    why: 'that looks like a real Claude Code or Codex session id — write a placeholder with a zero second group (00000000-0000-4000-8000-…)',
   },
 ];
 

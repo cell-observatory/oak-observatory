@@ -21,6 +21,7 @@
  *    it leaves alone, because a wrong highlight in a review tool is worse than none: it makes the
  *    reader doubt what else on the row is being shown to them accurately.
  */
+import { HIDDEN_MARK_SOURCE } from '@oak-observatory/core';
 import { ColorDepth } from './glyphs';
 
 /** Deliberately muted. These sit UNDER the review colours in the visual hierarchy — context is what
@@ -85,6 +86,11 @@ export function blockStateAfter(line: string, was: boolean): boolean {
   return open;
 }
 
+/** A mark the diff draws for a hidden character (core's revealHidden): dim, whole, in a comment or a string too. */
+const MARK = new RegExp(`^${HIDDEN_MARK_SOURCE}`);
+const MARKS = new RegExp(HIDDEN_MARK_SOURCE, 'g'); // made once: dimMarks runs for each comment and string of a frame
+const dimMarks = (s: string): string => s.replace(MARKS, (mk) => `\x1b[2m${mk}\x1b[22m`);
+
 export function highlightSource(line: string, depth: ColorDepth, inBlock = false): string {
   if (depth === 'none' || !line) return line;
   const R = '\x1b[39m'; // default FOREGROUND only — this runs inside a line that may carry a background
@@ -93,21 +99,21 @@ export function highlightSource(line: string, depth: ColorDepth, inBlock = false
   // Already inside a docblock: everything up to a closing `*/` is comment, and what follows is code.
   if (inBlock) {
     const end = line.indexOf('*/');
-    if (end < 0) return `${open('comment', depth)}${line}${R}`;
-    out = `${open('comment', depth)}${line.slice(0, end + 2)}${R}`;
+    if (end < 0) return `${open('comment', depth)}${dimMarks(line)}${R}`;
+    out = `${open('comment', depth)}${dimMarks(line.slice(0, end + 2))}${R}`;
     i = end + 2;
   }
   while (i < line.length) {
     const rest = line.slice(i);
     // A line comment takes everything after it, so it is checked first.
     const c = /^(\/\/|#(?!!)|--\s)/.exec(rest);
-    if (c) return `${out}${open('comment', depth)}${line.slice(i)}${R}`;
+    if (c) return `${out}${open('comment', depth)}${dimMarks(line.slice(i))}${R}`;
     // A BLOCK comment. Closed on this line, it is a span; left open, it takes the rest — and the
     // caller's `blockStateAfter` carries that to the next row.
     if (rest.startsWith('/*')) {
       const end = rest.indexOf('*/', 2);
-      if (end < 0) return `${out}${open('comment', depth)}${rest}${R}`;
-      out += `${open('comment', depth)}${rest.slice(0, end + 2)}${R}`;
+      if (end < 0) return `${out}${open('comment', depth)}${dimMarks(rest)}${R}`;
+      out += `${open('comment', depth)}${dimMarks(rest.slice(0, end + 2))}${R}`;
       i += end + 2;
       continue;
     }
@@ -117,8 +123,15 @@ export function highlightSource(line: string, depth: ColorDepth, inBlock = false
       let j = i + 1;
       while (j < line.length && line[j] !== quote) j += line[j] === '\\' ? 2 : 1;
       const end = Math.min(j + 1, line.length);
-      out += `${open('string', depth)}${line.slice(i, end)}${R}`;
+      out += `${open('string', depth)}${dimMarks(line.slice(i, end))}${R}`;
       i = end;
+      continue;
+    }
+    // A hidden character's mark, as one token: read as code, its `U`, `+` and digits would be coloured apart.
+    const mk = line[i] === '⟨' ? MARK.exec(rest) : null;
+    if (mk) {
+      out += `\x1b[2m${mk[0]}\x1b[22m`;
+      i += mk[0].length;
       continue;
     }
     const w = /^[A-Za-z_$][A-Za-z0-9_$]*/.exec(rest);

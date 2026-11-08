@@ -5,7 +5,6 @@ import com.cellobservatory.observatory.model.SessionRow
 import com.cellobservatory.observatory.model.SessionsResult
 import com.cellobservatory.observatory.settings.ObservatorySettings
 import com.cellobservatory.observatory.ui.ChangeMapPanel
-import com.intellij.testFramework.fixtures.BasePlatformTestCase
 import com.intellij.ui.components.JBTabbedPane
 import java.nio.file.Files
 import java.nio.file.Path
@@ -17,7 +16,7 @@ import javax.swing.JLabel
  * first … remote panes … reviewed on that machine"), and a pinned session missing from the listing was
  * explained as "recorded for another workspace", which a machine-wide listing can no longer mean.
  */
-class SessionsTabCopyTest : BasePlatformTestCase() {
+class SessionsTabCopyTest : ObservatoryPlatformTestCase() {
 
     private lateinit var cfg: Path
     private var savedPin: String? = null
@@ -61,10 +60,10 @@ class SessionsTabCopyTest : BasePlatformTestCase() {
         return desc.text to tabs.getToolTipTextAt(sessionsTab)
     }
 
-    fun testTheTabDescribesTheWorkspaceGroupingItShows() {
+    fun testTheTabDescribesTheMergedListItShows() {
         val (desc, tip) = painted(null, listOf(row("fixture-a")))
         for (text in listOf(desc, tip.orEmpty())) {
-            assertTrue("grouped by workspace, on this machine — $text", text.contains("Sessions on this machine, grouped by workspace"))
+            assertTrue("grouped by workspace, on this machine — $text", text.contains("Sessions from every machine, newest activity first"))
             assertFalse("no retired machine grouping — $text", Regex("grouped by machine|remote pane|reviewed on that machine").containsMatchIn(text))
         }
     }
@@ -78,5 +77,25 @@ class SessionsTabCopyTest : BasePlatformTestCase() {
         assertFalse("never 'another workspace': the listing spans every workspace — $desc", desc.contains("another workspace"))
         // Control: a pin the listing does carry gets no such line.
         assertFalse(painted("fixture-a", listOf(row("fixture-a"))).first.contains("Reviewing"))
+    }
+
+    // Another machine's raised hand, as the listing carries it (`syncedHands`): under its own header, on its machine, and
+    // never among this machine's workspaces.
+    fun testAnotherMachinesHandIsListedOnItsMachine() {
+        val hand = com.cellobservatory.observatory.model.SyncedHand("remote-wait", "Profile the import", "claude", "~/app", "build-box", "aaaaaaaaaaaa",
+            com.cellobservatory.observatory.model.SessionAttention("permission", "Bash", System.currentTimeMillis() - 60_000), null)
+        val panel = ChangeMapPanel(project)
+        ChangeMapPanel::class.java.getDeclaredMethod("repaintSessions", SessionsResult::class.java)
+            .apply { isAccessible = true }.invoke(panel, SessionsResult(null, listOf(row("fixture-a")), listOf(hand)))
+        val list = ChangeMapPanel::class.java.getDeclaredField("sessionsList").apply { isAccessible = true }.get(panel) as javax.swing.JList<Any>
+        val model = (0 until list.model.size).map { list.model.getElementAt(it) }
+        assertTrue(model.joinToString(), model.any { it.toString() == "SyncedHandsHeader(count=1)" })
+        val at = model.indexOfFirst { it.toString().startsWith("SyncedHandRow(") }
+        assertTrue("the hand is a row of its own — $model", at >= 0)
+        assertTrue("before this machine's workspaces — $model", at < model.indexOfFirst { it is SessionRow })
+        fun texts(c: java.awt.Component): List<String> = (if (c is JLabel) listOf(c.text) else emptyList()) +
+            ((c as? java.awt.Container)?.components?.flatMap { texts(it) } ?: emptyList())
+        val drawn = texts(list.cellRenderer.getListCellRendererComponent(list, model[at], at, false, false)).joinToString(" | ")
+        assertTrue(drawn, drawn.contains("Profile the import") && drawn.contains("permission · Bash · ") && drawn.contains("on build-box"))
     }
 }
