@@ -295,7 +295,9 @@ test('focus server: a process name holding ") " does not decide whether it is a 
   t.after(() => parent.kill('SIGKILL'));
   const zombie = Number((await new Promise(resolve => parent.stdout.once('data', resolve))).toString().trim());
   const stat = pid => { try { return fs.readFileSync(`/proc/${pid}/stat`, 'utf8'); } catch { return ''; } };
-  for (let i = 0; i < 50 && !(stat(zombie).startsWith(`${zombie} (z) S z) Z `) && stat(parent.pid).startsWith(`${parent.pid} (s) Z s) `)); i++) await new Promise(resolve => setTimeout(resolve, 20));
+  // Until the parent sleeps, not only wears its new name: just after its exec it is still running (R), and a loaded
+  // runner read it there.
+  for (let i = 0; i < 250 && !(stat(zombie).startsWith(`${zombie} (z) S z) Z `) && stat(parent.pid).startsWith(`${parent.pid} (s) Z s) S `)); i++) await new Promise(resolve => setTimeout(resolve, 20));
   assert.match(stat(zombie), /^\d+ \(z\) S z\) Z /, 'control: a zombie named "z) S z"');
   assert.match(stat(parent.pid), /^\d+ \(s\) Z s\) S /, 'control: a sleeping process named "s) Z s"');
   assert.equal(core.pidAlive(zombie, { reaped: true }), false, 'the zombie is gone');

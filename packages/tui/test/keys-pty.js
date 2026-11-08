@@ -148,12 +148,11 @@ async function drive(row) {
     await answered();
     // F1's first paint probes herdr's version synchronously: silence can still be the old Review frame.
     if (row.done) await until(row.done);
-    const screen = lines();
     // The store, through `oak list --json`, only for a row whose check reads it.
     let list = null;
     const listed = () => (list ??= JSON.parse(cp.execFileSync(process.execPath, [CLI, 'list', '--session', fx.session, '--json'], { cwd: fx.ws, env: fx.env, encoding: 'utf8' })));
     const read = (f) => (fs.existsSync(f) ? fs.readFileSync(f, 'utf8').trim().split('\n').filter(Boolean) : []);
-    row.check({
+    const view = (screen) => ({
       screen, text: screen.join('\n'), bottom: screen.slice(-4).join('\n'), keysRow: screen[ROWS - 1], raw, exited, snap, fg,
       rowOf: (text) => screen.findIndex((l) => l.includes(text)),
       get edits() { return Object.fromEntries(listed().edits.map((e) => [e.id, e.status])); },
@@ -172,6 +171,16 @@ async function drive(row) {
       })(),
       pid: child.pid,
     });
+    // Quiet is not done: a loaded machine can leave the app's answer to the last key unpainted after the quiet the
+    // keys wait for (the help, 105 ms after a check that failed on a loaded runner). A check that fails reads the
+    // screen, the store and the logs again until it passes, for 10 s; one that never passes fails on the screen as it is then.
+    const checkedAt = Date.now();
+    for (;;) {
+      try { row.check(view(lines())); break; } catch (error) {
+        if (Date.now() - checkedAt > 10000) throw error;
+        await new Promise((r) => setTimeout(r, 100)); await flush(); list = null;
+      }
+    }
   } finally {
     try { child.kill(); } catch { /* exited */ }
     // The app may have started a detached database build (`__index-build`) that is still writing in this home: retry
@@ -278,9 +287,20 @@ const ROWS_TABLE = [
         records.push({ type: 'queue-operation', timestamp: new Date().toISOString(), content: '<task-notification><task-id>shell-1</task-id><status>completed</status><summary>exit code 0</summary></task-notification>' });
         fs.writeFileSync(path.join(fx.home, '.claude/projects', fx.ws.replace(/[^a-zA-Z0-9]/g, '-'), fx.session + '.jsonl'), records.map(r => JSON.stringify({ ...r, cwd: fx.ws, sessionId: fx.session })).join('\n') + '\n');
       },
-      keys: [K.enter, click('1 finished'), async (_child, { lines, until }) => { await until(/Finished synthetic build/); assert.match(lines().join('\n'), /Finished synthetic build/); },
+      // A click lands on the row the app has drawn when it reads the click. The detail draws its Processes under
+      // "loading conversation…" first, then the conversation above them, then the live shell's output under it: three
+      // runs of a loaded runner clicked "1 finished" on the first layout and reached the app after the conversation
+      // came, folding the shell row drawn there instead. The clicks wait for the last layout.
+      keys: [K.enter, async (_child, { lines, until }) => {
+        const laidOut = /^(?![\s\S]*loading conversation…)[\s\S]*PROCESS FIRST/;
+        await until(laidOut, 20000);
+        assert.match(lines().join('\n'), laidOut, 'the conversation and the live shell\'s output are drawn');
+      },
+        click('1 finished'), async (_child, { lines, until }) => { await until(/Finished synthetic build/); assert.match(lines().join('\n'), /Finished synthetic build/); },
         click('Live synthetic build'), async (_child, { lines, until }) => {
-          await until(/PROCESS FIRST/); assert.match(lines().join('\n'), /process output/);
+          // The Processes list already shows the shell's first line under it, so the process view is what is waited for.
+          const opened = /^(?![\s\S]*Loading process output…)[\s\S]* · process output/;
+          await until(opened); assert.match(lines().join('\n'), opened);
           fs.appendFileSync(output, '\x1b]0;UNTRUSTED TITLE\x07\x1b[2JPROCESS APPENDED\n');
           await until(/PROCESS APPENDED/);
         }],
@@ -413,7 +433,9 @@ const ROWS_TABLE = [
   { id: 'ctrl+q twice quits', keys: [K.ctrl('q'), K.ctrl('q')], help: 'ctrl+q twice', wait: 600, check: (r) => assert.ok(r.exited) },
   { id: 'ctrl+q once arms it', keys: [K.ctrl('q')], mentions: 'repeat within two seconds to confirm', check: status(/press ctrl\+q again to exit/) },
   // ---- Tabs ----
-  { id: 'Tab goes to the next tab', keys: [K.tab], help: 'Tab / shift+Tab', check: (r) => assert.match(r.text, /FAKE HERDR/) },
+  // The herdr tab's first paint asks herdr its version, synchronously, and its client starts after: on a slow runner the
+  // app writes nothing for over a second, so quiet after the key is still the Review frame. The row waits for the client.
+  { id: 'Tab goes to the next tab', keys: [K.tab], help: 'Tab / shift+Tab', done: /FAKE HERDR/, check: (r) => assert.match(r.text, /FAKE HERDR/) },
   { id: 'shift+Tab goes to the previous tab', keys: [K.btab], mentions: 'Tab / shift+Tab', check: (r) => assert.match(r.keysRow, /↵ pin/) },
   { id: 'ctrl+n / ctrl+p switch tabs', keys: [K.ctrl('p')], mentions: 'ctrl+n / ctrl+p', check: (r) => assert.match(r.keysRow, /↵ pin/) },
   { id: 'alt+digit picks a tab', keys: [K.alt('2')], mentions: 'alt+1-3 too', check: (r) => assert.match(r.keysRow, /↵ pin/) },
@@ -491,7 +513,12 @@ fs.renameSync = function (a, b, ...r) { if (String(b) === ${JSON.stringify(home)
     const half = '{ "prefsFormat": 2, "billDay": 12, "remoteTitles": false,';
     return { id: 'Tab leaves a prefs.json that does not parse as it is', prefs: { machineUsage: false }, mentions: 'Tab / shift+Tab',
       prep: (fx) => { file = path.join(fx.home, '.claude/claude-observatory/prefs.json'); },
-      keys: [() => fs.writeFileSync(file, half), K.btab, (_child, { lines }) => { afterTab = fs.readFileSync(file, 'utf8'); said = lines().slice(-4).join('\n'); },
+      // The file is read once the app has said it left it: before that, it is as the hand edit left it whatever the
+      // tab switch will do, and a loaded runner read the status row before the app had answered the key.
+      keys: [() => fs.writeFileSync(file, half), K.btab, async (_child, { lines, until }) => {
+        await until(/layout not saved: prefs\.json is not valid JSON/);
+        afterTab = fs.readFileSync(file, 'utf8'); said = lines().slice(-4).join('\n');
+      },
         () => fs.writeFileSync(file, half.replace(/,$/, ' }')), K.tab],
       check: () => {
         assert.equal(afterTab, half, 'the tab switch left the file as the hand edit left it');
@@ -521,7 +548,11 @@ fs.renameSync = function (a, b, ...r) { if (String(b) === ${JSON.stringify(home)
       ].map(r => JSON.stringify(r)).join('\n') + '\n');
     },
     keys: [K.down, K.enter, async (child, { lines, until }) => {
-      await until(/1 finished/);
+      // The conversation is drawn above the Processes once it is read: a click aimed before that lands on it (see the
+      // process click row).
+      const laidOut = /^(?![\s\S]*loading conversation…)[\s\S]*synthetic-build[\s\S]*1 finished/;
+      await until(laidOut, 20000);
+      assert.match(lines().join('\n'), laidOut, 'the conversation is drawn');
       const y = lines().findIndex(l => l.includes('1 finished')); assert.ok(y >= 0, lines().join('\n'));
       const x = lines()[y].indexOf('1 finished') + 1;
       child.write(`\x1b[<0;${x};${y + 1}M\x1b[<0;${x};${y + 1}m`);
@@ -815,7 +846,9 @@ fs.writeFileSync(${JSON.stringify(fx.edLog)}, JSON.stringify([requests.length ? 
   (() => {
     let sw;
     return { id: 'Observatory: sync\'s last run shows under this machine; i lists its conflict, and Enter, ↓, Enter, y deletes the copy through oak sync resolve',
-      tab: 'observatory', ready: /backup · none/, prep: (fx) => { sw = syncWorld(fx); }, mentions: 'then oak sync\'s open conflicts', wait: 1200,
+      // The check reads the screen taken before the keys, and the machine's [W window] is drawn from the same session list
+      // as the session's `ws` row: on a slow runner sync's rows paint seconds before it, so the row waits for both.
+      tab: 'observatory', ready: /^(?=[\s\S]*backup · none)(?=[\s\S]*^ {7}ws +│)/m, prep: (fx) => { sw = syncWorld(fx); }, mentions: 'then oak sync\'s open conflicts', wait: 1200,
       before: ({ screen }) => screen.join('\n'), keys: ['i', K.enter, K.down, K.enter, 'y'],
       check: (r) => {
         // The master's column alone, its wrapped rows joined: the conversation pane is beside it.

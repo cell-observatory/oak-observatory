@@ -29,14 +29,15 @@ function fixture(t) {
   return { home, env };
 }
 
-// Regular files work even where the sandbox denies Node's pipe socketpair.
+// Regular files work even where the sandbox denies Node's pipe socketpair. A command gets two minutes, which only a hang
+// uses up: a stalled macOS runner held `oak usage --session=`, a tenth of a second of work, past the 15 s it had.
 function run(b, file, args, options = {}) {
   const stdout = path.join(b.home, 'stdout');
   const stderr = path.join(b.home, 'stderr');
   const out = fs.openSync(stdout, 'w');
   const err = fs.openSync(stderr, 'w');
   let result;
-  try { result = cp.spawnSync(file, args, { cwd: b.home, env: b.env, timeout: 15000, ...options, stdio: ['ignore', out, err] }); }
+  try { result = cp.spawnSync(file, args, { cwd: b.home, env: b.env, timeout: 120000, ...options, stdio: ['ignore', out, err] }); }
   finally { fs.closeSync(out); fs.closeSync(err); }
   assert.equal(result.error, undefined);
   return { ...result, stdout: fs.readFileSync(stdout, 'utf8'), stderr: fs.readFileSync(stderr, 'utf8') };
@@ -774,6 +775,10 @@ cp $r "$srcs" "$dest"
     fs.mkdirSync(path.join(remote, '.local', 'bin'), { recursive: true });
     fs.mkdirSync(path.join(remote, 'node-bin'));
     fs.symlinkSync(process.execPath, path.join(remote, 'node-bin', 'node'));
+    // Its Node in ~/.local/bin as well, where a user-local Node lives: the installed oak runs on MACHINE_PATH,
+    // whose /usr/local/bin comes before the PATH above, and on GitHub's ubuntu-latest runner that holds an
+    // older Node than OAK accepts.
+    fs.symlinkSync(process.execPath, path.join(remote, '.local', 'bin', 'node'));
     fs.writeFileSync(path.join(remote, '.local', 'bin', 'herdr'), `#!/bin/sh\necho "herdr ${pin}"\n`, { mode: 0o755 });
   };
   const add = () => run(b, process.execPath, [cli, 'machine', 'add', 'box', 'me@box'], { timeout: 60000 });

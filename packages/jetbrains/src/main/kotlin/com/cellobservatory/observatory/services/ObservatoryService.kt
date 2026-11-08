@@ -96,13 +96,6 @@ class ObservatoryService(private val project: Project) : Disposable {
     /** True while a coalesced repaint is queued on the EDT — see [notifyListeners]. */
     private val repaintQueued = AtomicBoolean(false)
 
-    init {
-        StoreWatcher.instance.addListener(watchListener)
-        // Store watcher only fires on EDITS; the transcript watcher fires on transcript growth (reads,
-        // bash, subagent spawns, to-dos) so Actions/Observations/Timeline/Overview/Multitasking stay live.
-        TranscriptWatcher.getInstance(project).addListener(watchListener)
-    }
-
     val workspaceRoot: String? get() = project.basePath
 
     /**
@@ -124,7 +117,6 @@ class ObservatoryService(private val project: Project) : Disposable {
     fun currentMachine(): String? = if (demoSessionOverride == null) remotePin?.machine else null
     fun machineSuffix(): String = currentMachine()?.let { " · on $it" } ?: ""
     private val savedListener = Runnable { if (!project.isDisposed) notifyListeners() }
-    init { com.cellobservatory.observatory.core.SavedMachines.listeners.add(savedListener) }
 
     fun currentSession(): String? {
         demoSessionOverride?.takeIf { it.isNotBlank() }?.let { return it }
@@ -1022,6 +1014,16 @@ class ObservatoryService(private val project: Project) : Disposable {
             multitaskFetch, changemapFetch, observationsFetch, processesFetch,
             promptsFetch, sessionsFetch, auditFetch, feedFetch,
         )
+
+    // After every field above: the startup activity builds this service off the EDT, and a watcher fires
+    // its listeners on the EDT, so a listener added before a field was set could run with that field null.
+    init {
+        StoreWatcher.instance.addListener(watchListener)
+        // Store watcher only fires on EDITS; the transcript watcher fires on transcript growth (reads,
+        // bash, subagent spawns, to-dos) so Actions/Observations/Timeline/Overview/Multitasking stay live.
+        TranscriptWatcher.getInstance(project).addListener(watchListener)
+        com.cellobservatory.observatory.core.SavedMachines.listeners.add(savedListener)
+    }
 
     override fun dispose() {
         stopProcessFeed()

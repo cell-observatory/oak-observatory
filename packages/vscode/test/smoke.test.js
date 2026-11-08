@@ -4832,6 +4832,10 @@ esac\nexit 0\n`, { mode: 0o755 });
       const t = Math.floor(Date.now() / 1000) - secsAgo;
       fs.utimesSync(jf, t, t); // recency IS the transcript's mtime — the liveness rule reads exactly this
     }
+    // "Still being written" is a claim about now, and the liveness rule allows it 60 s (FLEET_ACTIVE_MS) from that
+    // mtime. On a slow runner the listings that must see LIVE live come more than a minute after this point, so LIVE
+    // is written again just before each of them, as the agent writing it would.
+    const stillWriting = () => { const now = new Date(); fs.utimesSync(path.join(proj, LIVE + '.jsonl'), now, now); };
     // The Timeline's own render path, EXECUTED. A chip stuck on "session —" forever — or a grouped
     // column whose list is never rendered into — would satisfy every source assertion above; only
     // running the shipped script against a DOM stub can see either.
@@ -5206,6 +5210,15 @@ esac\nexit 0\n`, { mode: 0o755 });
       assert.equal(onActions.el('tl-pane-actions').style.display, 'flex', 'a reload comes back on the tab it left on');
     }
 
+    // One forced refresh asks for what the window is to be told: the window runs one CLI spawn at a time, and a forced
+    // refresh that arrives while one is in flight runs again once it lands. So the wait is for the answer, not for a
+    // number of tries: with the CLI starved of CPU, a listing outlasted 200 tries, and each try's forced refresh
+    // started an `oak feed` of its own, which slowed the runs it waited for. The window kills a CLI run at 120 s
+    // (CLI_SPAWN_TIMEOUT_MS) and answers all the same, so two of those bound the wait.
+    const refreshUntil = async (done) => {
+      rqProvider.refresh(true);
+      for (const end = Date.now() + 240_000; !done() && Date.now() < end;) await new Promise((r) => setTimeout(r, 10));
+    };
     // The selector consumes the built CLI (the file's TREE_OAK pin) on the window's existing refresh.
     // `read` picks the listing to wait for: by default the first that lands.
     const sessionsPush = async (pin, read = () => true) => {
@@ -5214,15 +5227,11 @@ esac\nexit 0\n`, { mode: 0o755 });
       rqView.webview.postMessage = (m) => { posts.push(m); return Promise.resolve(true); };
       rqView.visible = true;
       const landed = () => posts.find((m) => m.type === 'sessions' && read(m));
-      // The window coalesces to one spawn at a time, and a failed spawn releases that gate on a later
-      // tick — so wait for it rather than racing it. Twenty tries is ~200ms; the gate opens on the first.
-      for (let i = 0; i < 200 && !landed(); i++) {
-        rqProvider.refresh(true);
-        if (!landed()) await new Promise((r) => setTimeout(r, 10));
-      }
+      await refreshUntil(landed);
       rqView.visible = false;
       return landed() ?? posts.filter((m) => m.type === 'sessions').pop();
     };
+    stillWriting();
     const sp = await sessionsPush(OLDPIN);
     assert.ok(sp, 'the Prompts window is fed the selector rows on its own refresh cadence — no second timer');
     assert.equal(sp.current, OLDPIN, 'and told which session is under review');
@@ -5239,10 +5248,7 @@ esac\nexit 0\n`, { mode: 0o755 });
       rqView.webview.postMessage = (m) => { posts.push(m); return Promise.resolve(true); };
       rqView.visible = true;
       const answer = () => posts.find((m) => m.type === 'error' || (m.type === 'prompts' && m.rq === null));
-      for (let i = 0; i < 300 && !answer(); i++) {
-        rqProvider.refresh(true);
-        if (!answer()) await new Promise((r) => setTimeout(r, 10));
-      }
+      await refreshUntil(answer);
       rqView.visible = false;
       configValues['session'] = pinned;
       assert.ok(answer(), 'the window is told the CLI listed nothing');
@@ -5891,6 +5897,7 @@ else if (all.includes('--machine lab-a')) {
     const realPin = commands['claudeObservatory.pinSession'];
     commands['claudeObservatory.pinSession'] = (id) => { pinSeen.push(id); };
     createQuickPickChoose = (items) => { qpItems = items; return items[0]; };
+    stillWriting();
     await commands['claudeObservatory.switchActiveSession']();
     assert.deepEqual(pinSeen, [OLDPIN], 'a pick routes through pinSession — so a switch made mid-demo never writes settings.json');
     assert.equal(qpItems[0].label.slice(0, 1), '○', 'the reviewed-but-quiet session leads, marked ○');

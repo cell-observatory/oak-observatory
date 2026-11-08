@@ -5,7 +5,7 @@ import { storeDir } from './store';
 import type { HerdrOptions, HerdrTransport } from './herdr';
 import { spawnTool, spawnToolSync, noBackgroundChildren } from './spawn';
 import { oakCliEntry } from './cli-entry';
-import { herdrPaneContextSync } from './herdr-context';
+import { herdrPaneContextSync, herdrCheckMs } from './herdr-context';
 
 export interface HerdrPaneLink { paneId: string; socketPath?: string; at: number; reported?: boolean; sessionStartSource?: string }
 
@@ -92,7 +92,7 @@ export function reportHerdrSessionSync(session: string, kind: string, link: Herd
       '--seq', String(BigInt(Date.now()) * 1_000_000n),
       // herdr requires startup/resume/etc. to replace a previous Codex session in this pane.
       ...(link.sessionStartSource ? ['--session-start-source', link.sessionStartSource] : []),
-    ], { env: { ...process.env, HERDR_SOCKET_PATH: link.socketPath }, stdio: 'ignore', timeout: 500, killSignal: 'SIGKILL', direct: true });
+    ], { env: { ...process.env, HERDR_SOCKET_PATH: link.socketPath }, stdio: 'ignore', timeout: herdrCheckMs(500), killSignal: 'SIGKILL', direct: true });
     return result.status === 0 && !result.error;
   } catch { return false; }
 }
