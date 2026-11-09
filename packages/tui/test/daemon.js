@@ -289,9 +289,13 @@ test('focus server: a process name holding ") " does not decide whether it is a 
   const { spawn, spawnSync } = require('node:child_process');
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-zombie-name-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  const sleep = spawnSync('/bin/sh', ['-c', 'command -v sleep'], { encoding: 'utf8' }).stdout.trim();
-  for (const name of ['z) S z', 's) Z s']) fs.symlinkSync(sleep, path.join(dir, name));
-  const parent = spawn('/bin/sh', ['-c', '"$1" 0 & echo $!; exec "$2" 30', 'sh', path.join(dir, 'z) S z'), path.join(dir, 's) Z s')], { stdio: ['ignore', 'pipe', 'ignore'] });
+  // The shell under each name, not sleep: Rust coreutils' sleep (Ubuntu 26.04's) refuses to run under another name, so
+  // neither process was there, and Node renames its main thread. The parent waits in `read` on a FIFO nobody writes to,
+  // and reaps no child it did not start.
+  for (const name of ['z) S z', 's) Z s']) fs.symlinkSync('/bin/sh', path.join(dir, name));
+  const fifo = path.join(dir, 'fifo');
+  assert.equal(spawnSync('mkfifo', [fifo]).status, 0, 'control: a FIFO for the parent to wait on');
+  const parent = spawn('/bin/sh', ['-c', '"$1" -c "" & echo $!; exec "$2" -c \'read x < "$1"\' "$2" "$3"', 'sh', path.join(dir, 'z) S z'), path.join(dir, 's) Z s'), fifo], { stdio: ['ignore', 'pipe', 'ignore'] });
   t.after(() => parent.kill('SIGKILL'));
   const zombie = Number((await new Promise(resolve => parent.stdout.once('data', resolve))).toString().trim());
   const stat = pid => { try { return fs.readFileSync(`/proc/${pid}/stat`, 'utf8'); } catch { return ''; } };
