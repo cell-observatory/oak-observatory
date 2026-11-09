@@ -1489,7 +1489,7 @@
   },
   "devDependencies": {
     "@oak-observatory/core": "0.12.0-dev.0",
-    "@types/node": "^26.6.3",
+    "@types/node": "^26.6.6",
     "@types/vscode": "^1.85.0",
     "@vscode/codicons": "^0.0.45",
     "@vscode/vsce": "^4.0.0",
