@@ -20917,9 +20917,11 @@ test('tui: find-in-diff MARKS its matches, and composes with the diff’s own co
       for (let i = 0; i < 50; i++) tui.highlightVisible(l, 'aa');
       return Number(process.hrtime.bigint() - t0);
     };
-    time(400); // warm
-    const small = time(400);
-    const big = time(1600); // 4x the matches
+    time(400); time(1600); // warm
+    // The fastest of five of each: one sample can take a GC pause or lose the CPU, which made a linear 4x read 17.9x
+    // on a macOS runner (2026-11-09). Nothing outside the function makes a sample faster, so the minimum is its cost.
+    let small = Infinity, big = Infinity;
+    for (let r = 0; r < 5; r++) { small = Math.min(small, time(400)); big = Math.min(big, time(1600)); } // 4x the matches
     assert.ok(big < small * 12, `4x the matches must not cost ~16x the time — was ${(big / small).toFixed(1)}x`);
   }
 
