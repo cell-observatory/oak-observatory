@@ -22986,9 +22986,12 @@ test('statusline: each window draws and keeps its freshest reading, a payload sh
   const nopy = path.join(rig.home, 'no-python');
   fs.mkdirSync(nopy);
   const jq = rig.env.PATH.split(path.delimiter).find((d) => fs.existsSync(path.join(d, 'jq')));
+  // Each name once, by name: /bin is /usr/bin where /usr is merged, and existsSync follows a link, so a link whose target
+  // is missing (grub-ntldr-img on Ubuntu 26.04) read as not linked yet, and the second pass's symlink threw EEXIST.
+  const linked = new Set();
   for (const dir of ['/usr/bin', '/bin', jq]) {
     for (const name of fs.existsSync(dir) ? fs.readdirSync(dir) : []) {
-      if (!/^python/.test(name) && !fs.existsSync(path.join(nopy, name))) fs.symlinkSync(path.join(dir, name), path.join(nopy, name));
+      if (!/^python/.test(name) && !linked.has(name)) { linked.add(name); fs.symlinkSync(path.join(dir, name), path.join(nopy, name)); }
     }
   }
   const bare = rig.render(state, session(idle[0], 0, 0), cache, { PATH: nopy });
