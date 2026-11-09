@@ -8,6 +8,8 @@ the release notes.
 
 ## [Unreleased]
 
+## [0.11.0] — 2026-11-07
+
 ### Upgrading from 0.10.0
 
 - **Node.js 24 or newer.** 0.10 ran on Node 20, and `oak update` installs this release there with
