@@ -1416,6 +1416,10 @@ test('app: choosing what Review shows closes the launch rule; so does a key, pas
         .filter((l) => l && Array.from({ length: COLS }, (_, x) => l.getCell(x)).some((c) => c?.isInverse())).map((l) => l.translateToString(true)); };
       await press(...keys);
       if (then) await then({ press, status, lines, marked, child, fx });
+      // A GUI editor starts detached and the status row says it ran at once, but its stand-in records its arguments
+      // only once its own node is up, which on a loaded runner is after the keys have settled (macOS, 2026-11-09).
+      const launched = () => /^(opened |GUI editor ).* — ran /.test(status());
+      for (const until = Date.now() + 20000; Date.now() < until && (/^opening /.test(status()) || (launched() && !read(fx.edLog).length));) { await new Promise((r) => setTimeout(r, 50)); await flush(); }
       return { fx, status: status(), after: raw.slice(at), editor: read(fx.edLog).map((l) => JSON.parse(l)),
         ssh: read(fx.execLog).join('\n').split(/^ssh$/m).slice(1).map((s) => s.slice(1, s.indexOf('\n.\n')).split('\n'))
           // The review's own reads go over ssh -T; an editor's session is the one with a terminal.
