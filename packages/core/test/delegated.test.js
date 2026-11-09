@@ -89,10 +89,12 @@ test('delegated: a Claude agent through every state, from its own transcript, ha
   f.claude('s-claude-1', f.work, [{ type: 'user', timestamp: new Date().toISOString(), message: { role: 'user', content: 'brief' } }, tool('c1')]);
   const working = stateOf('a1', { native });
   assert.equal(working.state, 'working', 'a tool call in progress');
-  core.writeAttention('s-claude-1', { kind: 'permission', message: 'Bash', ts: Date.now() - 1000 });
+  const raised = Date.now() - 1000;
+  core.writeAttention('s-claude-1', { kind: 'permission', message: 'Bash', ts: raised });
   const blocked = stateOf('a1', { native });
   assert.equal(blocked.state, 'blocked');
-  assert.ok(Math.abs(blocked.since - (Date.now() - 1000)) < 50, 'since the hand went up');
+  // The hand's own time: measured against the clock after the read, a Windows runner's read outlasted the 50 ms allowed.
+  assert.equal(blocked.since, raised, 'since the hand went up');
   core.clearAttention('s-claude-1');
   f.claude('s-claude-1', f.work, [tool('c1'), result('c1'), said(2)]);
   assert.equal(stateOf('a1', { native }).state, 'waiting', 'the turn ended with no report');
