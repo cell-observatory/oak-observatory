@@ -125,8 +125,16 @@ async function drive(row) {
   const settle = async (ms) => { last = Math.max(last, Date.now()); const until = Date.now() + 5000; while (Date.now() - last < ms && Date.now() < until) await new Promise((r) => setTimeout(r, 30)); await flush(); };
   // A verb still running says so on the status row (`redoing 1 edit(s)…`): quiet is not done. Its answer is
   // waited for, as a reader would wait, up to a deadline a loaded machine still meets.
-  // A key row may wait for the screen to show something before its next key (a tab's program starting).
-  const until = async (re, ms = 10000) => { for (const end = Date.now() + ms; Date.now() < end && !re.test(lines().join('\n'));) { await new Promise((r) => setTimeout(r, 50)); await flush(); } };
+  // What a failed row saw: the screen, what the fake herdr client received, and whether the app had exited.
+  const shown = () => `screen:\n${lines().join('\n')}\nherdr received: ${JSON.stringify(fs.existsSync(fx.herdrLog) ? fs.readFileSync(fx.herdrLog, 'utf8') : '')}${exited ? '\nthe app had exited' : ''}`;
+  // A key row may wait for the screen to show something before its next key (a tab's program starting). A wait that
+  // ends without it fails there, rather than as a later check after keys that went to a screen not yet drawn.
+  const until = async (re, ms = 10000) => {
+    for (const end = Date.now() + ms; !re.test(lines().join('\n'));) {
+      if (Date.now() >= end) throw new Error(`the screen did not show ${re} within ${ms} ms\n${shown()}`);
+      await new Promise((r) => setTimeout(r, 50)); await flush();
+    }
+  };
   const answered = async () => { for (const end = Date.now() + 15000; Date.now() < end && /…\s*$/.test(lines()[ROWS - 3]);) { await new Promise((r) => setTimeout(r, 50)); await flush(); } };
   try {
     // The empty transcript has no title. Workers names its session row `ws`; the catalog's temporary
@@ -177,7 +185,7 @@ async function drive(row) {
     const checkedAt = Date.now();
     for (;;) {
       try { row.check(view(lines())); break; } catch (error) {
-        if (Date.now() - checkedAt > 10000) throw error;
+        if (Date.now() - checkedAt > 10000) throw new Error(`the check still failed after 10 s: ${error.message}\n${shown()}`, { cause: error });
         await new Promise((r) => setTimeout(r, 100)); await flush(); list = null;
       }
     }
@@ -902,7 +910,7 @@ fs.writeFileSync(${JSON.stringify(fx.edLog)}, JSON.stringify([requests.length ? 
       } };
   })(),
   { id: ':doctor shows oak sync\'s rows and the local index\'s, each with its fix', prep: syncWorld, mentions: 'type a command (status, doctor',
-    keys: [':', ...'doctor', K.enter, (c, { until }) => until(/doctor — esc to close/, 20000), 'G'],
+    keys: [':', ...'doctor', K.enter, (c, { until }) => until(/doctor\s+—\s+esc to close/, 20000), 'G'],
     wait: 2500, check: (r) => {
       // Read whole: a row the overlay wraps goes on after a ▸.
       const text = r.text.replace(/\s*▸/g, ' ').replace(/\s+/g, ' ');
