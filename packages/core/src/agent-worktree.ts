@@ -23,7 +23,9 @@ export function parseAgentWorktree(text: string): AgentWorktree | undefined {
 function git(cwd: string, args: string[], timeout = 1000): string {
   const r = spawnToolSync('git', ['-c', 'core.fsmonitor=false', '-c', 'core.untrackedCache=false', '-C', cwd, ...args],
     { encoding: 'utf8', timeout, maxBuffer: 256 * 1024, env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' } });
-  if (r.error || r.status !== 0) throw new Error(`agent worktree: ${String(r.stderr || r.error?.message || 'git failed').trim()}`);
+  // The spawn error first: a command past its timeout has often written a warning already (Windows' CRLF note on every
+  // diff), which named the failure in its place (Windows CI 2026-11-09).
+  if (r.error || r.status !== 0) throw new Error(`agent worktree: ${String(r.error?.message || r.stderr || 'git failed').trim()}`);
   return String(r.stdout);
 }
 export function checkAgentRepository(cwd: string): string {

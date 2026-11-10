@@ -18,9 +18,11 @@ function fixture(t) {
     assert.equal(options.env.GIT_OPTIONAL_LOCKS, '0');
     const a = args.slice(args.indexOf('-C') + 2);
     state.calls.push(a);
-    // A status that takes `statusMs`: past its timeout, spawnSync kills it and says ETIMEDOUT.
+    // A status that takes `statusMs`: past its timeout, spawnSync kills it and says ETIMEDOUT, after the warning Git for
+    // Windows writes when it reads a file with LF endings (core.autocrlf), which the error once reported in its place.
     if (a[0] === 'status' && options.timeout < (state.statusMs ?? 0))
-      return { status: null, signal: 'SIGTERM', error: Object.assign(new Error('spawnSync git ETIMEDOUT'), { code: 'ETIMEDOUT' }), stdout: '', stderr: '' };
+      return { status: null, signal: 'SIGTERM', error: Object.assign(new Error('spawnSync git ETIMEDOUT'), { code: 'ETIMEDOUT' }), stdout: '',
+        stderr: "warning: in the working copy of 'file.txt', LF will be replaced by CRLF the next time Git touches it\n" };
     let stdout = '';
     if (a[0] === 'status') stdout = state.status;
     else if (a[0] === 'rev-parse') stdout = a.includes('--abbrev-ref') || a.includes('--symbolic-full-name') ? 'main\n' : state.head + '\n';
@@ -258,20 +260,23 @@ test('agent worktree: real read-only Git reports synthetic clean, dirty, ahead, 
   const w = core.detectAgentWorktree(g.tree);
   assert.equal(w.branch, 'oak/agent-x');
   assert.equal(w.base, g.initial.id);
-  const clean = core.readAgentWorktree(w);
+  // The states, not the deadline (its own test above): a read gets 10 s, as a refresh's 1.5 s (0.5 s a command) let one
+  // stalled git diff on a Windows runner fail the clean read (2026-11-09).
+  const read = () => core.readAgentWorktree(w, Date.now(), 10000);
+  const clean = read();
   assert.equal(clean.error, undefined);
   assert.deepEqual([clean.dirty, clean.files, clean.ahead, clean.behind, clean.merged], [false, 0, 0, 0, true]);
   fs.appendFileSync(path.join(g.tree, 'file.txt'), 'two\n');
-  const dirty = core.readAgentWorktree(w);
+  const dirty = read();
   assert.deepEqual([dirty.dirty, dirty.files, dirty.added, dirty.removed, dirty.merged], [true, 1, 1, 0, false]);
   const next = g.commit('one\ntwo\n', g.initial.id); g.agent(next);
-  const ahead = core.readAgentWorktree(w);
+  const ahead = read();
   assert.deepEqual([ahead.dirty, ahead.ahead, ahead.behind, ahead.merged], [false, 1, 0, false]);
   g.main(next);
-  const merged = core.readAgentWorktree(w);
+  const merged = read();
   assert.deepEqual([merged.ahead, merged.behind, merged.merged], [0, 0, true]);
   g.main(g.commit('one\ntwo\nthree\n', next.id));
-  assert.equal(core.readAgentWorktree(w).behind, 1);
+  assert.equal(read().behind, 1);
   assert.match(core.diagnoseAgentWorktrees(g.repository).detail, /agent-x/);
   assert.ok(!fs.existsSync(path.join(g.tree, '.git/index.lock')));
   t.diagnostic(`real Git reads: clean ${clean.durationMs} ms/${clean.calls} calls; dirty ${dirty.durationMs} ms/${dirty.calls} calls; ahead ${ahead.durationMs} ms/${ahead.calls} calls; merged ${merged.durationMs} ms/${merged.calls} calls`);
