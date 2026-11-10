@@ -8,6 +8,18 @@ the release notes.
 
 ## [Unreleased]
 
+### Fixed
+
+- `oak install-extensions` and `oak update` no longer take the `cursor` script that Cursor's agent CLI installs in
+  `~/.local/bin` for the editor. With no Cursor app command on the PATH, that script exits with "No Cursor IDE
+  installation found", and the extension install failed. They now use the next `cursor` on the PATH, or Cursor's
+  install location, and report the editor's command as not found when there is neither.
+- Commands OAK runs on a saved machine over ssh find programs in `~/bin`, as a Debian or Ubuntu login shell does.
+  An update from another machine missed the Cursor command kept there.
+- `bootstrap.sh --channel dev` and `install.ps1 -Channel dev` install the latest release when it is newer than the
+  rolling pre-release, as `oak update` and `oak install-extensions` already did. Right after a release, they installed
+  the older pre-release CLI beside the release's editor extensions.
+
 ## [0.11.0] — 2026-11-07
 
 ### Upgrading from 0.10.0

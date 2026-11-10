@@ -1717,7 +1717,7 @@ test('CLI usage --pull-machines: where this machine has no current Claude share,
   const calls = f.sshCalls();
   assert.deepEqual(calls.map((c) => c[c.length - 2]).sort(), ['me@build-box', 'me@other-box']);
   assert.deepEqual(calls[0].slice(0, 7), ['-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8', '-o', 'StrictHostKeyChecking=accept-new']);
-  assert.equal(calls[0].at(-1), 'env PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH" CLAUDE_OBSERVATORY_NO_UPDATE_CHECK=1 oak __usage-records --json');
+  assert.equal(calls[0].at(-1), 'env PATH="$HOME/.local/bin:$HOME/bin:/opt/homebrew/bin:/usr/local/bin:$PATH" CLAUDE_OBSERVATORY_NO_UPDATE_CHECK=1 oak __usage-records --json');
   assert.equal(fs.readFileSync(f.b.env.MACHINE_EXEC_ENV, 'utf8'), '', 'no ssh carries this machine\'s store or agent identity');
   delete f.b.env.MACHINE_EXEC_ENV;
   // Kicked again within five minutes, the detached refresh asks nothing.

@@ -7263,10 +7263,18 @@ async function applyComponents(plan: UpdateComponent[]): Promise<UpdateComponent
  *  is still DETECTED via its dir, so a null means "installed but we can't drive an update", which the
  *  caller must SURFACE, never swallow. Mirrors core.resolveBin (candidates → PATH fallback). */
 function resolveEditorCli(cli: string, app: string, winApp: string): string | null {
-  if (onPath(cli)) return cli; // bare name; the launcher routes it through cmd.exe on Windows
   const fs = require('fs');
   const path = require('path');
   const os = require('os');
+  if (onPath(cli)) {
+    if (cli !== 'cursor' || process.platform === 'win32') return cli; // bare name; the launcher routes it through cmd.exe on Windows
+    // The editor's own command is the first `cursor` on PATH that is not the agent's shim (see isCursorAgentShim).
+    const found = String(process.env.PATH || '').split(':').filter(Boolean).map((d) => path.join(d, cli))
+      .filter((p) => { try { fs.accessSync(p, fs.constants.X_OK); return fs.statSync(p).isFile(); } catch { return false; } });
+    if (!found.length || !isCursorAgentShim(found[0])) return cli;
+    const editor = found.find((p) => !isCursorAgentShim(p));
+    if (editor) return editor;
+  }
   const home = os.homedir();
   const cands: string[] = [];
   if (process.platform === 'darwin') {
@@ -7289,9 +7297,21 @@ function resolveEditorCli(cli: string, app: string, winApp: string): string | nu
     cands.push(`/usr/share/${cli}/bin/${cli}`, `/usr/bin/${cli}`, `/snap/bin/${cli}`, path.join(home, '.local', 'bin', cli));
   }
   for (const p of cands) {
-    try { if (fs.existsSync(p)) return p; } catch { /* ignore */ }
+    try { if (fs.existsSync(p) && !isCursorAgentShim(p)) return p; } catch { /* ignore */ }
   }
   return null;
+}
+
+/** Cursor's agent CLI installs a `cursor` script in ~/.local/bin that runs the next `cursor` on PATH and, with none,
+ *  exits 1 ("No Cursor IDE installation found"). It is not the editor: an `--install-extension` through it failed
+ *  wherever the editor's own command was not on PATH (2026-11-09). */
+function isCursorAgentShim(file: string): boolean {
+  const fs = require('fs');
+  try {
+    return fs.statSync(file).size < 16384 && fs.readFileSync(file, 'utf8').includes('No Cursor IDE installation found');
+  } catch {
+    return false;
+  }
 }
 
 /**

@@ -370,8 +370,10 @@ export function editorBin(command: string): string {
 
 /** Where a non-interactive ssh finds the remote's `oak`, and the programs a remote command runs. Such a
  *  shell sources no profile, so its PATH is the system's alone: `oak machine add` installs to
- *  ~/.local/bin, and npm or Homebrew globals land in /opt/homebrew/bin (Apple silicon) or /usr/local/bin. */
-export const MACHINE_PATH = '$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH';
+ *  ~/.local/bin, and npm or Homebrew globals land in /opt/homebrew/bin (Apple silicon) or /usr/local/bin. ~/bin
+ *  follows ~/.local/bin, as a Debian or Ubuntu login profile orders them: an editor command kept there (an AppImage
+ *  Cursor's) was found by a login shell and not by an `oak update` over ssh (2026-11-09). */
+export const MACHINE_PATH = '$HOME/.local/bin:$HOME/bin:/opt/homebrew/bin:/usr/local/bin:$PATH';
 
 /** The environment for an ssh to a saved machine: an ssh_config SendEnv wildcard must not export this
  *  machine's store or agent identity, and no ssh asks anything in a dialog. With no terminal to ask on

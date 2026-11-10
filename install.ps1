@@ -78,7 +78,7 @@ New-Item -ItemType Directory -Path $tmp -Force | Out-Null
 try {
     # --- resolve the release ---------------------------------------------------------------------
     # The rolling pre-release keeps a FIXED `dev-latest` tag so its URLs never move; stable is whatever
-    # `releases/latest` serves. Same rule the CLI's channel resolver uses.
+    # `releases/latest` serves. The dev channel then takes the newer of the two, below.
     if ($Channel -eq 'dev') {
         Say 'Finding the newest pre-release...'
         $relUrl = "https://api.github.com/repos/$Repo/releases/tags/dev-latest"
@@ -91,6 +91,27 @@ try {
     } catch {
         Warn "Could not reach the release API for $Repo (channel: $Channel): $($_.Exception.Message)"
         exit 1
+    }
+    # The dev channel serves the newest build, which right after a release is the release itself: 0.12.0 outranks
+    # 0.12.0-dev.N until the next push to dev. `oak install-extensions` and `oak update` choose by that rule, as
+    # bootstrap.sh does. A release outranks its own pre-releases, so it wins when its x.y.z is at least the
+    # pre-release's. The release is optional here: without it the pre-release installs.
+    if ($Channel -eq 'dev') {
+        $xyz = {
+            param($r)
+            $t = "$($r.tag_name)" -replace '^[vV]', ''
+            if ($t -notmatch '^\d{1,9}\.\d{1,9}\.\d{1,9}') { $t = "$($r.name)" }
+            if ($t -match '(\d{1,9})\.(\d{1,9})\.(\d{1,9})') { [version]::new([int]$Matches[1], [int]$Matches[2], [int]$Matches[3]) } else { $null }
+        }
+        try {
+            $stable = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" -Headers @{ Accept = 'application/vnd.github+json' } -UseBasicParsing
+            $pv = & $xyz $rel
+            $sv = & $xyz $stable
+            if ($pv -and $sv -and $sv -ge $pv) {
+                $rel = $stable
+                Say 'The latest release is newer than the pre-release, so the dev channel installs it.'
+            }
+        } catch { }
     }
     $tgz = $rel.assets | Where-Object { $_.name -like '*.tgz' } | Select-Object -First 1
     if (-not $tgz) { Warn "Release $($rel.tag_name) has no CLI tarball."; exit 1 }
