@@ -137,7 +137,9 @@ export function orphanedAgentWorktrees(cwd = process.cwd()): { id: string; path:
   const out: { id: string; path: string }[] = [];
   for (const repo of repositories) {
     try {
-      for (const block of git(repo, ['worktree', 'list', '--porcelain']).split('\n\n')) {
+      // A one-off listing waits on Git as a removal does (10 s). With the default 1 s, a listing that ran longer on a
+      // slow Windows runner timed out, and read as no worktrees at all (2026-11-10).
+      for (const block of git(repo, ['worktree', 'list', '--porcelain'], 10000).split('\n\n')) {
         const p = /^worktree (.+)$/m.exec(block)?.[1];
         if (!p || p === repo) continue;
         const row = rows.find(r => r.worktree?.path === p);

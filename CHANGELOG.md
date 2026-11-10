@@ -19,6 +19,9 @@ the release notes.
 - `bootstrap.sh --channel dev` and `install.ps1 -Channel dev` install the latest release when it is newer than the
   rolling pre-release, as `oak update` and `oak install-extensions` already did. Right after a release, they installed
   the older pre-release CLI beside the release's editor extensions.
+- `oak doctor` and `oak agent close --remove-worktree` wait up to 10 s for Git to list a repository's worktrees.
+  With 1 s, a listing that took longer on a slow machine read as no worktrees at all: doctor reported no orphaned
+  agent worktrees, and the close found no orphaned worktree by that name.
 
 ## [0.11.0] — 2026-11-07
 

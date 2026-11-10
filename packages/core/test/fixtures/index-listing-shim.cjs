@@ -1,7 +1,8 @@
 // Core with the session listing, the inbox, the search and the machine's newest session served from the local index, each
 // checked against the old one on every call: run a listing test file with OAK_LISTING_TEST_DIST pointing here and every one
 // of its assertions holds of the index's answer too. The old one runs first, so what it writes as it reads (its sidecars)
-// is there as before.
+// is there as before. It reads the Codex rollouts afresh (forgetCodexSources): inside their 1 s window it read them as an
+// earlier call had, before the test changed them, and an index answer that came after the window read them as they are.
 const assert = require('node:assert/strict');
 const real = require('../../dist');
 
@@ -22,6 +23,7 @@ function withIndex(fn, pending) {
 module.exports = {
   ...real,
   sessionMeta(cwd, reviewing, opts) {
+    real.forgetCodexSources();
     const old = real.sessionMeta(cwd, reviewing, opts);
     return withIndex((db) => {
       const fromIndex = real.indexedSessionMeta(db, cwd, reviewing, opts);
@@ -30,6 +32,7 @@ module.exports = {
     }, () => old);
   },
   attentionInbox(cwd, opts = {}) {
+    real.forgetCodexSources();
     const old = real.attentionInbox(cwd, opts);
     return withIndex((db) => {
       const fromIndex = real.indexedInbox(db, cwd, opts);
@@ -48,6 +51,7 @@ module.exports = {
     return fromIndex;
   },
   searchConversations(cwd, query, opts) {
+    real.forgetCodexSources();
     const old = real.searchConversations(cwd, query, opts);
     return withIndex((db) => {
       const fromIndex = real.indexedSearch(db, cwd, query, opts);
