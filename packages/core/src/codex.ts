@@ -957,6 +957,13 @@ function rolloutNames(): { names: string[]; files: string[]; foreign: boolean } 
   return rolloutNamesMemo;
 }
 
+/** Forget the rollout walk and the sources read from it before their 1 s window ends. The index's parity check lists
+ *  twice over one state of the files, and a window that ended between the two gave them different Codex clocks. */
+export function forgetCodexSources(): void {
+  sourcesMemo = null;
+  rolloutNamesMemo = null;
+}
+
 /**
  * Locate the rollout for a session: the hook-provided path first (exact), the sessions tree second
  * (the filename embeds the session id — verified shape `rollout-<ts>-<id>.jsonl` under YYYY/MM/DD).
