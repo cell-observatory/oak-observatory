@@ -391,7 +391,7 @@ test('sync plan: by each machine\'s own settings: the backup plans every session
   const calls = w.sshCalls();
   assert.deepEqual(calls.map((c) => c[c.length - 2]).sort(), ['lab@lab', 'u@linux-b', 'u@mac']);
   assert.deepEqual(calls[0].slice(0, 9), ['-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8', '-o', 'StrictHostKeyChecking=accept-new', '-o', 'ControlMaster=no']);
-  assert.equal(calls[0].at(-1), `env PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH" CLAUDE_OBSERVATORY_NO_UPDATE_CHECK=1 oak __sync-inventory --json --user '${me}'`);
+  assert.equal(calls[0].at(-1), `env PATH="$HOME/.local/bin:$HOME/bin:/opt/homebrew/bin:/usr/local/bin:$PATH" CLAUDE_OBSERVATORY_NO_UPDATE_CHECK=1 oak __sync-inventory --json --user '${me}'`);
 });
 
 test('sync: a shared-account machine refuses inventory and fetch having read nothing, and no machine reads what sync never reads', { skip: POSIX }, (t) => {

@@ -19721,6 +19721,38 @@ test('install-extensions: detects an editor that does NOT yet have our extension
   }
 });
 
+test('install-extensions: Cursor\'s agent shim is not the editor (2026-11-09)', { skip: process.platform === 'win32' && 'the shim is a POSIX script' }, () => {
+  // Cursor's agent CLI puts a `cursor` script in ~/.local/bin that runs the next `cursor` on PATH and, with none,
+  // exits 1. Taken for the editor, `--install-extension` failed through it on a machine with no Cursor app on PATH.
+  const home = freshHome();
+  const shimDir = path.join(home, '.local', 'bin');
+  const ideDir = path.join(home, 'cursor-app', 'bin');
+  fs.mkdirSync(shimDir, { recursive: true });
+  fs.mkdirSync(ideDir, { recursive: true });
+  fs.mkdirSync(path.join(home, '.cursor', 'extensions'), { recursive: true }); // Cursor has run here, so its row is listed
+  const shim = path.join(shimDir, 'cursor');
+  fs.writeFileSync(shim, '#!/bin/sh\n# A stand-in for the agent CLI\'s shim, with its message.\n' +
+    'echo "Error: No Cursor IDE installation found. Use \'cursor agent\' or \'agent\' to run the agent." >&2\nexit 1\n', { mode: 0o755 });
+  const ide = path.join(ideDir, 'cursor');
+  const cursorRow = (PATH) => {
+    const env = { ...process.env, HOME: home, USERPROFILE: home, PATH, CLAUDE_OBSERVATORY_RELEASES_API: 'http://127.0.0.1:1/offline', CLAUDE_OBSERVATORY_NO_UPDATE_CHECK: '1' };
+    delete env.CLAUDE_CONFIG_DIR;
+    const out = cp.execFileSync(process.execPath, [CLI, 'install-extensions', '--check', '--json', '--vscode-only'], { env, encoding: 'utf8' });
+    return JSON.parse(out).vscode.find((r) => r.label === 'Cursor');
+  };
+  const sys = '/usr/bin:/bin';
+  // The shim alone. A Cursor this machine has in /usr/bin or /Applications is its own command, never the shim.
+  const alone = cursorRow(`${shimDir}:${sys}`);
+  assert.ok(alone, 'an editor that has run is listed');
+  assert.notEqual(alone.cli, 'cursor', 'the bare name runs the shim');
+  assert.notEqual(alone.cli, shim, 'and so does its path, where a Linux install is also looked for');
+  // The editor's own command later on PATH is the one OAK drives, not the shim ahead of it.
+  fs.writeFileSync(ide, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  assert.equal(cursorRow(`${shimDir}:${ideDir}:${sys}`).cli, ide);
+  // With the editor's command first, as before: the bare name.
+  assert.equal(cursorRow(`${ideDir}:${shimDir}:${sys}`).cli, 'cursor');
+});
+
 test('install-extensions: installs a LOCAL artifact into a bare JetBrains IDE (0.10.0)', () => {
   // The from-source path install.sh uses: --jetbrains-zip, no network, and it must install even though
   // nothing of ours is there yet. Exercises zipToolReady + applyJetbrainsZip + the version sentinel.
@@ -19817,6 +19849,32 @@ test('installers: install.ps1 parses as PowerShell', { skip: !hasPwsh() }, () =>
     "', [ref]$null, [ref]$e); if ($e -and $e.Count -gt 0) { $e | ForEach-Object { Write-Output $_.Message }; exit 1 }";
   const r = cp.spawnSync('pwsh', ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8' });
   assert.equal(r.status, 0, `install.ps1 has PowerShell syntax errors:\n${r.stdout}${r.stderr}`);
+});
+
+test('installers: install.ps1\'s dev channel installs the newer of the pre-release and the latest release', { skip: !hasPwsh() }, () => {
+  // Its own block, run with the release API stubbed: bootstrap.sh's run against fake releases is in gates.test.js.
+  const ps1 = fs.readFileSync(path.resolve(__dirname, '../../../install.ps1'), 'utf8');
+  const start = ps1.indexOf("    if ($Channel -eq 'dev') {", ps1.indexOf('The dev channel serves the newest build'));
+  const block = ps1.slice(start, ps1.indexOf('\n    }\n', start) + 6);
+  assert.match(block, /Invoke-RestMethod[\s\S]*\$rel = \$stable/, 'the block that compares the two releases');
+  const pick = (pre, latest) => {
+    const script = [
+      "function Say($m) { Write-Output \"say: $m\" }",
+      latest ? `function Invoke-RestMethod { param($Uri, $Headers, [switch]$UseBasicParsing) if ($Uri -notlike '*/releases/latest') { throw 'unexpected' }; [pscustomobject]@{ tag_name = '${latest}' } }`
+        : "function Invoke-RestMethod { throw 'offline' }",
+      "$Channel = 'dev'; $Repo = 'owner/repo'",
+      `$rel = [pscustomobject]@{ tag_name = 'dev-latest'; name = 'Pre-release ${pre} (rolling, from dev)' }`,
+      block,
+      'Write-Output "picked: $($rel.tag_name)"',
+    ].join('\n');
+    const r = cp.spawnSync('pwsh', ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8' });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    return r.stdout;
+  };
+  // Right after a release, before the next push to dev: 9.9.9 outranks 9.9.9-dev.4.
+  assert.match(pick('9.9.9-dev.4', 'v9.9.9'), /say: The latest release is newer than the pre-release[\s\S]*picked: v9\.9\.9/);
+  assert.match(pick('9.10.0-dev.1', 'v9.9.9'), /picked: dev-latest/, 'a pre-release ahead of the release');
+  assert.match(pick('9.9.9-dev.4', null), /picked: dev-latest/, 'no release to compare with');
 });
 
 function hasPwsh() {

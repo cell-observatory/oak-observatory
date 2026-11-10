@@ -37,7 +37,7 @@ function realTool(name) {
   }
   throw new Error(`${name} is not on PATH`);
 }
-function runBootstrap(t, { npmFails = false, pty = false, digest, plugin = true, tools = false } = {}) {
+function runBootstrap(t, { npmFails = false, pty = false, digest, plugin = true, tools = false, args = [], pre = null, stableFails = false } = {}) {
   const box = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-bootstrap-'));
   t.after(() => fs.rmSync(box, { recursive: true, force: true }));
   const bin = path.join(box, 'bin');
@@ -47,8 +47,14 @@ function runBootstrap(t, { npmFails = false, pty = false, digest, plugin = true,
   fs.writeFileSync(tgz, 'fixture tarball bytes');
   const sha = crypto.createHash('sha256').update(fs.readFileSync(tgz)).digest('hex');
   const json = path.join(box, 'release.json');
-  fs.writeFileSync(json, JSON.stringify({ tag_name: 'v9.9.9', assets: [{ name: 'oak-observatory-9.9.9.tgz',
+  // With a pre-release, the release's notes run past the 128 KiB one argument or environment variable holds on Linux,
+  // as 0.11.0's do (131,125 bytes of JSON).
+  fs.writeFileSync(json, JSON.stringify({ tag_name: 'v9.9.9', ...(pre ? { body: 'notes '.repeat(25000) } : {}), assets: [{ name: 'oak-observatory-9.9.9.tgz',
     digest: `sha256:${digest ?? sha}`, browser_download_url: 'https://fixture.invalid/oak-observatory-9.9.9.tgz' }] }));
+  // The rolling pre-release, as dev-release.yml publishes it: a fixed tag, its version in the name.
+  const preJson = path.join(box, 'pre.json');
+  if (pre) fs.writeFileSync(preJson, JSON.stringify({ tag_name: 'dev-latest', name: `Pre-release ${pre} (rolling, from dev)`, prerelease: true,
+    assets: [{ name: 'oak-observatory-cli-dev.tgz', digest: `sha256:${sha}`, browser_download_url: 'https://fixture.invalid/oak-observatory-cli-dev.tgz' }] }));
   // npm 11 and later print a UUID-shaped path segment as ***, `npm root -g` included; a script npm runs
   // is handed the real prefix.
   const npmPrefix = path.join(box, 'prefix-00000000-0000-4000-8000-000000000000');
@@ -65,7 +71,7 @@ function runBootstrap(t, { npmFails = false, pty = false, digest, plugin = true,
   const script = (body) => `#!/bin/sh\nprintf '%s\\n' "$(basename "$0") $*" >> "${log}"\n${body}\n`;
   fs.writeFileSync(path.join(bin, 'curl'), script(`out=""; url=""
 while [ $# -gt 0 ]; do case "$1" in -o) out="$2"; shift 2 ;; -H) shift 2 ;; -*) shift ;; *) url="$1"; shift ;; esac; done
-case "$url" in *api.github.com*) cat "${json}" ;; *) cp "${tgz}" "$out" ;; esac`), { mode: 0o755 });
+case "$url" in *releases/tags/dev-latest) cat "${preJson}" ;; *releases/latest) ${stableFails ? 'exit 22' : `cat "${json}"`} ;; *api.github.com*) cat "${json}" ;; *) cp "${tgz}" "$out" ;; esac`), { mode: 0o755 });
   fs.writeFileSync(path.join(bin, 'npm'), script(`case "$1" in
   ls) exit 1 ;;
   root) printf '%s\\n' "${npmRoot.replace(/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}/, '***')}" ;;
@@ -75,7 +81,7 @@ case "$url" in *api.github.com*) cat "${json}" ;; *) cp "${tgz}" "$out" ;; esac`
      ${pty === true ? 'mkdir -p "$pkg/node_modules/node-pty"; echo "module.exports = {}" > "$pkg/node_modules/node-pty/index.js"' : ''}`} ;;
 esac`), { mode: 0o755 });
   fs.writeFileSync(path.join(bin, 'oak'), script(''), { mode: 0o755 });
-  const r = cp.spawnSync(realTool('bash'), [path.join(root, 'scripts/bootstrap.sh')], {
+  const r = cp.spawnSync(realTool('bash'), [path.join(root, 'scripts/bootstrap.sh'), ...args], {
     encoding: 'utf8', timeout: 30000, stdio: ['ignore', 'pipe', 'pipe'],
     env: { PATH: bin, HOME: box, TMPDIR: box },
   });
@@ -95,6 +101,26 @@ test('bootstrap: verifies the tarball, installs with --allow-scripts=node-pty an
   const built = runBootstrap(t, { pty: true });
   assert.equal(built.status, 0, built.out);
   assert.doesNotMatch(built.out, /node-pty did not build/, 'a node-pty that loads is not reported');
+});
+
+test('bootstrap: the dev channel installs the newer of the pre-release and the latest release, as `oak update` does', { skip: process.platform === 'win32' && 'POSIX bash' }, t => {
+  const fetched = (r) => (/^curl .*?(https:\/\/fixture\.invalid\/\S+\.tgz)/m.exec(r.calls) || [])[1];
+  // Right after a release, before the next push to dev: 9.9.9 outranks 9.9.9-dev.4.
+  const promoted = runBootstrap(t, { args: ['--channel', 'dev'], pre: '9.9.9-dev.4' });
+  assert.equal(promoted.status, 0, promoted.out);
+  assert.equal(fetched(promoted), 'https://fixture.invalid/oak-observatory-9.9.9.tgz');
+  assert.match(promoted.out, /The latest release is newer than the pre-release, so the dev channel installs it\.[\s\S]*Release: v9\.9\.9  \(channel: dev\)/);
+  // A pre-release ahead of the release, and one with no release to compare it with: the pre-release.
+  for (const opts of [{ pre: '9.10.0-dev.1' }, { pre: '9.9.9-dev.4', stableFails: true }]) {
+    const r = runBootstrap(t, { args: ['--channel', 'dev'], ...opts });
+    assert.equal(r.status, 0, r.out);
+    assert.equal(fetched(r), 'https://fixture.invalid/oak-observatory-cli-dev.tgz', JSON.stringify(opts));
+    assert.match(r.out, /Release: dev-latest  \(channel: dev\)/);
+  }
+  // The stable channel asks for the release alone.
+  const stable = runBootstrap(t, { pre: '9.10.0-dev.1' });
+  assert.equal(fetched(stable), 'https://fixture.invalid/oak-observatory-9.9.9.tgz');
+  assert.doesNotMatch(stable.calls, /dev-latest/);
 });
 
 test('bootstrap: an unbuilt node-pty is blamed on npm\'s script policy, and tools already here are not asked for', { skip: process.platform !== 'linux' && 'the build check is Linux-only' }, t => {

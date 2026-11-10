@@ -91,6 +91,21 @@ else
 fi
 JSON="$(curl -fsSL -H 'Accept: application/vnd.github+json' "$REL_URL")" || {
   warn "Could not reach the release API for $REPO (channel: $CHANNEL)."; exit 1; }
+# The dev channel serves the newest build, which right after a release is the release itself: 0.12.0 outranks
+# 0.12.0-dev.N until the next push to dev. `oak install-extensions` and `oak update` choose by that rule, so the CLI
+# does too, or it lands a version behind the editors. A release outranks its own pre-releases, so the release wins
+# when its x.y.z is at least the pre-release's. Node reads both from files: a release's notes run past the 128 KiB
+# that one argument or environment variable can hold on Linux (0.11.0's JSON is 131,125 bytes).
+if [ "$CHANNEL" = "dev" ] && LATEST_JSON="$(curl -fsSL -H 'Accept: application/vnd.github+json' "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null)" &&
+  printf '%s' "$JSON" > "$TMP/pre.json" && printf '%s' "$LATEST_JSON" > "$TMP/latest.json" && node -e '
+    const xyz = (f) => { try { const r = JSON.parse(require("fs").readFileSync(f, "utf8")); const t = String(r.tag_name || "").replace(/^v/i, "");
+      const m = (/^\d{1,9}\.\d{1,9}\.\d{1,9}/.test(t) ? t : String(r.name || "").slice(0, 256)).match(/(\d{1,9})\.(\d{1,9})\.(\d{1,9})/);
+      return m ? m.slice(1).map(Number) : null; } catch { return null; } };
+    const p = xyz(process.argv[1]), s = xyz(process.argv[2]);
+    process.exit(p && s && (s[0] - p[0] || s[1] - p[1] || s[2] - p[2]) >= 0 ? 0 : 1);' "$TMP/pre.json" "$TMP/latest.json"; then
+  JSON="$LATEST_JSON"
+  say "The latest release is newer than the pre-release, so the dev channel installs it."
+fi
 # Parse without jq (may be absent): the tag, and the CLI tarball's download URL.
 TAG="$(printf '%s\n' "$JSON" | grep -o '"tag_name":[^,]*' | head -1 | sed 's/.*"\([^"]*\)"$/\1/')"
 [ -n "$TAG" ] || { warn "Could not find a $CHANNEL release for $REPO."; exit 1; }

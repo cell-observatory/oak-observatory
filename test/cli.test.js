@@ -1404,7 +1404,7 @@ test('CLI --machine: a review verb runs on the saved machine over ssh and answer
   // No keepalive of OAK's own: the person's ssh_config decides that.
   assert.deepEqual(calls[0].slice(0, 8), ['-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8', '-o', 'StrictHostKeyChecking=accept-new', 'builder@build-box.example']);
   const command = calls[0].slice(8).join('\n');
-  assert.match(command, /^env PATH="\$HOME\/\.local\/bin:\/opt\/homebrew\/bin:\/usr\/local\/bin:\$PATH"/);
+  assert.match(command, /^env PATH="\$HOME\/\.local\/bin:\$HOME\/bin:\/opt\/homebrew\/bin:\/usr\/local\/bin:\$PATH"/);
   assert.match(command, / OAK_FORWARDED=1 OAK_FORWARDED_MACHINE='build-box' /, 'the remote learns the label a repair it prints must name');
   assert.ok(command.endsWith("oak 'list' '--json' '--session' 'remote-review'"));
 });
@@ -1717,7 +1717,7 @@ test('CLI usage --pull-machines: where this machine has no current Claude share,
   const calls = f.sshCalls();
   assert.deepEqual(calls.map((c) => c[c.length - 2]).sort(), ['me@build-box', 'me@other-box']);
   assert.deepEqual(calls[0].slice(0, 7), ['-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8', '-o', 'StrictHostKeyChecking=accept-new']);
-  assert.equal(calls[0].at(-1), 'env PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH" CLAUDE_OBSERVATORY_NO_UPDATE_CHECK=1 oak __usage-records --json');
+  assert.equal(calls[0].at(-1), 'env PATH="$HOME/.local/bin:$HOME/bin:/opt/homebrew/bin:/usr/local/bin:$PATH" CLAUDE_OBSERVATORY_NO_UPDATE_CHECK=1 oak __usage-records --json');
   assert.equal(fs.readFileSync(f.b.env.MACHINE_EXEC_ENV, 'utf8'), '', 'no ssh carries this machine\'s store or agent identity');
   delete f.b.env.MACHINE_EXEC_ENV;
   // Kicked again within five minutes, the detached refresh asks nothing.

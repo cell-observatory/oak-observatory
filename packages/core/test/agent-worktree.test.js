@@ -152,8 +152,9 @@ test('agent worktree: the user\'s own worktree an agent started in is never orph
   // What `oak agent start` records when it starts inside a linked worktree without --worktree.
   const w = core.detectAgentWorktree(userwt);
   assert.equal(w.branch, 'feature');
-  w.state = core.readAgentWorktree(w);
-  assert.equal(w.state.merged, true, 'control: clean and merged, so only the branch rule protects it');
+  // Real Git, so a read gets 10 s, as in the states test below: a refresh's 0.5 s a command is its own test's.
+  w.state = core.readAgentWorktree(w, Date.now(), 10000);
+  assert.equal(w.state.merged, true, `control: clean and merged, so only the branch rule protects it (${w.state.error})`);
   core.writeDelegated({ id: 'a1b2', kind: 'codex', startedMs: 1, state: 'gone', closedMs: 2, worktree: w });
   assert.deepEqual(core.orphanedAgentWorktrees(repo), [], 'the user\'s worktree is not called orphaned');
   assert.throws(() => core.removeAgentWorktree(w), /not a worktree OAK made/);
@@ -297,7 +298,9 @@ test('agent worktree: real Git creates, reads and removes an agent worktree, and
   assert.equal(w.branch, 'oak/agent-y');
   assert.ok(fs.existsSync(path.join(w.path, 'a.txt')));
   fs.writeFileSync(path.join(w.path, 'b.txt'), 'b\n');
-  w.state = core.readAgentWorktree(w);
+  // 10 s, as in the states test above: a refresh's 0.5 s a command failed this read on a Windows runner (2026-11-10).
+  w.state = core.readAgentWorktree(w, Date.now(), 10000);
+  assert.equal(w.state.error, undefined);
   assert.deepEqual([w.state.dirty, w.state.files, w.state.added, w.state.merged], [true, 1, 1, false]);
   assert.equal(core.agentWorktreeSummary(w), '1 file · +1 −0 · not merged');
   assert.throws(() => core.removeAgentWorktree(w), /clean and merged/);
