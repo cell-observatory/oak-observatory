@@ -20,7 +20,8 @@ function fixture(t) {
     state.calls.push(a);
     // A status that takes `statusMs`: past its timeout, spawnSync kills it and says ETIMEDOUT, after the warning Git for
     // Windows writes when it reads a file with LF endings (core.autocrlf), which the error once reported in its place.
-    if (a[0] === 'status' && options.timeout < (state.statusMs ?? 0))
+    // A worktree listing that takes `listMs` times out the same way.
+    if (options.timeout < ((a[0] === 'status' ? state.statusMs : a[0] === 'worktree' && a[1] === 'list' ? state.listMs : 0) ?? 0))
       return { status: null, signal: 'SIGTERM', error: Object.assign(new Error('spawnSync git ETIMEDOUT'), { code: 'ETIMEDOUT' }), stdout: '',
         stderr: "warning: in the working copy of 'file.txt', LF will be replaced by CRLF the next time Git touches it\n" };
     let stdout = '';
@@ -119,6 +120,7 @@ test('agent worktree: doctor names orphaned worktrees without removing them', (t
   const f = fixture(t);
   const w = core.createAgentWorktree(f.work, 'agent-x');
   f.state.list = `worktree ${f.work}\nbranch refs/heads/main\n\nworktree ${w.path}\nbranch refs/heads/oak/agent-x\n\n`;
+  f.state.listMs = 1500; // a listing on a slow machine, past Git's default 1 s here (Windows CI 2026-11-10)
   assert.match(core.diagnoseAgentWorktrees(f.work).fix, /oak agent close --remove-worktree agent-x/);
   core.writeDelegated({ id: 'agent-x', kind: 'codex', startedMs: 1, state: 'working', closedMs: null, worktree: w });
   assert.equal(core.diagnoseAgentWorktrees(f.work).level, 'ok');
