@@ -88,13 +88,22 @@ test('agent setup suggestion: one-frame reads do not consume the first interacti
   async function launch(expectNotice) {
     let raw = '';
     const child = pty.spawn(process.execPath, [CLI, 'tui', '--tab', 'observatory', '--no-mouse'], { cols: 140, rows: 30, cwd: home, env, name: 'xterm-256color' });
+    const exited = new Promise(resolve => child.onExit(resolve));
     child.onData(d => { raw += d; });
+    let hung = false;
     try {
       const until = Date.now() + 8000;
       while (Date.now() < until && !(expectNotice ? raw.includes('oak agent setup') : raw.includes('no agent session yet'))) await new Promise(r => setTimeout(r, 50));
       if (expectNotice) assert.match(raw, /oak agent setup/);
       else { assert.match(raw, /no agent session yet/); assert.doesNotMatch(raw, /oak agent setup/); }
-    } finally { child.kill(); }
+    } finally {
+      // Wait for the exit before the next launch or the folder's removal: between the hangup and its exit the app can
+      // still write its index into the folder, and the removal then failed with ENOTEMPTY (2026-11-10).
+      child.kill();
+      hung = await Promise.race([exited.then(() => false), new Promise(r => setTimeout(r, 5000, true))]);
+      if (hung) { child.kill('SIGKILL'); await exited; }
+    }
+    assert.equal(hung, false, 'the app ends within 5 s of a hangup');
   }
   await launch(true);
   assert.ok(fs.existsSync(marker));
