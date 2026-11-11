@@ -97,6 +97,19 @@ function fixture() {
     env: Object.fromEntries(Object.entries(template.env).map(([k, v]) => [k, swap(v)])) };
 }
 
+// node-pty says only "posix_spawnp failed." (macOS) or "forkpty(3) failed." (Linux), whether it could not open a terminal or
+// could not start the process; one row on a macOS runner failed so (2026-11-10). What still works just after says more.
+function spawnState() {
+  let ptmx, fds, ttys;
+  try { fs.closeSync(fs.openSync('/dev/ptmx', fs.constants.O_RDWR | fs.constants.O_NOCTTY)); ptmx = 'opens'; } catch (e) { ptmx = e.code; }
+  try { fds = fs.readdirSync('/dev/fd').length; } catch (e) { fds = e.code; }
+  const sh = cp.spawnSync('/bin/sh', ['-c', 'echo "$(ulimit -n) $(ps -ax -o pid= | wc -l)"'], { encoding: 'utf8' });
+  const [nofile, procs] = sh.error ? [] : sh.stdout.trim().split(/\s+/);
+  try { ttys = process.platform === 'darwin' ? fs.readdirSync('/dev').filter((n) => /^ttys\d+$/.test(n)).length : fs.readdirSync('/dev/pts').filter((n) => /^\d+$/.test(n)).length; } catch (e) { ttys = e.code; }
+  return `just after: a new terminal (/dev/ptmx) ${ptmx}; terminals in /dev: ${ttys}; this process's open descriptors: ${fds} of ${nofile ?? '?'}; `
+    + (sh.error ? `a plain process did not start: ${sh.error.code}` : `processes: ${procs}`);
+}
+
 /** Run one row: start the app on its tab, press its keys, and check what happened. */
 async function drive(row) {
   const fx = fixture();
@@ -114,8 +127,13 @@ async function drive(row) {
   const env = { ...fx.env, ...row.env };
   for (const [k, v] of Object.entries(env)) if (v === undefined) delete env[k];
   const term = new Terminal({ cols: COLS, rows: ROWS, allowProposedApi: true });
-  const child = pty.spawn(process.execPath, [CLI, 'tui', '--session', fx.session, '--root', fx.ws, '--tab', row.tab ?? 'review'],
-    { cols: COLS, rows: ROWS, cwd: fx.ws, env, name: 'xterm-256color' });
+  let child;
+  try {
+    child = pty.spawn(process.execPath, [CLI, 'tui', '--session', fx.session, '--root', fx.ws, '--tab', row.tab ?? 'review'],
+      { cols: COLS, rows: ROWS, cwd: fx.ws, env, name: 'xterm-256color' });
+  } catch (error) {
+    throw new Error(`the app's terminal did not start: ${error.message}\n${spawnState()}`, { cause: error });
+  }
   let raw = '', last = Date.now(), exited = false;
   child.onData((d) => { raw += d; last = Date.now(); term.write(d); });
   child.onExit(() => { exited = true; });
