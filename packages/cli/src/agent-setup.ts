@@ -1,6 +1,6 @@
 import * as core from '@oak-observatory/core';
 
-/** An opt-in plan, with no writes until --yes or the terminal's final confirmation. */
+/** A plan, with no writes until --yes or the terminal's final confirmation. */
 export async function cmdAgentSetup(args: string[]): Promise<void> {
   const project = args.includes('--project') ? process.cwd() : undefined;
   const remove = args.includes('--remove');
@@ -51,5 +51,8 @@ export async function cmdAgentSetup(args: string[]): Promise<void> {
     if (!accepted) return;
   }
   core.applyAgentSetup(plan);
+  // `oak init` and `oak update` set up the user's guidance by default: a removal keeps it out of both, and setting it
+  // up again ends that.
+  if (!project) core.setAgentSetupDeclined(remove);
   output();
 }
