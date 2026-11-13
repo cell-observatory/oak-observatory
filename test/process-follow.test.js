@@ -1,3 +1,4 @@
+const { decodeRemoteLog } = require('./fixtures/remote-command.cjs');
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
@@ -234,7 +235,7 @@ test('CLI process follow reads appended output on the saved machine through fake
   assert.doesNotMatch(out, /LOCAL MUST NEVER/);
   const snapshots = out.trim().split('\n').map(JSON.parse);
   assert.equal(snapshots.at(-1).process.exitCode, 0);
-  assert.match(fs.readFileSync(log, 'utf8'), /processes/);
+  assert.match(decodeRemoteLog(fs.readFileSync(log, 'utf8')), /processes/);
 });
 
 test('Observatory lists running shells, folds finished shells and tails the selected output', t => {
@@ -324,7 +325,7 @@ test('dashboard processes: synthetic 1,000 shells, worker, Codex and saved machi
     assert.equal(codex.processes.length, 1);
     assert.match(codex.selected.outputTail, new RegExp(`${machine ? 'REMOTE' : 'LOCAL'} CODEX`));
   }
-  assert.match(fs.readFileSync(fx.log, 'utf8'), /processes/);
+  assert.match(decodeRemoteLog(fs.readFileSync(fx.log, 'utf8')), /processes/);
   // A large output file and 998 finished shells do not turn a list refresh into whole-file reads.
   const fd = fs.openSync(fx.local.output, 'w'); fs.ftruncateSync(fd, 50 * 1024 * 1024); fs.closeSync(fd);
   core.sessionProcesses(fx.local.work, 'parent');

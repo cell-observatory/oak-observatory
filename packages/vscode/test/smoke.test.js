@@ -1,3 +1,4 @@
+const { decodeRemoteLog } = require('../../../test/fixtures/remote-command.cjs');
 /* Extension smoke test — loads the built bundle against a minimal `vscode` mock and drives its
    commands over an isolated store. Run with `node --test` (npm test builds the bundle first). */
 const { test, after } = require('node:test');
@@ -2583,7 +2584,7 @@ esac\nexit 0\n`, { mode: 0o755 });
             assert.match(host.innerHTML, /data-proc="codex-123"/);
             assert.match(host.innerHTML, new RegExp(`${machine ? 'remote' : 'local'}-codex`));
           }
-          assert.match(fs.readFileSync(fx.log, 'utf8'), /views/);
+          assert.match(decodeRemoteLog(fs.readFileSync(fx.log, 'utf8')), /views/);
         } finally { fs.rmSync(dir, { recursive: true, force: true }); }
       }
       // Solo mode is the control: the same payload, five member tabs, no group tab anywhere.

@@ -17,7 +17,20 @@ Node.js 24 or newer, it then copies OAK to `~/.local/lib/oak`, with a launcher a
 installed by npm or linked to a checkout, is left as it is, and the capture hooks are installed with it. Use SSH keys or an
 existing SSH configuration; the operation is non-interactive. The herdr tab is its real client,
 including its machine switcher. `HERDR_REMOTE_BINARY` can select a remote binary where needed.
-A newer local herdr is left alone; remote provisioning still uses the pin.
+A newer local herdr is left alone; an existing remote herdr at the pin or newer is accepted on every platform.
+On Windows, use Git Bash, MSYS2 or Cygwin as the SSH login shell and install herdr and OAK there first.
+OAK accepts herdr on PATH or at `~/.local/bin/herdr/herdr.exe`, finds `oak` on the login shell's PATH
+(including npm's Windows prefix), and installs its capture hooks without copying a POSIX launcher.
+If either program is missing or herdr is too old, install it on Windows and re-run the add.
+
+Machine add checks the login shell's quoting before installing or saving the machine. Windows OpenSSH
+configured to use the WSL launcher as its login shell can lose quoted assignments; connect to the
+WSL distro's own sshd instead. Installation scripts travel on stdin. Forwarded OAK commands, updates,
+usage reads and sync commands are base64-encoded for the remote shell (`sh` and `base64 -d` are required).
+Commands that read input keep it separate from the script; other non-interactive SSH calls receive no stdin.
+A failed copy removes that run's temporary files. A failed launcher or version check restores the earlier
+OAK bundle and launcher. If the connection is lost and cleanup cannot run, OAK reports the temporary path;
+remove it after SSH works again. Capture-hook changes made by `oak init` are best-effort and are not rolled back.
 
 OAK joins herdr's live pane identities with captured sessions. A remote prompt is submitted through
 `herdr --machine <label> agent prompt`; it never passes through an OAK SSH relay. For an explicit
@@ -312,6 +325,13 @@ over a different one here. A folder that holds a record under this machine's nam
 was last written, and setup asks on a terminal whether this machine is a reinstall of that one; off a terminal,
 `--restore` says it is. It then previews a first run, and says whether anything runs in the background: nothing does
 until a machine is saved here or a backup folder is set.
+A Windows peer with a Git Bash SSH login shell can use its installed OAK for sync. The remote commands
+are `oak __sync-inventory` (with `--publish` for an actual pull), `oak __sync-fetch` (a request on stdin,
+file bytes on stdout), and `oak __sync-key`. They use the remote's HOME and inherited PATH and no PTY,
+so file bytes are not changed to terminal line endings. No rsync, tar, or remote temporary files are needed.
+Native Windows SSH shells such as PowerShell or cmd.exe are not supported by this POSIX transport.
+Windows end-to-end operation still needs confirmation on a Windows host.
+
 `oak machine add` suggests it once a machine is saved, and `oak doctor` does on a machine with a saved machine and no
 choice made yet; a machine with no saved machine is never told.
 
