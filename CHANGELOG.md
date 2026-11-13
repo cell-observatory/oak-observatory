@@ -10,6 +10,14 @@ the release notes.
 
 ### Fixed
 
+- `oak machine add` accepts Windows remotes running Git Bash, MSYS2 or Cygwin when herdr and OAK are already
+  installed. It checks for herdr before rejecting an unsupported install platform, recognizes the Windows
+  `herdr/herdr.exe` layout, and uses the installed OAK without copying a POSIX launcher.
+- Remote installation scripts travel on stdin, and forwarded commands, updates, usage reads and sync commands
+  are encoded so an SSH login shell cannot strip their quoted assignments. Machine add diagnoses a shell that
+  mangles quotes before installing, with advice to use the WSL distro's own sshd. Failed installs remove their
+  temporary copies and restore an earlier OAK bundle and launcher; SSH calls that need no input receive none.
+
 - `oak install-extensions` and `oak update` no longer take the `cursor` script that Cursor's agent CLI installs in
   `~/.local/bin` for the editor. With no Cursor app command on the PATH, that script exits with "No Cursor IDE
   installation found", and the extension install failed. They now use the next `cursor` on the PATH, or Cursor's

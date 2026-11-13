@@ -57,7 +57,7 @@ function judgeFailure(code: number | null, stderr: string, verb: string, deps: S
 /** Start a saved machine's hidden sync command over OAK's own ssh as the usage readings reach it (herdr's target,
  *  MACHINE_PATH, never an interactive shell, `ControlMaster=no` so it never becomes a shared connection's master). */
 function sshSync(target: string, verb: string, user: string, deps: SyncCliDeps, stdin: boolean, publish = false): ChildProcess {
-  const remote = `env PATH="${core().MACHINE_PATH}" CLAUDE_OBSERVATORY_NO_UPDATE_CHECK=1 oak ${verb}${verb === '__sync-inventory' ? ` --json${publish ? ' --publish' : ''}` : ''} --user ${quote(user)}`;
+  const remote = core().remoteShellCommand(`env PATH="${core().MACHINE_PATH}" CLAUDE_OBSERVATORY_NO_UPDATE_CHECK=1 oak ${verb}${verb === '__sync-inventory' ? ` --json${publish ? ' --publish' : ''}` : ''} --user ${quote(user)}`);
   const child = core().spawnTool('ssh', ['-T', ...deps.sshOpts, '-o', 'ControlMaster=no', target, remote], {
     stdio: [stdin ? 'pipe' : 'ignore', 'pipe', 'pipe'], direct: true, windowsHide: true, env: core().machineSshEnv(),
   });

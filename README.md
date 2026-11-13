@@ -491,7 +491,9 @@ updates follow it from then on). Beyond that, each surface can keep **itself** c
 
 **Platforms:** herdr is required on every platform and ships for Linux and macOS on x86_64 and arm64,
 and Windows on x86_64 only; Windows-on-ARM has no herdr build. Windows support for herdr-backed pane
-listing, replies and agent start is untested in this release. `oak machine add` targets must be POSIX hosts.
+listing, replies and agent start is untested in this release. `oak machine add` can also save a Windows remote whose SSH login shell is Git Bash, MSYS2 or Cygwin,
+with herdr and OAK already installed there; it installs neither binary on Windows. See
+[remote setup](docs/REMOTE.md) for the shell requirements and quoting diagnostic.
 On **Linux**, npm compiles node-pty, the helper the terminal app's herdr tab runs herdr in, while it
 installs OAK. That needs `python3`, `make` and a C++ compiler (`g++`, or whatever `$CXX` names;
 `build-essential` on Debian and Ubuntu), an npm prefix with no space in its path, and, under npm 12,
