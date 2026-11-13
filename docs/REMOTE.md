@@ -26,7 +26,7 @@ If either program is missing or herdr is too old, install it on Windows and re-r
 Machine add checks the login shell's quoting before installing or saving the machine. Windows OpenSSH
 configured to use the WSL launcher as its login shell can lose quoted assignments; connect to the
 WSL distro's own sshd instead. Installation scripts travel on stdin. Forwarded OAK commands, updates,
-usage reads and sync commands are base64-encoded for the remote shell (`sh` and `base64 -d` are required).
+usage reads and sync commands are base64-encoded for the remote shell (`sh` and `base64` are required).
 Commands that read input keep it separate from the script; other non-interactive SSH calls receive no stdin.
 A failed copy removes that run's temporary files. A failed launcher or version check restores the earlier
 OAK bundle and launcher. If the connection is lost and cleanup cannot run, OAK reports the temporary path;
