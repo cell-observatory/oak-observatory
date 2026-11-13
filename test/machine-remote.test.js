@@ -72,6 +72,26 @@ for (const system of ['MINGW64_NT-10.0-26100', 'MSYS_NT-10.0-26100', 'CYGWIN_NT-
   });
 }
 
+// The encoded command decodes with macOS's -D, and where -D is refused (GNU coreutils, busybox, Git Bash) with -d. A
+// -d that does not decode (a macOS -d) is never reached, and the decoded script still reads the caller's input.
+test('machine remote: the encoded command decodes with -D, or with -d where -D is refused', { skip: posix }, t => {
+  const core = require('../packages/core/dist');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-b64-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const real = cp.execFileSync('sh', ['-c', 'command -v base64'], { encoding: 'utf8' }).trim();
+  const command = core.remoteShellCommand("sed 's/^/decoded /'");
+  for (const [kind, script] of [
+    ['only -D decodes', `case "$1" in -D) exec "${real}" -d ;; *) echo "base64: -d is not decode here" >&2; exit 0 ;; esac`],
+    ['-D refused', `case "$1" in -d) exec "${real}" -d ;; *) echo "base64: invalid option -- 'D'" >&2; exit 1 ;; esac`],
+  ]) {
+    const bin = path.join(dir, kind.replace(/\W+/g, '-'));
+    fs.mkdirSync(bin);
+    fs.writeFileSync(path.join(bin, 'base64'), `#!/bin/sh\n${script}\n`, { mode: 0o755 });
+    const out = cp.execFileSync('sh', ['-c', command], { input: 'the input\n', encoding: 'utf8', env: { ...process.env, PATH: `${bin}:${process.env.PATH}` } });
+    assert.equal(out, 'decoded the input\n', kind);
+  }
+});
+
 test('machine remote: existing herdr is checked on every platform, with PATH fallback', { skip: posix }, t => {
   for (const system of ['FreeBSD', 'MINGW64_NT-10.0']) {
     const f = remote(t, system); f.herdr('tools/herdr'); f.oak();

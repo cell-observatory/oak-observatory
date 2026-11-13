@@ -1795,7 +1795,7 @@ exec "${process.execPath}" "${CLI}" "$@"
           fs.mkdirSync(path.join(fx.dir, 'real'));
           fs.renameSync(path.join(fx.dir, 'bin', 'ssh'), path.join(fx.dir, 'real', 'ssh'));
           fs.writeFileSync(path.join(fx.dir, 'bin', 'ssh'), `#!/bin/sh\nfor a in "$@"; do last="$a"; done
-case "$last" in '{ printf %s '*) payload=\${last#*%s }; payload=\${payload%% *}; last=$(printf %s "$payload" | base64 -d) ;; esac
+case "$last" in '{ { printf %s '*) payload=\${last#*%s }; payload=\${payload%% *}; last=$(printf %s "$payload" | base64 -d) ;; esac
 case "$last" in *"'search'"*) echo "$$ $PPID" > '${pids}'; exec sleep 30 ;; esac\nexec '${path.join(fx.dir, 'real', 'ssh')}' "$@"\n`, { mode: 0o755 });
         }, 'review', true);
       });
