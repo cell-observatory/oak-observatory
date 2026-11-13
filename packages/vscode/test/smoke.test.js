@@ -5396,6 +5396,24 @@ esac\nexit 0\n`, { mode: 0o755 });
         cmProvider.refresh(true);
         await settle(() => !cmProvider.running && spawned('warm') > 0);
         assert.equal(spawned('warm'), 1, 'control: without it the landed batch starts one warm-up');
+        // Windows' `oak.cmd`, spawned detached, ran cmd.exe with no console, so the node it started opened a console
+        // window of its own for as long as the warm-up ran. The warm-up runs the script the shim names on the editor's
+        // own node instead, as the poll's refreshes do (here a script that records how it ran; the poll may run it too).
+        const shimDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cc-ext-shim-')));
+        tmpDirs.push(shimDir);
+        const script = path.join(shimDir, 'node_modules', 'oak-observatory', 'dist', 'index.js');
+        fs.mkdirSync(path.dirname(script), { recursive: true });
+        const shimRan = path.join(shimDir, 'ran.jsonl');
+        fs.writeFileSync(script, `require('fs').appendFileSync(${JSON.stringify(shimRan)}, JSON.stringify({ args: process.argv.slice(2), node: process.env.ELECTRON_RUN_AS_NODE, cwd: process.cwd() }) + '\\n');\n`);
+        const warms = () => (fs.existsSync(shimRan) ? fs.readFileSync(shimRan, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)) : []).filter((r) => r.args[0] === 'warm');
+        const shim = path.join(shimDir, 'oak.cmd');
+        fs.writeFileSync(shim, '@IF EXIST "%~dp0\\node.exe" (\r\n  "%~dp0\\node.exe"  "%~dp0\\node_modules\\oak-observatory\\dist\\index.js" %*\r\n) ELSE (\r\n  node  "%~dp0\\node_modules\\oak-observatory\\dist\\index.js" %*\r\n)\r\n');
+        process.env.CLAUDE_OBSERVATORY_BIN = shim;
+        cmProvider.warmedAt = 0;
+        cmProvider.warmRecent(ws);
+        await settle(() => warms().length > 0);
+        assert.deepEqual(warms(), [{ args: ['warm', '--root', ws, '--since', '24h'], node: '1', cwd: fs.realpathSync(ws) }],
+          'the warm-up ran the script the shim names, on the editor\'s own node, in the workspace');
       } finally {
         if (noBackground === undefined) delete process.env.OAK_NO_BACKGROUND; else process.env.OAK_NO_BACKGROUND = noBackground;
         cmView.visible = false;

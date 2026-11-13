@@ -14,6 +14,7 @@ import { resolveSessionId, hasAssistantRecord } from './session';
 import { findTranscript } from './observe';
 import { readLog, rootDir } from './store';
 import { HIDDEN_SOURCE } from './hidden';
+import { bashPath, isWslLauncher, winOnPath, GIT_BASH_FIX, type BashLookup } from './spawn';
 
 export type CheckLevel = 'ok' | 'warn' | 'fail';
 
@@ -362,6 +363,21 @@ export function diagnose(input: DiagnoseInput): Check[] {
   return checks;
 }
 
+/** Windows only (null elsewhere): the Git Bash OAK runs the status line with, and whether a bare `bash` reaches the WSL
+ *  launcher instead. OAK and Claude Code run Git Bash by its path, but a command that says `bash`, as the status line
+ *  command an older OAK wrote did, runs Linux, which cannot read the Windows path it is given. */
+export function diagnoseGitBash(opts: BashLookup = {}): Check | null {
+  if ((opts.platform ?? process.platform) !== 'win32') return null;
+  const row = { id: 'git-bash', label: 'Git Bash' };
+  const git = bashPath(opts);
+  const first = winOnPath('bash.exe', opts);
+  const wsl = first !== null && isWslLauncher(first, opts.env ?? process.env);
+  const onPath = wsl ? `; the \`bash\` on PATH is the WSL launcher (${first})` : '';
+  if (!git) return { ...row, level: 'warn', detail: `not found${onPath}: the status line, and its usage bars, need Git Bash`, fix: `${GIT_BASH_FIX}, then run \`oak statusline\`.` };
+  if (wsl) return { ...row, level: 'warn', detail: `${git}${onPath}, so a command that runs a bare \`bash\` runs Linux, not Git Bash`,
+    fix: `Run \`oak statusline\` so the status line command names Git Bash by its path. To make \`bash\` in a terminal Git Bash too, put ${path.win32.dirname(git)} before ${path.win32.dirname(first as string)} in the system PATH.` };
+  return { ...row, level: 'ok', detail: git };
+}
 
 /** Write the channel marker, read it back, and restore it. Proves the setting SURVIVES, not merely
  *  that the write returned without an error. */
