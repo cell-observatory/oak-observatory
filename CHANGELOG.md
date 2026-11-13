@@ -42,6 +42,24 @@ the release notes.
   installing the status line stopped at it before setting up Codex's status line.
 - Inside WSL, `oak install-extensions` skips the Windows editor whose command it reaches through interop, says why,
   and does not count it as a failure. Its install failed there, so `bootstrap.sh` ended with a warning.
+- On Windows, `oak update` no longer waits indefinitely for the setup step of the CLI it installed. That step checked
+  the terminal's PTY in its own process, where a check that never finished kept the update running, and a check that timed out stopped its ConPTY with node-pty's `kill()`, which ends every process on the
+  console it lists. The check now runs in a short-lived process of its own. After 15 s, that process and the processes
+  it started are ended, and nothing else. Over ssh, or without an interactive console, the check is skipped and the
+  update says so; `oak doctor` runs it from a terminal. The setup step exits once it has written its report, and
+  `oak update` stops it after 10 minutes and reports that it did not finish, where it reported a failure.
+- `oak update`, `oak install-extensions` and `install.ps1` refuse to run inside the Claude desktop app on Windows and
+  ask for a normal terminal. The app runs its sessions in its own MSIX package, where Windows keeps what an install
+  writes under `%APPDATA%` in a copy that only the app's sessions see: an `oak` installed or updated there was not the
+  one a terminal or an editor ran. `oak doctor` warns about a copy left under
+  `%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\npm` and says how to remove it. `--check` and `--json`, which
+  only read, still run there.
+- A capture hook no longer fails the tool call it runs around when `oak` is not on the PATH. On macOS and Linux, the
+  hook in a user's Claude Code and Codex settings does nothing when it finds no `oak`; when `oak` is there, its exit
+  status is the hook's, as before. On Windows, and in a project's shared settings, the command is unchanged, and each
+  Claude Code entry carries `onFailure: "continue"`. Without Git Bash, Claude Code otherwise treats a PreToolUse hook
+  that cannot find `oak` as a block. `oak init`, `oak init --repair` and `oak update` rewrite hooks that an older OAK
+  wrote.
 
 ## [0.11.0] — 2026-11-07
 

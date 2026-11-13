@@ -75,6 +75,13 @@ function fail(msg: string): never {
   process.exit(1);
 }
 
+/** Inside the Claude desktop app's Windows package, what an install writes under %APPDATA% lands in the package's
+ *  private copy (core.claudeDesktopPackage), which no terminal and no editor outside the app sees: refused there. */
+function refuseInsideDesktopApp(verb: string): void {
+  const pkg = (require('@oak-observatory/core') as typeof import('@oak-observatory/core')).claudeDesktopPackage();
+  if (pkg) fail(`this runs inside the Claude desktop app (${pkg}), where Windows keeps what an install writes under %APPDATA% in a copy only the app's own sessions see — run \`oak ${verb}\` from a normal terminal (Windows Terminal, or PowerShell from the Start menu)`);
+}
+
 /** True while `emitJson` writes: JSON passes `guardHumanOutput` byte-exact, even from a verb that
  *  answers in JSON without `--json` (`chat-context`). */
 let writingJson = false;
@@ -192,13 +199,14 @@ function getSessionId(args: string[]): string {
 
 // --- init / uninstall: delegate the settings.json merge to the shared core installer ---
 
-function captureCommand(_project: boolean): string {
-  const { HOOK_MARKER } = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
+function captureCommand(project: boolean): string {
+  const { captureHookCommand } = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
   // Portable hook: relies on the globally-installed `oak` bin being on PATH. Survives moving/renaming
   // the repo and works for teammates who `npm i -g`. The trailing shell-comment marker makes the hook
   // recognizable for status/uninstall regardless of where the package lives, and lets a re-run of
-  // `init` migrate a pre-rename `claude-observatory capture` hook to this one in place.
-  return `oak capture #${HOOK_MARKER}`;
+  // `init` migrate a pre-rename `claude-observatory capture` hook to this one in place. A user's hook
+  // is a no-op where `oak` is missing (captureHookCommand says where and why).
+  return captureHookCommand('claude', { project });
 }
 
 function cmdInit(project: boolean, withStatusline = false, repair = false, statuslineForce = false): void {
@@ -208,7 +216,7 @@ function cmdInit(project: boolean, withStatusline = false, repair = false, statu
     // The self-fix for older installs: the upsert install re-run over every file the ledger (plus
     // the user scope) knows, collapsing doubled hooks to one canonical pair per event. Per-file
     // results, because "fixed everywhere" without naming the files is not checkable.
-    const results = core.repairInstall(command);
+    const results = core.repairInstall((scope) => captureCommand(scope === 'project'));
     for (const r of results) {
       const label = `${r.path}${r.scope === 'project' ? c.dim(' (project)') : ''}`;
       if (r.error && r.action !== 'skipped') process.stdout.write(c.red('✗ ') + `${label}: ${r.error}\n`);
@@ -313,7 +321,7 @@ function maybeInitCodex(): Promise<void> {
 
 function cmdInitCodex(verify: boolean): void {
   const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
-  const command = `oak capture --agent codex #${core.HOOK_MARKER}`;
+  const command = core.captureHookCommand('codex');
   let res: import('@oak-observatory/core').CodexInstallResult;
   try {
     res = core.installCodexHooks(command, core.isOurCommand);
@@ -1065,6 +1073,8 @@ async function cmdDoctor(args: string[]): Promise<void> {
   checks.push(core.diagnoseRemoteTitles());
   const codexQuota = core.diagnoseCodexQuota();
   if (codexQuota) checks.push(codexQuota);
+  const desktopCopy = core.diagnoseDesktopAppCopy();
+  if (desktopCopy) checks.push(desktopCopy);
   const herdr = await herdrCheck(args.includes('--fix'));
   checks.push(herdr.check);
   checks.push(python3Check(herdr.report));
@@ -7056,7 +7066,7 @@ async function updateCliBinary(assets: ReleaseAsset[], latest: string, current: 
  * to OAK_UPDATE_REPORT), null when it wrote none: it failed, or it is a release older than the report
  * (a switch down to one).
  */
-function finishInInstalledCli(): { ok: boolean; rows: UpdateComponent[] | null } {
+function finishInInstalledCli(): { ok: boolean; timedOut: boolean; rows: UpdateComponent[] | null } {
   const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
   const fs = require('fs');
   const os = require('os');
@@ -7072,7 +7082,7 @@ function finishInInstalledCli(): { ok: boolean; rows: UpdateComponent[] | null }
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-update-'));
   const report = path.join(dir, 'components.json');
   try {
-    const r = entry ? core.spawnToolSync(process.execPath, [entry, '__after-update'], { stdio: 'inherit', env: { ...process.env, OAK_UPDATE_REPORT: report } }) : null;
+    const r = entry ? core.spawnToolSync(process.execPath, [entry, '__after-update'], { stdio: 'inherit', env: { ...process.env, OAK_UPDATE_REPORT: report }, timeout: afterUpdateTimeout() }) : null;
     let rows: UpdateComponent[] | null = null;
     try {
       const parsed = JSON.parse(fs.readFileSync(report, 'utf8'));
@@ -7080,19 +7090,32 @@ function finishInInstalledCli(): { ok: boolean; rows: UpdateComponent[] | null }
     } catch {
       /* no report: handled by the caller */
     }
-    return { ok: r?.status === 0, rows };
+    return { ok: r?.status === 0, timedOut: (r?.error as NodeJS.ErrnoException | undefined)?.code === 'ETIMEDOUT', rows };
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+}
+
+/** How long `update` waits for the installed CLI's setup step before it stops it: generous, since that step installs
+ *  editor extensions. OAK_AFTER_UPDATE_TIMEOUT_MS overrides it. */
+function afterUpdateTimeout(): number {
+  const configured = Number(process.env.OAK_AFTER_UPDATE_TIMEOUT_MS);
+  return Number.isInteger(configured) && configured > 0 && configured <= 2147483647 ? configured : 10 * 60_000;
 }
 
 /** `__after-update`: the half of `oak update` that belongs to the NEW release (see finishInInstalledCli). */
 async function afterUpdate(): Promise<void> {
   const components = await applyComponents(await componentPlan());
   const tui = require('@oak-observatory/tui') as typeof import('@oak-observatory/tui');
-  const pty = await tui.diagnoseNativeSpawn(true);
-  if (pty.level !== 'ok') process.stdout.write(c.yellow('⚠ ') + `${pty.label}: ${pty.detail}\n` + (pty.fix ? c.dim(`  → ${pty.fix}\n`) : ''));
-  else if (pty.detail.startsWith('repaired')) process.stdout.write(c.green('✓ ') + `${pty.detail}\n`);
+  // In a child of its own with a deadline: on Windows a PTY check that never finished held this step open (Windows
+  // report §2), and node-pty's kill() there ends what is on the console of a pid it is handed.
+  const skipped = tui.ptyCheckSkipped();
+  if (skipped) process.stdout.write(c.dim(`- Native terminal PTY spawn: skipped (${skipped}) — \`oak doctor\` in a terminal checks it\n`));
+  else {
+    const pty = await tui.diagnoseNativeSpawn(true, { isolate: true });
+    if (pty.level !== 'ok') process.stdout.write(c.yellow('⚠ ') + `${pty.label}: ${pty.detail}\n` + (pty.fix ? c.dim(`  → ${pty.fix}\n`) : ''));
+    else if (pty.detail.startsWith('repaired')) process.stdout.write(c.green('✓ ') + `${pty.detail}\n`);
+  }
   // A supported Node whose database is still unavailable (built without node:sqlite, or OAK_INDEX=off): say once, in
   // OAK's words, what that leaves out. An update onto an unsupported Node never gets here: the launcher refuses first.
   const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
@@ -7173,13 +7196,15 @@ async function componentPlan(): Promise<UpdateComponent[]> {
   const hooks = row('hooks', 'Claude Code capture hooks');
   const installed = core.installStatus().filter((f) => f.exists && f.installed);
   const files = installed.filter((f) => f.scope === 'user');
-  const short = files.filter((f) => f.entries !== core.HEALTHY_HOOK_ENTRIES);
+  // A healthy count with an older command (one an `oak` that is gone fails) is work too.
+  const short = files.filter((f) => !core.hooksCurrent(captureCommand(false), f.path));
   out.push(!files.length ? hooks('absent', 'not installed — `oak init` adds them')
-    : short.length ? hooks('update', short.map((f) => `${f.path}: ${f.entries} of ${core.HEALTHY_HOOK_ENTRIES} events`).join('; '))
+    : short.length ? hooks('update', short.map((f) => `${f.path}: ${f.entries === core.HEALTHY_HOOK_ENTRIES ? 'an older hook command' : `${f.entries} of ${core.HEALTHY_HOOK_ENTRIES} events`}`).join('; '))
     : hooks('current', `all ${core.HEALTHY_HOOK_ENTRIES} events`));
-  for (const f of installed.filter((f) => f.scope === 'project' && f.entries !== core.HEALTHY_HOOK_ENTRIES)) {
+  for (const f of installed.filter((f) => f.scope === 'project' && !core.hooksCurrent(captureCommand(true), f.path))) {
     const missing = core.missingHookEvents(f.path);
-    const what = missing.length ? `is missing ${missing.join(', ')}` : `has ${f.entries} entries for its ${core.HEALTHY_HOOK_ENTRIES} events`;
+    const what = missing.length ? `is missing ${missing.join(', ')}`
+      : f.entries === core.HEALTHY_HOOK_ENTRIES ? 'has an older hook command' : `has ${f.entries} entries for its ${core.HEALTHY_HOOK_ENTRIES} events`;
     out.push(row('project-hooks', 'Claude Code project hooks')('manual', `${f.path} ${what} — run \`oak init --repair\` there`));
   }
   const codex = row('codex-hooks', 'Codex capture hooks');
@@ -7188,6 +7213,7 @@ async function componentPlan(): Promise<UpdateComponent[]> {
   out.push(!cx.installed ? codex('absent', 'not installed — `oak init --codex` adds them')
     : cx.disabled ? codex('current', 'turned off in codex config.toml — left alone')
     : cx.trust !== 'trusted' ? codex('update', `trust is ${cx.trust} — reinstall`)
+    : cx.installedCommand !== core.captureHookCommand('codex') ? codex('update', 'an older hook command — reinstall')
     : cx.userDisabled.length ? codex('current', `${cx.userDisabled.join(', ')} turned off in Codex — left alone`)
     : codex('current', 'installed and trusted'));
   // Only OUR status line, never a foreign one: the installer refuses those without --force, and an
@@ -7230,7 +7256,7 @@ async function applyComponents(plan: UpdateComponent[]): Promise<UpdateComponent
         out.push(set(edited.length ? 'manual' : 'updated', edited.length ? edited.map(e => `${e.path}: user-edited; left unchanged`).join('; ') : 'managed delegation guidance refreshed'));
       } else if (p.id === 'hooks') {
         const bad: string[] = [];
-        for (const f of core.installStatus().filter((f) => f.scope === 'user' && f.exists && f.installed && f.entries !== core.HEALTHY_HOOK_ENTRIES)) {
+        for (const f of core.installStatus().filter((f) => f.scope === 'user' && f.exists && f.installed && !core.hooksCurrent(captureCommand(false), f.path))) {
           try {
             core.installHooks(captureCommand(false), f.path);
           } catch (e) {
@@ -7239,7 +7265,7 @@ async function applyComponents(plan: UpdateComponent[]): Promise<UpdateComponent
         }
         out.push(bad.length ? set('failed', bad.join('; ')) : set('updated', `repaired to all ${core.HEALTHY_HOOK_ENTRIES} events`));
       } else if (p.id === 'codex-hooks') {
-        core.installCodexHooks(`oak capture --agent codex #${core.HOOK_MARKER}`, core.isOurCommand);
+        core.installCodexHooks(core.captureHookCommand('codex'), core.isOurCommand);
         const trust = core.codexHooksStatus(core.isOurCommand).trust;
         out.push(trust === 'trusted' ? set('updated', 'reinstalled and trusted') : set('failed', `trust is ${trust} after a reinstall — run \`oak init --codex\``));
       } else if (p.id === 'statusline') {
@@ -7821,6 +7847,7 @@ async function cmdInstallExtensions(args: string[]): Promise<void> {
   if (chI >= 0 && !chRaw) fail('`install-extensions --channel <stable|dev>` requires a value');
   const requested = chRaw ? core.normalizeChannel(chRaw) : null;
   if (chRaw && !requested) fail(`unknown channel "${chRaw}" — use stable or dev (pre-release)`);
+  if (!checkOnly) refuseInsideDesktopApp('install-extensions');
   const channel = requested ?? core.getUpdateChannel();
 
   const allEditors = vscodeEditors();
@@ -8375,6 +8402,8 @@ async function cmdUpdate(args: string[]): Promise<void> {
   const channel = requested ?? core.getUpdateChannel();
   // What every saved machine is asked to do: the same channel and the same --force.
   const passArgs = [...(requested ? ['--channel', requested] : []), ...(force ? ['--force'] : [])];
+  // --check and --json only read.
+  if (!checkOnly && !json) refuseInsideDesktopApp('update');
 
   const releases = await fetchReleases();
   // ONE decision for every surface, in core: a surface is acted on when its installed version
@@ -8493,7 +8522,9 @@ async function cmdUpdate(args: string[]): Promise<void> {
     const finished = finishInInstalledCli();
     // A setup step that failed, or that could not be found to run, may have set up nothing.
     if (!finished.ok)
-      componentResults = [...(finished.rows ?? []), { id: 'setup', label: 'OAK setup', state: 'failed', detail: 'the installed CLI’s setup step failed — run `oak doctor --fix`' }];
+      componentResults = [...(finished.rows ?? []), { id: 'setup', label: 'OAK setup', state: 'failed', detail: finished.timedOut
+        ? `the installed CLI’s setup step did not finish within ${afterUpdateTimeout() / 1000} s and was stopped — run \`oak doctor --fix\``
+        : 'the installed CLI’s setup step failed — run `oak doctor --fix`' }];
     else if (finished.rows) componentResults = finished.rows;
     else {
       // A release older than the per-component report set itself up without saying how.
@@ -9616,7 +9647,8 @@ function main(): void {
       break;
     case '__after-update':
       // Internal, hidden: `oak update` runs this in the CLI it just installed (finishInInstalledCli).
-      afterUpdate().catch((e) => fail(String(e?.message || e)));
+      // It ends once its report is written: a handle left open (ConPTY's, on Windows) kept it running.
+      afterUpdate().then(() => process.stdout.write('', () => process.exit()), (e) => fail(String(e?.message || e)));
       break;
     case '__tab-sync':
       // Internal, hidden: started detached by the capture hooks and the status line (core kickTabSync).

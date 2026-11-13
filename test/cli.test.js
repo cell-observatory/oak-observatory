@@ -910,7 +910,7 @@ test('CLI init: a codex config.toml that begins with a byte order mark keeps it 
   assert.deepEqual(fs.readFileSync(wired.cfg), original, 'uninstall leaves config.toml as it was before init, the mark first');
 });
 
-function doctor(b, { platform = process.platform, report, spawn, binary = '/fake/herdr', identity, loginScope, version, dirname = path.join(root, 'packages/cli/dist') } = {}) {
+function doctor(b, { platform = process.platform, report, spawn, binary = '/fake/herdr', identity, loginScope, version, desktopCopy = null, dirname = path.join(root, 'packages/cli/dist') } = {}) {
   let output = '';
   const native = [];
   let exitCode;
@@ -938,6 +938,7 @@ function doctor(b, { platform = process.platform, report, spawn, binary = '/fake
     diagnoseIndex: () => ({ id: 'index', label: 'Local database', level: 'ok', detail: 'fixture' }),
     diagnoseCodexQuota: () => null,
     diagnoseGitBash: () => null,
+    diagnoseDesktopAppCopy: () => desktopCopy,
     // How many signal handlers were in place when the check began: they must be, before it starts herdr.
     diagnoseHerdrForwarding: async () => { acted.push(`forwarding, ${handlers.length} handlers in place`); return []; },
     diagnoseHerdrPane: async () => [],
@@ -994,6 +995,14 @@ test('CLI doctor: tells the PTY row when it runs from the copy `oak machine add`
   fs.writeFileSync(path.join(bundle, 'package.json'), '{"name":"oak-observatory"}');
   assert.deepEqual((await doctor(b, { dirname: bundle }).run(['--json'])).native.map((o) => o.bundle), [true]);
   assert.deepEqual((await doctor(b).run(['--json'])).native.map((o) => o.bundle), [false], 'control: an npm install keeps package.json above dist/');
+});
+
+test('CLI doctor: lists a copy of OAK installed inside the Claude desktop app, and no row where there is none (Windows report §3)', async t => {
+  const b = fixture(t);
+  const row = { id: 'desktop-app-copy', label: 'no copy of OAK inside the Claude desktop app', level: 'warn', detail: 'fixture', fix: 'fixture' };
+  const ids = async (opts) => JSON.parse((await doctor(b, opts).run(['--json'])).output).checks.map((c) => c.id);
+  assert.ok((await ids({ desktopCopy: row })).includes('desktop-app-copy'));
+  assert.ok(!(await ids({})).includes('desktop-app-copy'));
 });
 
 // On Windows node-pty's ConPTY keeps a worker thread running after the PTY check's child has exited
@@ -3913,6 +3922,62 @@ test('CLI update: a foreign status line and an uninstalled hook are never touche
   assert.deepEqual(JSON.parse(fs.readFileSync(settings, 'utf8')), { statusLine: { type: 'command', command: 'ccusage statusline' } });
 });
 
+test('CLI update: hooks an older OAK wrote, every event there, get the command that a missing `oak` cannot fail (Windows report §8)', { skip: process.platform === 'win32' && 'POSIX fakes' }, async t => {
+  const f = updateFixture(t);
+  f.machines();
+  const settings = path.join(f.b.env.CLAUDE_CONFIG_DIR, 'settings.json');
+  const older = `oak capture #${realCore.HOOK_MARKER}`;
+  const s = JSON.parse(fs.readFileSync(settings, 'utf8'));
+  s.hooks = Object.fromEntries(realCore.CAPTURE_HOOK_EVENTS.map((e) => [e, [{ matcher: realCore.matcherFor(e), hooks: [{ type: 'command', command: older }] }]]));
+  fs.writeFileSync(settings, JSON.stringify(s));
+  const coreDist = path.join(root, 'packages/core/dist/index.js');
+  const codex = run(f.b, process.execPath, ['-e', `const c=require(${JSON.stringify(coreDist)});c.installCodexHooks('oak capture --agent codex #'+c.HOOK_MARKER,c.isOurCommand)`]);
+  assert.equal(codex.status, 0, codex.stderr);
+  const rows = async () => JSON.parse((await f.oak(['--json', '--here'])).stdout).components.filter((c) => c.id.endsWith('hooks')).map((c) => [c.id, c.state, c.detail]);
+  assert.deepEqual(await rows(), [['hooks', 'update', `${settings}: an older hook command`], ['codex-hooks', 'update', 'an older hook command — reinstall']]);
+  const r = await f.oak(['--here', '--cli-only']);
+  assert.equal(r.status, 0, r.stderr);
+  const after = JSON.parse(fs.readFileSync(settings, 'utf8')).hooks;
+  assert.deepEqual(realCore.CAPTURE_HOOK_EVENTS.map((e) => after[e][0].hooks), realCore.CAPTURE_HOOK_EVENTS.map(() => [{ type: 'command', command: realCore.captureHookCommand('claude'), onFailure: 'continue' }]));
+  assert.deepEqual(await rows(), [['hooks', 'current', `all ${realCore.HEALTHY_HOOK_ENTRIES} events`], ['codex-hooks', 'current', 'installed and trusted']]);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(f.b.env.CODEX_HOME, 'hooks.json'), 'utf8')).hooks.Stop.at(-1).hooks[0].command, realCore.captureHookCommand('codex'));
+});
+
+// Windows report §3. A preload plays Windows: the platform, and, inside the desktop app, its package's file system
+// virtualization, which puts a new file under %APPDATA% in the package's LocalCache\Roaming. Nothing answers at the
+// release feed, so a run that is not refused stops there, before it could install anything.
+test('CLI update / install-extensions: refused inside the Claude desktop app\'s package, never in a terminal (Windows report §3)', { skip: process.platform === 'win32' && 'plays Windows on POSIX' }, t => {
+  const b = fixture(t);
+  b.env.CLAUDE_OBSERVATORY_NO_UPDATE_CHECK = '1';
+  b.env.CLAUDE_OBSERVATORY_RELEASES_API = 'http://127.0.0.1:9';
+  b.env.APPDATA = path.join(b.home, 'AppData', 'Roaming');
+  b.env.LOCALAPPDATA = path.join(b.home, 'AppData', 'Local');
+  const privateCopy = path.join(b.env.LOCALAPPDATA, 'Packages', 'Claude_pzs8sxrjxfjjc', 'LocalCache', 'Roaming');
+  fs.mkdirSync(b.env.APPDATA, { recursive: true });
+  fs.mkdirSync(privateCopy, { recursive: true });
+  const terminal = path.join(b.home, 'windows.cjs');
+  fs.writeFileSync(terminal, 'Object.defineProperty(process, \'platform\', { value: \'win32\' });\n');
+  const app = path.join(b.home, 'desktop-app.cjs');
+  fs.writeFileSync(app, `require(${JSON.stringify(terminal)});
+const fs = require('fs'), path = require('path');
+const into = (p) => String(p).startsWith(process.env.APPDATA + path.sep) ? path.join(${JSON.stringify(privateCopy)}, path.relative(process.env.APPDATA, String(p))) : p;
+for (const k of ['writeFileSync', 'rmSync']) { const real = fs[k]; fs[k] = (p, ...rest) => real(into(p), ...rest); }
+`);
+  const oak = (preload, args) => run(b, process.execPath, ['--require', preload, cli, ...args], { timeout: 60_000 });
+  for (const args of [['update'], ['update', '--here'], ['install-extensions'], ['install-extensions', '--vscode-only']]) {
+    const r = oak(app, args);
+    assert.equal(r.status, 1, `${args.join(' ')}: ${r.stderr}`);
+    assert.match(r.stderr, new RegExp(`^oak: this runs inside the Claude desktop app \\(Claude_pzs8sxrjxfjjc\\), .* run \`oak ${args[0]}\` from a normal terminal`), args.join(' '));
+  }
+  // What only reads still runs there; a terminal, the app installed or not, is never refused.
+  for (const [preload, args] of [[app, ['update', '--check']], [app, ['update', '--json']], [terminal, ['update']], [terminal, ['install-extensions']]]) {
+    const r = oak(preload, args);
+    assert.doesNotMatch(r.stderr, /Claude desktop app/, args.join(' '));
+    assert.match(r.stderr, /could not (check for updates|reach the release feed)|need network access to github\.com/, `${args.join(' ')}: it went on to the release feed\n${r.stderr}`);
+  }
+  assert.deepEqual([...fs.readdirSync(b.env.APPDATA), ...fs.readdirSync(privateCopy)], [], 'no probe is left behind');
+});
+
 test('CLI __after-update: the installed CLI reports what it did to the one that ran the update', { skip: process.platform === 'win32' && 'POSIX fakes' }, async t => {
   const f = updateFixture(t);
   // Codex hooks whose trust state is gone (codex then skips them silently): reinstalled and trusted.
@@ -3931,6 +3996,18 @@ test('CLI __after-update: the installed CLI reports what it did to the one that 
   assert.equal(old.status, 0, old.stderr);
   assert.match(old.stdout, /Local database: this Node \(v[\d.]+\) has no node:sqlite; the database needs Node\.js 24 or newer/);
   assert.match(old.stdout, /→ Install Node\.js 24 or newer \(this is v[\d.]+\)\./);
+});
+
+test('CLI __after-update: ends once its report is written, though a handle stays open (Windows report §2)', { skip: process.platform === 'win32' && 'POSIX fakes' }, async t => {
+  // On Windows ConPTY's handles kept the step running after its PTY check (12 minutes, until killed by hand). A timer
+  // left running stands in for them here; the PTY check itself runs in a child of its own (see test doctor.js).
+  const f = updateFixture(t);
+  const preload = path.join(f.b.home, 'open-handle.cjs');
+  fs.writeFileSync(preload, 'setInterval(() => {}, 60_000);\n');
+  const report = path.join(f.b.home, 'report.json');
+  const r = run(f.b, process.execPath, ['--require', preload, cli, '__after-update'], { env: { ...f.b.env, OAK_UPDATE_REPORT: report }, timeout: 30000 });
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(Array.isArray(JSON.parse(fs.readFileSync(report, 'utf8'))));
 });
 
 test('CLI update: stopped while its saved machines run, it stops each ssh it started there', { skip: process.platform === 'win32' && 'POSIX fakes' }, async t => {
@@ -4106,6 +4183,13 @@ test('CLI update: the installed CLI\'s setup step failing is a failed row and a 
   assert.equal(partly.status, 1, partly.stdout);
   assert.match(partly.stdout.slice(partly.stdout.indexOf('\nResult\n')), /^ {2}status line\s+updated — refreshed to this build$/m);
   assert.equal(setupRow(partly.stdout), 'failed — the installed CLI’s setup step failed — run `oak doctor --fix`');
+  // One that never ends (a PTY check on Windows sat 12 minutes): stopped at the deadline, and said to be a timeout.
+  fs.writeFileSync(path.join(pkg, 'dist', 'index.js'), 'setInterval(() => {}, 60000);\n');
+  env.OAK_AFTER_UPDATE_TIMEOUT_MS = '1500';
+  const hung = await update();
+  delete env.OAK_AFTER_UPDATE_TIMEOUT_MS;
+  assert.equal(hung.status, 1, hung.stdout);
+  assert.equal(setupRow(hung.stdout), 'failed — the installed CLI’s setup step did not finish within 1.5 s and was stopped — run `oak doctor --fix`');
   // The control: a release that sets itself up and reports nothing (one older than the report) still passes.
   fs.writeFileSync(path.join(pkg, 'dist', 'index.js'), 'process.exit(0);\n');
   const quiet = await update();

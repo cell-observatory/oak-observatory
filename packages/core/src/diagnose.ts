@@ -378,6 +378,69 @@ export function diagnoseGitBash(opts: BashLookup = {}): Check | null {
     fix: `Run \`oak statusline\` so the status line command names Git Bash by its path. To make \`bash\` in a terminal Git Bash too, put ${path.win32.dirname(git)} before ${path.win32.dirname(first as string)} in the system PATH.` };
   return { ...row, level: 'ok', detail: git };
 }
+type DesktopAppIo = Pick<typeof fs, 'writeFileSync' | 'rmSync' | 'existsSync' | 'readdirSync'>;
+
+/**
+ * The Claude desktop app's Windows package folder (`Claude_<publisher id>`) when this process runs inside that package,
+ * else null. The app is an MSIX package, and what it starts (a Claude Code session and its shell) runs in the package's
+ * file system virtualization: a new file under %APPDATA% lands in %LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming
+ * instead, a private copy no terminal sees, so `npm i -g` there installs an `oak` only the app's sessions run. Told by
+ * writing a probe file to %APPDATA% and looking for it in that copy. Neither signal that needs no write tells the two
+ * apart: a Claude Code session in a terminal sets the same CLAUDECODE, and the package folder exists wherever the app
+ * is installed. Any error answers null, so the check never stops an install it cannot settle. install.ps1 makes the
+ * same check before its `npm i -g`.
+ */
+export function claudeDesktopPackage(opts: { platform?: NodeJS.Platform; env?: NodeJS.ProcessEnv; io?: DesktopAppIo } = {}): string | null {
+  const { platform = process.platform, env = process.env, io = fs } = opts;
+  if (platform !== 'win32' || !env.APPDATA || !env.LOCALAPPDATA) return null;
+  const packages = path.join(env.LOCALAPPDATA, 'Packages');
+  const name = `oak-container-probe-${process.pid}-${Math.random().toString(36).slice(2, 10)}`;
+  const probe = path.join(env.APPDATA, name);
+  try {
+    io.writeFileSync(probe, '');
+    return io.readdirSync(packages).find((d) => /^Claude_/i.test(d) && io.existsSync(path.join(packages, d, 'LocalCache', 'Roaming', name))) ?? null;
+  } catch {
+    return null;
+  } finally {
+    try {
+      io.rmSync(probe, { force: true });
+    } catch {
+      /* the probe is an empty file with a unique name; one left behind changes nothing */
+    }
+  }
+}
+
+/** `oak doctor`'s row for a copy of OAK that `npm i -g` installed from inside the Claude desktop app (claudeDesktopPackage
+ *  above): the app's Claude Code sessions run that copy, whatever a terminal updates. Null where there is none. */
+export function diagnoseDesktopAppCopy(opts: { platform?: NodeJS.Platform; env?: NodeJS.ProcessEnv } = {}): Check | null {
+  const { platform = process.platform, env = process.env } = opts;
+  if (platform !== 'win32' || !env.LOCALAPPDATA) return null;
+  const packages = path.join(env.LOCALAPPDATA, 'Packages');
+  let found: string[];
+  try {
+    found = fs.readdirSync(packages).filter((d) => /^Claude_/i.test(d))
+      .map((d) => path.join(packages, d, 'LocalCache', 'Roaming', 'npm', 'node_modules', 'oak-observatory'))
+      .filter((p) => fs.existsSync(p));
+  } catch {
+    return null;
+  }
+  if (!found.length) return null;
+  const version = (p: string) => {
+    try {
+      return ` (${JSON.parse(fs.readFileSync(path.join(p, 'package.json'), 'utf8')).version})`;
+    } catch {
+      return '';
+    }
+  };
+  return {
+    id: 'desktop-app-copy',
+    label: 'no copy of OAK inside the Claude desktop app',
+    level: 'warn',
+    detail: `${found.map((p) => p + version(p)).join('; ')}: installed or updated from inside the Claude desktop app, a copy only that app's Claude Code sessions see, and they run it instead of the \`oak\` a terminal updates`,
+    fix: 'From a normal terminal, delete that oak-observatory folder and the oak, oak.cmd and oak.ps1 files in the npm folder two levels above it; install and update OAK from a normal terminal only',
+  };
+}
+
 
 /** Write the channel marker, read it back, and restore it. Proves the setting SURVIVES, not merely
  *  that the write returned without an error. */

@@ -504,7 +504,10 @@ a pane. macOS and Windows use node-pty's prebuilt binaries.
 On **Windows**, install with `install.ps1` in native PowerShell without bash or WSL. npm's
 `.cmd` shims are handled through one launcher (`packages/core/src/spawn.ts`). Piping the bash one-liner
 into PowerShell is the one thing to avoid: with WSL installed it silently installs everything *inside*
-WSL, where Claude Code on the Windows side cannot see it. The **bundled status line**
+WSL, where Claude Code on the Windows side cannot see it. Install and update from a normal terminal, not
+from a session in the Claude desktop app: the app's MSIX package keeps what an install writes under
+`%APPDATA%` in a copy only the app's own sessions see, so `install.ps1`, `oak update` and
+`oak install-extensions` stop there and say so. The **bundled status line**
 is a bash script that parses its input with `jq` (and uses `python3`, or `py -3`, for the token
 estimates, which it skips when neither runs), so the Usage bars need Git Bash and `jq`
 (`winget install jqlang.jq`) on PATH. OAK finds Git Bash as Claude Code does: `CLAUDE_CODE_GIT_BASH_PATH`,
