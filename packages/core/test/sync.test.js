@@ -136,6 +136,22 @@ function inv(host, home, sessions, extra = {}) {
 }
 const node = (label, inventory, local = false) => ({ label, local, status: 'ok', inventory });
 
+test('sync plan extends the newest local transcript when a session moved between project folders', () => {
+  const here = inv('aaaaaaaaaaaa', '/home/u', [
+    ['/home/u/a-new', 'home:a-new', [['moved', 120]], NOW - DAY],
+    ['/home/u/z-old', 'home:z-old', [['moved', 100]], NOW - 2 * DAY],
+  ]);
+  const peer = inv('bbbbbbbbbbbb', '/home/u', [['/home/u/z-old', 'home:z-old', [['moved', 160]]]],
+    { families: { 'session-files': [{ name: `${folderOf('/home/u/z-old')}/moved/subagents/agent-one.jsonl`, size: 20, mtime: NOW - DAY }] } });
+  const planned = () => core.planSync([node('here', here, true), node('peer', peer)], NOW).machines[0].pulls;
+  for (const files of [here.families.transcripts, [...here.families.transcripts].reverse()]) {
+    here.families.transcripts = files;
+    const pulls = planned();
+    assert.equal(pulls.find(p => p.family === 'transcripts')?.to, `${folderOf('/home/u/a-new')}/moved.jsonl`);
+    assert.equal(pulls.find(p => p.family === 'session-files')?.to, `${folderOf('/home/u/a-new')}/moved/subagents/agent-one.jsonl`);
+  }
+});
+
 test('sync plan: same paths map to the same folder; a Mac\'s clone, home and share map by identity', () => {
   const app = (h) => `${h}/Github/app`;
   const a = inv('aaaaaaaaaaaa', '/home/u', [[app('/home/u'), 'git:github.com/Org/App', [['s1', 100]], NOW - DAY, app('/home/u')], ['/home/u/notes', 'home:notes', [['s2', 50]]]],

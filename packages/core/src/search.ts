@@ -18,10 +18,10 @@
  */
 import * as fs from 'fs';
 import * as path from 'path';
-import { findTranscript, fastSessionTitle } from './observe';
+import { findTranscript, fastSessionTitle, discoverListing, listingTranscripts } from './observe';
 import { sessionPrompts } from './prompts';
 import { storeDir, logPath, rootDir, allStoreSessionIds, hiddenSessions, isSafeSessionId } from './store';
-import { listWorkspaces, sessionWorkspace, isMirroredTranscript, isBridgePointer, workspaceLabel } from './session';
+import { sessionWorkspace, isMirroredTranscript, workspaceLabel } from './session';
 import { readCodexAgentMeta, findCodexRollout, codexSessionTitle, codexSessionSources } from './codex';
 import { codexTranscriptFile } from './codex-events';
 import { PromptReader, PromptReaderState, toMs } from './asks';
@@ -46,40 +46,20 @@ export interface SearchCandidate {
 export function searchCandidates(known?: ReadonlyMap<string, SearchCandidate>): SearchCandidate[] {
   const hidden = hiddenSessions();
   const out = new Map<string, SearchCandidate>();
-  const excluded = new Set<string>();
-  for (const w of listWorkspaces()) {
-    let names: string[] = [];
-    try {
-      names = fs.readdirSync(w.dir);
-    } catch {
+  const { byId, excluded } = discoverListing(listingTranscripts(), []);
+  for (const [id, found] of byId) {
+    if (hidden.has(id)) continue;
+    const file = found.file;
+    let lastMs = 0;
+    try { lastMs = fs.statSync(file).mtimeMs; } catch { continue; }
+    const cached = known?.get(id);
+    if (cached?.transcript === file && cached.lastMs === lastMs) {
+      out.set(id, { ...cached });
       continue;
     }
-    for (const n of names) {
-      if (!n.endsWith('.jsonl')) continue;
-      const id = n.slice(0, -6);
-      if (!isSafeSessionId(id) || out.has(id) || hidden.has(id)) continue;
-      const file = path.join(w.dir, n);
-      let lastMs = 0;
-      try {
-        lastMs = fs.statSync(file).mtimeMs;
-      } catch {
-        continue;
-      }
-      const cached = known?.get(id);
-      if (cached?.transcript === file && cached.lastMs === lastMs) {
-        out.set(id, { ...cached });
-        continue;
-      }
-      const provenance = isMirroredTranscript(file);
-      if (provenance.mirrored || isBridgePointer(file)) { excluded.add(id); continue; }
-      let title: string | null = null;
-      try {
-        title = fastSessionTitle(file, id);
-      } catch {
-        title = null;
-      }
-      out.set(id, { id, transcript: file, workspace: provenance.recordedCwd ? workspaceLabel(provenance.recordedCwd) : w.label, title, agent: readCodexAgentMeta(id) ? 'codex' : 'claude', lastMs });
-    }
+    let title: string | null = null;
+    try { title = fastSessionTitle(file, id); } catch { /* no title */ }
+    out.set(id, { id, transcript: file, workspace: found.workspace, title, agent: readCodexAgentMeta(id) ? 'codex' : 'claude', lastMs });
   }
   // Codex conversations, from the same rollouts the session lists show, read through the derived
   // transcript so the replies are searched as well as the asks. Newest first, so an archived copy loses.

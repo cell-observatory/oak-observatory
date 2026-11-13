@@ -20,6 +20,74 @@ function fixture(t) {
 const user = text => ({type:'user',message:{role:'user',content:text}});
 const answer = {type:'assistant',message:{id:'fixture-answer',role:'assistant',model:'claude-opus-4-1',content:[],usage:{input_tokens:100,output_tokens:20}}};
 const cxUser = text => ({type:'response_item',timestamp:'2026-01-01T00:00:01Z',payload:{type:'message',role:'user',content:[{type:'input_text',text}]}});
+test('a session resumed in another project folder uses the newest transcript and cwd on every read',t=>{
+ const f=fixture(t),id='fixture-moved',old=path.join(f.dir,'a-old'),current=path.join(f.dir,'z-new');
+ fs.mkdirSync(path.join(old,'.git','objects'),{recursive:true}); fs.mkdirSync(path.join(old,'.git','refs'));
+ fs.writeFileSync(path.join(old,'.git','HEAD'),'ref: refs/heads/main\n');
+ const stamp=Date.now()-60_000;
+ const original=f.claude(id,old,[{...user('Before the move'),timestamp:new Date(stamp-1000).toISOString(),uuid:'before'},{...answer,timestamp:new Date(stamp).toISOString()}]);
+ fs.utimesSync(original,stamp/1000,stamp/1000);
+ assert.equal(core.transcriptForSession(id),original); // warm the old ID-only path cache
+ assert.equal(core.describeSession(id).cwd,old);
+ assert.equal(core.sessionMeta(old).sessions.find(r=>r.id===id).workspace,old); // warm the local index too
+ assert.equal(core.listRepoSiblings(old)[0]?.worktree,old);
+ fs.renameSync(old,current); fs.symlinkSync(current,old,process.platform==='win32'?'junction':'dir');
+ const moved=f.claude(id,current,[]);
+ fs.copyFileSync(original,moved); // copied lines keep their OLD cwd
+ assert.equal(core.transcriptForSession(id),original,'a copied prefix alone has not yet resumed here');
+ const append=(file,cwd,text,ms)=>{
+   fs.appendFileSync(file,JSON.stringify({cwd,sessionId:id,...user(text),timestamp:new Date(ms).toISOString(),uuid:text})+'\n'+
+     JSON.stringify({cwd,sessionId:id,...answer,timestamp:new Date(ms+1).toISOString(),message:{...answer.message,id:text}})+'\n');
+   fs.utimesSync(file,ms/1000,ms/1000);
+ };
+ append(moved,current,'Kestrel continuation',stamp+1000);
+ core.writeAttention(id,{kind:'permission',message:'Bash',ts:Date.now()});
+ const check=(file,cwd)=>{
+   assert.equal(core.isMirroredTranscript(file).mirrored,false);
+   assert.equal(core.transcriptForSession(id),file);
+   assert.equal(core.findTranscript(old,id),file);
+   assert.equal(core.findTranscript(current,id),file);
+   assert.equal(core.describeSession(id).transcript,file);
+   assert.equal(core.sessionWorkspace(id),cwd);
+   assert.equal(core.resolveSessionContinuation(id).cwd,cwd);
+   assert.equal(core.listSiblings(old).find(r=>r.id===id)?.worktree,cwd);
+   assert.equal(core.listRepoSiblings(current).find(r=>r.id===id)?.worktree,cwd);
+   const rows=core.sessionMeta(current).sessions.filter(r=>r.id===id);
+   assert.equal(rows.length,1); assert.equal(rows[0].workspace,cwd);
+   assert.equal(core.attentionInbox(current).hands.find(r=>r.id===id)?.workspace,cwd);
+   assert.equal(core.searchConversations(current,'Kestrel continuation').hits[0]?.workspace,cwd);
+ };
+ check(moved,current);
+ assert.equal(core.sessionPrompts(old,id).length,2);
+ assert.equal(core.computeStats(id).windows.session.tokens,240,'session stats count the chosen copy once');
+ const mode=process.env.OAK_INDEX; process.env.OAK_INDEX='off';
+ try {
+   const stats=core.computeStats(id);
+   assert.equal(stats.windows.session.tokens,240);
+   assert.equal(stats.windows.month.tokens,240,'the local aggregate also counts the chosen copy once');
+ } finally { if(mode===undefined)delete process.env.OAK_INDEX;else process.env.OAK_INDEX=mode; }
+ assert.equal(core.resolveSessionId(current),id);
+ assert.equal(core.newestSessionGlobal(),id);
+ // A later write in the alphabetically first folder must take over too, in the same process.
+ fs.copyFileSync(moved,original); append(original,old,'Back at the old path',stamp+2000);
+ check(original,old);
+ // A newer assistant-less session remains demoted, independently of duplicate-copy selection.
+ const stub=f.claude('fixture-stub',old,[user('<command-name>/effort</command-name>')]);
+ fs.utimesSync(stub,(stamp+3000)/1000,(stamp+3000)/1000);
+ assert.equal(core.resolveSessionId(old),id);
+ assert.equal(core.newestSessionGlobal(),id);
+});
+test('latest transcript cwd crosses chunk boundaries and ignores metadata, pasted cwd and a torn tail',t=>{
+ const f=fixture(t),cwd=path.join(f.work,'caf\u00e9'),file=f.claude('fixture-tail',f.work,[user('Before'),answer]);
+ const original=fs.readFileSync(file);
+ fs.appendFileSync(file,JSON.stringify({cwd,sessionId:'fixture-tail',...user('x'.repeat(160_000))})+'\n'+
+   JSON.stringify({type:'user',message:{content:'{"cwd":"/pasted"}'}})+'\n'+
+   JSON.stringify({type:'queue-operation',content:'x'.repeat(160_000)})+'\n{"cwd":');
+ assert.equal(core.latestCwdLine(file).cwd,cwd);
+ assert.equal(core.isMirroredTranscript(file).recordedCwd,cwd);
+ fs.writeFileSync(file,original);
+ assert.equal(core.isMirroredTranscript(file).recordedCwd,f.work,'a truncated transcript invalidates the cached cwd');
+});
 test('local transcript stays; mirrored copies and bridge pointers cannot list or resolve',t=>{
   const f=fixture(t);
   const local=f.claude('fixture-local',f.work,[user('Local work'),answer]);

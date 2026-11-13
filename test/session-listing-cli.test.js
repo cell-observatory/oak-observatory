@@ -4,6 +4,29 @@ const fs=require('node:fs');
 const os=require('node:os');
 const path=require('node:path');
 const {spawnSync}=require('node:child_process');
+test('sessions --all and --session follow the continued copy after a workspace move, with and without the index',t=>{
+ const dir=fs.mkdtempSync(path.join(os.tmpdir(),'oak-sessions-move-'));
+ t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
+ const env={...process.env,HOME:dir,USERPROFILE:dir,CLAUDE_CONFIG_DIR:path.join(dir,'config'),CODEX_HOME:path.join(dir,'codex'),HERDR_BIN:path.join(dir,'absent-herdr'),HERDR_SOCKET_PATH:path.join(dir,'no-socket')};
+ const old=path.join(dir,'a-old'),current=path.join(dir,'z-new'),id='fixture-moved';
+ fs.mkdirSync(current);fs.symlinkSync(current,old,process.platform==='win32'?'junction':'dir');
+ const file=cwd=>path.join(env.CLAUDE_CONFIG_DIR,'projects',cwd.replace(/[^a-zA-Z0-9]/g,'-'),id+'.jsonl');
+ const records=(cwd,prompt,sec)=>[
+   {type:'user',cwd,sessionId:id,uuid:prompt,timestamp:new Date(sec*1000).toISOString(),message:{role:'user',content:prompt}},
+   {type:'assistant',cwd,sessionId:id,timestamp:new Date((sec+1)*1000).toISOString(),message:{id:prompt,role:'assistant',content:[{type:'text',text:prompt+' response'}],usage:{input_tokens:10,output_tokens:20}}},
+ ].map(r=>JSON.stringify(r)).join('\n')+'\n';
+ for(const cwd of [old,current])fs.mkdirSync(path.dirname(file(cwd)),{recursive:true});
+ fs.writeFileSync(file(old),records(old,'Before the move',1000));fs.utimesSync(file(old),1000,1000);
+ fs.writeFileSync(file(current),fs.readFileSync(file(old),'utf8')+records(current,'Kestrel continuation',2000));fs.utimesSync(file(current),2000,2000);
+ for(const extra of [{},{OAK_INDEX:'off'}]){
+   const cli=(...args)=>{const r=spawnSync(process.execPath,[process.env.OAK_LISTING_TEST_CLI || path.resolve(__dirname,'../packages/cli/dist/index.js'),...args],{cwd:old,env:{...env,...extra},encoding:'utf8',timeout:20000});assert.equal(r.status,0,r.stderr);return JSON.parse(r.stdout);};
+   const rows=cli('sessions','--all','--json').sessions;
+   assert.equal(rows.length,1);assert.equal(rows[0].workspace,'~/z-new');assert.equal(rows[0].tokens,60);
+   assert.match(JSON.stringify(cli('prompts','--session',id,'--root',old,'--json')),/Kestrel continuation/);
+   assert.match(JSON.stringify(cli('conversation','--session',id,'--root',old,'--json')),/Kestrel continuation response/);
+   assert.equal(cli('search','Kestrel','--json').hits[0]?.workspace,'~/z-new');
+ }
+});
 test('sessions CLI scopes and groups local workspaces; batched JSON shares the contract without herdr',t=>{
  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'oak-sessions-cli-'));
  t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));

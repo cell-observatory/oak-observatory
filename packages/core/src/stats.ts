@@ -16,6 +16,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { listSessions, readLog, rootDir } from './store';
 import { claudeConfigDir } from './paths';
+import { claudeSessionTranscript } from './session';
 
 export interface StatMetrics {
   edits: number;
@@ -242,6 +243,7 @@ function transcriptFiles(claudeOnly = false): string[] {
   } catch {
     return out;
   }
+  const claude = new Map<string, { file: string; mtime: number; duplicate: boolean }>();
   for (const proj of projects) {
     const dir = path.join(root, proj);
     let entries: string[];
@@ -250,8 +252,17 @@ function transcriptFiles(claudeOnly = false): string[] {
     } catch {
       continue;
     }
-    for (const f of entries) if (f.endsWith('.jsonl')) out.push(path.join(dir, f));
+    for (const f of entries) {
+      if (!f.endsWith('.jsonl')) continue;
+      const file = path.join(dir, f);
+      let mtime: number;
+      try { mtime = fs.statSync(file).mtimeMs; } catch { continue; }
+      const old = claude.get(f);
+      if (!old || mtime > old.mtime || (mtime === old.mtime && file < old.file)) claude.set(f, { file, mtime, duplicate: !!old });
+      else old.duplicate = true;
+    }
   }
+  for (const [name, found] of claude) out.push((found.duplicate ? claudeSessionTranscript(name.slice(0, -6)) : null) ?? found.file);
   return out;
 }
 

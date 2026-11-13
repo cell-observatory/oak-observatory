@@ -8,7 +8,7 @@
  */
 import * as fs from 'fs';
 import * as path from 'path';
-import { claudeConfigDir } from './paths';
+import { claudeSessionTranscript } from './session';
 import { cachedByFiles } from './fscache';
 import { isSafeSessionId, logPath, rootDir } from './store';
 
@@ -343,11 +343,6 @@ function scanTranscript(transcript: string): { asks: Ask[]; tokenAt: TokenAt[] }
   }
 }
 
-/** Resolved transcript paths, keyed by config dir + session. Positives only: a found transcript never
- *  moves, but a miss must re-scan because a store is sometimes seeded before its first ask lands. The
- *  config dir is part of the key because tests swap HOME mid-process. */
-const transcriptPathMemo = new Map<string, string>();
-
 /**
  * This session's transcript, found from the SESSION ID alone.
  *
@@ -357,35 +352,14 @@ const transcriptPathMemo = new Map<string, string>();
  *
  * Exported so the unit memos can stamp the transcript file alongside the log: the unit split depends on
  * ask boundaries, so a new ask with no accompanying edit must invalidate it too. That puts this scan on
- * the warm path of every refresh — hence the positive cache above.
+ * the warm path of every refresh. A resumed session can move, so paths are resolved afresh.
  */
 export function transcriptForSession(sessionId: string): string | null {
   if (!sessionId || !/^[A-Za-z0-9._-]+$/.test(sessionId)) return null;
   const { findCodexRollout } = require('./codex') as typeof import('./codex');
   const raw = findCodexRollout(sessionId);
   if (raw) return (require('./codex-events') as typeof import('./codex-events')).codexTranscriptFile(raw);
-  const base = path.join(claudeConfigDir(), 'projects');
-  const memoKey = `${base}|${sessionId}`;
-  const hit = transcriptPathMemo.get(memoKey);
-  if (hit) return hit;
-  let names: string[];
-  try {
-    names = fs.readdirSync(base);
-  } catch {
-    return null;
-  }
-  for (const slug of names) {
-    const p = path.join(base, slug, `${sessionId}.jsonl`);
-    try {
-      if (fs.statSync(p).isFile()) {
-        transcriptPathMemo.set(memoKey, p);
-        return p;
-      }
-    } catch {
-      /* not this project folder */
-    }
-  }
-  return null;
+  return claudeSessionTranscript(sessionId);
 }
 
 /**
