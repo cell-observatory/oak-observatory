@@ -4399,7 +4399,9 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
     const topRows = lay.tabbar.length ? 1 : 0; // single-row tab bar (no rules)
     const bodyH = Math.max(0, lay.rows - topRows - lay.chrome.bottom + 1);
     let sess = nativeSessions.get(tab.id);
-    const cmd = tab.command && tab.command.length ? [...tab.command] : [process.env.SHELL || 'bash'];
+    // With no SHELL on Windows (only an MSYS shell such as Git Bash sets one) a bare `bash` is the WSL launcher.
+    const cmd = tab.command && tab.command.length ? [...tab.command]
+      : [process.env.SHELL || (process.platform === 'win32' ? process.env.ComSpec || 'cmd.exe' : 'bash')];
     const launchFailed = `could not launch ${cmd[0]}${tab.id === 'herdr' ? ' — run oak doctor --fix' : ''}`;
     // A child that died within moments with nothing of its own on screen never really started (its exec
     // failed — herdr not installed, say): the screen holds at most node-pty's `execvp(3) failed.` and

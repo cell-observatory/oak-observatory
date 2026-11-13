@@ -1058,6 +1058,8 @@ async function cmdDoctor(args: string[]): Promise<void> {
     binOnPath: onPath('oak'),
     jqPresent: onPath('jq'),
   });
+  const gitBash = core.diagnoseGitBash();
+  if (gitBash) checks.push(gitBash);
   checks.push(loginShellOakCheck());
   checks.push(...await core.diagnoseHerdrPane());
   checks.push(core.diagnoseRemoteTitles());
@@ -6794,13 +6796,13 @@ function cmdStatusline(args: string[] = []): void {
   }
   // `direct`: bash is a real .exe that libuv resolves unaided, and the hint below is reachable ONLY
   // through res.error — a shell would report a missing bash as exit 127 and kill that branch.
+  // On Windows a bare `bash` is the WSL launcher when WSL is on, so bashPath() names Git Bash.
   // `--force` passes through: the installer REFUSES to replace a statusLine that is not ours
   // (ccusage's, Orca's) unless the caller explicitly said so.
-  const res = core.spawnToolSync('bash', [script, ...(args.includes('--force') ? ['--force'] : [])], { stdio: 'inherit', direct: true });
-  if (res.error) {
-    const winHint = process.platform === 'win32' ? ' — on Windows run this from Git Bash or WSL' : '';
-    fail(`could not run bash: ${res.error.message} (the status line needs bash + jq${winHint})`);
-  }
+  const bash = core.bashPath();
+  if (!bash) fail(`Git Bash not found (the status line is a bash script). ${core.GIT_BASH_FIX}.`);
+  const res = core.spawnToolSync(bash, [script, ...(args.includes('--force') ? ['--force'] : [])], { stdio: 'inherit', direct: true });
+  if (res.error) fail(`could not run bash: ${res.error.message} (the status line needs bash + jq)`);
   process.exit(res.status ?? 1);
 }
 
@@ -7242,7 +7244,9 @@ async function applyComponents(plan: UpdateComponent[]): Promise<UpdateComponent
         out.push(trust === 'trusted' ? set('updated', 'reinstalled and trusted') : set('failed', `trust is ${trust} after a reinstall — run \`oak init --codex\``));
       } else if (p.id === 'statusline') {
         // `direct`: bash is a real executable (the same call cmdStatusline makes), never `--force`.
-        const r = core.spawnToolSync('bash', [statuslineInstallerPath()], { stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', direct: true });
+        const bash = core.bashPath();
+        if (!bash) { out.push(set('failed', `Git Bash not found — ${core.GIT_BASH_FIX}`)); continue; }
+        const r = core.spawnToolSync(bash, [statuslineInstallerPath()], { stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', direct: true });
         const why = String(r.stderr ?? '').split('\n').find((l) => l.trim()) || r.error?.message || `the installer exited ${r.status ?? '?'}`;
         out.push(r.status === 0 && statuslineCurrent() ? set('updated', 'refreshed to this build') : set('failed', `${why} — run \`oak statusline\``));
       } else if (p.id === 'focus-server') {
@@ -7312,6 +7316,19 @@ function isCursorAgentShim(file: string): boolean {
   } catch {
     return false;
   }
+}
+
+/** Inside WSL, the `code` (or `cursor`, …) on PATH can be the Windows editor's own launcher, reached through interop:
+ *  the sh script its Windows install keeps in bin\ beside `<name>.cmd`. It drives Windows' editor, which cannot read
+ *  this distro's paths, so its `--install-extension` failed; and a window connected to WSL loads the extension
+ *  (extensionKind workspace) from this distro's server, not from Windows. WSL is detected as the TUI does. */
+function isWslInteropCli(cli: string): boolean {
+  if (process.platform !== 'linux' || !(process.env.WSL_DISTRO_NAME || process.env.WSLENV)) return false;
+  const fs = require('fs');
+  const path = require('path');
+  const file = path.isAbsolute(cli) ? cli : String(process.env.PATH || '').split(':').filter(Boolean).map((d: string) => path.join(d, cli))
+    .find((p: string) => { try { fs.accessSync(p, fs.constants.X_OK); return fs.statSync(p).isFile(); } catch { return false; } });
+  return !!file && fs.existsSync(`${file}.cmd`);
 }
 
 /**
@@ -7384,6 +7401,8 @@ type EditorRow = {
   gallery: boolean;
   /** A Remote-SSH server dir, driven by the server binary it holds rather than a desktop CLI. */
   server: boolean;
+  /** Inside WSL, its CLI is Windows' own editor, reached through interop (see isWslInteropCli); `cli` is then null. */
+  interop?: boolean;
 };
 
 function vscodeEditors(): EditorRow[] {
@@ -7423,7 +7442,8 @@ function vscodeEditors(): EditorRow[] {
       }
     }
     const cli = ed.server ? serverCli(path.join(home, ed.server), ed.cli) : resolveEditorCli(ed.cli, ed.app, ed.winApp);
-    out.push({ label: ed.label, extDirs: ed.extDirs, extRoots, cli, cliName: ed.cli, version: best, hasOld, gallery, server: Boolean(ed.server) });
+    const interop = !ed.server && cli !== null && isWslInteropCli(cli);
+    out.push({ label: ed.label, extDirs: ed.extDirs, extRoots, cli: interop ? null : cli, cliName: ed.cli, version: best, hasOld, gallery, server: Boolean(ed.server), ...(interop ? { interop } : {}) });
   }
   return out;
 }
@@ -7461,6 +7481,8 @@ function serverCli(serverDir: string, name: string): string | null {
  *  command to install: its binary arrives when the editor next connects. */
 function noCliFix(e: EditorRow | undefined): string {
   if (e?.server) return `connect to this machine from ${e.label.slice(0, -' server'.length)} once, so it installs its server (${e.cliName})`;
+  if (e?.interop)
+    return `install OAK on Windows (install.ps1) for Windows' own ${e.label}; a ${e.label} window connected to WSL runs it from this distro's ${e.label} server, which \`oak install-extensions\` installs into once ${e.label} has connected here`;
   const label = e?.label ?? 'VS Code';
   return `in ${label}, ⇧⌘P → "Shell Command: Install '${e?.cliName || 'code'}' command in PATH"`;
 }
@@ -7801,7 +7823,8 @@ async function cmdInstallExtensions(args: string[]): Promise<void> {
   if (chRaw && !requested) fail(`unknown channel "${chRaw}" — use stable or dev (pre-release)`);
   const channel = requested ?? core.getUpdateChannel();
 
-  const editors = vscodeEditors().filter(editorPresent);
+  const allEditors = vscodeEditors();
+  const editors = allEditors.filter(editorPresent);
   const jbDirs = jetbrainsPluginDirs();
   const local = vsixArg !== null || zipArg !== null;
   // In LOCAL mode no release is fetched, so a family with no artifact has nothing to install FROM.
@@ -7890,7 +7913,10 @@ async function cmdInstallExtensions(args: string[]): Promise<void> {
     // next connection. Said, not counted as a failure, as when the dirs belonged to the desktop row.
     for (const e of editors.filter((e) => !e.cli && e.server))
       process.stdout.write(c.dim(`${e.label}: no server binary found — skipped; ${noCliFix(e)} to install into it.\n`));
-    const noCli = editors.filter((e) => !e.cli && !e.server);
+    // Inside WSL, Windows' own editor: said, and not counted as a failure, as above.
+    for (const e of allEditors.filter((e) => e.interop))
+      process.stdout.write(c.dim(`${e.label}: the \`${e.cliName}\` on PATH is Windows' own, reached through WSL interop — skipped.\n    ${noCliFix(e)}.\n`));
+    const noCli = editors.filter((e) => !e.cli && !e.server && !e.interop);
     for (const e of noCli) {
       // Never a silent skip: the editor is here, we just cannot drive it.
       process.stdout.write(
@@ -7904,7 +7930,7 @@ async function cmdInstallExtensions(args: string[]): Promise<void> {
     // Guard on whether an editor EXISTS, not on whether there is work: everything-already-current is
     // the common case on a re-run (which is how the docs say to update), and it was reporting
     // "no editor detected" — while the truthful line was reachable only on runs that also failed.
-    if (!editors.length) process.stdout.write(c.dim('VS Code family: no editor detected — skipped.\n'));
+    if (!editors.length && !allEditors.some((e) => e.interop)) process.stdout.write(c.dim('VS Code family: no editor detected — skipped.\n'));
     else if (!actionable.length && !noCli.length) process.stdout.write(c.green('✓ ') + `VS Code family already at ${target}\n`);
     else {
       let src = vsixArg;
@@ -8617,8 +8643,9 @@ function usage(): void {
       `                       install capture hooks for codex (~/.codex/hooks.json + trust state;\n` +
       `                       foreign entries preserved); checks hooks.json + trust locally, no model\n` +
       `                       run — codex skips untrusted hooks silently, so status re-checks them\n` +
-      `  statusline [--force] install/refresh the bundled claude-statusline (usage bars; needs bash+jq);\n` +
-      `                       refuses to replace another tool's statusLine unless --force\n` +
+      `  statusline [--force] install/refresh the bundled claude-statusline (usage bars; needs bash+jq,\n` +
+      `                       on Windows Git Bash); refuses to replace another tool's statusLine\n` +
+      `                       unless --force\n` +
       `  uninstall [--project] [--all] [--purge-store]\n` +
       `                       remove the capture hooks from every install-ledger location (--project =\n` +
       `                       only this repo's file; --all also reverts the bundled status line, a\n` +
@@ -8629,7 +8656,8 @@ function usage(): void {
       `  integrity [--session <id>] [--json]  inspect capture gaps and unsafe history; read-only\n` +
       `  doctor [--json] [--fix]\n` +
       `                       diagnose setup (hooks, PATH, the \`oak\` a login shell runs, config dir,\n` +
-      `                       session, status line, herdr, the herdr server's environment) with fixes;\n` +
+      `                       session, status line and, on Windows, the Git Bash it runs with, herdr,\n` +
+      `                       the herdr server's environment) with fixes;\n` +
       `                       --markdown (--md) emits the report as Markdown; --fix installs the pinned\n` +
       `                       herdr, its claude + codex integrations and OAK's plugin, sets missing\n` +
       `                       sidebar widths and theme defaults (gruvbox), starts its server, repairs\n` +
@@ -8643,7 +8671,8 @@ function usage(): void {
       `  install-extensions [--check] [--json] [--force] [--channel stable|dev]\n` +
       `                       install the editor extensions into whatever editors are on this machine\n` +
       `                       (VS Code family + JetBrains); --vsix/--jetbrains-zip use local build\n` +
-      `                       outputs instead of the release; --check reports without installing\n` +
+      `                       outputs instead of the release; --check reports without installing;\n` +
+      `                       inside WSL, Windows' own editor on PATH (through interop) is skipped\n` +
       `  update [--here] [--check] [--json] [--cli-only] [--force] [--channel stable|dev]\n` +
       `                       update everything OAK installed from the followed release channel: the\n` +
       `                       CLI; the extension in each VS Code-family editor and Remote-SSH server\n` +

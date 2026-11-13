@@ -19,7 +19,13 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 1
 fi
 command -v git >/dev/null 2>&1 || echo "NOTE: 'git' not found — branch segment is just skipped (harmless)." >&2
-command -v python3 >/dev/null 2>&1 || echo "NOTE: 'python3' not found — the ~token estimate on the 5h/wk bars is skipped (percentages still show)." >&2
+# Under Git Bash or Cygwin with no Python installed, the python3 in WindowsApps is the Store's stub (an App Execution
+# Alias): it runs no code and only says "Python was not found". The Python launcher (py -3) stands in when it runs, as
+# it does in the status line. A Python from the Store is an alias there too, and it runs. (Local fix.)
+PY3=""; _py3="not found"; command -v python3 >/dev/null 2>&1 && PY3=python3
+case "${OSTYPE:-}" in msys*|cygwin*) case "$(command -v python3 2>/dev/null)" in */WindowsApps/*)
+  python3 -c '' >/dev/null 2>&1 || { PY3=""; _py3="is only the Microsoft Store's stub"; py -3 -c '' >/dev/null 2>&1 && PY3="py -3"; } ;; esac ;; esac
+[ -n "$PY3" ] || echo "NOTE: 'python3' $_py3 — the ~token estimate on the 5h/wk bars is skipped (percentages still show)." >&2
 if ! locale charmap 2>/dev/null | grep -qi utf && ! locale -a 2>/dev/null | grep -qiE 'utf-?8'; then
   echo "NOTE: no UTF-8 locale found — the bar glyphs may not render, but everything else works." >&2
 fi
@@ -44,11 +50,19 @@ fi
 # Scalar-tolerant read: a plain-string statusLine (e.g. "ccusage statusline") used to error jq
 # inside the substitution and kill the whole script under set -e — exit 5, no message. Any shape
 # that is not our object lands in the foreign branch below and gets the honest REFUSED instead.
+# Under Git Bash or Cygwin the command names bash.exe and the script by their Windows paths (the merge below says why),
+# and the guard knows that form as ours too. (Local fix.)
+SL_WIN=""; GB=""
+case "${OSTYPE:-}" in msys*|cygwin*)
+  SL_WIN="$(cygpath -m "$CLAUDE_DIR/statusline.sh" 2>/dev/null || true)"
+  GB="$(cygpath -m / 2>/dev/null || true)"; GB="${GB%/}/bin/bash.exe" ;;
+esac
 EXISTING=""
 [ -f "$SETTINGS" ] && EXISTING="$(settings_json | jq -r '.statusLine | if . == null then "" elif type == "object" then (.command // "unrecognized-statusLine-object") else tostring end' 2>/dev/null || echo "unreadable-statusLine")"
 case "$EXISTING" in
   "" ) : ;;                                   # nothing there — free to install
   *"$CLAUDE_DIR/statusline.sh"* ) : ;;        # ours (as this script spells it) — a refresh
+  *"${SL_WIN:-$CLAUDE_DIR/statusline.sh}"* ) : ;;  # ours, as it is written on Windows (Local fix.)
   * )
     if [ "${1:-}" != "--force" ]; then
       echo "REFUSED: $SETTINGS already has a statusLine that is not ours:" >&2
@@ -111,7 +125,14 @@ unset _utf8
 # loses the \r.
 case "${OSTYPE:-}" in msys*|cygwin*)
   jq() { command jq "$@" | tr -d '\r'; return "${PIPESTATUS[0]}"; }
-  if command -v python3 >/dev/null 2>&1; then python3() { command python3 "$@" | tr -d '\r'; return "${PIPESTATUS[0]}"; }; fi ;;
+  # With no Python installed, the python3 in WindowsApps is the Store's stub (an App Execution Alias): it runs no code
+  # and only says "Python was not found". The Python launcher (py -3) stands in when it runs; with neither, python3 here
+  # fails at once and prints nothing, so the ~estimate is skipped. A Python from the Store is an alias there too, and it
+  # runs. (Local fix.)
+  _py3=python3
+  case "$(command -v python3 2>/dev/null)" in */WindowsApps/*)
+    command python3 -c '' >/dev/null 2>&1 || { _py3=false; command py -3 -c '' >/dev/null 2>&1 && _py3="py -3"; } ;; esac
+  if command -v python3 >/dev/null 2>&1; then python3() { command $_py3 "$@" | tr -d '\r'; return "${PIPESTATUS[0]}"; }; fi ;;
 esac
 
 input=$(cat)
@@ -1809,6 +1830,13 @@ chmod +x "$CLAUDE_DIR/statusline.sh"
 # cell-observatory/claude-statusline carries the unquoted form, and scripts/sync-statusline.sh
 # overwrites this file wholesale — a test in packages/core/test/core.test.js fails if a sync drops it.)
 CMD="bash \"$CLAUDE_DIR/statusline.sh\""
+# On Windows Claude Code runs this command with Git Bash (bash -c) when it finds Git Bash, and with PowerShell when it
+# does not or when statusLine.shell says so. There, and in a shell whose PATH puts System32 first, a bare `bash` is the
+# WSL launcher once WSL is on: Linux, which reads neither /c/ nor C:\ paths. So under Git Bash or Cygwin the command
+# names this bash.exe and the script by their Windows paths. PowerShell runs no command that starts with a quoted path,
+# so the drive letter stays outside the quotes: C:"/Program Files/Git/bin/bash.exe" "C:/Users/me/.claude/statusline.sh"
+# is the same two words to bash and to PowerShell, and both pass the JSON on stdin. (Local fix.)
+if [ -n "$SL_WIN" ] && [ -f "$GB" ]; then case "$GB" in [A-Za-z]:/*) CMD="${GB%%/*}\"/${GB#*/}\" \"$SL_WIN\"" ;; esac; fi
 [ -f "$SETTINGS" ] || echo '{}' > "$SETTINGS"
 tmp="$(mktemp)"
 { if [ -n "$SBOM" ]; then printf '\357\273\277'; fi; settings_json | jq --arg cmd "$CMD" '.statusLine = {type:"command", command:$cmd, refreshInterval:60}'; } > "$tmp"
@@ -1828,8 +1856,8 @@ echo "  Open a fresh 'claude' session here; usage appears after the first reply.
 # bare [tui] table when there is one; a new [tui] table is appended only when none exists
 # (a [tui.sub] table does not count — TOML allows defining the super-table later).
 CODEX_DIR="${CODEX_HOME:-$HOME/.codex}"  # honor CODEX_HOME like every other codex path (core codexHome())
-if [ -d "$CODEX_DIR" ] && command -v python3 >/dev/null 2>&1; then
-  python3 - "$CODEX_DIR/config.toml" <<'PYEOF2'
+if [ -d "$CODEX_DIR" ] && [ -n "$PY3" ]; then
+  $PY3 - "$CODEX_DIR/config.toml" <<'PYEOF2'
 import re, sys
 cfg = sys.argv[1]
 ITEMS = 'status_line = ["model-with-reasoning", "git-branch", "current-dir", "context-used", "five-hour-limit", "weekly-limit", "used-tokens", "estimated-thread-cost"]  # oak-statusline'

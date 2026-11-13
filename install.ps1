@@ -46,6 +46,25 @@ function Warn { param($m) Write-Host "! $m" -ForegroundColor Yellow }
 function Ok   { param($m) Write-Host "$([char]0x2713) $m" -ForegroundColor Green }
 function Dim  { param($m) Write-Host "  $m" -ForegroundColor DarkGray }
 
+# Git Bash, found in the order Claude Code and `oak statusline` use: CLAUDE_CODE_GIT_BASH_PATH, Git in
+# Program Files, then the bin\bash.exe beside the git on PATH. Never System32\bash.exe: that is the WSL
+# launcher, which runs Linux and cannot read the status line's Windows paths.
+function Find-GitBash {
+    $wsl = if ($env:SystemRoot) { [IO.Path]::GetFullPath([IO.Path]::Combine($env:SystemRoot, 'System32', 'bash.exe')) }
+    $cands = @()
+    $set = $env:CLAUDE_CODE_GIT_BASH_PATH
+    if ($set -and ((Split-Path -Leaf $set) -in 'bash.exe', 'sh.exe', 'bash', 'sh')) { $cands += $set }
+    if ($env:ProgramFiles) { $cands += [IO.Path]::Combine($env:ProgramFiles, 'Git', 'bin', 'bash.exe') }
+    if (${env:ProgramFiles(x86)}) { $cands += [IO.Path]::Combine(${env:ProgramFiles(x86)}, 'Git', 'bin', 'bash.exe') }
+    $git = Get-Command git -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($git) { $cands += [IO.Path]::Combine((Split-Path $git.Source), '..', 'bin', 'bash.exe') }
+    foreach ($c in $cands) {
+        $full = [IO.Path]::GetFullPath($c)
+        if ((Test-Path -LiteralPath $full -PathType Leaf) -and $full -ne $wsl) { return $full }
+    }
+    return $null
+}
+
 switch ($Channel) {
     'main'       { $Channel = 'stable' }
     'release'    { $Channel = 'stable' }
@@ -200,17 +219,18 @@ try {
     # --- status line ----------------------------------------------------------------------------
     # Say the true thing rather than skipping quietly. The bundled status line IS a bash script that
     # parses its input with jq (and uses python3 for the token estimates), so it needs both on PATH.
-    # There is no PowerShell port; porting it is a separate piece of work.
-    $bash = Get-Command bash -ErrorAction SilentlyContinue
+    # There is no PowerShell port; porting it is a separate piece of work. The bash is Git Bash: a bare
+    # `bash` here can be the WSL launcher (see Find-GitBash).
+    $bash = Find-GitBash
     $jq   = Get-Command jq -ErrorAction SilentlyContinue
     if ($bash -and $jq) {
         Say 'Installing the bundled status line...'
         & oak statusline | Out-Null
-        if ($LASTEXITCODE -eq 0) { Ok 'Status line installed - it appears next session, if Claude Code can reach bash.' }
+        if ($LASTEXITCODE -eq 0) { Ok 'Status line installed - it appears next session.' }
         else { Warn 'The status line did not install. Everything else still works.' }
     } else {
         $missing = @()
-        if (-not $bash) { $missing += 'bash (Git for Windows)' }
+        if (-not $bash) { $missing += 'Git Bash' }
         if (-not $jq)   { $missing += 'jq' }
         Warn "Skipped the bundled status line: $($missing -join ' and ') not found."
         Dim  'Consequence: the sidebar Usage bars and the terminal status line stay empty. Everything else works.'

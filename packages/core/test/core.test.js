@@ -13647,6 +13647,80 @@ process.exitCode = r.status ?? 1;
   assert.match(rows[2], /wk[^|]*\b29% ·\d/, '…and the weekly one');
 });
 
+test('statusline: under Git Bash the statusLine command names bash.exe and the script by Windows paths, which bash and PowerShell both run (section 1)', { skip: process.platform === 'win32' && 'drives a stand-in cygpath and a C: symlink' }, (t) => {
+  if (cp.spawnSync('jq', ['--version']).error) return t.skip('jq is not installed');
+  // Claude Code on Windows runs statusLine.command with Git Bash (bash -c) when it finds Git Bash, and with PowerShell when
+  // it does not, where a bare `bash` is the WSL launcher once WSL is on. Off Windows, OSTYPE names Git Bash, a stand-in
+  // cygpath maps <home>/P to C:/P (and / to C:/Git), as Git Bash maps /c/Users/me/P to C:/Users/me/P, and a symlink
+  // C: -> <home> in the working directory resolves those paths.
+  const home = freshHome();
+  const cdir = path.join(home, '.claude');
+  fs.mkdirSync(cdir, { recursive: true });
+  const bin = path.join(home, 'bin');
+  fs.mkdirSync(bin);
+  fs.mkdirSync(path.join(home, 'Git', 'bin'), { recursive: true });
+  fs.symlinkSync(cp.execFileSync('bash', ['-c', 'command -v bash'], { encoding: 'utf8' }).trim(), path.join(home, 'Git', 'bin', 'bash.exe'));
+  fs.writeFileSync(path.join(bin, 'cygpath'), `#!/bin/sh\n[ "$1" = -m ] || exit 1\ncase "$2" in /) echo C:/Git ;; "${home}"/*) echo "C:/\${2#"${home}"/}" ;; *) exit 1 ;; esac\n`, { mode: 0o755 });
+  const cwd = path.join(home, 'win');
+  fs.mkdirSync(cwd);
+  fs.symlinkSync(home, path.join(cwd, 'C:'));
+  const env = { ...process.env, HOME: home, USERPROFILE: home, CLAUDE_CONFIG_DIR: cdir, PATH: statuslinePath(bin), OSTYPE: 'msys' };
+  const install = () => cp.spawnSync('bash', [path.resolve(__dirname, '../../cli/statusline/install-statusline.sh')], { env, cwd, encoding: 'utf8' });
+  let r = install();
+  assert.equal(r.status, 0, `installer runs — ${(r.stderr || '').trim()}`);
+  const cmd = JSON.parse(fs.readFileSync(path.join(cdir, 'settings.json'), 'utf8')).statusLine.command;
+  assert.equal(cmd, 'C:"/Git/bin/bash.exe" "C:/.claude/statusline.sh"', 'bash.exe by its path, the drive letter outside the quotes');
+  // Git Bash runs it as Claude Code does, [bash.exe, -c, command], with the JSON on stdin. (PowerShell parses the same
+  // string as one command of two words: evidence in the Windows round's report, from pwsh 7.4.)
+  r = cp.spawnSync('bash', ['-c', cmd], { env, cwd, encoding: 'utf8', input: JSON.stringify({ session_id: 's', model: { display_name: 'Fable 5' }, cwd: home }) });
+  assert.equal(r.status, 0, (r.stderr || '').trim());
+  assert.match(r.stdout, /Fable 5/, 'the status line rendered');
+  r = install();
+  assert.equal(r.status, 0, `a second install knows the command as ours, not REFUSED — ${(r.stderr || '').trim()}`);
+  // OAK's own check of whether the status line is ours (update, uninstall) reads this form too.
+  assert.ok(core.referencesOurStatusline('C:"/Program Files/Git/bin/bash.exe" "C:/Users/me/.claude/statusline.sh"', 'C:\\Users\\me\\.claude', 'win32'));
+  assert.ok(!core.referencesOurStatusline('C:"/Program Files/Git/bin/bash.exe" "C:/Users/me/other.sh"', 'C:\\Users\\me\\.claude', 'win32'), 'control');
+});
+
+test('statusline: under Git Bash the Store\'s python3 stub is passed over, for py -3 or quietly (section 8)', { skip: process.platform === 'win32' && 'stand-in stubs are sh scripts' }, (t) => {
+  if (cp.spawnSync('jq', ['--version']).error) return t.skip('jq is not installed');
+  if (!fs.existsSync('/usr/bin/python3')) return t.skip('no /usr/bin/python3 for the py stand-in');
+  // With no Python installed, Windows puts the Store's stub first as WindowsApps\python3.exe: it runs no code, prints
+  // "Python was not found…" and fails. Off Windows a stand-in in a WindowsApps folder does that and records its
+  // arguments, and a stand-in `py` (the Python launcher) runs the real python3.
+  const run = (withPy) => {
+    const home = freshHome();
+    const cdir = path.join(home, '.claude');
+    const codex = path.join(home, '.codex');
+    const apps = path.join(home, 'AppData', 'Local', 'Microsoft', 'WindowsApps');
+    const bin = path.join(home, 'bin');
+    for (const d of [cdir, codex, apps, bin]) fs.mkdirSync(d, { recursive: true });
+    const log = path.join(home, 'calls');
+    fs.writeFileSync(path.join(apps, 'python3'), `#!/bin/sh\necho "stub $*" >> "${log}"\necho 'Python was not found; run without arguments to install from the Microsoft Store, or disable this shortcut from Settings > Manage App Execution Aliases.'\nexit 49\n`, { mode: 0o755 });
+    if (withPy) fs.writeFileSync(path.join(bin, 'py'), `#!/bin/sh\necho "py $*" >> "${log}"\n[ "$1" = -3 ] || exit 2\nshift\nexec /usr/bin/python3 "$@"\n`, { mode: 0o755 });
+    const env = { ...process.env, HOME: home, USERPROFILE: home, CLAUDE_CONFIG_DIR: cdir, CODEX_HOME: codex, PATH: statuslinePath(bin, apps), OSTYPE: 'msys' };
+    const inst = cp.spawnSync('bash', [path.resolve(__dirname, '../../cli/statusline/install-statusline.sh')], { env, encoding: 'utf8' });
+    const now = Math.floor(Date.now() / 1000);
+    const r = cp.spawnSync('bash', [path.join(cdir, 'statusline.sh')], { env, encoding: 'utf8', input: JSON.stringify({ session_id: 's', model: { display_name: 'Fable 5' }, cwd: home,
+      rate_limits: { five_hour: { used_percentage: 5, resets_at: now + 3600 }, seven_day: { used_percentage: 29, resets_at: now + 86400 } } }) });
+    const toml = path.join(codex, 'config.toml');
+    return { inst, r, calls: fs.readFileSync(log, 'utf8').split('\n').filter(Boolean), toml: fs.existsSync(toml) ? fs.readFileSync(toml, 'utf8') : null, usage: path.join(cdir, 'statusline-usage.json') };
+  };
+  const a = run(true);
+  assert.equal(a.inst.status, 0, `installer runs — ${(a.inst.stderr || '').trim()}`);
+  assert.match(a.toml || '', /status_line = .*# oak-statusline/, 'py -3 wrote the codex status line');
+  assert.equal(a.r.status, 0, (a.r.stderr || '').trim());
+  assert.ok(a.calls.some((c) => c.startsWith(`py -3 - ${a.usage} `)), `py -3 ran the estimate: ${JSON.stringify(a.calls)}`);
+  const b = run(false);
+  assert.equal(b.inst.status, 0, `installer runs — ${(b.inst.stderr || '').trim()}`);
+  assert.match(b.inst.stderr, /NOTE: 'python3' is only the Microsoft Store's stub — the ~token estimate/);
+  assert.equal(b.toml, null, 'no codex status line without a Python');
+  assert.equal(b.r.status, 0, (b.r.stderr || '').trim());
+  assert.match(b.r.stdout, /Fable 5/, 'the status line rendered');
+  assert.doesNotMatch(b.r.stdout + b.r.stderr, /Python was not found/);
+  assert.deepEqual([...new Set(b.calls)], ['stub -c '], 'the stub only ever ran for the check that it runs no code');
+});
+
 test('prompts: the ask that WORKS a task is credited, not the one that planned it (0.8.8)', () => {
   freshHome();
   delete process.env.CLAUDE_CONFIG_DIR;
@@ -17071,6 +17145,77 @@ test('spawn: every child is asked to start with no console window on Windows (wi
   ]);
 });
 
+// A Windows machine with the WSL feature on and Git for Windows installed with its defaults: System32 (holding the WSL
+// launcher, bash.exe) comes first on PATH, and Git adds only its cmd folder.
+const WIN_GIT = 'C:\\Program Files\\Git\\bin\\bash.exe';
+const WIN_WSL = 'C:\\Windows\\System32\\bash.exe';
+const winBox = (files, env = {}) => ({
+  platform: 'win32',
+  env: { SystemRoot: 'C:\\Windows', ProgramFiles: 'C:\\Program Files', 'ProgramFiles(x86)': 'C:\\Program Files (x86)',
+    PATH: 'C:\\Windows\\system32;C:\\Windows;"C:\\Program Files\\Git\\cmd";C:\\Users\\u\\AppData\\Roaming\\npm', ...env },
+  exists: (f) => files.some((x) => x.toLowerCase() === f.toLowerCase()),
+});
+
+test('spawn: bashPath runs Git Bash on Windows, found the way Claude Code finds it, and never the WSL launcher', () => {
+  const git = 'C:\\Program Files\\Git\\cmd\\git.exe';
+  assert.equal(core.bashPath({ platform: 'linux' }), 'bash', 'elsewhere the bare name, as before');
+  assert.ok(core.isWslLauncher(core.winOnPath('bash.exe', winBox([WIN_WSL, git, WIN_GIT])), { SystemRoot: 'C:\\Windows' }), 'control: the bare name is the WSL launcher here');
+  assert.equal(core.bashPath(winBox([WIN_WSL, git, WIN_GIT])), WIN_GIT, 'Git for Windows\' default folder');
+  assert.equal(core.bashPath(winBox([WIN_WSL])), null, 'no Git Bash: none, never the WSL launcher');
+  // CLAUDE_CODE_GIT_BASH_PATH first, when it names a bash or sh that is there and is not the WSL launcher.
+  const mine = 'D:\\tools\\PortableGit\\bin\\bash.exe';
+  assert.equal(core.bashPath(winBox([WIN_GIT, mine], { CLAUDE_CODE_GIT_BASH_PATH: mine })), mine);
+  assert.equal(core.bashPath(winBox([WIN_GIT, WIN_WSL], { CLAUDE_CODE_GIT_BASH_PATH: 'c:\\windows\\SYSTEM32\\Bash.exe' })), WIN_GIT, 'the WSL launcher named there is passed over');
+  assert.equal(core.bashPath(winBox([WIN_GIT, 'D:\\tools\\git.exe'], { CLAUDE_CODE_GIT_BASH_PATH: 'D:\\tools\\git.exe' })), WIN_GIT, 'so is a file that is not a bash');
+  // Then a 32-bit Git, then the Git whose git.exe is on PATH, wherever it was installed.
+  const x86 = 'C:\\Program Files (x86)\\Git\\bin\\bash.exe';
+  assert.equal(core.bashPath(winBox([WIN_WSL, x86])), x86);
+  assert.equal(core.bashPath(winBox([WIN_WSL, 'E:\\Apps\\Git\\cmd\\git.exe', 'E:\\Apps\\Git\\bin\\bash.exe'],
+    { PATH: 'C:\\Windows\\system32;E:\\Apps\\Git\\cmd' })), 'E:\\Apps\\Git\\bin\\bash.exe');
+  assert.equal(core.bashPath(winBox([WIN_WSL, 'E:\\Apps\\Git\\bin\\bash.exe'], { ProgramFiles: 'E:\\Apps' })), 'E:\\Apps\\Git\\bin\\bash.exe', '%ProgramFiles% is read, not assumed');
+  assert.equal(core.isWslLauncher('D:\\Windows\\System32\\bash.exe', { SystemRoot: 'D:\\Windows' }), true, 'wherever Windows is');
+});
+
+test('doctor: on Windows a Git Bash row says when the bash on PATH is the WSL launcher, and how to fix it', () => {
+  assert.equal(core.diagnoseGitBash({ platform: 'linux' }), null, 'no row elsewhere');
+  const wsl = core.diagnoseGitBash(winBox([WIN_WSL, WIN_GIT]));
+  assert.equal(wsl.level, 'warn');
+  assert.match(wsl.detail, /WSL launcher \(C:\\Windows\\system32\\bash\.exe\)/);
+  assert.match(wsl.fix, /`oak statusline`/);
+  assert.match(wsl.fix, /put C:\\Program Files\\Git\\bin before C:\\Windows\\system32/);
+  const none = core.diagnoseGitBash(winBox([WIN_WSL]));
+  assert.equal(none.level, 'warn');
+  assert.match(none.detail, /^not found; the `bash` on PATH is the WSL launcher/);
+  assert.ok(none.fix.startsWith(core.GIT_BASH_FIX), none.fix);
+  const first = core.diagnoseGitBash(winBox([WIN_WSL, WIN_GIT], { PATH: 'C:\\Program Files\\Git\\bin;C:\\Windows\\system32' }));
+  assert.deepEqual([first.level, first.detail], ['ok', WIN_GIT], 'Git Bash first on PATH: ok');
+  assert.equal(core.diagnoseGitBash(winBox([WIN_GIT])).level, 'ok', 'no WSL: ok');
+});
+
+test('usage: on Windows the month refresh runs Git Bash through a detached launcher, which starts it hidden and waits (section 7)', () => {
+  assert.deepEqual(core.monthRefreshSpawn('/h/.claude/statusline.sh', { platform: 'linux' }), { file: 'bash', args: ['/h/.claude/statusline.sh'] });
+  assert.equal(core.monthRefreshSpawn('C:\\h\\statusline.sh', winBox([WIN_WSL])), null, 'no Git Bash: no refresh, never the WSL launcher');
+  const win = core.monthRefreshSpawn('C:\\h\\statusline.sh', winBox([WIN_WSL, WIN_GIT]));
+  assert.equal(win.file, process.execPath);
+  assert.deepEqual([win.args[0], win.args[2], win.args[3]], ['-e', WIN_GIT, 'C:\\h\\statusline.sh']);
+  assert.equal(win.env.ELECTRON_RUN_AS_NODE, '1', 'an editor\'s Electron runs it as node');
+  // The launcher itself, run here: it starts its child not detached and hidden (CREATE_NO_WINDOW on Windows), hands
+  // it the payload on stdin, and ends only once it has.
+  const dir = tmpDir('cc-launch-');
+  const out = path.join(dir, 'out');
+  const stub = path.join(dir, 'bash.js'); // stands in for Git Bash: `node bash.js <script>`
+  fs.writeFileSync(stub, `let s = ''; process.stdin.on('data', (d) => { s += d; }).on('end', () => setTimeout(() =>
+    require('fs').writeFileSync(${JSON.stringify(out)}, process.argv[2] + '\\n' + s), 300));`);
+  const log = path.join(dir, 'spawns.jsonl');
+  const r = cp.spawnSync(process.execPath, ['--require', path.resolve(__dirname, '../../tui/test/fixtures/spawn-recorder.cjs'),
+    ...win.args.slice(0, 2), process.execPath, stub, 'C:\\h\\statusline.sh'],
+  { input: '{"cwd":"/w"}', env: { ...process.env, OAK_SPAWN_LOG: log }, encoding: 'utf8', timeout: 30000 });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(fs.readFileSync(out, 'utf8'), 'C:\\h\\statusline.sh\n{"cwd":"/w"}', 'the script and the payload, before the launcher ended');
+  const spawns = fs.readFileSync(log, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  assert.deepEqual(spawns.map((e) => [e.file, e.args, e.detached, e.windowsHide]), [[process.execPath, [stub, 'C:\\h\\statusline.sh'], false, true]]);
+});
+
 test('spawn: on Windows a detached child starts at home, never in the caller\'s cwd, unless it is given one (0.10.0)', async () => {
   // Windows refuses to delete or rename a directory that is any running process's cwd, and a detached
   // child outlives its caller: the background refreshes `oak usage` starts pinned the folder it ran in
@@ -17421,6 +17566,10 @@ test('statusline: the vendored installer keeps the fixes a sync would silently d
   const sh = fs.readFileSync(path.resolve(__dirname, '../../cli/statusline/install-statusline.sh'), 'utf8');
   assert.match(sh, /CMD="bash \\"\$CLAUDE_DIR\/statusline\.sh\\""/, 'the statusLine command must be QUOTED');
   assert.doesNotMatch(sh, /CMD="bash \$CLAUDE_DIR\/statusline\.sh"/, 'the unquoted upstream form must not come back');
+  assert.match(sh, /CMD="\$\{GB%%\/\*\}\\"\/\$\{GB#\*\/\}\\" \\"\$SL_WIN\\""/, 'under Git Bash the command names bash.exe by its Windows path');
+  assert.match(sh, /\*"\$\{SL_WIN:-\$CLAUDE_DIR\/statusline\.sh\}"\* \) : ;;/, 'and the guard knows that form as ours');
+  assert.match(sh, /_py3=false; command py -3 -c ''/, 'the Store\'s python3 stub is passed over in the line');
+  assert.match(sh, /\$PY3 - "\$CODEX_DIR\/config\.toml"/, 'and in the installer');
   assert.match(sh, /winget install jqlang\.jq/, 'the jq error must name a Windows route');
   // The foreign-statusLine guard: scalar-tolerant read — a plain-string
   // statusLine used to kill the script with a SILENT exit 5 — plus the refusal and its escape.
@@ -19753,6 +19902,37 @@ test('install-extensions: Cursor\'s agent shim is not the editor (2026-11-09)', 
   assert.equal(cursorRow(`${ideDir}:${shimDir}:${sys}`).cli, 'cursor');
 });
 
+test('install-extensions: inside WSL, Windows\' own VS Code on PATH is skipped with a note, not failed (section 8)', { skip: process.platform !== 'linux' && 'WSL is Linux' }, () => {
+  // Through interop, the `code` on PATH is the sh script Windows' VS Code keeps in bin\ beside code.cmd. It drives
+  // Windows' editor, which cannot read this distro's paths: bootstrap.sh's install failed through it.
+  const home = freshHome();
+  const winBin = path.join(home, 'mnt', 'c', 'Microsoft VS Code', 'bin');
+  fs.mkdirSync(winBin, { recursive: true });
+  const ran = path.join(home, 'code-ran');
+  fs.writeFileSync(path.join(winBin, 'code'), `#!/bin/sh\necho "$*" >> '${ran}'\nexit 1\n`, { mode: 0o755 });
+  fs.writeFileSync(path.join(winBin, 'code.cmd'), '@echo off\r\n');
+  const vsix = path.join(home, 'oak.vsix');
+  fs.writeFileSync(vsix, 'not a real vsix');
+  const run = (wsl) => {
+    const env = { ...process.env, HOME: home, USERPROFILE: home, PATH: `${winBin}:/usr/bin:/bin`, CLAUDE_OBSERVATORY_RELEASES_API: 'http://127.0.0.1:1/offline', CLAUDE_OBSERVATORY_NO_UPDATE_CHECK: '1' };
+    delete env.CLAUDE_CONFIG_DIR; delete env.WSL_DISTRO_NAME; delete env.WSLENV;
+    if (wsl) env.WSL_DISTRO_NAME = 'Ubuntu';
+    // Unscoped, as bootstrap.sh runs it; --vsix keeps the run offline.
+    return cp.spawnSync(process.execPath, [CLI, 'install-extensions', '--vsix', vsix], { env, encoding: 'utf8' });
+  };
+  let r = run(true);
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.match(r.stdout, /VS Code: the `code` on PATH is Windows' own, reached through WSL interop — skipped\./);
+  assert.match(r.stdout, /install OAK on Windows \(install\.ps1\)[^\n]*connected to WSL runs it from this distro's VS Code server/);
+  assert.doesNotMatch(r.stdout, /VS Code family: no editor detected/, 'not contradicted by the line after it');
+  assert.ok(!fs.existsSync(ran), 'Windows\' code is not run');
+  // Control: outside WSL the same `code` is an editor's CLI, run and failed.
+  r = run(false);
+  assert.equal(r.status, 1, r.stdout + r.stderr);
+  assert.match(r.stdout, /VS Code --install-extension failed/);
+  assert.equal(fs.readFileSync(ran, 'utf8'), `--install-extension ${vsix} --force\n`);
+});
+
 test('install-extensions: installs a LOCAL artifact into a bare JetBrains IDE (0.10.0)', () => {
   // The from-source path install.sh uses: --jetbrains-zip, no network, and it must install even though
   // nothing of ours is there yet. Exercises zipToolReady + applyJetbrainsZip + the version sentinel.
@@ -19875,6 +20055,68 @@ test('installers: install.ps1\'s dev channel installs the newer of the pre-relea
   assert.match(pick('9.9.9-dev.4', 'v9.9.9'), /say: The latest release is newer than the pre-release[\s\S]*picked: v9\.9\.9/);
   assert.match(pick('9.10.0-dev.1', 'v9.9.9'), /picked: dev-latest/, 'a pre-release ahead of the release');
   assert.match(pick('9.9.9-dev.4', null), /picked: dev-latest/, 'no release to compare with');
+});
+
+test('installers: install.ps1 installs the status line with Git Bash, and says "Git Bash not found" rather than take the WSL launcher (section 1)', { skip: !hasPwsh() }, () => {
+  // Find-GitBash and the status-line block, run with stand-in files for System32\bash.exe (the WSL
+  // launcher), Git in Program Files and git on PATH, with `oak` stubbed. The environment is set inside the
+  // script so pwsh itself starts with the real one.
+  const ps1 = fs.readFileSync(path.resolve(__dirname, '../../../install.ps1'), 'utf8');
+  const fnAt = ps1.indexOf('function Find-GitBash {');
+  const fn = ps1.slice(fnAt, ps1.indexOf('\n}\n', fnAt) + 3);
+  const blockAt = ps1.indexOf('    # --- status line');
+  const block = ps1.slice(blockAt, ps1.indexOf('    # --- capture hooks', blockAt));
+  assert.ok(fnAt > 0 && blockAt > 0, 'the function and the status-line block');
+  const t = tmpWork();
+  const file = (rel, exec) => {
+    const f = path.join(t, ...rel.split('/'));
+    fs.mkdirSync(path.dirname(f), { recursive: true });
+    fs.writeFileSync(f, exec ? '#!/bin/sh\nexit 0\n' : '');
+    if (exec) fs.chmodSync(f, 0o755);
+    return f;
+  };
+  // The launcher answers to `bash` on PATH, as System32\bash.exe does on Windows.
+  const wsl = file('Windows/System32/bash.exe'); file('Windows/System32/bash', true);
+  const pfBash = path.join(t, 'PF', 'Git', 'bin', 'bash.exe');
+  const appsBash = path.join(t, 'Apps', 'Git', 'bin', 'bash.exe');
+  const q = (s) => `'${s.replace(/'/g, "''")}'`;
+  const run = ({ setBash, pathDirs }) => {
+    const script = [
+      "function Say($m) { Write-Output \"say: $m\" }", "function Warn($m) { Write-Output \"warn: $m\" }",
+      "function Ok($m) { Write-Output \"ok: $m\" }", "function Dim($m) { Write-Output \"dim: $m\" }",
+      "function oak { $global:oakRan = \"$args\"; $global:LASTEXITCODE = 0 }", 'function jq { }',
+      `$env:SystemRoot = ${q(path.join(t, 'Windows'))}; $env:ProgramFiles = ${q(path.join(t, 'PF'))}`,
+      "Remove-Item -LiteralPath 'Env:ProgramFiles(x86)' -ErrorAction SilentlyContinue",
+      `$env:CLAUDE_CODE_GIT_BASH_PATH = ${setBash ? q(setBash) : '$null'}`,
+      `$env:PATH = ${q(pathDirs.map((d) => path.join(t, ...d.split('/'))).join(path.delimiter))}`,
+      fn, block,
+      'Write-Output "found: $(Find-GitBash)"; Write-Output "oak ran: $global:oakRan"',
+    ].join('\n');
+    const r = cp.spawnSync('pwsh', ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8' });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    return r.stdout.replace(/\r\n/g, '\n');
+  };
+  const sys32 = ['Windows/System32'];
+  let out = run({ pathDirs: sys32 });
+  assert.match(out, /warn: Skipped the bundled status line: Git Bash not found\./, 'only the WSL launcher: no Git Bash');
+  assert.match(out, /dim: winget install Git\.Git/);
+  assert.match(out, /^found: $/m);
+  assert.match(out, /^oak ran: $/m, 'and `oak statusline` is not run');
+  out = run({ setBash: wsl, pathDirs: sys32 });
+  assert.match(out, /^found: $/m, 'CLAUDE_CODE_GIT_BASH_PATH naming the WSL launcher is passed over too');
+
+  file('PF/Git/bin/bash.exe');
+  out = run({ pathDirs: sys32 });
+  assert.ok(out.includes(`found: ${pfBash}\n`), out);
+  assert.match(out, /ok: Status line installed/);
+  assert.match(out, /^oak ran: statusline$/m);
+  const custom = file('Tools/bash.exe');
+  assert.ok(run({ setBash: custom, pathDirs: sys32 }).includes(`found: ${custom}\n`), 'CLAUDE_CODE_GIT_BASH_PATH comes first');
+  assert.ok(run({ setBash: path.join(t, 'Tools', 'git.exe'), pathDirs: sys32 }).includes(`found: ${pfBash}\n`), 'unless it names no bash');
+
+  fs.rmSync(path.join(t, 'PF'), { recursive: true });
+  file('Apps/Git/cmd/git', true); file('Apps/Git/cmd/git.exe'); file('Apps/Git/bin/bash.exe');
+  assert.ok(run({ pathDirs: [...sys32, 'Apps/Git/cmd'] }).includes(`found: ${appsBash}\n`), 'the bin\\bash.exe beside the git on PATH');
 });
 
 function hasPwsh() {

@@ -937,6 +937,7 @@ function doctor(b, { platform = process.platform, report, spawn, binary = '/fake
     diagnoseSync: () => [],
     diagnoseIndex: () => ({ id: 'index', label: 'Local database', level: 'ok', detail: 'fixture' }),
     diagnoseCodexQuota: () => null,
+    diagnoseGitBash: () => null,
     // How many signal handlers were in place when the check began: they must be, before it starts herdr.
     diagnoseHerdrForwarding: async () => { acted.push(`forwarding, ${handlers.length} handlers in place`); return []; },
     diagnoseHerdrPane: async () => [],

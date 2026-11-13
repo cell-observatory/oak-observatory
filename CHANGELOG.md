@@ -22,6 +22,26 @@ the release notes.
 - `oak doctor` and `oak agent close --remove-worktree` wait up to 10 s for Git to list a repository's worktrees.
   With 1 s, a listing that took longer on a slow machine read as no worktrees at all: doctor reported no orphaned
   agent worktrees, and the close found no orphaned worktree by that name.
+- On Windows, OAK runs its bash scripts with Git Bash, found as Claude Code finds it: `CLAUDE_CODE_GIT_BASH_PATH`,
+  Git for Windows' install folder, then the `bin\bash.exe` beside the `git` on the PATH. Once WSL is on, the `bash`
+  on the PATH is `System32\bash.exe`, the WSL launcher, which runs Linux and cannot read a Windows path: `oak
+  statusline` and `oak update` failed to install the status line, and the month refresh behind the usage bars did not
+  run. With no Git Bash, they say so.
+- On Windows, the status line command OAK writes into Claude Code's settings names Git Bash and the script by their
+  Windows paths, in a form that Git Bash and PowerShell both run. Claude Code runs it with PowerShell when it finds
+  no Git Bash, and there the bare `bash` of the command before was the WSL launcher.
+- `install.ps1` installs the status line with Git Bash, found the same way, and says "Git Bash not found" when there
+  is none. It ran the first `bash` on the PATH, which was the WSL launcher once WSL is on.
+- `oak doctor` on Windows has a Git Bash row. It warns when there is no Git Bash, and when the `bash` on the PATH is
+  the WSL launcher, and says how to fix each.
+- On Windows, the month refresh behind the usage bars and the VS Code extension's background build of recent
+  sessions' change maps no longer open a console window while they run. Both still outlive the editor or command that
+  started them.
+- On Windows with no Python installed, the status line skips its token estimates quietly, or runs them with `py -3`
+  when the Python launcher is there. The `python3` there is the Microsoft Store's stub, which runs nothing, and
+  installing the status line stopped at it before setting up Codex's status line.
+- Inside WSL, `oak install-extensions` skips the Windows editor whose command it reaches through interop, says why,
+  and does not count it as a failure. Its install failed there, so `bootstrap.sh` ended with a warning.
 
 ## [0.11.0] — 2026-11-07
 
