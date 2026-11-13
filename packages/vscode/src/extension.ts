@@ -1942,7 +1942,7 @@ function maybeInstallCodexHooksFromExtension(): string | null {
   try {
     const found = core.spawnToolSync(process.platform === 'win32' ? 'where' : 'which', ['codex'], { encoding: 'utf8' });
     if (found.status !== 0 || !String(found.stdout ?? '').trim()) return null;
-    const res = core.installCodexHooks(`oak capture --agent codex #${core.HOOK_MARKER}`, core.isOurCommand);
+    const res = core.installCodexHooks(core.captureHookCommand('codex'), core.isOurCommand);
     return res.hooksJson === 'unchanged'
       ? 'codex hooks: already installed.'
       : `codex hooks ${res.hooksJson} — run \`oak init --codex\` in a terminal to live-verify they fire (codex skips untrusted hooks silently).`;
@@ -1954,7 +1954,7 @@ function maybeInstallCodexHooksFromExtension(): string | null {
 /** Install the capture hooks into ~/.claude/settings.json (portable command), then offer a reload. */
 function installHooksFromExtension(): void {
   try {
-    const res = core.installHooks(`oak capture #${core.HOOK_MARKER}`);
+    const res = core.installHooks(core.captureHookCommand('claude'));
     if (res.ledgerError) {
       // The install itself succeeded; the RECORD of it did not — and ledger-wide uninstall can
       // only clean what the ledger knows. The CLI says this out loud; so does this surface.

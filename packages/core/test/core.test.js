@@ -5111,6 +5111,55 @@ test('install: hooks merged non-destructively, idempotent, and reversible', () =
   assert.deepEqual(JSON.parse(fs.readFileSync(sp, 'utf8')).permissions.allow, ['WebSearch']);
 });
 
+test('install: a capture hook whose `oak` is missing exits 0, and one whose `oak` fails still fails (Windows report §8)', (t) => {
+  // A session that outlived OAK's removal, or started before its install, ran a hook that exited 127 on every tool call.
+  const M = `#${core.HOOK_MARKER}`;
+  const cmds = { claude: core.captureHookCommand('claude', { platform: 'linux' }), codex: core.captureHookCommand('codex', { platform: 'darwin' }) };
+  assert.deepEqual(
+    [core.captureHookCommand('claude', { platform: 'win32' }), core.captureHookCommand('codex', { platform: 'win32' }), core.captureHookCommand('claude', { project: true, platform: 'linux' })],
+    [`oak capture ${M}`, `oak capture --agent codex ${M}`, `oak capture ${M}`],
+    'Windows and a shared project file keep the command every shell runs'
+  );
+  assert.ok(cmds.claude.endsWith(` ${M}`) && cmds.codex.startsWith(`sh -c '`) && Object.values(cmds).every(core.isOurCommand));
+  if (process.platform === 'win32') return t.skip('the guard is the POSIX shells\'');
+  // Only `sh` on PATH (the Codex command starts one), then also an `oak` that fails as a broken capture would.
+  const bin = tmpDir('cc-hookbin-'), withOak = tmpDir('cc-hookoak-');
+  fs.symlinkSync('/bin/sh', path.join(bin, 'sh'));
+  fs.writeFileSync(path.join(withOak, 'oak'), '#!/bin/sh\n/bin/cat\necho "$*" >&2\nexit 1\n', { mode: 0o755 });
+  const run = (shell, cmd, dirs) => cp.spawnSync(shell, ['-c', cmd], { input: '{"hook":"payload"}', encoding: 'utf8', env: { PATH: dirs.join(path.delimiter), HOME: bin } });
+  const shells = ['/bin/sh', '/bin/dash', '/bin/bash', '/bin/zsh', '/usr/bin/zsh'].filter((s) => fs.existsSync(s));
+  const plain = run('/bin/sh', `oak capture ${M}`, [bin]);
+  assert.equal(plain.status, 127, 'control: the plain command fails where `oak` is missing');
+  for (const shell of shells) {
+    for (const [agent, cmd] of Object.entries(cmds)) {
+      const missing = run(shell, cmd, [bin]);
+      assert.deepEqual([missing.status, missing.stdout, missing.stderr], [0, '', ''], `${agent} in ${shell}, no oak`);
+      const failing = run(shell, cmd, [bin, withOak]);
+      assert.deepEqual([failing.status, failing.stdout, failing.stderr.trim()], [1, '{"hook":"payload"}', agent === 'codex' ? 'capture --agent codex' : 'capture'], `${agent} in ${shell}, a failing oak`);
+    }
+  }
+});
+
+test('install: every entry says onFailure "continue", and an install written without it is rewritten (Windows report §8)', () => {
+  // Claude Code on Windows without Git Bash blocks a PreToolUse or PermissionRequest tool call on any exit but 0 and 2
+  // from a hook that does not say "continue", so a missing `oak` stopped every edit there.
+  const home = freshHome();
+  delete process.env.CLAUDE_CONFIG_DIR;
+  const sp = path.join(home, '.claude', 'settings.json');
+  const cmd = core.captureHookCommand('claude');
+  fs.mkdirSync(path.dirname(sp), { recursive: true });
+  const older = Object.fromEntries(core.CAPTURE_HOOK_EVENTS.map((e) => [e, [{ matcher: core.matcherFor(e), hooks: [{ type: 'command', command: cmd }] }]]));
+  fs.writeFileSync(sp, JSON.stringify({ hooks: older }));
+  assert.equal(core.installStatus().find((f) => f.path === sp).entries, core.HEALTHY_HOOK_ENTRIES, 'a healthy count');
+  assert.equal(core.hooksCurrent(cmd, sp), false, 'but not the entries this OAK writes');
+  assert.equal(core.installHooks(cmd, sp).changed, true);
+  const d = JSON.parse(fs.readFileSync(sp, 'utf8'));
+  assert.deepEqual(core.CAPTURE_HOOK_EVENTS.map((e) => d.hooks[e]), core.CAPTURE_HOOK_EVENTS.map((e) => [{ matcher: core.matcherFor(e), hooks: [{ type: 'command', command: cmd, onFailure: 'continue' }] }]));
+  assert.equal(core.hooksCurrent(cmd, sp), true);
+  assert.equal(core.installHooks(cmd, sp).changed, false, 'and a re-init is a no-op');
+  assert.equal(core.hooksCurrent(`node "/opt/old/capture.js" #${core.HOOK_MARKER}`, sp), false, 'another command is not current');
+});
+
 test('install: a settings.json that begins with a byte order mark is read past it, and every write keeps it first (2026-10-07)', (t) => {
   // JSON.parse refuses the mark: `oak init` called such a file invalid JSON, `oak status` found no hooks in it,
   // `oak uninstall` could not parse it, and the bundled status line's installer rewrote it without the mark.
@@ -5892,7 +5941,7 @@ test('install: an install from before PostToolUseFailure is reported partial, an
   const r = core.installHooks(cmd, sp);
   assert.ok(r.changed && r.backupPath, 'init has work to do, and backs the file up first');
   const d = JSON.parse(fs.readFileSync(sp, 'utf8'));
-  assert.deepEqual(d.hooks.PostToolUseFailure, [mine, { matcher: core.MATCHER, hooks: [{ type: 'command', command: cmd }] }],
+  assert.deepEqual(d.hooks.PostToolUseFailure, [mine, { matcher: core.MATCHER, hooks: [{ type: 'command', command: cmd, onFailure: 'continue' }] }],
     'ours is added in its own group with the capture matcher; the user\'s hook is untouched');
   assert.deepEqual(d.permissions, { allow: ['Bash(ls:*)'] }, 'nothing outside hooks is disturbed');
   assert.equal(row().entries, core.HEALTHY_HOOK_ENTRIES, 'healthy after');
@@ -8277,6 +8326,54 @@ test('diagnose: flags missing hooks and CLI-off-PATH, clears once installed', ()
   fs2.writeFileSync(core.settingsPath(), '{ not json');
   const broken = core.diagnose({ cwd: work, binOnPath: true, jqPresent: true });
   assert.equal(byId(broken, 'settings-json').level, 'fail', 'invalid settings.json flagged');
+});
+
+// Windows report §3. No Windows runs here, so the package's file system virtualization is played by an fs that sends a
+// new file under %APPDATA% to the package's LocalCache\Roaming, as Windows does for what the desktop app starts.
+test('diagnose: an install inside the Claude desktop app\'s package is told apart from one in a terminal (Windows report §3)', () => {
+  const root = tmpDir('oak-msix-');
+  const env = { APPDATA: path.join(root, 'Roaming'), LOCALAPPDATA: path.join(root, 'Local') };
+  const pkg = 'Claude_pzs8sxrjxfjjc';
+  const privateCopy = path.join(env.LOCALAPPDATA, 'Packages', pkg, 'LocalCache', 'Roaming');
+  // The app is installed in both cases, beside another package: the folder alone says nothing.
+  for (const d of [env.APPDATA, privateCopy, path.join(env.LOCALAPPDATA, 'Packages', 'Microsoft.WindowsTerminal_8wekyb3d8bbwe', 'LocalCache', 'Roaming')]) fs.mkdirSync(d, { recursive: true });
+  const writes = [];
+  const redirect = (p) => p.startsWith(env.APPDATA + path.sep) ? path.join(privateCopy, path.relative(env.APPDATA, p)) : p;
+  const contained = { ...fs, writeFileSync: (p, d) => { writes.push(p); fs.writeFileSync(redirect(p), d); }, rmSync: (p, o) => fs.rmSync(redirect(p), o) };
+  const left = () => [...fs.readdirSync(env.APPDATA), ...fs.readdirSync(privateCopy)];
+
+  assert.equal(core.claudeDesktopPackage({ platform: 'win32', env, io: contained }), pkg);
+  assert.equal(writes.length, 1);
+  assert.deepEqual(left(), [], 'the probe is removed');
+  // A terminal, with or without a Claude Code session in it (which sets CLAUDECODE as the app's sessions do).
+  for (const e of [env, { ...env, CLAUDECODE: '1' }]) assert.equal(core.claudeDesktopPackage({ platform: 'win32', env: e }), null);
+  assert.deepEqual(left(), [], 'the probe is removed');
+  // Off Windows, without the folders it needs, or when the probe cannot be written, it is no reason to refuse.
+  assert.equal(core.claudeDesktopPackage({ platform: 'linux', env, io: contained }), null);
+  assert.equal(core.claudeDesktopPackage({ platform: 'darwin', env, io: contained }), null);
+  assert.equal(core.claudeDesktopPackage({ platform: 'win32', env: { APPDATA: env.APPDATA }, io: contained }), null);
+  assert.equal(writes.length, 1, 'nothing is written where no check runs');
+  assert.equal(core.claudeDesktopPackage({ platform: 'win32', env, io: { ...contained, writeFileSync: () => { throw Object.assign(new Error('EPERM'), { code: 'EPERM' }); } } }), null);
+});
+
+test('diagnose: doctor warns about a copy of OAK installed inside the Claude desktop app (Windows report §3)', () => {
+  const root = tmpDir('oak-msix-');
+  const env = { LOCALAPPDATA: path.join(root, 'Local') };
+  const npm = path.join(env.LOCALAPPDATA, 'Packages', 'Claude_pzs8sxrjxfjjc', 'LocalCache', 'Roaming', 'npm');
+  fs.mkdirSync(path.join(npm, 'node_modules', 'other-tool'), { recursive: true });
+  assert.equal(core.diagnoseDesktopAppCopy({ platform: 'win32', env }), null, 'the app, with nothing of OAK in it');
+  assert.equal(core.diagnoseDesktopAppCopy({ platform: 'win32', env: {} }), null);
+  const copy = path.join(npm, 'node_modules', 'oak-observatory');
+  fs.mkdirSync(copy);
+  fs.writeFileSync(path.join(copy, 'package.json'), JSON.stringify({ name: 'oak-observatory', version: '0.10.0' }));
+  const row = core.diagnoseDesktopAppCopy({ platform: 'win32', env });
+  assert.equal(row?.id, 'desktop-app-copy');
+  assert.equal(row.level, 'warn');
+  assert.ok(row.detail.startsWith(`${copy} (0.10.0): `), row.detail);
+  assert.match(row.fix, /From a normal terminal, delete that oak-observatory folder and the oak, oak\.cmd and oak\.ps1 files/);
+  assert.equal(core.diagnoseDesktopAppCopy({ platform: 'linux', env }), null);
+  // It reaches doctor's Markdown as any row does.
+  assert.ok(core.diagnoseMarkdown([row]).includes('no copy of OAK inside the Claude desktop app'));
 });
 
 test('diagnose: a status line installed a moment ago is not told to install itself', () => {

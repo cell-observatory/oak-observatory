@@ -8,7 +8,7 @@ const net = require('node:net');
 const core = require('../../core/dist');
 // herdr's commands run through this launcher (a saved machine's with `detached`, which execFile ignores).
 const spawn = require('../../core/dist/spawn');
-const { diagnoseNativeSpawn, ptyBuildFix } = require('../dist/native');
+const { diagnoseNativeSpawn, ptyBuildFix, ptyCheckSkipped } = require('../dist/native');
 
 test('doctor forwarding: one fake herdr command per machine, slow/fast boundary and SSH target', async t => {
   let clock = 0;
@@ -258,4 +258,53 @@ test('doctor PTY: timeout kills the diagnostic child and reports failure', async
   assert.equal(check.level, 'fail');
   assert.match(check.detail, /timed out/);
   assert.equal(require(dir).killed, true);
+});
+
+// `__after-update` probes in a child of its own (Windows report §2): the fakes hold their process open the way ConPTY's
+// exit thread and output worker do, and start a child of their own, as ConPTY starts conhost and cmd.
+const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+test('doctor PTY: isolated, a PTY that never finishes is killed with the tree it started, and the caller is not held', { skip: process.platform === 'win32' && 'POSIX process groups' }, async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-doctor-pty-hang-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'index.js'), `
+    exports.spawn = () => {
+      const kid = require('child_process').spawn('sleep', ['60'], { stdio: 'ignore' });
+      require('fs').writeFileSync(require('path').join(__dirname, 'pids'), JSON.stringify([process.pid, kid.pid]));
+      setInterval(() => {}, 1000);
+      return { onData() {}, onExit() {}, kill() { throw new Error('the isolated probe never calls kill()'); } };
+    };
+  `);
+  const started = Date.now();
+  const check = await diagnoseNativeSpawn(false, { packageDir: dir, isolate: true, timeoutMs: 1500 });
+  assert.ok(Date.now() - started < 8000, `took ${Date.now() - started} ms`);
+  assert.equal(check.level, 'fail');
+  assert.match(check.detail, /timed out/);
+  const [probe, kid] = JSON.parse(fs.readFileSync(path.join(dir, 'pids'), 'utf8'));
+  assert.notEqual(probe, process.pid);
+  for (let i = 0; i < 50 && (alive(probe) || alive(kid)); i++) await new Promise(r => setTimeout(r, 100));
+  assert.deepEqual([alive(probe), alive(kid)], [false, false]);
+});
+
+test('doctor PTY: isolated, a PTY that finishes passes although its handles stay open', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-doctor-pty-done-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(dir, 'index.js'), `
+    exports.spawn = () => {
+      setInterval(() => {}, 1000);
+      return { onData() {}, onExit(fn) { setTimeout(() => fn({ exitCode: 0 }), 50); }, kill() { throw new Error('never called'); } };
+    };
+  `);
+  const check = await diagnoseNativeSpawn(false, { packageDir: dir, isolate: true, timeoutMs: 20000 });
+  assert.deepEqual([check.level, check.detail], ['ok', 'node-pty spawned and completed the echo check']);
+});
+
+test('doctor PTY: __after-update skips the check only on Windows without an interactive console', () => {
+  assert.equal(ptyCheckSkipped('win32', {}, true), null);
+  assert.equal(ptyCheckSkipped('win32', {}, false), 'no interactive console');
+  assert.equal(ptyCheckSkipped('win32', { SSH_CONNECTION: '10.0.0.2 50000 10.0.0.3 22' }, true), 'an ssh session');
+  assert.equal(ptyCheckSkipped('win32', { SSH_CLIENT: '10.0.0.2 50000 22' }, true), 'an ssh session');
+  // macOS and Linux keep it: it restores the spawn-helper bit an npm reinstall drops, and saved machines update over ssh.
+  for (const platform of ['darwin', 'linux']) {
+    assert.equal(ptyCheckSkipped(platform, { SSH_CONNECTION: '10.0.0.2 50000 10.0.0.3 22' }, false), null);
+  }
 });

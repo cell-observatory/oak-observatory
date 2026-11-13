@@ -92,6 +92,29 @@ if ([int]($nodeParts[0]) -lt 24) {
     exit 1
 }
 
+# --- not inside the Claude desktop app -----------------------------------------------------------
+# The Claude desktop app is an MSIX package, and what it starts runs in the package's file system virtualization: a
+# new file under %APPDATA% lands in %LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming instead, where no terminal and
+# no editor sees it, so `npm i -g` from there installs an oak only the app's own sessions run. A probe file written
+# to %APPDATA% and found in that copy tells; any error lets the install go on (core diagnose.ts claudeDesktopPackage
+# makes the same check for `oak update` and `oak install-extensions`).
+$probeName = 'oak-container-probe-' + [System.IO.Path]::GetRandomFileName()
+$probe = $null
+$container = $null
+try {
+    $probe = Join-Path $env:APPDATA $probeName
+    New-Item -ItemType File -Path $probe -Force | Out-Null
+    $container = Get-ChildItem -Path (Join-Path $env:LOCALAPPDATA 'Packages') -Directory -Filter 'Claude_*' -ErrorAction SilentlyContinue |
+        Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName "LocalCache\Roaming\$probeName") } | Select-Object -First 1
+} catch { } finally {
+    if ($probe) { Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue }
+}
+if ($container) {
+    Warn "This runs inside the Claude desktop app ($($container.Name)), where Windows keeps what an install writes under %APPDATA% in a copy only the app's own sessions see."
+    Dim  'Run this installer from a normal terminal: Windows Terminal, or PowerShell from the Start menu.'
+    exit 1
+}
+
 $tmp = Join-Path $env:TEMP ("oak-observatory-" + [System.IO.Path]::GetRandomFileName())
 New-Item -ItemType Directory -Path $tmp -Force | Out-Null
 try {
