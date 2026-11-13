@@ -130,40 +130,59 @@ export function removeAgentWorktree(w: AgentWorktree): void {
     try { git(w.repository, ['branch', '-d', '--', w.branch], 10000); } catch { /* not merged into HEAD: kept */ }
   }
 }
-export function orphanedAgentWorktrees(cwd = process.cwd()): { id: string; path: string }[] {
+/** OAK's orphaned worktrees in the current and recorded repositories, and each repository whose worktrees could not be
+ *  listed, with Git's reason. */
+export function scanAgentWorktrees(cwd = process.cwd()): { orphans: { id: string; path: string }[]; unread: { repository: string; error: string }[] } {
   const { listDelegatedRecords } = require('./delegated') as typeof import('./delegated');
   const rows = listDelegatedRecords().filter(r => !r.machine);
   const repositories = [...new Set([repoRoot(cwd), ...rows.map(r => r.worktree?.repository)].filter((x): x is string => !!x))].slice(0, 16);
-  const out: { id: string; path: string }[] = [];
+  const orphans: { id: string; path: string }[] = [], unread: { repository: string; error: string }[] = [];
   for (const repo of repositories) {
+    // A recorded repository since removed, or no longer a Git repository, has no worktrees to find.
+    if (!fs.existsSync(path.join(repo, '.git'))) continue;
+    let listing: string;
     try {
       // A one-off listing waits on Git as a removal does (10 s). With the default 1 s, a listing that ran longer on a
       // slow Windows runner timed out, and read as no worktrees at all (2026-11-10).
-      for (const block of git(repo, ['worktree', 'list', '--porcelain'], 10000).split('\n\n')) {
-        const p = /^worktree (.+)$/m.exec(block)?.[1];
-        if (!p || p === repo) continue;
-        const row = rows.find(r => r.worktree?.path === p);
-        // Only a worktree OAK made (its `oak/<id>` branch) is OAK's to call orphaned, recorded for an agent or not: the
-        // user's own worktrees, on their branches or detached, are never named, even when an agent started in one.
-        const oakId = /^branch refs\/heads\/oak\/(.+)$/m.exec(block)?.[1];
-        if (oakId && (!row || ((row.state === 'gone' || row.closedMs !== null) && row.worktree?.state?.merged && !row.worktree.state.error)))
-          out.push({ id: row?.id ?? oakId ?? path.basename(p), path: p });
-      }
-    } catch { /* a missing repository has no discoverable worktrees */ }
+      listing = git(repo, ['worktree', 'list', '--porcelain'], 10000);
+    } catch (e) {
+      // Any other failure is said: read as none, it called a repository clear that Git could not list.
+      unread.push({ repository: repo, error: String((e as Error).message).replace(/^agent worktree: /, '') });
+      continue;
+    }
+    for (const block of listing.split('\n\n')) {
+      const p = /^worktree (.+)$/m.exec(block)?.[1];
+      if (!p || p === repo) continue;
+      const row = rows.find(r => r.worktree?.path === p);
+      // Only a worktree OAK made (its `oak/<id>` branch) is OAK's to call orphaned, recorded for an agent or not: the
+      // user's own worktrees, on their branches or detached, are never named, even when an agent started in one.
+      const oakId = /^branch refs\/heads\/oak\/(.+)$/m.exec(block)?.[1];
+      if (oakId && (!row || ((row.state === 'gone' || row.closedMs !== null) && row.worktree?.state?.merged && !row.worktree.state.error)))
+        orphans.push({ id: row?.id ?? oakId ?? path.basename(p), path: p });
+    }
   }
-  return out;
+  return { orphans, unread };
+}
+const unreadText = (unread: { repository: string; error: string }[]) => unread.map(u => `could not list the worktrees of ${u.repository}: ${u.error}`).join('; ');
+/** The orphaned worktrees; throws when a repository's worktrees could not be listed. */
+export function orphanedAgentWorktrees(cwd = process.cwd()): { id: string; path: string }[] {
+  const { orphans, unread } = scanAgentWorktrees(cwd);
+  if (unread.length) throw new Error(unreadText(unread));
+  return orphans;
 }
 export function diagnoseAgentWorktrees(cwd = process.cwd()): Check {
-  const trees = orphanedAgentWorktrees(cwd);
-  return { id: 'agent-worktrees', label: 'Orphaned agent worktrees', level: trees.length ? 'warn' : 'ok',
-    detail: trees.length ? trees.map(w => `${w.id}: ${w.path}`).join('; ') : 'No orphaned worktrees found in the current or recorded repositories.',
+  const { orphans: trees, unread } = scanAgentWorktrees(cwd);
+  const found = trees.map(w => `${w.id}: ${w.path}`).join('; ');
+  return { id: 'agent-worktrees', label: 'Orphaned agent worktrees', level: trees.length || unread.length ? 'warn' : 'ok',
+    detail: [found, unreadText(unread)].filter(Boolean).join('; ') || 'No orphaned worktrees found in the current or recorded repositories.',
     ...(trees.length ? { fix: trees.map(w => `oak agent close --remove-worktree ${w.id}`).join('; ') } : {}) };
 }
 
 /** An orphan has no row to close. Resolve it only among the current repository's registered worktrees. */
 export function closeOrphanAgentWorktree(id: string, cwd = process.cwd()): AgentWorktree {
-  const matches = orphanedAgentWorktrees(cwd).filter(w => w.id === id);
-  if (matches.length !== 1) throw new Error(`no unique orphaned worktree "${id}" in this repository; oak doctor lists them`);
+  const { orphans, unread } = scanAgentWorktrees(cwd);
+  const matches = orphans.filter(w => w.id === id);
+  if (matches.length !== 1) throw new Error(`no unique orphaned worktree "${id}" in this repository; oak doctor lists them${unread.length ? ` (${unreadText(unread)})` : ''}`);
   const tree = detectAgentWorktree(matches[0].path);
   if (!tree) throw new Error('the orphaned worktree is no longer registered');
   removeAgentWorktree(tree);

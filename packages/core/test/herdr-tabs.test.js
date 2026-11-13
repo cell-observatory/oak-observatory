@@ -1067,9 +1067,18 @@ test('herdr tabs: the terminal app\'s pass never names a tab after the memory th
 // ~/.local/bin), on a sandboxed server kept off the network. Verified 2026-10-06 on herdr 0.9.1 and 0.9.3.
 test('herdr tab sync: a real herdr gives the root thread back the pane its memory thread\'s report took (live sandbox)', { timeout: 30000 }, async t => {
   const bin = process.env.HERDR_BIN || require('../dist/herdr-install').findHerdrBin();
-  const sleeper = ['/bin/sleep', '/usr/bin/sleep'].find(f => fs.existsSync(f));
-  if (!bin || !sleeper || process.platform === 'win32') {
-    const why = `SKIP LIVE HEAL: ${!bin ? 'no herdr binary' : 'no POSIX sleep to stand in for codex'}; the heal is verified against the scripted herdr only.`;
+  // A program that runs under the name `codex`: sleep, else a shell that waits on its terminal. uutils' sleep (Ubuntu
+  // 26.04) is one binary for every tool, which refuses to run under a name that is not one of them (2026-11-13).
+  const standIn = process.platform === 'win32' ? null : [['/bin/sleep', ['60']], ['/usr/bin/sleep', ['60']], ['/bin/sh', ['-c', 'read x']]]
+    .filter(([f]) => fs.existsSync(f)).map(([f, args]) => [fs.realpathSync(f), args]).find(([f, args]) => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-codex-stand-in-')), copy = path.join(dir, 'codex');
+      try {
+        fs.copyFileSync(f, copy); fs.chmodSync(copy, 0o755);
+        return require('node:child_process').spawnSync(copy, args[0] === '60' ? ['0'] : ['-c', 'exit 0'], { stdio: 'ignore', timeout: 5000 }).status === 0;
+      } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+    });
+  if (!bin || !standIn || process.platform === 'win32') {
+    const why = `SKIP LIVE HEAL: ${!bin ? 'no herdr binary' : 'no program that runs as codex'}; the heal is verified against the scripted herdr only.`;
     console.error(why); t.skip(why); return;
   }
   const cp = require('node:child_process');
@@ -1095,9 +1104,9 @@ test('herdr tab sync: a real herdr gives the root thread back the pane its memor
   const paneId = (await transport.herdrRequest('workspace.create', { cwd: box, label: 'heal', focus: true }, opts)).root_pane.pane_id;
   // herdr lists a pane among its agents, where a session's pane is looked up, only while an agent runs there.
   fs.mkdirSync(path.join(box, 'bin'));
-  fs.copyFileSync(sleeper, path.join(box, 'bin', 'codex'));
+  fs.copyFileSync(standIn[0], path.join(box, 'bin', 'codex'));
   fs.chmodSync(path.join(box, 'bin', 'codex'), 0o755);
-  await transport.herdrRequest('pane.send_text', { pane_id: paneId, text: `exec ${path.join(box, 'bin', 'codex')} 60\n` }, opts);
+  await transport.herdrRequest('pane.send_text', { pane_id: paneId, text: `exec ${path.join(box, 'bin', 'codex')} ${standIn[1].map(a => `'${a}'`).join(' ')}\n` }, opts);
   let snapshot;
   const held = async () => (snapshot = await transport.herdrSnapshot(opts)).agents.find(a => a.pane_id === paneId);
   for (const end = Date.now() + 10000; (await held())?.agent !== 'codex' && Date.now() < end;) await new Promise(r => setTimeout(r, 100));

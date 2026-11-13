@@ -279,6 +279,12 @@ const onlyEditors = (...editors) => (fx) => {
   for (const name of editors) fakeEditor(fx, name);
   fx.env.PATH = path.join(fx.dir, 'bin') + path.delimiter + NO_GUI_PATH;
 };
+/** Cursor's agent `cursor` (see core isCursorAgentShim) in `dir`: it says no Cursor is installed, and logs that it ran. */
+const fakeCursorAgent = (fx, dir) => {
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'cursor'), `#!${process.execPath}\nrequire('fs').appendFileSync(${JSON.stringify(fx.edLog)}, JSON.stringify(['cursor agent', ...process.argv.slice(2)]) + '\\n');\n`
+    + `console.error("Error: No Cursor IDE installation found. Use 'cursor agent' or 'agent' to run the agent.");\nprocess.exit(1);\n`, { mode: 0o755 });
+};
 const OPEN_B = [K.enter, K.down]; // unfold b.ts (the newest file, listed first) and select its one edit, #2
 const status = (re) => (r) => assert.match(r.bottom, re);
 /** Focus moved to the window titled `to`: its title takes the colour the focused title had at start
@@ -640,7 +646,7 @@ fs.writeFileSync(${JSON.stringify(fx.edLog)}, JSON.stringify([requests.length ? 
     env: { DISPLAY: ':synthetic' }, check: r => { assert.deepEqual(r.editor, []); assert.match(r.bottom, /W needs a GUI editor — set GUI editor under o \(prefs\.guiEditor\)/); } },
   { id: 'workspace window: W runs the GUI editor when the terminal editor is nvim, here the first on PATH', tab: 'observatory', keys: [K.down, 'W'], mentions: 'workspace window', cols: 200,
     prefs: { editor: 'nvim' }, env: { EDITOR: undefined, DISPLAY: ':synthetic' }, prep: onlyEditors('cursor', 'nvim'),
-    check: r => { assert.deepEqual(r.editor, [['cursor', '']]); assert.match(r.bottom, /GUI editor cursor, from the first GUI editor on PATH — ran cursor \S+/); } },
+    check: r => { assert.deepEqual(r.editor, [['cursor', '']]); assert.match(r.bottom, /GUI editor cursor, from the first GUI editor on PATH — ran \S+\/cursor \S+/); } },
   { id: 'workspace window: the GUI editor setting wins over $EDITOR', tab: 'observatory', keys: [K.down, 'W'], mentions: 'workspace window', cols: 200,
     prefs: { guiEditor: 'cursor' }, env: { DISPLAY: ':synthetic' }, prep: (fx) => fakeEditor(fx, 'cursor'),
     check: r => { assert.deepEqual(r.editor, [['cursor', '']]); assert.match(r.bottom, /GUI editor cursor, from the GUI editor setting/); } },
@@ -652,6 +658,14 @@ fs.writeFileSync(${JSON.stringify(fx.edLog)}, JSON.stringify([requests.length ? 
   { id: 'workspace window: with no GUI editor anywhere W says to set the GUI editor', tab: 'observatory', keys: [K.down, 'W'], mentions: 'workspace window', cols: 200,
     prefs: { editor: 'nvim' }, env: { EDITOR: undefined, DISPLAY: ':synthetic' }, prep: onlyEditors('nvim'),
     check: r => { assert.deepEqual(r.editor, []); assert.match(r.bottom, /W needs a GUI editor — set GUI editor under o \(prefs\.guiEditor\)/); } },
+  // Cursor's agent puts a `cursor` of its own on PATH, which runs the editor's only when that is on PATH too.
+  { id: "workspace window: W never runs Cursor's agent command, even with nothing else to run", tab: 'observatory', keys: [K.down, 'W'], mentions: 'workspace window', cols: 200,
+    prefs: { editor: 'nvim' }, env: { EDITOR: undefined, DISPLAY: ':synthetic' }, prep: (fx) => { onlyEditors('nvim')(fx); fakeCursorAgent(fx, path.join(fx.dir, 'bin')); },
+    check: r => { assert.deepEqual(r.editor, []); assert.match(r.bottom, /W needs a GUI editor — set GUI editor under o \(prefs\.guiEditor\)/); } },
+  { id: "workspace window: W runs Cursor's editor, past Cursor's agent command first on PATH", tab: 'observatory', keys: [K.down, 'W'], mentions: 'workspace window', cols: 200,
+    prefs: { guiEditor: 'cursor' }, env: { DISPLAY: ':synthetic' },
+    prep: (fx) => { onlyEditors('cursor')(fx); const agent = path.join(fx.dir, 'agent-bin'); fakeCursorAgent(fx, agent); fx.env.PATH = agent + path.delimiter + fx.env.PATH; },
+    check: r => { assert.deepEqual(r.editor, [['cursor', '']]); assert.match(r.bottom, /GUI editor cursor, from the GUI editor setting — ran \S+\/bin\/cursor /); } },
   { id: 'workspace window: W prints the command over SSH without a GUI', tab: 'observatory', keys: [K.down, 'W'], mentions: 'workspace window', env: { SSH_CONNECTION: '192.0.2.1 1234 192.0.2.2 22', DISPLAY: undefined, WAYLAND_DISPLAY: undefined },
     check: r => { assert.deepEqual(r.editor, []); assert.match(r.bottom, /Run on the machine with the editor: code --remote ssh-remote\+/); } },
   { id: 'Observatory ? opens the help, over its own key row', tab: 'observatory', keys: ['?'], mentions: 'these keys',
