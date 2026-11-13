@@ -3858,7 +3858,7 @@ function cmdConversation(args: string[]): void {
   // Provenance only: diagnose a local sync copy without parsing or presenting its conversation.
   if (args.includes('--source-info')) {
     // The raw lookup: session listing and resolution skip sync mirrors, but provenance must find one to report it.
-    const transcript = core.findTranscript(root, session) ?? core.transcriptForSession(session) ?? core.describeSession(session).transcript;
+    const transcript = core.findTranscript(root, session) ?? core.transcriptForSession(session) ?? core.describeSession(session).transcript ?? core.claudeSessionTranscript(session, true);
     return emitJson(transcript ? { ...core.isMirroredTranscript(transcript), syncedAt: require('fs').statSync(transcript).mtimeMs } : { mirrored: false });
   }
   const numberFlag = (name: string, minimum: number): number | undefined => {

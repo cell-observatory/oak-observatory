@@ -1359,6 +1359,30 @@ fs.openSync = function (p, ...r) { if (/manifest\\.jsonl\\.\\d+\\.tmp$/.test(Str
   assert.deepEqual(fs.readFileSync(notes(s.A)), original);
 });
 
+test('sync inventory and fetch follow the newest copy of a session resumed in another project folder', { skip: POSIX }, (t) => {
+  const w = world(t), s = seed(w), id = ID(66);
+  only(w, ['linux-a', 'mac']);
+  const old = path.join(s.A, 'a-old'), current = path.join(s.A, 'z-new');
+  fs.mkdirSync(current); fs.symlinkSync(current, old, 'dir');
+  const first = conversation(s.A, old, id, 'Before the fixture move');
+  const moved = path.join(s.A, '.claude', 'projects', claudeFolder(current), `${id}.jsonl`);
+  const continued = fs.readFileSync(first, 'utf8') + line({ type: 'user', cwd: current, sessionId: id, message: { role: 'user', content: 'Kestrel continuation' } });
+  write(first, fs.readFileSync(first), Date.now() - 60_000);
+  write(moved, continued, Date.now() - 30_000);
+  const inventory = w.json('linux-a', ['__sync-inventory', '--user', me]);
+  assert.equal(inventory.projects.find(p => p.folder === claudeFolder(current))?.cwd, current);
+  assert.equal(inventory.families.transcripts.filter(f => f.name.endsWith(`${id}.jsonl`)).length, 2, 'backups retain both files');
+  w.json('mac', ['sync', 'now']);
+  const fetched = w.json('mac', ['sync', 'fetch', id]);
+  assert.ok(fetched.path.endsWith(path.join(claudeFolder(path.join(s.M, 'z-new')), `${id}.jsonl`)));
+  assert.equal(fs.readFileSync(fetched.path, 'utf8'), continued);
+  const stale = path.join(s.M, '.claude', 'projects', claudeFolder(path.join(s.M, 'zz-stale')), `${id}.jsonl`);
+  write(stale, fs.readFileSync(first), Date.now() - 60_000);
+  const again = w.json('mac', ['sync', 'fetch', id]);
+  assert.equal(again.path, fetched.path, 'an already-held session resolves to its newest local copy');
+  assert.deepEqual(fs.readFileSync(stale), fs.readFileSync(first), 'the frozen copy is untouched');
+});
+
 test('sync fetch evicts nothing by its index, which may be out of date: the copy it would evict can be the last one', { skip: POSIX }, (t) => {
   const w = world(t);
   const s = seed(w);

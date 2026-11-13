@@ -17,7 +17,9 @@ the release notes.
   are encoded so an SSH login shell cannot strip their quoted assignments. Machine add diagnoses a shell that
   mangles quotes before installing, with advice to use the WSL distro's own sshd. Failed installs remove their
   temporary copies and restore an earlier OAK bundle and launcher; SSH calls that need no input receive none.
-
+- A Claude Code session resumed after its workspace moved now uses its most recently written transcript and latest
+  recorded workspace, even when the new project folder starts with a copy of the old history. Session lists,
+  `--session`, the inbox, search and sync follow that copy instead of the frozen one.
 - `oak install-extensions` and `oak update` no longer take the `cursor` script that Cursor's agent CLI installs in
   `~/.local/bin` for the editor. With no Cursor app command on the PATH, that script exits with "No Cursor IDE
   installation found", and the extension install failed. They now use the next `cursor` on the PATH, or Cursor's

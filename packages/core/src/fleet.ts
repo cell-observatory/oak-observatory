@@ -13,7 +13,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { claudeConfigDir } from './paths';
-import { projectDir, commonDir, repoKeyForSession, firstCwdLine, isMirroredTranscript, isBridgePointer } from './session';
+import { projectDir, commonDir, repoKeyForSession, latestCwdLine, claudeSessionTranscript, isMirroredTranscript, isBridgePointer } from './session';
 import { readLog, isSafeSessionId, sidecarMemo, storeDir } from './store';
 import { readManifest, manifestKey, syncDir, type SyncManifest } from './sync-state';
 import { machineHostTag } from './machine-usage';
@@ -254,11 +254,12 @@ export function listSiblings(cwd: string, activeSessionId?: string): SiblingSess
     const id = name.slice(0, -'.jsonl'.length);
     if (!isSafeSessionId(id)) continue;
     // A copy of another machine's session that oak sync landed here is no sibling: it runs there (syncCopy).
-    const transcript = path.join(dir, name);
+    const transcript = claudeSessionTranscript(id);
+    if (!transcript) continue;
     if (isMirroredTranscript(transcript).mirrored || isBridgePointer(transcript) || syncCopy(id, transcript)) continue;
-    // Same project dir ⇒ every session here launched from `cwd`; the branch isn't resolved on this
-    // cheap same-dir path (honest null, not a guess) — listRepoSiblings reads it from the transcript.
-    const s = buildSibling(id, transcript, cwd, null, activeSessionId, now);
+    // A resumed session can have moved since this project folder was written. The branch is
+    // unresolved on this path; listRepoSiblings reads it from the transcript.
+    const s = buildSibling(id, transcript, isMirroredTranscript(transcript).recordedCwd ?? cwd, null, activeSessionId, now);
     if (s) out.push(s);
   }
   return out.sort((a, b) => b.lastMs - a.lastMs);
@@ -268,7 +269,7 @@ export function listSiblings(cwd: string, activeSessionId?: string): SiblingSess
  * Every session across ALL worktrees of the same logical repo as `cwd` — the repo-scoped superset of
  * listSiblings. Two worktrees launch from different cwds, so they mangle to different project dirs and
  * listSiblings (one dir) can't see across them; this unions every projectDir whose commonDir (§S2)
- * equals this cwd's. Each candidate's real cwd is read from its transcript (firstCwdLine — the mangled
+ * equals this cwd's. Each candidate's real cwd is read from its transcript (latestCwdLine — the mangled
  * folder name is irreversible), then keyed via repoKeyForSession. Git-free, path-only, zero token.
  * Returns [] when this cwd has no resolvable repo (never unions on a null key — that would wrongly
  * group every unrelated non-repo session together).
@@ -299,7 +300,8 @@ export function listRepoSiblings(cwd: string, activeSessionId?: string): Sibling
       if (!isSafeSessionId(id)) continue;
       const transcript = path.join(dir, name);
       if (isMirroredTranscript(transcript).mirrored || isBridgePointer(transcript) || syncCopy(id, transcript)) continue;
-      const first = firstCwdLine(transcript);
+      if (claudeSessionTranscript(id) !== transcript) continue;
+      const first = latestCwdLine(transcript);
       if (!first) continue; // no cwd line ⇒ can't resolve its repo; skip (never guess membership)
       if (repoKeyForSession(id, first.cwd) !== key) continue; // different (or unresolvable) repo
       const s = buildSibling(id, transcript, first.cwd, first.gitBranch, activeSessionId, now);

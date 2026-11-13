@@ -84,7 +84,7 @@ function newestSessionIn(dir: string): string | null {
     candidates.push({ id: name.slice(0, -'.jsonl'.length), mtime, file });
   }
   if (candidates.length === 0) return null;
-  candidates.sort((a, b) => b.mtime - a.mtime);
+  candidates.sort((a, b) => b.mtime - a.mtime || (a.file < b.file ? -1 : a.file > b.file ? 1 : 0));
   for (const c of candidates) {
     if (hasAssistantRecord(c.file)) return c.id;
   }
@@ -117,19 +117,30 @@ export interface WorkspaceDir {
  * symptoms, and no error anywhere — the panes just rendered empty.
  *
  * Scans the project dirs, which is a readdir over a directory that already exists for the picker, and
- * takes the cwd from the transcript's own first line: append-only, so it is a fact about the session
- * rather than an inference. Null when nothing on this machine holds it — a remote session, or a
+ * chooses the newest eligible transcript. Its latest cwd-bearing line names the workspace after a move.
+ * Null when nothing on this machine holds it — a remote session, or a
  * transcript that has not been written yet — and every caller must treat that as "use the default".
  */
-function claudeSessionTranscript(sessionId: string): string | null {
-  if (!sessionId) return null;
+export function claudeSessionTranscript(sessionId: string, includeCopies = false): string | null {
+  if (!sessionId || !/^[A-Za-z0-9._-]+$/.test(sessionId)) return null;
   const base = path.join(claudeConfigDir(), 'projects');
   let names: string[]; try { names = fs.readdirSync(base); } catch { return null; }
-  for (const slug of names) {
+  let newest: string | null = null;
+  let mtime = -Infinity;
+  let copy: string | null = null;
+  let copyMtime = -Infinity;
+  for (const slug of names.sort()) {
     const file = path.join(base, slug, `${sessionId}.jsonl`);
-    try { if (fs.statSync(file).isFile() && !isMirroredTranscript(file).mirrored && !isBridgePointer(file)) return file; } catch {}
+    try {
+      const st = fs.statSync(file);
+      if (!st.isFile()) continue;
+      if (st.mtimeMs > copyMtime) { copy = file; copyMtime = st.mtimeMs; }
+      if (st.mtimeMs > mtime && !isMirroredTranscript(file, false).mirrored && !isBridgePointer(file)) {
+        newest = file; mtime = st.mtimeMs;
+      }
+    } catch {}
   }
-  return null;
+  return newest ?? (includeCopies ? copy : null);
 }
 export function sessionWorkspace(sessionId: string): string | null {
   return sessionId ? describeSession(sessionId).cwd : null;
@@ -262,9 +273,13 @@ export function newestSessionGlobal(): string | null {
     }
   }
   if (!candidates.length) return null;
-  candidates.sort((a, b) => b.mtime - a.mtime);
+  candidates.sort((a, b) => b.mtime - a.mtime || (a.file < b.file ? -1 : a.file > b.file ? 1 : 0));
   const hidden = (require('./store') as typeof import('./store')).hiddenSessions();
-  const visible = candidates.filter((c) => !hidden.has(c.id)); // a deleted session is never auto-selected
+  const seen = new Set<string>();
+  const visible = candidates.filter((c) => {
+    if (hidden.has(c.id) || seen.has(c.id)) return false;
+    seen.add(c.id); return true;
+  }); // only the newest copy participates in assistant-less stub demotion
   if (!visible.length) return null;
   for (const c of visible.slice(0, 25)) {
     if (hasAssistantRecord(c.file)) return c.id;
@@ -422,16 +437,16 @@ function boundCache<K>(c: { size: number; keys(): IterableIterator<K>; delete(k:
 // Cache the repo key by sessionId so grouping survives a worktree being pruned after first
 // resolution (commonDir needs the live `.git` on disk). Only successful resolutions are cached —
 // a transient miss (worktree not yet on disk) can be retried.
-const repoKeyCache = new Map<string, string>();
+const repoKeyCache = new Map<string, { cwd: string; key: string }>();
 
 /** commonDir(cwd) memoized by sessionId. Returns null when the cwd's repo can't be resolved. */
 export function repoKeyForSession(sessionId: string, cwd: string): string | null {
   const hit = repoKeyCache.get(sessionId);
-  if (hit !== undefined) return hit;
+  if (hit?.cwd === cwd) return hit.key;
   const key = commonDir(cwd);
   if (key !== null) {
     boundCache(repoKeyCache);
-    repoKeyCache.set(sessionId, key);
+    repoKeyCache.set(sessionId, { cwd, key });
   }
   return key;
 }
@@ -598,23 +613,55 @@ export function hasAssistantRecord(transcriptPath: string): boolean {
 }
 
 
-interface TranscriptProvenance { cwd?: string; bridge: boolean; ino: number; size: number; mtime: number; version: 1 }
+/** Last cwd-bearing record, reading backwards so a copied prefix cannot hide a resumed session's new cwd.
+ * With `since`, stop after the record crossing that byte: only an appended suffix needs checking again. */
+export function latestCwdLine(file: string, since = 0): FirstCwdLine | null {
+  let fd: number;
+  try { fd = fs.openSync(file, 'r'); } catch { return null; }
+  try {
+    let end = fs.fstatSync(fd).size;
+    let tail: Buffer[] = [];
+    while (end > 0) {
+      const start = Math.max(0, end - 64 * 1024);
+      const buf = Buffer.alloc(end - start);
+      const n = fs.readSync(fd, buf, 0, buf.length, start);
+      let right = n;
+      for (let i = n - 1; i >= 0; i--) {
+        if (buf[i] !== 10) continue;
+        const line = Buffer.concat([buf.subarray(i + 1, right), ...tail]).toString('utf8');
+        const hit = parseCwdLine(line);
+        if (hit) return hit;
+        if (start + i < since) return null;
+        tail = [];
+        right = i;
+      }
+      tail.unshift(buf.subarray(0, right));
+      end = start;
+    }
+    return parseCwdLine(Buffer.concat(tail).toString('utf8'));
+  } finally { fs.closeSync(fd); }
+}
+
+interface TranscriptProvenance { cwd?: string; launchCwd?: string; bridge: boolean; ino: number; size: number; mtime: number; version: 2 }
 const provenanceCache = new Map<string, TranscriptProvenance>();
-/** Persist the immutable launch identity: a finished session must not reread its body on every
- * CLI invocation. Append-only growth retains a known cwd; a pointer is rechecked when it grows
- * because it can gain a local reply. Replacements and truncation invalidate the sidecar. */
-function transcriptProvenance(file: string): TranscriptProvenance {
-  const empty: TranscriptProvenance = { bridge: false, ino: 0, size: 0, mtime: 0, version: 1 };
+/** Persist launch and current identity; growth can change cwd after a move or turn a bridge into a local conversation. */
+function transcriptProvenance(file: string, refreshCwd = true): TranscriptProvenance {
+  const empty: TranscriptProvenance = { bridge: false, ino: 0, size: 0, mtime: 0, version: 2 };
   let st: fs.Stats; try { st = fs.statSync(file); } catch { return empty; }
   const store = (require('./store') as typeof import('./store')).rootDir();
   const sidecar = path.join(store, 'session-meta', 'provenance', createHash('sha256').update(path.resolve(file)).digest('hex') + '.json');
   let old = provenanceCache.get(sidecar);
   if (!old) { try { old = JSON.parse(fs.readFileSync(sidecar, 'utf8')); } catch {} }
-  if (old?.version === 1 && old.ino === st.ino &&
-      ((old.size === st.size && old.mtime === st.mtimeMs) || (old.cwd && !old.bridge && st.size > old.size))) return old;
+  const prior = old?.version === 2 && old.ino === st.ino && st.size > old.size ? old : undefined;
+  const folder = path.basename(path.dirname(file));
+  const knownLocal = prior && [prior.launchCwd, prior.cwd].some((cwd) => cwd &&
+    (namesProject(folder, cwd) || namesProject(folder, canonPath(cwd))));
+  if (old?.version === 2 && old.ino === st.ino && ((old.size === st.size && old.mtime === st.mtimeMs) ||
+      (!refreshCwd && knownLocal && !old.bridge))) return old;
   if (old && (old.ino !== st.ino || st.size <= old.size)) { firstCwdCache.delete(file); assistantSeen.delete(file); assistantNegKey.delete(file); }
-  const value: TranscriptProvenance = { version: 1, ino: st.ino, size: st.size, mtime: st.mtimeMs,
-    cwd: firstCwdLine(file)?.cwd, bridge: bridgeInfo(file) !== null && !hasAssistantRecord(file) };
+  const value: TranscriptProvenance = { version: 2, ino: st.ino, size: st.size, mtime: st.mtimeMs,
+    cwd: latestCwdLine(file, prior?.size ?? 0)?.cwd ?? prior?.cwd,
+    launchCwd: prior?.launchCwd ?? firstCwdLine(file)?.cwd, bridge: bridgeInfo(file) !== null && !hasAssistantRecord(file) };
   boundCache(provenanceCache); provenanceCache.set(sidecar, value);
   try {
     fs.mkdirSync(path.dirname(sidecar), { recursive: true, mode: 0o700 });
@@ -628,14 +675,15 @@ function transcriptProvenance(file: string): TranscriptProvenance {
  * decisive even when the recorded directory exists here. A missing cwd alone is NOT proof: local
  * worktrees can be pruned or drives unmounted. Foreign platform home roots, when absent here, are
  * additional evidence (including rollouts, which have no mangled project folder).
+ * Path lookups may skip cwd refresh: a known-local file that only grew needs no content read to stay eligible.
  */
-export function isMirroredTranscript(transcriptPath: string): { mirrored: boolean; recordedCwd?: string } {
-  const recordedCwd = transcriptProvenance(transcriptPath).cwd;
+export function isMirroredTranscript(transcriptPath: string, refreshCwd = true): { mirrored: boolean; recordedCwd?: string } {
+  const { cwd: recordedCwd, launchCwd } = transcriptProvenance(transcriptPath, refreshCwd);
   if (!recordedCwd) return { mirrored: false };
   const parent = path.dirname(transcriptPath);
   const project = path.basename(path.dirname(parent)) === 'projects';
-  const mismatch = project && !namesProject(path.basename(parent), recordedCwd)
-    && !namesProject(path.basename(parent), canonPath(recordedCwd));
+  const mismatch = project && ![launchCwd, recordedCwd].some((cwd) => cwd &&
+    (namesProject(path.basename(parent), cwd) || namesProject(path.basename(parent), canonPath(cwd))));
   const foreignHome = process.platform === 'darwin' ? /^\/home\//.test(recordedCwd)
     : process.platform === 'win32' ? /^\/(?:Users|home)\//.test(recordedCwd)
     : /^\/Users\//.test(recordedCwd);
@@ -646,7 +694,7 @@ export function isMirroredTranscript(transcriptPath: string): { mirrored: boolea
 /** Bridge metadata can precede a real local conversation. Only a pointer WITHOUT an assistant
  * reply is excluded; bookkeeping records (cost-state/mode) do not make a conversation local. */
 export function isBridgePointer(transcriptPath: string): boolean {
-  return transcriptProvenance(transcriptPath).bridge;
+  return transcriptProvenance(transcriptPath, false).bridge;
 }
 
 /** Readable, unambiguous workspace label, shared by every session consumer. Home-shortened and
@@ -681,7 +729,7 @@ export function describeSession(session: string): SessionDescriptor {
   const rollout = raw ? cx.readCodexRollout(raw) : undefined;
   const claudePath = /^claude(?:-acp)?$/.test(runtime) ? claudeSessionTranscript(session) : null;
   const nativeSessionId = source?.id || session;
-  return { session, runtime, nativeSessionId, cwd: source?.cwd || meta?.cwd || (claudePath ? firstCwdLine(claudePath)?.cwd : null) || null,
+  return { session, runtime, nativeSessionId, cwd: source?.cwd || meta?.cwd || (claudePath ? isMirroredTranscript(claudePath).recordedCwd : null) || null,
     provider: rollout?.provider || meta?.provider || null, model: rollout?.model || meta?.model || null, machine: os.hostname(), transcript: raw ?? claudePath,
     continuation: { agentId: runtime, nativeSessionId: nativeSessionId } };
 }

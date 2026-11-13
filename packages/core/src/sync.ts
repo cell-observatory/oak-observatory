@@ -19,7 +19,7 @@ import * as path from 'path';
 import { createHash } from 'crypto';
 import { claudeConfigDir, claudeJsonPath } from './paths';
 import { codexHome } from './codex';
-import { mangleCwd } from './session';
+import { mangleCwd, latestCwdLine } from './session';
 import { machineHostTag } from './machine-usage';
 import { identityKey, readMountTable, type SyncIdentity, type SyncShare } from './sync-identity';
 import { readManifest, readTombstones, manifestKey, ownEvictedSessions, keptPrefs, type SyncTombstone } from './sync-state';
@@ -472,7 +472,7 @@ export function folderNamesCwd(folder: string, cwd: string): boolean {
 /**
  * Each Claude project folder: its transcripts, the files of its sessions' `subagents/` and `tool-results/`, its auto
  * memory, and the working directory its sessions started in, read from the newest transcripts (at most CWD_TRIES of
- * them, SYNC_HEAD_BYTES each) until one names a directory whose mangled name is the folder's. Transcripts Claude
+ * them, SYNC_HEAD_BYTES from each head, then its latest cwd if the head names another folder). Transcripts Claude
  * Code set aside (`<session>.orphaned-…`) are not sessions and are skipped.
  */
 function scanClaudeProjects(claude: string, allowed: (real: string, from?: string) => boolean, known?: SyncListContext['known'], pulled?: (name: string) => boolean,
@@ -535,7 +535,9 @@ function scanClaudeProjects(claude: string, allowed: (real: string, from?: strin
     const byAge = [...scan.transcripts].sort((a, b) => b.mtime - a.mtime);
     const ownFirst = [...byAge.filter((t) => !pulled?.(t.name)).slice(0, CWD_TRIES), ...byAge.filter((t) => pulled?.(t.name)).slice(0, CWD_TRIES)];
     for (const t of ownFirst) {
-      const cwd = headCwd(path.join(base, t.name));
+      const file = path.join(base, t.name);
+      let cwd = headCwd(file);
+      if (!cwd || !folderNamesCwd(d.name, cwd)) cwd = latestCwdLine(file)?.cwd ?? cwd;
       if (cwd && folderNamesCwd(d.name, cwd)) {
         scan.cwd = cwd;
         scan.own = !pulled?.(t.name);
@@ -1032,6 +1034,17 @@ export function sessionOf(family: string, name: string): string | null {
   return FAMILIES.get(family)?.session?.(name) ?? null;
 }
 
+/** The active copy of each Claude session in an inventory; backups still retain every named file. */
+export function newestSyncTranscripts(files: readonly SyncFile[]): Map<string, SyncFile> {
+  const out = new Map<string, SyncFile>();
+  for (const file of files) {
+    const id = sessionOf('transcripts', file.name)!;
+    const old = out.get(id);
+    if (!old || file.mtime > old.mtime || (file.mtime === old.mtime && file.name < old.name)) out.set(id, file);
+  }
+  return out;
+}
+
 /** Join a relative `/` path onto a directory of a machine of `platform`. */
 function joinOn(platform: string, dir: string, rel: string): string {
   if (!rel || rel === '.') return dir;
@@ -1138,7 +1151,7 @@ const DAY_MS = 86_400_000;
  * A file older than this machine's own retention (`cleanupPeriodDays`, Claude Code's 30 days when unset) is never
  * planned, since Claude Code here would delete it and the next sync would bring it back. Where several machines hold
  * a longer copy of one file, the longest is planned; identical text from several, once. A session already here,
- * in whatever project folder, is extended where it is: one session is never two files here.
+ * in several project folders, is extended in the most recently written copy.
  */
 export function planSync(nodes: SyncNode[], now = Date.now(), opts: SyncPlanOptions = {}): SyncPlan {
   const live = nodes.filter((n): n is SyncNode & { inventory: SyncInventory } => n.status === 'ok' && !!n.inventory);
@@ -1173,7 +1186,7 @@ export function planSync(nodes: SyncNode[], now = Date.now(), opts: SyncPlanOpti
     };
     // A session's transcript, and a rollout, wherever they are here: a session already here is extended where it is.
     const sessionsHere = new Map<string, string>();
-    for (const t of me.families.transcripts ?? []) sessionsHere.set(t.name.slice(t.name.indexOf('/') + 1), t.name);
+    for (const [id, t] of newestSyncTranscripts(me.families.transcripts ?? [])) sessionsHere.set(`${id}.jsonl`, t.name);
     const rolloutsHere = new Map<string, string>();
     for (const r of me.families.rollouts ?? []) rolloutsHere.set(r.name.slice(r.name.lastIndexOf('/') + 1), r.name);
     const best = new Map<string, SyncPlanItem>();
