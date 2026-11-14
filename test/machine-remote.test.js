@@ -47,7 +47,8 @@ cp $r "$src" "$dest" || exit 1
 if [ -n "$FAIL_COPY" ]; then case "$src" in *"$FAIL_COPY") echo 'copy interrupted' >&2; exit 1 ;; esac; fi
 `);
   write(path.join(there, 'tools', 'uname'), `#!/bin/sh\nif [ "$1" = -s ]; then printf '${system}\\r\\n'; else printf 'x86_64\\r\\n'; fi\n`);
-  write(path.join(there, 'tools', 'node'), `#!/bin/sh\nif [ "$1" = --version ]; then echo v24.18.0; else shift; if [ "$1" = --version ]; then if [ -f "$HOME/fail-version" ]; then echo broken; else echo 'oak 9.9.9'; fi; fi; fi\n`);
+  // In ~/.local/bin too, which leads OAK's remote PATH: a node in /usr/local/bin (a CI runner's) came before tools/.
+  for (const dir of ['tools', '.local/bin']) write(path.join(there, dir, 'node'), `#!/bin/sh\nif [ "$1" = --version ]; then echo v24.18.0; else shift; if [ "$1" = --version ]; then if [ -f "$HOME/fail-version" ]; then echo broken; else echo 'oak 9.9.9'; fi; fi; fi\n`);
   write(path.join(there, 'tools', 'mv'), `#!/bin/sh\ncase "$1" in *-new) if [ -f "$HOME/fail-launch" ]; then echo 'launcher move failed' >&2; exit 1; fi ;; esac\nexec /bin/mv "$@"\n`);
   const herdr = (where, version = pin) => write(path.join(there, where), `#!/bin/sh\necho 'herdr ${version}'\n`);
   const oak = (where = 'tools/oak') => write(path.join(there, where), '#!/bin/sh\nprintf \'%s\\n\' "$*" >> "$HOME/oak-calls"\n[ "$1" = --version ] && echo "oak 9.9.9"\nexit 0\n');

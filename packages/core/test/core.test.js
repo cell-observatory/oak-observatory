@@ -20194,6 +20194,9 @@ test('installers: install.ps1 installs the status line with Git Bash, and says "
     return r.stdout.replace(/\r\n/g, '\n');
   };
   const sys32 = ['Windows/System32'];
+  // The file Find-GitBash names, compared as a file: .NET's GetFullPath expands an 8.3 short name (the RUNNER~1 temp
+  // folder on Windows CI), which path.join keeps.
+  const names = (out, f) => { const m = /^found: (.+)$/m.exec(out); try { return !!m && fs.realpathSync.native(m[1]) === fs.realpathSync.native(f); } catch { return false; } };
   let out = run({ pathDirs: sys32 });
   assert.match(out, /warn: Skipped the bundled status line: Git Bash not found\./, 'only the WSL launcher: no Git Bash');
   assert.match(out, /dim: winget install Git\.Git/);
@@ -20204,16 +20207,16 @@ test('installers: install.ps1 installs the status line with Git Bash, and says "
 
   file('PF/Git/bin/bash.exe');
   out = run({ pathDirs: sys32 });
-  assert.ok(out.includes(`found: ${pfBash}\n`), out);
+  assert.ok(names(out, pfBash), out);
   assert.match(out, /ok: Status line installed/);
   assert.match(out, /^oak ran: statusline$/m);
   const custom = file('Tools/bash.exe');
-  assert.ok(run({ setBash: custom, pathDirs: sys32 }).includes(`found: ${custom}\n`), 'CLAUDE_CODE_GIT_BASH_PATH comes first');
-  assert.ok(run({ setBash: path.join(t, 'Tools', 'git.exe'), pathDirs: sys32 }).includes(`found: ${pfBash}\n`), 'unless it names no bash');
+  assert.ok(names(run({ setBash: custom, pathDirs: sys32 }), custom), 'CLAUDE_CODE_GIT_BASH_PATH comes first');
+  assert.ok(names(run({ setBash: path.join(t, 'Tools', 'git.exe'), pathDirs: sys32 }), pfBash), 'unless it names no bash');
 
   fs.rmSync(path.join(t, 'PF'), { recursive: true });
   file('Apps/Git/cmd/git', true); file('Apps/Git/cmd/git.exe'); file('Apps/Git/bin/bash.exe');
-  assert.ok(run({ pathDirs: [...sys32, 'Apps/Git/cmd'] }).includes(`found: ${appsBash}\n`), 'the bin\\bash.exe beside the git on PATH');
+  assert.ok(names(run({ pathDirs: [...sys32, 'Apps/Git/cmd'] }), appsBash), 'the bin\\bash.exe beside the git on PATH');
 });
 
 function hasPwsh() {

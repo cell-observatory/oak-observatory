@@ -105,8 +105,8 @@ test('test bootstrap: OAK_NO_BACKGROUND stops every detached child OAK starts on
     // The log is read while the run writes it, so a line still being written is left for the next read.
     const recorded = () => {
       const calls = fs.existsSync(log) ? fs.readFileSync(log, 'utf8').split('\n').slice(0, -1).map((line) => JSON.parse(line)) : [];
-      // On Windows the launcher runs bash through cmd.exe, so the recorded file is the whole command line.
-      return calls.filter((c) => c.detached).map((c) => (/^bash(?:\s|$)/.test(c.file) ? 'month refresh' : c.args.slice(1).join(' ')));
+      // The month refresh runs the status line script: with bash, or on Windows through a node launcher that starts Git Bash.
+      return calls.filter((c) => c.detached).map((c) => (/^bash(?:\s|$)/.test(c.file) || c.args.some((a) => /statusline\.sh$/.test(a)) ? 'month refresh' : c.args.slice(1).join(' ')));
     };
     if (entry.pty) {
       // The update check needs a terminal on stderr, and the terminal app runs until it is stopped. Neither run is stopped

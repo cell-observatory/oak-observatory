@@ -140,7 +140,10 @@ class ProcessDashboardTest : ObservatoryPlatformTestCase() {
             val calls = File(fx.get("calls").asString).readLines().filter { it.startsWith("processes ") && it.contains("--machine build-box") }
             assertTrue("saved-machine list and follow calls", calls.size >= 4)
             assertTrue(calls.joinToString("\n"), calls.all { it.endsWith(" | 45000") && !it.contains("--root") })
-            assertTrue(File(fx.get("log").asString).readText().contains("processes"))
+            // Remote commands travel base64-encoded (core remoteShellCommand): read the ones the ssh log carried.
+            val sent = Regex("printf %s ([A-Za-z0-9+/=]+) \\| base64 -D").findAll(File(fx.get("log").asString).readText())
+                .joinToString("\n") { String(java.util.Base64.getDecoder().decode(it.groupValues[1])) }
+            assertTrue(sent, sent.contains("processes"))
         } finally {
             service.selectedFeed = null
             service.remotePin = oldPin
