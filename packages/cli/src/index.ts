@@ -244,6 +244,7 @@ function cmdInit(project: boolean, withStatusline = false, repair = false, statu
   // skipped codex entirely for upgraders ("already installed — nothing to do", which then wasn't
   // true), and cmdStatusline's own process.exit made anything after it unreachable.
   const finishInit = (): void => {
+    if (!project) initAgentSetup();
     void maybeInitCodex().finally(() => {
       if (withStatusline) cmdStatusline(statuslineForce ? ['--force'] : []);
     });
@@ -273,6 +274,22 @@ function cmdInit(project: boolean, withStatusline = false, repair = false, statu
   finishInit();
 }
 
+
+/** `oak init` sets up the user's delegation guidance by default, as `oak update` does on a machine with OAK's hooks.
+ *  `oak agent setup --remove` takes it out and keeps it out. */
+function initAgentSetup(): void {
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
+  try {
+    const plan = core.applyDefaultAgentSetup();
+    if (!plan) return;
+    const edited = plan.items.filter((e) => e.state === 'edited');
+    process.stdout.write(c.green('✓ ') + `set up agent delegation guidance for Claude Code and Codex (${plan.manifest})\n` +
+      (edited.length ? c.yellow(`  left as you edited it: ${edited.map((e) => e.path).join(', ')}\n`) : '') +
+      c.dim('  `oak agent setup --check` lists it; `oak agent setup --remove` takes it out.\n'));
+  } catch (e) {
+    process.stdout.write(c.yellow('⚠ ') + `agent delegation guidance was not set up: ${String((e as Error)?.message || e)}\n`);
+  }
+}
 
 function maybeInitCodex(): Promise<void> {
   const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
@@ -7156,6 +7173,12 @@ function statuslineCurrent(): boolean {
   }
 }
 
+/** Whether `oak init` has put OAK's capture hooks in the user's Claude Code settings. */
+function userHooksInstalled(): boolean {
+  const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
+  return core.installStatus().some((f) => f.scope === 'user' && f.exists && f.installed);
+}
+
 /** What this CLI would change in OAK's own setup here. Reads only. */
 async function componentPlan(): Promise<UpdateComponent[]> {
   const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
@@ -7163,8 +7186,10 @@ async function componentPlan(): Promise<UpdateComponent[]> {
   const out: UpdateComponent[] = [];
   const setup = core.agentSetupStatus();
   const setupItems = setup.flatMap(p => p.items);
-  if (setup.length) out.push(row('agent-setup', 'Agent delegation guidance')( setupItems.some(e => e.state === 'outdated' || e.state === 'missing') ? 'update' : setupItems.some(e => e.state === 'edited') ? 'manual' : 'current',
-    setupItems.length ? setupItems.map(e => `${e.path}: ${e.state}`).join('; ') : 'not set up — oak agent setup opts in'));
+  // The user's guidance is set up by default wherever OAK set up Claude Code (its hooks), unless the user removed it.
+  const byDefault = userHooksInstalled() && core.defaultAgentSetupPending();
+  if (setup.length || byDefault) out.push(row('agent-setup', 'Agent delegation guidance')(byDefault || setupItems.some(e => e.state === 'outdated' || e.state === 'missing') ? 'update' : setupItems.some(e => e.state === 'edited') ? 'manual' : 'current',
+    [...(byDefault ? ['not set up — OAK sets it up by default; `oak agent setup --remove` takes it out'] : []), ...setupItems.map(e => `${e.path}: ${e.state}`)].join('; ')));
   // The user's settings file, the one `oak init` writes. A file the user never installed into is not one
   // an update adds hooks to. A project's own .claude/settings.json is committed and shared, so an update
   // never writes there: each one that needs repair is a row naming the command to run in it.
@@ -7223,9 +7248,12 @@ async function applyComponents(plan: UpdateComponent[]): Promise<UpdateComponent
       if (p.id === 'herdr' && p.state !== 'absent') out.push({ ...p, ...(await ensureHerdrPin()) });
       else if (p.state !== 'update') out.push(p);
       else if (p.id === 'agent-setup') {
-        const plans = core.refreshAgentSetup();
+        const refreshed = core.refreshAgentSetup();
+        const added = userHooksInstalled() ? core.applyDefaultAgentSetup() : null;
+        const plans = [...refreshed, ...(added ? [added] : [])];
         const edited = plans.flatMap(p => p.items).filter(e => e.state === 'edited');
-        out.push(set(edited.length ? 'manual' : 'updated', edited.length ? edited.map(e => `${e.path}: user-edited; left unchanged`).join('; ') : 'managed delegation guidance refreshed'));
+        out.push(set(edited.length ? 'manual' : 'updated', edited.length ? edited.map(e => `${e.path}: user-edited; left unchanged`).join('; ')
+          : added ? 'set up by default; `oak agent setup --remove` takes it out' : 'managed delegation guidance refreshed'));
       } else if (p.id === 'hooks') {
         const bad: string[] = [];
         for (const f of core.installStatus().filter((f) => f.scope === 'user' && f.exists && f.installed && f.entries !== core.HEALTHY_HOOK_ENTRIES)) {

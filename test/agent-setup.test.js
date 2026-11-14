@@ -45,7 +45,7 @@ test('agent setup CLI: opt-in plan, --yes, --check, JSON, project scope and unin
 function commands(coreOverride = core) {
   const ts = require('typescript'), vm = require('node:vm');
   const source = fs.readFileSync(path.join(__dirname, '../packages/cli/src/index.ts'), 'utf8')
-    .replace(/main\(\);\s*$/, 'module.exports = { applyComponents, cmdAgentStartBrief };');
+    .replace(/main\(\);\s*$/, 'module.exports = { applyComponents, componentPlan, cmdAgentStartBrief };');
   const code = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
   const module = { exports: {} };
   vm.runInNewContext(code, { module, exports: module.exports, Buffer, Date, process,
@@ -66,6 +66,37 @@ test('oak update component refreshes old guidance and preserves edited blocks', 
   const second = await commands().applyComponents([{ id: 'agent-setup', label: 'Agent delegation guidance', state: 'update' }]);
   assert.equal(second[0].state, 'manual');
   assert.match(fs.readFileSync(old.path, 'utf8'), /customized/);
+});
+
+test('agent setup by default: oak init makes it, --remove keeps it out of init and update, setup brings it back', async t => {
+  const f = indexFixture(t, core);
+  const skill = path.join(process.env.CLAUDE_CONFIG_DIR, 'skills/oak-delegate/SKILL.md');
+  const init = run(f, ['init', '--no-codex']);
+  assert.equal(init.status, 0, init.stderr);
+  assert.match(init.stdout, /set up agent delegation guidance for Claude Code and Codex/);
+  assert.ok(fs.existsSync(skill), 'oak init sets it up');
+  const removed = run(f, ['agent', 'setup', '--remove', '--yes']);
+  assert.equal(removed.status, 0, removed.stderr);
+  assert.equal(fs.existsSync(skill), false);
+  const again = run(f, ['init', '--no-codex']);
+  assert.equal(again.status, 0, again.stderr);
+  assert.doesNotMatch(again.stdout, /set up agent delegation guidance/);
+  assert.equal(fs.existsSync(skill), false, 'a removal stays removed through oak init');
+  const row = async () => (await commands().componentPlan()).find(c => c.id === 'agent-setup');
+  assert.equal(await row(), undefined, 'and through oak update');
+  const back = run(f, ['agent', 'setup', '--yes']);
+  assert.equal(back.status, 0, back.stderr);
+  assert.ok(fs.existsSync(skill), 'oak agent setup adds it back');
+  // A machine with OAK's hooks and no guidance yet (set up before this default): the update adds it.
+  core.applyAgentSetup(core.agentSetupPlan({ remove: true }));
+  assert.equal(fs.existsSync(skill), false);
+  const planned = await row();
+  assert.equal(planned.state, 'update');
+  assert.match(planned.detail, /OAK sets it up by default/);
+  const [applied] = await commands().applyComponents([planned]);
+  assert.equal(applied.state, 'updated');
+  assert.match(applied.detail, /set up by default/);
+  assert.ok(fs.existsSync(skill), 'oak update sets it up');
 });
 
 test('agent start CLI passes repeatable writable roots and optional worktree base', async t => {

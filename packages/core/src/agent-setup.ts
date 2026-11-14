@@ -1,4 +1,5 @@
-/** Opt-in delegation guidance. The manifest records the exact content OAK owns, including JSON fields. */
+/** Delegation guidance, set up for the user by default (`oak init`, `oak update`) and per repository on request. The
+ *  manifest records the exact content OAK owns, including JSON fields. */
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -246,6 +247,19 @@ export function refreshAgentSetup(cwd = process.cwd(), remove = false): AgentSet
     return [applyAgentSetup(plan)];
   });
 }
+/** The user removed the user-scope setup (`oak agent setup --remove`): a default setup leaves it removed until
+ *  `oak agent setup` adds it back. Uninstalling OAK is not a removal the user chose for this. */
+const declinedPath = (): string => path.join(path.dirname(prefsPath()), 'agent-setup-removed');
+export function agentSetupDeclined(): boolean { return fs.existsSync(declinedPath()); }
+export function setAgentSetupDeclined(declined: boolean): void {
+  if (declined) atomic(declinedPath(), '1\n'); else fs.rmSync(declinedPath(), { force: true });
+}
+/** The user-scope setup OAK makes by default, with the CLIs' own models and efforts and no questions: applied when
+ *  there is none and the user has not removed it. Null when there was nothing to do. */
+export function defaultAgentSetupPending(): boolean { return !fs.existsSync(location().manifest) && !agentSetupDeclined(); }
+export function applyDefaultAgentSetup(): AgentSetupPlan | null {
+  return defaultAgentSetupPending() ? applyAgentSetup(agentSetupPlan()) : null;
+}
 export function agentSetupStatus(cwd = process.cwd()): AgentSetupPlan[] {
   return [undefined, ...(repoRoot(cwd) ? [cwd] : [])].flatMap(project => fs.existsSync(location(project).manifest) ? [agentSetupPlan({ project })] : []);
 }
@@ -253,15 +267,16 @@ export function diagnoseAgentSetup(cwd = process.cwd()): Check {
   try {
     const plans = agentSetupStatus(cwd);
     const bad = plans.flatMap(p => p.items).filter(e => !['current', 'kept'].includes(e.state));
+    if (!plans.length && agentSetupDeclined()) return { id: 'agent-setup', label: 'Agent delegation setup', level: 'ok', detail: 'Removed with oak agent setup --remove; oak agent setup adds it back.' };
     return { id: 'agent-setup', label: 'Agent delegation setup', level: plans.length && !bad.length ? 'ok' : 'warn',
       detail: bad.length ? bad.map(e => `${e.path}: ${e.state}`).join('; ') : plans.length ? 'Managed delegation guidance is current.' : 'Agents have no OAK delegation guidance.',
       ...(!plans.length || bad.length ? { fix: 'oak agent setup --check; oak agent setup' } : {}) };
   } catch (e) { return { id: 'agent-setup', label: 'Agent delegation setup', level: 'warn', detail: String((e as Error).message), fix: 'oak agent setup --check' }; }
 }
 export function takeAgentSetupNotice(cwd = process.cwd()): string | null {
-  if (agentSetupStatus(cwd).length) return null;
+  if (agentSetupStatus(cwd).length || agentSetupDeclined()) return null;
   const file = path.join(path.dirname(prefsPath()), 'agent-setup-suggested');
   if (fs.existsSync(file)) return null;
   atomic(file, '1\n');
-  return 'oak agent setup: teach your agent to delegate in herdr tabs (opt-in)';
+  return 'oak agent setup: teach your agent to delegate in herdr tabs';
 }

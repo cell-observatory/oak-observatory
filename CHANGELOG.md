@@ -8,6 +8,14 @@ the release notes.
 
 ## [Unreleased]
 
+### Changed
+
+- Agents learn to delegate in OAK by default. `oak init` sets up the delegation guidance for your user (the
+  `oak-delegate` skill, the `oak-builder` agent, the Codex instructions block and the `Bash(oak agent:*)` permission),
+  with the model and effort each CLI already uses, and `oak update` does the same on a machine with OAK's capture hooks.
+  `oak agent setup --remove` takes it out and keeps it out of later updates; `oak agent setup` adds it back. A
+  repository's own setup (`--project`) is still made only on request.
+
 ### Fixed
 
 - `oak install-extensions` and `oak update` no longer take the `cursor` script that Cursor's agent CLI installs in

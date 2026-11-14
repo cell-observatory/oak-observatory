@@ -232,12 +232,15 @@ machine's sessions the local database holds, by machine (`machines`). `oak sessi
 in workspace order, leaving out sessions in which nothing happened (no edit, no tokens, no reply from the model) unless
 they may still be running, and Codex's Auto-review threads unless `--all` is given or `--session` names one.
 
-**Set up your agent to delegate.** Run `oak agent setup` to preview the managed guidance and choose model, effort,
-and Codex build-cache defaults. Confirm the listed writes, or use `--yes`; `--check --json` reports installed and
-outdated content. `--project` uses this repository's files. `--remove` removes OAK's content. Setup installs the
+**Your agent delegates by default.** `oak init`, and `oak update` on a machine with OAK's capture hooks, set up the
+managed delegation guidance for your user, with the model and effort each CLI already uses. Setup installs the
 `oak-delegate` Claude skill, an `oak-builder` agent without nested delegation, a Codex instructions block, and the
-Claude permission rule `Bash(oak agent:*)`. Existing choices and user-edited blocks remain intact. `oak update`
-refreshes installed guidance; `oak uninstall` removes it. Run these commands from each repository with project setup.
+Claude permission rule `Bash(oak agent:*)`. Existing choices and user-edited blocks remain intact. `oak agent setup
+--check --json` reports installed and outdated content. `oak agent setup --remove` removes OAK's content and keeps it
+out of later updates; `oak agent setup` adds it back, letting you choose model, effort and Codex build-cache defaults
+first (or `--yes` to skip the questions). `--project` sets up this repository's files, which only happens on request.
+`oak update` refreshes installed guidance; `oak uninstall` removes it. Run these commands from each repository with
+project setup.
 
 Parents start agents of their own kind unless the brief or a flag specifies another kind. The guidance requires a
 brief, uncommitted changes, a report with before/after test evidence, and a binary diff. Before work and shared-file

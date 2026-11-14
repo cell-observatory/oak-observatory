@@ -3859,7 +3859,8 @@ test('CLI update: one plan for this machine and every saved machine, then each s
   const plan = JSON.parse((await f.oak(['--json'])).stdout);
   assert.deepEqual(plan.machines.map((m) => [m.label, m.state]), [['current', 'current'], ['stale', 'update'], ['bare', 'no-oak'], ['legacy', 'old-oak'], ['off', 'disabled']]);
   assert.equal(plan.machines[1].plan.surfaces.find((s) => s.label === 'VS Code server').reason, 'behind', "a machine's row carries its own plan");
-  assert.deepEqual(plan.components.map((c) => [c.id, c.state]), [['hooks', 'update'], ['codex-hooks', 'absent'], ['statusline', 'update'], ['herdr', 'current'], ['focus-server', 'current']]);
+  // The fixture's `oak init` set up the delegation guidance, by default: current.
+  assert.deepEqual(plan.components.map((c) => [c.id, c.state]), [['agent-setup', 'current'], ['hooks', 'update'], ['codex-hooks', 'absent'], ['statusline', 'update'], ['herdr', 'current'], ['focus-server', 'current']]);
   assert.equal(plan.surfaces.find((s) => s.label === 'Cursor').reason, 'managed');
   assert.equal(plan.upToDate, false);
   const herePlan = JSON.parse((await f.oak(['--json', '--here'])).stdout);
@@ -3909,7 +3910,8 @@ test('CLI update: a foreign status line and an uninstalled hook are never touche
   const plan = JSON.parse((await f.oak(['--json', '--here'])).stdout);
   assert.deepEqual(plan.components.filter((c) => ['hooks', 'statusline'].includes(c.id)).map((c) => c.state), ['absent', 'absent']);
   await f.oak(['--here', '--cli-only']);
-  assert.deepEqual(JSON.parse(fs.readFileSync(settings, 'utf8')), { statusLine: { type: 'command', command: 'ccusage statusline' } });
+  // The fixture's `oak init` set up the delegation guidance, whose permission the update puts back: OAK's own entry.
+  assert.deepEqual(JSON.parse(fs.readFileSync(settings, 'utf8')), { statusLine: { type: 'command', command: 'ccusage statusline' }, permissions: { allow: ['Bash(oak agent:*)'] } });
 });
 
 test('CLI __after-update: the installed CLI reports what it did to the one that ran the update', { skip: process.platform === 'win32' && 'POSIX fakes' }, async t => {
@@ -3921,7 +3923,7 @@ test('CLI __after-update: the installed CLI reports what it did to the one that 
   const r = run(f.b, process.execPath, [cli, '__after-update'], { env: { ...f.b.env, OAK_UPDATE_REPORT: report }, timeout: 60000 });
   assert.equal(r.status, 0, r.stderr);
   const rows = JSON.parse(fs.readFileSync(report, 'utf8'));
-  assert.deepEqual(rows.map((c) => [c.id, c.state]), [['hooks', 'updated'], ['codex-hooks', 'updated'], ['statusline', 'updated'], ['herdr', 'current'], ['focus-server', 'current']]);
+  assert.deepEqual(rows.map((c) => [c.id, c.state]), [['agent-setup', 'current'], ['hooks', 'updated'], ['codex-hooks', 'updated'], ['statusline', 'updated'], ['herdr', 'current'], ['focus-server', 'current']]);
   assert.equal(f.hookEntries(), realCore.HEALTHY_HOOK_ENTRIES);
   // npm installs a release on a Node older than its engines with only an EBADENGINE warning, so the update says, as it
   // finishes, what that Node leaves out (simulated here: its node:sqlite missing). A Node that runs the index hears nothing.

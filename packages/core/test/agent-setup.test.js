@@ -78,6 +78,29 @@ test('agent setup: doctor suggests setup and the terminal suggestion appears onc
   assert.equal(core.takeAgentSetupNotice(), null);
 });
 
+test('agent setup: the user setup is made by default once, and a removal keeps it out until it is set up again', (t) => {
+  indexFixture(t, core);
+  const skill = path.join(process.env.CLAUDE_CONFIG_DIR, 'skills/oak-delegate/SKILL.md');
+  assert.equal(core.defaultAgentSetupPending(), true);
+  const made = core.applyDefaultAgentSetup();
+  assert.ok(made && fs.existsSync(made.manifest) && fs.existsSync(skill));
+  assert.equal(core.applyDefaultAgentSetup(), null, 'once made, the default leaves it to refresh');
+  // `oak agent setup --remove`: the content goes, and the removal is remembered.
+  core.applyAgentSetup(core.agentSetupPlan({ remove: true }));
+  core.setAgentSetupDeclined(true);
+  assert.equal(fs.existsSync(skill), false);
+  assert.equal(core.defaultAgentSetupPending(), false);
+  assert.equal(core.applyDefaultAgentSetup(), null, 'a removal stays removed');
+  assert.equal(fs.existsSync(skill), false);
+  const check = core.diagnoseAgentSetup();
+  assert.equal(check.level, 'ok');
+  assert.match(check.detail, /Removed with oak agent setup --remove/);
+  assert.equal(core.takeAgentSetupNotice(), null, 'no suggestion after a removal');
+  // `oak agent setup`: set up again, and the default is back in force.
+  core.setAgentSetupDeclined(false);
+  assert.equal(core.defaultAgentSetupPending(), true);
+});
+
 // An agent kind that names an Object.prototype member reached a shared object: `__proto__` wrote into Object.prototype,
 // and `constructor` deleted from the global Object.
 test('agent setup: a plan never writes into or deletes from shared objects', (t) => {
