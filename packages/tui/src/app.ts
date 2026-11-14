@@ -3551,10 +3551,18 @@ export function runTui(core: Core, args: string[], resolveSession: (a: string[])
       } else core.writeEditorReviewRequest({ editor, session: o.session, workspace: o.folder!, action: 'workspace' });
     }
     const quote = (word: string) => /^[a-zA-Z0-9_./:@+=,-]+$/.test(word) ? word : process.platform === 'win32' ? `'${word.replace(/'/g, "''")}'` : `'${word.replace(/'/g, "'\\''")}'`;
-    const ran = (process.platform === 'win32' ? '& ' : '') + [launch.command, ...launch.args].map(quote).join(' ');
+    let ran = (process.platform === 'win32' ? '& ' : '') + [launch.command, ...launch.args].map(quote).join(' ');
     const noGui = !!(process.env.SSH_CONNECTION || process.env.SSH_TTY) || (process.platform === 'linux' && !process.env.DISPLAY && !process.env.WAYLAND_DISPLAY);
     // Which editor and why first: the command can be long enough for the status row to cut it.
     if (noGui) { state.status = `${from}${after}. Run on the machine with the editor: ${ran}`; return; }
+    // Cursor's agent puts a `cursor` of its own first on PATH, which runs the editor's only when that is on PATH too, and
+    // otherwise fails: run the editor's own command, here or in its app.
+    if (process.platform !== 'win32' && launch.command === 'cursor') {
+      const editor = core.cursorEditorCli();
+      if (!editor) throw new Error(`Cursor's editor is not installed here: the cursor on PATH is Cursor's agent. Install Cursor, or set another GUI editor under ${keyForAction('options')} (prefs.guiEditor)`);
+      launch.command = editor;
+      ran = [launch.command, ...launch.args].map(quote).join(' ');
+    }
     await new Promise<void>((resolve) => {
       const child = core.spawnTool(launch.command, launch.args, { stdio: 'ignore', cwd, detached: true, windowsHide: false });
       child.once('error', (e: Error) => { state.status = `Could not run ${ran}: ${e.message}. Run on the machine with the editor: ${ran}`; resolve(); });

@@ -7302,17 +7302,7 @@ function resolveEditorCli(cli: string, app: string, winApp: string): string | nu
   return null;
 }
 
-/** Cursor's agent CLI installs a `cursor` script in ~/.local/bin that runs the next `cursor` on PATH and, with none,
- *  exits 1 ("No Cursor IDE installation found"). It is not the editor: an `--install-extension` through it failed
- *  wherever the editor's own command was not on PATH (2026-11-09). */
-function isCursorAgentShim(file: string): boolean {
-  const fs = require('fs');
-  try {
-    return fs.statSync(file).size < 16384 && fs.readFileSync(file, 'utf8').includes('No Cursor IDE installation found');
-  } catch {
-    return false;
-  }
-}
+const isCursorAgentShim = (file: string): boolean => (require('@oak-observatory/core') as typeof import('@oak-observatory/core')).isCursorAgentShim(file);
 
 /**
  * What the editor itself says is installed in `dir`, from its own `extensions.json` registry:

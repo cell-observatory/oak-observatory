@@ -1478,7 +1478,7 @@ process.stdout.write(out); process.exit(r.status ?? 1);
     it('W runs one Remote-SSH folder command, with no new-window flag', async () => {
       const r = await drive('cursor', [...DONE, ...W], null, fx => { fx.env.DISPLAY = ':synthetic'; }, 'observatory');
       assert.deepEqual(r.editor, [['cursor', '--remote', 'ssh-remote+' + TARGET, path.dirname(r.fx.file) + '/']]);
-      assert.match(r.status, /ran cursor --remote/);
+      assert.match(r.status, /ran \S*\/cursor --remote/);
     });
     it('W opens JetBrains Gateway with the resolved SSH connection', async () => {
       const r = await drive('idea', [...DONE, ...W], null, fx => {
@@ -1536,7 +1536,7 @@ exec "${process.execPath}" "${CLI}" "$@"
       });
       assert.deepEqual(r.editor, [['remote nvim', r.fx.file], ['cursor', '--remote', 'ssh-remote+' + TARGET, '--goto', `${r.fx.file}:2`]]);
       assert.equal(r.ssh.length, 1, 'only e went over ssh -t; cursor connects itself');
-      assert.match(r.status, /^GUI editor cursor, from the GUI editor setting — ran cursor --remote ssh-remote\+builder@build-box\.example --goto /);
+      assert.match(r.status, /^GUI editor cursor, from the GUI editor setting — ran \S*\/cursor --remote ssh-remote\+builder@build-box\.example --goto /);
     });
     it('W on Review opens a JetBrains GUI editor\'s project there through Gateway', async () => {
       const r = await drive('idea', [K.down, K.enter, K.f7, ...W], null, fx => {

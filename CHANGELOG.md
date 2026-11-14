@@ -22,6 +22,11 @@ the release notes.
 - `oak doctor` and `oak agent close --remove-worktree` wait up to 10 s for Git to list a repository's worktrees.
   With 1 s, a listing that took longer on a slow machine read as no worktrees at all: doctor reported no orphaned
   agent worktrees, and the close found no orphaned worktree by that name.
+- `oak doctor` and `oak agent close --remove-worktree` say when Git could not list a repository's worktrees, with Git's
+  reason. Any failure other than a removed repository read as no worktrees, so doctor reported none orphaned.
+- `W` never runs the `cursor` script that Cursor's agent CLI installs. Auto no longer counts it as Cursor, and with
+  Cursor as the GUI editor, `W` runs Cursor's own command, from the PATH or Cursor's install location. When only the
+  agent's script is installed, `W` says so.
 
 ## [0.11.0] — 2026-11-07
 

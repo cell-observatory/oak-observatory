@@ -30,7 +30,7 @@ function fixture(t) {
     else if (a[0] === 'merge-base') stdout = 'a'.repeat(40) + '\n';
     else if (a[0] === 'rev-list') stdout = state.counts;
     else if (a[0] === 'diff') stdout = a.includes('--numstat') ? state.diff : state.treeDiff;
-    else if (a[0] === 'worktree' && a[1] === 'list') stdout = state.list;
+    else if (a[0] === 'worktree' && a[1] === 'list') { if (state.listFails) return { status: 128, stdout: '', stderr: state.listFails }; stdout = state.list; }
     else if (a[0] === 'worktree' && a[1] === 'add') {
       const target = a[a.length - 2];
       fs.mkdirSync(target);
@@ -128,6 +128,30 @@ test('agent worktree: doctor names orphaned worktrees without removing them', (t
   assert.match(core.diagnoseAgentWorktrees(f.work).detail, /agent-x/);
   assert.equal(fs.existsSync(w.path), true);
   assert.ok(!f.state.calls.some(a => a[0] === 'worktree' && a[1] === 'remove'));
+});
+
+test('agent worktree: a repository whose worktrees Git could not list is said, not read as clear; a removed one is skipped', (t) => {
+  const f = fixture(t);
+  const w = core.createAgentWorktree(f.work, 'agent-x');
+  f.state.list = `worktree ${f.work}\nbranch refs/heads/main\n\nworktree ${w.path}\nbranch refs/heads/oak/agent-x\n\n`;
+  assert.equal(core.diagnoseAgentWorktrees(f.work).level, 'warn', 'control: the orphan is found');
+  f.state.listFails = 'fatal: unable to read the worktrees\n';
+  const failed = core.diagnoseAgentWorktrees(f.work);
+  assert.equal(failed.level, 'warn');
+  assert.match(failed.detail, new RegExp(`could not list the worktrees of ${f.work.replace(/[\\^$.*+?()[\]{}|]/g, '\\$&')}: fatal: unable to read the worktrees`));
+  assert.throws(() => core.closeOrphanAgentWorktree('agent-x', f.work), /no unique orphaned worktree "agent-x".*fatal: unable to read the worktrees/);
+  assert.throws(() => core.orphanedAgentWorktrees(f.work), /could not list the worktrees/);
+  delete f.state.listFails;
+  f.state.listMs = 60000; // past even the listing's 10 s
+  assert.match(core.diagnoseAgentWorktrees(f.work).detail, /could not list the worktrees of .*ETIMEDOUT/);
+  delete f.state.listMs;
+  // A repository recorded for an agent and since removed has nothing to list: no Git call, and nothing to say.
+  const gone = path.join(f.dir, 'removed-repo');
+  core.writeDelegated({ id: 'agent-z', kind: 'codex', startedMs: 1, state: 'gone', closedMs: 2, worktree: { ...w, path: path.join(f.dir, 'agent-z'), repository: gone } });
+  f.state.list = `worktree ${f.work}\nbranch refs/heads/main\n\n`;
+  const before = f.state.calls.length;
+  assert.equal(core.diagnoseAgentWorktrees(f.work).level, 'ok');
+  assert.equal(f.state.calls.slice(before).filter(a => a[0] === 'worktree' && a[1] === 'list').length, 1, 'only the existing repository is listed');
 });
 
 test('agent worktree: the user\'s own worktrees, on a branch or detached, are never called orphaned', (t) => {

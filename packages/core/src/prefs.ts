@@ -553,12 +553,41 @@ export function detectEditors(
     // One entry per EDITOR, not per binary: `hx` and `helix` are the same program, and offering both
     // makes the reader step past a duplicate to reach the next real choice.
     if (seenLabel.has(e.label)) continue;
-    const found = dirs.some((d) => exts.some((x) => isExec(path.join(d, e.bin + x))));
+    // Cursor's agent puts a `cursor` of its own on PATH (isCursorAgentShim), which is not the editor.
+    const found = dirs.some((d) => exts.some((x) => isExec(path.join(d, e.bin + x)) && !(e.bin === 'cursor' && !win && isCursorAgentShim(path.join(d, e.bin + x)))));
     if (!found) continue;
     seenLabel.add(e.label);
     out.push({ command: e.command, label: e.label });
   }
   return out;
+}
+
+/** Cursor's agent CLI installs a `cursor` script in ~/.local/bin that runs the next `cursor` on PATH and, with none,
+ *  exits 1 ("No Cursor IDE installation found"). It is not the editor: an `--install-extension` through it failed
+ *  wherever the editor's own command was not on PATH (2026-11-09), and W ran it in the editor's place. */
+export function isCursorAgentShim(file: string): boolean {
+  try {
+    return fs.statSync(file).size < 16384 && fs.readFileSync(file, 'utf8').includes('No Cursor IDE installation found');
+  } catch {
+    return false;
+  }
+}
+
+/** Where an installed Cursor keeps its own command when that is not on PATH: the macOS app bundle, and the usual
+ *  Linux install folders. */
+export function cursorInstalls(home = os.homedir()): string[] {
+  return process.platform === 'darwin'
+    ? ['/Applications', path.join(home, 'Applications')].map((root) => path.join(root, 'Cursor.app', 'Contents', 'Resources', 'app', 'bin', 'cursor'))
+    : ['/usr/share/cursor/bin/cursor', '/usr/bin/cursor', '/snap/bin/cursor', path.join(home, '.local', 'bin', 'cursor')];
+}
+
+/** The Cursor editor's own command, outside Windows: the first `cursor` on PATH that is not the agent's shim, else an
+ *  installed Cursor's (cursorInstalls), else null when only the agent's is here, or none. */
+export function cursorEditorCli(pathVar = process.env.PATH ?? '', installs = cursorInstalls()): string | null {
+  const runnable = (p: string) => {
+    try { fs.accessSync(p, fs.constants.X_OK); return fs.statSync(p).isFile() && !isCursorAgentShim(p); } catch { return false; }
+  };
+  return [...pathVar.split(':').filter(Boolean).map((d) => path.join(d, 'cursor')), ...installs].find(runnable) ?? null;
 }
 
 /** What a detected command is called, for the row that names it. Empty for anything hand-typed. */

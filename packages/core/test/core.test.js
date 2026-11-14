@@ -27959,6 +27959,27 @@ test('ignore: a file with no negations at all reports nothing dead', () => {
     'positive control: the same probe DOES fire when a dead rule exists');
 });
 
+test("Cursor's agent shim is not the Cursor editor: detection skips it, and the editor's own command is found past it", { skip: process.platform === 'win32' && 'the shim is a POSIX script' }, () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-cursor-shim-'));
+  try {
+    const shimDir = path.join(dir, 'shim'), ideDir = path.join(dir, 'ide'), app = path.join(dir, 'Cursor.app', 'cursor');
+    for (const d of [shimDir, ideDir, path.dirname(app)]) fs.mkdirSync(d, { recursive: true });
+    // What Cursor's agent installs (2026.08): it runs the next `cursor` on PATH, and with none says this and exits 1.
+    fs.writeFileSync(path.join(shimDir, 'cursor'), `#!/bin/sh\necho "Error: No Cursor IDE installation found. Use 'cursor agent' or 'agent' to run the agent." 1>&2\nexit 1\n`, { mode: 0o755 });
+    fs.writeFileSync(path.join(ideDir, 'cursor'), '#!/bin/sh\n', { mode: 0o755 });
+    fs.writeFileSync(app, '#!/bin/sh\n', { mode: 0o755 });
+    assert.equal(core.isCursorAgentShim(path.join(shimDir, 'cursor')), true);
+    assert.equal(core.isCursorAgentShim(path.join(ideDir, 'cursor')), false);
+    assert.deepEqual(core.detectEditors({ path: shimDir, win: false }).map((e) => e.command), [], 'only the agent: no Cursor to offer');
+    assert.deepEqual(core.detectEditors({ path: `${shimDir}:${ideDir}`, win: false }).map((e) => e.command), ['cursor'], 'the editor past the shim');
+    assert.equal(core.cursorEditorCli(`${shimDir}:${ideDir}`, []), path.join(ideDir, 'cursor'), "the editor's own command past the shim on PATH");
+    assert.equal(core.cursorEditorCli(shimDir, [app]), app, 'an installed Cursor whose command is not on PATH');
+    assert.equal(core.cursorEditorCli(shimDir, []), null, 'only the agent');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('options: the editor row offers what this machine HAS, and steps through exactly that', () => {
   // The row used to be free text only, so `e` was configured by remembering a command AND its wait
   // flag. Everything here is injected, so the Windows branch — where `code` is `code.cmd` and an
