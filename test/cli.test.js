@@ -1,3 +1,4 @@
+const { decodeRemoteCommand } = require('./fixtures/remote-command.cjs');
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
@@ -640,8 +641,8 @@ test('CLI machine add: also installs the oak stack + capture hooks on the remote
   assert.equal(runs.length, l.split('\n').filter((line) => /^(ssh|scp) /.test(line)).length, 'one line for each ssh and scp');
   assert.deepEqual([...new Set(runs)].sort(), ['scp never', 'ssh never'], runs.join('\n'));
   assert.match(l, /ssh .* node --version/, 'checks Node on the remote before installing oak');
-  assert.match(l, /scp .*index\.js testtgt:\.local\/lib\/oak\/index\.js/, 'pushes the CLI bundle');
-  assert.match(l, /scp .*capture\.js testtgt:\.local\/lib\/oak\/capture\.js/, 'pushes the capture bundle');
+  assert.match(l, /scp .*index\.js testtgt:\.local\/lib\/oak\.oak-[a-f0-9]+\/index\.js/, 'pushes the CLI bundle');
+  assert.match(l, /scp .*capture\.js testtgt:\.local\/lib\/oak\.oak-[a-f0-9]+\/capture\.js/, 'pushes the capture bundle');
   assert.match(l, /ssh .*\.local\/bin\/oak/, 'writes the oak launcher on the remote PATH');
   assert.match(l, /ssh .*oak init/, 'installs the capture hooks on the remote');
   assert.match(l, /oak init --no-codex [^\n]*oak init --codex/, 'the unseen remote init installs codex hooks but never wires a codex model');
@@ -689,7 +690,7 @@ test('CLI machine add: a remote with an older herdr gets a copy of this machine\
   const result = run(b, process.execPath, [cli, 'machine', 'add', 'testlbl', 'testtgt']);
   assert.equal(result.status, 0, result.stderr + result.stdout);
   assert.ok(result.stdout.includes(`herdr ${pin} installed on testtgt`), result.stdout);
-  assert.match(fs.readFileSync(b.env.MACHINE_ADD_LOG, 'utf8'), new RegExp(`^scp .* ${path.join(bin, 'herdr').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} testtgt:\\.local/bin/herdr\\.oak-new$`, 'm'), 'this machine\'s herdr, copied');
+  assert.match(fs.readFileSync(b.env.MACHINE_ADD_LOG, 'utf8'), new RegExp(`^scp .* ${path.join(bin, 'herdr').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} testtgt:\\.local/bin/herdr\\.oak-[a-f0-9]+`, 'm'), 'this machine\'s herdr, copied');
   const runs = fs.readFileSync(b.env.SSH_ASKPASS_LOG, 'utf8').split('\n').map((line) => line.trim()).filter(Boolean);
   assert.deepEqual([...new Set(runs)].sort(), ['scp never', 'ssh never'], runs.join('\n'));
 });
@@ -715,7 +716,7 @@ test('CLI machine add: each ssh and scp shares the command\'s console on Windows
   assert.equal(result.status, 0, result.stderr + result.stdout);
   const steps = fs.readFileSync(log, 'utf8').trim().split('\n').map((l) => JSON.parse(l))
     .filter((s) => ['ssh', 'scp'].includes(path.basename(s.file)) && s.args[0] !== '-G');
-  assert.ok(steps.some((s) => path.basename(s.file) === 'scp' && s.args.at(-1).endsWith('herdr.oak-new')) && steps.length > 5, `control: the add copied herdr and ran its steps: ${JSON.stringify(steps.map((s) => s.args.at(-1)))}`);
+  assert.ok(steps.some((s) => path.basename(s.file) === 'scp' && s.args.at(-1).match(/herdr\.oak-[a-f0-9]+$/)) && steps.length > 5, `control: the add copied herdr and ran its steps: ${JSON.stringify(steps.map((s) => s.args.at(-1)))}`);
   assert.deepEqual(steps.filter((s) => s.windowsHide).map((s) => `${path.basename(s.file)} ${s.args.at(-1)}`), [], 'none is started hidden');
 });
 
@@ -735,7 +736,7 @@ test('CLI machine add: works from a machine that machine add provisioned (packag
   fs.copyFileSync(path.join(root, 'packages/cli/package.json'), path.join(flat, 'package.json'));
   const result = run(b, process.execPath, [path.join(flat, 'index.js'), 'machine', 'add', 'testlbl', 'testtgt']);
   assert.equal(result.status, 0, result.stderr + result.stdout);
-  assert.match(fs.readFileSync(b.env.MACHINE_ADD_LOG, 'utf8'), /scp .*remote-lib\/oak\/package\.json testtgt:\.local\/lib\/oak\/package\.json/);
+  assert.match(fs.readFileSync(b.env.MACHINE_ADD_LOG, 'utf8'), /scp .*remote-lib\/oak\/package\.json testtgt:\.local\/lib\/oak\.oak-[a-f0-9]+\/package\.json/);
 });
 
 test('CLI machine add: an oak there that is not its launcher is left as it is, and the launcher never writes through a link (2026-10-07)', { skip: process.platform === 'win32' && 'POSIX fake tools' }, t => {
@@ -910,7 +911,7 @@ test('CLI init: a codex config.toml that begins with a byte order mark keeps it 
   assert.deepEqual(fs.readFileSync(wired.cfg), original, 'uninstall leaves config.toml as it was before init, the mark first');
 });
 
-function doctor(b, { platform = process.platform, report, spawn, binary = '/fake/herdr', identity, loginScope, version, dirname = path.join(root, 'packages/cli/dist') } = {}) {
+function doctor(b, { platform = process.platform, report, spawn, binary = '/fake/herdr', identity, loginScope, version, desktopCopy = null, dirname = path.join(root, 'packages/cli/dist') } = {}) {
   let output = '';
   const native = [];
   let exitCode;
@@ -937,6 +938,8 @@ function doctor(b, { platform = process.platform, report, spawn, binary = '/fake
     diagnoseSync: () => [],
     diagnoseIndex: () => ({ id: 'index', label: 'Local database', level: 'ok', detail: 'fixture' }),
     diagnoseCodexQuota: () => null,
+    diagnoseGitBash: () => null,
+    diagnoseDesktopAppCopy: () => desktopCopy,
     // How many signal handlers were in place when the check began: they must be, before it starts herdr.
     diagnoseHerdrForwarding: async () => { acted.push(`forwarding, ${handlers.length} handlers in place`); return []; },
     diagnoseHerdrPane: async () => [],
@@ -993,6 +996,14 @@ test('CLI doctor: tells the PTY row when it runs from the copy `oak machine add`
   fs.writeFileSync(path.join(bundle, 'package.json'), '{"name":"oak-observatory"}');
   assert.deepEqual((await doctor(b, { dirname: bundle }).run(['--json'])).native.map((o) => o.bundle), [true]);
   assert.deepEqual((await doctor(b).run(['--json'])).native.map((o) => o.bundle), [false], 'control: an npm install keeps package.json above dist/');
+});
+
+test('CLI doctor: lists a copy of OAK installed inside the Claude desktop app, and no row where there is none (Windows report §3)', async t => {
+  const b = fixture(t);
+  const row = { id: 'desktop-app-copy', label: 'no copy of OAK inside the Claude desktop app', level: 'warn', detail: 'fixture', fix: 'fixture' };
+  const ids = async (opts) => JSON.parse((await doctor(b, opts).run(['--json'])).output).checks.map((c) => c.id);
+  assert.ok((await ids({ desktopCopy: row })).includes('desktop-app-copy'));
+  assert.ok(!(await ids({})).includes('desktop-app-copy'));
 });
 
 // On Windows node-pty's ConPTY keeps a worker thread running after the PTY check's child has exited
@@ -1327,7 +1338,7 @@ function machineFixture(t) {
     return file;
   };
   const log = () => (fs.existsSync(b.env.MACHINE_EXEC_LOG) ? fs.readFileSync(b.env.MACHINE_EXEC_LOG, 'utf8') : '');
-  const sshCalls = () => log().split(/^ssh\n/m).slice(1).map((s) => s.slice(0, s.indexOf('\n.\n')).split('\n'));
+  const sshCalls = () => log().split(/^ssh\n/m).slice(1).map((s) => s.slice(0, s.indexOf('\n.\n')).split('\n').map(decodeRemoteCommand));
   return { b, onRemote, seed, log, sshCalls };
 }
 const onMachine = (f, args) => run(f.b, process.execPath, [cli, ...args, '--machine', 'build-box']);
@@ -1391,6 +1402,7 @@ test('CLI --machine: editor Review batch includes units, tree and raw file histo
 
 test('CLI --machine: a review verb runs on the saved machine over ssh and answers byte for byte', { skip: process.platform === 'win32' && 'POSIX fake ssh' }, t => {
   const f = machineFixture(t);
+  f.b.env.SSH_MANGLE_QUOTES = '1';
   f.seed('remote-review');
   const forwarded = onMachine(f, ['list', '--json', '--session', 'remote-review']);
   assert.equal(forwarded.status, 0, forwarded.stderr);
@@ -1824,7 +1836,7 @@ test('CLI usage: the saved machines\' refresh, its herdr call and each ssh ask f
   const pulled = run({ ...f.b, env }, process.execPath, ['--require', recorder, cli, 'usage', '--pull-machines']);
   assert.equal(pulled.status, 0, pulled.stderr);
   assert.equal(f.usage().claudeMachineNote, 'build-box', 'control: the recorded refresh read the machine');
-  const started = spawns().map((s) => [path.basename(s.file), s.args.join(' '), s.windowsHide]);
+  const started = spawns().map((s) => [path.basename(s.file), s.args.map(decodeRemoteCommand).join(' '), s.windowsHide]);
   assert.deepEqual(started.filter(([file]) => file === 'herdr' || file === 'ssh').map(([file, args, hide]) => [file, file === 'ssh' ? args.split(' ').at(-1) : args, hide]),
     [['herdr', 'machine list --json', true], ['ssh', '--json', true]], `herdr's machine list and the machine's ssh: ${JSON.stringify(started)}`);
 });
@@ -2186,6 +2198,7 @@ test('CLI --machine: only ignore --stdin hands its stdin on, byte for byte; any 
   // arrive changed. Any other verb hands ssh no stdin at all: given one, the remote command could wait on a
   // stdin that never ends, and fed one, it took what the caller's next command was to read.
   const f = machineFixture(t);
+  f.b.env.SSH_MANGLE_QUOTES = '1';
   const got = path.join(f.b.env.FAKE_REMOTE_HOME, 'stdin.bin');
   // The remote oak keeps all that reaches its stdin, then answers.
   fs.writeFileSync(path.join(f.b.env.FAKE_REMOTE_HOME, '.local', 'bin', 'oak'), `#!/bin/sh\ncat > '${got}'\nprintf '{}\\n'\n`, { mode: 0o755 });
@@ -3005,7 +3018,7 @@ test('CLI --machine: a patch shown on a terminal shows a hidden character in the
       compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
     }).outputText;
     const core = { findHerdrBin: () => '/fake/herdr', herdrMachines: async () => [{ id: 'm', label: 'box', target: 'box.example', enabled: true }],
-      machineSshEnv: () => ({}), sshMuxOptions: realCore.sshMuxOptions, spawnTool: () => child, revealHidden: realCore.revealHidden,
+      machineSshEnv: () => ({}), sshMuxOptions: realCore.sshMuxOptions, remoteShellCommand: realCore.remoteShellCommand, spawnTool: () => child, revealHidden: realCore.revealHidden,
       spawnToolSync: () => ({ status: 0, stdout: 'controlmaster false\ncontrolpersist no\n' }) };
     const proc = { env: {}, platform: 'linux', stdout: { isTTY: true, write: (text) => { out += text; return true; } }, stderr: { write() {} }, pid: 4242, once() {}, off() {} };
     vm.runInNewContext(code, { module, exports: module.exports, Buffer, require: name => name === '@oak-observatory/core' ? core : require(name), process: proc,
@@ -3027,7 +3040,7 @@ test('CLI --machine: a configurable overall deadline fails loudly and escalates 
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
   }).outputText;
   const core = { findHerdrBin: () => '/fake/herdr', herdrMachines: async () => [{ id: 'm', label: 'box', target: 'box.example', enabled: true }],
-    machineSshEnv: () => ({}), sshMuxOptions: realCore.sshMuxOptions, spawnTool: () => child, spawnToolSync: () => ({ status: 0, stdout: 'controlmaster false\ncontrolpersist no\n' }) };
+    machineSshEnv: () => ({}), sshMuxOptions: realCore.sshMuxOptions, remoteShellCommand: realCore.remoteShellCommand, spawnTool: () => child, spawnToolSync: () => ({ status: 0, stdout: 'controlmaster false\ncontrolpersist no\n' }) };
   // Only `once`: a handler left behind would keep the raised signal from ending the process.
   const proc = { env: { OAK_MACHINE_TIMEOUT_MS: '250' }, platform: 'linux', stdout: { isTTY: false }, stderr: { write: text => { stderr += text; } }, pid: 4242,
     exit: code => { throw new Error('exit ' + code); }, once: (signal, fn) => { handlers[signal] = fn; }, kill: (pid, signal) => { throw new Error(`raised ${signal} at ${pid}`); } };
@@ -3083,7 +3096,7 @@ test('CLI --machine and update: ssh runs in a session of its own except on Windo
   for (const platform of ['linux', 'darwin', 'win32']) {
     const detached = [], handled = [], module = { exports: {} };
     const core = { findHerdrBin: () => '/fake/herdr', herdrMachines: async () => [{ id: 'm', label: 'box', target: 'box.example', enabled: true }],
-      machineSshEnv: () => ({}), sshMuxOptions: realCore.sshMuxOptions, spawnToolSync: () => ({ status: 0, stdout: 'controlmaster false\ncontrolpersist no\n' }),
+      machineSshEnv: () => ({}), sshMuxOptions: realCore.sshMuxOptions, remoteShellCommand: realCore.remoteShellCommand, spawnToolSync: () => ({ status: 0, stdout: 'controlmaster false\ncontrolpersist no\n' }),
       spawnTool: (bin, argv, opts) => { detached.push([bin, opts.detached, opts.windowsHide]); return Object.assign(new EventEmitter(), { stderr: new EventEmitter(), kill() {} }); } };
     vm.runInNewContext(code, { module, exports: module.exports, Buffer, require: name => name === '@oak-observatory/core' ? core : require(name),
       process: { env: {}, platform, stdout: { isTTY: false }, stderr: { write() {} }, once: (event) => handled.push(event), off() {} }, setTimeout: () => ({ unref() {} }), clearTimeout() {} });
@@ -3818,13 +3831,14 @@ exit 0
   const hookEntries = () => realCore.CAPTURE_HOOK_EVENTS.filter((e) => JSON.stringify(JSON.parse(fs.readFileSync(settings, 'utf8')).hooks?.[e] ?? []).includes('oak capture')).length;
   // Each ssh's arguments, and the remote commands ssh was handed, per host.
   const sshArgv = (host) => (fs.existsSync(env.MACHINE_EXEC_LOG) ? fs.readFileSync(env.MACHINE_EXEC_LOG, 'utf8') : '')
-    .split(/^ssh\n/m).slice(1).map((c) => c.slice(0, c.indexOf('\n.\n')).split('\n')).filter((a) => a.includes(`me@${host}`));
+    .split(/^ssh\n/m).slice(1).map((c) => c.slice(0, c.indexOf('\n.\n')).split('\n').map(decodeRemoteCommand)).filter((a) => a.includes(`me@${host}`));
   const sshTo = (host) => sshArgv(host).map((a) => a[a.length - 1]);
   return { b, target, oak, machines, remote, editorLog, regVersion, jars, hookEntries, script, installer, sshArgv, sshTo };
 }
 
 test('CLI update: one plan for this machine and every saved machine, then each surface updated once', { skip: process.platform === 'win32' && 'POSIX fakes' }, async t => {
   const f = updateFixture(t);
+  f.b.env.SSH_MANGLE_QUOTES = '1';
   const { b, target } = f;
   const row = (out, label) => (out.match(new RegExp(`^  ${label.replace(/[\\()]/g, '\\$&')}\\s{2,}(.*)$`, 'm')) ?? [])[1];
   const result = (out) => out.slice(out.indexOf('\nResult\n')); // the rows after the update, not the plan's
@@ -3912,6 +3926,62 @@ test('CLI update: a foreign status line and an uninstalled hook are never touche
   assert.deepEqual(JSON.parse(fs.readFileSync(settings, 'utf8')), { statusLine: { type: 'command', command: 'ccusage statusline' } });
 });
 
+test('CLI update: hooks an older OAK wrote, every event there, get the command that a missing `oak` cannot fail (Windows report §8)', { skip: process.platform === 'win32' && 'POSIX fakes' }, async t => {
+  const f = updateFixture(t);
+  f.machines();
+  const settings = path.join(f.b.env.CLAUDE_CONFIG_DIR, 'settings.json');
+  const older = `oak capture #${realCore.HOOK_MARKER}`;
+  const s = JSON.parse(fs.readFileSync(settings, 'utf8'));
+  s.hooks = Object.fromEntries(realCore.CAPTURE_HOOK_EVENTS.map((e) => [e, [{ matcher: realCore.matcherFor(e), hooks: [{ type: 'command', command: older }] }]]));
+  fs.writeFileSync(settings, JSON.stringify(s));
+  const coreDist = path.join(root, 'packages/core/dist/index.js');
+  const codex = run(f.b, process.execPath, ['-e', `const c=require(${JSON.stringify(coreDist)});c.installCodexHooks('oak capture --agent codex #'+c.HOOK_MARKER,c.isOurCommand)`]);
+  assert.equal(codex.status, 0, codex.stderr);
+  const rows = async () => JSON.parse((await f.oak(['--json', '--here'])).stdout).components.filter((c) => c.id.endsWith('hooks')).map((c) => [c.id, c.state, c.detail]);
+  assert.deepEqual(await rows(), [['hooks', 'update', `${settings}: an older hook command`], ['codex-hooks', 'update', 'an older hook command — reinstall']]);
+  const r = await f.oak(['--here', '--cli-only']);
+  assert.equal(r.status, 0, r.stderr);
+  const after = JSON.parse(fs.readFileSync(settings, 'utf8')).hooks;
+  assert.deepEqual(realCore.CAPTURE_HOOK_EVENTS.map((e) => after[e][0].hooks), realCore.CAPTURE_HOOK_EVENTS.map(() => [{ type: 'command', command: realCore.captureHookCommand('claude'), onFailure: 'continue' }]));
+  assert.deepEqual(await rows(), [['hooks', 'current', `all ${realCore.HEALTHY_HOOK_ENTRIES} events`], ['codex-hooks', 'current', 'installed and trusted']]);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(f.b.env.CODEX_HOME, 'hooks.json'), 'utf8')).hooks.Stop.at(-1).hooks[0].command, realCore.captureHookCommand('codex'));
+});
+
+// Windows report §3. A preload plays Windows: the platform, and, inside the desktop app, its package's file system
+// virtualization, which puts a new file under %APPDATA% in the package's LocalCache\Roaming. Nothing answers at the
+// release feed, so a run that is not refused stops there, before it could install anything.
+test('CLI update / install-extensions: refused inside the Claude desktop app\'s package, never in a terminal (Windows report §3)', { skip: process.platform === 'win32' && 'plays Windows on POSIX' }, t => {
+  const b = fixture(t);
+  b.env.CLAUDE_OBSERVATORY_NO_UPDATE_CHECK = '1';
+  b.env.CLAUDE_OBSERVATORY_RELEASES_API = 'http://127.0.0.1:9';
+  b.env.APPDATA = path.join(b.home, 'AppData', 'Roaming');
+  b.env.LOCALAPPDATA = path.join(b.home, 'AppData', 'Local');
+  const privateCopy = path.join(b.env.LOCALAPPDATA, 'Packages', 'Claude_pzs8sxrjxfjjc', 'LocalCache', 'Roaming');
+  fs.mkdirSync(b.env.APPDATA, { recursive: true });
+  fs.mkdirSync(privateCopy, { recursive: true });
+  const terminal = path.join(b.home, 'windows.cjs');
+  fs.writeFileSync(terminal, 'Object.defineProperty(process, \'platform\', { value: \'win32\' });\n');
+  const app = path.join(b.home, 'desktop-app.cjs');
+  fs.writeFileSync(app, `require(${JSON.stringify(terminal)});
+const fs = require('fs'), path = require('path');
+const into = (p) => String(p).startsWith(process.env.APPDATA + path.sep) ? path.join(${JSON.stringify(privateCopy)}, path.relative(process.env.APPDATA, String(p))) : p;
+for (const k of ['writeFileSync', 'rmSync']) { const real = fs[k]; fs[k] = (p, ...rest) => real(into(p), ...rest); }
+`);
+  const oak = (preload, args) => run(b, process.execPath, ['--require', preload, cli, ...args], { timeout: 60_000 });
+  for (const args of [['update'], ['update', '--here'], ['install-extensions'], ['install-extensions', '--vscode-only']]) {
+    const r = oak(app, args);
+    assert.equal(r.status, 1, `${args.join(' ')}: ${r.stderr}`);
+    assert.match(r.stderr, new RegExp(`^oak: this runs inside the Claude desktop app \\(Claude_pzs8sxrjxfjjc\\), .* run \`oak ${args[0]}\` from a normal terminal`), args.join(' '));
+  }
+  // What only reads still runs there; a terminal, the app installed or not, is never refused.
+  for (const [preload, args] of [[app, ['update', '--check']], [app, ['update', '--json']], [terminal, ['update']], [terminal, ['install-extensions']]]) {
+    const r = oak(preload, args);
+    assert.doesNotMatch(r.stderr, /Claude desktop app/, args.join(' '));
+    assert.match(r.stderr, /could not (check for updates|reach the release feed)|need network access to github\.com/, `${args.join(' ')}: it went on to the release feed\n${r.stderr}`);
+  }
+  assert.deepEqual([...fs.readdirSync(b.env.APPDATA), ...fs.readdirSync(privateCopy)], [], 'no probe is left behind');
+});
+
 test('CLI __after-update: the installed CLI reports what it did to the one that ran the update', { skip: process.platform === 'win32' && 'POSIX fakes' }, async t => {
   const f = updateFixture(t);
   // Codex hooks whose trust state is gone (codex then skips them silently): reinstalled and trusted.
@@ -3930,6 +4000,18 @@ test('CLI __after-update: the installed CLI reports what it did to the one that 
   assert.equal(old.status, 0, old.stderr);
   assert.match(old.stdout, /Local database: this Node \(v[\d.]+\) has no node:sqlite; the database needs Node\.js 24 or newer/);
   assert.match(old.stdout, /→ Install Node\.js 24 or newer \(this is v[\d.]+\)\./);
+});
+
+test('CLI __after-update: ends once its report is written, though a handle stays open (Windows report §2)', { skip: process.platform === 'win32' && 'POSIX fakes' }, async t => {
+  // On Windows ConPTY's handles kept the step running after its PTY check (12 minutes, until killed by hand). A timer
+  // left running stands in for them here; the PTY check itself runs in a child of its own (see test doctor.js).
+  const f = updateFixture(t);
+  const preload = path.join(f.b.home, 'open-handle.cjs');
+  fs.writeFileSync(preload, 'setInterval(() => {}, 60_000);\n');
+  const report = path.join(f.b.home, 'report.json');
+  const r = run(f.b, process.execPath, ['--require', preload, cli, '__after-update'], { env: { ...f.b.env, OAK_UPDATE_REPORT: report }, timeout: 30000 });
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(Array.isArray(JSON.parse(fs.readFileSync(report, 'utf8'))));
 });
 
 test('CLI update: stopped while its saved machines run, it stops each ssh it started there', { skip: process.platform === 'win32' && 'POSIX fakes' }, async t => {
@@ -4105,6 +4187,13 @@ test('CLI update: the installed CLI\'s setup step failing is a failed row and a 
   assert.equal(partly.status, 1, partly.stdout);
   assert.match(partly.stdout.slice(partly.stdout.indexOf('\nResult\n')), /^ {2}status line\s+updated — refreshed to this build$/m);
   assert.equal(setupRow(partly.stdout), 'failed — the installed CLI’s setup step failed — run `oak doctor --fix`');
+  // One that never ends (a PTY check on Windows sat 12 minutes): stopped at the deadline, and said to be a timeout.
+  fs.writeFileSync(path.join(pkg, 'dist', 'index.js'), 'setInterval(() => {}, 60000);\n');
+  env.OAK_AFTER_UPDATE_TIMEOUT_MS = '1500';
+  const hung = await update();
+  delete env.OAK_AFTER_UPDATE_TIMEOUT_MS;
+  assert.equal(hung.status, 1, hung.stdout);
+  assert.equal(setupRow(hung.stdout), 'failed — the installed CLI’s setup step did not finish within 1.5 s and was stopped — run `oak doctor --fix`');
   // The control: a release that sets itself up and reports nothing (one older than the report) still passes.
   fs.writeFileSync(path.join(pkg, 'dist', 'index.js'), 'process.exit(0);\n');
   const quiet = await update();

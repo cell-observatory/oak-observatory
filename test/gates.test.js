@@ -475,6 +475,20 @@ test('installers: install.ps1 is ASCII, so Windows PowerShell 5.1 can parse it w
   assert.deepEqual(bad, []);
 });
 
+test('installers: install.ps1 stops inside the Claude desktop app before it installs anything (Windows report §3)', () => {
+  // No PowerShell runs here (nor in CI), so this holds the check's shape: core's claudeDesktopPackage, whose test plays
+  // the package, makes the same one.
+  const ps1 = read('install.ps1');
+  const check = ps1.indexOf('# --- not inside the Claude desktop app');
+  assert.ok(check > 0 && check < ps1.indexOf('$tmp = Join-Path') && check < ps1.search(/^\s*& npm i -g /m), 'before the download and the install');
+  const block = ps1.slice(check, ps1.indexOf('$tmp = Join-Path'));
+  assert.match(block, /\$probe = Join-Path \$env:APPDATA \$probeName/);
+  assert.match(block, /-Filter 'Claude_\*'/);
+  assert.match(block, /Test-Path -LiteralPath \(Join-Path \$_\.FullName "LocalCache\\Roaming\\\$probeName"\)/);
+  assert.match(block, /finally \{\s*if \(\$probe\) \{ Remove-Item -LiteralPath \$probe /);
+  assert.match(block, /if \(\$container\) \{[^}]*Run this installer from a normal terminal[^}]*exit 1\s*\}/);
+});
+
 test('the root build links node_modules/.bin/oak, which npm ci skips while the CLI is unbuilt (the smoke and JetBrains tests run it)', () => {
   assert.match(JSON.parse(read('package.json')).scripts.build, / && npm rebuild oak-observatory --ignore-scripts$/);
 });

@@ -10,6 +10,16 @@ the release notes.
 
 ### Fixed
 
+- `oak machine add` accepts Windows remotes running Git Bash, MSYS2 or Cygwin when herdr and OAK are already
+  installed. It checks for herdr before rejecting an unsupported install platform, recognizes the Windows
+  `herdr/herdr.exe` layout, and uses the installed OAK without copying a POSIX launcher.
+- Remote installation scripts travel on stdin, and forwarded commands, updates, usage reads and sync commands
+  are encoded so an SSH login shell cannot strip their quoted assignments. Machine add diagnoses a shell that
+  mangles quotes before installing, with advice to use the WSL distro's own sshd. Failed installs remove their
+  temporary copies and restore an earlier OAK bundle and launcher; SSH calls that need no input receive none.
+- A Claude Code session resumed after its workspace moved now uses its most recently written transcript and latest
+  recorded workspace, even when the new project folder starts with a copy of the old history. Session lists,
+  `--session`, the inbox, search and sync follow that copy instead of the frozen one.
 - `oak install-extensions` and `oak update` no longer take the `cursor` script that Cursor's agent CLI installs in
   `~/.local/bin` for the editor. With no Cursor app command on the PATH, that script exits with "No Cursor IDE
   installation found", and the extension install failed. They now use the next `cursor` on the PATH, or Cursor's
@@ -22,6 +32,44 @@ the release notes.
 - `oak doctor` and `oak agent close --remove-worktree` wait up to 10 s for Git to list a repository's worktrees.
   With 1 s, a listing that took longer on a slow machine read as no worktrees at all: doctor reported no orphaned
   agent worktrees, and the close found no orphaned worktree by that name.
+- On Windows, OAK runs its bash scripts with Git Bash, found as Claude Code finds it: `CLAUDE_CODE_GIT_BASH_PATH`,
+  Git for Windows' install folder, then the `bin\bash.exe` beside the `git` on the PATH. Once WSL is on, the `bash`
+  on the PATH is `System32\bash.exe`, the WSL launcher, which runs Linux and cannot read a Windows path: `oak
+  statusline` and `oak update` failed to install the status line, and the month refresh behind the usage bars did not
+  run. With no Git Bash, they say so.
+- On Windows, the status line command OAK writes into Claude Code's settings names Git Bash and the script by their
+  Windows paths, in a form that Git Bash and PowerShell both run. Claude Code runs it with PowerShell when it finds
+  no Git Bash, and there the bare `bash` of the command before was the WSL launcher.
+- `install.ps1` installs the status line with Git Bash, found the same way, and says "Git Bash not found" when there
+  is none. It ran the first `bash` on the PATH, which was the WSL launcher once WSL is on.
+- `oak doctor` on Windows has a Git Bash row. It warns when there is no Git Bash, and when the `bash` on the PATH is
+  the WSL launcher, and says how to fix each.
+- On Windows, the month refresh behind the usage bars and the VS Code extension's background build of recent
+  sessions' change maps no longer open a console window while they run. Both still outlive the editor or command that
+  started them.
+- On Windows with no Python installed, the status line skips its token estimates quietly, or runs them with `py -3`
+  when the Python launcher is there. The `python3` there is the Microsoft Store's stub, which runs nothing, and
+  installing the status line stopped at it before setting up Codex's status line.
+- Inside WSL, `oak install-extensions` skips the Windows editor whose command it reaches through interop, says why,
+  and does not count it as a failure. Its install failed there, so `bootstrap.sh` ended with a warning.
+- On Windows, `oak update` no longer waits indefinitely for the setup step of the CLI it installed. That step checked
+  the terminal's PTY in its own process, where a check that never finished kept the update running, and a check that timed out stopped its ConPTY with node-pty's `kill()`, which ends every process on the
+  console it lists. The check now runs in a short-lived process of its own. After 15 s, that process and the processes
+  it started are ended, and nothing else. Over ssh, or without an interactive console, the check is skipped and the
+  update says so; `oak doctor` runs it from a terminal. The setup step exits once it has written its report, and
+  `oak update` stops it after 10 minutes and reports that it did not finish, where it reported a failure.
+- `oak update`, `oak install-extensions` and `install.ps1` refuse to run inside the Claude desktop app on Windows and
+  ask for a normal terminal. The app runs its sessions in its own MSIX package, where Windows keeps what an install
+  writes under `%APPDATA%` in a copy that only the app's sessions see: an `oak` installed or updated there was not the
+  one a terminal or an editor ran. `oak doctor` warns about a copy left under
+  `%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\npm` and says how to remove it. `--check` and `--json`, which
+  only read, still run there.
+- A capture hook no longer fails the tool call it runs around when `oak` is not on the PATH. On macOS and Linux, the
+  hook in a user's Claude Code and Codex settings does nothing when it finds no `oak`; when `oak` is there, its exit
+  status is the hook's, as before. On Windows, and in a project's shared settings, the command is unchanged, and each
+  Claude Code entry carries `onFailure: "continue"`. Without Git Bash, Claude Code otherwise treats a PreToolUse hook
+  that cannot find `oak` as a block. `oak init`, `oak init --repair` and `oak update` rewrite hooks that an older OAK
+  wrote.
 
 ## [0.11.0] — 2026-11-07
 

@@ -1,3 +1,4 @@
+const { decodeRemoteCommand, decodeRemoteLog } = require('../../../test/fixtures/remote-command.cjs');
 /**
  * The Review tab on a session that lives on another machine: its reads and verbs go to THAT machine
  * through the CLI's own `--machine <label>`, and a session on this machine is served exactly as before.
@@ -1421,7 +1422,7 @@ test('app: choosing what Review shows closes the launch rule; so does a key, pas
       const launched = () => /^(opened |GUI editor ).* — ran /.test(status());
       for (const until = Date.now() + 20000; Date.now() < until && (/^opening /.test(status()) || (launched() && !read(fx.edLog).length));) { await new Promise((r) => setTimeout(r, 50)); await flush(); }
       return { fx, status: status(), after: raw.slice(at), editor: read(fx.edLog).map((l) => JSON.parse(l)),
-        ssh: read(fx.execLog).join('\n').split(/^ssh$/m).slice(1).map((s) => s.slice(1, s.indexOf('\n.\n')).split('\n'))
+        ssh: read(fx.execLog).join('\n').split(/^ssh$/m).slice(1).map((s) => s.slice(1, s.indexOf('\n.\n')).split('\n').map(decodeRemoteCommand))
           // The review's own reads go over ssh -T; an editor's session is the one with a terminal.
           .filter((argv) => argv[0] === '-t') };
     } finally {
@@ -1692,7 +1693,7 @@ exec "${process.execPath}" "${CLI}" "$@"
       const rows = all.slice(at + 2);
       return { title: all[at], box: all[at + 1], rows: rows.slice(0, Math.max(0, rows.findIndex((l) => !l.trim()))) }; };
     const until = async (lines, re, ms = 15000) => { for (const end = Date.now() + ms; Date.now() < end && !re.test(lines().join('\n'));) await new Promise((r) => setTimeout(r, 100)); };
-    const searches = (fx) => (fs.existsSync(fx.execLog) ? fs.readFileSync(fx.execLog, 'utf8').match(/oak 'search' '--json' '--query=[^']*'/g) ?? [] : []);
+    const searches = (fx) => (fs.existsSync(fx.execLog) ? decodeRemoteLog(fs.readFileSync(fx.execLog, 'utf8')).match(/oak 'search' '--json' '--query=[^']*'/g) ?? [] : []);
     const open = async (press, lines) => { await press('b'); await until(lines, /Local filler 11/); };
     for (const tab of ['review', 'observatory']) {
       it(`${tab}: the search box shows as the picker opens, and typing narrows the rows by name`, async () => {
@@ -1793,7 +1794,9 @@ exec "${process.execPath}" "${CLI}" "$@"
           pids = path.join(fx.dir, 'search-ssh.pids');
           fs.mkdirSync(path.join(fx.dir, 'real'));
           fs.renameSync(path.join(fx.dir, 'bin', 'ssh'), path.join(fx.dir, 'real', 'ssh'));
-          fs.writeFileSync(path.join(fx.dir, 'bin', 'ssh'), `#!/bin/sh\ncase "$*" in *"'search'"*) echo "$$ $PPID" > '${pids}'; exec sleep 30 ;; esac\nexec '${path.join(fx.dir, 'real', 'ssh')}' "$@"\n`, { mode: 0o755 });
+          fs.writeFileSync(path.join(fx.dir, 'bin', 'ssh'), `#!/bin/sh\nfor a in "$@"; do last="$a"; done
+case "$last" in '{ { printf %s '*) payload=\${last#*%s }; payload=\${payload%% *}; last=$(printf %s "$payload" | base64 -d) ;; esac
+case "$last" in *"'search'"*) echo "$$ $PPID" > '${pids}'; exec sleep 30 ;; esac\nexec '${path.join(fx.dir, 'real', 'ssh')}' "$@"\n`, { mode: 0o755 });
         }, 'review', true);
       });
     }

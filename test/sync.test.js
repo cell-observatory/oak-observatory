@@ -1,3 +1,4 @@
+const { decodeRemoteCommand } = require('./fixtures/remote-command.cjs');
 // `oak sync` across throwaway machines: linux-a and linux-b (both Linux homes of one user), a Mac-like machine whose
 // clones live elsewhere, and a lab machine that runs under a shared account. ssh and herdr are
 // test/fixtures/machine-exec-stub.sh; each machine's `oak` runs this build in its own home, with
@@ -187,7 +188,7 @@ function world(t) {
   const sshCalls = () => {
     const log = path.join(io, 'machine-exec.log');
     const text = fs.existsSync(log) ? fs.readFileSync(log, 'utf8') : '';
-    return text.split(/^ssh\n/m).slice(1).map((s) => s.slice(0, s.indexOf('\n.\n')).split('\n'));
+    return text.split(/^ssh\n/m).slice(1).map((s) => s.slice(0, s.indexOf('\n.\n')).split('\n').map(decodeRemoteCommand));
   };
   const clearSsh = () => fs.rmSync(path.join(io, 'machine-exec.log'), { force: true });
   /** A machine's prefs.json `sync`, set as `oak sync …` would set it. */
@@ -1356,6 +1357,30 @@ fs.openSync = function (p, ...r) { if (/manifest\\.jsonl\\.\\d+\\.tmp$/.test(Str
   w.syncPrefs('linux-a', { backup: { kind: 'machine', label: 'linux-b' }, exclude: { machines: ['mac', 'lab'] } });
   w.json('linux-a', ['sync', 'now']);
   assert.deepEqual(fs.readFileSync(notes(s.A)), original);
+});
+
+test('sync inventory and fetch follow the newest copy of a session resumed in another project folder', { skip: POSIX }, (t) => {
+  const w = world(t), s = seed(w), id = ID(66);
+  only(w, ['linux-a', 'mac']);
+  const old = path.join(s.A, 'a-old'), current = path.join(s.A, 'z-new');
+  fs.mkdirSync(current); fs.symlinkSync(current, old, 'dir');
+  const first = conversation(s.A, old, id, 'Before the fixture move');
+  const moved = path.join(s.A, '.claude', 'projects', claudeFolder(current), `${id}.jsonl`);
+  const continued = fs.readFileSync(first, 'utf8') + line({ type: 'user', cwd: current, sessionId: id, message: { role: 'user', content: 'Kestrel continuation' } });
+  write(first, fs.readFileSync(first), Date.now() - 60_000);
+  write(moved, continued, Date.now() - 30_000);
+  const inventory = w.json('linux-a', ['__sync-inventory', '--user', me]);
+  assert.equal(inventory.projects.find(p => p.folder === claudeFolder(current))?.cwd, current);
+  assert.equal(inventory.families.transcripts.filter(f => f.name.endsWith(`${id}.jsonl`)).length, 2, 'backups retain both files');
+  w.json('mac', ['sync', 'now']);
+  const fetched = w.json('mac', ['sync', 'fetch', id]);
+  assert.ok(fetched.path.endsWith(path.join(claudeFolder(path.join(s.M, 'z-new')), `${id}.jsonl`)));
+  assert.equal(fs.readFileSync(fetched.path, 'utf8'), continued);
+  const stale = path.join(s.M, '.claude', 'projects', claudeFolder(path.join(s.M, 'zz-stale')), `${id}.jsonl`);
+  write(stale, fs.readFileSync(first), Date.now() - 60_000);
+  const again = w.json('mac', ['sync', 'fetch', id]);
+  assert.equal(again.path, fetched.path, 'an already-held session resolves to its newest local copy');
+  assert.deepEqual(fs.readFileSync(stale), fs.readFileSync(first), 'the frozen copy is untouched');
 });
 
 test('sync fetch evicts nothing by its index, which may be out of date: the copy it would evict can be the last one', { skip: POSIX }, (t) => {
@@ -3976,4 +4001,37 @@ test('sync settings: an older OAK\'s rewrite of prefs.json is undone at the next
   assert.deepEqual(JSON.parse(read(prefs)).sync, { backup: { kind: 'machine', label: 'linux-b' }, exclude: { projects: ['home:secret'], machines: ['lab'] } });
   const doctor = JSON.parse(w.runAs('linux-b', ['doctor', '--json']).stdout).checks.find((c) => c.id === 'sync-settings');
   assert.equal(doctor?.level, 'warn', 'oak doctor says it');
+});
+
+test('sync remote shell: npm PATH with spaces, quote mangling, inventory, binary fetch and key', { skip: POSIX }, (t) => {
+  const w = world(t);
+  const s = seed(w);
+  only(w, ['linux-a', 'linux-b']);
+  // Git Bash's inherited PATH includes npm's native Windows prefix. No OAK in ~/.local/bin.
+  const npmBin = path.join(s.B, 'AppData', 'Roaming', 'npm with spaces');
+  fs.mkdirSync(npmBin, { recursive: true });
+  fs.renameSync(path.join(s.B, '.local', 'bin', 'oak'), path.join(npmBin, 'oak'));
+  const env = { FAKE_REMOTE_PATH: `${npmBin}:/usr/bin:/bin`, SSH_MANGLE_QUOTES: '1' };
+  const binary = Buffer.from(Array.from({ length: 256 * 1024 }, (_, i) => i & 255));
+  write(path.join(s.B, '.claude', 'skills', 'remote', 'payload.bin'), binary);
+  const share = path.join(w.W, 'remote-backup');
+  assert.equal(w.runAs('linux-b', ['sync', 'backup', '--folder', share]).status, 0);
+  const key = w.json('linux-b', ['sync', 'key']);
+  const copied = w.json('linux-a', ['sync', 'key', '--from', 'linux-b'], env);
+  assert.equal(copied.syncKey.fingerprint, key.syncKey.fingerprint);
+  const plan = w.json('linux-a', ['sync', 'plan'], env);
+  assert.equal(plan.machines.find(m => m.label === 'linux-b').status, 'ok');
+  const result = w.json('linux-a', ['sync', 'now'], env);
+  assert.equal(result.status, 'ok', JSON.stringify(result));
+  assert.deepEqual(fs.readFileSync(path.join(s.A, '.claude', 'skills', 'remote', 'payload.bin')), binary);
+  const commands = w.sshCalls().map(args => {
+    assert.equal(args[0], '-T', 'no PTY line-ending conversion');
+    return args.at(-1);
+  });
+  for (const verb of ['__sync-key', '__sync-inventory', '__sync-fetch']) assert.ok(commands.some(c => c.includes(verb)), verb);
+  assert.ok(commands.some(c => c.includes('--publish')), 'now publishes the remote inventory');
+  // The other supported layout needs the quoted HOME expansion; the login PATH alone cannot find it.
+  fs.renameSync(path.join(npmBin, 'oak'), path.join(s.B, '.local', 'bin', 'oak'));
+  const localBin = w.json('linux-a', ['sync', 'plan'], { SSH_MANGLE_QUOTES: '1' });
+  assert.equal(localBin.machines.find(m => m.label === 'linux-b').status, 'ok');
 });

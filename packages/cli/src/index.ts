@@ -75,6 +75,13 @@ function fail(msg: string): never {
   process.exit(1);
 }
 
+/** Inside the Claude desktop app's Windows package, what an install writes under %APPDATA% lands in the package's
+ *  private copy (core.claudeDesktopPackage), which no terminal and no editor outside the app sees: refused there. */
+function refuseInsideDesktopApp(verb: string): void {
+  const pkg = (require('@oak-observatory/core') as typeof import('@oak-observatory/core')).claudeDesktopPackage();
+  if (pkg) fail(`this runs inside the Claude desktop app (${pkg}), where Windows keeps what an install writes under %APPDATA% in a copy only the app's own sessions see — run \`oak ${verb}\` from a normal terminal (Windows Terminal, or PowerShell from the Start menu)`);
+}
+
 /** True while `emitJson` writes: JSON passes `guardHumanOutput` byte-exact, even from a verb that
  *  answers in JSON without `--json` (`chat-context`). */
 let writingJson = false;
@@ -192,13 +199,14 @@ function getSessionId(args: string[]): string {
 
 // --- init / uninstall: delegate the settings.json merge to the shared core installer ---
 
-function captureCommand(_project: boolean): string {
-  const { HOOK_MARKER } = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
+function captureCommand(project: boolean): string {
+  const { captureHookCommand } = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
   // Portable hook: relies on the globally-installed `oak` bin being on PATH. Survives moving/renaming
   // the repo and works for teammates who `npm i -g`. The trailing shell-comment marker makes the hook
   // recognizable for status/uninstall regardless of where the package lives, and lets a re-run of
-  // `init` migrate a pre-rename `claude-observatory capture` hook to this one in place.
-  return `oak capture #${HOOK_MARKER}`;
+  // `init` migrate a pre-rename `claude-observatory capture` hook to this one in place. A user's hook
+  // is a no-op where `oak` is missing (captureHookCommand says where and why).
+  return captureHookCommand('claude', { project });
 }
 
 function cmdInit(project: boolean, withStatusline = false, repair = false, statuslineForce = false): void {
@@ -208,7 +216,7 @@ function cmdInit(project: boolean, withStatusline = false, repair = false, statu
     // The self-fix for older installs: the upsert install re-run over every file the ledger (plus
     // the user scope) knows, collapsing doubled hooks to one canonical pair per event. Per-file
     // results, because "fixed everywhere" without naming the files is not checkable.
-    const results = core.repairInstall(command);
+    const results = core.repairInstall((scope) => captureCommand(scope === 'project'));
     for (const r of results) {
       const label = `${r.path}${r.scope === 'project' ? c.dim(' (project)') : ''}`;
       if (r.error && r.action !== 'skipped') process.stdout.write(c.red('✗ ') + `${label}: ${r.error}\n`);
@@ -313,7 +321,7 @@ function maybeInitCodex(): Promise<void> {
 
 function cmdInitCodex(verify: boolean): void {
   const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
-  const command = `oak capture --agent codex #${core.HOOK_MARKER}`;
+  const command = core.captureHookCommand('codex');
   let res: import('@oak-observatory/core').CodexInstallResult;
   try {
     res = core.installCodexHooks(command, core.isOurCommand);
@@ -1058,11 +1066,15 @@ async function cmdDoctor(args: string[]): Promise<void> {
     binOnPath: onPath('oak'),
     jqPresent: onPath('jq'),
   });
+  const gitBash = core.diagnoseGitBash();
+  if (gitBash) checks.push(gitBash);
   checks.push(loginShellOakCheck());
   checks.push(...await core.diagnoseHerdrPane());
   checks.push(core.diagnoseRemoteTitles());
   const codexQuota = core.diagnoseCodexQuota();
   if (codexQuota) checks.push(codexQuota);
+  const desktopCopy = core.diagnoseDesktopAppCopy();
+  if (desktopCopy) checks.push(desktopCopy);
   const herdr = await herdrCheck(args.includes('--fix'));
   checks.push(herdr.check);
   checks.push(python3Check(herdr.report));
@@ -1248,7 +1260,7 @@ function sshMux(target: string): string[] {
   const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
   let opts = sshMuxAsked.get(target);
   if (opts) return opts;
-  opts = core.sshMuxOptions(core.spawnToolSync('ssh', ['-G', target], { encoding: 'utf8', timeout: 5000, direct: true, env: core.machineSshEnv() }));
+  opts = core.sshMuxOptions(core.spawnToolSync('ssh', ['-G', target], { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'pipe'], direct: true, env: core.machineSshEnv() }));
   sshMuxAsked.set(target, opts);
   return opts;
 }
@@ -1380,7 +1392,7 @@ async function forwardToMachine(verb: string, args: string[]): Promise<void> {
   // (`enterSessionWorkspace`). OAK_FORWARDED_MACHINE: the label this side reaches it by, so a repair
   // command the remote prints ("not recorded … --record-only") runs from here. An older build there
   // ignores both.
-  const remote = `env PATH="${core.MACHINE_PATH}" CLAUDE_OBSERVATORY_NO_UPDATE_CHECK=1 OAK_FORWARDED=1 OAK_FORWARDED_MACHINE=${quote(label)} sh -c ${quote(script)} oak ${argv.map(quote).join(' ')}`;
+  const remote = core.remoteShellCommand(`env PATH="${core.MACHINE_PATH}" CLAUDE_OBSERVATORY_NO_UPDATE_CHECK=1 OAK_FORWARDED=1 OAK_FORWARDED_MACHINE=${quote(label)} sh -c ${quote(script)} oak ${argv.map(quote).join(' ')}`);
   const env = core.machineSshEnv();
   const configured = Number(process.env.OAK_MACHINE_TIMEOUT_MS);
   const timeout = Number.isInteger(configured) && configured > 0 && configured <= 2147483647
@@ -1607,7 +1619,7 @@ async function cmdMachine(args: string[]): Promise<void> {
   const env = core.machineSshEnv();
   // windowsHide: false, as forwardToMachine's: on Windows too, ssh asks in this command's console.
   const ssh = (script: string) =>
-    core.spawnToolSync('ssh', [...SSH_OPTS, ...sshMux(target), target, script], { encoding: 'utf8', timeout: 120000, env, windowsHide: false });
+    core.spawnToolSync('ssh', ['-T', ...SSH_OPTS, ...sshMux(target), target, 'sh -s'], { input: script + '\n', encoding: 'utf8', timeout: 120000, direct: true, env, windowsHide: false });
   const why = (r: { stderr: string | Buffer; status: number | null }): string =>
     sshReason(String(r.stderr ?? '')) || `exit ${r.status ?? '?'}`;
 
@@ -1615,15 +1627,24 @@ async function cmdMachine(args: string[]): Promise<void> {
   const un = ssh('uname -s; uname -m');
   if (un.status !== 0) fail(`could not reach ${target}: ${why(un)}`);
   const [sysname = '', machine = ''] = String(un.stdout).trim().split('\n').map((l) => l.trim());
-  const key = core.herdrPlatformKeyFromUname(sysname, machine);
-  // Windows is a herdr release but not an ssh-remote one (its install is a zip + DLLs, and herdr's
-  // remote path is POSIX). Say which machine and why rather than failing three steps later.
-  if (!key) fail(`herdr publishes no ssh-installable binary for ${sysname || '?'}/${machine || '?'} — install it on ${target} yourself`);
-
-  const already = core.parseHerdrVersion(ssh('if [ -x "$HOME/.local/bin/herdr" ]; then "$HOME/.local/bin/herdr" --version; elif command -v herdr >/dev/null 2>&1; then herdr --version; fi').stdout);
+  const windows = /^(MINGW|MSYS|CYGWIN)/i.test(sysname);
+  // This one command deliberately travels on the command line: later commands (including herdr's own)
+  // need a login shell that preserves quoting. The install scripts themselves travel on stdin.
+  const quoting = core.spawnToolSync('ssh', ['-T', '-n', ...SSH_OPTS, ...sshMux(target), target,
+    'x="a b"; [ "$x" = "a b" ] && printf \'oak-shell-ok\\n\''],
+    { encoding: 'utf8', timeout: 120000, stdio: ['ignore', 'pipe', 'pipe'], direct: true, env, windowsHide: false });
+  if (quoting.status !== 0 || String(quoting.stdout).trim() !== 'oak-shell-ok') {
+    fail(`the SSH login shell on ${target} does not preserve shell quoting: ${why(quoting)} — Windows OpenSSH using the WSL launcher as its login shell can cause this; connect to the distro's own sshd instead`);
+  }
+  const probe = ssh('if [ -f "$HOME/.local/bin/herdr/herdr.exe" ]; then "$HOME/.local/bin/herdr/herdr.exe" --version; elif [ -f "$HOME/.local/bin/herdr" ]; then "$HOME/.local/bin/herdr" --version; elif command -v herdr >/dev/null 2>&1; then herdr --version; fi');
+  if (probe.status !== 0) fail(`could not probe herdr on ${target}: ${why(probe)}`);
+  const already = core.parseHerdrVersion(probe.stdout);
   if (already && core.compareVersions(already, lock.version) >= 0) {
     process.stdout.write(c.dim(`${target} already runs herdr ${already}\n`));
   } else {
+    if (windows) fail(`install herdr ${lock.version} or newer on ${target} using the Windows installer, then re-run \`oak machine add <label> ${target}\`; OAK does not install herdr over SSH on Windows`);
+    const key = core.herdrPlatformKeyFromUname(sysname, machine);
+    if (!key) fail(`herdr publishes no ssh-installable binary for ${sysname || '?'}/${machine || '?'} — install it on ${target} yourself`);
     // Same platform and already pinned here? Copy the bytes this machine verified at install time
     // instead of pulling the identical asset down a second time.
     const localProbe = core.probeHerdr({ lock });
@@ -1639,23 +1660,30 @@ async function cmdMachine(args: string[]): Promise<void> {
       const mk = ssh('mkdir -p "$HOME/.local/bin"');
       if (mk.status !== 0) fail(`could not create ~/.local/bin on ${target}: ${why(mk)}`);
       process.stdout.write(c.dim(`copying herdr ${lock.version} to ${target}:~/.local/bin/herdr …\n`));
-      const cp = core.spawnToolSync('scp', [...SSH_OPTS, ...sshMux(target), src, `${target}:.local/bin/herdr.oak-new`], {
+      const pending = `herdr.oak-${require('crypto').randomBytes(8).toString('hex')}`;
+      const clean = () => {
+        const r = ssh(`rm -f "$HOME/.local/bin/${pending}"`);
+        if (r.status !== 0) process.stderr.write(`oak: could not remove ~/.local/bin/${pending} on ${target}: ${why(r)}\n`);
+      };
+      const cp = core.spawnToolSync('scp', [...SSH_OPTS, ...sshMux(target), src, `${target}:.local/bin/${pending}`], {
         encoding: 'utf8',
         timeout: 600000,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        direct: true,
         env,
         windowsHide: false,
       });
-      if (cp.status !== 0) fail(`scp to ${target} failed: ${why(cp)}`);
+      if (cp.status !== 0) { clean(); fail(`scp to ${target} failed: ${why(cp)}`); }
       // Land it with a rename, never a write-in-place: overwriting a herdr that is currently running
       // is ETXTBSY on Linux, while a rename swaps it cleanly under the running process.
-      const land = ssh('chmod 0755 "$HOME/.local/bin/herdr.oak-new" && mv "$HOME/.local/bin/herdr.oak-new" "$HOME/.local/bin/herdr"');
-      if (land.status !== 0) fail(`could not install herdr on ${target}: ${why(land)}`);
-      // macOS refuses to run a quarantined binary with a dialog no ssh session can answer. Stripping
-      // the attribute is best-effort: a file that never carried one makes xattr exit nonzero, which
-      // is not a failure of anything.
-      if (sysname.trim().toLowerCase() === 'darwin') ssh('xattr -d com.apple.quarantine "$HOME/.local/bin/herdr" >/dev/null 2>&1; true');
-      const got = core.parseHerdrVersion(ssh('"$HOME/.local/bin/herdr" --version').stdout);
-      if (got !== lock.version) fail(`installed herdr on ${target}, but it reports ${got ?? 'nothing'} (expected ${lock.version})`);
+      const land = ssh(`f="$HOME/.local/bin/${pending}"; ${sysname.trim().toLowerCase() === 'darwin' ? 'xattr -d com.apple.quarantine "$f" >/dev/null 2>&1 || true; ' : ''}chmod 0755 "$f" && "$f" --version`);
+      const got = core.parseHerdrVersion(land.stdout);
+      if (land.status !== 0 || got !== lock.version) {
+        clean();
+        fail(`could not install herdr on ${target}: ${why(land)}; reports ${got ?? 'nothing'} (expected ${lock.version})`);
+      }
+      const moved = ssh(`mv "$HOME/.local/bin/${pending}" "$HOME/.local/bin/herdr"`);
+      if (moved.status !== 0) { clean(); fail(`could not install herdr on ${target}: ${why(moved)}`); }
       process.stdout.write(c.green('✓ ') + `herdr ${got} installed on ${target}\n`);
     } finally {
       if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -1681,7 +1709,7 @@ async function cmdMachine(args: string[]): Promise<void> {
     if (add.status !== 0) fail(`\`herdr machine add\` failed (exit ${add.status ?? '?'}) — the remote binary is installed; re-run once the reason above is fixed`);
     process.stdout.write(c.green('✓ ') + `machine ${label} → ${target}\n`);
   }
-  await installOakStack(target, __dirname);
+  await installOakStack(target, __dirname, windows);
   // A machine is saved now: sync is offered, until it is set up here.
   const st = core.syncStatus();
   if (!st.setUp && !st.backup && !core.keptPrefs().sync?.setupAt) {
@@ -1698,65 +1726,96 @@ async function cmdMachine(args: string[]): Promise<void> {
  * `distDir` is this bundle's own directory (`__dirname`), which holds the index.js launcher, cli.js
  * (this CLI), capture.js + the sidecar assets.
  */
-async function installOakStack(target: string, distDir: string): Promise<void> {
+async function installOakStack(target: string, distDir: string, windows: boolean): Promise<void> {
   const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
   const path = require('path');
   const env = core.machineSshEnv();
-  const ssh = (script: string) => core.spawnToolSync('ssh', [...SSH_OPTS, ...sshMux(target), target, script], { encoding: 'utf8', timeout: 120000, env, windowsHide: false });
-  const scp = (args: string[]) => core.spawnToolSync('scp', [...SSH_OPTS, ...sshMux(target), ...args], { encoding: 'utf8', timeout: 600000, env, windowsHide: false });
+  const ssh = (script: string) => core.spawnToolSync('ssh', ['-T', ...SSH_OPTS, ...sshMux(target), target, 'sh -s'], { input: script + '\n', encoding: 'utf8', timeout: 120000, direct: true, env, windowsHide: false });
+  const scp = (args: string[]) => core.spawnToolSync('scp', [...SSH_OPTS, ...sshMux(target), ...args], { encoding: 'utf8', timeout: 600000, stdio: ['ignore', 'pipe', 'pipe'], direct: true, env, windowsHide: false });
   const why = (r: { stderr?: string | Buffer; status: number | null }): string =>
     sshReason(String(r.stderr ?? '')) || `exit ${r.status ?? '?'}`;
 
-  // A Node that runs the local index is OAK's only extra remote runtime need. A stock host often has it user-local in
-  // ~/.local/bin, which a non-interactive ssh does NOT put on PATH — so check that path explicitly too.
-  const nodeV = ssh('command -v node >/dev/null 2>&1 && node --version || { [ -x "$HOME/.local/bin/node" ] && "$HOME/.local/bin/node" --version; } || true');
+  const nodeV = ssh(`PATH="${core.MACHINE_PATH}"; command -v node >/dev/null 2>&1 && node --version || true`);
+  if (nodeV.status !== 0) fail(`could not probe Node on ${target}: ${why(nodeV)}`);
   if (!core.nodeRunsIndex(/v\d+\.\d+\.\d+/.exec(String(nodeV.stdout || ''))?.[0] ?? '')) {
     process.stdout.write(c.yellow('! ') + `oak not installed on ${target}: needs ${core.INDEX_NODES} (found ${String(nodeV.stdout).trim() || 'none'}). herdr is set up; install that Node there and re-run \`oak machine add <label> ${target}\` to enable review + capture.\n`);
     return;
   }
-  process.stdout.write(c.dim(`installing oak + capture hooks on ${target} …\n`));
-  // An `oak` there that is not the launcher below (npm's, or npm's link to a checkout, which npm puts in
-  // ~/.local/bin when its prefix is ~/.local) is left as it is: writing the launcher went through such a link
-  // and replaced the checkout's build. Found as `--machine` finds it, on MACHINE_PATH.
+  // npm's executable or link to a checkout is left alone. On Windows every OAK must be installed there:
+  // the POSIX launcher and standalone bundle below are not a native Windows installation.
   const found = ssh(`PATH="${core.MACHINE_PATH}"; o=$(command -v oak 2>/dev/null) || exit 0; ` +
-    `[ "$o" = "$HOME/.local/bin/oak" ] && [ ! -L "$o" ] && grep -q '/.local/lib/oak/index.js' "$o" 2>/dev/null && exit 0; printf '%s\\n' "$o"`);
-  const other = found.status === 0 ? String(found.stdout ?? '').trim() : '';
-  const mk = ssh(other ? 'mkdir -p "$HOME/.local/bin"' : 'mkdir -p "$HOME/.local/lib/oak/herdr-plugin" "$HOME/.local/bin"');
-  if (mk.status !== 0) fail(`could not create ~/.local on ${target}: ${why(mk)}`);
-  // Put ~/.local/bin on PATH for login (.profile) and interactive (.bashrc) shells — a stock host does
-  // not, so `oak` and the capture hooks would not resolve in the agent's pane. Idempotent; printf is
-  // single-quoted so $HOME/$PATH land literally in the rc, evaluated when a shell starts.
-  // …and .zprofile: zsh (the macOS default) reads neither of the other two.
-  ssh('for rc in "$HOME/.profile" "$HOME/.bashrc" "$HOME/.zprofile"; do touch "$rc"; grep -q "oak: user-local bin on PATH" "$rc" || printf \'\\n# oak: user-local bin on PATH\\nexport PATH="$HOME/.local/bin:$PATH"\\n\' >> "$rc"; done');
+    (windows ? '' : `[ "$o" = "$HOME/.local/bin/oak" ] && [ ! -L "$o" ] && grep -q '/.local/lib/oak/index.js' "$o" 2>/dev/null && exit 0; `) + `printf '%s\\n' "$o"`);
+  if (found.status !== 0) fail(`could not find oak on ${target}: ${why(found)}`);
+  const other = String(found.stdout ?? '').trim();
+  if (windows && !other) {
+    process.stdout.write(c.yellow('! ') + `oak not installed on ${target}: install OAK on Windows and put oak on the SSH login shell's PATH, then re-run \`oak machine add <label> ${target}\`. herdr is set up.\n`);
+    return;
+  }
+  process.stdout.write(c.dim(`installing oak + capture hooks on ${target} …\n`));
+  const initScript = `PATH="${core.MACHINE_PATH}"; export PATH; oak init --no-codex </dev/null >/dev/null 2>&1 || true; oak init --codex </dev/null >/dev/null 2>&1 || true; v=$(oak --version </dev/null) || exit $?; case "$v" in oak\\ ?*) printf '%s\\n' "$v" ;; *) echo 'oak returned no version' >&2; exit 1 ;; esac`;
+  let init: ReturnType<typeof ssh>;
   if (other) {
     process.stdout.write(c.dim(`${target} already runs oak from ${other}, which \`oak machine add\` did not put there: left as it is\n`));
+    init = ssh(initScript);
   } else {
-    // The index.js launcher is copied last, after the two bundles it loads, so a failed copy never
-    // leaves it pointing at a cli.js that is not there.
+    // Copy into a directory owned by this run. A failed copy must neither leave a partial install nor
+    // remove an older working one. The final script keeps backups until the new launcher runs.
+    const id = require('crypto').randomBytes(8).toString('hex');
+    const stage = `.local/lib/oak.oak-${id}`;
+    const clean = () => {
+      const r = ssh(`d="$HOME/${stage}"; rm -rf "\${d:?}"`);
+      if (r.status !== 0) process.stderr.write(`oak: could not remove ~/${stage} on ${target}: ${why(r)}\n`);
+    };
+    const mk = ssh(`mkdir -p "$HOME/${stage}/herdr-plugin" "$HOME/.local/bin"`);
+    if (mk.status !== 0) { clean(); fail(`could not create ~/.local on ${target}: ${why(mk)}`); }
     for (const f of ['cli.js', 'capture.js', 'THIRD_PARTY_NOTICES.md', 'index.js']) {
-      const cp = scp([path.join(distDir, f), `${target}:.local/lib/oak/${f}`]);
-      if (cp.status !== 0) fail(`could not copy oak/${f} to ${target}: ${why(cp)}`);
+      const cp = scp([path.join(distDir, f), `${target}:${stage}/${f}`]);
+      if (cp.status !== 0) { clean(); fail(`could not copy oak/${f} to ${target}: ${why(cp)}`); }
     }
-    // The manifest rides beside the bundle so `oak --version` there is the real version (without it
-    // `oak update` on the remote planned an update forever). It is found
-    // where version() looks: ../package.json in an npm install, beside index.js in a bundle that
-    // `oak machine add` itself pushed (a remote adding a machine of its own).
+    // A machine provisioned this way keeps its manifest beside index.js, instead of one directory up.
     const manifest = [path.join(distDir, '..', 'package.json'), path.join(distDir, 'package.json')].find((p) => require('fs').existsSync(p));
-    const cpManifest = scp([manifest ?? path.join(distDir, 'package.json'), `${target}:.local/lib/oak/package.json`]);
-    if (cpManifest.status !== 0) fail(`could not copy package.json to ${target}: ${why(cpManifest)}`);
-    const cpPlugin = scp(['-r', path.join(distDir, 'herdr-plugin') + '/.', `${target}:.local/lib/oak/herdr-plugin/`]);
-    if (cpPlugin.status !== 0) fail(`could not copy the herdr plugin to ${target}: ${why(cpPlugin)}`);
-    // Launcher that resolves node at RUN time — system node if on PATH, else the user-local one — so it
-    // works even from a hook's non-interactive shell. $HOME/$@ stay literal (printf is single-quoted).
-    // Written beside its place and renamed over it: a write to the path itself went through a link there.
-    const launch = ssh('f="$HOME/.local/bin/oak"; rm -f "$f.oak-new" && printf \'#!/bin/sh\\nexec "$(command -v node 2>/dev/null || echo "$HOME/.local/bin/node")" "$HOME/.local/lib/oak/index.js" "$@"\\n\' > "$f.oak-new" && chmod 0755 "$f.oak-new" && mv -f "$f.oak-new" "$f"');
-    if (launch.status !== 0) fail(`could not install the oak launcher on ${target}: ${why(launch)}`);
+    const cpManifest = scp([manifest ?? path.join(distDir, 'package.json'), `${target}:${stage}/package.json`]);
+    if (cpManifest.status !== 0) { clean(); fail(`could not copy package.json to ${target}: ${why(cpManifest)}`); }
+    const cpPlugin = scp(['-r', path.join(distDir, 'herdr-plugin') + '/.', `${target}:${stage}/herdr-plugin/`]);
+    if (cpPlugin.status !== 0) { clean(); fail(`could not copy the herdr plugin to ${target}: ${why(cpPlugin)}`); }
+    init = ssh(`set -e
+stage="$HOME/${stage}"
+d="$HOME/.local/lib/oak"
+f="$HOME/.local/bin/oak"
+backup="$stage-old"
+old="$f.oak-${id}-old"
+new="$f.oak-${id}-new"
+landed=0; launched=0
+finish() {
+  status=$?; trap - 0
+  if [ "$status" -ne 0 ]; then
+    if [ "$launched" = 1 ]; then rm -f "$f"; fi
+    if [ -e "$old" ] || [ -L "$old" ]; then mv "$old" "$f" || exit "$status"; fi
+    if [ "$landed" = 1 ]; then rm -rf "\${d:?}"; fi
+    if [ -e "$backup" ] || [ -L "$backup" ]; then mv "$backup" "$d" || exit "$status"; fi
+  else
+    rm -rf "\${backup:?}"; rm -f "$old"
+  fi
+  rm -rf "\${stage:?}"; rm -f "$new"
+  exit "$status"
+}
+trap finish 0
+trap 'exit 1' 1 2 15
+printf '#!/bin/sh\\nexec "$(command -v node 2>/dev/null || echo "$HOME/.local/bin/node")" "$HOME/.local/lib/oak/index.js" "$@"\\n' > "$new"
+chmod 0755 "$new"
+if [ -e "$d" ] || [ -L "$d" ]; then mv "$d" "$backup"; fi
+mv "$stage" "$d"; landed=1
+if [ -e "$f" ] || [ -L "$f" ]; then mv "$f" "$old"; fi
+mv "$new" "$f"; launched=1
+${initScript}
+`);
+    if (init.status !== 0) { clean(); fail(`could not install the oak launcher on ${target}: ${why(init)}`); }
   }
-  // Capture hooks (claude + codex), then verify oak actually runs. Hooks are best-effort; a dead oak
-  // is a hard failure. `--no-codex` on the plain init: its codex step can also wire a local model, a
-  // config change that must never happen where nobody sees it; `init --codex` installs the hooks.
-  const init = ssh(`PATH="${core.MACHINE_PATH}"; oak init --no-codex >/dev/null 2>&1 || true; oak init --codex >/dev/null 2>&1 || true; oak --version 2>&1`);
-  if (!/oak\s+\S+/.test(String(init.stdout || ''))) fail(`installed oak on ${target}, but it did not run: ${why(init)}`);
+  if (init.status !== 0 || !/oak\s+\S+/.test(String(init.stdout || ''))) fail(`installed oak on ${target}, but it did not run: ${why(init)}`);
+  if (!windows) {
+    // Literal HOME/PATH are evaluated when a login or interactive shell starts, not during this install.
+    ssh('for rc in "$HOME/.profile" "$HOME/.bashrc" "$HOME/.zprofile"; do touch "$rc"; grep -q "oak: user-local bin on PATH" "$rc" || printf \'\\n# oak: user-local bin on PATH\\nexport PATH="$HOME/.local/bin:$PATH"\\n\' >> "$rc"; done');
+  }
   process.stdout.write(c.green('\u2713 ') + (other
     ? `oak on ${target} (${String(init.stdout).trim()}) + capture hooks\n`
     : `oak installed on ${target} (${String(init.stdout).trim()}) + capture hooks; ~/.local/bin on PATH\n`));
@@ -3799,7 +3858,7 @@ function cmdConversation(args: string[]): void {
   // Provenance only: diagnose a local sync copy without parsing or presenting its conversation.
   if (args.includes('--source-info')) {
     // The raw lookup: session listing and resolution skip sync mirrors, but provenance must find one to report it.
-    const transcript = core.findTranscript(root, session) ?? core.transcriptForSession(session) ?? core.describeSession(session).transcript;
+    const transcript = core.findTranscript(root, session) ?? core.transcriptForSession(session) ?? core.describeSession(session).transcript ?? core.claudeSessionTranscript(session, true);
     return emitJson(transcript ? { ...core.isMirroredTranscript(transcript), syncedAt: require('fs').statSync(transcript).mtimeMs } : { mirrored: false });
   }
   const numberFlag = (name: string, minimum: number): number | undefined => {
@@ -4480,7 +4539,7 @@ function cmdEditorReview(args: string[]): void {
   if (sub === 'connection') {
     const target = flagValue(args, '--target');
     if (!target || target.startsWith('-') || /[\s\0]/.test(target)) fail('Invalid SSH target');
-    const r = core.spawnToolSync('ssh', ['-G', target], { encoding: 'utf8', timeout: 5000, direct: true, env: core.machineSshEnv() });
+    const r = core.spawnToolSync('ssh', ['-G', target], { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'pipe'], direct: true, env: core.machineSshEnv() });
     if (r.status !== 0) fail('Could not resolve the saved SSH target');
     const values = new Map(String(r.stdout).split('\n').map(l => { const i = l.indexOf(' '); return [l.slice(0, i), l.slice(i + 1).trim()]; }));
     return emitJson({ host: values.get('hostname'), user: values.get('user'), port: Number(values.get('port')) });
@@ -6404,7 +6463,7 @@ function sshUsageBrief(m: { target: string }, how: import('@oak-observatory/core
   const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
   const quote = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`;
   const verb = how.verb === 'records' ? `__usage-records --json${how.since ? ` --since ${quote(how.since)}` : ''}` : '__usage-brief --json';
-  const remote = `env PATH="${core.MACHINE_PATH}" CLAUDE_OBSERVATORY_NO_UPDATE_CHECK=1 oak ${verb}`;
+  const remote = core.remoteShellCommand(`env PATH="${core.MACHINE_PATH}" CLAUDE_OBSERVATORY_NO_UPDATE_CHECK=1 oak ${verb}`);
   return new Promise((resolve) => {
     let child: ReturnType<typeof core.spawnTool>;
     try {
@@ -6794,13 +6853,13 @@ function cmdStatusline(args: string[] = []): void {
   }
   // `direct`: bash is a real .exe that libuv resolves unaided, and the hint below is reachable ONLY
   // through res.error — a shell would report a missing bash as exit 127 and kill that branch.
+  // On Windows a bare `bash` is the WSL launcher when WSL is on, so bashPath() names Git Bash.
   // `--force` passes through: the installer REFUSES to replace a statusLine that is not ours
   // (ccusage's, Orca's) unless the caller explicitly said so.
-  const res = core.spawnToolSync('bash', [script, ...(args.includes('--force') ? ['--force'] : [])], { stdio: 'inherit', direct: true });
-  if (res.error) {
-    const winHint = process.platform === 'win32' ? ' — on Windows run this from Git Bash or WSL' : '';
-    fail(`could not run bash: ${res.error.message} (the status line needs bash + jq${winHint})`);
-  }
+  const bash = core.bashPath();
+  if (!bash) fail(`Git Bash not found (the status line is a bash script). ${core.GIT_BASH_FIX}.`);
+  const res = core.spawnToolSync(bash, [script, ...(args.includes('--force') ? ['--force'] : [])], { stdio: 'inherit', direct: true });
+  if (res.error) fail(`could not run bash: ${res.error.message} (the status line needs bash + jq)`);
   process.exit(res.status ?? 1);
 }
 
@@ -7054,7 +7113,7 @@ async function updateCliBinary(assets: ReleaseAsset[], latest: string, current: 
  * to OAK_UPDATE_REPORT), null when it wrote none: it failed, or it is a release older than the report
  * (a switch down to one).
  */
-function finishInInstalledCli(): { ok: boolean; rows: UpdateComponent[] | null } {
+function finishInInstalledCli(): { ok: boolean; timedOut: boolean; rows: UpdateComponent[] | null } {
   const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
   const fs = require('fs');
   const os = require('os');
@@ -7070,7 +7129,7 @@ function finishInInstalledCli(): { ok: boolean; rows: UpdateComponent[] | null }
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-update-'));
   const report = path.join(dir, 'components.json');
   try {
-    const r = entry ? core.spawnToolSync(process.execPath, [entry, '__after-update'], { stdio: 'inherit', env: { ...process.env, OAK_UPDATE_REPORT: report } }) : null;
+    const r = entry ? core.spawnToolSync(process.execPath, [entry, '__after-update'], { stdio: 'inherit', env: { ...process.env, OAK_UPDATE_REPORT: report }, timeout: afterUpdateTimeout() }) : null;
     let rows: UpdateComponent[] | null = null;
     try {
       const parsed = JSON.parse(fs.readFileSync(report, 'utf8'));
@@ -7078,19 +7137,32 @@ function finishInInstalledCli(): { ok: boolean; rows: UpdateComponent[] | null }
     } catch {
       /* no report: handled by the caller */
     }
-    return { ok: r?.status === 0, rows };
+    return { ok: r?.status === 0, timedOut: (r?.error as NodeJS.ErrnoException | undefined)?.code === 'ETIMEDOUT', rows };
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+}
+
+/** How long `update` waits for the installed CLI's setup step before it stops it: generous, since that step installs
+ *  editor extensions. OAK_AFTER_UPDATE_TIMEOUT_MS overrides it. */
+function afterUpdateTimeout(): number {
+  const configured = Number(process.env.OAK_AFTER_UPDATE_TIMEOUT_MS);
+  return Number.isInteger(configured) && configured > 0 && configured <= 2147483647 ? configured : 10 * 60_000;
 }
 
 /** `__after-update`: the half of `oak update` that belongs to the NEW release (see finishInInstalledCli). */
 async function afterUpdate(): Promise<void> {
   const components = await applyComponents(await componentPlan());
   const tui = require('@oak-observatory/tui') as typeof import('@oak-observatory/tui');
-  const pty = await tui.diagnoseNativeSpawn(true);
-  if (pty.level !== 'ok') process.stdout.write(c.yellow('⚠ ') + `${pty.label}: ${pty.detail}\n` + (pty.fix ? c.dim(`  → ${pty.fix}\n`) : ''));
-  else if (pty.detail.startsWith('repaired')) process.stdout.write(c.green('✓ ') + `${pty.detail}\n`);
+  // In a child of its own with a deadline: on Windows a PTY check that never finished held this step open (Windows
+  // report §2), and node-pty's kill() there ends what is on the console of a pid it is handed.
+  const skipped = tui.ptyCheckSkipped();
+  if (skipped) process.stdout.write(c.dim(`- Native terminal PTY spawn: skipped (${skipped}) — \`oak doctor\` in a terminal checks it\n`));
+  else {
+    const pty = await tui.diagnoseNativeSpawn(true, { isolate: true });
+    if (pty.level !== 'ok') process.stdout.write(c.yellow('⚠ ') + `${pty.label}: ${pty.detail}\n` + (pty.fix ? c.dim(`  → ${pty.fix}\n`) : ''));
+    else if (pty.detail.startsWith('repaired')) process.stdout.write(c.green('✓ ') + `${pty.detail}\n`);
+  }
   // A supported Node whose database is still unavailable (built without node:sqlite, or OAK_INDEX=off): say once, in
   // OAK's words, what that leaves out. An update onto an unsupported Node never gets here: the launcher refuses first.
   const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
@@ -7171,13 +7243,15 @@ async function componentPlan(): Promise<UpdateComponent[]> {
   const hooks = row('hooks', 'Claude Code capture hooks');
   const installed = core.installStatus().filter((f) => f.exists && f.installed);
   const files = installed.filter((f) => f.scope === 'user');
-  const short = files.filter((f) => f.entries !== core.HEALTHY_HOOK_ENTRIES);
+  // A healthy count with an older command (one an `oak` that is gone fails) is work too.
+  const short = files.filter((f) => !core.hooksCurrent(captureCommand(false), f.path));
   out.push(!files.length ? hooks('absent', 'not installed — `oak init` adds them')
-    : short.length ? hooks('update', short.map((f) => `${f.path}: ${f.entries} of ${core.HEALTHY_HOOK_ENTRIES} events`).join('; '))
+    : short.length ? hooks('update', short.map((f) => `${f.path}: ${f.entries === core.HEALTHY_HOOK_ENTRIES ? 'an older hook command' : `${f.entries} of ${core.HEALTHY_HOOK_ENTRIES} events`}`).join('; '))
     : hooks('current', `all ${core.HEALTHY_HOOK_ENTRIES} events`));
-  for (const f of installed.filter((f) => f.scope === 'project' && f.entries !== core.HEALTHY_HOOK_ENTRIES)) {
+  for (const f of installed.filter((f) => f.scope === 'project' && !core.hooksCurrent(captureCommand(true), f.path))) {
     const missing = core.missingHookEvents(f.path);
-    const what = missing.length ? `is missing ${missing.join(', ')}` : `has ${f.entries} entries for its ${core.HEALTHY_HOOK_ENTRIES} events`;
+    const what = missing.length ? `is missing ${missing.join(', ')}`
+      : f.entries === core.HEALTHY_HOOK_ENTRIES ? 'has an older hook command' : `has ${f.entries} entries for its ${core.HEALTHY_HOOK_ENTRIES} events`;
     out.push(row('project-hooks', 'Claude Code project hooks')('manual', `${f.path} ${what} — run \`oak init --repair\` there`));
   }
   const codex = row('codex-hooks', 'Codex capture hooks');
@@ -7186,6 +7260,7 @@ async function componentPlan(): Promise<UpdateComponent[]> {
   out.push(!cx.installed ? codex('absent', 'not installed — `oak init --codex` adds them')
     : cx.disabled ? codex('current', 'turned off in codex config.toml — left alone')
     : cx.trust !== 'trusted' ? codex('update', `trust is ${cx.trust} — reinstall`)
+    : cx.installedCommand !== core.captureHookCommand('codex') ? codex('update', 'an older hook command — reinstall')
     : cx.userDisabled.length ? codex('current', `${cx.userDisabled.join(', ')} turned off in Codex — left alone`)
     : codex('current', 'installed and trusted'));
   // Only OUR status line, never a foreign one: the installer refuses those without --force, and an
@@ -7228,7 +7303,7 @@ async function applyComponents(plan: UpdateComponent[]): Promise<UpdateComponent
         out.push(set(edited.length ? 'manual' : 'updated', edited.length ? edited.map(e => `${e.path}: user-edited; left unchanged`).join('; ') : 'managed delegation guidance refreshed'));
       } else if (p.id === 'hooks') {
         const bad: string[] = [];
-        for (const f of core.installStatus().filter((f) => f.scope === 'user' && f.exists && f.installed && f.entries !== core.HEALTHY_HOOK_ENTRIES)) {
+        for (const f of core.installStatus().filter((f) => f.scope === 'user' && f.exists && f.installed && !core.hooksCurrent(captureCommand(false), f.path))) {
           try {
             core.installHooks(captureCommand(false), f.path);
           } catch (e) {
@@ -7237,12 +7312,14 @@ async function applyComponents(plan: UpdateComponent[]): Promise<UpdateComponent
         }
         out.push(bad.length ? set('failed', bad.join('; ')) : set('updated', `repaired to all ${core.HEALTHY_HOOK_ENTRIES} events`));
       } else if (p.id === 'codex-hooks') {
-        core.installCodexHooks(`oak capture --agent codex #${core.HOOK_MARKER}`, core.isOurCommand);
+        core.installCodexHooks(core.captureHookCommand('codex'), core.isOurCommand);
         const trust = core.codexHooksStatus(core.isOurCommand).trust;
         out.push(trust === 'trusted' ? set('updated', 'reinstalled and trusted') : set('failed', `trust is ${trust} after a reinstall — run \`oak init --codex\``));
       } else if (p.id === 'statusline') {
         // `direct`: bash is a real executable (the same call cmdStatusline makes), never `--force`.
-        const r = core.spawnToolSync('bash', [statuslineInstallerPath()], { stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', direct: true });
+        const bash = core.bashPath();
+        if (!bash) { out.push(set('failed', `Git Bash not found — ${core.GIT_BASH_FIX}`)); continue; }
+        const r = core.spawnToolSync(bash, [statuslineInstallerPath()], { stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', direct: true });
         const why = String(r.stderr ?? '').split('\n').find((l) => l.trim()) || r.error?.message || `the installer exited ${r.status ?? '?'}`;
         out.push(r.status === 0 && statuslineCurrent() ? set('updated', 'refreshed to this build') : set('failed', `${why} — run \`oak statusline\``));
       } else if (p.id === 'focus-server') {
@@ -7312,6 +7389,19 @@ function isCursorAgentShim(file: string): boolean {
   } catch {
     return false;
   }
+}
+
+/** Inside WSL, the `code` (or `cursor`, …) on PATH can be the Windows editor's own launcher, reached through interop:
+ *  the sh script its Windows install keeps in bin\ beside `<name>.cmd`. It drives Windows' editor, which cannot read
+ *  this distro's paths, so its `--install-extension` failed; and a window connected to WSL loads the extension
+ *  (extensionKind workspace) from this distro's server, not from Windows. WSL is detected as the TUI does. */
+function isWslInteropCli(cli: string): boolean {
+  if (process.platform !== 'linux' || !(process.env.WSL_DISTRO_NAME || process.env.WSLENV)) return false;
+  const fs = require('fs');
+  const path = require('path');
+  const file = path.isAbsolute(cli) ? cli : String(process.env.PATH || '').split(':').filter(Boolean).map((d: string) => path.join(d, cli))
+    .find((p: string) => { try { fs.accessSync(p, fs.constants.X_OK); return fs.statSync(p).isFile(); } catch { return false; } });
+  return !!file && fs.existsSync(`${file}.cmd`);
 }
 
 /**
@@ -7384,6 +7474,8 @@ type EditorRow = {
   gallery: boolean;
   /** A Remote-SSH server dir, driven by the server binary it holds rather than a desktop CLI. */
   server: boolean;
+  /** Inside WSL, its CLI is Windows' own editor, reached through interop (see isWslInteropCli); `cli` is then null. */
+  interop?: boolean;
 };
 
 function vscodeEditors(): EditorRow[] {
@@ -7423,7 +7515,8 @@ function vscodeEditors(): EditorRow[] {
       }
     }
     const cli = ed.server ? serverCli(path.join(home, ed.server), ed.cli) : resolveEditorCli(ed.cli, ed.app, ed.winApp);
-    out.push({ label: ed.label, extDirs: ed.extDirs, extRoots, cli, cliName: ed.cli, version: best, hasOld, gallery, server: Boolean(ed.server) });
+    const interop = !ed.server && cli !== null && isWslInteropCli(cli);
+    out.push({ label: ed.label, extDirs: ed.extDirs, extRoots, cli: interop ? null : cli, cliName: ed.cli, version: best, hasOld, gallery, server: Boolean(ed.server), ...(interop ? { interop } : {}) });
   }
   return out;
 }
@@ -7461,6 +7554,8 @@ function serverCli(serverDir: string, name: string): string | null {
  *  command to install: its binary arrives when the editor next connects. */
 function noCliFix(e: EditorRow | undefined): string {
   if (e?.server) return `connect to this machine from ${e.label.slice(0, -' server'.length)} once, so it installs its server (${e.cliName})`;
+  if (e?.interop)
+    return `install OAK on Windows (install.ps1) for Windows' own ${e.label}; a ${e.label} window connected to WSL runs it from this distro's ${e.label} server, which \`oak install-extensions\` installs into once ${e.label} has connected here`;
   const label = e?.label ?? 'VS Code';
   return `in ${label}, ⇧⌘P → "Shell Command: Install '${e?.cliName || 'code'}' command in PATH"`;
 }
@@ -7799,9 +7894,11 @@ async function cmdInstallExtensions(args: string[]): Promise<void> {
   if (chI >= 0 && !chRaw) fail('`install-extensions --channel <stable|dev>` requires a value');
   const requested = chRaw ? core.normalizeChannel(chRaw) : null;
   if (chRaw && !requested) fail(`unknown channel "${chRaw}" — use stable or dev (pre-release)`);
+  if (!checkOnly) refuseInsideDesktopApp('install-extensions');
   const channel = requested ?? core.getUpdateChannel();
 
-  const editors = vscodeEditors().filter(editorPresent);
+  const allEditors = vscodeEditors();
+  const editors = allEditors.filter(editorPresent);
   const jbDirs = jetbrainsPluginDirs();
   const local = vsixArg !== null || zipArg !== null;
   // In LOCAL mode no release is fetched, so a family with no artifact has nothing to install FROM.
@@ -7890,7 +7987,10 @@ async function cmdInstallExtensions(args: string[]): Promise<void> {
     // next connection. Said, not counted as a failure, as when the dirs belonged to the desktop row.
     for (const e of editors.filter((e) => !e.cli && e.server))
       process.stdout.write(c.dim(`${e.label}: no server binary found — skipped; ${noCliFix(e)} to install into it.\n`));
-    const noCli = editors.filter((e) => !e.cli && !e.server);
+    // Inside WSL, Windows' own editor: said, and not counted as a failure, as above.
+    for (const e of allEditors.filter((e) => e.interop))
+      process.stdout.write(c.dim(`${e.label}: the \`${e.cliName}\` on PATH is Windows' own, reached through WSL interop — skipped.\n    ${noCliFix(e)}.\n`));
+    const noCli = editors.filter((e) => !e.cli && !e.server && !e.interop);
     for (const e of noCli) {
       // Never a silent skip: the editor is here, we just cannot drive it.
       process.stdout.write(
@@ -7904,7 +8004,7 @@ async function cmdInstallExtensions(args: string[]): Promise<void> {
     // Guard on whether an editor EXISTS, not on whether there is work: everything-already-current is
     // the common case on a re-run (which is how the docs say to update), and it was reporting
     // "no editor detected" — while the truthful line was reachable only on runs that also failed.
-    if (!editors.length) process.stdout.write(c.dim('VS Code family: no editor detected — skipped.\n'));
+    if (!editors.length && !allEditors.some((e) => e.interop)) process.stdout.write(c.dim('VS Code family: no editor detected — skipped.\n'));
     else if (!actionable.length && !noCli.length) process.stdout.write(c.green('✓ ') + `VS Code family already at ${target}\n`);
     else {
       let src = vsixArg;
@@ -8104,7 +8204,7 @@ function sshUpdate(m: import('@oak-observatory/core').HerdrMachine, body: string
     `if [ -L "$g" ] && t=$(cd "$g" 2>/dev/null && pwd -P); then case "$t" in */packages/cli) [ -e "\${t%/packages/cli}/.git" ] && t="\${t%/packages/cli}" ;; esac; ` +
     `printf '\\n${marker}linked %s\\n' "$t" >&2; exit 78; fi; fi; ` +
     `${body}; oak_status=$?; printf '\\n${marker}%s\\n' "$oak_status" >&2; exit "$oak_status"`;
-  const remote = `env PATH="${core.MACHINE_PATH}" CLAUDE_OBSERVATORY_NO_UPDATE_CHECK=1 sh -c ${quote(script)} oak`;
+  const remote = core.remoteShellCommand(`env PATH="${core.MACHINE_PATH}" CLAUDE_OBSERVATORY_NO_UPDATE_CHECK=1 sh -c ${quote(script)} oak`);
   return new Promise((resolve) => {
     let child: ReturnType<typeof core.spawnTool>;
     try {
@@ -8349,6 +8449,8 @@ async function cmdUpdate(args: string[]): Promise<void> {
   const channel = requested ?? core.getUpdateChannel();
   // What every saved machine is asked to do: the same channel and the same --force.
   const passArgs = [...(requested ? ['--channel', requested] : []), ...(force ? ['--force'] : [])];
+  // --check and --json only read.
+  if (!checkOnly && !json) refuseInsideDesktopApp('update');
 
   const releases = await fetchReleases();
   // ONE decision for every surface, in core: a surface is acted on when its installed version
@@ -8467,7 +8569,9 @@ async function cmdUpdate(args: string[]): Promise<void> {
     const finished = finishInInstalledCli();
     // A setup step that failed, or that could not be found to run, may have set up nothing.
     if (!finished.ok)
-      componentResults = [...(finished.rows ?? []), { id: 'setup', label: 'OAK setup', state: 'failed', detail: 'the installed CLI’s setup step failed — run `oak doctor --fix`' }];
+      componentResults = [...(finished.rows ?? []), { id: 'setup', label: 'OAK setup', state: 'failed', detail: finished.timedOut
+        ? `the installed CLI’s setup step did not finish within ${afterUpdateTimeout() / 1000} s and was stopped — run \`oak doctor --fix\``
+        : 'the installed CLI’s setup step failed — run `oak doctor --fix`' }];
     else if (finished.rows) componentResults = finished.rows;
     else {
       // A release older than the per-component report set itself up without saying how.
@@ -8617,8 +8721,9 @@ function usage(): void {
       `                       install capture hooks for codex (~/.codex/hooks.json + trust state;\n` +
       `                       foreign entries preserved); checks hooks.json + trust locally, no model\n` +
       `                       run — codex skips untrusted hooks silently, so status re-checks them\n` +
-      `  statusline [--force] install/refresh the bundled claude-statusline (usage bars; needs bash+jq);\n` +
-      `                       refuses to replace another tool's statusLine unless --force\n` +
+      `  statusline [--force] install/refresh the bundled claude-statusline (usage bars; needs bash+jq,\n` +
+      `                       on Windows Git Bash); refuses to replace another tool's statusLine\n` +
+      `                       unless --force\n` +
       `  uninstall [--project] [--all] [--purge-store]\n` +
       `                       remove the capture hooks from every install-ledger location (--project =\n` +
       `                       only this repo's file; --all also reverts the bundled status line, a\n` +
@@ -8629,7 +8734,8 @@ function usage(): void {
       `  integrity [--session <id>] [--json]  inspect capture gaps and unsafe history; read-only\n` +
       `  doctor [--json] [--fix]\n` +
       `                       diagnose setup (hooks, PATH, the \`oak\` a login shell runs, config dir,\n` +
-      `                       session, status line, herdr, the herdr server's environment) with fixes;\n` +
+      `                       session, status line and, on Windows, the Git Bash it runs with, herdr,\n` +
+      `                       the herdr server's environment) with fixes;\n` +
       `                       --markdown (--md) emits the report as Markdown; --fix installs the pinned\n` +
       `                       herdr, its claude + codex integrations and OAK's plugin, sets missing\n` +
       `                       sidebar widths and theme defaults (gruvbox), starts its server, repairs\n` +
@@ -8643,7 +8749,8 @@ function usage(): void {
       `  install-extensions [--check] [--json] [--force] [--channel stable|dev]\n` +
       `                       install the editor extensions into whatever editors are on this machine\n` +
       `                       (VS Code family + JetBrains); --vsix/--jetbrains-zip use local build\n` +
-      `                       outputs instead of the release; --check reports without installing\n` +
+      `                       outputs instead of the release; --check reports without installing;\n` +
+      `                       inside WSL, Windows' own editor on PATH (through interop) is skipped\n` +
       `  update [--here] [--check] [--json] [--cli-only] [--force] [--channel stable|dev]\n` +
       `                       update everything OAK installed from the followed release channel: the\n` +
       `                       CLI; the extension in each VS Code-family editor and Remote-SSH server\n` +
@@ -8750,6 +8857,7 @@ function usage(): void {
       `  machine add <label> <ssh-target> | machine list [--json]\n` +
       `                       the machines herdr runs agents on: add installs the version pinned in herdr.lock\n` +
       `                       over ssh (checksum-verified) and saves it non-interactively; a newer local herdr is left alone.\n` +
+      `                       Windows SSH shells (Git Bash, MSYS2, Cygwin) need herdr and oak installed there first.\n` +
       `                       list is herdr's own machine list\n` +
       `  sync now [--machine <label>]… [--json] [--quiet]\n` +
       `                       pull from each enabled saved machine what this machine keeps: memory, plans, skills,\n` +
@@ -9587,7 +9695,8 @@ function main(): void {
       break;
     case '__after-update':
       // Internal, hidden: `oak update` runs this in the CLI it just installed (finishInInstalledCli).
-      afterUpdate().catch((e) => fail(String(e?.message || e)));
+      // It ends once its report is written: a handle left open (ConPTY's, on Windows) kept it running.
+      afterUpdate().then(() => process.stdout.write('', () => process.exit()), (e) => fail(String(e?.message || e)));
       break;
     case '__tab-sync':
       // Internal, hidden: started detached by the capture hooks and the status line (core kickTabSync).

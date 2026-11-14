@@ -375,6 +375,14 @@ export function editorBin(command: string): string {
  *  Cursor's) was found by a login shell and not by an `oak update` over ssh (2026-11-09). */
 export const MACHINE_PATH = '$HOME/.local/bin:$HOME/bin:/opt/homebrew/bin:/usr/local/bin:$PATH';
 
+/** Carry a command past a login shell that re-quotes its arguments. fd 3 keeps the caller's stdin
+ *  for commands such as sync fetch and ignore --stdin; the decoded script has a separate pipe. */
+export function remoteShellCommand(command: string): string {
+  const encoded = Buffer.from(`${command} <&3 3<&-\n`, 'utf8').toString('base64');
+  // macOS decodes with -D, which is not decode everywhere: GNU coreutils, busybox and Git Bash refuse it and decode with -d.
+  return `{ { printf %s ${encoded} | base64 -D 2>/dev/null || printf %s ${encoded} | base64 -d; } | sh; } 3<&0`;
+}
+
 /** The environment for an ssh to a saved machine: an ssh_config SendEnv wildcard must not export this
  *  machine's store or agent identity, and no ssh asks anything in a dialog. With no terminal to ask on
  *  (on macOS and Linux, the ssh of `--machine` and `oak update` runs apart from the terminal), ssh asks

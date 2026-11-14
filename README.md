@@ -491,7 +491,9 @@ updates follow it from then on). Beyond that, each surface can keep **itself** c
 
 **Platforms:** herdr is required on every platform and ships for Linux and macOS on x86_64 and arm64,
 and Windows on x86_64 only; Windows-on-ARM has no herdr build. Windows support for herdr-backed pane
-listing, replies and agent start is untested in this release. `oak machine add` targets must be POSIX hosts.
+listing, replies and agent start is untested in this release. `oak machine add` can also save a Windows remote whose SSH login shell is Git Bash, MSYS2 or Cygwin,
+with herdr and OAK already installed there; it installs neither binary on Windows. See
+[remote setup](docs/REMOTE.md) for the shell requirements and quoting diagnostic.
 On **Linux**, npm compiles node-pty, the helper the terminal app's herdr tab runs herdr in, while it
 installs OAK. That needs `python3`, `make` and a C++ compiler (`g++`, or whatever `$CXX` names;
 `build-essential` on Debian and Ubuntu), an npm prefix with no space in its path, and, under npm 12,
@@ -504,9 +506,18 @@ a pane. macOS and Windows use node-pty's prebuilt binaries.
 On **Windows**, install with `install.ps1` in native PowerShell without bash or WSL. npm's
 `.cmd` shims are handled through one launcher (`packages/core/src/spawn.ts`). Piping the bash one-liner
 into PowerShell is the one thing to avoid: with WSL installed it silently installs everything *inside*
-WSL, where Claude Code on the Windows side cannot see it. The **bundled status line**
-is a bash script that parses its input with `jq` (and uses `python3` for the token estimates), so the
-Usage bars need Git Bash + `jq` (`winget install jqlang.jq`) on PATH. Windows paths are canonicalized
+WSL, where Claude Code on the Windows side cannot see it. Install and update from a normal terminal, not
+from a session in the Claude desktop app: the app's MSIX package keeps what an install writes under
+`%APPDATA%` in a copy only the app's own sessions see, so `install.ps1`, `oak update` and
+`oak install-extensions` stop there and say so. The **bundled status line**
+is a bash script that parses its input with `jq` (and uses `python3`, or `py -3`, for the token
+estimates, which it skips when neither runs), so the Usage bars need Git Bash and `jq`
+(`winget install jqlang.jq`) on PATH. OAK finds Git Bash as Claude Code does: `CLAUDE_CODE_GIT_BASH_PATH`,
+Git for Windows' install folder, then the `bin\bash.exe` beside the `git` on PATH. It never runs
+`System32\bash.exe`, the WSL launcher, which is the `bash` on PATH once WSL is on; `oak doctor` warns
+when it is. Inside a WSL distro, `oak install-extensions` skips the Windows editor it reaches through
+interop: install OAK on Windows for that editor, and a window connected to WSL runs the extension from
+the distro's editor server. Windows paths are canonicalized
 for drive-letter case everywhere (capture, lookups, both editors); a store written by v0.8.9 or earlier
 may hold phantom `+N −0` / `+0 −N` edit pairs from that bug — they heal on read, and
 `oak clean --phantoms` removes them for good (#43).

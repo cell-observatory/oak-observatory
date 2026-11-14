@@ -10,8 +10,9 @@
  *   2. A BARE name never finds one either. libuv's `path_search_walk_ext` says it plainly: "Since
  *      CreateProcess can start only .com and .exe files, only those extensions are tried." So
  *      `spawn('code', …)` is ENOENT on a machine where `code.cmd` sits right there on the PATH.
- *      (A bare name backed by a real `.exe` — `bash`, `where`, `unzip`, `powershell` — resolves fine
- *      without us. Those callers should pass `direct`; see the ENOENT note below.)
+ *      (A bare name backed by a real `.exe` — `where`, `unzip`, `powershell` — resolves fine without
+ *      us. Those callers should pass `direct`; see the ENOENT note below. `bash` resolves too, but to the
+ *      WSL launcher whenever WSL is on: run `bashPath()` instead.)
  *
  * So on win32 those spawns MUST go through `cmd.exe`. But passing an args ARRAY together with
  * `shell: true` is deprecated as DEP0190 — and worse than deprecated, it is wrong: shell
@@ -54,6 +55,7 @@
 import * as cp from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
+import * as path from 'path';
 import type { Readable, Writable } from 'stream';
 
 export interface LaunchOpts {
@@ -117,6 +119,73 @@ export function launchSpec(file: string, args: readonly string[] = [], opts: Lau
 function split<T extends object>(options: T & LaunchOpts): [T, LaunchOpts] {
   const { platform, direct, ...rest } = options as T & LaunchOpts;
   return [rest as T, { platform, direct }];
+}
+
+export interface BashLookup {
+  /** Injected so the win32 lookup is unit-testable from macOS/Linux. Defaults to `process.platform`. */
+  platform?: NodeJS.Platform;
+  env?: NodeJS.ProcessEnv;
+  exists?: (file: string) => boolean;
+}
+
+const isFile = (file: string): boolean => {
+  try {
+    return fs.statSync(file).isFile();
+  } catch {
+    return false;
+  }
+};
+
+/** The first `name` (with its extension, e.g. `git.exe`) in a Windows PATH, or null. */
+export function winOnPath(name: string, opts: BashLookup = {}): string | null {
+  const env = opts.env ?? process.env;
+  const exists = opts.exists ?? isFile;
+  for (const dir of String(env.PATH ?? env.Path ?? '').split(';')) {
+    const d = dir.trim().replace(/^"(.*)"$/, '$1');
+    if (d && exists(path.win32.join(d, name))) return path.win32.join(d, name);
+  }
+  return null;
+}
+
+/** `%SystemRoot%\System32\bash.exe`, the WSL launcher. With WSL on, System32 comes first on Windows' PATH, so a bare
+ *  `bash` is this one, and it runs Linux, which read the Windows path of the script it was handed with the backslashes
+ *  gone (`C:Users…install-statusline.sh: No such file or directory`). */
+export function isWslLauncher(file: string, env: NodeJS.ProcessEnv = process.env): boolean {
+  const norm = (p: string) => path.win32.normalize(p).toLowerCase();
+  return norm(file) === norm(path.win32.join(env.SystemRoot || 'C:\\Windows', 'System32', 'bash.exe'));
+}
+
+/** What to tell someone on Windows with no Git Bash. */
+export const GIT_BASH_FIX = 'Install Git for Windows (winget install Git.Git), or set CLAUDE_CODE_GIT_BASH_PATH to its bin\\bash.exe';
+
+/** `node -e` source that starts argv[1] with the rest of argv, `windowsHide` and not detached (on Windows a console
+ *  with no window, which the child's own children share), feeds it this process's stdin and ends when it does. A
+ *  detached node running it keeps a console program's tree windowless and still outlives its caller (see
+ *  monthRefreshSpawn). */
+export const HIDDEN_CONSOLE_LAUNCHER =
+  "const c=require('child_process').spawn(process.argv[1],process.argv.slice(2),{stdio:['pipe','ignore','ignore'],windowsHide:true});" +
+  "c.on('error',()=>{});c.stdin.on('error',()=>{});process.stdin.pipe(c.stdin);";
+
+/**
+ * The bash OAK runs its bash scripts with: `bash` off Windows. On Windows, Git Bash, found the way Claude Code finds
+ * the bash it runs hooks and the status line with: CLAUDE_CODE_GIT_BASH_PATH when it names a bash or sh, Git for
+ * Windows' default folders, then `..\..\bin\bash.exe` from the first `git.exe` on PATH (Git puts only its `cmd`
+ * folder there). Never the WSL launcher; null when there is no Git Bash.
+ */
+export function bashPath(opts: BashLookup = {}): string | null {
+  if ((opts.platform ?? process.platform) !== 'win32') return 'bash';
+  const env = opts.env ?? process.env;
+  const exists = opts.exists ?? isFile;
+  const w = path.win32;
+  const set = env.CLAUDE_CODE_GIT_BASH_PATH;
+  const git = winOnPath('git.exe', { env, exists });
+  const candidates = [
+    set && ['bash.exe', 'sh.exe', 'bash', 'sh'].includes(w.basename(set).toLowerCase()) ? set : null,
+    w.join(env.ProgramFiles || 'C:\\Program Files', 'Git', 'bin', 'bash.exe'),
+    w.join(env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'Git', 'bin', 'bash.exe'),
+    git ? w.join(git, '..', '..', 'bin', 'bash.exe') : null,
+  ];
+  return candidates.find((p): p is string => !!p && exists(p) && !isWslLauncher(p, env)) ?? null;
 }
 
 /** OAK_NO_BACKGROUND=1 turns off every fire-and-forget child OAK starts on its own (the account pull, the
