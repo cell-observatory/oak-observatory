@@ -542,6 +542,8 @@ esac
   fs.writeFileSync(path.join(bin, 'ssh'), `#!/bin/sh
 if [ "$1" = -G ]; then
   echo "G $2" >> "${log}"
+  # A non-interactive probe must see EOF, not wait on an open stdin pipe.
+  cat >/dev/null
   case "$2" in
     me@shared) printf 'user me\\ncontrolmaster auto\\ncontrolpersist no\\n' ;;
     me@persisted) printf 'user me\\ncontrolmaster auto\\ncontrolpersist 600\\n' ;;

@@ -24,6 +24,7 @@ const LEGACY_HOOK_MARKERS = ['claude-observatory-hook'];
 interface HookCmd {
   type: string;
   command: string;
+  onFailure?: string;
 }
 interface HookGroup {
   matcher?: string;
@@ -47,6 +48,22 @@ export function isOurCommand(cmd: string): boolean {
   if (cmd.includes(HOOK_MARKER)) return true;
   if (LEGACY_HOOK_MARKERS.some((m) => cmd.includes(m))) return true;
   return /(\boak\b|claude[-_](observatory|changes)|claude_review)/.test(cmd) && /capture(\.js)?["']?\s*$/.test(cmd.trim());
+}
+
+/**
+ * The capture command OAK writes for an agent. In a user's settings on macOS and Linux it does nothing when `oak` is
+ * not on PATH (a session started before OAK was installed, or after it was removed), so the hook never fails the tool
+ * call it runs around; when `oak` is there, its exit status is the hook's, so a capture that fails still says so.
+ * Claude Code runs a hook with /bin/sh; Codex with the person's login shell, which need not read sh, so Codex's runs
+ * the guard in a `sh` of its own. A project's settings are committed and shared, and on Windows Claude Code runs a
+ * hook in Git Bash or, without it, in PowerShell, which read no guard alike: those keep the command every shell runs,
+ * and Claude Code's entries carry `onFailure: "continue"` (addTo), so a missing `oak` is reported, never a block.
+ */
+export function captureHookCommand(agent: 'claude' | 'codex', opts: { project?: boolean; platform?: NodeJS.Platform } = {}): string {
+  const run = agent === 'codex' ? 'oak capture --agent codex' : 'oak capture';
+  if (opts.project || (opts.platform ?? process.platform) === 'win32') return `${run} #${HOOK_MARKER}`;
+  const guarded = `command -v oak >/dev/null 2>&1 || exit 0; exec ${run}`;
+  return `${agent === 'codex' ? `sh -c '${guarded}'` : guarded} #${HOOK_MARKER}`;
 }
 
 /** The text of a settings file, without the byte order mark an editor may have put first, which JSON.parse
@@ -143,7 +160,7 @@ function addTo(events: Record<string, HookGroup[]>, event: string, command: stri
     for (const h of Array.isArray(g.hooks) ? g.hooks : []) {
       if (!isOurCommand(h.command)) continue;
       ours++;
-      if (h.command === command && g.matcher === matcher) canonical = true;
+      if (h.command === command && h.onFailure === 'continue' && g.matcher === matcher) canonical = true;
     }
   }
   if (ours === 1 && canonical) return false; // exactly right already — a no-op re-init
@@ -161,7 +178,10 @@ function addTo(events: Record<string, HookGroup[]>, event: string, command: stri
   // events it would land our entry inside a foreign managed group (Orca, herdr and Superset all
   // install `*` groups) — mutating a group that is not ours to touch. Every entry of ours is gone
   // by this point, so a fresh group is always the right home.
-  list.push({ matcher, hooks: [{ type: 'command', command }] });
+  // `onFailure: "continue"`: Claude Code on Windows without Git Bash blocks a PreToolUse or PermissionRequest tool call
+  // on any exit but 0 and 2 from a hook that does not say this (Claude Code 2.1.312 to 2.1.321), so an `oak` it could
+  // not find stopped every edit. Capture never answers with exit 2, which blocks everywhere.
+  list.push({ matcher, hooks: [{ type: 'command', command, onFailure: 'continue' }] });
   return true;
 }
 
@@ -438,6 +458,21 @@ export function missingHookEvents(file: string = settingsPath()): string[] {
   );
 }
 
+/** Whether `installHooks(command, file)` would leave the file as it is: every event carries exactly the entry it writes
+ *  now. False for an install an older OAK wrote with another command or without `onFailure`, so a component update
+ *  rewrites it although its entry count is healthy. */
+export function hooksCurrent(command: string, file: string = settingsPath()): boolean {
+  let data: any;
+  try {
+    data = readSettings(file).data;
+  } catch {
+    return false;
+  }
+  const hooks = JSON.parse(JSON.stringify(data?.hooks ?? {}));
+  if (migrateMatchers(hooks)) return false;
+  return !CAPTURE_HOOK_EVENTS.some((event) => addTo(hooks, event, command));
+}
+
 export function installStatus(): InstallStatusRow[] {
   return knownSettingsFiles().map(({ path: p, scope }) => {
     const exists = fs.existsSync(p);
@@ -490,7 +525,7 @@ export function uninstallEverywhere(): MultiFileResult[] {
  * this only adds enumeration and the rule that repair never resurrects: a ledger-recorded settings
  * file that no longer exists is skipped and forgotten, not re-created in a repo that may be gone.
  */
-export function repairInstall(command: string): MultiFileResult[] {
+export function repairInstall(command: string | ((scope: 'user' | 'project') => string)): MultiFileResult[] {
   return knownSettingsFiles().map(({ path: p, scope }) => {
     // The user-scope file may legitimately not exist yet (fresh machine): install it. A missing
     // PROJECT file means the repo moved or removed it — leave it gone.
@@ -504,7 +539,7 @@ export function repairInstall(command: string): MultiFileResult[] {
     }
     try {
       const existed = fs.existsSync(p) && hooksInstalled(p);
-      const r = installHooks(command, p);
+      const r = installHooks(typeof command === 'string' ? command : command(scope), p);
       return {
         path: p,
         scope,

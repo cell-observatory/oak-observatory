@@ -202,7 +202,7 @@ function discover(db: DatabaseSync, only?: Set<string>): Discovery {
       const st = stat(file);
       if (!st || !st.isFile()) continue;
       const s = of(id);
-      s.transcripts.push({ t: { id, file, label: w.label }, st });
+      s.transcripts.push({ t: { id, file, label: w.label, mtimeMs: st.mtimeMs }, st });
       s.newest = Math.max(s.newest, st.mtimeMs);
       // Only a folder that is there is stat'ed: most sessions have none.
       if (dirs.has(id)) {
@@ -649,6 +649,10 @@ function projectKey(r: Run, cwd: string | undefined | null): { key: string | nul
  *  one. */
 function originOf(r: Run, f: SessionListingFacts | null): string | null {
   const file = f?.rollout ?? f?.transcript;
+  // A resumed copy can now have a local cwd. A write since sync's recorded snapshot belongs here.
+  const entry = file ? manifestEntry(r, file) : null;
+  const st = file && entry?.sha256 ? stat(file) : null;
+  if (st && entry && (entry.size !== st.size || entry.mtime !== Math.floor(st.mtimeMs))) return null;
   return file ? fileOrigin(r, file) : null;
 }
 
@@ -2818,7 +2822,7 @@ export function catchUp(db: DatabaseSync, opts: CatchUpOptions = {}): CatchUpRes
       if (!prev && states.get(`copy:${s.id}`) === stamp) continue;
       const revive = prev?.archived === true;
       const facts = !prev || prev.inputs !== stamp || revive;
-      const transcript = facts ? (s.transcripts[0]?.t.file ?? null) : prev?.transcript ?? null;
+      const transcript = facts ? (discoverListing(s.transcripts.map((x) => x.t), []).byId.get(s.id)?.file ?? null) : prev?.transcript ?? null;
       const stamps = unitStamps(s, transcript, now);
       const machine = prev?.machine ?? r.me;
       const stale = Object.entries(stamps).some(([k, v]) => states.get(`unit:${k}:${machine}:${s.id}`) !== v);

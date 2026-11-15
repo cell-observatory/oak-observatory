@@ -14,7 +14,7 @@ import { lineDelta, plainTitle } from './format';
 import { spawnToolSync } from './spawn';
 import { graphemeHead } from './graphemes';
 import { contentGet, contentNote, flushPairDeltas, pairDelta, pairKeyOf, derivedInventory } from './derived';
-import { projectDir, resolveSessionId, listWorkspaces, isBridgePointer, isMirroredTranscript, workspaceLabel, SESSION_BUSY_MS } from './session';
+import { projectDir, resolveSessionId, listWorkspaces, claudeSessionTranscript, isBridgePointer, isMirroredTranscript, workspaceLabel, SESSION_BUSY_MS } from './session';
 import { readAttention, readTabLink, captureMutex } from './capture';
 import { claudeConfigDir, canonPath } from './paths';
 import { agentPhaseDetail } from './actions';
@@ -43,7 +43,7 @@ function findTranscriptInInventory(cwd: string, sessionId: string): string | nul
   let dir = path.resolve(cwd);
   for (;;) {
     const p = path.join(projectDir(dir), `${sessionId}.jsonl`);
-    if (fs.existsSync(p) && !isMirroredTranscript(p).mirrored && !isBridgePointer(p)) return p;
+    if (fs.existsSync(p) && !isMirroredTranscript(p, false).mirrored && !isBridgePointer(p)) return claudeSessionTranscript(sessionId);
     const parent = path.dirname(dir);
     if (parent === dir) { const source = findCodexRollout(sessionId); return source && !isMirroredTranscript(source).mirrored ? codexTranscriptFile(source) : null; }
     dir = parent;
@@ -832,6 +832,7 @@ export interface ListingTranscript {
   id: string;
   file: string;
   label: string;
+  mtimeMs?: number;
 }
 
 /** Where a session's conversation was found: its transcript (a Codex session's derived one), the workspace and working
@@ -878,18 +879,23 @@ export function listingTranscripts(): ListingTranscript[] {
  * Which conversation each session id names. Every workspace's transcripts are indexed by id, so a row can name where it
  * came from: the listing used to gate on `findTranscript`, which WALKS UP the tree, so sessions belonging to `~` and
  * other ancestors were offered as if they were this repo's, 13 of 63 on the repo that found this, with nothing on the
- * row to say otherwise. The first project folder (by label) whose copy is neither mirrored nor a bridge pointer wins; an
+ * row to say otherwise. The newest copy that is neither mirrored nor a bridge pointer wins (path breaks mtime ties); an
  * id whose every copy is one is excluded. Codex's rollouts follow, newest first, so an archived copy loses.
  */
 export function discoverListing(transcripts: Iterable<ListingTranscript>, codex: Iterable<CodexSessionSource>, probe: ListingProbe = LIVE_LISTING_PROBE): ListingDiscovery {
   const byId = new Map<string, ListingFound>();
   const excluded = new Set<string>();
+  const mtimes = new Map<string, number>();
   for (const t of transcripts) {
-    if (byId.has(t.id)) continue;
+    let ms: number;
+    try { ms = t.mtimeMs ?? fs.statSync(t.file).mtimeMs; } catch { continue; }
+    const previous = byId.get(t.id);
+    if (previous && (ms < mtimes.get(t.id)! || (ms === mtimes.get(t.id)! && t.file >= previous.file))) continue;
     const provenance = probe.mirrored(t.file);
     if (provenance.mirrored || probe.bridge(t.file)) { excluded.add(t.id); continue; }
     const sessionCwd = provenance.recordedCwd;
     byId.set(t.id, { file: t.file, workspace: sessionCwd ? workspaceLabel(sessionCwd) : t.label, cwd: sessionCwd });
+    mtimes.set(t.id, ms);
   }
   const codexIds = new Set<string>();
   for (const source of codex) {

@@ -375,7 +375,7 @@ async function lookUpSsh(label: string, real: string, env: NodeJS.ProcessEnv, op
   }
   const printed = target === undefined ? { status: null } : await new Promise<{ status: number | null; stdout: string }>((resolve) => {
     execFileTool(real, ['-G', target], { env, timeout: Math.min(5000, opts.timeoutMs || 15000) }, (error, stdout) =>
-      resolve({ status: error ? (typeof error.code === 'number' ? error.code : null) : 0, stdout }));
+      resolve({ status: error ? (typeof error.code === 'number' ? error.code : null) : 0, stdout })).stdin?.end();
   });
   const extra = sshMuxOptions(printed);
   if (target !== undefined && printed.status === 0) sshDecided.set(key, { extra, at: Date.now() });

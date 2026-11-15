@@ -27,7 +27,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { createHash } from 'crypto';
 import {
-  syncInventory, parseSyncInventory, planSync, syncFamily, syncFamilies, neverRead, syncLocalPath, folderMapper, localUserName, sessionOf,
+  syncInventory, parseSyncInventory, planSync, syncFamily, syncFamilies, neverRead, syncLocalPath, folderMapper, localUserName, sessionOf, newestSyncTranscripts,
   CLAUDE_DEFAULT_RETENTION_DAYS, localSyncLabel, SYNC_HASH_MAX_BYTES, SYNC_TOMBSTONE_AHEAD_MS,
   type SyncInventory, type SyncNode, type SyncPlanItem, type SyncFamily, type SyncFile, type SyncPlacement, type SyncChannel,
   type SyncAskFailure, type SyncMachineStatus,
@@ -1909,8 +1909,13 @@ export async function syncFetchSession(transport: SyncTransport, session: string
   // A backup folder's copy of each machine it holds, tried after the machines themselves.
   const role = settings.backup?.kind === 'folder' ? resolveSyncBackup(settings.backup, { nodes: [], local: me }) : null;
   for (const n of role?.nodes ?? []) if (n.passive && n.inventory) index.push({ label: n.label, inventory: n.inventory, node: n });
-  const holds = (inv: SyncInventory): { fam: SyncFamily; f: SyncFile }[] => syncFamilies().flatMap((fam) =>
-    (inv.families[fam.id] ?? []).filter((f) => sessionOf(fam.id, f.name) === session).map((f) => ({ fam, f })));
+  const holds = (inv: SyncInventory): { fam: SyncFamily; f: SyncFile }[] => {
+    const selected = newestSyncTranscripts(inv.families.transcripts ?? []).get(session);
+    const folder = selected?.name.slice(0, selected.name.indexOf('/'));
+    return syncFamilies().flatMap((fam) => (inv.families[fam.id] ?? []).filter((f) => sessionOf(fam.id, f.name) === session &&
+      (fam.id !== 'transcripts' || f === selected) &&
+      (fam.id !== 'session-files' || !folder || f.name.startsWith(`${folder}/`))).map((f) => ({ fam, f })));
+  };
   const holders = index.filter((x) => holds(x.inventory).length);
   if (!holders.length) {
     if (role?.error) throw new Error(`no machine's inventory lists session ${session}, and the backup folder could not be read: ${role.error}`);
@@ -1945,6 +1950,7 @@ export async function syncFetchSession(transport: SyncTransport, session: string
         node = { label: x.label, local: false, status: 'ok', inventory: x.inventory, target: m.target, channel: (req) => transport.fetch(m.target, user, req) };
       }
       const mapFolder = folderMapper(me);
+      const localTranscript = newestSyncTranscripts(me.families.transcripts ?? []).get(session);
       const items: SyncPlanItem[] = [];
       for (const { fam, f } of holds(x.inventory)) {
         const origin = f.origin ?? x.inventory.host;
@@ -1965,6 +1971,8 @@ export async function syncFetchSession(transport: SyncTransport, session: string
         }
         const ownName = origin === me.host ? f.originName : undefined;
         if (ownName && fam.accepts(ownName)) to = ownName;
+        if (localTranscript && fam.id === 'transcripts') to = localTranscript.name;
+        if (localTranscript && fam.id === 'session-files') to = localTranscript.name.slice(0, localTranscript.name.indexOf('/')) + f.name.slice(f.name.indexOf('/'));
         if (!fam.accepts(to)) continue;
         const originName = f.origin ? f.originName : f.name;
         const mine = here.get(`${fam.id}\0${to}`);

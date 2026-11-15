@@ -50,7 +50,8 @@ case "$tool" in
     target=; last=
     for a in "$@"; do target="$last"; last="$a"; done
     [ -n "${FAKE_REMOTE_ROOT:-}" ] && FAKE_REMOTE_HOME="$FAKE_REMOTE_ROOT/${target##*@}"
+    if [ -n "${SSH_MANGLE_QUOTES:-}" ]; then last=$(printf '%s' "$last" | sed 's/[A-Za-z_][A-Za-z_0-9]*="[^"]*"//g'); fi
     cd "$FAKE_REMOTE_HOME" || exit 255
-    exec /usr/bin/env -i HOME="$FAKE_REMOTE_HOME" PATH=/usr/bin:/bin /bin/sh -c "$last" ;;
+    exec /usr/bin/env -i HOME="$FAKE_REMOTE_HOME" PATH="${FAKE_REMOTE_PATH:-/usr/bin:/bin}" /bin/sh -c "$last" ;;
 esac
 exit 0

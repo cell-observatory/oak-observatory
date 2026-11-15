@@ -1942,7 +1942,7 @@ function maybeInstallCodexHooksFromExtension(): string | null {
   try {
     const found = core.spawnToolSync(process.platform === 'win32' ? 'where' : 'which', ['codex'], { encoding: 'utf8' });
     if (found.status !== 0 || !String(found.stdout ?? '').trim()) return null;
-    const res = core.installCodexHooks(`oak capture --agent codex #${core.HOOK_MARKER}`, core.isOurCommand);
+    const res = core.installCodexHooks(core.captureHookCommand('codex'), core.isOurCommand);
     return res.hooksJson === 'unchanged'
       ? 'codex hooks: already installed.'
       : `codex hooks ${res.hooksJson} — run \`oak init --codex\` in a terminal to live-verify they fire (codex skips untrusted hooks silently).`;
@@ -1954,7 +1954,7 @@ function maybeInstallCodexHooksFromExtension(): string | null {
 /** Install the capture hooks into ~/.claude/settings.json (portable command), then offer a reload. */
 function installHooksFromExtension(): void {
   try {
-    const res = core.installHooks(`oak capture #${core.HOOK_MARKER}`);
+    const res = core.installHooks(core.captureHookCommand('claude'));
     if (res.ledgerError) {
       // The install itself succeeded; the RECORD of it did not — and ledger-wide uninstall can
       // only clean what the ledger knows. The CLI says this out loud; so does this surface.
@@ -2870,7 +2870,7 @@ export function shimScript(shim: string): string | null {
  *  refresh runs, and the bundle behind the launcher `oak machine add` writes (a sh script that execs
  *  ~/.local/lib/oak/index.js), as the CLI sees through it. Anything else spawns as before. Every
  *  spawn here asks Windows for no window. */
-function spawnOakDetached(args: string[]): void {
+function spawnOakDetached(args: string[], cwd?: string): void {
   try {
     const bin = resolveObservatoryBin();
     let target = bin;
@@ -2899,8 +2899,8 @@ function spawnOakDetached(args: string[]): void {
       }
     }
     const child = viaNode
-      ? core.spawnTool(process.execPath, [target, ...args], { detached: true, stdio: 'ignore', windowsHide: true, env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' } })
-      : core.spawnTool(bin, args, { detached: true, stdio: 'ignore', windowsHide: true });
+      ? core.spawnTool(process.execPath, [target, ...args], { cwd, detached: true, stdio: 'ignore', windowsHide: true, env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' } })
+      : core.spawnTool(bin, args, { cwd, detached: true, stdio: 'ignore', windowsHide: true });
     child.on('error', () => { /* a later refresh can retry when the CLI is available */ });
     child.unref();
   } catch {
@@ -9958,20 +9958,11 @@ class ChangeMapViewProvider implements vscode.WebviewViewProvider {
     const now = Date.now();
     if (now - this.warmedAt < 10 * 60_000 || core.noBackgroundChildren()) return; // at most once every ten minutes
     this.warmedAt = now;
-    try {
-      // Also `--root <cwd>`: same unquoted-concatenation defect as spawnCliJson above.
-      const child = core.spawnTool(resolveObservatoryBin(), ['warm', '--root', cwd, '--since', '24h'], {
-        cwd,
-        stdio: 'ignore',
-        detached: true,
-      });
-      child.on('error', () => {
-        /* no CLI on PATH — switching stays slow, which is the pre-0.9.0 behaviour, not a failure */
-      });
-      child.unref();
-    } catch {
-      /* best-effort by construction */
-    }
+    // Also `--root <cwd>`: same unquoted-concatenation defect as spawnCliJson above. Through spawnOakDetached, as the
+    // poll's refreshes go: Windows' `oak.cmd`, spawned detached, ran cmd.exe with no console, so the node it started
+    // opened a console window of its own for as long as the warm-up ran. With no CLI on PATH, switching stays slow,
+    // which is the pre-0.9.0 behaviour, not a failure.
+    spawnOakDetached(['warm', '--root', cwd, '--since', '24h'], cwd);
   }
 
   private spawnJson(args: string[], cwd: string, cb: (data: unknown | null, stderr?: string) => void): void {

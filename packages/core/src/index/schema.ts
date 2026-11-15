@@ -726,8 +726,8 @@ export const SCHEMA_VERSION = MIGRATIONS.length;
  *  re-derives every session's facts. A version, not a hash of the code: the CLI's bundle, the editor's and core's own
  *  build print the same function differently, and one index file shared by all three would be re-derived whole each
  *  time another of them read it. The file records the version its facts were derived by (`meta.ingest_version`). */
-// File paths start at the current worktree root; native child sessions keep their parent.
-export const INGEST_VERSION = 6;
+// A resumed Claude session uses its newest transcript and latest recorded cwd.
+export const INGEST_VERSION = 7;
 
 /** Bring a writable database to SCHEMA_VERSION, inside the caller's write transaction. Throws when the file was written
  *  by a newer OAK, which this one must not write: a newer schema, or facts derived by a newer INGEST_VERSION (deriving

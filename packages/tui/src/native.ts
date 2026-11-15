@@ -73,8 +73,29 @@ export function ptyBuildFix(platform: NodeJS.Platform = process.platform, env: N
   return `On Linux node-pty compiles from source: it needs ${tools}; missing here: ${missing.join(', ')}. Install them, then reinstall OAK (${how}). Meanwhile ${attach}.`;
 }
 
-/** Loading node-pty does not prove its spawn helper can execute. Never opens a user shell. */
-export async function diagnoseNativeSpawn(fix = false, opts: { timeoutMs?: number; packageDir?: string; bundle?: boolean } = {}): Promise<Check> {
+/** Why `__after-update` skips the PTY check, or null to run it. On Windows a session with no console of its own (an ssh
+ *  login, output piped away) starts ConPTY children that may never run: an update over ssh sat 12 minutes on one (Windows
+ *  report §2). `oak doctor` checks the PTY from a terminal. Elsewhere the check also restores the spawn-helper bit, so
+ *  it always runs. */
+export function ptyCheckSkipped(platform: NodeJS.Platform = process.platform, env: NodeJS.ProcessEnv = process.env, tty = !!process.stdout.isTTY): string | null {
+  if (platform !== 'win32') return null;
+  if (env.SSH_CONNECTION || env.SSH_CLIENT) return 'an ssh session';
+  return tty ? null : 'no interactive console';
+}
+
+/** The probe as `isolate` runs it: a node process of its own, which prints the echo's exit code and then ends itself,
+ *  since ConPTY's exit thread and output worker keep a process alive after its child has exited (microsoft/node-pty#887).
+ *  It never calls kill(): on Windows that runs node-pty's console-list helper, which ends every process on the console
+ *  of a pid it is given. */
+const ISOLATED_PROBE = `const [dir, file, args] = JSON.parse(process.argv[1]);
+const child = require(dir).spawn(file, args, { name: 'xterm', cols: 40, rows: 2, cwd: process.cwd(), env: process.env });
+child.onData(() => {});
+child.onExit((e) => process.stdout.write(String(e.exitCode), () => process.exit(0)));`;
+
+/** Loading node-pty does not prove its spawn helper can execute. Never opens a user shell. With `isolate` each attempt
+ *  runs in a short-lived child process with a hard timeout, after which that child's process tree, and nothing else, is
+ *  killed: a PTY that never finishes then cannot hold the caller open or reach its console. */
+export async function diagnoseNativeSpawn(fix = false, opts: { timeoutMs?: number; packageDir?: string; bundle?: boolean; isolate?: boolean } = {}): Promise<Check> {
   const row = { id: 'native-spawn', label: 'Native terminal PTY spawn' };
   let module: any;
   let packageDir = opts.packageDir;
@@ -88,7 +109,10 @@ export async function diagnoseNativeSpawn(fix = false, opts: { timeoutMs?: numbe
     return { ...row, level: 'warn', detail: `node-pty is not ${packageDir ? 'built' : 'installed'}, so OAK's herdr tab has no terminal here: ${cause}`,
       fix: ptyBuildFix(process.platform, process.env, packageDir, opts.bundle) };
   }
-  const probe = (): Promise<void> => new Promise((resolve, reject) => {
+  const windows = process.platform === 'win32';
+  const file = windows ? (process.env.ComSpec || 'cmd.exe') : '/bin/echo';
+  const args = windows ? ['/d', '/c', 'echo', 'oak-pty-check'] : ['oak-pty-check'];
+  const inProcess = (): Promise<void> => new Promise((resolve, reject) => {
     let child: any;
     let timer: NodeJS.Timeout | undefined;
     let settled = false;
@@ -100,15 +124,41 @@ export async function diagnoseNativeSpawn(fix = false, opts: { timeoutMs?: numbe
       else resolve();
     };
     try {
-      const windows = process.platform === 'win32';
-      child = module.spawn(windows ? (process.env.ComSpec || 'cmd.exe') : '/bin/echo',
-        windows ? ['/d', '/c', 'echo', 'oak-pty-check'] : ['oak-pty-check'],
-        { name: 'xterm', cols: 40, rows: 2, cwd: process.cwd(), env: process.env });
+      child = module.spawn(file, args, { name: 'xterm', cols: 40, rows: 2, cwd: process.cwd(), env: process.env });
       timer = setTimeout(() => finish(new Error('PTY spawn check timed out')), opts.timeoutMs ?? 3000);
       child.onData(() => {});
       child.onExit((event: { exitCode: number }) => finish(event.exitCode === 0 ? undefined : new Error(`PTY child exited ${event.exitCode}`)));
     } catch (error) { finish(error instanceof Error ? error : new Error(String(error))); }
   });
+  const isolated = (): Promise<void> => new Promise((resolve, reject) => {
+    const core = require('@oak-observatory/core') as typeof import('@oak-observatory/core');
+    const ms = opts.timeoutMs ?? 15000;
+    let out = '';
+    let err = '';
+    let settled = false;
+    // Its own process group on POSIX, so the timeout's kill reaches what it started; on Windows it shares no console
+    // (no stdio inherited, hidden), and taskkill /T ends only the tree under its pid.
+    const child = core.spawnTool(process.execPath, ['-e', ISOLATED_PROBE, JSON.stringify([packageDir, file, args])],
+      { stdio: ['ignore', 'pipe', 'pipe'], detached: !windows, env: process.env });
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) reject(error);
+      else resolve();
+    };
+    const timer = setTimeout(() => {
+      if (windows) core.spawnToolSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore' });
+      else try { process.kill(-child.pid!, 'SIGKILL'); } catch { /* already gone */ }
+      finish(new Error('PTY spawn check timed out'));
+    }, ms);
+    child.stdout!.on('data', (d) => { out += d; });
+    child.stderr!.on('data', (d) => { err += d; });
+    child.on('error', (error) => finish(error));
+    child.on('close', (code) => finish(out === '0' ? undefined : new Error(out ? `PTY child exited ${out}`
+      : `PTY check exited ${code}${err.trim() ? `: ${err.trim().split('\n').pop()}` : ''}`)));
+  });
+  const probe = opts.isolate ? isolated : inProcess;
   try { await probe(); return { ...row, level: 'ok', detail: 'node-pty spawned and completed the echo check' }; }
   catch (error) {
     const failure = String(error);

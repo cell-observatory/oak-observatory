@@ -405,7 +405,10 @@ test('derived facts: cached and uncached CLI payloads deeply equal for every fix
     // Ensure repo-scoped multitask actually includes this copied session. Keep every source record.
     fs.writeFileSync(f.file, JSON.stringify({ cwd: f.cwd }) + '\n');
     const src = fs.openSync(source, 'r'), dest = fs.openSync(f.file, 'a'), chunk = Buffer.alloc(65536);
-    try { let n; while ((n = fs.readSync(src, chunk, 0, chunk.length, null))) fs.writeSync(dest, chunk, 0, n); }
+    try {
+      let n; while ((n = fs.readSync(src, chunk, 0, chunk.length, null))) fs.writeSync(dest, chunk, 0, n);
+      fs.writeSync(dest, '\n' + JSON.stringify({ cwd: f.cwd }) + '\n'); // the copied fixture resumes in this workspace
+    }
     finally { fs.closeSync(src); fs.closeSync(dest); }
     const subs = path.join(core.projectDir(f.cwd), f.session, 'subagents');
     fs.rmSync(path.dirname(subs), { recursive: true, force: true });

@@ -17,7 +17,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { claudeConfigDir } from './paths';
-import { spawnToolSync, spawnTool, noBackgroundChildren } from './spawn';
+import { spawnToolSync, spawnTool, noBackgroundChildren, bashPath, HIDDEN_CONSOLE_LAUNCHER, type BashLookup } from './spawn';
 import { withFileMutation } from './store';
 import { rewriteStatuslineCache } from './statusline-lock';
 
@@ -379,6 +379,23 @@ export function dueMonthRefresh(claimMs = 5 * 60_000): boolean {
 }
 
 /**
+ * How kickMonthRefresh starts the script, or null when nothing here can run it. Elsewhere that is bash.
+ * On Windows it is Git Bash (bashPath; the bare name is the WSL launcher whenever WSL is on), and never
+ * detached itself: with no console, the MSYS2 runtime opens a hidden one with CREATE_NEW_CONSOLE, and a
+ * default terminal other than the console host shows it as a window. So a detached node runs
+ * HIDDEN_CONSOLE_LAUNCHER, which starts Git Bash with `windowsHide` and no `detached`: libuv passes
+ * CREATE_NO_WINDOW, and bash and every program the script runs share one console with no window. The
+ * launcher waits for bash, so the job libuv kills its children with closes only once the scan is done;
+ * detached, the launcher itself is outside the caller's job and outlives it. ELECTRON_RUN_AS_NODE makes
+ * an editor's runtime (VS Code's extension host) run the launcher as node.
+ */
+export function monthRefreshSpawn(script: string, opts: BashLookup = {}): { file: string; args: string[]; env?: NodeJS.ProcessEnv } | null {
+  if ((opts.platform ?? process.platform) !== 'win32') return { file: 'bash', args: [script] };
+  const bash = bashPath(opts);
+  return bash ? { file: process.execPath, args: ['-e', HIDDEN_CONSOLE_LAUNCHER, bash, script], env: { ...(opts.env ?? process.env), ELECTRON_RUN_AS_NODE: '1' } } : null;
+}
+
+/**
  * Kick the installed statusline (detached, throttled) to refresh the bill-cycle month cache, fed a
  * minimal payload. Called by every surface that shows usage but does not itself run the statusline —
  * the editors and the TUI read usage in-host, so without this a machine used only through them shows a
@@ -388,10 +405,12 @@ export function dueMonthRefresh(claimMs = 5 * 60_000): boolean {
 export function kickMonthRefresh(cwd: string): void {
   try {
     const script = path.join(claudeConfigDir(), 'statusline.sh');
-    if (noBackgroundChildren() || !fs.existsSync(script) || !dueMonthRefresh()) return;
+    if (noBackgroundChildren() || !fs.existsSync(script)) return;
+    const run = monthRefreshSpawn(script);
+    if (!run || !dueMonthRefresh()) return;
     // The payload names the workspace, not the process's directory: on Windows the process starts at
     // home, elsewhere in the caller's directory (see spawnTool).
-    const child = spawnTool('bash', [script], { detached: true, stdio: ['pipe', 'ignore', 'ignore'] });
+    const child = spawnTool(run.file, run.args, { detached: true, stdio: ['pipe', 'ignore', 'ignore'], ...(run.env ? { env: run.env } : {}) });
     try { child.stdin?.end(JSON.stringify({ cwd })); } catch { /* no stdin to write */ }
     child.unref();
   } catch { /* best-effort — the month stays stale until the next poll */ }
