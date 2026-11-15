@@ -15,9 +15,18 @@ the release notes.
   with the model and effort each CLI already uses, and `oak update` does the same on a machine with OAK's capture hooks.
   `oak agent setup --remove` takes it out and keeps it out of later updates; `oak agent setup` adds it back. A
   repository's own setup (`--project`) is still made only on request.
+- OAK installs herdr 0.9.5 (was 0.9.1). `oak update` and `oak doctor --fix` install it where the installed herdr is
+  older, and keep a newer one. A herdr server that is already running keeps the old binary until it restarts, as
+  OAK's warning after the install says; until then OAK reports that server incompatible instead of reading its
+  panes. A saved machine needs herdr 0.9.5 or newer as well (`oak doctor --fix` there installs it). herdr 0.9.2 and
+  later can add a Windows machine as a saved machine.
 
 ### Fixed
 
+- When `oak update` or `oak doctor --fix` reinstalls herdr's Codex integration, Codex keeps trusting the hooks it
+  trusted before. herdr 0.9.5 moves its own hook to the end of the list, and Codex records trust by position, so
+  the hooks that moved, OAK's capture hook among them, read as modified and stopped running. A hook that was not
+  trusted before is still not trusted.
 - `oak machine add` accepts Windows remotes running Git Bash, MSYS2 or Cygwin when herdr and OAK are already
   installed. It checks for herdr before rejecting an unsupported install platform, recognizes the Windows
   `herdr/herdr.exe` layout, and uses the installed OAK without copying a POSIX launcher.

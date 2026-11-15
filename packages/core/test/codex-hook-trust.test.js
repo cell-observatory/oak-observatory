@@ -162,6 +162,80 @@ test('Codex trust: repairs missing trust when herdr integration is already curre
   assert.ok(!fs.readFileSync(b.log, 'utf8').includes('integration install codex'));
 });
 
+// herdr 0.9.5 reinstalls its Codex hook by removing it and appending it as the LAST SessionStart group
+// (its config_edit.rs), so every group after it moves up one. Codex files trust by position: upgrading
+// herdr 0.9.1 to 0.9.5 through `oak doctor --fix` left OAK's own capture hook and herdr's hook
+// "modified" (live, Codex 0.166 hooks/list, 2026-11-15). Trust follows each moved hook.
+test('Codex trust: a hook that herdr\'s reinstall moves keeps its trust and its enabled switch; a never-trusted one gains nothing', POSIX, async t => {
+  // CRLF, as the config's first lines are: each table header must still be recognized to be replaced,
+  // whether another table follows the replaced one or the replaced one ends the file.
+  for (const replacedLast of [false, true]) {
+    const b = sandbox(t);
+    const file = path.join(b.codexDir, 'hooks.json');
+    const key = (g) => `${file}:session_start:${g}:0`;
+    const herdrHook = b.hooks.hooks.Stop[0].hooks[0];
+    const foreign = { type: 'command', command: 'bash never-trusted.sh' };
+    const before = { hooks: { SessionStart: [{ hooks: [herdrHook] }, { hooks: [command] }, { hooks: [foreign] }] } };
+    const after = { hooks: { SessionStart: [{ hooks: [command] }, { hooks: [foreign] }, { hooks: [herdrHook] }] } };
+    const hashAt = (layout, g) => codexHookTrustHash('SessionStart', layout.hooks.SessionStart[g], 0, 'linux');
+    fs.writeFileSync(file, JSON.stringify(before));
+    fs.writeFileSync(b.payload, JSON.stringify(after));
+    const replaced = `[hooks.state.${JSON.stringify(key(0))}]\r\ntrusted_hash = "${hashAt(before, 0)}"\r\nenabled = false\r\n`;
+    const kept = `[hooks.state.${JSON.stringify(key(1))}]\r\ntrusted_hash = "${hashAt(before, 1)}"\r\n`;
+    const original = `${b.original}\r\n${replacedLast ? `${kept}\r\n${replaced}` : `${replaced}\r\n${kept}`}`;
+    fs.writeFileSync(b.configFile, original);
+    const label = replacedLast ? 'replaced table last' : 'replaced table first';
+
+    const report = await ensureHerdr(b.options);
+    assert.equal(report.integrations.codex, 'installed', label);
+    assert.deepEqual(report.warnings, [], label);
+    const result = fs.readFileSync(b.configFile, 'utf8');
+    assert.ok(result.startsWith(b.original), `${label}: every byte outside the moved tables survives`);
+    const states = parseToml(result).hooks.state;
+    assert.deepEqual(states[key(0)], { trusted_hash: hashAt(after, 0) }, `${label}: OAK's hook is trusted where it now is, without the switch of the hook that sat there`);
+    assert.deepEqual(states[key(2)], { trusted_hash: hashAt(after, 2), enabled: false }, `${label}: herdr's hook keeps its trust and the switch the person turned off`);
+    assert.deepEqual(states[key(1)], { trusted_hash: hashAt(before, 1) }, `${label}: a hook never trusted is not trusted by moving; the table there is left as it was`);
+    for (const [k, v] of Object.entries(realStates)) assert.deepEqual(states[k], v, k);
+    assert.deepEqual(states.unrelated, { enabled: false });
+    assert.equal(backups(b).length, 1, label);
+    assert.equal(fs.readFileSync(path.join(b.codexDir, backups(b)[0]), 'utf8'), original, label);
+
+    b.env.OAK_TEST_CURRENT = 'yes';
+    const again = await ensureHerdr(b.options);
+    assert.equal(again.integrations.codex, 'current', label);
+    assert.deepEqual(again.warnings, [], label);
+    assert.equal(fs.readFileSync(b.configFile, 'utf8'), result, `${label}: a second run rewrites nothing`);
+    assert.equal(backups(b).length, 1, label);
+  }
+});
+
+test('Codex trust: when the trust cannot follow a moved hook, the reason is reported and herdr\'s hook is still trusted', POSIX, async t => {
+  const b = sandbox(t);
+  const file = path.join(b.codexDir, 'hooks.json');
+  const key = (g) => `${file}:session_start:${g}:0`;
+  const herdrHook = b.hooks.hooks.Stop[0].hooks[0];
+  const foreign = { type: 'command', command: 'bash never-trusted.sh' };
+  const before = { hooks: { SessionStart: [{ hooks: [herdrHook] }, { hooks: [command] }, { hooks: [foreign] }] } };
+  const after = { hooks: { SessionStart: [{ hooks: [command] }, { hooks: [foreign] }, { hooks: [herdrHook] }] } };
+  const hashAt = (layout, g) => codexHookTrustHash('SessionStart', layout.hooks.SessionStart[g], 0, 'linux');
+  fs.writeFileSync(file, JSON.stringify(before));
+  fs.writeFileSync(b.payload, JSON.stringify(after));
+  // The table OAK's hook moves into is spelled inline, which the carry does not remove, so it refuses
+  // to write a second definition.
+  const original = `model = "test"\n\n[hooks.state]\n${JSON.stringify(key(0))} = { trusted_hash = "${hashAt(before, 0)}" }\n\n` +
+    `[hooks.state.${JSON.stringify(key(1))}]\ntrusted_hash = "${hashAt(before, 1)}"\n`;
+  parseToml(original);
+  fs.writeFileSync(b.configFile, original);
+
+  const report = await ensureHerdr(b.options);
+  assert.equal(report.integrations.codex, 'installed');
+  assert.equal(report.warnings.length, 1, report.warnings.join('\n'));
+  assert.match(report.warnings[0], /^could not carry Codex's trust to the hooks herdr moved: Invalid TOML/);
+  const states = parseToml(fs.readFileSync(b.configFile, 'utf8')).hooks.state;
+  assert.deepEqual(states[key(2)], { trusted_hash: hashAt(after, 2) }, 'herdr\'s hook is trusted at its new position, as before the carry existed');
+  assert.deepEqual(states[key(0)], { trusted_hash: hashAt(before, 0) }, 'the table the carry could not replace is left as it was');
+});
+
 test('Codex trust: preserves existing disabled or stale states in any valid TOML spelling', async t => {
   for (const state of ['enabled = false', 'trusted_hash = "sha256:previous"', 'enabled = false, trusted_hash = "sha256:previous"']) {
     const b = sandbox(t);

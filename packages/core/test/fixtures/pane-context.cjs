@@ -23,7 +23,7 @@ if (!isMainThread) {
         if (workerData.scenario === 'tty') info.shell_pid = 2147483647;
         const error = workerData.scenario === 'stale' ? { code: 'pane_not_found', message: 'no such pane' } : null;
         const result = method === 'pane.process_info' ? { type: 'pane_process_info', process_info: info }
-          : method === 'session.snapshot' ? { type: 'session_snapshot', snapshot: { version: '0.9.1', protocol: 22, workspaces: [], tabs: [], panes: [], agents: [] } }
+          : method === 'session.snapshot' ? { type: 'session_snapshot', snapshot: { version: require('../../dist/herdr-lock').HERDR_LOCK.version, protocol: 22, workspaces: [], tabs: [], panes: [], agents: [] } }
           : { type: 'ok' };
         socket.end(JSON.stringify({ id, ...(error ? { error } : { result }) }) + '\n');
       };

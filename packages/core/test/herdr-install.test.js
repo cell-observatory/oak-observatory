@@ -18,7 +18,7 @@ const C = require('../dist');
 const parseToml = (text) => JSON.parse(JSON.stringify(require('smol-toml').parse(text)));
 
 const POSIX = { skip: process.platform === 'win32' && 'the fixture herdr is a POSIX shell script' };
-const PINNED = '0.9.1';
+const PINNED = C.HERDR_LOCK.version;
 
 /** A stand-in herdr: answers every verb `ensureHerdr` asks about, and appends each argv to a log. */
 function fakeHerdr({ version = PINNED, log, claude = 'not installed', codex = 'not installed', server = 'not running', linked = null, noAgent = null, stale = 'no', configCheck = 'ok', rejectKey = 'sidebar_min_width', statusError = '' }) {

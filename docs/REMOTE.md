@@ -139,16 +139,17 @@ the terminal app is already sending still arrives after it ends, as one sent fro
 prompt that has already reached the saved machine may still arrive in its pane. A reply that a JetBrains
 IDE is sending when it quits arrives if the IDE leaves `oak` running, and may not if the IDE stops the
 processes it started. At its deadline, OAK stops
-such a command with herdr's SSH, the SSH of a jump host included. On macOS and Linux, herdr's SSH gets the
-same exception as OAK's own: herdr 0.9.1 gives it no option about connection sharing, so where OAK's ssh to
-the saved machine's target would run with `ControlMaster=no`, herdr's does too. OAK runs herdr's SSH through a
-small `ssh` script that it puts first on the command's `PATH`, kept in the `herdr-ssh` directory of its
-store, which only you can write to. A reply the terminal app sends gets `ControlMaster=no` without OAK
-asking `ssh -G` first, so that it starts at once; it still uses a master that is already open. When OAK
-cannot put that script in place, or the store is on a `noexec` mount where it cannot run, herdr's SSH runs
-without `ControlMaster=no`, and `oak doctor` names the machine and why. herdr 0.9.2 and later give that SSH
-a connection of their own (`-S` and `ControlPersist`), whose master runs in the background, where no stop
-of OAK's reaches it: the script runs it as herdr asks, and `oak doctor` has nothing to name. A jump host's
+such a command with herdr's SSH, the SSH of a jump host included. On macOS and Linux, herdr 0.9.2 and later,
+which includes the version OAK installs, give herdr's SSH a connection of their own (`-S` and
+`ControlPersist`), whose master runs in the background, where no stop of OAK's reaches it. OAK runs herdr's
+SSH through a small `ssh` script that it puts first on the command's `PATH`, kept in the `herdr-ssh`
+directory of its store, which only you can write to, and the script runs such an SSH as herdr asks. An SSH
+of herdr's without a connection of its own, as herdr 0.9.1 ran every one, gets the same exception as OAK's
+own: where OAK's ssh to the saved machine's target would run with `ControlMaster=no`, herdr's does too. A
+reply the terminal app sends then gets `ControlMaster=no` without OAK asking `ssh -G` first, so that it
+starts at once; it still uses a master that is already open. When OAK cannot put that script in place, or
+the store is on a `noexec` mount where it cannot run, herdr's SSH runs without `ControlMaster=no`, and
+unless herdr is 0.9.2 or later, `oak doctor` names the machine and why. A jump host's
 own connection is outside this: with `ControlMaster` on and `ControlPersist` off for the jump host, the hop that ssh starts
 for `ProxyJump` becomes the master for it and ends with the ssh that started it, OAK's or any other,
 closing the sessions that share it. Set `ControlPersist` for the jump host to keep them. (On Windows, OAK

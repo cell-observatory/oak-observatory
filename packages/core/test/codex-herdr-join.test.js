@@ -220,7 +220,7 @@ test('Codex capture wire request through the real herdr CLI and a fake socket', 
       // herdr's CLI opens every invocation with a compatibility ping (id api-client:status) and
       // aborts with UnexpectedResult unless a server answers it as one; a blanket {type:'ok'}
       // fixture would make the report under test never leave the process.
-      const result = request.method === 'ping' ? { type: 'pong', version: '0.9.1', protocol: 22 }
+      const result = request.method === 'ping' ? { type: 'pong', version: require('../dist/herdr-lock').HERDR_LOCK.version, protocol: 22 }
         : request.method === 'pane.process_info' ? { type: 'pane_process_info', process_info: { pane_id: request.params.pane_id, shell_pid: process.pid } } : { type: 'ok' };
       socket.end(JSON.stringify({ id: request.id, result }) + '\n');
     });

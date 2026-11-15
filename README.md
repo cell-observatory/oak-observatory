@@ -191,7 +191,7 @@ after the two seconds OAK waits for the second, or before the next key you press
 command, and find anything); `?` lists every key from your own keymap.
 
 **herdr.** OAK uses **herdr** as its required terminal backend. **Install oak, get herdr**: the
-installers install the version pinned in `herdr.lock` (currently 0.9.1), verify its checksum, install
+installers install the version pinned in `herdr.lock` (currently 0.9.5), verify its checksum, install
 the Claude and Codex integrations, and link OAK’s herdr plugin. A newer installed herdr is preserved.
 Run `oak doctor --fix` to repair the backend, native terminal helper permissions, or an outdated OAK
 focus server. `oak doctor` also checks forwarding latency for saved machines, says why a saved machine

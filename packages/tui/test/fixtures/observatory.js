@@ -1,6 +1,6 @@
 // Small protocol-22 snapshots: local and remote pane ids deliberately overlap, and so do workspace ids,
 // which each machine labels its own way.
-const { backupFolderPath } = require('../../../core/dist');
+const { backupFolderPath, HERDR_LOCK } = require('../../../core/dist');
 const pane = (id, session, status, agent = 'claude', workspace = 'w1') => ({
   pane_id: id, tab_id: 'tab', workspace_id: workspace, terminal_id: id, revision: 1, focused: id === 'p1',
   agent, agent_status: status, title: session, cwd: '/workspace',
@@ -8,7 +8,7 @@ const pane = (id, session, status, agent = 'claude', workspace = 'w1') => ({
 });
 const workspaces = labels => Object.entries(labels).map(([id, label], i) => ({ workspace_id: id, label, number: i + 1,
   active_tab_id: 'tab', agent_status: 'unknown', focused: i === 0, pane_count: 1, tab_count: 1 }));
-const snapshot = (panes, labels = { w1: 'demo', w2: 'docs' }) => ({ protocol: 22, version: '0.9.1', panes,
+const snapshot = (panes, labels = { w1: 'demo', w2: 'docs' }) => ({ protocol: 22, version: HERDR_LOCK.version, panes,
   agents: panes.map(p => ({ ...p, name: p.agent_session.value })), workspaces: workspaces(labels), tabs: [], layouts: [] });
 function fixture() {
   const now = Date.parse('2026-09-18T14:01:00Z');

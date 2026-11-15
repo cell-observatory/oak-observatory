@@ -3823,7 +3823,7 @@ esac\nexit 0\n`, { mode: 0o755 });
           if (end < 0) return;
           const { id, method } = JSON.parse(buffer.slice(0, end));
           socket.end(JSON.stringify(method === 'session.snapshot'
-            ? { id, result: { type: 'session_snapshot', snapshot: { protocol: 22, version: '0.9.1', panes: [{ pane_id: 'pane1', agent_session: { value: S }, agent_status: 'idle' }] } } }
+            ? { id, result: { type: 'session_snapshot', snapshot: { protocol: 22, version: core.HERDR_LOCK.version, panes: [{ pane_id: 'pane1', agent_session: { value: S }, agent_status: 'idle' }] } } }
             : { id, error: { code: 'agent_blocked', message: 'a permission dialog is open in pane1' } }) + '\n');
         });
       });

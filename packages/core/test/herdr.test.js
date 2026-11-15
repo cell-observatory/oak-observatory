@@ -12,6 +12,7 @@ const { once } = require('node:events');
 const { Duplex } = require('node:stream');
 const ts = require('typescript');
 const core = require('../dist/herdr.js');
+const { HERDR_LOCK } = require('../dist/herdr-lock');
 const { generate } = require('../scripts/gen-herdr-types.js');
 const execFile = promisify(cp.execFile);
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -323,7 +324,7 @@ socketTest('herdr: agent helpers forward exact verbs and snapshot refuses incomp
   const box = sandbox(t);
   let protocol = 22;
   const fake = await fakeServer(t, box, ({ id, method }, socket) => success(socket, id,
-    method === 'session.snapshot' ? { type: 'session_snapshot', snapshot: { version: '0.9.1', protocol, panes: [] } } : { type: 'ok' }));
+    method === 'session.snapshot' ? { type: 'session_snapshot', snapshot: { version: HERDR_LOCK.version, protocol, panes: [] } } : { type: 'ok' }));
   for (const [helper, method, params] of [
     ['start', 'agent.start', { name: 'oak', kind: 'codex', pane_id: 'w1:p1' }],
     ['waitFor', 'agent.wait', { target: 'oak', until: ['idle'], timeout_ms: 50000 }],
@@ -1035,7 +1036,7 @@ test('herdr prompt handoff: match the live session, reject blocked and failed se
   memoryTransport(t, ({ id, method, params }, socket) => {
     requests.push({ method, params });
     if (method === 'session.snapshot') return socket.push(JSON.stringify({ id, result: {
-      type: 'session_snapshot', snapshot: { protocol: 22, version: '0.9.1', panes: [{ pane_id: 'pane1', agent_session: { value: 's1' }, agent_status: blocked ? 'blocked' : 'idle' }] }
+      type: 'session_snapshot', snapshot: { protocol: 22, version: HERDR_LOCK.version, panes: [{ pane_id: 'pane1', agent_session: { value: 's1' }, agent_status: blocked ? 'blocked' : 'idle' }] }
     } }) + '\n');
     if (fail) return socket.push(JSON.stringify({ id, error: { code: 'agent_blocked', message: 'permission pending' } }) + '\n');
     socket.push(JSON.stringify({ id, result: { type: 'agent_prompted' } }) + '\n');
@@ -1083,7 +1084,7 @@ test('herdr pane state: a Codex agent working with a question waiting reads as w
   memoryTransport(t, ({ id, method }, socket) => {
     requests.push(method);
     if (method === 'session.snapshot') return socket.push(JSON.stringify({ id, result: {
-      type: 'session_snapshot', snapshot: { protocol: 22, version: '0.9.1', panes: [{ pane_id: 'pane1', ...codex }] } } }) + '\n');
+      type: 'session_snapshot', snapshot: { protocol: 22, version: HERDR_LOCK.version, panes: [{ pane_id: 'pane1', ...codex }] } } }) + '\n');
     socket.push(JSON.stringify({ id, result: { type: 'agent_prompted' } }) + '\n');
   });
   const result = await core.promptSession('s1', 'my answer', { socketPath: '/tmp/memory-only.sock' });
@@ -1193,7 +1194,7 @@ test('herdr prompt handoff: remote forwarding preserves text arguments and unava
     calls.push(argv);
     // A saved machine's command: apart from the terminal, and its ssh refuses askpass (see the fake-binary test).
     assert.deepEqual([options.detached, options.env.SSH_ASKPASS_REQUIRE], [true, 'never']);
-    const value = argv.includes('snapshot') ? { snapshot: { version: '0.9.1', protocol: 22, panes: found ? [{ pane_id: 'remote-pane', agent_session: { value: 's1' }, agent_status: 'idle' }] : [] } } : { ok: true };
+    const value = argv.includes('snapshot') ? { snapshot: { version: HERDR_LOCK.version, protocol: 22, panes: found ? [{ pane_id: 'remote-pane', agent_session: { value: 's1' }, agent_status: 'idle' }] : [] } } : { ok: true };
     queueMicrotask(() => callback(null, JSON.stringify(value), ''));
     return { on() {} };
   });
@@ -1225,7 +1226,7 @@ test('herdr prompt handoff: forwarded commands get the remote budget, and a time
       queueMicrotask(() => callback(Object.assign(new Error('killed'), { killed: true, signal: 'SIGTERM' }), '', ''));
       return { on() {} };
     }
-    const value = argv.includes('snapshot') ? { snapshot: { version: '0.9.1', protocol: 22, panes: [{ pane_id: 'remote-pane', agent_session: { value: 's1' }, agent_status: 'idle' }] } } : { ok: true };
+    const value = argv.includes('snapshot') ? { snapshot: { version: HERDR_LOCK.version, protocol: 22, panes: [{ pane_id: 'remote-pane', agent_session: { value: 's1' }, agent_status: 'idle' }] } } : { ok: true };
     queueMicrotask(() => callback(null, JSON.stringify(value), ''));
     return { on() {} };
   });
@@ -1250,7 +1251,7 @@ test('herdr prompt handoff: forwarded commands get the remote budget, and a time
 });
 
 test('herdr regression: CLI snapshot envelopes share validation and remote prompt decoding', async t => {
-  const snapshot = { version: '0.9.1', protocol: 22, panes: [{ pane_id: 'p1', agent_session: { value: 'fixture-session' }, agent_status: 'idle' }], agents: [] };
+  const snapshot = { version: HERDR_LOCK.version, protocol: 22, panes: [{ pane_id: 'p1', agent_session: { value: 'fixture-session' }, agent_status: 'idle' }], agents: [] };
   const envelope = { id: 'cli:api:snapshot', result: { type: 'session_snapshot', snapshot } };
   const calls = [];
   t.mock.method(require('../dist/spawn'), 'execFileTool', (_binary, argv, _options, callback) => {
@@ -1311,7 +1312,7 @@ test('herdr regression: fake binary receives prompt as one positional including 
   const log = path.join(box.dir, 'argv');
   fs.writeFileSync(binary, `#!/bin/sh
 if [ "$3" = api ]; then
-  printf '%s\\n' '{"id":"snapshot","result":{"type":"session_snapshot","snapshot":{"version":"0.9.1","protocol":22,"panes":[{"pane_id":"p1","agent_session":{"value":"fixture-session"},"agent_status":"idle"}],"agents":[]}}}'
+  printf '%s\\n' '{"id":"snapshot","result":{"type":"session_snapshot","snapshot":{"version":"${HERDR_LOCK.version}","protocol":22,"panes":[{"pane_id":"p1","agent_session":{"value":"fixture-session"},"agent_status":"idle"}],"agents":[]}}}'
 else
   printf '%s\\0' "$@" > "$ARGV_LOG"
   printf '%s\\n' '{"result":{"type":"ok"}}'
@@ -1353,7 +1354,7 @@ test('herdr new sessions: protocol gate, create terminal, start agent; failure l
   let fail = false;
   memoryTransport(t, ({ id, method, params }, socket) => {
     requests.push({ method, params });
-    const result = method === 'session.snapshot' ? { type: 'session_snapshot', snapshot: { protocol: 22, version: '0.9.1', panes: [] } }
+    const result = method === 'session.snapshot' ? { type: 'session_snapshot', snapshot: { protocol: 22, version: HERDR_LOCK.version, panes: [] } }
       : method === 'tab.create' ? { type: 'tab_created', root_pane: { pane_id: 'p1' } } : { type: 'agent_started' };
     socket.push(JSON.stringify(method === 'agent.start' && fail ? { id, error: { code: 'launch_failed', message: 'no binary' } } : { id, result }) + '\n');
   });

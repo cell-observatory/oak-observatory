@@ -1,18 +1,18 @@
 {
-  "version": "0.9.1",
+  "version": "0.9.5",
   "protocol": 22,
   "assets": {
-    "linux-x86_64": "https://github.com/herdrdev/herdr/releases/download/v0.9.1/herdr-linux-x86_64",
-    "linux-aarch64": "https://github.com/herdrdev/herdr/releases/download/v0.9.1/herdr-linux-aarch64",
-    "macos-x86_64": "https://github.com/herdrdev/herdr/releases/download/v0.9.1/herdr-macos-x86_64",
-    "macos-aarch64": "https://github.com/herdrdev/herdr/releases/download/v0.9.1/herdr-macos-aarch64",
-    "windows-x86_64": "https://github.com/herdrdev/herdr/releases/download/v0.9.1/herdr-windows-x86_64.zip"
+    "linux-x86_64": "https://github.com/herdrdev/herdr/releases/download/v0.9.5/herdr-linux-x86_64",
+    "linux-aarch64": "https://github.com/herdrdev/herdr/releases/download/v0.9.5/herdr-linux-aarch64",
+    "macos-x86_64": "https://github.com/herdrdev/herdr/releases/download/v0.9.5/herdr-macos-x86_64",
+    "macos-aarch64": "https://github.com/herdrdev/herdr/releases/download/v0.9.5/herdr-macos-aarch64",
+    "windows-x86_64": "https://github.com/herdrdev/herdr/releases/download/v0.9.5/herdr-windows-x86_64.zip"
   },
   "sha256": {
-    "linux-x86_64": "2a02fed16beb651ef006e1d43f048f652ca4dc58ad053cd2d44450563d5c54b7",
-    "linux-aarch64": "f4ccf4de745f2cb9a39a983e9ba3703dad50ec2a58dea83026ceab721bbd8d9e",
-    "macos-x86_64": "053be0639935fe54ab5efbdb46651054e4f6a753a5b43153c88bd6912bce1e94",
-    "macos-aarch64": "5fc7a7e7adfaca56fa80aa89dcb025693357268dab8285b9ce2d08a2313c89de",
-    "windows-x86_64": "04ce380cac5af27bfcf75d0951ac49b7afe4c984aee8852985806d4f71f93a6e"
+    "linux-x86_64": "14d9e8bc8b4a9e0118d77c32266f76d461f09b40342eb23752960bd89f59929d",
+    "linux-aarch64": "17d7536f2da50859523680ef279dffcac8e4a235f4e46fe8da6c2ec44141897c",
+    "macos-x86_64": "5fb0a908ec7f6745e3e245738b06bfad56c46391c391ab3c0955fbead01f1369",
+    "macos-aarch64": "fb77c2232a05a8035421382c894392f4174e4e38a18e48af3dd0290157c3a7e2",
+    "windows-x86_64": "d2c6c9c971c43a0bfdde8c692a9a1a7a45c3e4807cd01ae45662b4734fac1cbf"
   }
 }
