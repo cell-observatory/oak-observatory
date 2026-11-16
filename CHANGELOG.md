@@ -23,6 +23,10 @@ the release notes.
 
 ### Fixed
 
+- On Windows, `oak update` and `oak doctor --fix` upgrade herdr while its server is running. Windows does not let a
+  running herdr.exe be replaced, so the old one stayed in place and the update still reported it as installed. OAK
+  now moves the old herdr.exe aside and deletes it on a later run, once nothing runs it. An install that still leaves
+  an older herdr reports a failure. The warning to add herdr's folder to PATH now appears only when it is missing.
 - When `oak update` or `oak doctor --fix` reinstalls herdr's Codex integration, Codex keeps trusting the hooks it
   trusted before. herdr 0.9.5 moves its own hook to the end of the list, and Codex records trust by position, so
   the hooks that moved, OAK's capture hook among them, read as modified and stopped running. A hook that was not

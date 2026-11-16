@@ -310,6 +310,16 @@ export function findHerdrBin(opts: { home?: string; platform?: NodeJS.Platform; 
   return executable(mine, platform) ? mine : null;
 }
 
+/** Delete the herdr.exe copies an upgrade moved aside (see ensureHerdr). Windows refuses to delete one
+ *  that is still running, so that copy stays until a later run. */
+function removeOldHerdrExes(dir: string): void {
+  let names: string[];
+  try { names = fs.readdirSync(dir); } catch { return; }
+  for (const name of names) {
+    if (/^herdr\.exe\.old-\d+$/.test(name)) try { fs.unlinkSync(path.join(dir, name)); } catch { /* still running */ }
+  }
+}
+
 /** `herdr 0.9.1` → `0.9.1`. Null when the binary did not answer (missing, or not herdr at all). */
 export function parseHerdrVersion(out: string): string | null {
   const m = /herdr\s+v?(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.+-]+)?)/i.exec(out);
@@ -406,6 +416,7 @@ export async function ensureHerdr(opts: EnsureHerdrOptions = {}): Promise<HerdrR
   };
 
   // --- the binary -------------------------------------------------------------------------------
+  if (platform === 'win32') removeOldHerdrExes(path.dirname(herdrInstallPath(home, platform)));
   let bin = findHerdrBin({ home, platform, env });
   let version = bin ? parseHerdrVersion(run(bin, ['--version']).stdout) : null;
   if (bin && !version) {
@@ -440,6 +451,18 @@ export async function ensureHerdr(opts: EnsureHerdrOptions = {}): Promise<HerdrR
       // in a Windows user name cannot rewrite the command.
       const dir = path.dirname(dest);
       fs.mkdirSync(dir, { recursive: true });
+      // Windows will not overwrite an .exe that is running, and a running herdr server runs herdr.exe:
+      // Expand-Archive left the old one in place and still exited 0. Windows does allow renaming it, so
+      // the old copy moves aside first (removeOldHerdrExes deletes it once nothing runs it) and comes
+      // back if the archive brings no herdr.exe.
+      const aside = `${dest}.old-${Date.now()}`;
+      let moved = false;
+      try {
+        fs.renameSync(dest, aside);
+        moved = true;
+      } catch {
+        /* nothing installed yet, or the rename was refused: the version check below catches an old copy */
+      }
       const r = spawnToolSync(
         'powershell.exe',
         ['-NoProfile', '-Command', 'Expand-Archive -LiteralPath $env:OAK_ZIP -DestinationPath $env:OAK_DEST -Force'],
@@ -450,11 +473,17 @@ export async function ensureHerdr(opts: EnsureHerdrOptions = {}): Promise<HerdrR
       } catch {
         /* the zip is scratch; a leftover is not worth failing the install over */
       }
+      if (moved && !fs.existsSync(dest)) {
+        try { fs.renameSync(aside, dest); } catch { /* reported below: no herdr.exe answers */ }
+      }
       if (r.status !== 0) {
         const detail = String(r.stderr || r.error?.message || '').trim();
         throw new Error(`could not expand the herdr archive into ${dir} (Expand-Archive exited ${r.status ?? '?'})${detail ? `: ${detail}` : ''}`);
       }
-      report.warnings.push(`add ${dir} to PATH so \`herdr\` resolves in your shell`);
+      // Windows paths ignore case.
+      if (!pathDirs(env).some(d => path.resolve(d).toLowerCase() === path.resolve(dir).toLowerCase())) {
+        report.warnings.push(`add ${dir} to PATH so \`herdr\` resolves in your shell`);
+      }
     } else {
       installBinary(tmp, dest);
       if (!pathDirs(env).some(dir => path.resolve(dir) === path.resolve(path.dirname(dest)))) {
@@ -463,6 +492,11 @@ export async function ensureHerdr(opts: EnsureHerdrOptions = {}): Promise<HerdrR
     }
     bin = dest;
     version = parseHerdrVersion(run(bin, ['--version']).stdout);
+    // An install that leaves an older herdr in place is a failure, never "installed".
+    if (version && compareVersions(version, lock.version) < 0) {
+      throw new Error(`herdr ${lock.version} did not install: ${bin} still reports ${version}` +
+        (platform === 'win32' ? '; if a herdr server is running, stop it first (`herdr server stop`)' : ''));
+    }
     report.upgraded = true;
     // We install where herdr's own tooling looks (`~/.local/bin/herdr`), which is NOT necessarily
     // where this shell resolves `herdr`: an older copy in /usr/local/bin or a package manager's dir
