@@ -7,6 +7,7 @@ const fs = require('node:fs');
 const net = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
+const { HERDR_LOCK } = require('../dist/herdr-lock');
 
 async function fakeHerdr(t, handlers) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oak-fake-herdr-'));
@@ -18,7 +19,7 @@ async function fakeHerdr(t, handlers) {
   handlers = { 'pane.process_info': ({ pane_id }) => ({ type: 'pane_process_info', process_info: { pane_id, shell_pid: process.pid } }),
     'session.snapshot': () => {
     if (!fake.snapshot) throw Object.assign(new Error('unscripted session.snapshot'), { code: 'unknown_method' });
-    return { type: 'session_snapshot', snapshot: { version: '0.9.1', protocol: 22, workspaces: [], tabs: [], panes: [], agents: [], ...fake.snapshot } };
+    return { type: 'session_snapshot', snapshot: { version: HERDR_LOCK.version, protocol: 22, workspaces: [], tabs: [], panes: [], agents: [], ...fake.snapshot } };
   }, ...handlers };
   const server = net.createServer(socket => {
     let buffer = '';

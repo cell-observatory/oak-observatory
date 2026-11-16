@@ -32,7 +32,7 @@ import { isDeepStrictEqual } from 'util';
 import { spawnTool, spawnToolSync } from './spawn';
 import { compareVersions } from './semver';
 import { HERDR_LOCK } from './herdr-lock';
-import { trustHerdrCodexHook } from './codex-hook-trust';
+import { carryCodexHookTrust, trustHerdrCodexHook, trustedCodexHooks } from './codex-hook-trust';
 // smol-toml's CJS runtime is also used by codex.ts; its declarations are ESM.
 const { parse: parseToml } = require('smol-toml') as { parse(text: string): Record<string, any> };
 
@@ -487,6 +487,8 @@ export async function ensureHerdr(opts: EnsureHerdrOptions = {}): Promise<HerdrR
   // idempotent installer turns into a settings-file churn machine.
   const wanted = opts.integrations ?? ['claude', 'codex'];
   const states = integrationStates(run(bin, ['integration', 'status']).stdout);
+  const codexDir = env.CODEX_HOME?.trim() ? env.CODEX_HOME : path.join(home, '.codex');
+  let codexTrust: Map<string, boolean | undefined> | undefined;
   for (const target of wanted) {
     const state = states[target];
     if (state === undefined) {
@@ -498,6 +500,9 @@ export async function ensureHerdr(opts: EnsureHerdrOptions = {}): Promise<HerdrR
       report.integrations[target] = 'current';
       continue;
     }
+    // herdr moves its Codex hooks to the end on a reinstall, so note what Codex trusts first: the
+    // trust then follows each moved hook (below). A config this cannot read is reported there.
+    if (target === 'codex') try { codexTrust = trustedCodexHooks(codexDir, platform); } catch { /* reported below */ }
     const r = run(bin, ['integration', 'install', target]);
     if (r.status === 0) {
       report.integrations[target] = 'installed';
@@ -519,8 +524,15 @@ export async function ensureHerdr(opts: EnsureHerdrOptions = {}): Promise<HerdrR
 
   // Also repair trust for an integration installed before OAK learned Codex's per-hook trust format.
   if (report.integrations.codex === 'installed' || report.integrations.codex === 'current') {
+    if (report.integrations.codex === 'installed' && codexTrust) {
+      try {
+        carryCodexHookTrust(codexDir, codexTrust, platform);
+      } catch (error) {
+        report.warnings.push(`could not carry Codex's trust to the hooks herdr moved: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
     try {
-      trustHerdrCodexHook(env.CODEX_HOME?.trim() ? env.CODEX_HOME : path.join(home, '.codex'), platform);
+      trustHerdrCodexHook(codexDir, platform);
     } catch (error) {
       report.warnings.push(`could not trust herdr's Codex hook: ${error instanceof Error ? error.message : String(error)}`);
     }

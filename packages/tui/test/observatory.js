@@ -3085,7 +3085,7 @@ test('herdr tab titles: the app\'s pass leaves alone a tab its session\'s own sy
   const passes = [];
   const state = { session: S, views: { sessions: { sessions: [] } }, observatory: { machines: [{ id: 'local', label: 'laptop', local: true }], details: {} } };
   const fake = { ...core, findHerdrBin: () => '/herdr', herdrSocketPath: () => herdr.socketPath, resolveMonitor: () => null,
-    herdrSnapshot: async () => ({ version: '0.9.1', protocol: 22, layouts: [], ...JSON.parse(JSON.stringify(server)) }),
+    herdrSnapshot: async () => ({ version: core.HERDR_LOCK.version, protocol: 22, layouts: [], ...JSON.parse(JSON.stringify(server)) }),
     herdrRequest: (method, params, o) => core.herdrRequest(method, params, { ...o, ...options }),
     herdrSubscribe: () => ({ close() {} }), herdrMachines: async () => [], readHerdrPaneLink: () => null, observatoryRoots: () => [],
     ensureHerdrTabs: async opts => { const done = await core.ensureHerdrTabs(opts); passes.push(opts.listedAt); return done; } };
@@ -3232,7 +3232,7 @@ test('oak tui --once: a saved machine\'s pinned session reads its previews in on
   fs.writeFileSync(path.join(bin, 'herdr'), `#!${process.execPath}
 const argv = process.argv.slice(2);
 if (argv.join(' ') === 'machine list --json') process.stdout.write(${JSON.stringify(JSON.stringify([{ id: 'm1', label: 'build-box', target: 'builder@build-box.example', session: 'default', enabled: true, selected: false }]))});
-else if (argv[0] === '--machine') process.stdout.write('{"result":{"snapshot":{"version":"0.9.1","protocol":22,"panes":[],"agents":[],"workspaces":[],"tabs":[]}}}');
+else if (argv[0] === '--machine') process.stdout.write('{"result":{"snapshot":{"version":"${core.HERDR_LOCK.version}","protocol":22,"panes":[],"agents":[],"workspaces":[],"tabs":[]}}}');
 `, { mode: 0o755 });
   // The remote's oak: this build, and one line per run of what it was asked and how many bytes it answered.
   fs.writeFileSync(path.join(remote, '.local', 'bin', 'oak'), `#!${process.execPath}

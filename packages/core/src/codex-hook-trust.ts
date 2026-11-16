@@ -182,24 +182,108 @@ export function trustHerdrCodexHook(codexDir: string, platform: NodeJS.Platform 
     // Validate without reserializing: comments, whitespace and every existing byte stay untouched.
     const candidate = config + addition;
     parseToml(candidate);
-    if (original !== undefined) {
-      const backup = `${configFile}.oak-hook-trust-${Date.now()}-${crypto.randomBytes(4).toString('hex')}.bak`;
-      fs.copyFileSync(configFile, backup, fs.constants.COPYFILE_EXCL);
-    }
-    // The refusal now covers the whole window, backup included: a writer obeying no lock still never
-    // gets bytes appended after its change. Publication is one rename, so no reader sees a half file.
-    if (readOptional(configFile) !== original || readOptional(hooksFile) !== currentHooks) {
-      throw new Error('Codex configuration changed while preparing herdr hook trust; retry the install');
-    }
-    let mode = 0o600;
-    try { if (original !== undefined) mode = fs.statSync(configFile).mode & 0o777; } catch { /* keep it private */ }
-    const tmp = `${configFile}.oak-trust-publish-${process.pid}-${crypto.randomBytes(4).toString('hex')}.tmp`;
-    try {
-      fs.writeFileSync(tmp, candidate, { encoding: 'utf8', mode, flag: 'wx' });
-      fs.renameSync(tmp, configFile);
-    } finally {
-      try { fs.rmSync(tmp, { force: true }); } catch { /* already renamed */ }
-    }
+    publish(configFile, original, hooksFile, currentHooks, candidate);
     return missing.length;
+  });
+}
+
+/** Back up, re-check and atomically replace config.toml; called inside withConfigLock. */
+function publish(configFile: string, original: string | undefined, hooksFile: string, currentHooks: string, candidate: string): void {
+  if (original !== undefined) {
+    const backup = `${configFile}.oak-hook-trust-${Date.now()}-${crypto.randomBytes(4).toString('hex')}.bak`;
+    fs.copyFileSync(configFile, backup, fs.constants.COPYFILE_EXCL);
+  }
+  // The refusal now covers the whole window, backup included: a writer obeying no lock still never
+  // gets bytes appended after its change. Publication is one rename, so no reader sees a half file.
+  if (readOptional(configFile) !== original || readOptional(hooksFile) !== currentHooks) {
+    throw new Error('Codex configuration changed while preparing herdr hook trust; retry the install');
+  }
+  let mode = 0o600;
+  try { if (original !== undefined) mode = fs.statSync(configFile).mode & 0o777; } catch { /* keep it private */ }
+  const tmp = `${configFile}.oak-trust-publish-${process.pid}-${crypto.randomBytes(4).toString('hex')}.tmp`;
+  try {
+    fs.writeFileSync(tmp, candidate, { encoding: 'utf8', mode, flag: 'wx' });
+    fs.renameSync(tmp, configFile);
+  } finally {
+    try { fs.rmSync(tmp, { force: true }); } catch { /* already renamed */ }
+  }
+}
+
+/** Every command hook in hooks.json Codex can fingerprint, with the state key it files the trust under. */
+function codexHookPositions(hooksFile: string, hooksText: string, platform: NodeJS.Platform): { key: string; hash: string }[] {
+  const positions: { key: string; hash: string }[] = [];
+  for (const [event, groups] of Object.entries(JSON.parse(hooksText).hooks ?? {})) {
+    if (!Array.isArray(groups)) continue;
+    groups.forEach((group: CodexHookGroup, groupIndex) => (Array.isArray(group?.hooks) ? group.hooks : []).forEach((_, handlerIndex) => {
+      let hash: string;
+      try { hash = codexHookTrustHash(event, group, handlerIndex, platform); } catch { return; /* not a hook Codex trusts by hash */ }
+      positions.push({ key: `${hooksFile}:${event.replace(/([a-z])([A-Z])/g, '$1_$2').toLowerCase()}:${groupIndex}:${handlerIndex}`, hash });
+    }));
+  }
+  return positions;
+}
+
+/** The hooks Codex trusts right now, by trust hash, each with its table's `enabled` switch. Taken just
+ * before `herdr integration install codex`, for carryCodexHookTrust after it. */
+export function trustedCodexHooks(codexDir: string, platform: NodeJS.Platform = process.platform): Map<string, boolean | undefined> {
+  const hooksFile = path.resolve(codexDir, 'hooks.json');
+  const hooksText = readOptional(hooksFile);
+  const config = hooksText === undefined ? undefined : readOptional(path.join(path.dirname(hooksFile), 'config.toml'));
+  const trusted = new Map<string, boolean | undefined>();
+  if (hooksText === undefined || config === undefined) return trusted;
+  const { parse: parseToml } = require('smol-toml') as { parse(text: string): Record<string, any> };
+  const states = parseToml(config).hooks?.state ?? {};
+  for (const { key, hash } of codexHookPositions(hooksFile, hooksText, platform)) {
+    if (states[key]?.trusted_hash === hash) trusted.set(hash, typeof states[key].enabled === 'boolean' ? states[key].enabled : undefined);
+  }
+  return trusted;
+}
+
+/** herdr reinstalls its Codex hooks by removing them and appending them at the END of each event
+ * (0.9.5's config_edit.rs), so every group after one of herdr's moves, and Codex files trust by
+ * position: a moved hook reads as modified and stops running, OAK's own capture hook included. Trust
+ * follows the hook: a hook trusted before the install (`before`, from trustedCodexHooks) whose new
+ * position holds no trust for it gets its trust and `enabled` there; the table that position held is
+ * replaced. A hook that was not trusted before gains nothing. Returns the number of tables written. */
+export function carryCodexHookTrust(codexDir: string, before: Map<string, boolean | undefined>, platform: NodeJS.Platform = process.platform): number {
+  if (!before.size) return 0;
+  const hooksFile = path.resolve(codexDir, 'hooks.json');
+  const configFile = path.join(path.dirname(hooksFile), 'config.toml');
+  return withConfigLock(configFile, () => {
+    const currentHooks = readOptional(hooksFile);
+    const original = readOptional(configFile);
+    if (currentHooks === undefined || original === undefined) return 0;
+    const { parse: parseToml } = require('smol-toml') as { parse(text: string): Record<string, any> };
+    const states = parseToml(original).hooks?.state ?? {};
+    const moved = codexHookPositions(hooksFile, currentHooks, platform)
+      .filter(({ key, hash }) => before.has(hash) && states[key]?.trusted_hash !== hash);
+    if (!moved.length) return 0;
+    // Drop each replaced table, header through the line before the next header; every other byte stays.
+    const keys = new Set(moved.map(({ key }) => key));
+    const tableKey = (line: string): string | undefined => {
+      try {
+        const state = parseToml(line).hooks?.state ?? {};
+        const names = Object.keys(state);
+        return names.length === 1 && !Object.keys(state[names[0]]).length ? names[0] : undefined;
+      } catch { return undefined; }
+    };
+    const bom = original.startsWith('\uFEFF') ? '\uFEFF' : '';
+    let skipping = false;
+    // Each line keeps its own ending (LF or CRLF), so the kept lines rejoin byte-exact.
+    const kept = original.slice(bom.length).split(/(?<=\n)/).filter(line => {
+      if (/^\s*\[/.test(line)) skipping = keys.has(tableKey(line) as string);
+      return !skipping;
+    });
+    const eol = original.includes('\r\n') ? '\r\n' : '\n';
+    const addition = eol + moved.map(({ key, hash }) =>
+      `[hooks.state.${JSON.stringify(key).replace(/\u007f/g, '\\u007f')}]${eol}trusted_hash = "${hash}"${eol}` +
+      (typeof before.get(hash) === 'boolean' ? `enabled = ${before.get(hash)}${eol}` : '')
+    ).join(eol);
+    // A table spelled some other way (inline, dotted) is not removed above, so this parse refuses the
+    // duplicate and nothing is written.
+    const candidate = bom + kept.join('') + addition;
+    parseToml(candidate);
+    publish(configFile, original, hooksFile, currentHooks, candidate);
+    return moved.length;
   });
 }

@@ -45,8 +45,8 @@ case "$tool" in
     case "$last" in
       *"oak-shell-ok"*) echo oak-shell-ok ;;
       *"uname -s"*) printf '%b\n' "${SSH_FAKE_UNAME:-Linux\nx86_64}" ;;
-      *"herdr --version"*) printf 'herdr %s\n' "${SSH_FAKE_HERDR:-0.9.1}" ;;
-      *'"$f" --version'*) printf 'herdr %s\n' "${HERDR_FAKE_VERSION:-0.9.1}" ;;
+      *"herdr --version"*) printf 'herdr %s\n' "${SSH_FAKE_HERDR:-0.9.5}" ;;
+      *'"$f" --version'*) printf 'herdr %s\n' "${HERDR_FAKE_VERSION:-0.9.5}" ;;
       *"node --version"*) printf '%s\n' "${SSH_FAKE_NODE:-v24.18.0}" ;;
       *"oak --version"*) printf 'oak 0.0.0\n' ;;
     esac

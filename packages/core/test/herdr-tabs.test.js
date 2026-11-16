@@ -11,6 +11,7 @@ const { reconcileHerdrTabs, ensureHerdrTabs, paneForeground, BTOP_LABEL, MONITOR
 // The driver's transport: core's own, pointed at the scripted server below by `herdrOptions`.
 const transport = require('../dist/herdr');
 const { fakeHerdr, processInfo, scripted } = require('./fake-herdr');
+const { HERDR_LOCK } = require('../dist/herdr-lock');
 
 // A snapshot with one workspace, its tabs, panes and joined agents.
 const snap = (tabs, panes = [], agents = [], workspaces) => ({ tabs, panes, agents, ...(workspaces ? { workspaces } : {}) });
@@ -445,7 +446,7 @@ test('herdr tabs driver: two OAKs reconciling one server at once make one btop t
   let made = 0;
   const herdr = await fakeHerdr(t, {
     // The server as it is NOW: a tab one OAK made is there when the other asks.
-    'session.snapshot': () => ({ type: 'session_snapshot', snapshot: { version: '0.9.1', protocol: 22, ...homeSnap(tabs, [pane(1, 1)]) } }),
+    'session.snapshot': () => ({ type: 'session_snapshot', snapshot: { version: HERDR_LOCK.version, protocol: 22, ...homeSnap(tabs, [pane(1, 1)]) } }),
     'tab.create': () => {
       made++;
       tabs.push(tab(8 + made, BTOP_LABEL));
@@ -501,7 +502,7 @@ test('herdr tabs driver: a store that cannot take the create lock still makes th
   const tabs = [tab(1, '1')];
   let made = 0;
   const herdr = await fakeHerdr(t, {
-    'session.snapshot': () => ({ type: 'session_snapshot', snapshot: { version: '0.9.1', protocol: 22, ...homeSnap(tabs, [pane(1, 1)]) } }),
+    'session.snapshot': () => ({ type: 'session_snapshot', snapshot: { version: HERDR_LOCK.version, protocol: 22, ...homeSnap(tabs, [pane(1, 1)]) } }),
     'tab.create': () => {
       made++;
       tabs.push(tab(9, BTOP_LABEL));
@@ -528,7 +529,7 @@ test('herdr tabs driver: a create lock that is being written, or cannot be remov
   const tabs = [tab(1, '1')];
   let made = 0;
   const herdr = await fakeHerdr(t, {
-    'session.snapshot': () => ({ type: 'session_snapshot', snapshot: { version: '0.9.1', protocol: 22, ...homeSnap(tabs, [pane(1, 1)]) } }),
+    'session.snapshot': () => ({ type: 'session_snapshot', snapshot: { version: HERDR_LOCK.version, protocol: 22, ...homeSnap(tabs, [pane(1, 1)]) } }),
     'tab.create': () => {
       made++;
       tabs.push(tab(9, BTOP_LABEL));
@@ -830,7 +831,7 @@ test('herdr tab sync: the capture bundle itself starts the sync and returns at o
     'session.snapshot': async () => {
       // A sync holding capture's output open cannot finish: its answer waits for the pipe to close.
       await hookClosed.promise;
-      return { type: 'session_snapshot', snapshot: { version: '0.9.1', protocol: 22, ...herdr.snapshot } };
+      return { type: 'session_snapshot', snapshot: { version: HERDR_LOCK.version, protocol: 22, ...herdr.snapshot } };
     },
     'tab.rename': ok,
   });
@@ -892,7 +893,7 @@ test('herdr tab sync: the capture bundle itself starts the sync and returns at o
 async function identityHerdr(t, tabs, panes) {
   const held = {}, sequenced = {};
   const herdr = await fakeHerdr(t, {
-    'session.snapshot': () => ({ type: 'session_snapshot', snapshot: { version: '0.9.1', protocol: 22, workspaces: [workspace('w1', 'work')], tabs,
+    'session.snapshot': () => ({ type: 'session_snapshot', snapshot: { version: HERDR_LOCK.version, protocol: 22, workspaces: [workspace('w1', 'work')], tabs,
       panes: panes.map(p => ({ ...p, agent_session: held[p.pane_id] ? { value: held[p.pane_id] } : null })),
       agents: Object.entries(held).map(([pane_id, value]) => ({ pane_id, agent: 'codex', agent_session: { value } })) } }),
     'pane.report_agent_session': ({ pane_id, agent_session_id, session_start_source, seq }) => {

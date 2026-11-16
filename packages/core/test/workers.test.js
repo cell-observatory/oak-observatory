@@ -31,7 +31,7 @@ function fixture(t) {
   ].map(x => JSON.stringify({ timestamp: new Date().toISOString(), ...x })).join('\n')+'\n');
   const pane = { pane_id: 'pane-1', tab_id: 'tab-1', workspace_id: 'ws', agent: 'codex', agent_status: 'unknown', cwd: wt,
     agent_session: { value: id, agent: 'codex' } };
-  const snapshot = { version: '0.9.1', protocol: 22, workspaces: [], tabs: [{ tab_id: 'tab-1', label: 'Verify copper widgets' }], panes: [pane], agents: [{ ...pane, name: 'worker-1' }] };
+  const snapshot = { version: core.HERDR_LOCK.version, protocol: 22, workspaces: [], tabs: [{ tab_id: 'tab-1', label: 'Verify copper widgets' }], panes: [pane], agents: [{ ...pane, name: 'worker-1' }] };
   const options = { snapshot, native: new Map(), alive: () => true };
   return { home, cwd, wt, id, snapshot, options };
 }

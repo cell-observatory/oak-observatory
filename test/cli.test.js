@@ -3189,7 +3189,7 @@ function slowMachineHerdr(t, { slow = false, slowG = false } = {}) {
   const b = fixture(t);
   const bin = path.join(b.home, 'bin'), log = path.join(b.home, 'herdr.log');
   fs.mkdirSync(bin);
-  const snapshot = JSON.stringify({ result: { snapshot: { version: '0.9.1', protocol: 22, panes: [{ pane_id: 'p1', agent: 'claude', agent_session: { value: 's1' }, agent_status: 'idle' }], agents: [] } } });
+  const snapshot = JSON.stringify({ result: { snapshot: { version: realCore.HERDR_LOCK.version, protocol: 22, panes: [{ pane_id: 'p1', agent: 'claude', agent_session: { value: 's1' }, agent_status: 'idle' }], agents: [] } } });
   const machines = JSON.stringify(['box', ...(slow ? ['slow'] : [])].map((label, i) => ({ id: `m${i + 1}`, label, target: `${label}.example`, session: 's', enabled: true, selected: false })));
   fs.writeFileSync(path.join(bin, 'herdr'), `#!/bin/sh
 case "$*" in

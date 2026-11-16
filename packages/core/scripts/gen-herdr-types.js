@@ -8,7 +8,7 @@ const { promisify } = require('node:util');
 
 const resultMethods = {
   pong: 'ping',
-  ok: 'server.stop server.live_handoff product_announcement.dismiss release_notes.dismiss command.invoke workspace.report_metadata workspace.close tab.close agent.send_keys pane.edit_scrollback pane.input.set pane.send_text pane.send_keys pane.send_input pane.graphics.set pane.graphics.clear pane.report_agent pane.report_agent_session pane.report_metadata pane.clear_agent_authority pane.release_agent pane.close popup.close',
+  ok: 'server.stop server.live_handoff server.ssh_agent.register product_announcement.dismiss release_notes.dismiss command.invoke workspace.report_metadata workspace.close tab.close agent.send_keys pane.edit_scrollback pane.clear pane.input.set pane.send_text pane.send_keys pane.send_input pane.report_agent pane.report_agent_session pane.report_metadata pane.clear_agent_authority pane.release_agent pane.close popup.close',
   config_reload: 'server.reload_config',
   agent_manifest_status: 'server.agent_manifests',
   agent_manifest_reload: 'server.reload_agent_manifests',
@@ -53,7 +53,6 @@ const resultMethods = {
   pane_link_activated: 'pane.link.activate',
   pane_link_resolved: 'pane.link.resolve',
   pane_read: 'pane.read agent.read',
-  pane_graphics_info: 'pane.graphics.info',
   subscription_started: 'events.subscribe',
   wait_matched: 'events.wait',
   output_matched: 'pane.wait_for_output',
