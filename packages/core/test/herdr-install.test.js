@@ -539,7 +539,10 @@ test('herdr regression: on Windows the herdr.exe in use moves aside for the pinn
 test('herdr regression: on Windows an install that leaves the old herdr.exe fails, and the old one stays usable', POSIX, async t => {
   const b = bed();
   const { exe, opts } = windowsUpgrade(t, b, { brings: false });
-  await assert.rejects(run(b, opts), new RegExp(`herdr ${PINNED.replace(/\./g, '\\.')} did not install: .*herdr\\.exe still reports 0\\.9\\.1; if a herdr server is running, stop it first`));
+  await assert.rejects(run(b, opts), (error) => {
+    assert.ok(error.message.startsWith(`herdr ${PINNED} did not install: ${exe} still reports 0.9.1; if a herdr server is running, stop it first`), error.message);
+    return true;
+  });
   assert.match(fs.readFileSync(exe, 'utf8'), /herdr 0\.9\.1/, 'the old herdr.exe is back in place');
 });
 
