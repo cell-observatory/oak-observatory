@@ -495,6 +495,57 @@ test('herdr regression: Windows archive has a zip suffix and extraction errors r
   assert.equal(fs.existsSync(invocation.options.env.OAK_ZIP), false);
 });
 
+// On Windows a running herdr server holds herdr.exe, which Windows will not overwrite but does let be renamed:
+// Expand-Archive left the old herdr.exe in place, exited 0, and the update reported the old version as installed.
+// The stand-in for Expand-Archive behaves the same way: it writes herdr.exe only where none is left in place.
+function windowsUpgrade(t, b, { brings }) {
+  const exe = path.join(b.home, '.local', 'bin', 'herdr', 'herdr.exe');
+  writeExec(exe, fakeHerdr({ version: '0.9.1', log: b.log }));
+  const payload = Buffer.from('fixture archive');
+  const lock = { version: PINNED, protocol: 22, assets: { 'windows-x86_64': 'https://example.invalid/herdr-windows.zip' },
+    sha256: { 'windows-x86_64': crypto.createHash('sha256').update(payload).digest('hex') } };
+  const spawn = require('../dist/spawn');
+  const real = spawn.spawnToolSync;
+  t.mock.method(spawn, 'spawnToolSync', (file, args, options) => {
+    if (file !== 'powershell.exe') return real(file, args, options);
+    if (brings && !fs.existsSync(exe)) writeExec(exe, fakeHerdr({ log: b.log }));
+    return { status: 0, stdout: '', stderr: '' };
+  });
+  const sh = (file, args) => {
+    const r = require('child_process').spawnSync(file, args, { encoding: 'utf8', env: { PATH: b.pathDir } });
+    return { status: r.status, stdout: String(r.stdout ?? ''), stderr: String(r.stderr ?? '') };
+  };
+  const opts = { platform: 'win32', lock, download: async () => payload, run: sh, spawnDetached: () => {} };
+  return { exe, opts };
+}
+
+test('herdr regression: on Windows the herdr.exe in use moves aside for the pinned one, and a later run deletes it', POSIX, async t => {
+  const b = bed();
+  const { exe, opts } = windowsUpgrade(t, b, { brings: true });
+  // The install directory on PATH in another case: Windows paths ignore case, so no PATH warning.
+  const env = { PATH: [b.pathDir, path.dirname(exe).toUpperCase()].join(path.delimiter) };
+  const report = await run(b, { ...opts, env });
+  assert.equal(report.version, PINNED);
+  assert.equal(report.upgraded, true);
+  assert.ok(!report.warnings.some((w) => /to PATH/.test(w)), report.warnings.join('\n'));
+  const old = fs.readdirSync(path.dirname(exe)).filter((n) => /^herdr\.exe\.old-\d+$/.test(n));
+  assert.equal(old.length, 1, 'the old herdr.exe is kept aside while its server may still run it');
+  assert.match(fs.readFileSync(path.join(path.dirname(exe), old[0]), 'utf8'), /herdr 0\.9\.1/);
+  const again = await run(b, { ...opts, env, download: async () => assert.fail('already current') });
+  assert.equal(again.version, PINNED);
+  assert.deepEqual(fs.readdirSync(path.dirname(exe)).filter((n) => n.includes('.old-')), [], 'a later run deletes the old copy');
+});
+
+test('herdr regression: on Windows an install that leaves the old herdr.exe fails, and the old one stays usable', POSIX, async t => {
+  const b = bed();
+  const { exe, opts } = windowsUpgrade(t, b, { brings: false });
+  await assert.rejects(run(b, opts), (error) => {
+    assert.ok(error.message.startsWith(`herdr ${PINNED} did not install: ${exe} still reports 0.9.1; if a herdr server is running, stop it first`), error.message);
+    return true;
+  });
+  assert.match(fs.readFileSync(exe, 'utf8'), /herdr 0\.9\.1/, 'the old herdr.exe is back in place');
+});
+
 test('herdr regression: POSIX install reports its download and warns only for a missing PATH directory', POSIX, async t => {
   for (const onPath of [false, true]) {
     const b = withPython(bed());
