@@ -192,6 +192,13 @@ const money = (v: number): number => Math.round(v * 10000) / 10000;
 const DAY_MS = 86_400_000;
 const utcDay = (ms: number): string => new Date(ms).toISOString().slice(0, 10);
 
+/** What a message is named by where no machine says it ran its session (`ran` 0: a copy of its transcript, which a file
+ *  sync brought, or a record from an OAK before schema version 10), in place of the machine that holds the copy, and the
+ *  label it shows under. Never a machine id (RECORD_HOST_ID). */
+const UNKNOWN_MACHINE = 'unknown';
+const UNKNOWN_LABEL = 'unknown machine (copies)';
+const creditedTo = (t: string): string => `CASE WHEN ${t}ran = 1 THEN ${t}machine_id ELSE '${UNKNOWN_MACHINE}' END`;
+
 /** The totals of the rows a window counts (`self`: this machine's ids; `account`: the account counted). Its whole UTC days
  *  are summed from the daily rollup and the hours at either end from the messages: a month holds tens of thousands of
  *  messages and a few hundred day rows, and every status line render asks for it. */
@@ -201,14 +208,14 @@ export function windowTotals(db: DatabaseSync, agent: string, span: UsageWindowS
   const args = account === null ? [] : [...self, account];
   const from = Math.ceil(span.start / DAY_MS) * DAY_MS;
   const to = Math.max(from, Math.floor(span.end / DAY_MS) * DAY_MS);
-  const sums = (messages: string): string => `machine_id IN (${marks}) AS own, machine_id AS machine, ${messages} AS messages, total(input + output + cache_create) AS tokens,
+  const sums = (messages: string): string => `ran = 1 AND machine_id IN (${marks}) AS own, ${creditedTo('')} AS machine, ${messages} AS messages, total(input + output + cache_create) AS tokens,
       total(input) AS input, total(output) AS output, total(cache_create) AS cacheCreate, total(cache_create_1h) AS cacheCreate1h, total(cache_read) AS cacheRead,
       total(cost) AS cost, total(cost_approx) AS approx,
       total(CASE WHEN top_tier = 1 THEN input + output + cache_create ELSE 0 END) AS top, total(CASE WHEN top_tier = 1 THEN cache_read ELSE 0 END) AS topRead`;
   const rows = [
-    ...db.prepare(`SELECT ${sums('count(*)')} FROM usage_messages WHERE agent = ? AND ((ts >= ? AND ts < ?) OR (ts >= ? AND ts < ?)) AND ${counted} GROUP BY machine_id`)
+    ...db.prepare(`SELECT ${sums('count(*)')} FROM usage_messages WHERE agent = ? AND ((ts >= ? AND ts < ?) OR (ts >= ? AND ts < ?)) AND ${counted} GROUP BY machine_id, ran`)
       .all(...self, agent, span.start, Math.min(from, span.end), Math.max(to, span.start), span.end, ...args),
-    ...(to > from ? db.prepare(`SELECT ${sums('total(messages)')} FROM usage_daily WHERE agent = ? AND day >= ? AND day < ? AND ${counted} GROUP BY machine_id`)
+    ...(to > from ? db.prepare(`SELECT ${sums('total(messages)')} FROM usage_daily WHERE agent = ? AND day >= ? AND day < ? AND ${counted} GROUP BY machine_id, ran`)
       .all(...self, agent, utcDay(from), utcDay(to), ...args) : []),
   ] as (typeof ZERO & { own: number; machine: string })[];
   const spend = db.prepare(`SELECT machine_id IN (${marks}) AS own, machine_id AS machine, total(delta) AS spend FROM usage_spend
@@ -404,13 +411,14 @@ export function usageBreakdownSql(by: (typeof USAGE_GROUPS)[number], span: { sta
   opts: { agent?: string; machine?: readonly string[]; account?: string | null; codexAccount?: string | null; self?: readonly string[]; limit: number }): { sql: string; args: (string | number)[] } {
   const daily = span.end - span.start > DAILY_AFTER_MS && by !== 'session';
   const t = daily ? 'd' : 'u';
-  const key = by === 'day' ? (daily ? 'd.day' : "strftime('%Y-%m-%d', u.ts / 1000, 'unixepoch')") : by === 'session' ? "u.machine_id || '/' || u.session_id"
-    : by === 'machine' ? `${t}.machine_id` : by === 'model' ? `${t}.model` : by === 'agent' ? `${t}.agent` : `coalesce(${t}.account, '')`;
-  const group = by === 'session' ? 'u.machine_id, u.session_id' : key;
+  // A message no machine says it ran counts toward no machine (UNKNOWN_MACHINE), whichever holds its copy.
+  const key = by === 'day' ? (daily ? 'd.day' : "strftime('%Y-%m-%d', u.ts / 1000, 'unixepoch')") : by === 'session' ? `${creditedTo('u.')} || '/' || u.session_id`
+    : by === 'machine' ? creditedTo(`${t}.`) : by === 'model' ? `${t}.model` : by === 'agent' ? `${t}.agent` : `coalesce(${t}.account, '')`;
+  const group = by === 'session' ? `${creditedTo('u.')}, u.session_id` : key;
   const where: string[] = daily ? ["d.day >= strftime('%Y-%m-%d', ? / 1000, 'unixepoch')", "d.day <= strftime('%Y-%m-%d', (? - 1) / 1000, 'unixepoch')"] : ['u.ts >= ?', 'u.ts < ?'];
   const args: (string | number)[] = [span.start, span.end];
   if (opts.agent) { where.push(`${t}.agent = ?`); args.push(opts.agent); }
-  if (opts.machine) { where.push(`${t}.machine_id IN (${opts.machine.map(() => '?').join(', ')})`); args.push(...opts.machine); }
+  if (opts.machine) { where.push(`${t}.ran = 1 AND ${t}.machine_id IN (${opts.machine.map(() => '?').join(', ')})`); args.push(...opts.machine); }
   if (opts.account !== undefined && opts.account !== null && opts.self) {
     // Each agent's rows by its own account: the Claude account counted, and the Codex account this machine is signed in to.
     where.push(`(${t}.machine_id IN (${opts.self.map(() => '?').join(', ')}) OR (${t}.agent = 'claude' AND ${t}.account = ?) OR (${t}.agent = 'codex' AND ${t}.account = ?))`);
@@ -419,10 +427,10 @@ export function usageBreakdownSql(by: (typeof USAGE_GROUPS)[number], span: { sta
   // A session's row counts every agent it started (their transcripts' messages name it): `agents` says how many, and the
   // `own_` figures its own turns alone, null where a message's agent is unknown (a record from an OAK before schema 6).
   const own = (v: string): string => `CASE WHEN count(u.worker) = count(*) THEN total(CASE WHEN u.worker = '' THEN ${v} ELSE 0 END) END`;
-  const extra = by === 'session' ? `, u.machine_id AS machine, u.session_id AS session, (SELECT s.title FROM sessions s WHERE s.machine_id = u.machine_id AND s.session_id = u.session_id) AS title,
+  const extra = by === 'session' ? `, ${creditedTo('u.')} AS machine, u.session_id AS session, (SELECT s.title FROM sessions s WHERE s.machine_id = u.machine_id AND s.session_id = u.session_id) AS title,
       count(DISTINCT nullif(u.worker, '')) AS agents, ${own('u.input + u.output + u.cache_create')} AS own_tokens, ${own('u.cache_read')} AS own_cache_read,
       round(${own('u.cost')}, 4) AS own_cost`
-    : by === 'machine' ? `, (SELECT coalesce(m.saved_label, m.label) FROM machines m WHERE m.machine_id = ${t}.machine_id) AS label` : '';
+    : by === 'machine' ? `, CASE WHEN ${t}.ran = 1 THEN (SELECT coalesce(m.saved_label, m.label) FROM machines m WHERE m.machine_id = ${t}.machine_id) ELSE '${UNKNOWN_LABEL}' END AS label` : '';
   const sums = daily
     ? 'total(d.messages) AS messages, total(d.input + d.output + d.cache_create) AS tokens, total(d.input) AS input, total(d.output) AS output, total(d.cache_create) AS cache_create, total(d.cache_create_1h) AS cache_create_1h, total(d.cache_read) AS cache_read, round(total(d.cost), 4) AS cost, total(d.cost_approx) AS cost_approx, min(d.day) AS first_day, max(d.day) AS last_day'
     : 'count(*) AS messages, total(u.input + u.output + u.cache_create) AS tokens, total(u.input) AS input, total(u.output) AS output, total(u.cache_create) AS cache_create, total(u.cache_create_1h) AS cache_create_1h, total(u.cache_read) AS cache_read, round(total(u.cost), 4) AS cost, total(u.cost_approx) AS cost_approx, min(u.ts) AS first_ts, max(u.ts) AS last_ts';
@@ -494,7 +502,7 @@ export function machineReadingEntries(db: DatabaseSync): MachineUsageEntry[] {
  *  line and the readouts' tooltips take it (observe.ts UsageLine.machineMeasured): per window, their tokens, cache
  *  reads and spend (the month's at list price), the window, and which machines; null when no other machine counts. */
 export function othersMeasured(t: UsageTotals): UsageLineMeasured {
-  const names = new Map(t.machines.map((m) => [m.machine, m.label ?? m.machine]));
+  const names = new Map([...t.machines.map((m): [string, string] => [m.machine, m.label ?? m.machine]), [UNKNOWN_MACHINE, UNKNOWN_LABEL]]);
   const hosts = (w: UsageWindowTotals): string => [...w.others.machines].sort().join(',');
   const any = (w: UsageWindowTotals): boolean => w.others.machines.length > 0;
   if (!any(t.five) && !any(t.week) && !any(t.month)) return null;

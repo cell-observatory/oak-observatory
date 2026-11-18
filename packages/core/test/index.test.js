@@ -282,6 +282,36 @@ test('index: the upgrade to schema 6 keeps the usage rows and days, priced by no
   db.close();
 });
 
+// Schema version 10 says of each message whether the machine it is filed under ran its session. The upgrade marks every
+// Claude message a copy's until its machine reads it again (Codex's are read only where Codex ran), keeps each day apart by
+// it, and reads every usage file again, once; nothing else is read again.
+test('index: the upgrade to schema 10 marks Claude\'s messages unclaimed and Codex\'s claimed, keeps the days apart by it, and reads the usage files again (0.11.0)', { skip }, () => {
+  const { DatabaseSync } = require('node:sqlite');
+  const { MIGRATIONS } = require(path.join(DIST, 'index', 'schema.js'));
+  const db = new DatabaseSync(':memory:');
+  for (let v = 0; v < 9; v++) db.exec(MIGRATIONS[v]);
+  const msg = db.prepare(`INSERT INTO usage_messages (message_id, agent, machine_id, session_id, model, ts, input, output, cache_create, cache_read, cost)
+    VALUES (?, ?, 'aaaaaaaaaaaa', 's1', 'claude-opus-4-8', 1767225600000, ?, 0, 0, 0, 0.5)`);
+  msg.run('m1', 'claude', 10);
+  msg.run('m2', 'claude', 20);
+  msg.run('m3', 'codex', 40);
+  const state = db.prepare("INSERT INTO ingest_state (source, kind, machine_id, session_id, state, updated_ms) VALUES (?, ?, ?, ?, 'done', 1)");
+  state.run('unit:usage:aaaaaaaaaaaa:s1', 'unit', 'aaaaaaaaaaaa', 's1');
+  state.run('unit:deleted-usage:aaaaaaaaaaaa:s3', 'unit', 'aaaaaaaaaaaa', 's3');
+  state.run('unit:work:aaaaaaaaaaaa:s1', 'unit', 'aaaaaaaaaaaa', 's1');
+  db.exec(MIGRATIONS[9]);
+  assert.deepEqual(db.prepare('SELECT message_id, ran FROM usage_messages ORDER BY message_id').all().map((r) => [r.message_id, r.ran]), [['m1', 0], ['m2', 0], ['m3', 1]]);
+  const days = () => db.prepare('SELECT agent, ran, messages, input, cost FROM usage_daily ORDER BY agent, ran').all().map((r) => [r.agent, r.ran, r.messages, r.input, r.cost]);
+  assert.deepEqual(days(), [['claude', 0, 2, 30, 1], ['codex', 1, 1, 40, 0.5]]);
+  // The days follow a message its machine claims.
+  db.exec("UPDATE usage_messages SET ran = 1 WHERE message_id = 'm1'");
+  assert.deepEqual(days(), [['claude', 0, 1, 20, 0.5], ['claude', 1, 1, 10, 0.5], ['codex', 1, 1, 40, 0.5]]);
+  db.exec('DELETE FROM usage_messages');
+  assert.equal(db.prepare('SELECT count(*) AS n FROM usage_daily').get().n, 0);
+  assert.deepEqual(db.prepare('SELECT source FROM ingest_state ORDER BY source').all().map((r) => r.source), ['unit:work:aaaaaaaaaaaa:s1']);
+  db.close();
+});
+
 // A background build takes another pass when a kick claimed one after it began (a hook that moved a hand, whose own build
 // found this one holding the lease); a claim dated ahead, a backoff, is no such kick.
 test('index: a build takes another pass for a kick claimed after it began, never for a backoff', { skip }, (t) => {
@@ -1816,7 +1846,7 @@ test('query: every named query and declared filter against distinct synthetic ro
       title: `${id} quokkacorn`, text: 'note', size: 4, mtime_ms: at(n), sha: id, archived_ms: archived });
     if (archived) continue;
     put('usage_readings', { machine_id: machine, agent, kind: id === 'a' ? 'five' : 'week', measured_ms: at(n), pct: n, source: 'fixture' });
-    put('usage_messages', { machine_id: machine, session_id: id, agent, message_id: `msg-${id}`, account: `account-${id}`, model: `model-${id}`, ts: at(n), input: n });
+    put('usage_messages', { machine_id: machine, session_id: id, agent, message_id: `msg-${id}`, account: `account-${id}`, model: `model-${id}`, ts: at(n), input: n, ran: 1 });
   }
   const covered = new Map();
   const query = (name, params = {}) => {

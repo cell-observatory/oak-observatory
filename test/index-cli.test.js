@@ -753,10 +753,10 @@ test('oak usage --window: a window\'s tokens by model, session or day from the i
   fs.writeFileSync(sub, JSON.stringify({ isSidechain: true, ...turn('k1', 3_200_000, 'claude-opus-4-8', { input_tokens: 20, output_tokens: 10 }) }) + '\n');
   const text = f.cli(['usage', '--window', 'week', '--by', 'session']);
   assert.equal(text.status, 0, text.stderr);
-  assert.match(text.stdout, /^usage · week · by session/);
+  assert.match(text.stdout, /^usage · week · claude \+ codex · by session/);
   assert.match(text.stdout, /cache reads are counted apart; ~\$ is an estimate at today's API list prices, not a bill/);
   assert.match(text.stdout, /^\s+700\s+↺5\.0K\s+~\$0\.01\s+Count the tokens · with 1 agent\n\s+670\s+↺5\.0K\s+~\$0\.01\s+own$/m);
-  assert.match(f.cli(['usage', '--since', '3d', '--by', 'model']).stdout, /^usage · since · by model/, 'a span --since places is no window');
+  assert.match(f.cli(['usage', '--since', '3d', '--by', 'model']).stdout, /^usage · since · claude \+ codex · by model/, 'a span --since places is no window');
   r = f.json(['usage', '--window', 'fortnight', '--json']);
   assert.deepEqual([r.status, r.out.error.code], [2, 'bad_param']);
   r = f.json(['usage', '--window', 'week', '--by', 'colour', '--json']);

@@ -1482,7 +1482,7 @@ function ingestComments(r: Run, machine: string, id: string, present: boolean): 
 // --- usage --------------------------------------------------------------------------------------------------------
 
 const USAGE_COLS = ['message_id', 'agent', 'machine_id', 'session_id', 'account', 'model', 'ts', 'input', 'output', 'cache_create', 'cache_read', 'cost',
-  'top_tier', 'seq', 'synced_ms', 'cache_create_1h', 'provider', 'speed', 'geo', 'priced', 'cost_approx', 'worker'] as const;
+  'top_tier', 'seq', 'synced_ms', 'cache_create_1h', 'provider', 'speed', 'geo', 'priced', 'cost_approx', 'worker', 'ran'] as const;
 
 /** What a message records beyond its tokens (schema version 6), which a record from an OAK before it does not carry: such
  *  a record leaves them unknown, never the values of the snapshot it replaces, and its row unpriced (`priced` ''). A row
@@ -1504,12 +1504,30 @@ const USAGE_TAKES = `${UNIT('excluded')} > ${UNIT('usage_messages')} OR (${UNIT(
     AND ${UNIT('excluded')} >= ${UNIT('usage_messages')})
   OR (${UNIT('excluded')} = ${UNIT('usage_messages')} AND usage_messages.provider IS NULL AND excluded.provider IS NOT NULL)`;
 
+/** When a message's credit (the machine it counts toward, the account that machine ran it under) moves to another
+ *  machine's snapshot of it: a machine that ran the session (`ran` 1) takes it from one that holds only a copy, whichever
+ *  arrived first, and never gives it back to one. Between two of a kind, the snapshot USAGE_TAKES keeps; between two that
+ *  ran the session (resumed on another machine) and are equal, the lower machine id, so every machine credits the same
+ *  one whatever order they arrive in. */
+const CLAIM_TAKES = `excluded.ran > usage_messages.ran OR (excluded.ran = usage_messages.ran AND (${USAGE_TAKES}
+  OR (excluded.ran = 1 AND ${UNIT('excluded')} = ${UNIT('usage_messages')} AND excluded.ts = usage_messages.ts AND excluded.machine_id < usage_messages.machine_id)))`;
+const CREDIT = new Set(['machine_id', 'ran', 'synced_ms', 'account']);
+
+/** A message's upsert, by these columns (`value`: what each takes): its tokens and details follow USAGE_TAKES, its credit
+ *  CLAIM_TAKES, each kept where its rule keeps the stored row's. */
+function usageUpsertSql(cols: readonly string[], value: (c: string) => string): string {
+  const set = cols.filter((c) => c !== 'message_id').map((c) => (c === 'seq' ? 'seq = excluded.seq'
+    : `${c} = CASE WHEN ${CREDIT.has(c) ? CLAIM_TAKES : USAGE_TAKES} THEN ${value(c)} ELSE usage_messages.${c} END`));
+  return `INSERT INTO usage_messages (${cols.join(', ')}) VALUES (${cols.map(() => '?').join(', ')})
+  ON CONFLICT(message_id) DO UPDATE SET ${set.join(', ')}
+  WHERE (${USAGE_TAKES}) OR (${CLAIM_TAKES})`;
+}
+
 /** Write a message's usage at its largest snapshot, between two equal ones the earlier (a fork's copy carries the time
  *  the message was first written). The same message from another file, or from another machine's copy of it, is the
- *  same row: a message is counted once however many files and machines hold it. True when it wrote. */
-const USAGE_UPSERT = `INSERT INTO usage_messages (${USAGE_COLS.join(', ')}) VALUES (${USAGE_COLS.map(() => '?').join(', ')})
-  ON CONFLICT(message_id) DO UPDATE SET ${USAGE_COLS.filter((c) => c !== 'message_id').map((c) => (c === 'account' ? 'account = coalesce(excluded.account, usage_messages.account)' : `${c} = excluded.${c}`)).join(', ')}
-  WHERE ${USAGE_TAKES}`;
+ *  same row: a message is counted once however many files and machines hold it, toward the machine that ran its session
+ *  (CLAIM_TAKES). True when it wrote. */
+const USAGE_UPSERT = usageUpsertSql(USAGE_COLS, (c) => (c === 'account' ? 'coalesce(excluded.account, usage_messages.account)' : `excluded.${c}`));
 
 /** One message's usage as a line reports it. */
 export interface UsageMessage {
@@ -1546,12 +1564,12 @@ function usageCost(agent: string, model: string, provider: string | null, t: { i
  *  programs with it) cost more than running it. */
 const usageUpserts = new WeakMap<DatabaseSync, StatementSync>();
 
-function writeUsage(r: Run, machine: string, u: UsageMessage, account: string | null, provider: string | null = null): boolean {
+function writeUsage(r: Run, machine: string, u: UsageMessage, account: string | null, ran: boolean, provider: string | null = null): boolean {
   const detail = { ...u, cacheCreate1h: u.cacheCreate1h ?? null, speed: u.speed ?? null, geo: u.geo ?? null };
   const cost = usageCost(u.agent, u.model, provider, detail);
   const values = fitRow(r.db, 'usage_messages', USAGE_COLS, [u.id, u.agent, machine, u.session, account, u.model, u.ts, u.input, u.output, u.cacheCreate, u.cacheRead,
     cost.usd, TOP_TIER.test(u.model) ? 1 : 0, r.pub.owns(machine) ? nextSeq(r) : 0, null, detail.cacheCreate1h, u.agent === 'codex' ? provider ?? 'openai' : '', detail.speed,
-    detail.geo, PRICE_VERSION, cost.approx ? 1 : 0, u.worker ?? '']);
+    detail.geo, PRICE_VERSION, cost.approx ? 1 : 0, u.worker ?? '', ran ? 1 : 0]);
   let upsert = usageUpserts.get(r.db);
   if (!upsert) usageUpserts.set(r.db, (upsert = r.db.prepare(USAGE_UPSERT)));
   const changed = Number(upsert.run(...values).changes) > 0;
@@ -1593,9 +1611,10 @@ const USAGE_NEEDLE = Buffer.from('"usage"');
  * message's usage, at its largest snapshot. A replaced or rewritten file is read from the start again, which writes
  * nothing twice (a message is its row). A line still being written waits for its newline. `deleted`: a session deleted
  * before this index knew it (deletedUsage), whose rows name no session, read from a cursor of its own. `worker`: the file
- * is one of the session's workers', whose rows name it (UsageMessage.worker).
+ * is one of the session's workers', whose rows name it (UsageMessage.worker). `ran`: this machine ran the session (its
+ * rows claim their messages); `again`: read from the start whatever was read before (ingestUsage).
  */
-function ingestUsageFile(r: Run, machine: string, id: string, file: string, account: string | null, deleted = false, worker = false): void {
+function ingestUsageFile(r: Run, machine: string, id: string, file: string, account: string | null, deleted = false, worker = false, ran = false, again = false): void {
   const source = `${deleted ? 'deleted-usage' : 'usage'}:${file}`;
   const prev = getState(r, source);
   let fd: number;
@@ -1606,9 +1625,9 @@ function ingestUsageFile(r: Run, machine: string, id: string, file: string, acco
   }
   try {
     const st = fs.fstatSync(fd);
-    if (prev?.state === 'done' && prev.dev === st.dev && prev.ino === st.ino && prev.size === st.size && prev.mtime_ms === st.mtimeMs) return;
+    if (!again && prev?.state === 'done' && prev.dev === st.dev && prev.ino === st.ino && prev.size === st.size && prev.mtime_ms === st.mtimeMs) return;
     let cursor = prev?.cursor ?? 0;
-    let restart = !prev || prev.dev !== st.dev || prev.ino !== st.ino || st.size < cursor;
+    let restart = again || !prev || prev.dev !== st.dev || prev.ino !== st.ino || st.size < cursor;
     if (!restart && cursor > 0) {
       const g = guards(fd, cursor);
       restart = g.head !== prev!.head_sha || g.anchor !== prev!.anchor_sha;
@@ -1648,7 +1667,7 @@ function ingestUsageFile(r: Run, machine: string, id: string, file: string, acco
         at = buf.indexOf(USAGE_NEEDLE, stop + 1);
       }
       for (const u of best.values()) {
-        writeUsage(r, machine, worker ? { ...u, worker: name } : u, account);
+        writeUsage(r, machine, worker ? { ...u, worker: name } : u, account, ran);
         if (r.txRows >= TX_ROWS) { commit(r); keepLease(r); begin(r); }
       }
       cursor += end + 1;
@@ -1703,7 +1722,7 @@ function ingestCodexUsage(r: Run, machine: string, id: string, rollout: string, 
   for (let i = from; i < deltas.length; i++) {
     const d = deltas[i];
     writeUsage(r, machine, { id: `codex:${d.id}`, agent: 'codex', session: deleted ? '' : id, model: d.model, ts: d.ts, input: d.usage.input, output: d.usage.output,
-      cacheCreate: d.usage.cacheWrite, cacheRead: d.usage.cacheRead }, account, d.provider);
+      cacheCreate: d.usage.cacheWrite, cacheRead: d.usage.cacheRead }, account, true, d.provider);
     if (r.txRows >= TX_ROWS) { commit(r); keepLease(r); begin(r); }
   }
   putState(r, { source, kind: 'codex-usage', machine, session: id, cursor: deltas.length, state: deltas[deltas.length - 1]?.id ?? null });
@@ -1857,16 +1876,37 @@ function ingestUsageMachine(r: Run, account: string | null): void {
   }
 }
 
-/** The usage of one session's files: its transcripts and their workers', or its rollouts (`deleted`: deletedUsage). */
+/** Whether this machine ran a Claude Code session, not only holds a copy of its transcript (one a file sync brought):
+ *  Claude Code keeps the session's environment and its edits' history in folders of its own beside the transcripts, which
+ *  no sync of the transcripts copies, and OAK's capture keeps its store here. A session with none of them (one run before
+ *  they were kept, or whose folders were cleaned) is taken for a copy. */
+function ranHere(r: Run, s: SessionSources): boolean {
+  if (s.store || storeHere(r, s.id)) return true;
+  if (!isSafeSessionId(s.id)) return false;
+  const dir = claudeConfigDir();
+  return fs.existsSync(path.join(dir, 'session-env', s.id)) || fs.existsSync(path.join(dir, 'file-history', s.id));
+}
+
+/** The usage of one session's files: its transcripts and their workers', or its rollouts (`deleted`: deletedUsage). A
+ *  session this machine ran claims its messages (CLAIM_TAKES): the first read that knows it (a session read before as a
+ *  copy, or before schema version 10) reads its transcripts again from their start. */
 function ingestUsage(r: Run, machine: string, s: SessionSources, deleted = false): void {
   r.account ??= claudeAccountTag();
+  const ran = s.transcripts.length > 0 && r.pub.owns(machine) && ranHere(r, s);
+  const mark = `${deleted ? 'deleted-' : ''}usage-ran:${s.id}`;
+  const again = ran && !getState(r, mark);
   for (const t of s.transcripts) {
-    ingestUsageFile(r, machine, s.id, t.t.file, r.account, deleted);
+    ingestUsageFile(r, machine, s.id, t.t.file, r.account, deleted, false, ran, again);
     commit(r);
     for (const w of workerTranscripts(t.t.file, s.id)) {
-      ingestUsageFile(r, machine, s.id, w, r.account, deleted, true);
+      ingestUsageFile(r, machine, s.id, w, r.account, deleted, true, ran, again);
       commit(r);
     }
+  }
+  if (again) {
+    begin(r);
+    putState(r, { source: mark, kind: 'usage', machine, session: s.id, state: 'done' });
+    commit(r);
   }
   for (const x of s.rollouts) {
     ingestCodexUsage(r, machine, s.id, x.file, deleted);
@@ -2044,14 +2084,13 @@ function recordUpsert(db: DatabaseSync, table: string, given: string[], own = fa
   const have = recordColumns(db, table);
   const cols = ['machine_id', ...given.filter((c) => have.has(c) && c !== 'machine_id' && c !== 'synced_ms'), 'synced_ms'];
   if (table === 'sessions') for (const c of ['updated_ms', 'listed']) if (!cols.includes(c)) cols.push(c);
-  // A message's details a record does not carry are unknown (USAGE_DETAIL).
-  if (table === 'usage_messages') for (const c of USAGE_DETAIL) if (have.has(c) && !cols.includes(c)) cols.splice(cols.length - 1, 0, c);
+  // A message's details a record does not carry are unknown (USAGE_DETAIL), and its claim a copy's (recordRan).
+  if (table === 'usage_messages') for (const c of [...USAGE_DETAIL, 'ran']) if (have.has(c) && !cols.includes(c)) cols.splice(cols.length - 1, 0, c);
   const keys = table === 'usage_messages' ? ['message_id'] : ['machine_id', ...RECORD_TABLES[table].keys];
-  let sql = upsertSql(table, keys, cols);
+  let sql = table === 'usage_messages' ? usageUpsertSql(cols, (c) => `excluded.${c}`) : upsertSql(table, keys, cols);
   // This machine's own session read back over a row its files gave: whether the listing shows it is the files' to say
   // (the record does not carry it), and a replay never hides it.
   if (table === 'sessions' && own) sql = sql.replace('listed = excluded.listed', 'listed = sessions.listed');
-  if (table === 'usage_messages') sql += ` WHERE ${USAGE_TAKES}`;
   if (table === 'account_bill_days') sql += ' WHERE excluded.updated_ms >= account_bill_days.updated_ms';
   // Another machine's hand never replaces one this machine raised on the same row (applyRecord).
   if (table === 'attention' && !own) sql += ' WHERE attention.synced_ms IS NOT NULL';
@@ -2059,6 +2098,10 @@ function recordUpsert(db: DatabaseSync, table: string, given: string[], own = fa
   byKey.set(k, hit);
   return hit;
 }
+
+/** A message record's claim to have run its session (CLAIM_TAKES): a record from an OAK before schema version 10 makes
+ *  none, and its Claude message counts as a copy's; Codex's rollouts are read only where Codex ran them. */
+const recordRan = (row: Record<string, unknown>): number => (row.ran === 1 || (row.ran == null && row.agent === 'codex') ? 1 : 0);
 
 function noteForgotten(r: Run, host: string, ids: Iterable<string>): void {
   let set = r.forgotten.get(host);
@@ -2119,7 +2162,7 @@ function applyRecord(r: Run, host: string, own: boolean, rec: Record<string, unk
     const seq = own && (USAGE_RECORD_TABLES as readonly string[]).includes(t) ? nextSeq(r) : null;
     const { sql, cols } = recordUpsert(r.db, t, seq === null ? Object.keys(row) : [...Object.keys(row).filter((c) => c !== 'seq'), 'seq'], own);
     const values = cols.map((c) => (c === 'seq' && seq !== null ? seq : c === 'machine_id' ? host : c === 'synced_ms' ? (own ? null : r.now) : c === 'updated_ms' ? r.now
-      : c === 'listed' ? (own ? row.listed ?? 0 : 0) : c === 'origin' && !own ? 'synced' : row[c]));
+      : c === 'listed' ? (own ? row.listed ?? 0 : 0) : c === 'origin' && !own ? 'synced' : c === 'ran' && t === 'usage_messages' ? recordRan(row) : row[c]));
     r.db.prepare(sql).run(...fitRow(r.db, t, cols, values));
   } else return;
   count(r);
@@ -3484,7 +3527,7 @@ export function applyUsageRecords(db: DatabaseSync, a: UsageRecords, opts: { lab
           if (dayHeld.get(machine, rest.session_id, day, day + DAY, now)) continue;
         }
         const { sql, cols } = recordUpsert(db, table, Object.keys(rest));
-        db.prepare(sql).run(...fitRow(db, table, cols, cols.map((c) => (c === 'machine_id' ? machine : c === 'synced_ms' ? now : rest[c]))));
+        db.prepare(sql).run(...fitRow(db, table, cols, cols.map((c) => (c === 'machine_id' ? machine : c === 'synced_ms' ? now : c === 'ran' && table === 'usage_messages' ? recordRan(rest) : rest[c]))));
         n++;
       }
     };
