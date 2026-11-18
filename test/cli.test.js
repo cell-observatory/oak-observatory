@@ -1786,6 +1786,8 @@ test('CLI usage --pull-machines: what a saved machine measured of its own usage 
     { type: 'user', timestamp: at, cwd: '/build/p', sessionId: 'b1', message: { role: 'user', content: 'build' } },
     { type: 'assistant', timestamp: at, cwd: '/build/p', sessionId: 'b1', message: { id: 'msg-b1', role: 'assistant', model: 'claude-opus-4-8', content: [], usage: { input_tokens: 3_900_000, output_tokens: 20_000 } } },
   ].map((x) => JSON.stringify(x)).join('\n') + '\n');
+  // Claude Code's session-env folder for it says build-box ran the session, so build-box claims its usage.
+  fs.mkdirSync(path.join(f.root, 'build-box', '.claude', 'session-env', 'b1'), { recursive: true });
   assert.deepEqual([f.usage().claudeMeasuredMachines, f.usage().claudeAccount.machineMeasured], ['', null], 'control: nothing read yet');
   assert.equal(f.pull().status, 0);
   const u = f.usage();
