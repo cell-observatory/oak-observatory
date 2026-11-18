@@ -20,9 +20,18 @@ the release notes.
   OAK's warning after the install says; until then OAK reports that server incompatible instead of reading its
   panes. A saved machine needs herdr 0.9.5 or newer as well (`oak doctor --fix` there installs it). herdr 0.9.2 and
   later can add a Windows machine as a saved machine.
+- `oak usage --window` and `--since` say in their header which agents the rows count: `claude + codex` unless
+  `--agent` narrows them. Without `--agent` the rows add Claude's and Codex's usage together, which overstates the
+  usage that counts toward Claude's limits. `oak help` now lists `--since` and `--until`.
 
 ### Fixed
 
+- `oak usage --by machine` credits each message to the machine that ran its session, so every machine shows the
+  same split. When a file sync copied transcripts between machines, each message counted toward whichever machine
+  read its copy first. A machine now claims a session when Claude Code's `session-env` or `file-history` folder for
+  it, or OAK's store of it, is on that machine, and the claim travels in the record log and the usage pull. A copy
+  that no machine claims shows as `unknown machine (copies)` in `oak usage`, `oak query usage` and the status line.
+  Totals do not change. The database moves to schema 10 and reads every session's usage once more.
 - On Windows, `oak update` and `oak doctor --fix` upgrade herdr while its server is running. Windows does not let a
   running herdr.exe be replaced, so the old one stayed in place and the update still reported it as installed. OAK
   now moves the old herdr.exe aside and deletes it on a later run, once nothing runs it. An install that still leaves

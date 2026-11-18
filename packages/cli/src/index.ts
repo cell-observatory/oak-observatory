@@ -6720,7 +6720,9 @@ function cmdUsageWindow(args: string[]): void {
     return v >= 1e9 ? `${(v / 1e9).toFixed(1)}B` : v >= 1e6 ? `${(v / 1e6).toFixed(1)}M` : v >= 1e3 ? `${(v / 1e3).toFixed(1)}K` : String(Math.round(v));
   };
   // `--since` places the span itself, in place of the window.
-  process.stdout.write(c.bold(`usage · ${typeof p.since === 'number' ? 'since' : p.window} · by ${p.by}`) + c.dim(`  ${new Date(p.start).toISOString().slice(0, 16)}Z to ${new Date(Math.min(p.end, Date.now())).toISOString().slice(0, 16)}Z\n`));
+  // Without --agent the rows add Claude's and Codex's usage together: the header says so.
+  const agents = flagValue(args, '--agent') ?? 'claude + codex';
+  process.stdout.write(c.bold(`usage · ${typeof p.since === 'number' ? 'since' : p.window} · ${agents} · by ${p.by}`) + c.dim(`  ${new Date(p.start).toISOString().slice(0, 16)}Z to ${new Date(Math.min(p.end, Date.now())).toISOString().slice(0, 16)}Z\n`));
   process.stdout.write(c.dim('tokens are input + output + cache creation; cache reads are counted apart; ~$ is an estimate at today\'s API list prices, not a bill\n'));
   if (p.by === 'session') process.stdout.write(c.dim('a session counts every agent it started; the line under it, `own`, is its own turns\n'));
   process.stdout.write('\n');
@@ -9082,7 +9084,9 @@ function usage(): void {
       `                       --window 5h|week|bill|month|day|all [--by machine|model|session|day|agent|account]\n` +
       `                       [--agent claude|codex] [--json] breaks a window down from the local database, each\n` +
       `                       message once across the machines whose usage it holds, as the token and dollar\n` +
-      `                       estimates count it; --brief prints the shares and the usage this machine measured\n` +
+      `                       estimates count it; --since <time> [--until <time>] (an ISO date, or 12h, 7d back)\n` +
+      `                       in place of --window gives any span; without --agent the rows add Claude's and\n` +
+      `                       Codex's usage together; --brief prints the shares and the usage this machine measured\n` +
       `                       itself, as an earlier pre-release reads them from a machine that saved this one\n` +
       `  titles [--json] [--refresh] [--off | --on]\n` +
       `                       Remote Control titles read from claude.ai, so sessions carry the names the\n` +

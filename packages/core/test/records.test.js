@@ -52,11 +52,14 @@ function machines(t, names) {
       get host() {
         return require('node:crypto').createHash('sha256').update(`${os.hostname()}\0${home}`).digest('hex').slice(0, 12);
       },
-      transcript(id, records, cwd = m.work) {
+      /** A session it ran (Claude Code's folder of the session's environment beside it), or with `{ copy: true }` only a
+       *  copy of its transcript, as a file sync brings one. */
+      transcript(id, records, cwd = m.work, { copy = false } = {}) {
         m.use();
         const file = path.join(core.projectDir(cwd), `${id}.jsonl`);
         fs.mkdirSync(path.dirname(file), { recursive: true });
         fs.mkdirSync(cwd, { recursive: true });
+        if (!copy) fs.mkdirSync(path.join(home, '.claude', 'session-env', id), { recursive: true });
         fs.writeFileSync(file, records.map((r) => JSON.stringify({ cwd, sessionId: id, ...r })).join('\n') + '\n');
         return file;
       },
@@ -212,8 +215,9 @@ test('usage: a new price table prices every stored row again, this machine\'s an
     .map((r) => ({ ...r })));
   const day = () => b.db((db) => ({ ...one(db, 'SELECT total(messages) AS n, total(input + output + cache_create) AS t, total(cost) AS c FROM usage_daily') }));
   const before = priced();
+  // both-1 is in a session each machine ran: it counts toward the lower machine id.
   assert.deepEqual(before.map((r) => [r.message_id, r.machine_id === a.host ? 'a' : 'b', r.priced]), [['a-1', 'a', core.PRICE_VERSION], ['b-1', 'b', core.PRICE_VERSION],
-    ['both-1', 'b', core.PRICE_VERSION]], 'each message once');
+    ['both-1', a.host < b.host ? 'a' : 'b', core.PRICE_VERSION]], 'each message once');
   const cost = before.reduce((s, r) => s + r.cost, 0);
   const dayBefore = day();
   assert.ok(Math.abs(dayBefore.c - cost) < 1e-12);
@@ -237,7 +241,7 @@ test('usage: a new price table prices every stored row again, this machine\'s an
   assert.equal(totals.five.messages, 3);
   assert.ok(Math.abs(totals.five.cost - Math.round(cost * 10000) / 10000) < 1e-9, `the window's cost ${totals.five.cost}`);
   assert.equal(totals.five.spend, 7.5);
-  assert.equal(totals.five.others.cost, Math.round(before[0].cost * 10000) / 10000, 'a\'s part once');
+  assert.equal(totals.five.others.cost, Math.round(before.filter((r) => r.machine_id === a.host).reduce((s, r) => s + r.cost, 0) * 10000) / 10000, 'a\'s part once');
   // `oak usage` (the status line asks it) prices them again before it sums the windows, with no full catch-up.
   older();
   b.use();
@@ -279,7 +283,8 @@ test('usage: a message held by two machines counts once; work on separate machin
   assert.equal(totals.five.tokens, 1100 + 55 + 2200, 'both-1 once, each machine\'s own work added');
   assert.equal(totals.five.messages, 3);
   assert.deepEqual(totals.five.others.machines, [a.host], 'a\'s part is named');
-  assert.equal(totals.five.others.tokens, 1100, 'a\'s own message; the one b holds too is b\'s first');
+  // Each machine ran a session that holds both-1: it counts toward the lower machine id, on every machine.
+  assert.equal(totals.five.others.tokens, 1100 + (a.host < b.host ? 55 : 0), 'a\'s own message, and the one both hold where a\'s id is the lower');
   // A third machine signed in to another account: its usage is no part of this account's windows.
   const { c } = machines(t, ['c']);
   fs.writeFileSync(path.join(c.home, '.claude', '.claude.json'), JSON.stringify({ oauthAccount: { accountUuid: 'other-account' } }));
@@ -290,6 +295,101 @@ test('usage: a message held by two machines counts once; work on separate machin
   const after = b.db((db) => core.usageTotals(db, { fiveReset: null, weekReset: null }));
   assert.equal(after.five.tokens, totals.five.tokens, 'another account\'s message is left out');
   assert.equal(b.db((db) => one(db, "SELECT count(*) AS n FROM usage_messages WHERE message_id = 'c-1'").n), 1, 'though the index holds it');
+});
+
+test('usage: a message counts toward the machine that ran its session, whichever copy of its transcript arrives first, by the record log or a usage pull; a copy no machine ran counts toward no machine, the same on every machine (0.11.0)', { skip }, (t) => {
+  const ms = machines(t, ['a', 'b', 'c']);
+  const { a, b, c } = ms;
+  for (const m of [a, b, c]) fs.writeFileSync(path.join(m.home, '.claude', '.claude.json'), JSON.stringify({ oauthAccount: { accountUuid: 'one-account' } }));
+  const lines = [userAsk('on a'), turn('r-1', 600, { input_tokens: 100, output_tokens: 10 })];
+  a.transcript('s-run', lines);
+  // b holds a file sync's copies: of a's session, and of one a machine with no OAK ran.
+  b.transcript('s-run', lines, undefined, { copy: true });
+  b.transcript('s-orphan', [userAsk('elsewhere'), turn('o-1', 500, { input_tokens: 7, output_tokens: 0 })], undefined, { copy: true });
+  b.catchUp();
+  const fromB = b.db((db) => core.usageRecordsSince(db, null));
+  a.catchUp();
+  const fromA = a.db((db) => core.usageRecordsSince(db, null));
+  const credit = (m) => m.db((db) => rows(db, 'SELECT message_id, machine_id, ran, input FROM usage_messages ORDER BY message_id').map((r) => [r.message_id, r.machine_id, r.ran, r.input]));
+  assert.deepEqual(credit(b), [['o-1', b.host, 0, 7], ['r-1', b.host, 0, 100]], 'control: b files its copies under itself, as copies');
+  // The record logs: a's claim takes the message from b's copy, which b read first; b's copy takes nothing from a.
+  ms.carry(a, b);
+  b.catchUp();
+  ms.carry(b, a);
+  a.catchUp();
+  const split = [['o-1', b.host, 0, 7], ['r-1', a.host, 1, 100]];
+  for (const m of [a, b]) assert.deepEqual(credit(m), split, `${m.name}: the message is a's`);
+  // The usage pull: an OAK before this version sends no claim (a copy's, as far as c can tell), then b's copy, a's claim,
+  // and b's copy again.
+  c.use();
+  const { ran: _r, ...old } = fromA.messages[0];
+  const pull = (from, messages) => assert.ok(core.indexApplyUsageRecords({ ...from, messages }, { label: from === fromA ? 'a' : 'b', skewMs: 0 }));
+  pull(fromA, [old]);
+  assert.deepEqual(credit(c), [['r-1', a.host, 0, 100]], 'a record with no claim is a copy\'s');
+  pull(fromB, fromB.messages);
+  pull(fromA, fromA.messages);
+  pull(fromB, fromB.messages);
+  assert.deepEqual(credit(c), split, 'c: the message is a\'s');
+  // Every machine shows the same split, each message once; a copy no machine ran is no machine's.
+  for (const m of [a, b, c]) {
+    m.use();
+    const byMachine = core.queryIndex('usage', { window: 'week', by: 'machine', account: 'all' });
+    assert.deepEqual(byMachine.rows.map((r) => [r.key, r.tokens, r.label]), [[a.host, 110, m === a ? 'this machine' : 'a'], ['unknown', 7, 'unknown machine (copies)']], m.name);
+    assert.deepEqual(core.queryIndex('usage', { window: 'week', by: 'session', account: 'all' }).rows.map((r) => [r.machine, r.session]), [[a.host, 's-run'], ['unknown', 's-orphan']]);
+    const totals = m.db((db) => core.usageTotals(db, { fiveReset: null, weekReset: null }));
+    assert.equal(totals.five.tokens, 117, `${m.name}: each message once`);
+    assert.equal(core.othersMeasured(totals).machines, m === a ? 'unknown machine (copies)' : 'a, unknown machine (copies)', `${m.name}: the status line names them`);
+  }
+  // `oak usage --by machine`, as text and as JSON.
+  b.use();
+  const cli = path.resolve(__dirname, '../../cli/dist/index.js');
+  const usage = (...extra) => {
+    const r = cp.spawnSync(process.execPath, [cli, 'usage', '--window', 'week', '--by', 'machine', '--all-accounts', ...extra], { env: { ...process.env, OAK_NO_BACKGROUND: '1' }, encoding: 'utf8' });
+    assert.equal(r.status, 0, r.stderr);
+    return r.stdout;
+  };
+  assert.match(usage(), /^\s+7\s.*unknown machine \(copies\)$/m);
+  assert.deepEqual(JSON.parse(usage('--json')).rows.map((r) => [r.key, r.label]), [[a.host, 'a'], ['unknown', 'unknown machine (copies)']]);
+  // A larger snapshot from a copy still gives its tokens; the message stays a's.
+  c.use();
+  pull(fromB, [{ ...fromB.messages.find((x) => x.message_id === 'r-1'), input: 300 }]);
+  assert.deepEqual(credit(c)[1], ['r-1', a.host, 1, 300]);
+});
+
+test('usage: a message in a session two machines each ran (one resumed it there) counts toward the same one of them on both (0.11.0)', { skip }, (t) => {
+  const ms = machines(t, ['a', 'b']);
+  const { a, b } = ms;
+  const lines = [userAsk('on a'), turn('r-1', 600, { input_tokens: 100, output_tokens: 10 })];
+  a.transcript('s-run', lines);
+  b.transcript('s-run', lines);
+  a.catchUp();
+  b.catchUp();
+  ms.carry(a, b);
+  ms.carry(b, a);
+  a.catchUp();
+  b.catchUp();
+  const lower = a.host < b.host ? a.host : b.host;
+  for (const m of [a, b]) assert.deepEqual({ ...m.db((db) => one(db, "SELECT machine_id, ran FROM usage_messages WHERE message_id = 'r-1'")) }, { machine_id: lower, ran: 1 }, m.name);
+});
+
+test('usage: a copy of a session that is then resumed here claims all its messages, those read before as a copy\'s too, and its record log says so (0.11.0)', { skip }, (t) => {
+  const ms = machines(t, ['a', 'b']);
+  const { a, b } = ms;
+  const lines = [userAsk('elsewhere'), turn('l-1', 600, { input_tokens: 100, output_tokens: 10 })];
+  b.transcript('s-late', lines, undefined, { copy: true });
+  b.catchUp();
+  const credit = (m) => m.db((db) => rows(db, 'SELECT message_id, machine_id, ran FROM usage_messages ORDER BY message_id').map((r) => [r.message_id, r.machine_id === b.host ? 'b' : r.machine_id, r.ran]));
+  assert.deepEqual(credit(b), [['l-1', 'b', 0]], 'control: a copy');
+  ms.carry(b, a);
+  a.catchUp();
+  assert.deepEqual(credit(a), [['l-1', 'b', 0]], 'control: a copy on a');
+  // Resumed on b: Claude Code's folder of the session appears, and the transcript goes on.
+  b.transcript('s-late', [...lines, turn('l-2', 300, { input_tokens: 5, output_tokens: 1 })]);
+  b.catchUp();
+  assert.deepEqual(credit(b), [['l-1', 'b', 1], ['l-2', 'b', 1]]);
+  ms.carry(b, a);
+  a.catchUp();
+  assert.deepEqual(credit(a), [['l-1', 'b', 1], ['l-2', 'b', 1]]);
 });
 
 test('usage: the status line\'s readings, its spend ledger and the accounts go into the index, each reading once per time it was measured', { skip }, (t) => {
@@ -383,6 +483,15 @@ test('usage: `oak query usage` breaks a window down by machine, model, session, 
   const sum = core.queryIndex('usage', { since: '1d', by: 'agent', account: 'all' });
   assert.deepEqual([all.rows[0].tokens, Object.keys(all.rows[0]).includes('first_day')], [158, true], 'the rollup, in whole days');
   assert.deepEqual([sum.rows[0].tokens, Object.keys(sum.rows[0]).includes('first_ts')], [158, true], 'the messages, in a short span');
+  // The readout names the agents its rows add up: Claude's and Codex's together, unless --agent narrows them.
+  const cli = path.resolve(__dirname, '../../cli/dist/index.js');
+  const header = (...extra) => {
+    const r = cp.spawnSync(process.execPath, [cli, 'usage', '--window', 'all', '--by', 'agent', ...extra], { env: { ...process.env, OAK_NO_BACKGROUND: '1' }, encoding: 'utf8' });
+    assert.equal(r.status, 0, r.stderr);
+    return r.stdout.replace(/\x1b\[[0-9;]*m/g, '').split('\n')[0];
+  };
+  assert.match(header(), /^usage · all · claude \+ codex · by agent /);
+  assert.match(header('--agent', 'claude'), /^usage · all · claude · by agent /);
 });
 
 test('usage: a Codex rollout\'s turns go into the index, priced under the provider that served them', { skip }, (t) => {
@@ -2288,8 +2397,8 @@ test('usage: a row a forget left without its session takes it back from a snapsh
   assert.ok(core.indexApplyUsageRecords(page({ ...msg, input: 10 }), { label: 'a', skewMs: 0 }));
   assert.deepEqual({ ...row() }, { machine_id: a.host, session_id: '', input: 100 }, 'a smaller snapshot takes nothing');
   // The same message in a session of another machine's (which this one's log would then leave out, and a machine that
-  // counted it from that log lose): it takes nothing either.
-  assert.ok(core.indexApplyUsageRecords({ ...page({ ...msg, session_id: 's-c' }), host: c.host, hosts: [c.host] }, { label: 'c', skewMs: 0 }));
+  // counted it from that log lose), a copy of it there: it takes nothing either.
+  assert.ok(core.indexApplyUsageRecords({ ...page({ ...msg, session_id: 's-c', ran: 0 }), host: c.host, hosts: [c.host] }, { label: 'c', skewMs: 0 }));
   assert.deepEqual({ ...row() }, { machine_id: a.host, session_id: '', input: 100 }, 'another machine\'s snapshot takes nothing');
   assert.ok(core.indexApplyUsageRecords(page(msg), { label: 'a', skewMs: 0 }));
   assert.deepEqual({ ...row() }, { machine_id: a.host, session_id: 's-x', input: 100 }, 'one as large of its machine takes the session back');

@@ -718,7 +718,75 @@ DELETE FROM ingest_state WHERE kind = 'records' AND machine_id NOT IN (SELECT ma
 const V8 = `ALTER TABLE delegated ADD COLUMN worktree_json TEXT;
 UPDATE delegated SET stamp = '';`;
 
-export const MIGRATIONS: readonly string[] = [V1, V2, V3, V4, V5, V6, V7, V8, V9];
+/** A message's day, kept apart by whether the machine ran the session (schema version 10). */
+const DAY_KEY_V10 = (row: string): string => `${DAY_KEY(row)} AND ran = ${row}.ran`;
+const DAY_ADD_V10 = (row: string, sign: '+' | '-'): string => DAY_ADD_V6(row, sign).replace(DAY_KEY(row), DAY_KEY_V10(row));
+const DAY_OPEN_V10 = (row: string): string => `INSERT INTO usage_daily (day, machine_id, ran, agent, account, model, top_tier)
+    SELECT strftime('%Y-%m-%d', ${row}.ts / 1000, 'unixepoch'), ${row}.machine_id, ${row}.ran, ${row}.agent, coalesce(${row}.account, ''), ${row}.model, ${row}.top_tier
+    WHERE NOT EXISTS (SELECT 1 FROM usage_daily WHERE ${DAY_KEY_V10(row)});`;
+const DAY_CLOSE_V10 = (row: string): string => `DELETE FROM usage_daily WHERE ${DAY_KEY_V10(row)} AND messages <= 0;`;
+
+/**
+ * Schema version 10: a message counts toward the machine that ran its session.
+ *
+ * - `usage_messages.ran`: 1 where the machine it is filed under ran the session (ingest.ts ranHere: Claude Code's own
+ *   folders of the session, or OAK's store of it, are there), 0 where that machine holds only a copy of the transcript
+ *   (one a file sync brought), or the record came from an OAK before this version. A claim to have run it takes the
+ *   message from a copy, whichever arrives first; a copy's message is named by no machine (usage.ts UNKNOWN_MACHINE).
+ *   Codex's rollouts are read only where Codex ran them: theirs are 1.
+ * - `usage_daily` keeps each day apart by it, built again from the messages.
+ *
+ * Each session's usage is looked at again, once: a session this machine ran has its transcripts read from their start,
+ * to claim their messages and publish the claim; a copy's, unchanged, reads nothing.
+ */
+const V10 = `
+DROP TRIGGER usage_messages_daily_ai;
+DROP TRIGGER usage_messages_daily_ad;
+DROP TRIGGER usage_messages_daily_au;
+ALTER TABLE usage_messages ADD COLUMN ran INTEGER NOT NULL DEFAULT 0;
+UPDATE usage_messages SET ran = 1 WHERE agent = 'codex';
+DROP TABLE usage_daily;
+CREATE TABLE usage_daily (
+  day TEXT NOT NULL,
+  machine_id TEXT NOT NULL,
+  ran INTEGER NOT NULL DEFAULT 0,
+  agent TEXT NOT NULL,
+  account TEXT NOT NULL DEFAULT '',
+  model TEXT NOT NULL DEFAULT '',
+  top_tier INTEGER NOT NULL DEFAULT 0,
+  messages INTEGER NOT NULL DEFAULT 0,
+  input INTEGER NOT NULL DEFAULT 0,
+  output INTEGER NOT NULL DEFAULT 0,
+  cache_create INTEGER NOT NULL DEFAULT 0,
+  cache_read INTEGER NOT NULL DEFAULT 0,
+  cost REAL NOT NULL DEFAULT 0,
+  cache_create_1h INTEGER NOT NULL DEFAULT 0,
+  cost_approx INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (day, machine_id, ran, agent, account, model)
+) STRICT;
+INSERT INTO usage_daily (day, machine_id, ran, agent, account, model, top_tier, messages, input, output, cache_create, cache_read, cost, cache_create_1h, cost_approx)
+  SELECT strftime('%Y-%m-%d', ts / 1000, 'unixepoch'), machine_id, ran, agent, coalesce(account, ''), model, max(top_tier), count(*), sum(input), sum(output),
+    sum(cache_create), sum(cache_read), total(cost), sum(coalesce(cache_create_1h, 0)), sum(cost_approx)
+  FROM usage_messages GROUP BY 1, machine_id, ran, agent, coalesce(account, ''), model;
+CREATE TRIGGER usage_messages_daily_ai AFTER INSERT ON usage_messages BEGIN
+  ${DAY_OPEN_V10('new')}
+  ${DAY_ADD_V10('new', '+')}
+END;
+CREATE TRIGGER usage_messages_daily_ad AFTER DELETE ON usage_messages BEGIN
+  ${DAY_ADD_V10('old', '-')}
+  ${DAY_CLOSE_V10('old')}
+END;
+CREATE TRIGGER usage_messages_daily_au AFTER UPDATE OF ts, machine_id, ran, agent, account, model, input, output, cache_create, cache_read, cost, cache_create_1h, cost_approx
+  ON usage_messages BEGIN
+  ${DAY_ADD_V10('old', '-')}
+  ${DAY_CLOSE_V10('old')}
+  ${DAY_OPEN_V10('new')}
+  ${DAY_ADD_V10('new', '+')}
+END;
+DELETE FROM ingest_state WHERE source LIKE 'unit:usage:%' OR source LIKE 'unit:deleted-usage:%';
+`;
+
+export const MIGRATIONS: readonly string[] = [V1, V2, V3, V4, V5, V6, V7, V8, V9, V10];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;
 
