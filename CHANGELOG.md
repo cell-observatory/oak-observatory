@@ -23,6 +23,15 @@ the release notes.
 - `oak usage --window` and `--since` say in their header which agents the rows count: `claude + codex` unless
   `--agent` narrows them. Without `--agent` the rows add Claude's and Codex's usage together, which overstates the
   usage that counts toward Claude's limits. `oak help` now lists `--since` and `--until`.
+- The Claude and GPT usage readouts no longer name machines. An account's shares belong to the account, whichever
+  machine read them, so the status line, the terminal app and the VS Code and JetBrains status bars, tooltips and
+  Stats panels show a saved machine's Claude reading without its name; the tooltips and Stats panels still say when it
+  was measured. When Claude's or GPT's estimates include the account's usage on other machines, the tooltips, the
+  Stats panels and the terminal app's usage bar on hover say so without listing them, and GPT's no longer read
+  "estimates include usage measured on this machine alone" when they do not. The "Usage received" line still names the
+  machines whose usage arrived. `oak usage --json` keeps its machine fields and adds `gptOthersMeasured`; its list of
+  the machines Claude's estimates include (`claudeMeasuredMachines`) leaves out copies that no machine claims, and
+  `gptMeasuredMachines` is unchanged.
 
 ### Fixed
 
@@ -30,7 +39,7 @@ the release notes.
   same split. When a file sync copied transcripts between machines, each message counted toward whichever machine
   read its copy first. A machine now claims a session when Claude Code's `session-env` or `file-history` folder for
   it, or OAK's store of it, is on that machine, and the claim travels in the record log and the usage pull. A copy
-  that no machine claims shows as `unknown machine (copies)` in `oak usage`, `oak query usage` and the status line.
+  that no machine claims shows as `unknown machine (copies)` in `oak usage` and `oak query usage`.
   Totals do not change. The database moves to schema 10 and reads every session's usage once more.
 - On Windows, `oak update` and `oak doctor --fix` upgrade herdr while its server is running. Windows does not let a
   running herdr.exe be replaced, so the old one stayed in place and the update still reported it as installed. OAK

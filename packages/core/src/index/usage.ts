@@ -35,7 +35,7 @@ export function codexWindowTotals(db: DatabaseSync, monthStart: number, weekStar
       { machine_id: string; model: string; provider: string | null; moTok: number; moReads: number; moUsd: number; weekTok: number }[];
   const labels = new Map((db.prepare('SELECT machine_id, coalesce(saved_label, label, machine_id) AS label FROM machines').all() as
     { machine_id: string; label: string }[]).map((r) => [r.machine_id, r.label]));
-  const totals = { moTok: 0, moReads: 0, moUsd: 0, moUsdKnown: true, weekTok: 0, measuredMachines: '', budgetScope: '', localEquivalent: false, usageFreshness: usageFreshness(db, now) };
+  const totals = { moTok: 0, moReads: 0, moUsd: 0, moUsdKnown: true, weekTok: 0, measuredMachines: '', othersMeasured: false, budgetScope: '', localEquivalent: false, usageFreshness: usageFreshness(db, now) };
   for (const r of rows) {
     totals.moTok += r.moTok; totals.moReads += r.moReads; totals.moUsd += r.moUsd; totals.weekTok += r.weekTok;
     const model = r.provider && r.provider !== 'openai' ? `provider:${r.provider}/${r.model}` : r.model;
@@ -49,6 +49,9 @@ export function codexWindowTotals(db: DatabaseSync, monthStart: number, weekStar
   // from local readings (as before 0.11) still stands in for a week with no sample.
   const self = new Set(selfIds(db));
   totals.localEquivalent = [...labels.keys()].every((id) => self.has(id));
+  // Whether the estimates add any other machine's turns: what the readouts say, naming no machine, since the shares are
+  // the account's. measuredMachines names them for the JSON alone.
+  totals.othersMeasured = machines.some((id) => !self.has(id));
   totals.moUsd = Math.round(totals.moUsd * 1e8) / 1e8;
   return totals;
 }
@@ -500,9 +503,10 @@ export function machineReadingEntries(db: DatabaseSync): MachineUsageEntry[] {
 
 /** What the other machines whose rows a window counts measured in it (UsageWindowTotals.others), in the shape the status
  *  line and the readouts' tooltips take it (observe.ts UsageLine.machineMeasured): per window, their tokens, cache
- *  reads and spend (the month's at list price), the window, and which machines; null when no other machine counts. */
+ *  reads and spend (the month's at list price), the window, and which machines; null when no other machine counts. The
+ *  name list leaves out the copies no machine claims (UNKNOWN_MACHINE), whose usage the sums still count. */
 export function othersMeasured(t: UsageTotals): UsageLineMeasured {
-  const names = new Map([...t.machines.map((m): [string, string] => [m.machine, m.label ?? m.machine]), [UNKNOWN_MACHINE, UNKNOWN_LABEL]]);
+  const names = new Map(t.machines.map((m): [string, string] => [m.machine, m.label ?? m.machine]));
   const hosts = (w: UsageWindowTotals): string => [...w.others.machines].sort().join(',');
   const any = (w: UsageWindowTotals): boolean => w.others.machines.length > 0;
   if (!any(t.five) && !any(t.week) && !any(t.month)) return null;
@@ -512,7 +516,7 @@ export function othersMeasured(t: UsageTotals): UsageLineMeasured {
     week: any(t.week) && t.week.reset !== null ? { tok: t.week.others.tokens, reads: t.week.others.cacheRead, cost: t.week.others.spend, fable: t.week.others.topTier.tokens,
       fableReads: t.week.others.topTier.cacheRead, reset: t.week.reset, hosts: hosts(t.week) } : null,
     month: any(t.month) ? { tok: t.month.others.tokens, reads: t.month.others.cacheRead, cost: t.month.others.cost, start: t.month.start, reset: t.month.end, hosts: hosts(t.month) } : null,
-    machines: [...all].sort().map((h) => plainLabel(names.get(h) ?? h)).join(', '),
+    machines: [...all].filter((h) => h !== UNKNOWN_MACHINE).sort().map((h) => plainLabel(names.get(h) ?? h)).join(', '),
   };
 }
 

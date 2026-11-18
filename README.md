@@ -67,7 +67,7 @@ end is not review. OAK keeps you **in the loop on every edit**, deciding one cha
 - **Usage at a glance** — the Usage bars show your Claude plan's 5-hour and weekly usage and your Codex rate
   limits, read on each machine for itself; where this machine has no current reading of your Claude
   account's shares, they show a saved machine's reading of the same account (with no Claude Code login
-  here, of the one account the saved machines name) and name that machine. The token and dollar
+  here, of the one account the saved machines name), naming no machine: the shares are the account's. The token and dollar
   estimates count each message of the account once, across this machine and every machine whose usage
   the local database holds (brought by `oak sync`, or read from each saved machine over SSH every five
   minutes), so machines of one account show the same budgets and month. An account with no five-hour
@@ -278,7 +278,7 @@ are saved in herdr (`oak machine add`), and OAK reads a saved machine by running
 over SSH (`--machine`, and the Observatory's automatic reads listed under Notes). Usage is measured
 on each machine for itself; where this machine has no current reading of the Claude account's 5-hour or
 weekly share, the readouts show a saved machine's reading of the same account (with no Claude Code login
-here, of the one account the saved machines name) and name it, and the token and dollar estimates count
+here, of the one account the saved machines name), naming no machine, since the shares are the account's, and the token and dollar estimates count
 each message of the account once across the machines whose usage the local database holds. See
 [remote development](docs/REMOTE.md).
 

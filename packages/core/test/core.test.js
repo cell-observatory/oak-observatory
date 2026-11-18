@@ -3441,7 +3441,8 @@ test('observe: a window this machine has no current share of shows a saved machi
   assert.equal(u.machineNote, 'build-box');
   assert.equal(u.rollingLimits, true);
   const brief = core.usageBrief(h.cwd);
-  assert.deepStrictEqual([brief.claude.five.pct, brief.claude.week.pct, brief.claude.month.pct, brief.claude.machine], [1, 22, 2, 'build-box'], 'the terminal app\'s readout carries it too');
+  assert.deepStrictEqual([brief.claude.five.pct, brief.claude.week.pct, brief.claude.month.pct], [1, 22, 2], 'the terminal app\'s readout carries it too');
+  assert.doesNotMatch(JSON.stringify(brief), /build-box/, 'and names no machine: the shares are the account\'s');
   // Another account's reading is never this account's.
   h.store(h.machine('build-box', {}, 'acct-2'));
   assert.deepStrictEqual([core.usageLine(h.cwd, 'nosession').fiveHourPct, core.usageLine(h.cwd, 'nosession').machineNote], [0, '']);
@@ -4092,14 +4093,12 @@ test('observe: the status bars name only the windows they show, so a per-model c
   assert.equal(u.machineNote, 'build-box: fable', 'the Stats panels, which show the cap, name it');
   assert.equal(u.machineTipNote, 'build-box: fable', 'and so do the bars\' tooltips');
   assert.equal(u.machineBarNote, '', 'the bars, which do not, name no machine');
-  assert.equal(core.usageBrief(h.cwd).claude.machine, '', 'nor does the terminal app\'s bar');
   // Every window a bar shows from the machine and the cap this machine's own: the bars name the machine alone.
   h.local({ fable_pct: 4, fable_at: h.nowS - 30, fable_reset: h.nowS + 86400, fable_label: 'Fable' });
   h.store(h.machine('build-box', { fable: cap }));
   const bars = core.usageLine(h.cwd, 'nosession');
   assert.deepStrictEqual([bars.fiveMachine, bars.weekMachine, bars.monthMachine, bars.fablePct, bars.fableMachine], ['build-box', 'build-box', 'build-box', 4, null], 'control: the cap is this machine\'s');
-  assert.deepStrictEqual([bars.machineNote, bars.machineBarNote, bars.machineTipNote, core.usageBrief(h.cwd).claude.machine],
-    ['build-box: 5h wk mo', 'build-box', 'build-box: wk mo', 'build-box']);
+  assert.deepStrictEqual([bars.machineNote, bars.machineBarNote, bars.machineTipNote], ['build-box: 5h wk mo', 'build-box', 'build-box: wk mo']);
 });
 
 test('machine usage: a refresh records how each machine answered, keeping one sanitized line at most, and oak doctor says why one gave no reading', async () => {
@@ -4561,7 +4560,7 @@ test('machine usage: a machine\'s label shows without its control, bidirectional
   const hidden = `\u001b\u0007\t${HIDDEN_ALL}`;
   assert.equal(core.plainLabel(`build${hidden}-box`), 'build-box', 'each of them dropped');
   assert.equal(core.plainLabel('gpu été 中 \u{1f680}'), 'gpu été 中 \u{1f680}', 'control: what a person reads stays');
-  assert.equal(new RegExp(core.PLAIN_LABEL_SOURCE, 'gu')[Symbol.replace](`a${hidden}b`, ''), 'ab', 'the class VS Code\'s webviews take is the same');
+  assert.equal(new RegExp(core.PLAIN_LABEL_SOURCE, 'gu')[Symbol.replace](`a${hidden}b`, ''), 'ab', 'the class PLAIN_LABEL_SOURCE exports is the same');
   for (const text of HIDDEN_KEPT) assert.equal(new RegExp(core.PLAIN_LABEL_SOURCE, 'gu')[Symbol.replace](text, ''), text, `…and keeps ${JSON.stringify(text)}`);
   // The zero-width joiner stays: an emoji family or an Indic letter is built with it, and it reorders nothing.
   const family = 'lab \u{1F9D1}\u200d\u{1F4BB} \u{1F468}\u200d\u{1F469}\u200d\u{1F467}';
@@ -4569,8 +4568,8 @@ test('machine usage: a machine\'s label shows without its control, bidirectional
   const label = 'build\u202excod\u202c-\u200bbox\u2066\u2069';
   h.store({ ...h.machine('x'), label });
   const u = core.usageLine(h.cwd, 'nosession');
-  assert.deepStrictEqual([u.fiveMachine, u.weekMachine, u.monthMachine, u.machineNote, u.machineBarNote, core.usageBrief(h.cwd).claude.machine],
-    ['buildxcod-box', 'buildxcod-box', 'buildxcod-box', 'buildxcod-box', 'buildxcod-box', 'buildxcod-box']);
+  assert.deepStrictEqual([u.fiveMachine, u.weekMachine, u.monthMachine, u.machineNote, u.machineBarNote],
+    ['buildxcod-box', 'buildxcod-box', 'buildxcod-box', 'buildxcod-box', 'buildxcod-box']);
   h.store({ ...h.machine('x'), label: family });
   assert.equal(core.usageLine(h.cwd, 'nosession').machineNote, family, 'a label with an emoji family is named whole');
   // A label with nothing left to show is named by its target, cleaned the same way.
@@ -25058,7 +25057,7 @@ test('statusline: an account with no five-hour limit draws no 5h segment, on the
   const mixed = rigAccount(rig, none);
   assert.deepStrictEqual([mixed.fiveHourPct, mixed.fiveMachine, mixed.fiveNoneAt], [1, 'build-box', null], 'control: core takes the saved machine\'s newer answer');
   const shown = rig.render(state, idle, none, oakStandIn(rig, { sessionTokens: null, claudeAccount: mixed }).env);
-  assert.match(vis(shown.line), /^\(build-box: 5h\) {2}5h +~12k\/1\.2M +1% ·3h 0m {2}wk /, `core's reading draws that machine's share — got ${JSON.stringify(vis(shown.line))}`);
+  assert.match(vis(shown.line), /^5h +~12k\/1\.2M +1% ·3h 0m {2}wk /, `core's reading draws that machine's share — got ${JSON.stringify(vis(shown.line))}`);
   assert.equal(rig.port(), shown.line, 'the terminal app draws the same line');
   assert.match(vis(rig.render(state, idle, none).line), /^wk /, 'control: with no oak, none');
   const older = { ...mixed };
@@ -25241,7 +25240,7 @@ function staleLaptopCache(nowS) {
 /** A cache as two renders wrote it, without what differs between any two: when each wrote, and the ledger's times. */
 const cacheFields = (c) => ({ ...c, ts: 0, costs: Object.fromEntries(Object.entries(c.costs || {}).map(([k, v]) => [k, { ...v, at: 0 }])) });
 
-test('statusline: a window this machine has no current share of draws the saved machine\'s reading OAK shows, named, and records none of it (2026-10-22)', (t) => {
+test('statusline: a window this machine has no current share of draws the saved machine\'s reading OAK shows, names no machine, and records none of it (2026-10-22)', (t) => {
   // The user's laptop: its sessions idle (no rate_limits), its own account pull unable to read a login, its cached
   // shares sixteen days old. OAK's readouts there showed the account's 5h, weekly and Fable shares from a saved machine
   // of the same account, and named it, while this line drew `5h 0%` and `wk —`, although the `oak usage` call it makes
@@ -25263,12 +25262,13 @@ test('statusline: a window this machine has no current share of draws the saved 
   // No oak: this machine's own readings, as before.
   const own = rig.render(state, idle, cache);
   assert.match(vis(own.line), /^5h +~0\/6M +0% {2}wk — {2}mo +~0\/128\.5M +0% ·20d 0h$/, `no oak — got ${JSON.stringify(vis(own.line))}`);
-  // With oak: what core shows, from the one call the line already makes, under one dim name ahead of the windows.
+  // With oak: what core shows, from the one call the line already makes. No machine is named: the shares are the account's.
   const oak = oakStandIn(rig, { sessionTokens: { input: 0, output: 0, cacheRead: 0, total: 0 }, claudeAccount: account, claudeMachineNote: account.machineNote });
   const lent = rig.render(state, idle, cache, oak.env);
-  assert.match(vis(lent.line), /^\(build-box\) {2}5h +~12k\/1\.2M +1% ·3h 0m {2}fable +~400k\/10M +4% ·2d 0h {2}wk +~30M\/100M \+90M↺ +30% ·2d 0h {2}mo +~2M\/100M \+5M↺ +2% ·9d 0h$/,
+  assert.match(vis(lent.line), /^5h +~12k\/1\.2M +1% ·3h 0m {2}fable +~400k\/10M +4% ·2d 0h {2}wk +~30M\/100M \+90M↺ +30% ·2d 0h {2}mo +~2M\/100M \+5M↺ +2% ·9d 0h$/,
     `the saved machine's shares, countdowns and figures, beside this machine's own cache reads as core keeps them — got ${JSON.stringify(vis(lent.line))}`);
-  assert.ok(lent.line.startsWith('\x1b[2m(build-box)\x1b[0m  '), `the name is dim, as on OAK's bars — got ${JSON.stringify(lent.line.slice(0, 30))}`);
+  assert.doesNotMatch(vis(lent.line), /build-box|\(/, `no machine is named, as on OAK's bars — got ${JSON.stringify(vis(lent.line))}`);
+  assert.equal(rig.port(), lent.line, 'the terminal app draws the same line, naming no machine');
   assert.deepEqual(oak.calls(), ['usage --session s'], 'one oak process: the call each render already made');
   // Recorded: none of it. The cache is the one the line writes with no oak, and its shares, stamps and resets are this
   // machine's as they were, so the brief it gives the other machines reports its own measurements alone.
@@ -25307,7 +25307,7 @@ test('statusline: a saved machine\'s reading never calibrates the estimate (2026
   assert.deepStrictEqual(without.slice(0, 5), [60000, 300000, 60000, 300000, 100000], 'control: with no oak, nothing calibrates');
   const lent = rig.render(state, idle, staleLaptopCache(nowS), oakStandIn(rig, { sessionTokens: null, claudeAccount: account }).env);
   // eslint-disable-next-line no-control-regex
-  assert.match(lent.line.replace(/\x1b\[[0-9;]*m/g, ''), /^\(build-box\) {2}5h .* 1% .*fable .* 4% .*wk .* 30% /, 'control: the render drew the saved machine\'s shares');
+  assert.match(lent.line.replace(/\x1b\[[0-9;]*m/g, ''), /^5h .* 1% .*fable .* 4% .*wk .* 30% /, 'control: the render drew the saved machine\'s shares');
   assert.deepStrictEqual(cal(), without, 'and calibrated exactly what it calibrates with no oak');
 });
 
@@ -25426,7 +25426,7 @@ test('statusline: a narrow pane compacts the line before it wraps it, never cuts
   assert.equal(vis(alone.rows[1]), 'Opus 5 · high · think · Explanatory · ↑1.2M ↓84k ↺41M · ◷1h02m · 84k/200k 42%', 'and its tokens unlabelled');
 });
 
-test('statusline: a saved machine named for the week lends the week and its month, named with them, and the line keeps its own ended 5h window (2026-10-22)', (t) => {
+test('statusline: a saved machine named for the week lends the week and its month, drawn with them, and the line keeps its own ended 5h window (2026-10-22)', (t) => {
   const rig = quotaLineRig();
   if (!rig) return t.skip('python3 or jq is not installed');
   const nowS = Math.floor(Date.now() / 1000);
@@ -25444,8 +25444,8 @@ test('statusline: a saved machine named for the week lends the week and its mont
   const r = rig.render(state, idle, cache, oak.env);
   // eslint-disable-next-line no-control-regex
   const vis = (s) => s.replace(/\x1b\[[0-9;]*m/g, '');
-  assert.match(vis(r.line), /^\(build-box: wk mo\) {2}5h +~0\/6M +0% {2}wk +~30M\/100M \+90M↺ +30% ·2d 0h {2}mo +~2M\/100M \+5M↺ +2% ·9d 0h$/,
-    `the 5h window ended here (0%, no countdown), the week and month from the saved machine, named — got ${JSON.stringify(vis(r.line))}`);
+  assert.match(vis(r.line), /^5h +~0\/6M +0% {2}wk +~30M\/100M \+90M↺ +30% ·2d 0h {2}mo +~2M\/100M \+5M↺ +2% ·9d 0h$/,
+    `the 5h window ended here (0%, no countdown), the week and month from the saved machine — got ${JSON.stringify(vis(r.line))}`);
   assert.deepStrictEqual([r.after.five_pct, r.after.five_at, r.after.week_pct, r.after.week_at, r.after.week_tok], [95, nowS - 3 * 3600, 70, nowS - 16 * 86400, 0],
     'the cache keeps this machine\'s own');
   assert.equal(rig.port(), r.line, 'the terminal app draws the same line, byte for byte');
@@ -25454,26 +25454,29 @@ test('statusline: a saved machine named for the week lends the week and its mont
     assert.match(cp.spawnSync(b32, ['-c', 'printf %s "$BASH_VERSION"'], { encoding: 'utf8' }).stdout, /^3\.2\./, 'control: the shell below is bash 3.2');
     assert.equal(rig.render(state, idle, cache, oak.env, b32).line, r.line, 'bash 3.2 draws the same line');
   }
-  // Two saved machines, one window each: each machine named with its windows, on the line and in the terminal app.
+  // Two saved machines, one window each: each window drawn from its machine, and neither named, on the line and in the
+  // terminal app.
   seedMachines(rig, savedMachine('box-a', { week: null, fable: null, month: null }), savedMachine('box-b', { five: null, fable: null }));
   const two = rigAccount(rig, cache);
   assert.equal(two.machineNote, 'box-a: 5h; box-b: wk mo', 'control: core names both');
   const r2 = rig.render(state, idle, cache, oakStandIn(rig, { sessionTokens: null, claudeAccount: two }).env);
-  assert.match(vis(r2.line), /^\(box-a: 5h; box-b: wk mo\) {2}5h +~12k\/1\.2M +1% ·3h 0m {2}wk /, `got ${JSON.stringify(vis(r2.line))}`);
-  assert.equal(rig.port(), r2.line, 'the terminal app names them the same way');
-  // A name is drawn without control characters, which would break the line's read or reach the terminal: core drops
-  // them from a machine's label, and the line does not rely on it.
+  assert.match(vis(r2.line), /^5h +~12k\/1\.2M +1% ·3h 0m {2}wk /, `got ${JSON.stringify(vis(r2.line))}`);
+  assert.doesNotMatch(vis(r2.line), /box-a|box-b/, `got ${JSON.stringify(vis(r2.line))}`);
+  assert.equal(rig.port(), r2.line, 'the terminal app draws them the same way');
+  // A name with control characters in it breaks neither the line's read nor the terminal: core drops them from a
+  // machine's label, and the line, which draws no name, does not rely on it.
   const r3 = rig.render(state, idle, cache, oakStandIn(rig, { sessionTokens: null, claudeAccount: { ...two, fiveMachine: 'box\n\u001b[2J-a\u0007' } }).env);
   // eslint-disable-next-line no-control-regex
   assert.doesNotMatch(r3.line.replace(/\x1b\[[0-9;]*m/g, ''), /[\x00-\x1f\x7f]/, `no control character reaches the line — got ${JSON.stringify(r3.line)}`);
-  assert.match(vis(r3.line), /^\(box\[2J-a: 5h; box-b: wk mo\) {2}5h +~12k\/1\.2M +1% ·3h 0m {2}wk +~30M\/100M /, 'and every field after the name is read where it was');
+  assert.match(vis(r3.line), /^5h +~12k\/1\.2M +1% ·3h 0m {2}wk +~30M\/100M /, 'and every field after the name is read where it was');
+  assert.doesNotMatch(vis(r3.line), /box/, `got ${JSON.stringify(vis(r3.line))}`);
 });
 
 test('statusline: a share this render measured within five minutes stands over a saved machine\'s that core named before it was recorded (2026-10-22)', (t) => {
   // core reads the cache before this render writes it: on the first render after this machine's session replies, it
   // still names the saved machine for windows this render has just measured. Core keeps this machine's share while it
   // is under five minutes old, and so does the line; the month goes with the week. The per-model cap this render did
-  // not measure is the saved machine's, named alone, and once this render's shares are recorded the terminal app
+  // not measure is the saved machine's, drawn from it, and once this render's shares are recorded the terminal app
   // draws the same line.
   const rig = quotaLineRig();
   if (!rig) return t.skip('python3 or jq is not installed');
@@ -25488,7 +25491,7 @@ test('statusline: a share this render measured within five minutes stands over a
   const r = rig.render(state, active, staleLaptopCache(nowS), oakStandIn(rig, { sessionTokens: null, claudeAccount: account }).env);
   // eslint-disable-next-line no-control-regex
   const vis = (s) => s.replace(/\x1b\[[0-9;]*m/g, '');
-  assert.match(vis(r.line), /^\(build-box: fable\) {2}5h +~420k\/6M +7% ·4h 0m {2}fable +~400k\/10M +4% ·2d 0h {2}wk +~9\.9M\/30M \+90M↺ +33% ·2d 0h {2}mo +~0\/128\.5M +0% ·20d 0h$/,
+  assert.match(vis(r.line), /^5h +~420k\/6M +7% ·4h 0m {2}fable +~400k\/10M +4% ·2d 0h {2}wk +~9\.9M\/30M \+90M↺ +33% ·2d 0h {2}mo +~0\/128\.5M +0% ·20d 0h$/,
     `this render's 5h and week, its own month, the saved machine's cap — got ${JSON.stringify(vis(r.line))}`);
   assert.deepStrictEqual([r.after.five_pct, r.after.five_at, r.after.week_pct, r.after.week_at], [7, nowS - 20, 33, nowS - 20], 'recorded as this machine\'s, dated by the reply');
   assert.equal(rig.port(), r.line, 'the terminal app, reading what this render recorded, draws the same line');
@@ -25514,8 +25517,8 @@ test('statusline: a share this machine measured hours ago inside its window give
   const r = rig.render(state, idle, cache, oakStandIn(rig, { sessionTokens: null, claudeAccount: account }).env);
   // eslint-disable-next-line no-control-regex
   const vis = (s) => s.replace(/\x1b\[[0-9;]*m/g, '');
-  assert.match(vis(r.line), /^\(build-box: wk mo\) {2}5h +~720k\/6M +12% ·4h 0m {2}wk +~30M\/100M \+90M↺ +30% ·2d 0h {2}mo +~2M\/100M \+5M↺ +2% ·9d 0h$/,
-    `this machine's live 5h, the saved machine's week and month, named — got ${JSON.stringify(vis(r.line))}`);
+  assert.match(vis(r.line), /^5h +~720k\/6M +12% ·4h 0m {2}wk +~30M\/100M \+90M↺ +30% ·2d 0h {2}mo +~2M\/100M \+5M↺ +2% ·9d 0h$/,
+    `this machine's live 5h, the saved machine's week and month — got ${JSON.stringify(vis(r.line))}`);
   assert.deepStrictEqual([r.after.week_pct, r.after.week_at], [22, nowS - 3 * 3600], 'the cache keeps this machine\'s own week');
   assert.equal(rig.port(), r.line, 'the terminal app draws the same line, byte for byte');
 });
@@ -25540,7 +25543,7 @@ test('statusline: a saved machine\'s later week replaces this machine\'s live sh
     rate_limits: { seven_day: { used_percentage: 81, resets_at: nowS + 2 * 86400 + 30 } } };
   const r = rig.render(state, active, cache, oakStandIn(rig, { sessionTokens: null, claudeAccount: rigAccount(rig, cache) }).env);
   assert.equal(rig.port(), r.line, `the later week, as the terminal app draws it after this render — got ${JSON.stringify(vis(r.line))}`);
-  assert.match(vis(r.line), /^\(build-box: wk\) {2}5h — {2}wk +~2M\/100M \+90M↺ +2% ·6d 23h /, `got ${JSON.stringify(vis(r.line))}`);
+  assert.match(vis(r.line), /^5h — {2}wk +~2M\/100M \+90M↺ +2% ·6d 23h /, `got ${JSON.stringify(vis(r.line))}`);
   assert.deepStrictEqual([r.after.week_pct, r.after.week_at], [81, nowS - 20], 'the cache keeps this machine\'s own share, dated by the reply');
   // A 5h share of 0 with no reset known, measured a minute ago.
   seedMachines(rig, savedMachine('build-box', { week: null, fable: null, month: null }));
@@ -25550,7 +25553,7 @@ test('statusline: a saved machine\'s later week replaces this machine\'s live sh
   assert.deepStrictEqual([account.fiveHourPct, account.fiveMachine], [1, 'build-box'], 'control: core shows the saved machine\'s running 5h window');
   const r2 = rig.render(state, idle, none, oakStandIn(rig, { sessionTokens: null, claudeAccount: account }).env);
   assert.equal(rig.port(), r2.line, `the saved machine's running window, as the terminal app draws it — got ${JSON.stringify(vis(r2.line))}`);
-  assert.match(vis(r2.line), /^\(build-box: 5h\) {2}5h +~12k\/1\.2M +1% ·3h 0m /, `got ${JSON.stringify(vis(r2.line))}`);
+  assert.match(vis(r2.line), /^5h +~12k\/1\.2M +1% ·3h 0m /, `got ${JSON.stringify(vis(r2.line))}`);
 });
 
 /** The two machines of the case the user hit, on one Claude account, each a status line rig with its own transcripts,
@@ -25674,7 +25677,7 @@ test('statusline: two machines on one account calibrate their estimates against 
   const coreSays = (m) => two.as(m, () => { const u = core.usageLine(m.rig.home, ''); return [u.fiveTotal, u.weekTotal, u.monthTokens, u.monthTokensTotal, u.monthCost, u.monthCostTotal]; });
   assert.deepStrictEqual(coreSays(lap), coreSays(big), 'core reads the same figures on both');
   assert.deepStrictEqual([two.as(lap, () => core.usageLine(lap.rig.home, '').machineMeasured.machines), two.as(big, () => core.usageLine(big.rig.home, '').machineMeasured.machines)],
-    ['build-box', 'laptop'], 'and names the machine whose usage they include');
+    ['build-box', 'laptop'], 'and the JSON lists the machine whose usage they include');
   assert.equal(two.as(lap, () => lap.rig.port()), l2.line, 'the terminal app draws the line the shell drew');
   const b32 = bash32();
   if (b32) {

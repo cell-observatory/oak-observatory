@@ -1594,12 +1594,14 @@ test('extension: three views, click commands, inline annotations, chat, status s
       vm.runInContext(scripts[scripts.length - 1][1], sandbox);
       return { elFor, listener };
     };
-    await t.test('GPT Stats names the database union and fallback', () => {
-    for (const machines of ['work-box, build-box', 'this machine alone']) {
+    // GPT's shares are the account's: the Stats note says the estimates include other machines' usage and names none,
+    // whatever the message also carries (an older extension host's gptMeasuredMachines).
+    await t.test('GPT Stats says the estimates include other machines, naming none', () => {
+    for (const others of [true, false]) {
       const { elFor, listener } = usageView('gpt');
       listener({ data: { type: 'usage', u: { gptWeekPct: 20, gptMonthTok: 10_000_000, gptMonthTokTotal: 88_571_429,
-        gptMonthCost: 17.535, gptMeasuredMachines: machines } } });
-      assert.equal(elFor('ulast').textContent, 'estimates include usage measured on '+machines);
+        gptMonthCost: 17.535, gptOthersMeasured: others, gptMeasuredMachines: 'work-box, build-box' } } });
+      assert.equal(elFor('ulast').textContent, others ? 'estimates include the account’s usage on other machines' : '');
       assert.equal(elFor('up-mo').textContent, '11%');
     }
     });
@@ -1661,27 +1663,27 @@ test('extension: three views, click commands, inline annotations, chat, status s
       if (u.rollingLimits === false && u.monthCost == null) assert.equal(elFor('ul-$').parentElement.style.display, 'none', `${utab}: no $ row without a spend`);
       // Its figures are OAK's, priced from the cycle's tokens: the row says they are an estimate at today's list prices.
       if (u.rollingLimits === false && u.monthCost != null) assert.match(elFor('ul-$').parentElement.title, /estimated from its tokens at today’s API list prices/, `${utab}: the $ row says it is an estimate`);
-      // The section's stamp: the cache's last refresh, and the saved machine a reading came from.
-      listener({ data: { type: 'usage', u: { ...u, cachedAtMs: Date.now(), machineNote: 'build-box' } } });
-      // GPT's figures are always this machine's own, so its tab's stamp names none.
-      if (utab === 'claude') assert.match(elFor('ulast').textContent, /^updated \S.* · measured on build-box$/, 'claude: the stamp names the saved machine');
-      else assert.match(elFor('ulast').textContent, /^updated \S[^·]*$/, 'gpt: the stamp, naming no machine');
-      // With when that machine measured the reading (two days ago here, so with its date), and with no control,
-      // bidi or zero-width characters from its herdr label.
+      // The section's stamp: the cache's last refresh, and when a saved machine measured a reading (two days ago here,
+      // so with its date). The shares are the account's, so it names no machine, whatever its herdr label holds.
       const machineAt = Date.now() - 2 * 86400_000;
-      listener({ data: { type: 'usage', u: { ...u, cachedAtMs: Date.now(), machineNote: 'build\u001b[2J\u202e\u200b\u2066box\u2069\u200e\ufeff\u0007\t', machineAt } } });
-      if (utab === 'claude') assert.equal(elFor('ulast').textContent.replace(/^updated [^·]* · /, ''), `measured on build[2Jbox at ${core.relTime(machineAt)}`,
-        'claude: when the saved machine measured it, and its label as plain text');
-      const family = 'lab \u{1F468}\u200d\u{1F469}\u200d\u{1F467}';
-      listener({ data: { type: 'usage', u: { ...u, cachedAtMs: Date.now(), machineNote: family, machineAt } } });
-      if (utab === 'claude') assert.equal(elFor('ulast').textContent.replace(/^updated [^·]* · /, ''), `measured on ${family} at ${core.relTime(machineAt)}`,
-        'claude: an emoji family in the label keeps its joiners');
+      for (const machineNote of ['build-box', 'build\u001b[2J\u202e\u200b\u2066box\u2069\u200e\ufeff\u0007\t', 'lab \u{1F468}\u200d\u{1F469}\u200d\u{1F467}', 'build-box: wk; lab-box: mo']) {
+        listener({ data: { type: 'usage', u: { ...u, cachedAtMs: Date.now(), machineNote, machineAt } } });
+        // GPT's figures are always this machine's own, so its tab's stamp has no time measured.
+        if (utab === 'claude') assert.equal(elFor('ulast').textContent.replace(/^updated [^·]* · /, ''), `measured at ${core.relTime(machineAt)}`,
+          `claude: when the saved machine measured it, naming no machine (${JSON.stringify(machineNote)})`);
+        else assert.match(elFor('ulast').textContent, /^updated \S[^·]*$/, 'gpt: the stamp, naming no machine');
+        assert.doesNotMatch(elFor('ulast').textContent, /box|lab/, `${utab}: no machine named`);
+      }
       listener({ data: { type: 'usage', u: { ...u, cachedAtMs: Date.now(), machineNote: '' } } });
-      assert.doesNotMatch(elFor('ulast').textContent, /measured on/, `${utab}: this machine's own reading names none`);
-      // The saved machines whose own usage the estimates add to this machine's are named too, on the claude tab only.
-      listener({ data: { type: 'usage', u: { ...u, cachedAtMs: Date.now(), machineNote: '', machineMeasured: { five: null, week: null, month: null, machines: 'build-box, lab\u202e-box' } } } });
-      if (utab === 'claude') assert.match(elFor('ulast').textContent, /^updated \S.* · estimates include usage measured on build-box, lab-box$/, 'claude: the stamp names the machines the estimates include');
-      else assert.doesNotMatch(elFor('ulast').textContent, /estimates include/, 'gpt: its estimates are this machine\'s own');
+      assert.doesNotMatch(elFor('ulast').textContent, /measured/, `${utab}: this machine's own reading has no time measured`);
+      // Whether the estimates add the account's usage on other machines, on the claude tab only, naming none: even when
+      // the only other usage is the copies no machine claims (machines '').
+      for (const machines of ['build-box, lab\u202e-box', '']) {
+        listener({ data: { type: 'usage', u: { ...u, cachedAtMs: Date.now(), machineNote: '', machineMeasured: { five: null, week: null, month: null, machines } } } });
+        if (utab === 'claude') assert.match(elFor('ulast').textContent, /^updated \S.* · estimates include the account’s usage on other machines$/, 'claude: the stamp says the estimates include other machines');
+        else assert.doesNotMatch(elFor('ulast').textContent, /estimates include/, 'gpt: its estimates are this machine\'s own');
+        assert.doesNotMatch(elFor('ulast').textContent, /box/, `${utab}: no machine named`);
+      }
     }
     // With no rolling windows the month row says whose turns it counts: this machine's, and those of the saved machines
     // whose bill cycle the month adds up.
@@ -1691,7 +1693,7 @@ test('extension: three views, click commands, inline annotations, chat, status s
       assert.equal(elFor('ul-mo').parentElement.title, 'tokens this bill cycle, measured on this machine');
       listener({ data: { type: 'usage', u: { rollingLimits: false, monthTokens: 1200000, monthTokensTotal: null,
         machineMeasured: { five: null, week: null, month: { tok: 1, reads: 0, cost: 0, start: 1, reset: 2, hosts: 'b16b16b16b16' }, machines: 'build-box' } } } });
-      assert.equal(elFor('ul-mo').parentElement.title, 'tokens this bill cycle, measured on this machine and on build-box');
+      assert.equal(elFor('ul-mo').parentElement.title, 'tokens this bill cycle, measured on this machine and on the account’s other machines');
     }
     // A window at 0% with a budget reads ~0 against it in the used column, as the status line and the terminal app
     // read ~0/<budget>; the columns were empty (2026-10-20). One at 0% with no budget leaves them empty, and a share
@@ -3348,7 +3350,20 @@ esac\nexit 0\n`, { mode: 0o755 });
               await commands['claudeObservatory.usageRefresh']();
               const union = gptSlots().find((i) => i.visible && i.text.startsWith('mo: '));
               assert.match(union.text, /~\$28$/);
-              assert.match(String(union.tooltip), /estimates include usage measured on .*build-box/);
+              // The union includes build-box's turns: the tooltip says the estimates include other machines, naming
+              // none (only the freshness stamp says whose records arrived).
+              const tip = String(union.tooltip), readout = tip.split('\n').filter((l) => !l.startsWith('Usage received: ')).join('\n');
+              assert.ok(tip.includes('\nestimates include the account’s usage on other machines\n'), tip);
+              assert.doesNotMatch(readout, /build-box/);
+              // …and so does the GPT Stats tab, from what the extension posts it.
+              const before = stView.webview.postMessage, got = [];
+              stView.webview.postMessage = (m) => got.push(m);
+              try { stProvider.postUsage(); } finally { stView.webview.postMessage = before; }
+              const u = got.find((m) => m.type === 'usage').u, { elFor, listener } = usageView('gpt');
+              listener({ data: { type: 'usage', u } });
+              const note = elFor('ulast').textContent;
+              assert.ok(note.includes('estimates include the account’s usage on other machines'), note);
+              assert.doesNotMatch(u.gptUsageFreshness ? note.replace(u.gptUsageFreshness, '') : note, /build-box/);
               assert.doesNotMatch(String(union.tooltip), /local tokens|calendar month/);
             } finally {
               const db = core.openIndex();
@@ -3448,7 +3463,8 @@ esac\nexit 0\n`, { mode: 0o755 });
         assert.deepEqual(row('wk').slice(0, 2), ['22%', ''], 'the week row stays');
       }
       // This machine's shares are last week's, and a saved machine of the same account read the account a minute
-      // ago (the cache `oak usage --pull-machines` writes): the bar shows that reading and names the machine.
+      // ago (the cache `oak usage --pull-machines` writes): the bar shows that reading, and nothing names the machine
+      // (the shares are the account's).
       {
         const store = path.join(home, '.claude', 'claude-observatory', 'remote-cache', 'machine-usage.json');
         const account = path.join(home, '.claude.json');
@@ -3465,48 +3481,47 @@ esac\nexit 0\n`, { mode: 0o755 });
         fs.writeFileSync(store, machines('build-box'));
         // The oldest window's time, to the minute and with its date, as the tooltip and the Stats stamp give it.
         const measured = core.relTime(weekAt).replace(/^(\d\d:\d\d):\d\d$/, '$1');
+        // The tooltip's account readout: all but the line that says when each machine's usage arrived (core
+        // usageFreshness), which is about the machines, not the account's shares.
+        const readout = (tip) => String(tip).split('\n').filter((l) => !l.startsWith('Usage received: ')).join('\n');
         try {
           await commands['claudeObservatory.usageRefresh']();
-          assert.deepEqual(claudeSlots().filter((i) => i.visible).map((i) => i.text.replace(/%.*$/, '%')), ['✳ (build-box)', 'wk: 22%'],
-            'the saved machine\'s reading, named beside the icon');
           assert.ok(!/^\d\d:\d\d$/.test(measured), `control: the week was measured on another day (${measured})`);
-          assert.ok(String(visibleUsage('wk').tooltip).includes(`\nmeasured on a saved machine signed in to the same Claude account (build-box) at ${measured}\n`),
-            `the tooltip says when that machine measured the oldest window shown, not this machine's cache time: ${visibleUsage('wk').tooltip}`);
-          // herdr's label is whatever was typed: on the bar `$(name)` would draw an icon, and ESC, BEL and TAB, bidi
-          // controls (which reorder the text around them) and zero-width characters pass through.
-          fs.writeFileSync(store, machines('$(alert)\u001b[2Jbox\u0007\t\u202e\u200b\u2066\u200f\ufeff$(x y)'));
-          await commands['claudeObservatory.usageRefresh']();
-          assert.equal(claudeSlots()[0].text, '✳ (\\$(alert)[2Jbox$(x y))', 'the bar escapes the icon syntax VS Code would draw and drops control, bidi and zero-width characters');
-          const labelTip = String(claudeSlots()[0].tooltip);
-          // eslint-disable-next-line no-control-regex
-          assert.ok(labelTip.includes(`account ($(alert)[2Jbox$(x y)) at ${measured}\n`) && !/[\u0000-\u0009\u000b-\u001f\u007f\u061c\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/.test(labelTip),
-            `the tooltip is plain text: control, bidi and zero-width characters dropped, nothing escaped: ${JSON.stringify(labelTip)}`);
-          // The zero-width joiner an emoji family is built with stays, on the bar and in the tooltip.
-          const family = 'lab \u{1F9D1}\u200d\u{1F4BB}';
-          fs.writeFileSync(store, machines(family));
-          await commands['claudeObservatory.usageRefresh']();
-          assert.equal(claudeSlots()[0].text, `✳ (${family})`, 'the bar keeps the family whole');
-          assert.ok(String(claudeSlots()[0].tooltip).includes(`account (${family}) at ${measured}\n`), 'and so does the tooltip');
-          // The per-model cap alone from the machine, beside this machine's own live week: the bar shows no cap,
-          // so it names no machine, and the tooltip, which shows the cap, names it with its window.
+          // Whatever herdr's label holds (`$(name)` icon syntax, ESC, BEL and TAB, bidi controls, zero-width characters,
+          // an emoji family), neither the bar nor the tooltip names the machine; the tooltip says when it measured the
+          // oldest window shown, not this machine's cache time.
+          for (const label of ['build-box', '$(alert)\u001b[2Jbox\u0007\t\u202e\u200b\u2066\u200f\ufeff$(x y)', 'lab \u{1F9D1}\u200d\u{1F4BB}']) {
+            fs.writeFileSync(store, machines(label));
+            await commands['claudeObservatory.usageRefresh']();
+            assert.deepEqual(claudeSlots().filter((i) => i.visible).map((i) => i.text.replace(/%.*$/, '%')), ['✳', 'wk: 22%'],
+              `the saved machine's reading, naming no machine beside the icon (${JSON.stringify(label)})`);
+            const tip = String(visibleUsage('wk').tooltip);
+            assert.ok(tip.includes(`\nmeasured on a saved machine signed in to the same Claude account at ${measured}\n`), `when it was measured: ${tip}`);
+            assert.doesNotMatch(readout(tip), /box|lab|alert/, `the tooltip's readout names no machine: ${tip}`);
+            assert.equal(String(claudeSlots()[0].tooltip), tip, 'the icon has the same tooltip');
+          }
+          // The per-model cap alone from the machine, beside this machine's own live week: the tooltip, which shows the
+          // cap, says when it was measured, naming no machine.
           const cap = { pct: 9, reset: weekReset * 1000, at: (sec - 60) * 1000, tok: null, total: null, label: 'Fable' };
           fs.writeFileSync(store, JSON.stringify({ ...JSON.parse(machines('build-box')), machines: [{ ...JSON.parse(machines('build-box')).machines[0],
             brief: { ...JSON.parse(machines('build-box')).machines[0].brief, five: null, week: null, fable: cap } }] }));
           fs.writeFileSync(cache, JSON.stringify({ v: 3, five_pct: 9, five_at: sec - 30, five_reset: sec + 3600, week_pct: 30, week_at: sec - 30, week_reset: weekReset }));
           await commands['claudeObservatory.usageRefresh']();
           assert.deepEqual(claudeSlots().filter((i) => i.visible).map((i) => i.text.replace(/%.*$/, '%')), ['✳', 'wk: 30%'], 'the bar names no machine');
-          assert.ok(String(visibleUsage('wk').tooltip).includes('\nmeasured on a saved machine signed in to the same Claude account (build-box: fable) at '),
-            `the tooltip names the cap's machine: ${visibleUsage('wk').tooltip}`);
+          assert.ok(String(visibleUsage('wk').tooltip).includes('\nmeasured on a saved machine signed in to the same Claude account at '),
+            `the tooltip says when the cap was measured: ${visibleUsage('wk').tooltip}`);
+          assert.doesNotMatch(readout(visibleUsage('wk').tooltip), /build-box/, 'naming no machine');
           // What the machine measured of its own turns in this machine's windows: the estimates add it, so the tooltip
-          // names the machine although the bar shows this machine's own shares.
+          // says so, naming no machine, although the bar shows this machine's own shares.
           const own = { host: 'b16b16b16b16', at: (sec - 120) * 1000, five: { tok: 3920000, reads: 0, cost: 60, reset: (sec + 3600) * 1000 },
             week: { tok: 15500000, reads: 0, cost: 400, reset: weekReset * 1000, fable: 0, fableReads: 0 }, month: null };
           fs.writeFileSync(store, JSON.stringify({ ...JSON.parse(machines('build-box')), machines: [{ ...JSON.parse(machines('build-box')).machines[0],
             brief: { ...JSON.parse(machines('build-box')).machines[0].brief, five: null, week: null, own } }] }));
           await commands['claudeObservatory.usageRefresh']();
           assert.deepEqual(claudeSlots().filter((i) => i.visible).map((i) => i.text.replace(/%.*$/, '%')), ['✳', 'wk: 30%'], 'the bar names no machine');
-          assert.ok(String(visibleUsage('wk').tooltip).includes('\nestimates include usage measured on build-box\n') && !String(visibleUsage('wk').tooltip).includes('measured on a saved machine'),
-            `the tooltip names the machine whose usage the estimates include: ${visibleUsage('wk').tooltip}`);
+          assert.ok(String(visibleUsage('wk').tooltip).includes('\nestimates include the account’s usage on other machines\n') && !String(visibleUsage('wk').tooltip).includes('measured on a saved machine'),
+            `the tooltip says the estimates include other machines: ${visibleUsage('wk').tooltip}`);
+          assert.doesNotMatch(readout(visibleUsage('wk').tooltip), /build-box/, 'naming none');
           fs.writeFileSync(cache, JSON.stringify({ v: 3, five_pct: 40, five_at: old, five_reset: old + 3600, week_pct: 70, week_at: old, week_reset: old + 86400 }));
           fs.writeFileSync(store, machines('build-box'));
           await commands['claudeObservatory.usageRefresh']();
@@ -3519,10 +3534,11 @@ esac\nexit 0\n`, { mode: 0o755 });
           // tooltip says it could not be matched.
           fs.writeFileSync(account, JSON.stringify({ numStartups: 1 }));
           await commands['claudeObservatory.usageRefresh']();
-          assert.deepEqual(claudeSlots().filter((i) => i.visible).map((i) => i.text.replace(/%.*$/, '%')), ['✳ (build-box)', 'wk: 22%'],
-            'no login here: the saved machine\'s reading, named');
-          assert.ok(String(visibleUsage('wk').tooltip).includes(`\nmeasured on a saved machine (build-box) at ${measured}; this machine has no Claude Code login to match its account with\n`),
+          assert.deepEqual(claudeSlots().filter((i) => i.visible).map((i) => i.text.replace(/%.*$/, '%')), ['✳', 'wk: 22%'],
+            'no login here: the saved machine\'s reading, naming no machine');
+          assert.ok(String(visibleUsage('wk').tooltip).includes(`\nmeasured on a saved machine at ${measured}; this machine has no Claude Code login to match its account with\n`),
             String(visibleUsage('wk').tooltip));
+          assert.doesNotMatch(readout(visibleUsage('wk').tooltip), /build-box/, 'the warning names no machine');
           fs.writeFileSync(account, JSON.stringify({ oauthAccount: { accountUuid: 'acct-1' } }));
           // The poll kicks the refresh that reads the saved machines: a detached `oak usage --pull-machines --if-due`,
           // claimed once a minute and only where herdr (and so a saved machine) can be. A fake oak records the run.
@@ -3565,7 +3581,7 @@ esac\nexit 0\n`, { mode: 0o755 });
               assert.deepEqual(claudeSlots().filter((i) => i.visible).map((i) => i.text), [], 'off: the saved machine\'s reading is not shown, and this machine\'s own has no week or month');
               fs.rmSync(prefs, { force: true });
               await commands['claudeObservatory.usageRefresh']();
-              assert.equal(claudeSlots()[0].text, '✳ (build-box)', 'control: on again, the reading is back');
+              assert.deepEqual(claudeSlots().filter((i) => i.visible).map((i) => i.text.replace(/%.*$/, '%')), ['✳', 'wk: 22%'], 'control: on again, the reading is back');
 
               // Windows' `oak.cmd`, run through cmd.exe, would start node in a console window of its own for as long as the
               // refresh runs, so the poll runs the script the shim names with the editor's own node, as it does a script

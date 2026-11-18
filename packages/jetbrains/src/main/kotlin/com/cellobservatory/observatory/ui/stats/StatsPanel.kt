@@ -2,7 +2,6 @@ package com.cellobservatory.observatory.ui.stats
 
 import com.cellobservatory.observatory.core.ObservatoryCli
 import com.cellobservatory.observatory.services.ObservatoryService
-import com.cellobservatory.observatory.ui.plainLabel
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 import com.intellij.ide.util.PropertiesComponent
@@ -90,16 +89,18 @@ private data class Usage(
     /** Whose tokens the measured figures are: "here", "2 machines", "2 machines (1 unreachable)". */
     val usageScope: String?,
     val statuslineCache: Boolean, val cachedAtMs: Long?, val staleMs: Long,
-    /** The saved machine(s) the claude figures came from (core's machineNote); null for this machine. */
+    /** The saved machine(s) the claude figures came from (core's machineNote); null for this machine. Only whether
+     *  there is one is shown: the shares are the account's. */
     val machineNote: String? = null,
     /** When the oldest of those windows was measured there (epoch ms; core's machineAt). */
     val machineAt: Long? = null,
     /** A window shown is this machine's own (its fiveMachine, weekMachine or fableMachine is null). */
     val localShown: Boolean = false,
-    /** The saved machines whose own usage the estimates add to this machine's (core's machineMeasured); null when the
-     *  estimates are this machine's alone. */
-    val measuredMachines: String? = null,
-    val gptMeasuredMachines: String? = null,
+    /** The estimates add the account's usage on the saved machines to this machine's (core's machineMeasured); false
+     *  when they are this machine's alone. */
+    val othersMeasured: Boolean = false,
+    /** GPT's estimates add other machines' turns to this machine's (gptOthersMeasured). */
+    val gptOthersMeasured: Boolean = false,
     val usageFreshness: String? = null, val gptUsageFreshness: String? = null,
     /** null = nothing has reported yet; false = this plan has no rolling windows (Enterprise / API). */
     val rollingLimits: Boolean?, val localWindows: List<Pair<String, Double>>,
@@ -233,16 +234,16 @@ private fun spent(tok: Double?, pct: Double?): String = when {
     else -> ""
 }
 
-/** The usage section's note: the cache's last refresh, and, on the claude tab, the saved machine a reading came
- *  from when this machine had none current, with when that machine measured it, and the saved machines whose own
- *  usage the estimates add to this machine's (GPT names the machines its database totals include). */
+/** The usage section's note: the cache's last refresh, on the claude tab when a saved machine measured a reading this
+ *  machine had none current of, and whether the estimates add the account's usage on other machines, naming no
+ *  machine: the shares are the account's. */
 private fun usageStamp(u: Usage?, tab: String): String =
     listOfNotNull(
         u?.cachedAtMs?.let { "updated " + atTime(it) },
         if (tab == "gpt") u?.gptUsageFreshness else u?.usageFreshness,
-        u?.machineNote?.takeIf { tab != "gpt" }?.let { "measured on ${plainLabel(it)}" + (u.machineAt?.let { at -> " at ${atTime(at)}" } ?: "") },
-        u?.measuredMachines?.takeIf { tab != "gpt" }?.let { "estimates include usage measured on ${plainLabel(it)}" },
-        u?.gptMeasuredMachines?.takeIf { tab == "gpt" }?.let { "estimates include usage measured on ${plainLabel(it)}" },
+        u?.machineNote?.takeIf { tab != "gpt" }?.let { u.machineAt }?.let { "measured at ${atTime(it)}" },
+        "estimates include the account’s usage on other machines"
+            .takeIf { (if (tab == "gpt") u?.gptOthersMeasured else u?.othersMeasured) == true },
     ).joinToString(" · ")
 
 /** Stale stamp + credit note, drawn as one footnote line under the rows — they used to ride the
@@ -735,7 +736,7 @@ class StatsPanel(private val project: Project) : JPanel(BorderLayout()), com.int
             gptWeekPct = num(o.get("gptWeekPct")), gptWeekReset = lng(o.get("gptWeekReset")),
             gptCtxPct = num(o.get("gptCtxPct")), gptCtxTokens = num(o.get("gptCtxTokens")), gptCtxSize = num(o.get("gptCtxSize")),
             gptWeekTok = num(o.get("gptWeekTok")), gptWeekTotal = num(o.get("gptWeekTotal")),
-            gptMeasuredMachines = o.get("gptMeasuredMachines")?.takeIf { it.isJsonPrimitive }?.asString,
+            gptOthersMeasured = o.get("gptOthersMeasured")?.takeIf { it.isJsonPrimitive }?.asBoolean == true,
             usageFreshness = account.get("usageFreshness")?.takeIf { it.isJsonPrimitive }?.asString,
             gptUsageFreshness = o.get("gptUsageFreshness")?.takeIf { it.isJsonPrimitive }?.asString,
             gptMonthReset = lng(o.get("gptMonthReset")),
@@ -761,8 +762,7 @@ class StatsPanel(private val project: Project) : JPanel(BorderLayout()), com.int
             localShown = listOf("five" to "fiveHourPct", "week" to "weekPct", "fable" to "fablePct").any { (w, pct) ->
                 num(account.get(pct)) != null && account.get("${w}Machine")?.takeIf { it.isJsonPrimitive } == null
             },
-            measuredMachines = account.get("machineMeasured")?.takeIf { it.isJsonObject }?.asJsonObject?.get("machines")
-                ?.takeIf { it.isJsonPrimitive }?.asString?.takeIf { it.isNotBlank() },
+            othersMeasured = account.get("machineMeasured")?.isJsonObject == true,
             staleMs = lng(o.get("staleMs")) ?: 300_000L,
             sessionTokens = tokens("sessionTokens"),
             sessionTreeTokens = tokens("sessionTreeTokens"),
@@ -830,9 +830,9 @@ private class FoldSection(key: String, private val title: String, body: List<JCo
         isOpaque = false
         alignmentX = LEFT_ALIGNMENT
     }
-    /** A dim note under the title (the usage section shows its last-updated time here, and the saved machines its
-     *  figures come from or include). It WRAPS at the section's width: as a label beside the title, the default dock
-     *  cut the machines' names off its end. */
+    /** A dim note under the title (the usage section shows its last-updated time here, when a saved machine measured
+     *  its figures, and what its estimates include). It WRAPS at the section's width: as a label beside the title, the
+     *  default dock cut its end off. */
     private val noteLabel = com.intellij.ui.components.JBTextArea().apply {
         isEditable = false
         isFocusable = false

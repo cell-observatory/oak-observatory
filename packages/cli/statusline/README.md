@@ -41,9 +41,8 @@ the `statusline-last.json` it writes.
   (`packages/core/src/pricing.ts`), so a model OAK cannot price adds nothing, and prices 5-minute and 1-hour
   cache writes each at its own rate. Where this machine has no
   current reading of a window, the line draws the saved machine's reading of the same account that OAK's
-  own readouts show, taken from the `oak usage` call it already makes, and names that machine in a dim
-  label ahead of the windows (`(build-box)`, or `(build-box: wk mo)` when only some came from it); it
-  records none of that reading in `statusline-last.json`, and none of it calibrates the token estimate.
+  own readouts show, taken from the `oak usage` call it already makes, drawn as this machine's own would be
+  and naming no machine, since the shares are the account's; it records none of that reading in `statusline-last.json`, and none of it calibrates the token estimate.
   The token and dollar estimates calibrate against the account's measured usage, once a scan interval: the
   account's totals for the 5-hour, weekly and bill-cycle windows that the same `oak usage` call carries
   from OAK's local database (`usageTotals`, each message once across every machine whose usage the database

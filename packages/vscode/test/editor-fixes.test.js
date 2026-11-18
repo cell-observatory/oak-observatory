@@ -346,7 +346,7 @@ test('A file\'s hidden characters show as marks in the review bubble, the Feed\'
 
 // More characters a webview draws as nothing or as a blank (the soft hyphen, the Hangul fillers) and the tag characters,
 // which spell out text no one sees unless they finish a flag: each shows as its mark in the bubble, the deletion ghost and
-// the Feed, a tag's with five digits, and the usage view drops each from a machine's label. A flag and Hangul stay.
+// the Feed, a tag's with five digits. A flag and Hangul stay.
 test('The soft hyphen, the Hangul fillers and stray tag characters show as marks, and the flags and Hangul stay', () => {
   const core = require('../../core/dist');
   const consts = {};
@@ -376,12 +376,6 @@ test('The soft hyphen, the Hangul fillers and stray tag characters show as marks
   const feed = view.el('tl-feed').innerHTML;
   for (const mark of marks) assert.ok(feed.includes(`<span class="tlf-hid">${mark}</span>`), `${mark} shows, dimmed, in the Feed: ${feed}`);
   assert.ok(feed.includes(scotland), 'and the flag stays');
-  // The usage view's machine label: core's class, which needs the u flag.
-  const decl = /function plainLabel\(s\)\{ return String\(s\)\.replace\(\/\$\{core\.PLAIN_LABEL_SOURCE\}\/(\w*),''\); \}/.exec(source);
-  assert.ok(decl, 'the usage view cleans a machine\'s label with core\'s class');
-  const label = vm.runInNewContext(`(function plainLabel(s){ return String(s).replace(/${core.PLAIN_LABEL_SOURCE}/${decl[1]},''); })`);
-  assert.equal(label(`build${hidden.join('')}-box`), 'build-box');
-  assert.equal(label(`box ${scotland} \ud55c\uad6d`), `box ${scotland} \ud55c\uad6d`);
 });
 
 test('Windows plugin PATH includes the herdr executable directory', () => {

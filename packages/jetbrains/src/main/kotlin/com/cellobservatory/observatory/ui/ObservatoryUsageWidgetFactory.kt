@@ -49,19 +49,18 @@ internal data class UsageSnap(
     /** The month's dollar figure as every status bar shows it after the month's reset (core's monthUsd): `~$13`
      *  estimated at list prices, `$13` where it is the charge Claude Code reported; null with no reading. */
     val monthUsd: String? = null, val gptMonthUsd: String? = null,
-    /** The saved machine(s) the claude windows the bar shows came from, wk and mo (core's machineBarNote); null for
-     *  this machine. The per-model cap is the tooltip's alone, so a cap from a saved machine names nothing on the bar. */
-    val machineBarNote: String? = null,
-    /** The same over the windows the tooltip shows, wk, the per-model cap and mo (core's machineTipNote). */
+    /** The saved machine(s) the windows the tooltip shows came from, wk, the per-model cap and mo (core's
+     *  machineTipNote); null for this machine. Only whether there is one is shown: the shares are the account's. */
     val machineTipNote: String? = null,
     /** True when this machine has no Claude Code login to match that machine's account against. */
     val machineUnmatched: Boolean = false,
     /** When the oldest of the tooltip's windows was measured there (epoch ms; core's machineTipAt). */
     val machineTipAt: Long? = null,
-    /** The saved machines whose own usage the estimates add to this machine's (core's machineMeasured), for the
-     *  tooltip; null when the estimates are this machine's alone. */
-    val measuredMachines: String? = null,
-    val gptMeasuredMachines: String? = null,
+    /** The estimates add the account's usage on the saved machines to this machine's (core's machineMeasured, which
+     *  `oak usage --json` carries in claudeAccount); false when they are this machine's alone. */
+    val othersMeasured: Boolean = false,
+    /** GPT's estimates add other machines' turns to this machine's (gptOthersMeasured). */
+    val gptOthersMeasured: Boolean = false,
     val usageFreshness: String? = null, val gptUsageFreshness: String? = null,
 )
 
@@ -85,12 +84,11 @@ internal fun parseUsageSnap(json: String): UsageSnap? = try {
         monthCostTotal = num("claudeMonthCostTotal"),
         monthPct = num("claudeMonthPct"), monthReset = lng("claudeMonthReset"),
         monthUsd = str("claudeMonthUsd"), gptMonthUsd = str("gptMonthUsd"),
-        machineBarNote = str("claudeMachineBarNote"),
         machineTipNote = str("claudeMachineTipNote"),
         machineUnmatched = o.get("claudeMachineUnmatched")?.takeIf { it.isJsonPrimitive }?.asBoolean == true,
         machineTipAt = lng("claudeMachineTipAt"),
-        measuredMachines = str("claudeMeasuredMachines"),
-        gptMeasuredMachines = str("gptMeasuredMachines"),
+        othersMeasured = o.get("claudeAccount")?.takeIf { it.isJsonObject }?.asJsonObject?.get("machineMeasured")?.isJsonObject == true,
+        gptOthersMeasured = o.get("gptOthersMeasured")?.takeIf { it.isJsonPrimitive }?.asBoolean == true,
         usageFreshness = str("claudeUsageFreshness"), gptUsageFreshness = str("gptUsageFreshness"),
     )
 } catch (_: Exception) {
@@ -207,13 +205,11 @@ private class UsageWidget(private val project: Project) : CustomStatusBarWidget 
             (if (u.isNotEmpty()) " <font color='${fgHex()}'>$u</font>" else "")
     }
 
-    private fun agentHtml(icon: String, iconHex: String, chunks: List<String>, machine: String? = null): String {
+    private fun agentHtml(icon: String, iconHex: String, chunks: List<String>): String {
         val live = chunks.filter { it.isNotEmpty() }
         if (live.isEmpty()) return ""
         val sep = " <font color='${greyHex()}'>·</font> "
-        // A saved machine's reading names that machine beside the icon, as the terminal app's bar does.
-        val from = machine?.let { " <font color='${greyHex()}'>(${escHtml(plainLabel(it))})</font>" } ?: ""
-        return "<html><font color='$iconHex'>$icon</font>$from " + live.joinToString(sep) + "</html>"
+        return "<html><font color='$iconHex'>$icon</font> " + live.joinToString(sep) + "</html>"
     }
 
     private fun tipLine(label: String, pct: Double?, reset: Long?, est: Double?, tot: Double?): String {
@@ -244,11 +240,11 @@ private class UsageWidget(private val project: Project) : CustomStatusBarWidget 
             "<font color='${greyHex()}'>mo:</font> <font color='${fgHex()}'>${escHtml(s.monthUsd)}</font>"
         else if (s != null) withUsd(chunk("mo", s.monthPct, s.monthReset), s.monthUsd) else ""
         // wk · mo, as the TUI's one-line readout and the VS Code status bar show them. The account's
-        // per-model weekly cap (its "Fable" row) has no chunk: the tooltip names it.
+        // per-model weekly cap (its "Fable" row) has no chunk: the tooltip names it. A saved machine's reading of the
+        // account names no machine: the shares are the account's.
         val claude = if (s == null) "" else agentHtml(
             "✳", "#D97757",
             listOf(chunk("wk", s.weekPct, s.weekReset), moChunk),
-            s.machineBarNote,
         )
         // gpt's month now mirrors claude's: when core reports an allowance (gptMonthTokTotal), show a
         // % via the SAME chunk() helper — same threshold colors, same reset formatting — as every other
@@ -284,14 +280,15 @@ private class UsageWidget(private val project: Project) : CustomStatusBarWidget 
                 tipLine(s.fableLabel ?: "Fable", s.fablePct, s.fableReset, null, null) +
                 tipLine("mo", s.monthPct, s.monthReset, null, null) +
                 spent(s.monthUsd, s.monthCostTotal) +
-                // When it was measured there: a machine that stops answering keeps its last reading, however old.
+                // When it was measured there: a machine that stops answering keeps its last reading, however old. The
+                // shares are the account's, so no machine is named.
                 (s.machineTipNote?.let {
                     val at = s.machineTipAt?.let { ms -> " at ${com.cellobservatory.observatory.ui.stats.atTime(ms)}" } ?: ""
-                    if (s.machineUnmatched) "<br>measured on a saved machine (${escHtml(plainLabel(it))})$at; this machine has no Claude Code login to match its account with"
-                    else "<br>measured on a saved machine signed in to the same Claude account (${escHtml(plainLabel(it))})$at"
+                    if (s.machineUnmatched) "<br>measured on a saved machine$at; this machine has no Claude Code login to match its account with"
+                    else "<br>measured on a saved machine signed in to the same Claude account$at"
                 } ?: "") +
-                // The saved machines whose own usage the estimates and the month add to this machine's.
-                (s.measuredMachines?.let { "<br>estimates include usage measured on ${escHtml(plainLabel(it))}" } ?: "") +
+                // Whether the estimates and the month add the account's usage on other machines.
+                (if (s.othersMeasured) "<br>estimates include the account’s usage on other machines" else "") +
                 (s.usageFreshness?.let { "<br>${escHtml(it)}" } ?: "") +
                 "<br>Click for the Stats panel.</html>"
         }
@@ -301,7 +298,7 @@ private class UsageWidget(private val project: Project) : CustomStatusBarWidget 
             (if (s != null) tipLine("wk", s.gptWeekPct, s.gptWeekReset, null, null) else "") +
             (if (s?.gptMonthTok != null) "<br>mo ${human(s.gptMonthTok)} tokens · bill cycle · ${until(s.gptMonthReset)}" else "") +
             (s?.gptMonthUsd?.let { "<br>mo ${escHtml(it)} spent, estimated at today’s API list prices" } ?: "") +
-            (s?.gptMeasuredMachines?.let { "<br>estimates include usage measured on ${escHtml(plainLabel(it))}" } ?: "") +
+            (if (s?.gptOthersMeasured == true) "<br>estimates include the account’s usage on other machines" else "") +
             (s?.gptUsageFreshness?.let { "<br>${escHtml(it)}" } ?: "") +
             "<br>Click for the Stats panel.</html>"
         claudeBox.isVisible = claude.isNotEmpty()

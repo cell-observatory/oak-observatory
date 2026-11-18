@@ -6624,18 +6624,20 @@ function cmdUsage(args: string[]): void {
     claudeMonthReset: acct.monthReset,
     claudeWeekTokens: acct.weekTokens,
     claudeWeekTotal: acct.weekTotal,
-    // The saved machine(s) the claude* figures came from, every window's; '' for this one.
+    // The saved machine(s) the claude* figures came from, every window's; '' for this one. JSON only: the shares are
+    // the account's, so no readout names a machine.
     claudeMachineNote: acct.machineNote,
-    // …and the same over the windows the JetBrains widget's bar shows (wk, mo), for the bar itself to name.
+    // …and the same over the windows a status bar shows (wk, mo).
     claudeMachineBarNote: acct.machineBarNote,
-    // …and over the windows its tooltip shows (wk, the per-model cap, mo), for the tooltip to name.
+    // …and over the windows its tooltip shows (wk, the per-model cap, mo), which the tooltip's "measured at" keys on.
     claudeMachineTipNote: acct.machineTipNote,
     // …and true when this machine has no Claude Code login to match that machine's account against.
     claudeMachineUnmatched: acct.machineUnmatched,
     // …and when the oldest of those windows was measured there (epoch ms), every window's and the tooltip's.
     claudeMachineAt: acct.machineAt,
     claudeMachineTipAt: acct.machineTipAt,
-    // The saved machines whose own usage the estimates add to this machine's ('' for none), for the widget's tooltip.
+    // The saved machines whose own usage the estimates add to this machine's ('' for none, or for copies no machine
+    // claims), JSON only; the widget's tooltip says only that the estimates include other machines (claudeAccount).
     claudeMeasuredMachines: acct.machineMeasured?.machines ?? '',
     claudeUsageFreshness: acct.usageFreshness ?? '',
     gptFivePct: gpt?.fivePct ?? null,
@@ -6655,7 +6657,10 @@ function cmdUsage(args: string[]): void {
     gptMonthCost: gpt?.monthCost ?? null,
     gptMonthCostTotal: gpt?.monthCostTotal ?? null,
     gptMonthUsd: gpt ? core.monthUsd(gpt) : null,
+    // The machines whose turns GPT's estimates count, JSON only; the readouts say only whether they include another
+    // machine (gptOthersMeasured), since the shares are the account's.
     gptMeasuredMachines: gpt?.measuredMachines ?? null,
+    gptOthersMeasured: gpt?.othersMeasured ?? false,
     gptUsageSource: gpt?.usageSource ?? null,
     gptUsageFreshness: gpt?.usageFreshness ?? '',
     sessionTokens: core.sessionUsage(process.cwd(), sid),

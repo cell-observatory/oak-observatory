@@ -2482,20 +2482,21 @@ export interface UsageLine {
    *  {label:"+50%", dates:"5/13-9/13"}. The budgets shown already INCLUDE its extra tokens. */
   promo: { label: string; dates: string } | null;
   /** The saved machine whose reading of the same Claude account a window shows (machine-usage.ts), by its
-   *  herdr label; null when the window is this machine's own reading. */
+   *  herdr label; null when the window is this machine's own reading. The shares are the account's, so no readout
+   *  names the machine: the status line reads these as "this window is a saved machine's reading". */
   fiveMachine: string | null;
   weekMachine: string | null;
   fableMachine: string | null;
   monthMachine: string | null;
-  /** What the readouts print to name them: '' when every window shown is this machine's own, the machine's
-   *  label when every one came from it, else each machine with its windows (`build-box: 5h wk`). The Stats
-   *  panels print this one: they show every window. */
+  /** Which machines the windows shown came from, for `oak usage --json` (no readout prints it): '' when every
+   *  window shown is this machine's own, the machine's label when every one came from it, else each machine with
+   *  its windows (`build-box: 5h wk`). The Stats panels key their "measured at" time on it: they show every window. */
   machineNote: string;
   /** machineNote over the windows the status bars show (wk, mo), which leave the per-model cap to their
-   *  tooltips: a bar names no window it does not show, so a cap alone from a saved machine names none there. */
+   *  tooltips. */
   machineBarNote: string;
   /** machineNote over the windows the status bars' tooltips show (wk, the per-model cap, mo): no bar shows the
-   *  5-hour window, in its text or its tooltip. */
+   *  5-hour window, in its text or its tooltip. The tooltips key their "measured at" time on it. */
   machineTipNote: string;
   /** True when a saved machine's reading is shown although this machine has no Claude Code login to match its
    *  account against: it stands for the one account the saved machines name, and the tooltips say so. */
@@ -2503,7 +2504,7 @@ export interface UsageLine {
   /** When the oldest window shown from a saved machine was measured there (epoch ms, read by this machine's
    *  clock: that machine's stamp less its clock's difference from this one); null when every window shown is
    *  this machine's own. A machine that stops answering keeps its last reading, so this, not this machine's
-   *  cache time, says how old a reading named by machineNote is. */
+   *  cache time, says how old a saved machine's reading is. */
   machineAt: number | null;
   /** machineAt over the windows machineTipNote names. */
   machineTipAt: number | null;
@@ -2514,8 +2515,9 @@ export interface UsageLine {
    * own few turns. Per window: the tokens, cache reads and spend of each machine whose figures count (the same account,
    * this machine's window, fresh; the week with the per-model cap's family), that window (`reset`, epoch ms; the month
    * by its bill cycle, `start` to `reset`), and which machines it holds (`hosts`, their sorted host hashes: the status
-   * line starts its smoothing over when they number more than any calibration held). `machines` names them for the
-   * readouts (`build-box, lab-box`). Null when none counts.
+   * line starts its smoothing over when they number more than any calibration held). `machines` lists their names for
+   * `oak usage --json` (`build-box, lab-box`), without the copies no machine claims; the readouts print no name and
+   * only say that the estimates include the account's usage on other machines. Null when none counts.
    */
   machineMeasured: {
     five: { tok: number; reads: number; cost: number; reset: number; hosts: string } | null;
@@ -3336,10 +3338,9 @@ export interface BriefWindow {
   usd?: string | null;
 }
 export interface UsageBrief {
-  /** `machine` names the saved machine(s) these windows came from, as UsageLine.machineBarNote; '' for this one. */
-  claude: { five: BriefWindow; week: BriefWindow; month: BriefWindow; machine: string; usageFreshness?: string };
+  claude: { five: BriefWindow; week: BriefWindow; month: BriefWindow; usageFreshness?: string };
   /** Absent when this machine has no codex/gpt usage at all. */
-  gpt: { five: BriefWindow; week: BriefWindow; month: BriefWindow; measuredMachines?: string; usageSource?: string; usageFreshness?: string } | null;
+  gpt: { five: BriefWindow; week: BriefWindow; month: BriefWindow; othersMeasured?: boolean; usageSource?: string; usageFreshness?: string } | null;
 }
 
 /** BOTH providers' 5h / week / month windows at once, for the terminal app's status readout (which
@@ -3364,13 +3365,13 @@ export function usageBrief(cwd: string): UsageBrief {
       five: { pct: u.fiveHourPct, resetMs: u.fiveReset },
       week: { pct: u.weekPct, resetMs: u.weekReset },
       month: { pct: claudeMonthPct, resetMs: u.monthReset ?? null, tok: u.monthTokens ?? null, usd: monthUsd(u) },
-      machine: u.machineBarNote, usageFreshness: u.usageFreshness,
+      usageFreshness: u.usageFreshness,
     },
     gpt: g ? {
       five: { pct: g.fivePct, resetMs: g.fiveReset },
       week: { pct: g.weekPct, resetMs: g.weekReset },
       month: { pct: gptMonthPct, resetMs: g.monthReset ?? null, tok: g.monthTok, usd: monthUsd(g) },
-      measuredMachines: g.measuredMachines, usageSource: g.usageSource, usageFreshness: g.usageFreshness,
+      othersMeasured: g.othersMeasured, usageSource: g.usageSource, usageFreshness: g.usageFreshness,
     } : null,
   };
 }

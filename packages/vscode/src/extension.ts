@@ -3086,13 +3086,12 @@ function combinedShell(): string {
       if(d.getFullYear()===n.getFullYear() && d.getMonth()===n.getMonth() && d.getDate()===n.getDate()) return p2(d.getHours())+':'+p2(d.getMinutes());
       if(d.getFullYear()===n.getFullYear()) return MN[d.getMonth()]+' '+d.getDate()+' '+p2(d.getHours())+':'+p2(d.getMinutes());
       return d.getFullYear()+'-'+p2(d.getMonth()+1)+'-'+p2(d.getDate()); }
-    // The cache's last refresh, and the saved machine a reading came from when this machine had none current, with
-    // when that machine measured it (its label with no control, bidirectional, zero-width or other hidden characters,
-    // the class core.plainLabel drops, which needs the u flag: it is herdr's, whatever was typed), and the saved
-    // machines whose own usage the estimates add to this machine's (core machineMeasured).
-    function plainLabel(s){ return String(s).replace(/${core.PLAIN_LABEL_SOURCE}/gu,''); }
-    function usageStamp(u){ return [u.cachedAtMs? 'updated '+atTime(u.cachedAtMs) : '', u.machineNote? 'measured on '+plainLabel(u.machineNote)+(u.machineAt? ' at '+atTime(u.machineAt) : '') : '',
-      u.machineMeasured && u.machineMeasured.machines ? 'estimates include usage measured on '+plainLabel(u.machineMeasured.machines) : '', u.usageFreshness || ''].filter(Boolean).join(' \u00b7 '); }
+    // The cache's last refresh; when a saved machine measured a reading this machine had none current of; and whether the
+    // estimates add the account's usage on other machines (core machineMeasured; GPT's gptOthersMeasured). The shares are
+    // the account's, so no machine is named.
+    function usageStamp(u){ return [u.cachedAtMs? 'updated '+atTime(u.cachedAtMs) : '', u.machineNote && u.machineAt ? 'measured at '+atTime(u.machineAt) : '',
+      u.machineMeasured ? 'estimates include the account’s usage on other machines' : '',
+      u.usageFreshness || ''].filter(Boolean).join(' \u00b7 '); }
     function renderUsage(u){ LASTU=u; var hint=document.getElementById('uhint');
       if(!u){ setRow('ctx',null); setRow('5h',null); setRow('wk',null); setRow('mo',null); setRow('$',null); var fb0=rowOf('fable'); if(fb0) fb0.style.display='none'; if(hint) hint.style.display='none'; return; }
       // One tab per subscription: gpt appears only when codex reports windows.
@@ -3123,7 +3122,7 @@ function combinedShell(): string {
         if(u.gptMonthCost) setRow('$', gmp, '~'+usd(u.gptMonthCost), u.gptMonthCostTotal? '~'+usd(u.gptMonthCostTotal):'', '');
         var prg=document.getElementById('upromo'); if(prg) prg.style.display='none';
         if(hint) hint.style.display='none';
-        var ulg=document.getElementById('ulast'); if(ulg) ulg.textContent = usageStamp({ cachedAtMs: u.cachedAtMs, machineMeasured: { machines: u.gptMeasuredMachines }, usageFreshness: u.gptUsageFreshness });
+        var ulg=document.getElementById('ulast'); if(ulg) ulg.textContent = usageStamp({ cachedAtMs: u.cachedAtMs, machineMeasured: u.gptOthersMeasured, usageFreshness: u.gptUsageFreshness });
         return;
       }
       var showC=['ctx','mo','$'];
@@ -3185,7 +3184,7 @@ function combinedShell(): string {
         // The month keeps its share wherever the statusline gave it a budget, as JetBrains' panel draws it (a
         // month measured at 0 reads 0%), and a month never measured shows no figure rather than ~0.
         setRow('mo', moPct, spent(u.monthTokens,moPct,u.monthTokensTotal), u.monthTokensTotal? humanTok(u.monthTokensTotal):'', u.monthReads? '+'+humanTok(u.monthReads)+'\u21ba':'');
-        var rmo=rowOf('mo'); if(rmo) rmo.title='tokens this bill cycle, measured on this machine'+(u.machineMeasured && u.machineMeasured.month ? ' and on '+plainLabel(u.machineMeasured.machines) : '');
+        var rmo=rowOf('mo'); if(rmo) rmo.title='tokens this bill cycle, measured on this machine'+(u.machineMeasured && u.machineMeasured.month ? ' and on the account’s other machines' : '');
         if(u.monthCost!=null){ setRow('$', dPct, '~'+usd(u.monthCost), u.monthCostTotal? '~'+usd(u.monthCostTotal):'', ''); var rd=rowOf('$'); if(rd) rd.title='this cycle’s cost, estimated from its tokens at today’s API list prices — not a bill'; }
         else { var rd0=rowOf('$'); if(rd0) rd0.style.display='none'; } // no spend: no row, rather than the last post's figures
         showCredits(u);
@@ -8105,7 +8104,7 @@ class StatsUsageViewProvider implements vscode.WebviewViewProvider {
               gptWeekTok: g.weekTok, gptWeekTotal: g.weekTotal,
               gptMonthStart: g.monthStart, gptMonthReset: g.monthReset,
               gptMonthTok: g.monthTok, gptMonthTokTotal: g.monthTokTotal, gptMonthReads: g.monthReads,
-              gptMonthCost: g.monthCost, gptMonthCostTotal: g.monthCostTotal, gptMeasuredMachines: g.measuredMachines, gptUsageSource: g.usageSource, gptUsageFreshness: g.usageFreshness }
+              gptMonthCost: g.monthCost, gptMonthCostTotal: g.monthCostTotal, gptOthersMeasured: g.othersMeasured, gptUsageSource: g.usageSource, gptUsageFreshness: g.usageFreshness }
           : u0;
       } catch { u = u0; }
     }
@@ -13067,12 +13066,6 @@ export function activate(context: vscode.ExtensionContext): void {
     win.show();
     return true;
   };
-  // A saved machine's label is herdr's, so whatever was typed into it: its control characters (ESC, BEL, TAB),
-  // bidirectional controls and zero-width characters are dropped wherever it is shown (core.plainLabel), and on
-  // the bar, which draws `$(name)` as an icon, that syntax is escaped. The tooltip is plain text (VS Code sets it as
-  // the hover's textContent), so an escape there would show.
-  const plainLabel = core.plainLabel;
-  const barLabel = (s: string): string => plainLabel(s).replace(/\$\((?=[A-Za-z0-9-]+(?:~[A-Za-z]+)?\))/g, '\\$(');
   // A clock time to the minute, with the date when it is not today (core.relTime keeps a same-day time's seconds).
   const usageAt = (ms: number): string => core.relTime(ms).replace(/^(\d\d:\d\d):\d\d$/, '$1');
   const usageTip = (label: string, pct: number | null, reset: number | null, est: number | null, tot: number | null): string => {
@@ -13132,12 +13125,13 @@ export function activate(context: vscode.ExtensionContext): void {
         (u.monthReads ? `\nmo cache reads +${usageHuman(u.monthReads)}\u21ba` : '') +
         (mu && !mu.startsWith('~') ? `\nmo ${mu} spent, as Claude Code reported it`
           : u.monthCost ? `\nmo ~${musd(u.monthCost)} spent${u.monthCostTotal ? ` of ~${musd(u.monthCostTotal)}` : ''}, estimated at today’s API list prices` : '') +
-        // When it was measured there: a machine that stops answering keeps its last reading, however old.
+        // When it was measured there: a machine that stops answering keeps its last reading, however old. The shares are
+        // the account's, so no machine is named.
         (!u.machineTipNote ? ''
-          : u.machineUnmatched ? `\nmeasured on a saved machine (${plainLabel(u.machineTipNote)})${u.machineTipAt ? ` at ${usageAt(u.machineTipAt)}` : ''}; this machine has no Claude Code login to match its account with`
-          : `\nmeasured on a saved machine signed in to the same Claude account (${plainLabel(u.machineTipNote)})${u.machineTipAt ? ` at ${usageAt(u.machineTipAt)}` : ''}`) +
-        // The saved machines whose own usage the estimates and the month add to this machine's.
-        (u.machineMeasured?.machines ? `\nestimates include usage measured on ${plainLabel(u.machineMeasured.machines)}` : '') +
+          : u.machineUnmatched ? `\nmeasured on a saved machine${u.machineTipAt ? ` at ${usageAt(u.machineTipAt)}` : ''}; this machine has no Claude Code login to match its account with`
+          : `\nmeasured on a saved machine signed in to the same Claude account${u.machineTipAt ? ` at ${usageAt(u.machineTipAt)}` : ''}`) +
+        // Whether the estimates and the month add the account's usage on other machines.
+        (u.machineMeasured ? '\nestimates include the account’s usage on other machines' : '') +
         (u.usageFreshness ? `\n${u.usageFreshness}` : '') +
         '\nClick for the Stats panel.';
       let shown = [
@@ -13155,9 +13149,8 @@ export function activate(context: vscode.ExtensionContext): void {
         shown = true;
       }
       if (shown) {
-        // A saved machine's reading is named beside the icon, as the terminal app's bar names it, by the windows the
-        // bar shows (machineBarNote): the per-model cap is the tooltip's, which machineNote names.
-        claudeIcon.text = u.machineBarNote ? `\u2733 (${barLabel(u.machineBarNote)})` : '\u2733';
+        // A saved machine's reading of the account names no machine, as on the terminal app's bar.
+        claudeIcon.text = '\u2733';
         claudeIcon.color = new vscode.ThemeColor('charts.orange');
         claudeIcon.tooltip = tip;
         claudeIcon.show();
@@ -13175,7 +13168,7 @@ export function activate(context: vscode.ExtensionContext): void {
         usageTip('wk', g?.weekPct ?? null, g?.weekReset ?? null, g?.weekTok ?? null, null) +
         (g?.monthTok != null ? `\nmo ${usageHuman(g.monthTok)} tokens · bill cycle · ${usageUntil(g.monthReset)}` : '') +
         (gusd ? `\nmo ${gusd} spent, estimated at today’s API list prices` : '') +
-        (g?.measuredMachines ? `\nestimates include usage measured on ${plainLabel(g.measuredMachines)}` : '') +
+        (g?.othersMeasured ? '\nestimates include the account’s usage on other machines' : '') +
         (g?.usageFreshness ? `\n${g.usageFreshness}` : '') +
         '\nClick for the Stats panel.';
       // wk · mo, the same windows claude shows; its 5h is the Stats panel's.

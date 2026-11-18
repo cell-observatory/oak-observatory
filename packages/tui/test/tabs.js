@@ -305,35 +305,9 @@ test('TUI usage: the month ends with its dollar figure, for Claude and GPT', () 
   assert.equal(usageRow(state)[0].trimEnd(), '✳ claude mo: $12');
 });
 
-// Where this machine had no current share, the readout is a saved machine's reading of the account, and says so.
-test('TUI usage: a reading from a saved machine names that machine after the provider, at every width', () => {
-  const now = Date.parse('2026-09-19T12:00:00Z');
-  const at = (ms) => tui.untilStr(ms, now);
-  const week = now + 2 * 86400000 + 5 * 3600000, month = now + 10 * 86400000;
-  const state = usageFixture();
-  assert.match(usageRow(state)[0], /^✳ claude wk: 71%/, 'control: this machine\'s own reading names no machine');
-  state.usageBoth.claude.machine = 'build-box';
-  assert.equal(usageRow(state)[0].trimEnd(), `✳ claude (build-box) wk: 71% ${at(week)} · mo: 50% ${at(month)}`);
-  assert.match(usageRow(state, 46)[0], /^✳ claude \(build-box\) wk: 71% · mo: 50% *$/, 'compacted, it keeps the name');
-  state.usageBoth.claude.machine = 'build-box: wk';
-  assert.match(usageRow(state)[0], /^✳ claude \(build-box: wk\) wk: 71% /, 'a machine that supplied some windows names them');
-  // Where the name and every window cannot share the row, the name gives up its room first: no window loses its
-  // share, with GPT's on the row too, and the reading still says it is another machine's.
-  state.usageBoth.claude.machine = 'gpu-build-server-in-the-basement-lab-rack-7';
-  for (const width of [40, 50]) {
-    const [row] = usageRow(state, width);
-    assert.match(row, /^✳ claude \(gpu-[^)]*\) wk: 71% · mo: 50% *$/, `${width} columns: ${row}`);
-  }
-  state.usageBoth.gpt = { five: { pct: 4, resetMs: null }, week: { pct: 37, resetMs: null }, month: { pct: 12, resetMs: null } };
-  for (const width of [64, 80]) {
-    const [row] = usageRow(state, width);
-    assert.match(row, /^✳ claude \(gpu-[^)]*\) wk: 71% · mo: 50%  \|  ⬡ gpt wk: 37% · mo: 12% *$/, `${width} columns: ${row}`);
-  }
-});
-
-// The bar shows wk and mo, and names a saved machine by those windows alone; the machine's herdr label shows
-// without its hidden characters. Drawn from core's own reading of a saved machine's cache, as the app reads it.
-test('TUI usage: the bar names a saved machine only for the windows it shows, by a label with nothing hidden in it', () => {
+// Where this machine has no current share, the bar shows a saved machine's reading of the account and names no machine:
+// the shares are the account's. Drawn from core's own reading of a saved machine's cache, as the app reads it.
+test('TUI usage: a saved machine\'s reading of the account names no machine, at every width', () => {
   const fs = require('node:fs');
   const os = require('node:os');
   const crypto = require('node:crypto');
@@ -353,20 +327,28 @@ test('TUI usage: the bar names a saved machine only for the windows it shows, by
     put(core.machineUsageCachePath(), { version: 1, attemptedAt: now, machines: [machine('build-box', {})] });
     const row = () => usageRow({ ...usageFixture(), now, usageBoth: core.usageBrief(home) })[0].trimEnd();
     assert.equal(core.usageLine(home, '').machineNote, 'build-box: fable', 'control: the cap is the saved machine\'s');
-    assert.match(row(), /^✳ claude wk: 30% .* · mo: 2% /, 'the bar names no machine: none of its windows is one\'s');
-    // Its 5-hour share alone: the bar shows no 5h, so it names no machine either, where the Stats panels, which show the
-    // 5h, name it.
+    assert.match(row(), /^✳ claude wk: 30% .* · mo: 2% /, 'the bar names no machine');
+    assert.doesNotMatch(row(), /build|box|\(/, row());
+    // Its 5-hour share alone: the bar shows no 5h.
     const five = { pct: 4, reset: now + 3 * 3600000, at: now - 30000, tok: null, total: null };
     put(path.join(home, '.claude', 'statusline-last.json'), { v: 3, week_pct: 30, week_at: nowS - 30, week_reset: nowS + 86400, month_tok: 1000000, month_tok_total: 50000000, month_reset: nowS + 5 * 86400 });
     put(core.machineUsageCachePath(), { version: 1, attemptedAt: now, machines: [machine('build-box', { fable: null, five })] });
     assert.deepEqual([core.usageLine(home, '').machineNote, core.usageLine(home, '').machineBarNote, core.usageLine(home, '').machineTipNote], ['build-box: 5h', '', ''],
       'control: the 5h is the saved machine\'s');
     assert.match(row(), /^✳ claude wk: 30% .* · mo: 2% /, row());
-    // Its week, from a label with bidi controls and zero-width characters in it: named, and nothing hidden.
+    assert.doesNotMatch(row(), /build|box|\(/, row());
+    // Its week, the month with it, from a machine with a long label that has bidi controls and zero-width characters in
+    // it: the bar shows that machine's figures and no part of its label, at every width.
     const week = { pct: 4, reset: now + 2 * 86400000, at: now - 30000, tok: null, total: null };
     put(path.join(home, '.claude', 'statusline-last.json'), { v: 3, month_tok: 1000000, month_tok_total: 50000000, month_reset: nowS + 5 * 86400 });
-    put(core.machineUsageCachePath(), { version: 1, attemptedAt: now, machines: [machine('build\u202e-\u200bbox\u2066\u200f\ufeff', { week })] });
-    assert.match(row(), /^✳ claude \(build-box: wk\) wk: 4% /, row());
+    put(core.machineUsageCachePath(), { version: 1, attemptedAt: now, machines: [machine('build\u202e-\u200bbox-in-the-basement-lab\u2066\u200f\ufeff', { week })] });
+    assert.equal(core.usageLine(home, '').weekMachine, 'build-box-in-the-basement-lab', 'control: the week is the saved machine\'s');
+    assert.match(row(), /^✳ claude wk: 4% /, row());
+    for (const width of [40, 50, 80, 200]) {
+      const at = usageRow({ ...usageFixture(), now, usageBoth: core.usageBrief(home) }, width)[0];
+      assert.match(at, /^✳ claude wk: 4% /, `${width} columns: ${at}`);
+      assert.doesNotMatch(at, /build|box|basement|\(/, `${width} columns: ${at}`);
+    }
     assert.doesNotMatch(row(), /[\u061c\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/u);
   } finally {
     for (const [k, v] of Object.entries(was)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
@@ -540,18 +522,36 @@ for (const check of ['overlay-verbs', 'overlay-rebind', 'row-menu-key', 'row-men
   }
 });
 
-// Account totals keep the same text on both machines; hovering names the measured union or local fallback.
-{
+// Account totals keep the same text on both machines. GPT's shares are the account's, so hovering says that its
+// estimates include the account's usage on other machines, naming none; the freshness stamp still says whose records
+// arrived.
+test('TUI usage: the hover says GPT\'s estimates include other machines without naming one', () => {
   const state = mkState(TABS());
-  state.usageBoth = { claude: { five: { pct: null }, week: { pct: null }, month: { pct: null }, machine: '' },
-    gpt: { five: { pct: null }, week: { pct: 20 }, month: { pct: 11, tok: 10_000_000, usd: '~$18' }, measuredMachines: 'work-box, build-box' } };
+  state.usageBoth = { claude: { five: { pct: null }, week: { pct: null }, month: { pct: null } },
+    gpt: { five: { pct: null }, week: { pct: 20 }, month: { pct: 11, tok: 10_000_000, usd: '~$18' }, othersMeasured: true } };
   const line = tui.statuslineFor(state, 200, {}, 'none', 1)[0].trim();
   assert.equal(line, '⬡ gpt wk: 20% · mo: 11% ~$18');
   state.hoverUsage = true;
-  assert.match(tui.statusWithToast('ready', state, 200), /GPT estimates include usage measured on work-box, build-box/);
+  assert.equal(tui.statusWithToast('ready', state, 200).trim(), 'GPT estimates include the account\'s usage on other machines');
   state.usageBoth.gpt.usageFreshness = 'Usage received — build-box: 2026-11-04T12:00:00.000Z (stale; unreachable)';
-  assert.match(tui.statusWithToast('ready', state, 100), /12:00:00.000Z.*stale; unreachable/);
+  assert.match(tui.statusWithToast('ready', state, 200), /12:00:00\.000Z \(stale; unreachable\) · GPT estimates include the account's usage on other machines/);
   state.usageBoth.gpt.usageFreshness = '';
-  state.usageBoth.gpt.measuredMachines = 'this machine alone';
-  assert.match(tui.statusWithToast('ready', state, 200), /GPT estimates include usage measured on this machine alone/);
-}
+  state.usageBoth.gpt.othersMeasured = false;
+  assert.doesNotMatch(tui.statusWithToast('ready', state, 200), /estimates/, 'this machine\'s turns alone: no note');
+});
+
+// Claude's estimates include the account's usage on other machines; the hover says so and names none of them, also when
+// only copies no machine claims count (an empty name list).
+test('TUI usage: the hover says Claude\'s estimates include other machines without naming one', () => {
+  const state = mkState(TABS());
+  state.usageBoth = { claude: { five: { pct: null }, week: { pct: 20 }, month: { pct: 11 } }, gpt: null };
+  state.hoverUsage = true;
+  assert.doesNotMatch(tui.statusWithToast('ready', state, 200), /Claude estimates/, 'control: no other machine counts');
+  const month = { tok: 5, reads: 0, cost: 0, start: 0, reset: 1, hosts: 'ab12' };
+  for (const machines of ['build-box, lab-box', '']) {
+    state.usage = { machineMeasured: { five: null, week: null, month, machines } };
+    const note = tui.statusWithToast('ready', state, 200);
+    assert.match(note, /Claude estimates include the account's usage on other machines/, note);
+    assert.doesNotMatch(note, /build-box|lab-box|measured on/, note);
+  }
+});
