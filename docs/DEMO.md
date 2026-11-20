@@ -135,7 +135,7 @@ gives the Observations panel its recap and each edit's reasoning, for free.
 
 ```bash
 ./install.sh                              # or: npm run build && npm i -g --allow-scripts=node-pty ./packages/cli && oak doctor --fix
-oak init --with-statusline # capture hooks + the bundled status line (usage bars)
+oak init --with-statusline # capture hooks, agent delegation guidance + the bundled status line (usage bars)
 ```
 
 > Install the hooks **before** launching Claude Code — a running session reverts hook edits made

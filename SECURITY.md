@@ -66,7 +66,10 @@ connection and permissions. OAK’s network paths are:
   puts `~/.local/bin` on the PATH to `~/.profile`, `~/.bashrc` and `~/.zprofile`
   (creating any that are missing), and runs `oak init` there, which writes OAK's capture
   hooks into the target's `~/.claude/settings.json` and Codex's `~/.codex/hooks.json`,
-  and adds trust entries for those hooks to `~/.codex/config.toml`.
+  adds trust entries for those hooks to `~/.codex/config.toml`, and sets up the agent
+  delegation guidance (below) unless `oak agent setup --remove` took it out there. On a
+  Windows target (a Git Bash, MSYS2 or Cygwin login shell) it installs neither herdr nor
+  OAK: it uses the ones installed there and runs `oak init` with that OAK.
 - **SSH commands you run** — `oak <verb> --machine <label>` runs one of `fleet`, `views`,
   `review`, `list`, `sessions`, `prompts`, `conversation`, `feed`, `processes`, `multitask`, `subagents`,
   `diff`, `keep`, `undo`, `redo`, `resolve`, `clean`, `task-keep`, `task-undo`, `task-clear`, `chat-context`, `comment`, `quote`, `ignore`, `search`,
@@ -328,6 +331,13 @@ Out of scope: vulnerabilities in herdr itself — report those to
 
 ## Good to know
 
+- **`oak init` lets your agents run `oak agent` without asking.** Plain `oak init`, and `oak update` on a
+  machine with OAK's capture hooks, set up OAK's agent delegation guidance for your user by default: the
+  `oak-delegate` skill and `oak-builder` agent under `~/.claude` (or `CLAUDE_CONFIG_DIR`), a marked block
+  in `~/.codex/AGENTS.md` (or under `CODEX_HOME`), and the permission rule `Bash(oak agent:*)` in Claude
+  Code's `settings.json`, with which Claude Code runs any `oak agent` command, such as starting, messaging
+  or closing an agent in a herdr tab, without a permission prompt. `oak agent setup --remove`
+  takes all of it out and keeps it out of later runs; `oak agent setup --check` lists it.
 - Capture, review, and observability are **zero-token**, with no telemetry.
   Local views read local transcripts and stores; saved-machine listings use the
   automatic SSH path above. To title a Codex session whose prompt only hands the

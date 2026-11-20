@@ -639,7 +639,7 @@ columns for display only.
 | `attention`, `waits` | Raised hands and the waits the attention ledger recorded; since version 4 every machine's hands, another machine's marked with `synced_ms` |
 | `comments` (+ `comments_fts`), `notes` (+ `notes_fts`) | Review comments; plans, memories and skills |
 | `tombstones`, `ingest_state`, `meta`, `lease` | Deliberate deletes, each file's cursor and stamp, the database's own records, and the catch-up lease |
-| `usage_messages`, `usage_daily` | One row per assistant message at its largest snapshot, kept for ever, and its rollup by day (version 2; see Usage, below). Schema 6 adds `cache_create_1h` and `cost_approx` to both tables, and `worker`, `provider`, `speed`, `geo` and `priced` to messages. `cache_create` holds total cache writes; its one-hour subset is priced separately from the remainder. `priced` identifies the price-table version, so an upgrade reprices old messages and rebuilds their rollups |
+| `usage_messages`, `usage_daily` | One row per assistant message at its largest snapshot, kept for ever, and its rollup by day (version 2; see Usage, below). Schema 6 adds `cache_create_1h` and `cost_approx` to both tables, and `worker`, `provider`, `speed`, `geo` and `priced` to messages. `cache_create` holds total cache writes; its one-hour subset is priced separately from the remainder. `ran` on messages and the rollup says whether the machine in `machine_id` ran the message's session (see Usage, below). `priced` identifies the price-table version, so an upgrade reprices old messages and rebuilds their rollups |
 | `usage_readings`, `usage_spend`, `accounts` | The shares each machine read of an account's windows and the Claude account's answers on its five-hour limit, the spend Claude Code reported per session, and the accounts seen (version 2) |
 | `account_bill_days` | Each account's bill day for Claude and for GPT, as the machine that set it last recorded it with the time it did (schema 7); the rows travel with the usage records and sync, so every machine counts the same month |
 | `findings`, `finding_resolutions` | Short facts an agent posted for other agents (`oak finding add`), with the posting session and machine, repository and paths, and their retirements (schema 9); untrusted text, shown quoted, and carried to every machine in the record log |
@@ -660,7 +660,7 @@ deriving them again would only be undone by the newer OAK, and the two would tak
 files as before, and `oak doctor` names the update. A change none can make raises the format in the file's name, and a
 new file is built.
 
-**Derivation version.** `INGEST_VERSION` is 5. A Codex rollout is published only after the same file stamp still holds after derivation. If it grows or is replaced while being read, the catch-up defers it without publishing partial facts or advancing its saved stamp; a later pass retries it. Upgrading to version 5 derives older facts again, including prompt cursors whose source files have not changed.
+**Derivation version.** `INGEST_VERSION` is 7. A Codex rollout is published only after the same file stamp still holds after derivation. If it grows or is replaced while being read, the catch-up defers it without publishing partial facts or advancing its saved stamp; a later pass retries it. Upgrading to version 5 derives older facts again, including prompt cursors whose source files have not changed. Version 6 starts file paths at the current worktree's root and keeps a native child session's parent. Claude Code continues a session resumed after its workspace moved in a new project folder that starts with a copy of the old history; in version 7 such a session is read from its most recently written transcript, with its latest recorded working directory. Each upgrade derives every session's facts again once.
 
 **Catching up.** A read first catches the database up with the files on disk (`ingest.ts`):
 
@@ -781,8 +781,14 @@ at most 5.5 MB, each answered in under half a second; the next, after one more t
 row per assistant message, Claude Code's message id or a Codex turn's, at its largest snapshot: a message Claude Code
 writes as several lines while it streams counts once, at the line with the most input, output and cache-creation tokens
 (the earlier of two equal ones), with its cache reads, model, list-price cost (`pricing.ts`), session, account and the
-machine it was first seen on. A message two machines hold, such as a transcript oak sync copied, is one row. Rows are
-kept for ever, and `usage_daily` rolls them up by UTC day, machine, agent, account and model, kept in step by triggers,
+machine it counts toward. That is the machine that ran its session (`ran` 1): a machine claims a session when Claude
+Code's `session-env` or `file-history` folder for it, or OAK's store of it, is there, which no sync of the transcripts
+copies. A claim replaces a copy's row whichever arrived first, travels in the record log and the usage pull, and
+between two machines that both ran the session (one resumed on another machine) goes to the lower machine id; a
+Codex message always carries the claim. A message no machine claims (`ran` 0: a copy a file sync brought, or a
+record from an OAK before the claim) counts toward `unknown machine (copies)` in the breakdowns, and once in the
+totals. A message two machines hold, such as a transcript oak sync copied, is one row. Rows are
+kept for ever, and `usage_daily` rolls them up by UTC day, machine, claim (`ran`), agent, account and model, kept in step by triggers,
 so a window longer than 35 days is summed from the rollup. `usage_readings` keeps each share a machine read of an
 account's windows (the 5-hour, weekly and per-model weekly shares, and the bill-cycle month its status line projected)
 with its reset and when it was measured, once per measurement, and the Claude account's answers on its five-hour limit
@@ -1131,7 +1137,10 @@ where this machine has no login; machine configuration belongs to herdr, not OAK
 `herdr.lock` pins the upstream version, protocol, asset URLs and SHA-256 checksums. Core embeds
 that pin through `gen:herdr-lock`; `gen:herdr` regenerates the API declarations. The CLI distribution
 ships `dist/herdr-plugin/`; the pin travels compiled into the bundle. `ensureHerdr()` owns installation and integration
-setup and preserves newer installed binaries.
+setup and preserves newer installed binaries. On Windows, where a running `herdr.exe` cannot be replaced, it renames
+the old binary aside and deletes it on a later run, and an install that still leaves an older herdr fails. Before it
+reinstalls herdr's Codex integration, which moves hooks within `hooks.json`, it records which hooks Codex trusts, and
+afterwards writes that trust at each moved hook's new position (`carryCodexHookTrust`).
 
 The focus endpoint reports its protocol and build stamp before accepting operations. The TUI
 replaces an outdated endpoint at startup; `oak doctor --fix` performs the same repair and reports
