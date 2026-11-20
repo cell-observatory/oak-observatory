@@ -230,18 +230,22 @@ test('delegated: a pane herdr no longer has ends its agent; a closed tab does to
   assert.equal(stateOf('p2').state, 'done');
 });
 
-test('delegated: start — a tab labelled from the brief, its shell told not to update, herdr\'s timeout checked against the pane, the trust prompt answered, the brief sent and entered', async (t) => {
+test('delegated: start — a tab labelled from the brief, its shell told not to update, herdr\'s timeout checked against the pane, no key sent to the folder-trust prompt, the brief sent and entered once the user answered it', async (t) => {
   const f = indexFixture(t, core);
   const brief = path.join(f.dir, 'fix1-brief.md');
   fs.writeFileSync(brief, '# Fix the parser\n\nDo it.\n');
-  let infos = 0, reads = 0;
+  let infos = 0, reads = 0, waiting = null;
   const screens = ['$ ', 'Is this a project you created or one you trust? (Like your own code)\n❯ 1. Yes, I trust this folder', '> \n? for shortcuts', 'thinking… (esc to interrupt)'];
   const fake = await fakeHerdr(t, {
     'tab.create': () => ({ type: 'tab_created', tab: { tab_id: 't9', workspace_id: 'w2', label: 'x', number: 3, focused: false, pane_count: 1, agent_status: 'unknown' }, root_pane: { pane_id: 'p9' } }),
     'pane.process_info': ({ pane_id }) => ({ type: 'pane_process_info', process_info: infos++ < 1 ? processInfo.idle(pane_id) : { pane_id, shell_pid: 100, foreground_process_group_id: 300, foreground_processes: [{ pid: 300, name: 'claude', argv: ['claude', '--agent', 'builder'] }] } }),
     // herdr's own start gave up while the agent was in fact starting.
     'agent.start': () => { throw Object.assign(new Error('timed out waiting for the agent'), { code: 'timeout' }); },
-    'pane.read': () => ({ type: 'pane_read', read: { pane_id: 'p9', text: screens[Math.min(reads++, screens.length - 1)], revision: reads, format: 'text', source: 'visible', tab_id: 't9', truncated: false, workspace_id: 'w2' } }),
+    'pane.read': () => {
+      // The row as the user's views read it while the prompt is up (taken at the read that finds the composer: the user answered).
+      if (reads === 2) waiting = core.readDelegated('fix1');
+      return { type: 'pane_read', read: { pane_id: 'p9', text: screens[Math.min(reads++, screens.length - 1)], revision: reads, format: 'text', source: 'visible', tab_id: 't9', truncated: false, workspace_id: 'w2' } };
+    },
     'pane.send_keys': () => ({ type: 'ok' }),
     'agent.prompt': () => ({ type: 'agent_prompted', agent: {} }),
     'agent.send_keys': () => ({ type: 'ok' }),
@@ -255,15 +259,172 @@ test('delegated: start — a tab labelled from the brief, its shell told not to 
   assert.deepEqual([create.label, create.focus, create.env, create.cwd], ['fix1: Fix the parser', false, { DISABLE_AUTO_UPDATE: 'true', OAK_DELEGATED: 'fix1' }, f.work]);
   assert.deepEqual(fake.calls('agent.start')[0].args, ['--agent', 'builder', '--permission-mode', 'auto']);
   assert.ok(logs.some((l) => /claude runs in the pane/.test(l)), 'the timeout was checked, not believed');
-  assert.deepEqual(fake.calls('pane.send_keys'), [{ pane_id: 'p9', keys: ['Enter'] }], 'the trust prompt took its first choice');
+  assert.deepEqual(fake.calls('pane.send_keys'), [], 'OAK never answers the folder-trust prompt');
+  assert.deepEqual(logs.filter((l) => /trust/.test(l)), ['fix1: waiting for you — answer Claude Code\'s folder-trust prompt in herdr tab "fix1: Fix the parser"; OAK never answers it'], 'said once');
+  assert.deepEqual([waiting?.state, waiting?.error], ['blocked', 'Waiting for you: answer Claude Code\'s folder-trust prompt in herdr tab "fix1: Fix the parser". OAK never answers it.'], 'the row waited on the user, saying for what');
   const prompt = fake.calls('agent.prompt')[0];
   assert.equal(prompt.target, 'oak-fix1');
   assert.match(prompt.text, /^# fix1: Fix the parser\n\nYour brief is .*fix1-brief\.md\. .*write .*fix1-out\/report\.md and end your last message with DONE\.$/s);
   assert.deepEqual(fake.calls('agent.send_keys'), [{ target: 'oak-fix1', keys: ['Enter'] }], 'Enter follows the prompt');
   const order = fake.requests.map((r) => r.method).filter((m) => m !== 'pane.read' && m !== 'pane.process_info');
-  assert.deepEqual(order, ['session.snapshot', 'tab.create', 'agent.start', 'pane.send_keys', 'agent.prompt', 'agent.send_keys']);
-  assert.deepEqual([rec.id, rec.title, rec.tab, rec.workspace, rec.pane, rec.pid, rec.state, rec.agentType], ['fix1', 'Fix the parser', 't9', 'w2', 'p9', 300, 'starting', 'builder']);
-  assert.deepEqual(core.readDelegated('fix1').pane, 'p9', 'recorded');
+  assert.deepEqual(order, ['session.snapshot', 'tab.create', 'agent.start', 'agent.prompt', 'agent.send_keys']);
+  assert.deepEqual([rec.id, rec.title, rec.tab, rec.workspace, rec.pane, rec.pid, rec.state, rec.error, rec.agentType], ['fix1', 'Fix the parser', 't9', 'w2', 'p9', 300, 'starting', undefined, 'builder']);
+  const stored = core.readDelegated('fix1');
+  assert.deepEqual([stored.pane, stored.state, stored.error], ['p9', 'starting', undefined], 'recorded, the wait over');
+});
+
+/** A fake herdr whose new pane starts `kind`, then shows `screen()`, and answers `pane.process_info` with `info(n, pane)`
+ *  after the first answer (the idle shell); every key, prompt and close is recorded. */
+async function trustHerdr(t, kind, screen, info, extra = {}) {
+  let infos = 0;
+  return fakeHerdr(t, {
+    'tab.create': () => ({ type: 'tab_created', tab: { tab_id: 't7', workspace_id: 'w2' }, root_pane: { pane_id: 'p7' } }),
+    'pane.process_info': ({ pane_id }) => ({ type: 'pane_process_info', process_info: infos++ < 1 ? processInfo.idle(pane_id) : info(infos - 1, pane_id) }),
+    'agent.start': () => ({ type: 'agent_started', agent: {}, argv: [kind] }),
+    'pane.read': () => ({ type: 'pane_read', read: { pane_id: 'p7', text: screen(), format: 'text', source: 'visible' } }),
+    'pane.send_keys': () => ({ type: 'ok' }), 'agent.prompt': () => ({ type: 'agent_prompted', agent: {} }), 'agent.send_keys': () => ({ type: 'ok' }),
+    'tab.close': () => ({ type: 'ok' }),
+    ...extra,
+  });
+}
+/** The pane's foreground: the CLI `kind`, as pid `pid`. */
+const cliIn = (kind, pid = 300) => (_n, pane_id) => ({ pane_id, shell_pid: 100, foreground_process_group_id: pid, foreground_processes: [{ pid, name: kind, argv: [kind] }] });
+/** Everything typed into the pane or its composer. */
+const typed = (fake) => ['pane.send_keys', 'pane.send_text', 'agent.prompt', 'agent.send_keys'].flatMap((m) => fake.calls(m).map((p) => [m, p]));
+const noNative = () => new Map();
+
+test('delegated: start — Claude Code exits at its folder-trust prompt ("No, exit"): nothing typed, before or after, and the row gone with why', async (t) => {
+  const f = indexFixture(t, core);
+  const brief = path.join(f.dir, 'dec1-brief.md');
+  fs.writeFileSync(brief, '# Decline the folder\n');
+  // Claude Code through its second look at the pane, then the shell again; the prompt it drew stays on the screen.
+  const fake = await trustHerdr(t, 'claude', () => 'Is this a project you created or one you trust? (Like your own code)\n  1. Yes, I trust this folder\n❯ 2. No, exit\n$ ',
+    (n, pane) => n < 3 ? cliIn('claude')(n, pane) : processInfo.idle(pane));
+  if (!fake) return;
+  fake.snapshot = {};
+  const logs = [];
+  await assert.rejects(core.startDelegatedAgent({ kind: 'claude', brief, cwd: f.work, name: 'dec1', out: path.join(f.dir, 'dec1-out'), herdr: { socketPath: fake.socketPath },
+    sleep: async () => {}, patience: 0.1, log: (l) => logs.push(l) }),
+  /^Error: claude exited at its folder-trust prompt \(declined, or the CLI ended\); OAK sent it no keys and no brief\. The tab stays open in herdr \(pane p7\)\.$/);
+  assert.deepEqual(typed(fake), [], 'no key, text or brief into the prompt or the shell after it');
+  assert.deepEqual(fake.calls('tab.close'), [], 'the tab is left for a look');
+  const rec = core.readDelegated('dec1');
+  assert.deepEqual([rec.state, rec.error, typeof rec.endedMs], ['gone', 'claude exited at its folder-trust prompt (declined, or the CLI ended); OAK sent it no keys and no brief', 'number']);
+  assert.equal(logs.filter((l) => /waiting for you/.test(l)).length, 1);
+});
+
+test('delegated: start — a folder-trust prompt still up at the deadline: nothing typed, the row left waiting on the user with how the brief gets there, the tab open', async (t) => {
+  const f = indexFixture(t, core);
+  const brief = path.join(f.dir, 'tri1-brief.md');
+  fs.writeFileSync(brief, '# Triage the widgets\n');
+  const agent = liveAgent(t, 'codex');
+  let screen = 'You are in /w/tree\n\nDo you trust the contents of this directory? Working with untrusted contents comes with higher risk of prompt injection.\n\n› 1. Yes, continue\n  2. No, quit';
+  const fake = await trustHerdr(t, 'codex', () => screen, cliIn('codex', agent.pid));
+  if (!fake) return;
+  fake.snapshot = {};
+  const logs = [];
+  const out = path.join(f.dir, 'tri1-out');
+  const rec = await core.startDelegatedAgent({ kind: 'codex', brief, cwd: f.work, name: 'tri1', out, herdr: { socketPath: fake.socketPath },
+    sleep: async () => {}, patience: 0.1, log: (l) => logs.push(l) });
+  const file = path.join(out, 'brief-prompt.md');
+  const reason = `Waiting for you: answer Codex's folder-trust prompt in herdr tab "tri1: Triage the widgets", then send the brief with: oak agent tell tri1 --file ${file}. OAK never answers the prompt, and has not sent the brief.`;
+  assert.deepEqual(typed(fake), [], 'no key, text or brief');
+  assert.deepEqual(fake.calls('tab.close'), [], 'the tab stays open');
+  assert.deepEqual([rec.state, rec.error, rec.endedMs, rec.pid], ['blocked', reason, null, agent.pid]);
+  const stored = core.readDelegated('tri1');
+  assert.deepEqual([stored.state, stored.error], ['blocked', reason], 'recorded');
+  assert.equal(fs.readFileSync(file, 'utf8'), core.delegatedPrompt(rec), 'the prompt the start would have sent');
+  assert.deepEqual(logs.filter((l) => /trust/.test(l)), ['tri1: waiting for you — answer Codex\'s folder-trust prompt in herdr tab "tri1: Triage the widgets"; OAK never answers it', `tri1: ${reason}`]);
+  // A refresh keeps it waiting on the user: Codex links no session before its first prompt.
+  assert.deepEqual([stateOf('tri1', { native: noNative }).state, core.readDelegated('tri1').error], ['blocked', reason]);
+  // `oak agent tell` refuses while the prompt is up, and delivers the brief once the user answered it; the wait is then over.
+  const opts = { socketPath: fake.socketPath };
+  fake.snapshot = { panes: [{ pane_id: 'p7', agent: 'codex', agent_session: null }] };
+  await assert.rejects(core.checkDelegatedTell(['tri1'], opts), /tri1: codex's composer is not available/);
+  assert.deepEqual(typed(fake), []);
+  screen = '› Ask Codex to do anything\n\n  ? for shortcuts';
+  const told = await core.tellDelegatedAgent('tri1', fs.readFileSync(file, 'utf8'), 'tester', opts);
+  assert.deepEqual(typed(fake), [['agent.prompt', { target: 'oak-tri1', text: core.delegatedPrompt(rec) }], ['agent.send_keys', { target: 'oak-tri1', keys: ['Enter'] }]]);
+  assert.deepEqual([told.state, told.error], ['starting', undefined]);
+  assert.deepEqual([stateOf('tri1', { native: noNative }).state, core.readDelegated('tri1').error], ['starting', undefined]);
+});
+
+test('delegated: a row waiting on its folder-trust prompt keeps its reason through refreshes, and drops it once it leaves', (t) => {
+  const f = indexFixture(t, core);
+  const why = 'Waiting for you: answer Claude Code\'s folder-trust prompt in herdr tab "w1: Fix the parser". OAK never answers it.';
+  record(f, { id: 'w1', state: 'blocked', error: why });
+  assert.deepEqual([stateOf('w1', { native: noNative }).state, core.readDelegated('w1').error], ['blocked', why]);
+  // The user answered: Claude Code's session linked.
+  core.writeDelegated({ ...core.readDelegated('w1'), session: 's-w1' });
+  assert.notEqual(stateOf('w1', { native: noNative }).state, 'blocked');
+  assert.equal(core.readDelegated('w1').error, undefined, 'the reason went with the wait');
+});
+
+/** Claude Code's composer as 2.1.329 drew it with auto mode on (synthetic text): framed by two rules, the agent's name on
+ *  the upper one, a status line below, a permission mode's line at the bottom, and no "? for shortcuts" footer. */
+const ruledComposer = (prompt = '❯ Try "write a test"') => [' ▐▛███▜▌   Claude Code v9.9.9', '▝▜█████▛▘  Model · Plan', '', '', `${' '.repeat(60)}0 tokens`,
+  `${'─'.repeat(56)} builder`, prompt, '─'.repeat(64), '  12:00 · Jan 1 | repo | ~/w/tree', '  ⏵⏵ auto mode on (shift+tab to cycle)'].join('\n');
+
+test('delegated: start — Claude Code\'s composer framed by rules, with no "? for shortcuts" footer, takes the brief; `oak agent tell` reaches it too', async (t) => {
+  const f = indexFixture(t, core);
+  const brief = path.join(f.dir, 'cmp1-brief.md');
+  fs.writeFileSync(brief, '# Read the composer\n');
+  const agent = liveAgent(t, 'claude');
+  let screen = ruledComposer();
+  const fake = await trustHerdr(t, 'claude', () => screen, cliIn('claude', agent.pid));
+  if (!fake) return;
+  fake.snapshot = {};
+  const logs = [];
+  const rec = await core.startDelegatedAgent({ kind: 'claude', brief, cwd: f.work, name: 'cmp1', out: path.join(f.dir, 'cmp1-out'), herdr: { socketPath: fake.socketPath },
+    sleep: async () => {}, patience: 0.1, log: (l) => logs.push(l) });
+  assert.deepEqual(typed(fake), [['agent.prompt', { target: 'oak-cmp1', text: core.delegatedPrompt(rec) }], ['agent.send_keys', { target: 'oak-cmp1', keys: ['Enter'] }]], 'the brief, then Enter');
+  assert.deepEqual([rec.state, rec.error, rec.pid], ['starting', undefined, agent.pid]);
+  fake.snapshot = { panes: [{ pane_id: 'p7', agent: 'claude', agent_session: null }] };
+  const opts = { socketPath: fake.socketPath };
+  assert.deepEqual((await core.checkDelegatedTell(['cmp1'], opts)).map((r) => r.id), ['cmp1'], 'its composer takes a message');
+  // An empty composer shows its prompt alone; a numbered choice between rules is a menu, not the composer.
+  screen = ruledComposer('❯');
+  assert.deepEqual((await core.checkDelegatedTell(['cmp1'], opts)).map((r) => r.id), ['cmp1']);
+  screen = ruledComposer('❯ 1. Yes, use this key');
+  await assert.rejects(core.checkDelegatedTell(['cmp1'], opts), /cmp1: claude's composer is not available/);
+});
+
+test('delegated: start — a composer that shows before herdr names the agent still gets the brief, once herdr does (2026-11-20)', async (t) => {
+  // Claude Code 2.1.329 drew its composer before herdr's hooks made the agent an active named agent, and the start
+  // failed on the brief with "agent oak-… is not an active named agent".
+  const f = indexFixture(t, core);
+  const brief = path.join(f.dir, 'reg1-brief.md');
+  fs.writeFileSync(brief, '# Wait for the name\n');
+  const agent = liveAgent(t, 'claude');
+  let asked = 0;
+  const fake = await trustHerdr(t, 'claude', () => ruledComposer(), cliIn('claude', agent.pid), {
+    'agent.prompt': () => {
+      if (asked++ < 2) throw Object.assign(new Error('agent oak-reg1 is not an active named agent'), { code: 'agent_not_found' });
+      return { type: 'agent_prompted', agent: {} };
+    },
+  });
+  if (!fake) return;
+  fake.snapshot = {};
+  const rec = await core.startDelegatedAgent({ kind: 'claude', brief, cwd: f.work, name: 'reg1', out: path.join(f.dir, 'reg1-out'), herdr: { socketPath: fake.socketPath },
+    sleep: async () => {}, patience: 0.1 });
+  assert.equal(asked, 3, 'asked again until herdr named the agent');
+  assert.deepEqual(fake.calls('agent.send_keys'), [{ target: 'oak-reg1', keys: ['Enter'] }], 'one Enter, after the brief went in');
+  assert.equal(rec.state, 'starting');
+});
+
+test('delegated: start — a composer that never appears leaves the row gone with the pid herdr showed once the CLI ran', async (t) => {
+  const f = indexFixture(t, core);
+  const brief = path.join(f.dir, 'pid1-brief.md');
+  fs.writeFileSync(brief, '# Wait for the composer\n');
+  // herdr answers agent.start before the CLI is in the pane's foreground (launch_pending): the shell still shows once.
+  const fake = await trustHerdr(t, 'claude', () => ruledComposer('❯ 1. Dark mode'), (n, pane) => n < 2 ? processInfo.idle(pane) : cliIn('claude', 4242)(n, pane));
+  if (!fake) return;
+  fake.snapshot = {};
+  await assert.rejects(core.startDelegatedAgent({ kind: 'claude', brief, cwd: f.work, name: 'pid1', out: path.join(f.dir, 'pid1-out'), herdr: { socketPath: fake.socketPath },
+    sleep: async () => {}, patience: 0.1 }), /^Error: claude's composer never appeared\. The tab stays open in herdr \(pane p7\)\.$/);
+  assert.deepEqual(typed(fake), [], 'a menu is not the composer: nothing typed');
+  const stored = core.readDelegated('pid1');
+  assert.deepEqual([stored.state, stored.pid], ['gone', 4242], 'the pid the pane showed');
 });
 
 test('delegated: start — an agent that never started leaves its row gone with why, and the tab for a look', async (t) => {

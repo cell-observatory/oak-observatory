@@ -10847,6 +10847,7 @@ const OVERVIEW_SCRIPT = `
       h+='<span class="mt-badge" style="background:'+phaseColor(a.phase)+'">'+esc(a.state||phaseLabel(a.phase))+'</span>';
       h+='<span class="mt-meta">'+esc(a.machine||'this machine')+' · '+esc(a.kind||'claude')+' · '+relAge(a.lastActiveMs)+'</span>';
       if(a.state==='queued') h+='<span class="mt-meta">waiting on '+esc((a.after||[]).join(', '))+'</span>';
+      if(a.error) h+='<span class="mt-cur" title="'+esc(a.error)+'">'+esc(a.error)+'</span>';
       if(a.loaded===false){
         // Never draw +0/−0/0 tok for a map nobody built — that reads as "this session did nothing".
         // No apostrophe in this title: the TS template literal would unescape it and break the JS string.
