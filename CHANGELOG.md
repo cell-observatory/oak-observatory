@@ -134,6 +134,8 @@ the release notes.
   `prefs.json` once. They listed it once for each delegation preference OAK keeps there.
 - `oak update --check` says that everything is up to date when nothing needs updating, instead of
   "run `oak update` to apply."
+- OAK's herdr plugin names herdr 0.9.5, the pinned version, as the oldest it runs on. Its manifest still said 0.9.1
+  after the pin moved.
 
 ## [0.11.0] — 2026-11-07
 
