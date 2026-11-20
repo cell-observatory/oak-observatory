@@ -78,6 +78,17 @@ test('agent setup: doctor suggests setup and the terminal suggestion appears onc
   assert.equal(core.takeAgentSetupNotice(), null);
 });
 
+test('agent setup: doctor names prefs.json once when several of its preferences need setting up again (2026-11-20)', (t) => {
+  indexFixture(t, core);
+  core.applyDefaultAgentSetup();
+  fs.rmSync(core.prefsPath());
+  const bad = core.agentSetupStatus().flatMap(p => p.items).filter(e => e.path === core.prefsPath() && e.state !== 'current');
+  assert.ok(bad.length > 1, `control: ${bad.length} preferences in prefs.json need setting up again`);
+  const check = core.diagnoseAgentSetup();
+  assert.equal(check.level, 'warn');
+  assert.equal(check.detail.split(core.prefsPath()).length - 1, 1, check.detail);
+});
+
 test('agent setup: the user setup is made by default once, and a removal keeps it out until it is set up again', (t) => {
   indexFixture(t, core);
   const skill = path.join(process.env.CLAUDE_CONFIG_DIR, 'skills/oak-delegate/SKILL.md');

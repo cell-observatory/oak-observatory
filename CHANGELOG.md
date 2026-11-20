@@ -114,6 +114,10 @@ the release notes.
   Claude Code entry carries `onFailure: "continue"`. Without Git Bash, Claude Code otherwise treats a PreToolUse hook
   that cannot find `oak` as a block. `oak init`, `oak init --repair` and `oak update` rewrite hooks that an older OAK
   wrote.
+- The "Agent delegation guidance" row of `oak update`, the matching `oak doctor` check and `oak uninstall` name
+  `prefs.json` once. They listed it once for each delegation preference OAK keeps there.
+- `oak update --check` says that everything is up to date when nothing needs updating, instead of
+  "run `oak update` to apply."
 
 ## [0.11.0] — 2026-11-07
 
