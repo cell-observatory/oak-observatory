@@ -3859,6 +3859,9 @@ test('CLI update: one plan for this machine and every saved machine, then each s
   assert.equal(row(check.stdout, 'JetBrains (PyCharm2026.1)'), `0.10.0 → ${target}`);
   assert.equal(row(check.stdout, 'JetBrains (CLion2026.1)'), `0.10.0 → ${target}`, 'every JetBrains product with the plugin');
   assert.match(row(check.stdout, 'Claude Code capture hooks'), new RegExp(`settings\\.json: ${realCore.HEALTHY_HOOK_ENTRIES - 1} of ${realCore.HEALTHY_HOOK_ENTRIES} events`));
+  // Each delegation preference is its own item in prefs.json: the row names the file once, not once per preference.
+  const guidance = row(check.stdout, 'Agent delegation guidance');
+  assert.equal(guidance.match(/prefs\.json: current/g)?.length, 1, `got ${guidance}`);
   assert.equal(row(check.stdout, 'status line'), 'older than this build’s script');
   assert.equal(row(check.stdout, 'herdr'), `current (${JSON.parse(fs.readFileSync(path.join(root, 'herdr.lock'), 'utf8')).version})`);
   assert.equal(row(check.stdout, 'machine current'), `current (${target})`);
@@ -3916,6 +3919,11 @@ test('CLI update: one plan for this machine and every saved machine, then each s
   for (const label of ['VS Code', 'Cursor server', 'JetBrains (PyCharm2026.1)', 'machine stale', 'machine current'])
     assert.match(row(result(run2.stdout), label), /^current \(/, label);
   assert.equal(row(result(run2.stdout), 'status line'), 'current (this build’s script)');
+  // …and --check says so, instead of asking for an update that has nothing to do (2026-11-20).
+  const check2 = await f.oak(['--check']);
+  assert.equal(check2.status, 0, check2.stderr);
+  assert.doesNotMatch(check2.stdout, /run `oak update` to apply/);
+  assert.match(check2.stdout, new RegExp(`everything is up to date \\(${target.replace(/[\\.]/g, '\\$&')}\\)`));
 });
 
 test('CLI update: a foreign status line and an uninstalled hook are never touched', { skip: process.platform === 'win32' && 'POSIX fakes' }, async t => {
@@ -4568,6 +4576,18 @@ test('CLI uninstall --all: removes the lines the bundled status line set in Code
   // …which `oak uninstall --all` does.
   assert.equal(run(b, process.execPath, [cli, 'uninstall', '--all']).status, 0);
   assert.deepEqual([fs.readFileSync(toml, 'utf8'), fs.existsSync(script), JSON.parse(fs.readFileSync(settings, 'utf8')).statusLine], ['model = "gpt-5.2"\n', false, undefined]);
+});
+
+test('CLI uninstall: the delegation guidance names prefs.json once, not once per preference set there (2026-11-20)', t => {
+  const b = fixture(t);
+  b.env.CLAUDE_OBSERVATORY_NO_UPDATE_CHECK = '1';
+  const setup = run(b, process.execPath, [cli, 'agent', 'setup', '--yes']);
+  assert.equal(setup.status, 0, setup.stderr);
+  const prefs = setup.stdout.match(/prefs\.json \(/g)?.length ?? 0;
+  assert.ok(prefs > 1, `control: the setup set ${prefs} preferences in prefs.json — ${setup.stdout}`);
+  const r = run(b, process.execPath, [cli, 'uninstall']);
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.stdout.match(/prefs\.json: /g)?.length, 1, r.stdout);
 });
 
 test('CLI uninstall --purge-store without --all says that it purged nothing (2026-11-03)', t => {

@@ -444,7 +444,7 @@ function cmdUninstall(args: string[]): void {
   const all = args.includes('--all');
   const target = project ? core.projectSettingsPath(process.cwd()) : core.settingsPath();
   const setups = project ? (core.repoRoot(process.cwd()) ? [core.applyAgentSetup(core.agentSetupPlan({ project: process.cwd(), remove: true }))] : []) : core.refreshAgentSetup(process.cwd(), true);
-  for (const p of setups) for (const e of p.items) process.stdout.write(`${e.path}: ${e.state === 'edited' ? 'user-edited; left unchanged' : 'OAK delegation content removed or absent'}\n`);
+  for (const p of setups) for (const line of new Set(p.items.map((e) => `${e.path}: ${e.state === 'edited' ? 'user-edited; left unchanged' : 'OAK delegation content removed or absent'}`))) process.stdout.write(`${line}\n`);
   if (project) {
     // Explicitly scoped: exactly this repo's settings file, nothing else.
     let res: InstallResult;
@@ -7268,7 +7268,8 @@ async function componentPlan(): Promise<UpdateComponent[]> {
   // The user's guidance is set up by default wherever OAK set up Claude Code (its hooks), unless the user removed it.
   const byDefault = userHooksInstalled() && core.defaultAgentSetupPending();
   if (setup.length || byDefault) out.push(row('agent-setup', 'Agent delegation guidance')(byDefault || setupItems.some(e => e.state === 'outdated' || e.state === 'missing') ? 'update' : setupItems.some(e => e.state === 'edited') ? 'manual' : 'current',
-    [...(byDefault ? ['not set up — OAK sets it up by default; `oak agent setup --remove` takes it out'] : []), ...setupItems.map(e => `${e.path}: ${e.state}`)].join('; ')));
+    // Each preference OAK sets is an item in the one prefs.json: name each file and state once.
+    [...(byDefault ? ['not set up — OAK sets it up by default; `oak agent setup --remove` takes it out'] : []), ...new Set(setupItems.map(e => `${e.path}: ${e.state}`))].join('; ')));
   // The user's settings file, the one `oak init` writes. A file the user never installed into is not one
   // an update adds hooks to. A project's own .claude/settings.json is committed and shared, so an update
   // never writes there: each one that needs repair is a row naming the command to run in it.
@@ -8572,7 +8573,9 @@ async function cmdUpdate(args: string[]): Promise<void> {
       if (preVer)
         process.stdout.write(c.dim(`pre-release channel: ${preVer} — switch with \`oak update --channel dev\`\n`));
     }
-    process.stdout.write(
+    if (!switching && hereUpToDate && machinesUpToDate)
+      process.stdout.write(c.green('✓ ') + `everything is up to date (${latest}${channel === 'dev' ? ', pre-release channel' : ''})\n`);
+    else process.stdout.write(
       c.dim(switching ? `run \`oak update --channel ${requested}\` to apply.\n` : 'run `oak update` to apply.\n')
     );
     return;
