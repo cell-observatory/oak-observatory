@@ -3,7 +3,7 @@
 <pre><code>oak init --codex
 oak doctor --fix
 oak agent start --kind codex</code></pre>
-<p>Hook installation pre-trusts OAK’s exact hook commands. herdr owns the terminal; use its client to answer permissions, select models and resume conversations. Ordinary setup does not start a model turn.</p>
+<p>Hook installation pre-trusts OAK’s exact hook commands. Codex records that trust by each hook’s position, so when <code>oak update</code> or <code>oak doctor --fix</code> reinstalls herdr’s Codex integration, which moves hooks, OAK carries the trust of every hook Codex trusted before to its new position; a hook that was not trusted stays untrusted. herdr owns the terminal; use its client to answer permissions, select models and resume conversations. Ordinary setup does not start a model turn.</p>
 <h2>Capture evidence</h2>
 <ul><li>Paired hooks record before/after file content and native tool identity when available.</li>
 <li>Rollout parsing supplies prompts, replies, reasoning, tool activity and usage.</li>
