@@ -1889,8 +1889,10 @@ function ranHere(r: Run, s: SessionSources): boolean {
 
 /** The usage of one session's files: its transcripts and their workers', or its rollouts (`deleted`: deletedUsage). A
  *  session this machine ran claims its messages (CLAIM_TAKES): the first read that knows it (a session read before as a
- *  copy, or before schema version 10) reads its transcripts again from their start. */
+ *  copy, or before schema version 10) reads its transcripts again from their start. The demo simulator's sessions have
+ *  none: no one spent it, here or on the machine whose copy this is. */
 function ingestUsage(r: Run, machine: string, s: SessionSources, deleted = false): void {
+  if (DEMO_SESSION.test(s.id)) return;
   r.account ??= claudeAccountTag();
   const ran = s.transcripts.length > 0 && r.pub.owns(machine) && ranHere(r, s);
   const mark = `${deleted ? 'deleted-' : ''}usage-ran:${s.id}`;

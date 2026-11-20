@@ -1134,6 +1134,8 @@ if _due or (TOT and _hadfc):
         # interval decides, and nothing is read now.
         if not TOT and not _due: raise _Wait()
         for path in ([] if TOT else glob.glob(os.path.join(proj, '**', '*.jsonl'), recursive=True)):
+            # The demo simulator's sessions (`oak demo`), their transcripts and their folders, are no one's usage.
+            if re.fullmatch(r'demo-[0-9a-f]{8}(\.jsonl)?', (os.path.relpath(path, proj).split(os.sep) + [''])[1]): continue
             try: m = os.path.getmtime(path)
             except Exception: continue
             if m < ws30: continue

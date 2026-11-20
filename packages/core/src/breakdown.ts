@@ -139,6 +139,8 @@ export function claudeBreakdown(
   // decided by that snapshot's own line (its timestamp/model/session), so a fork's copy never
   // moves history into the fork's week.
   const best = new Map<string, { t: UsageSplit; tsMs: number; model: string; file: string; unit: number }>();
+  // The demo simulator's sessions, their transcripts and their folders, are no one's usage.
+  const { isDemoSession } = require('./demo') as typeof import('./demo');
   const walk = (dir: string): string[] => {
     const outp: string[] = [];
     let ents: fs.Dirent[] = [];
@@ -148,6 +150,7 @@ export function claudeBreakdown(
       return outp;
     }
     for (const e of ents) {
+      if (isDemoSession(e.name.replace(/\.jsonl$/, ''))) continue;
       const fp = path.join(dir, e.name);
       if (e.isDirectory()) outp.push(...walk(fp));
       else if (e.isFile() && e.name.endsWith('.jsonl')) outp.push(fp);

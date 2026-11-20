@@ -53,6 +53,10 @@ the release notes.
   it, or OAK's store of it, is on that machine, and the claim travels in the record log and the usage pull. A copy
   that no machine claims shows as `unknown machine (copies)` in `oak usage` and `oak query usage`.
   Totals do not change. The database moves to schema 10 and reads every session's usage once more.
+- The demo simulator's sessions (`oak demo`) count in no usage figure. Their turns, which no one spent, counted in
+  `oak usage`, `oak stats`, the status line and the editors' usage readouts, on the machine that ran the demo and on
+  any that held a copy of its transcripts. The database moves to schema 11, which removes the simulator's usage an
+  earlier OAK stored. The demo's sessions still list, replay and clean as before.
 - On Windows, `oak update` and `oak doctor --fix` upgrade herdr while its server is running. Windows does not let a
   running herdr.exe be replaced, so the old one stayed in place and the update still reported it as installed. OAK
   now moves the old herdr.exe aside and deletes it on a later run, once nothing runs it. An install that still leaves

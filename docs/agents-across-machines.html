@@ -407,7 +407,7 @@ oak sync: pulled 3 files, 8KB
   build-box   2 files, 6KB
   gpu-box     1 file, 2KB</code></pre>
 
-<p>Schema 5 added <code>delegated</code>, and the current database schema is 6. Its rows travel in the record log alongside sessions, prompts, answers, edits, workers, usage and raised hands. <code>oak query delegated --all</code> reads this machine’s tracked agents, including its remote pointers, and their workers; <code>workers=false</code> omits workers. To read agents independently started on every machine, join the table to <code>machines</code>. Filter <code>d.machine IS NULL</code> to select the owning machine’s records rather than also counting a caller’s remote pointer.</p>
+<p>Schema 5 added <code>delegated</code>, and the current database schema is 11. Its rows travel in the record log alongside sessions, prompts, answers, edits, workers, usage and raised hands. <code>oak query delegated --all</code> reads this machine’s tracked agents, including its remote pointers, and their workers; <code>workers=false</code> omits workers. To read agents independently started on every machine, join the table to <code>machines</code>. Filter <code>d.machine IS NULL</code> to select the owning machine’s records rather than also counting a caller’s remote pointer.</p>
 
 <pre><code>$ oak query sql &quot;SELECT coalesce(m.saved_label, m.label) AS machine, d.id, d.state FROM delegated d JOIN machines m USING (machine_id) WHERE d.machine IS NULL ORDER BY machine, d.id&quot; --json | jq -c &quot;.rows[]&quot;
 {&quot;machine&quot;:&quot;build-box&quot;,&quot;id&quot;:&quot;login&quot;,&quot;state&quot;:&quot;done&quot;}
