@@ -25244,9 +25244,12 @@ test('statusline: two machines on one account calibrate their estimates against 
   const vis = (s) => s.replace(/\x1b\[[0-9;]*m/g, '');
   // Before either machine has the other's figures: each calibrates on its own transcripts, as before.
   const b1 = two.render(big), l1 = two.render(lap);
-  assert.ok(monthPct(b1.after) > 17 && monthPct(b1.after) < 19, `control: the build machine's month — ${monthPct(b1.after)}%`);
+  // The month's budget is the week's times the bill cycle's days over seven, and the calendar makes the cycle 28 to 31
+  // days long, so the month reads 18% to 20%, its token and dollar budgets move with it, and the token budget is checked
+  // against the cycle the scan used.
+  assert.ok(monthPct(b1.after) > 17 && monthPct(b1.after) < 21, `control: the build machine's month — ${monthPct(b1.after)}%`);
   assert.ok(monthPct(l1.after) > 100, `control: the laptop's month is over its own budget, as its own reading showed it — ${monthPct(l1.after)}%`);
-  assert.match(vis(l1.line), /mo +~17M\/10M \+455M↺ +100% /, `control: the defect — got ${JSON.stringify(vis(l1.line))}`);
+  assert.match(vis(l1.line), /mo +~17M\/[\d.]+M \+455M↺ +100% /, `control: the defect — got ${JSON.stringify(vis(l1.line))}`);
   assert.ok(b1.after.five_total > 15 * l1.after.five_total, `control: budgets ${b1.after.five_total} and ${l1.after.five_total} differ fifteenfold`);
   // The pull: each machine's brief, which now carries what it measured of its own turns, reaches the other.
   const bb = two.brief(big), lb = two.brief(lap);
@@ -25265,10 +25268,13 @@ test('statusline: two machines on one account calibrate their estimates against 
   assert.equal(l2.after.month_tok, 138_300_000 + 616_000, 'the month is the two machines\' own turns, each counted once');
   assert.equal(l2.after.five_total, Math.trunc(((3_920_000 + 287_000) / 11) * 100), 'the 5h budget is the account\'s tokens over the account\'s share');
   assert.equal(l2.after.week_total, Math.trunc(((15_500_000 + 287_000) / 9) * 100), 'and so is the week\'s');
-  assert.ok(monthPct(l2.after) > 17 && monthPct(l2.after) < 19, `the laptop's month reads the account's ${monthPct(l2.after)}%, not 100%`);
+  const cycleDays = (l2.state.mo_end - l2.state.mo_start) / 86400;
+  assert.ok(Math.abs(l2.after.month_tok_total - (((15_500_000 + 287_000) / 9) * 100 * cycleDays) / 7) < 1,
+    `and the month's is the week's over the ${cycleDays}-day bill cycle`);
+  assert.ok(monthPct(l2.after) > 17 && monthPct(l2.after) < 21, `the laptop's month reads the account's ${monthPct(l2.after)}%, not 100%`);
   assert.ok(l2.after.month_cost > 4000 && l2.after.month_cost_total > 20000, `and its dollars the build machine's range — ${l2.after.month_cost}/${l2.after.month_cost_total}`);
   assert.deepStrictEqual([l2.state.n5, l2.state.n7, b2.state.n5, b2.state.n7], [1, 1, 1, 1], 'each calibrated with the other machine in its sum, starting the smoothing over');
-  assert.match(vis(l2.line), /^5h +~4\.2M\/38\.2M \+210M↺ +11% ·3h 0m {2}wk +~15\.7M\/175\.4M \+810M↺ +9% ·3d 0h {2}mo +~138\.9M\/776\.8M \+6B↺ +18% ·\d+d \d+h {2}~\$4\.1k\/~\$23\.0k$/,
+  assert.match(vis(l2.line), /^5h +~4\.2M\/38\.2M \+210M↺ +11% ·3h 0m {2}wk +~15\.7M\/175\.4M \+810M↺ +9% ·3d 0h {2}mo +~138\.9M\/[\d.]+M \+6B↺ +\d+% ·\d+d \d+h {2}~\$4\.1k\/~\$[\d.]+k$/,
     `got ${JSON.stringify(vis(l2.line))}`);
   // Every OAK readout there reads the same cache: core, the terminal app and the brief the other machine borrows.
   const coreSays = (m) => two.as(m, () => { const u = core.usageLine(m.rig.home, ''); return [u.fiveTotal, u.weekTotal, u.monthTokens, u.monthTokensTotal, u.monthCost, u.monthCostTotal]; });
