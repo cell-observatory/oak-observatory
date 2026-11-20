@@ -398,6 +398,145 @@ test('usage: a copy of a session that is then resumed here claims all its messag
   assert.deepEqual(credit(a), [['l-1', 'b', 1], ['l-2', 'b', 1]]);
 });
 
+/** A demo simulator's session (`oak demo`) in `m`'s transcripts, with the agent's transcript the simulator writes beside it;
+ *  `copy` as a file sync brings one. */
+function demoSession(m, id, { copy = false } = {}) {
+  const file = m.transcript(id, [userAsk('a demo ask'), turn(`${id}-1`, 500, { input_tokens: 40, output_tokens: 120 })], undefined, { copy });
+  const sub = path.join(path.dirname(file), id, 'subagents', 'agent-demosub1.jsonl');
+  fs.mkdirSync(path.dirname(sub), { recursive: true });
+  fs.writeFileSync(sub, JSON.stringify({ cwd: m.work, sessionId: id, ...turn(`${id}-sub`, 400, { input_tokens: 30, output_tokens: 90 }) }) + '\n');
+  return file;
+}
+
+test('usage: the demo simulator\'s sessions count in no usage figure, on the machine that ran one and on one that holds a copy, and still list (0.12.0)', { skip }, (t) => {
+  const ms = machines(t, ['a', 'b']);
+  const { a, b } = ms;
+  for (const m of [a, b]) fs.writeFileSync(path.join(m.home, '.claude', '.claude.json'), JSON.stringify({ oauthAccount: { accountUuid: 'one-account' } }));
+  a.transcript('s-real', [userAsk('a real ask'), turn('r-1', 600, { input_tokens: 1000, output_tokens: 100 })]);
+  demoSession(a, 'demo-0a1b2c3d');
+  // b holds a file sync's copy of a's demo session, a copy of a real session no machine ran, and work of its own.
+  demoSession(b, 'demo-0a1b2c3d', { copy: true });
+  b.transcript('s-orphan', [userAsk('elsewhere'), turn('o-1', 500, { input_tokens: 3, output_tokens: 0 })], undefined, { copy: true });
+  b.transcript('s-b', [userAsk('on b'), turn('b-1', 400, { input_tokens: 7, output_tokens: 0 })]);
+  a.catchUp();
+  b.catchUp();
+  ms.carry(a, b);
+  ms.carry(b, a);
+  a.catchUp();
+  b.catchUp();
+  const real = 1100 + 3 + 7;
+  const cli = path.resolve(__dirname, '../../cli/dist/index.js');
+  for (const m of [a, b]) {
+    m.use();
+    assert.deepEqual(m.db((db) => rows(db, "SELECT message_id FROM usage_messages WHERE session_id = 'demo-0a1b2c3d' OR message_id LIKE 'demo-%'")), [], `${m.name}: no row of the demo's`);
+    assert.equal(m.db((db) => one(db, 'SELECT total(input + output + cache_create) AS n FROM usage_daily').n), real, `${m.name}: nor in the daily rollup`);
+    const totals = m.db((db) => core.usageTotals(db, { fiveReset: null, weekReset: null }));
+    assert.deepEqual([totals.five.tokens, totals.week.tokens, totals.month.tokens], [real, real, real], `${m.name}: the windows`);
+    for (const by of ['machine', 'model', 'session', 'day', 'agent', 'account']) {
+      for (const window of ['week', 'all']) {
+        const q = core.queryIndex('usage', { window, by, account: 'all' });
+        assert.ok(!q.error, JSON.stringify(q));
+        assert.equal(q.rows.reduce((s, r) => s + r.tokens, 0), real, `${m.name}: ${window} by ${by}`);
+      }
+    }
+    // The copies count as before (the real one no machine ran), with no demo message among them.
+    const copies = core.queryIndex('usage', { window: 'week', by: 'machine', account: 'all' }).rows.find((r) => r.key === 'unknown');
+    assert.equal(copies?.tokens, 3, `${m.name}: the copies' row`);
+    // `oak usage` as the readouts read it: the snapshot's totals, a window by machine, and the breakdown.
+    const usage = (...args) => {
+      const r = cp.spawnSync(process.execPath, [cli, 'usage', ...args, '--json'], { cwd: m.work, env: { ...process.env, OAK_NO_BACKGROUND: '1' }, encoding: 'utf8' });
+      assert.equal(r.status, 0, r.stderr);
+      return JSON.parse(r.stdout);
+    };
+    const snap = usage();
+    assert.deepEqual([snap.usageTotals.five.tokens, snap.usageTotals.week.tokens, snap.usageTotals.month.tokens], [real, real, real], `${m.name}: oak usage --json`);
+    assert.equal(usage('--window', 'month', '--by', 'machine', '--all-accounts').rows.reduce((s, r) => s + r.tokens, 0), real, `${m.name}: oak usage --window month --by machine`);
+    const breakdown = usage('--breakdown', '--by', 'session', '--agent', 'claude').agents[0];
+    assert.equal(breakdown.usageSource, 'database');
+    assert.equal(breakdown.totals.tokens, real, `${m.name}: oak usage --breakdown`);
+  }
+  // The simulator's session itself still lists where it ran.
+  assert.equal(a.db((db) => one(db, "SELECT count(*) AS n FROM sessions WHERE session_id = 'demo-0a1b2c3d'").n), 1, 'the demo session still lists');
+});
+
+test('usage: the demo simulator\'s usage an earlier OAK stored, its own and a copy\'s, counts no more once the index is brought up to this version (0.12.0)', { skip }, (t) => {
+  const { a } = machines(t, ['a']);
+  fs.writeFileSync(path.join(a.home, '.claude', '.claude.json'), JSON.stringify({ oauthAccount: { accountUuid: 'one-account' } }));
+  a.transcript('s-real', [userAsk('a real ask'), turn('r-1', 600, { input_tokens: 1000, output_tokens: 100 })]);
+  demoSession(a, 'demo-0a1b2c3d');
+  a.catchUp();
+  // The rows an OAK at schema version 10 kept: the demo session's messages this machine ran, and a copy's of another
+  // machine's demo.
+  const ts = Date.now() - 500_000;
+  a.db((db) => {
+    const add = db.prepare(`INSERT INTO usage_messages (message_id, agent, machine_id, session_id, account, model, ts, input, output, cost, ran)
+      VALUES (?, 'claude', ?, ?, NULL, 'claude-opus-4-8', ?, ?, ?, 0.01, ?)`);
+    add.run('stored-1', a.host, 'demo-0a1b2c3d', ts, 40, 120, 1);
+    add.run('stored-sub', a.host, 'demo-0a1b2c3d', ts, 30, 90, 1);
+    add.run('stored-copy', a.host, 'demo-0f0e0d0c', ts, 5, 15, 0);
+    // Control: as stored, they count.
+    assert.equal(core.usageTotals(db, { fiveReset: null, weekReset: null }).five.tokens, 1100 + 160 + 120 + 20, 'control: the stored rows count');
+    db.exec('PRAGMA user_version = 10');
+  });
+  a.catchUp();
+  assert.equal(a.db((db) => one(db, 'PRAGMA user_version').user_version), core.SCHEMA_VERSION);
+  assert.deepEqual(a.db((db) => rows(db, "SELECT message_id FROM usage_messages WHERE session_id GLOB 'demo-*'")), [], 'no row of the demo\'s');
+  assert.equal(a.db((db) => one(db, 'SELECT total(input + output + cache_create) AS n FROM usage_daily').n), 1100, 'nor in the daily rollup');
+  assert.equal(a.db((db) => core.usageTotals(db, { fiveReset: null, weekReset: null })).month.tokens, 1100);
+  a.use();
+  assert.deepEqual(core.queryIndex('usage', { window: 'all', by: 'machine', account: 'all' }).rows.map((r) => [r.key, r.tokens]), [[a.host, 1100]]);
+  assert.equal(a.db((db) => one(db, "SELECT count(*) AS n FROM sessions WHERE session_id = 'demo-0a1b2c3d'").n), 1, 'the demo session still lists');
+});
+
+test('usage: with no index, the transcript scans of `oak stats` and `oak usage --breakdown` leave the demo simulator\'s sessions out (0.12.0)', (t) => {
+  const { a } = machines(t, ['a']);
+  a.transcript('s-real', [userAsk('a real ask'), turn('r-1', 600, { input_tokens: 1000, output_tokens: 100 })]);
+  demoSession(a, 'demo-0a1b2c3d');
+  a.use();
+  process.env.OAK_INDEX = 'off';
+  assert.equal(core.computeStats(undefined, undefined, true).windows.week.tokens, 1100, 'the Claude plan-window fallback');
+  assert.equal(core.claudeBreakdown('session', Date.now() - 7 * 86400_000, null, path.join(a.home, '.claude', 'projects')).totals.tokens, 1100);
+  const cli = path.resolve(__dirname, '../../cli/dist/index.js');
+  const json = (...args) => {
+    const r = cp.spawnSync(process.execPath, [cli, ...args, '--json'], { cwd: a.work, env: { ...process.env, OAK_NO_BACKGROUND: '1' }, encoding: 'utf8' });
+    assert.equal(r.status, 0, r.stderr);
+    return JSON.parse(r.stdout);
+  };
+  assert.equal(json('stats').windows.week.tokens, 1100, 'oak stats');
+  const breakdown = json('usage', '--breakdown', '--by', 'session', '--agent', 'claude').agents[0];
+  assert.notEqual(breakdown.usageSource, 'database', 'control: the transcripts\' scan answered');
+  assert.equal(breakdown.totals.tokens, 1100, 'oak usage --breakdown');
+  // The stats caches keep no entry of the demo's.
+  const caches = fs.readdirSync(core.rootDir()).filter((n) => n.startsWith('stats-cache'));
+  assert.ok(caches.length > 0, 'control: a stats cache was written');
+  for (const n of caches) assert.doesNotMatch(fs.readFileSync(path.join(core.rootDir(), n), 'utf8'), /demo-0a1b2c3d/, n);
+});
+
+test('status line: its own transcript scan leaves the demo simulator\'s sessions out (0.12.0)', { skip: process.platform === 'win32' && 'POSIX shell' }, (t) => {
+  for (const tool of ['jq', 'python3']) if (cp.spawnSync(tool, ['--version']).error) return t.skip(`${tool} is not installed`);
+  const { a } = machines(t, ['a']);
+  const nowS = Math.floor(Date.now() / 1000);
+  fs.writeFileSync(path.join(a.home, '.claude', '.claude.json'), JSON.stringify({ oauthAccount: { accountUuid: 'one-account' } }));
+  fs.writeFileSync(path.join(a.home, '.claude', 'statusline-last.json'), JSON.stringify({ v: 3, api_ts: nowS, five_pct: 10, five_at: nowS - 5, five_reset: nowS + 3600,
+    week_pct: 20, week_at: nowS - 5, week_reset: nowS + 3 * 86400 }));
+  const file = a.transcript('s-real', [userAsk('a real ask', 700), turn('r-1', 600, { input_tokens: 1000, output_tokens: 100 })]);
+  demoSession(a, 'demo-0a1b2c3d');
+  const bin = path.join(a.home, 'bin');
+  const env = { ...process.env, HOME: a.home, USERPROFILE: a.home, CLAUDE_CONFIG_DIR: path.join(a.home, '.claude'), CODEX_HOME: path.join(a.home, '.codex'),
+    OAK_MACHINE_LABEL: 'a', OAK_INDEX: 'off', PATH: [bin, '/usr/bin', '/bin', '/usr/local/bin'].join(path.delimiter) };
+  fs.mkdirSync(bin);
+  fs.writeFileSync(path.join(bin, 'oak'), `#!/bin/sh\nexec "${process.execPath}" "${path.resolve(__dirname, '../../cli/dist/index.js')}" "$@"\n`, { mode: 0o755 });
+  const inst = cp.spawnSync('bash', [path.resolve(__dirname, '../../cli/statusline/install-statusline.sh'), '--force'], { env, encoding: 'utf8' });
+  assert.equal(inst.status, 0, inst.stderr);
+  const limits = { five_hour: { used_percentage: 10, resets_at: nowS + 3600 }, seven_day: { used_percentage: 20, resets_at: nowS + 3 * 86400 } };
+  const r = cp.spawnSync('bash', [path.join(a.home, '.claude', 'statusline.sh')], { input: JSON.stringify({ session_id: 's-real', cwd: a.work, transcript_path: file, rate_limits: limits }), env, encoding: 'utf8' });
+  assert.equal(r.status, 0, r.stderr);
+  const st = JSON.parse(fs.readFileSync(path.join(a.home, '.claude', 'statusline-usage.json'), 'utf8'));
+  assert.ok(Object.keys(st.fc).some((p) => p.endsWith('s-real.jsonl')), `control: the scan read the real transcript: ${JSON.stringify(Object.keys(st.fc))}`);
+  assert.deepEqual(Object.keys(st.fc).filter((p) => p.includes('demo-0a1b2c3d')), [], 'no file of the demo\'s');
+  assert.deepEqual([st.U5, st.U7, st.U30], [1100, 1100, 1100]);
+});
+
 test('usage: the status line\'s readings, its spend ledger and the accounts go into the index, each reading once per time it was measured', { skip }, (t) => {
   const f = indexFixture(t, core);
   const now = Math.floor(Date.now() / 1000);
@@ -2373,7 +2512,11 @@ test('usage pull: the demo\'s usage is neither sent nor applied', { skip }, (t) 
   a.transcript('demo-0123abcd', [userAsk('the demo'), turn('pd', 60, { input_tokens: 9, output_tokens: 9 })]);
   a.catchUp();
   const sent = a.db((db) => {
-    assert.equal(one(db, "SELECT count(*) AS n FROM usage_messages WHERE session_id = 'demo-0123abcd'").n, 1, 'control: counted where it runs');
+    assert.equal(one(db, "SELECT count(*) AS n FROM usage_messages WHERE session_id = 'demo-0123abcd'").n, 0, 'not counted where it runs either (0.12.0)');
+    // A row of it all the same, as an earlier OAK kept one, unsent and after every row sent so far.
+    db.prepare(`INSERT INTO usage_messages (message_id, agent, machine_id, session_id, account, model, ts, input, output, cost, seq, ran)
+      SELECT 'pd', agent, machine_id, 'demo-0123abcd', account, model, ts, 9, 9, cost, seq + 1, ran FROM usage_messages WHERE message_id = 'pr'`).run();
+    assert.equal(one(db, "SELECT count(*) AS n FROM usage_messages WHERE message_id = 'pd' AND synced_ms IS NULL AND seq > 0").n, 1, 'control: a row the pull would send');
     return core.usageRecordsSince(db, null);
   });
   assert.deepEqual(sent.messages.map((m) => m.message_id), ['pr'], 'only the real session\'s usage is sent');

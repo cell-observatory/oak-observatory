@@ -1392,7 +1392,7 @@ test('final 0.11 docs: delegated walkthrough includes wait, worker log and integ
   assert.match(guide, /OAK does not merge/);
 });
 test('final 0.11 docs: database schema and derivation versions are current', () => {
-  assert.match(docFlat('docs/ARCHITECTURE.md'), /Schema\*\* \(version 9/);
+  assert.match(docFlat('docs/ARCHITECTURE.md'), /Schema\*\* \(version 11/);
   assert.match(docFlat('docs/ARCHITECTURE.md'), /INGEST_VERSION.*5/);
   assert.match(docFlat('docs/_content/database-and-sync.html'), /CLI refuses unsupported Node.js/);
 });
