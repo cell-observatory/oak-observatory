@@ -1544,7 +1544,10 @@ export interface GptUsagePanel {
   monthCost: number | null;
   monthCostTotal: number | null;
   usageSource: 'database' | 'local';
+  /** The machines whose turns the estimates count, by their labels: JSON only. */
   measuredMachines: string;
+  /** Whether those include any machine but this one: the readouts say so, naming none. */
+  othersMeasured: boolean;
   usageFreshness?: string;
 }
 
@@ -1685,7 +1688,7 @@ function gptUsageFromDatabase(session: string | undefined, now: number, database
   }
   const weekStart = weekReset !== null ? weekReset - 7 * 86400_000 : now - 7 * 86400_000;
   const cyc = database ? database.cycle(monthStart, weekStart, now)
-    : { ...codexCycleUsage(monthStart, weekStart, now), measuredMachines: 'this machine alone', budgetScope: 'local', localEquivalent: true, usageFreshness: '' };
+    : { ...codexCycleUsage(monthStart, weekStart, now), measuredMachines: 'this machine alone', othersMeasured: false, budgetScope: 'local', localEquivalent: true, usageFreshness: '' };
   // MONTH budget, estimated the SAME way claude's statusline does (install-statusline.sh:886 —
   // `tk30 = t7 * mdays/7`, and the month % = month_tok / month_tok_total): project a calibrated
   // shorter window across the cycle. gpt exposes no monthly quota %, so we back-derive the WEEKLY
@@ -1738,7 +1741,7 @@ function gptUsageFromDatabase(session: string | undefined, now: number, database
     // the month's $ unavailable rather than understated. A month with NO priced spend stays unavailable.
     monthCost: cyc.moUsd > 0 && cyc.moUsdKnown ? cyc.moUsd : null,
     monthCostTotal,
-    usageSource: db ? 'database' : 'local', measuredMachines: cyc.measuredMachines,
+    usageSource: db ? 'database' : 'local', measuredMachines: cyc.measuredMachines, othersMeasured: cyc.othersMeasured,
     usageFreshness: cyc.usageFreshness,
   };
 }

@@ -94,12 +94,6 @@ export interface StatuslineData {
   weekEst?: number | null;
   weekTotal?: number | null;
   weekMeasured?: number | null;
-  /** The saved machine each window's reading came from (core's fiveMachine and its siblings), named in one dim
-   *  segment ahead of the windows, as the shell's line names it; null or absent for this machine's own reading. */
-  fiveMachine?: string | null;
-  weekMachine?: string | null;
-  fableMachine?: string | null;
-  monthMachine?: string | null;
   /** Whose measurements these are: 'here', or 'N machines'. Rendered beside them, because a token
    *  total that cannot say whose it is reads as the account's when it may be one laptop's. */
   usageScope?: string;
@@ -455,7 +449,6 @@ export function statuslineGauges(
     collectLabels?.push('ctx');
     if (!collect) parts.push(ctxSegment(d, depth, themed, width, labelWidth));
   }
-  const lead = parts.length; // where the windows begin: the saved machine's name goes ahead of them
   const window = (
     label: string,
     pct: number | null | undefined,
@@ -572,7 +565,6 @@ export function statuslineGauges(
   // ONE dollar pair, MONTHLY, in its OWN segment: 30 days of spend against
   // four weekly cycles of budget (spend alone for plans with no quota to project from), plus the
   // live promotion with its dates — money and promos read apart from the quota bars.
-  let moDrawn = false;
   {
     const mo: string[] = [];
     let moHead = '';
@@ -597,22 +589,6 @@ export function statuslineGauges(
     if (seg30 && !moHead) seg30 = `${dim('mo', depth)} ${seg30}`;
     if (d.promo?.label) seg30 = `${seg30 ? `${seg30} ` : ''}${yel(`${d.promo.label}${d.promo.dates ? ` ${d.promo.dates}` : ''}`, depth)}`;
     if (seg30) parts.push(seg30);
-    moDrawn = !!moHead || !!d.monthTokens;
-  }
-  // A SAVED MACHINE'S READING is named as the shell's line names it: one dim segment ahead of the windows, as core's
-  // machineNote spells it (in its order), the machine alone when every window drawn came from it, else each machine
-  // with its windows.
-  const drawn: [string, string | null | undefined][] = [];
-  if (!d.noWindows && d.fivePct != null) drawn.push(['5h', d.fiveMachine]);
-  if (!d.noWindows && d.weekPct != null) drawn.push(['wk', d.weekMachine]);
-  if (typeof d.fablePct === 'number' && isFinite(d.fablePct)) drawn.push([(d.fableLabel || 'fable').toLowerCase(), d.fableMachine]);
-  if (moDrawn) drawn.push(['mo', d.monthMachine]);
-  const from = drawn.filter((w): w is [string, string] => !!w[1]);
-  if (from.length) {
-    const by = new Map<string, string[]>();
-    for (const [label, m] of from) by.set(m, [...(by.get(m) ?? []), label]);
-    const note = by.size === 1 && from.length === drawn.length ? from[0][1] : [...by].map(([m, labels]) => `${m}: ${labels.join(' ')}`).join('; ');
-    parts.splice(lead, 0, dim(`(${note})`, depth));
   }
   // CREDIT, where the account reports one. It answers a different question from the windows — they
   // say how much of a rate is spent, this says how much is left to spend at all — so it sits beside

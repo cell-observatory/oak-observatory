@@ -630,10 +630,6 @@ export function statuslineDataFor(state: DashState): StatuslineData {
     fableEst: u?.fableTokens ?? null,
     fableTotal: u?.fableTotal ?? null,
     fableReads: u?.fableReads ?? null,
-    fiveMachine: u?.fiveMachine ?? null,
-    weekMachine: u?.weekMachine ?? null,
-    fableMachine: u?.fableMachine ?? null,
-    monthMachine: u?.monthMachine ?? null,
   };
   if (u?.fiveMeasuredAll) data.fiveMeasured = u.fiveMeasuredAll;
   if (u?.weekMeasuredAll) data.weekMeasured = u.weekMeasuredAll;
@@ -736,27 +732,20 @@ export function statuslineFor(state: DashState, cols: number, g: Glyphs, depth: 
   // Claude leads when it has data, OR when there is no gpt data either — then it carries the "install
   // the statusline" hint. A codex-only machine with gpt numbers is never nagged about a statusline it
   // does not use (the whole point of the second provider). The two providers are divided by a bar.
-  const build = (compact: boolean, machine = b.claude.machine, money = true): string => {
+  const build = (compact: boolean, money = true): string => {
     const parts: string[] = [];
     if (!noClaude || !gpt) {
+      // A saved machine's reading of the account names no machine: the shares are the account's.
       const c = win3(b.claude, compact, money);
-      // A saved machine's reading of the account names that machine: `✳ claude (build-box) wk: 1% …`.
-      const from = c && machine ? ` ${grey(`(${machine})`)}` : '';
       // The install hint only without a cache: a window reset leaves an installed status line with nothing to show yet.
-      parts.push(c ? `${orange('✳ claude')}${from} ${c}` : `${orange('✳ claude')} ${grey(state.usage?.statuslineCache ? '—' : 'run oak statusline')}`);
+      parts.push(c ? `${orange('✳ claude')} ${c}` : `${orange('✳ claude')} ${grey(state.usage?.statuslineCache ? '—' : 'run oak statusline')}`);
     }
     if (gpt) parts.push(`${blue('⬡ gpt')} ${win3(gpt, compact, money)}`);
     return parts.join(`  ${grey('|')}  `);
   };
   const full = build(false);
   let line = displayWidth(full) <= cols ? full : build(true); // drop reset times to keep it one line
-  if (displayWidth(line) > cols) line = build(true, b.claude.machine, false); // then the dollar figures
-  // Still too wide with a saved machine's name: the name gives up its room before any window does, cut to what
-  // the windows leave and never below one character, so the reading still says it is another machine's.
-  if (b.claude.machine && displayWidth(line) > cols) {
-    const room = cols - displayWidth(build(true, '', false)) - 3;
-    line = build(true, fitVisible(b.claude.machine, Math.max(1, room)).trimEnd(), false);
-  }
+  if (displayWidth(line) > cols) line = build(true, false); // then the dollar figures
   return pad2([fit(line)]);
 }
 
@@ -775,12 +764,11 @@ export function statuslineFor(state: DashState, cols: number, g: Glyphs, depth: 
 export function statusWithToast(left: string, state: DashState, cols: number): string {
   if (state.hoverUsage && !state.confirm && !state.goto) {
     const notes: string[] = [];
-    const c = state.usage?.machineMeasured?.machines;
+    const others = !!state.usage?.machineMeasured;
     const freshness = state.usageBoth?.claude.usageFreshness || state.usageBoth?.gpt?.usageFreshness || state.usage?.usageFreshness;
     if (freshness) notes.push(freshness);
-    if (c) notes.push(`Claude estimates include usage measured on ${c}`);
-    const g = state.usageBoth?.gpt;
-    if (g?.measuredMachines) notes.push(`GPT estimates include usage measured on ${g.measuredMachines}`);
+    if (others) notes.push('Claude estimates include the account\'s usage on other machines');
+    if (state.usageBoth?.gpt?.othersMeasured) notes.push('GPT estimates include the account\'s usage on other machines');
     if (notes.length) left = notes.join(' · ');
   }
   left = sanitizeCell(left);

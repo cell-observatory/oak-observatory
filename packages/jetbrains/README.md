@@ -172,13 +172,13 @@ failed or unavailable sends retain the clipboard draft. Comments stay unsent unt
 Machines are saved with `oak machine add`, which replaces the `remotes` command. Usage is measured on each
 machine for itself; where this machine has no current reading of the Claude account's 5-hour or weekly
 share, the Stats panel shows a saved machine's reading of the same account (with no
-Claude Code login here, of the one account the saved machines name) and name it. An account with no five-hour
+Claude Code login here, of the one account the saved machines name), naming no machine: the shares are the account's. An account with no five-hour
 limit, whose usage answer carries no 5-hour window (as a verified Ultra plan's does), shows no 5-hour readout in
 the Stats panel, and the status bar shows none for any plan. The status bar shows weekly and monthly usage, with the month's dollar
 figure after its `mo` reset, as the Claude Code status line shows it: the estimate at today's list prices, marked `~`, or, on a plan with
 no rolling windows, the spend Claude Code reported. The token and dollar
 estimates count each message of the account once, across this machine and every machine whose usage the
-local database holds, and the tooltip and the Stats panel name those machines. To read it, OAK runs
+local database holds, and the tooltip and the Stats panel say when they include the account's usage on other machines. To read it, OAK runs
 `oak __usage-records --json` on each enabled saved machine over SSH, in the background, at most every five
 minutes while the plugin runs (not on a machine whose record log `oak sync` keeps current here);
 `"machineUsage": false` in `~/.claude/claude-observatory/prefs.json` turns that off. `oak server` is only the local TUI focus endpoint.

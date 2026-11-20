@@ -255,9 +255,8 @@ const num = (v: unknown, min = 0): number | null => (typeof v === 'number' && Nu
  *  (U+200C) stay: an emoji family or an Indic letter is built with the one, Persian and Indic words with the other,
  *  and neither reorders anything; so do the combining grapheme joiner, the Mongolian vowel separator and the
  *  variation selectors.
- *  One definition for core, the CLI and VS Code (its webviews take PLAIN_LABEL_SOURCE, with the `u` flag); the
- *  terminal app's sanitizeCell drops the same set from every cell, and the JetBrains plugin's plainLabel keeps the
- *  same class. */
+ *  One definition for core, the CLI and VS Code; the terminal app's sanitizeCell drops the same set from every cell,
+ *  and the JetBrains plugin's plainLabel keeps the same class (PLAIN_LABEL_SOURCE, which needs the `u` flag). */
 const HIDDEN = new RegExp(`[\\u0000-\\u001f\\u007f-\\u009f]|${HIDDEN_SOURCE}`, 'gu');
 export const PLAIN_LABEL_SOURCE = HIDDEN.source;
 export function plainLabel(s: string): string {

@@ -217,94 +217,55 @@ class UsageReadoutTest : ObservatoryPlatformTestCase() {
         assertFalse(render(parseUsageSnap("""{"gptWeekPct":30,"gptMonthTok":0}""")!!, field = "gptLabel").first.contains("mo"))
     }
 
-    fun testASavedMachinesReadingIsNamedBesideTheIconAndInTheTooltip() {
+    fun testASavedMachinesReadingNamesNoMachineOnTheBarOrInTheTooltip() {
         // Where this machine has no current share, `oak usage --json` carries a saved machine's reading of the same
-        // account and names that machine: in `claudeMachineTipNote`, by the windows the tooltip shows, for the tooltip,
-        // and in `claudeMachineBarNote`, by the windows the bar shows, for the bar.
-        val snap = parseUsageSnap(
-            """{"claudeFivePct":1,"claudeFiveReset":${now + 3_600_000L},"claudeWeekPct":22,"claudeWeekReset":$weekReset,
-                 "claudeMachineNote":"build-box","claudeMachineBarNote":"build-box","claudeMachineTipNote":"build-box"}"""
-        )!!
-        val (bar, tip) = render(snap)
-        assertTrue(bar, Regex("^✳ \\(build-box\\) wk: 22% ").containsMatchIn(bar))
-        assertTrue(tip, tip.contains("\nmeasured on a saved machine signed in to the same Claude account (build-box)\n"))
-        // This machine's own reading names no machine, and a blank note is none.
-        val (own, ownTip) = render(parseUsageSnap("""{"claudeWeekPct":22,"claudeMachineTipNote":""}""")!!)
-        assertTrue(own, own.startsWith("✳ wk: 22%"))
-        assertFalse(ownTip, ownTip.contains("measured on"))
-        // A machine's label is text, never markup.
-        assertTrue(render(snap.copy(machineBarNote = "<b>box</b>")).first.contains("(&lt;b&gt;box&lt;/b&gt;)"))
-        // With no Claude Code login here there was no account to match, and the tooltip says so instead.
-        val unmatched = parseUsageSnap("""{"claudeWeekPct":22,"claudeMachineBarNote":"build-box","claudeMachineTipNote":"build-box","claudeMachineUnmatched":true}""")!!
-        val (uBar, uTip) = render(unmatched)
-        assertTrue(uBar, uBar.startsWith("✳ (build-box) wk: 22%"))
-        assertTrue(uTip, uTip.contains("\nmeasured on a saved machine (build-box); this machine has no Claude Code login to match its account with\n"))
-        assertFalse(uTip, uTip.contains("same Claude account"))
-    }
-
-    fun testTheTooltipSaysWhenTheSavedMachineMeasuredTheReading() {
-        // The machine measured its week two days ago and has not answered since: the tooltip gives that time, with
-        // its date, so a days-old reading does not pass for a current one.
+        // account and the machine it came from (`claudeMachineBarNote`, `claudeMachineTipNote`) for the JSON alone: the
+        // shares are the account's, so neither the bar nor the tooltip names a machine, whatever its herdr label holds
+        // (control, bidi and zero-width characters, an emoji family, markup, the per-model cap's window). The tooltip
+        // says when it was measured (two days ago here, so with its date): a days-old reading does not pass for a
+        // current one.
         val measured = now - 2 * day
         val at = com.cellobservatory.observatory.ui.stats.atTime(measured)
         assertFalse("control: a time on another day carries its date — $at", Regex("^\\d\\d:\\d\\d$").matches(at))
-        val snap = parseUsageSnap("""{"claudeWeekPct":22,"claudeMachineTipNote":"build-box","claudeMachineTipAt":$measured}""")!!
-        val (_, tip) = render(snap)
-        assertTrue(tip, tip.contains("\nmeasured on a saved machine signed in to the same Claude account (build-box) at $at\n"))
-        val (_, uTip) = render(snap.copy(machineUnmatched = true))
-        assertTrue(uTip, uTip.contains("\nmeasured on a saved machine (build-box) at $at; this machine has no Claude Code login to match its account with\n"))
+        for (label in listOf("build-box", """build\u001b[2J\u202e\u200bbox\u2066\u2069\u200e\u200f\u061c\ufeff\u0007\t<b>""",
+                "lab \uD83E\uDDD1\u200D\uD83D\uDCBB", "build-box: fable")) {
+            val snap = parseUsageSnap(
+                """{"claudeFivePct":1,"claudeFiveReset":${now + 3_600_000L},"claudeWeekPct":22,"claudeWeekReset":$weekReset,
+                     "claudeMachineNote":"$label","claudeMachineBarNote":"$label","claudeMachineTipNote":"$label","claudeMachineTipAt":$measured}"""
+            )!!
+            val (bar, tip) = render(snap)
+            assertTrue(bar, bar.startsWith("✳ wk: 22% "))
+            assertTrue(tip, tip.contains("\nmeasured on a saved machine signed in to the same Claude account at $at\n"))
+            assertFalse("no machine named — ${bar + tip}", Regex("box|lab|&lt;").containsMatchIn(bar + tip))
+            // With no Claude Code login here there was no account to match: the tooltip says so, naming no machine.
+            val (uBar, uTip) = render(snap.copy(machineUnmatched = true))
+            assertTrue(uBar, uBar.startsWith("✳ wk: 22% "))
+            assertTrue(uTip, uTip.contains("\nmeasured on a saved machine at $at; this machine has no Claude Code login to match its account with\n"))
+            assertFalse(uTip, uTip.contains("same Claude account") || Regex("box|lab").containsMatchIn(uTip))
+        }
+        // This machine's own reading has no time measured, and a blank note is none.
+        val (own, ownTip) = render(parseUsageSnap("""{"claudeWeekPct":22,"claudeMachineTipNote":""}""")!!)
+        assertTrue(own, own.startsWith("✳ wk: 22%"))
+        assertFalse(ownTip, ownTip.contains("measured on"))
     }
 
-    fun testAMachineLabelShowsWithoutControlCharacters() {
-        // herdr's label is whatever was typed into it: ESC, BEL and TAB, bidi controls (which reorder the text around
-        // them) and zero-width characters are dropped on the bar and in the tooltip, and markup stays text.
-        val label = "build\\u001b[2J\\u202e\\u200bbox\\u2066\\u2069\\u200e\\u200f\\u061c\\ufeff\\u0007\\t<b>"
-        val snap = parseUsageSnap("""{"claudeWeekPct":1,"claudeMachineTipNote":"$label","claudeMachineBarNote":"$label"}""")!!
-        assertEquals("control: the label reached the widget whole", "build\u001b[2J\u202e\u200bbox\u2066\u2069\u200e\u200f\u061c\ufeff\u0007\t<b>", snap.machineTipNote)
-        val (bar, tip) = render(snap)
-        assertTrue(bar, bar.startsWith("✳ (build[2Jbox&lt;b&gt;) wk: 1%"))
-        assertTrue(tip, tip.contains("account (build[2Jbox&lt;b&gt;)\n"))
-        assertFalse(
-            "no control, bidi or zero-width character left — ${bar + tip}",
-            Regex("[\\u0000-\\u0009\\u000b-\\u001f\\u007f\\u061c\\u200b-\\u200f\\u202a-\\u202e\\u2066-\\u2069\\ufeff]").containsMatchIn(bar + tip),
-        )
-    }
-
-    fun testAnEmojiFamilyInALabelKeepsItsJoiners() {
-        // The zero-width joiner stays where the others go: an emoji family is built with it, and it reorders nothing.
-        val family = "lab \uD83E\uDDD1\u200D\uD83D\uDCBB \uD83D\uDC68\u200D\uD83D\uDC69\u200D\uD83D\uDC67"
-        val (bar, tip) = render(parseUsageSnap("""{"claudeWeekPct":1,"claudeMachineTipNote":"$family","claudeMachineBarNote":"$family"}""")!!)
-        assertTrue(bar, bar.startsWith("✳ ($family) wk: 1%"))
-        assertTrue(tip, tip.contains("account ($family)\n"))
-    }
-
-    fun testTheTooltipNamesTheMachinesTheEstimatesInclude() {
-        // The estimates add what the saved machines of the account measured of their own turns: the tooltip names them
-        // (`claudeMeasuredMachines`), as text, while the bar, which shows this machine's own shares, names none.
-        val snap = parseUsageSnap(
-            """{"claudeFivePct":11,"claudeFiveReset":${now + 3_600_000L},"claudeWeekPct":9,"claudeWeekReset":$weekReset,
-                 "claudeMachineTipNote":"","claudeMachineBarNote":"","claudeMeasuredMachines":"build-box, <b>lab</b>"}"""
-        )!!
-        val (bar, tip) = render(snap)
-        assertTrue("the bar names no machine — $bar", bar.startsWith("✳ wk: 9%"))
-        assertTrue(tip, tip.contains("\nestimates include usage measured on build-box, &lt;b&gt;lab&lt;/b&gt;\n"))
-        assertFalse(tip, tip.contains("measured on a saved machine"))
-        val (_, own) = render(parseUsageSnap("""{"claudeWeekPct":9,"claudeMeasuredMachines":""}""")!!)
-        assertFalse("control: estimates of this machine alone name none — $own", own.contains("estimates include"))
-    }
-
-    fun testTheBarNamesNoMachineForTheCapAlone() {
-        // The per-model cap alone came from a saved machine: the bar, which shows no cap, names no machine (its
-        // `claudeMachineBarNote` is empty), and the tooltip, which shows the cap, names the machine with its window.
-        val snap = parseUsageSnap(
-            """{"claudeFivePct":9,"claudeFiveReset":${now + 3_600_000L},"claudeWeekPct":30,"claudeWeekReset":$weekReset,
-                 "claudeFablePct":9,"claudeFableReset":$weekReset,"claudeFableLabel":"Fable",
-                 "claudeMachineNote":"build-box: fable","claudeMachineBarNote":"","claudeMachineTipNote":"build-box: fable"}"""
-        )!!
-        val (bar, tip) = render(snap)
-        assertTrue("the bar names no machine — $bar", bar.startsWith("✳ wk: 30%"))
-        assertFalse(bar, bar.contains("build-box"))
-        assertTrue(tip, tip.contains("\nmeasured on a saved machine signed in to the same Claude account (build-box: fable)\n"))
+    fun testTheTooltipSaysTheEstimatesIncludeOtherMachinesNamingNone() {
+        // The estimates add what the saved machines of the account measured of their own turns (core's machineMeasured,
+        // in `claudeAccount`): the tooltip says so, naming none, even when the only other usage is the copies no machine
+        // claims (machines ""), while the bar shows this machine's own shares.
+        for (machines in listOf("build-box, <b>lab</b>", "")) {
+            val snap = parseUsageSnap(
+                """{"claudeFivePct":11,"claudeFiveReset":${now + 3_600_000L},"claudeWeekPct":9,"claudeWeekReset":$weekReset,
+                     "claudeMachineTipNote":"","claudeMachineBarNote":"","claudeMeasuredMachines":"$machines",
+                     "claudeAccount":{"machineMeasured":{"five":null,"week":null,"month":null,"machines":"$machines"}}}"""
+            )!!
+            val (bar, tip) = render(snap)
+            assertTrue("the bar names no machine — $bar", bar.startsWith("✳ wk: 9%"))
+            assertTrue(tip, tip.contains("\nestimates include the account’s usage on other machines\n"))
+            assertFalse(tip, tip.contains("measured on") || Regex("box|lab").containsMatchIn(tip))
+        }
+        val (_, own) = render(parseUsageSnap("""{"claudeWeekPct":9,"claudeMeasuredMachines":"","claudeAccount":{"machineMeasured":null}}""")!!)
+        assertFalse("control: estimates of this machine alone say none — $own", own.contains("estimates include"))
     }
 
     fun testTheCapIsReadFromTheFlattenedAccountKeys() {
@@ -329,13 +290,16 @@ class UsageReadoutTest : ObservatoryPlatformTestCase() {
         assertTrue("control: the rest of the payload still parsed", plain.fivePct != null)
     }
 
-    fun testGptAccountTotalsNameBothMachinesAndTheFallback() {
-        for (machines in listOf("work-box, build-box", "this machine alone")) {
+    fun testGptAccountTotalsSayTheyIncludeOtherMachinesNamingNone() {
+        // GPT's shares are the account's: the tooltip says the estimates include other machines' usage, and neither it
+        // nor the bar names one, whatever machines `oak usage --json` lists (gptMeasuredMachines, for the JSON alone).
+        for (others in listOf(true, false)) {
             val s = parseUsageSnap("""{"gptWeekPct":20,"gptMonthTok":10000000,"gptMonthTokTotal":88571429,
-                "gptMonthUsd":"~${'$'}18","gptMeasuredMachines":"$machines"}""")!!
+                "gptMonthUsd":"~${'$'}18","gptMeasuredMachines":"work-box, build-box","gptOthersMeasured":$others}""")!!
             val (bar, tip) = render(s, "gptLabel")
             assertTrue(bar, bar.contains("wk: 20%") && bar.contains("mo: 11%") && bar.contains("~${'$'}18"))
-            assertTrue(tip, tip.contains("estimates include usage measured on $machines"))
+            assertEquals(tip, others, tip.contains("\nestimates include the account’s usage on other machines\n"))
+            assertFalse(bar + tip, (bar + tip).contains("box"))
             assertFalse(tip, tip.contains("local tokens") || tip.contains("calendar month"))
         }
     }

@@ -166,7 +166,7 @@ The `remotes` command and its SSH session scanner are retired: OAK reads a saved
 machine's own `oak` over SSH (`--machine`). Usage is measured on each machine for itself; where this
 machine has no current reading of the Claude account's 5-hour or weekly share, the readouts show a saved
 machine's reading of the same account (with no Claude Code login here, of the one account the saved
-machines name) and name it. An account with no five-hour limit, whose usage answer carries no 5-hour
+machines name), naming no machine: the shares are the account's. An account with no five-hour limit, whose usage answer carries no 5-hour
 window (as a verified Ultra plan's does), shows no 5-hour readout. To read it, the terminal app, both
 editors, `oak usage` and the bundled status line run `oak __usage-records --json` on each enabled saved
 machine over SSH, in the background, at most every five minutes, and keep that machine's usage in the

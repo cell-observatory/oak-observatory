@@ -5,8 +5,9 @@ import com.cellobservatory.observatory.platform.ObservatoryPlatformTestCase
 
 /**
  * Where this machine has no current share of the Claude account, the figures are a saved machine's reading of it,
- * and the usage section's note names that machine beside the cache's last refresh, on the claude tab. GPT's
- * figures are always this machine's own, so the gpt tab's note names none. Read through the panel's own parser.
+ * and the usage section's note says when it was measured beside the cache's last refresh, on the claude tab, naming
+ * no machine: the shares are the account's. GPT's figures are always this machine's own, so the gpt tab's note has
+ * no such time. Read through the panel's own parser.
  */
 class StatsMachineNoteTest : ObservatoryPlatformTestCase() {
 
@@ -37,14 +38,21 @@ class StatsMachineNoteTest : ObservatoryPlatformTestCase() {
     private fun foot(json: String): String =
         panelKt.getDeclaredMethod("footNote", usageClass).apply { isAccessible = true }.invoke(null, parsed(json)) as String
 
-    fun testTheNoteNamesTheSavedMachineOnTheClaudeTab() {
+    fun testTheNoteNamesNoMachineOnTheClaudeTab() {
+        // Whatever the saved machine's label holds (control, bidi and zero-width characters, JSON-escaped as the CLI
+        // writes them, an emoji family, the per-model cap's window), the note says when it was measured and names no machine.
         val at = System.currentTimeMillis()
-        val json = """{"claudeAccount":{"cachedAtMs":$at,"machineNote":"build-box"}}"""
-        assertTrue(note(json, "claude"), Regex("^updated \\S.* · measured on build-box$").matches(note(json, "claude")))
-        assertTrue(note(json, "gpt"), Regex("^updated \\S[^·]*$").matches(note(json, "gpt")))
+        val measured = at - 60_000
+        for (label in listOf("build-box", """build\u001b[2J\u202e\u200b\u2066box\u2069\u200f\ufeff\u0007\t""",
+                "lab \uD83D\uDC68\u200D\uD83D\uDC69\u200D\uD83D\uDC67", "build-box: fable")) {
+            val json = """{"claudeAccount":{"cachedAtMs":$at,"machineNote":"$label","machineAt":$measured}}"""
+            assertTrue(note(json, "claude"), Regex("^updated \\S.* · measured at ${Regex.escape(atTime(measured))}$").matches(note(json, "claude")))
+            assertFalse(note(json, "claude"), Regex("box|lab").containsMatchIn(note(json, "claude")))
+            assertTrue(note(json, "gpt"), Regex("^updated \\S[^·]*$").matches(note(json, "gpt")))
+        }
         val own = note("""{"claudeAccount":{"cachedAtMs":$at,"machineNote":""}}""", "claude")
         assertTrue("control: this machine's own reading still has its stamp — $own", own.startsWith("updated "))
-        assertFalse(own, own.contains("measured on"))
+        assertFalse(own, own.contains("measured"))
     }
 
     fun testASavedMachinesReadingSaysWhenThatMachineMeasuredIt() {
@@ -56,7 +64,7 @@ class StatsMachineNoteTest : ObservatoryPlatformTestCase() {
             """{"claudeAccount":{"statuslineCache":true,"cachedAtMs":$cachedAt,"machineNote":"build-box"$machine}}"""
         val old = usage(now - 60_000, ""","machineAt":$measured""")
         assertFalse("control: a time on another day carries its date — ${atTime(measured)}", Regex("^\\d\\d:\\d\\d$").matches(atTime(measured)))
-        assertTrue(note(old, "claude"), note(old, "claude").endsWith(" · measured on build-box at ${atTime(measured)}"))
+        assertTrue(note(old, "claude"), note(old, "claude").endsWith(" · measured at ${atTime(measured)}"))
         assertEquals("the footnote dates the reading by that machine's measurement", "as of ${atTime(measured)}", foot(old))
         // A saved machine's reading a minute old is current, however old this machine's cache.
         assertEquals("", foot(usage(now - 3_600_000, ""","machineAt":${now - 60_000}""")))
@@ -77,42 +85,25 @@ class StatsMachineNoteTest : ObservatoryPlatformTestCase() {
         assertEquals("", foot(mixed.replace("\"fiveMachine\":null", "\"fiveMachine\":\"build-box\"").replace("build-box: wk", "build-box")))
     }
 
-    fun testAMachineLabelShowsWithoutControlCharacters() {
-        // herdr's label is whatever was typed into it: ESC, BEL and TAB, bidi controls and zero-width characters are
-        // dropped from the note.
-        val json = """{"claudeAccount":{"cachedAtMs":${System.currentTimeMillis()},"machineNote":"build\u001b[2J\u202e\u200b\u2066box\u2069\u200f\ufeff\u0007\t"}}"""
-        assertTrue(note(json, "claude"), note(json, "claude").endsWith(" · measured on build[2Jbox"))
-    }
-
-    fun testAnEmojiFamilyInALabelKeepsItsJoiners() {
-        val family = "lab \uD83D\uDC68\u200D\uD83D\uDC69\u200D\uD83D\uDC67"
-        val json = """{"claudeAccount":{"cachedAtMs":${System.currentTimeMillis()},"machineNote":"$family"}}"""
-        assertTrue(note(json, "claude"), note(json, "claude").endsWith(" · measured on $family"))
-    }
-
-    fun testTheNoteNamesTheMachinesTheEstimatesInclude() {
+    fun testTheNoteSaysTheEstimatesIncludeOtherMachinesNamingNone() {
         // The estimates add what the saved machines of the account measured of their own turns (core's machineMeasured):
-        // the note names them on the claude tab, as plain text, and never on the gpt tab, whose figures are this
-        // machine's own.
+        // the note says so on the claude tab, naming none, even when the only other usage is the copies no machine
+        // claims (machines ""), and never on the gpt tab, whose figures are this machine's own.
         val at = System.currentTimeMillis()
-        val json = """{"claudeAccount":{"cachedAtMs":$at,"machineNote":"","machineMeasured":{"five":null,"week":null,"month":null,"machines":"build-box, lab\u202e-box"}}}"""
-        assertTrue(note(json, "claude"), Regex("^updated \\S.* · estimates include usage measured on build-box, lab-box$").matches(note(json, "claude")))
-        assertTrue(note(json, "gpt"), Regex("^updated \\S[^·]*$").matches(note(json, "gpt")))
+        for (machines in listOf("build-box, lab\u202e-box", "")) {
+            val json = """{"claudeAccount":{"cachedAtMs":$at,"machineNote":"","machineMeasured":{"five":null,"week":null,"month":null,"machines":"$machines"}}}"""
+            assertTrue(note(json, "claude"), Regex("^updated \\S.* · estimates include the account’s usage on other machines$").matches(note(json, "claude")))
+            assertFalse(note(json, "claude"), note(json, "claude").contains("box"))
+            assertTrue(note(json, "gpt"), Regex("^updated \\S[^·]*$").matches(note(json, "gpt")))
+        }
         val none = note("""{"claudeAccount":{"cachedAtMs":$at,"machineMeasured":null}}""", "claude")
-        assertFalse("control: estimates of this machine alone name none — $none", none.contains("estimates include"))
-    }
-
-    fun testTheNoteKeepsTheCapsMachine() {
-        // The Stats panel shows the per-model cap, so a cap from a saved machine is named with its window, from the full
-        // note (machineNote), never the status bar's (machineBarNote), which names none for it.
-        val json = """{"claudeAccount":{"cachedAtMs":${System.currentTimeMillis()},"machineNote":"build-box: fable","machineBarNote":""}}"""
-        assertTrue(note(json, "claude"), note(json, "claude").endsWith(" · measured on build-box: fable"))
+        assertFalse("control: estimates of this machine alone say none — $none", none.contains("estimates include"))
     }
 
     fun testTheNoteWrapsInANarrowDockRatherThanLosingItsEnd() {
-        // The note ends with the saved machines' names. As a label beside the section's title it was cut there, with an
-        // ellipsis, in the default dock (the Stats pane is a fifth of the window): it wraps under the title instead, whole.
-        val text = "updated 14:02 · measured on build-box at 13:58 · estimates include usage measured on build-box, lab-box"
+        // As a label beside the section's title the note was cut at its end, with an ellipsis, in the default dock (the
+        // Stats pane is a fifth of the window): it wraps under the title instead, whole.
+        val text = "updated 14:02 · measured at 13:58 · estimates include the account’s usage on other machines"
         val section = Class.forName("com.cellobservatory.observatory.ui.stats.FoldSection")
             .getDeclaredConstructor(String::class.java, String::class.java, List::class.java, javax.swing.JComponent::class.java)
             .apply { isAccessible = true }
@@ -140,10 +131,14 @@ class StatsMachineNoteTest : ObservatoryPlatformTestCase() {
         assertTrue("a narrow dock: the note takes more than one line — $narrow", narrow >= 2)
         assertEquals("control: a wide dock, one line", 1, linesAt(4000))
     }
-    fun testGptNamesTheDatabaseMachinesAndLocalFallback() {
-        for (machines in listOf("work-box, build-box", "this machine alone")) {
-            assertEquals("estimates include usage measured on $machines", note("""{"gptMeasuredMachines":"$machines"}""", "gpt"))
+    fun testGptSaysTheEstimatesIncludeOtherMachinesNamingNone() {
+        // GPT's shares are the account's: the note names none of the machines `oak usage --json` lists.
+        for (others in listOf(true, false)) {
+            assertEquals(if (others) "estimates include the account’s usage on other machines" else "",
+                note("""{"gptMeasuredMachines":"work-box, build-box","gptOthersMeasured":$others}""", "gpt"))
         }
+        assertEquals("control: the claude tab keys on its own field", "",
+            note("""{"gptOthersMeasured":true}""", "claude"))
     }
 
 }

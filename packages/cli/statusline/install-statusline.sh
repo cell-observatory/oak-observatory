@@ -88,7 +88,7 @@ cat > "$CLAUDE_DIR/statusline.sh" <<'STATUSLINE_EOF'
 #   Line 2: ctx bar | model · effort · think · style · ↑input ↓output ↺cached session tokens · ◷duration
 #           (effort/think/style/tokens/duration shown only when present)
 #   Line 3: the quota bars — 5h | week | per-model week | month, each `label <bar> pct% · resets`,
-#           after a dim `(machine)` when one is a saved machine's reading (A SAVED MACHINE'S READING)
+#           a saved machine's reading of the account drawn like this machine's own (A SAVED MACHINE'S READING)
 #
 # THE BARS ARE PROGRESS BARS THAT HOLD THEIR FIGURES (painted again, 2026-10-14): each one's
 # used/total and +cached↺ print inside a painted box whose first pct% is a very dim tint of the usage
@@ -423,7 +423,8 @@ emit " $DIM|$R " " " "${l1[@]}"
 # ships with — the same split its Stats panel shows. Omitted (never zeroed) when the CLI is absent
 # or the session has no usage yet, matching the shown-only-when-present rule of the other segments.
 # The same read carries the account's windows as OAK's own readouts show them (`claudeAccount`, core usageLine). For
-# each window core took from a saved machine of the same account (fillFromMachines), it names that machine; this jq
+# each window core took from a saved machine of the same account (fillFromMachines), it gives that machine's name, which
+# only marks the window as a saved machine's reading (no readout names a machine: the shares are the account's); this jq
 # takes the name, the share, its reset (epoch seconds), and the estimate and budget beside it, and for the month the
 # figures it came with; and whether the account has a five-hour limit by core's reading of its answers (no_five: 1 for
 # none, 0 for one, '' from an oak that does not say). One field per line, each present ('' for none) so the reads stay
@@ -1627,8 +1628,8 @@ _we5=${est5:-}; _wt5=${tot5:-}; _we7=${est7:-}; _wt7=${tot7:-}
 _unlock
 
 # A SAVED MACHINE'S READING (2026-10-22). Where this machine has no current share of a window, OAK's own readouts show a
-# saved machine's reading of the same account and name that machine (core fillFromMachines), and this line drew its own
-# ended or out-of-date share beside them (`5h 0%`, `wk —`). A window core names a machine for is drawn as they draw it,
+# saved machine's reading of the same account (core fillFromMachines), and this line drew its own ended or out-of-date
+# share beside them (`5h 0%`, `wk —`). A window core took from a saved machine is drawn as they draw it,
 # from the `oak usage` read above: its share, countdown, estimate and budget, beside the cache reads this line measured,
 # which core keeps as well; the month, which comes with the week, comes whole. Drawn only: the cache is written above,
 # so statusline-last.json, and the brief this machine gives the others, hold its own measurements alone, and the
@@ -1636,18 +1637,17 @@ _unlock
 # this render's pull, which core read the cache too early to see) stands, as core keeps this machine's live share, by
 # core's rule: a 5h window that has ended (_x5), or whose share is 0 with no reset known, has none, and a later week (a
 # reset half a week or more after this one's) replaces this machine's share, live or not. No saved machine's 5h share is
-# drawn while the account has no five-hour limit (no_five).
-_sm5=""; _sm7=""; _smf=""; _smm=""
+# drawn while the account has no five-hour limit (no_five). No machine is named: the shares are the account's.
 _live() { [ -n "$1" ] && case "$_carried" in *"$2"*) false ;; esac; }
 if [ -n "$_m5" ] && [ -n "$_m5p" ] && [ -z "$_n5" ] && ! { [ -z "$_x5" ] && { [ -n "$five_reset" ] || _gt "$five_pct" 0; } && _live "$five_pct" 5; }; then
-  five_pct=$_m5p; five_reset=$_m5r; est5=$_m5e; tot5=$_m5t; _sm5=$_m5
+  five_pct=$_m5p; five_reset=$_m5r; est5=$_m5e; tot5=$_m5t
 fi
 if [ -n "$_m7" ] && [ -n "$_m7p" ] && { ! _live "$week_pct" 7 || { [ -n "$_m7r" ] && [ -n "$week_reset" ] && [ $(( _m7r - week_reset )) -ge 302400 ]; }; }; then
-  week_pct=$_m7p; week_reset=$_m7r; est7=$_m7e; tot7=$_m7t; _sm7=$_m7
-  if [ -n "$_mm" ] && [ -n "$_mmt" ]; then tok30=$_mmt; tokt30=$_mmT; moreset=$_mmr; reads30=$_mmR; cost30=$_mmc; costt30=$_mmC; _smm=$_mm; fi
+  week_pct=$_m7p; week_reset=$_m7r; est7=$_m7e; tot7=$_m7t
+  if [ -n "$_mm" ] && [ -n "$_mmt" ]; then tok30=$_mmt; tokt30=$_mmT; moreset=$_mmr; reads30=$_mmR; cost30=$_mmc; costt30=$_mmC; fi
 fi
 if [ -n "$_mf" ] && [ -n "$_mfp" ] && [ -z "${fable_pct:-}" ]; then
-  fable_pct=$_mfp; fable_reset=$_mfr; fable_label=$_mfl; estf=$_mfe; totf=$_mft; _smf=$_mf
+  fable_pct=$_mfp; fable_reset=$_mfr; fable_label=$_mfl; estf=$_mfe; totf=$_mft
 fi
 
 # Line 3 — the usage bars
@@ -1755,24 +1755,6 @@ fi
 # segment when there is not.
 if [ "${_mohead:-0}" = 1 ]; then _motail="${_mo:+ ${DIM}·${R} $_mo}"
 else _motail=""; [ -n "$_mo" ] && parts+=("$_mo"); fi
-# The saved machine a window drawn came from, named as OAK's readouts name it (core machineNote, in its order): the
-# machine alone when every window drawn came from it, else each machine with its windows (`build-box: wk mo`). One dim
-# segment ahead of the windows, where OAK's bars put `(build-box)` after `claude`: it is read before the figures it
-# names, and as a segment of its own it wraps whole, heading the rows on a pane too narrow for it beside a window.
-_nw=0; _nb=0; _nms=(); _nls=()
-_name() { _nw=$(( _nw + 1 )); [ -n "$2" ] || return 0; local k=0
-  while [ "$k" -lt "${#_nms[@]}" ] && [ "${_nms[$k]}" != "$2" ]; do k=$(( k + 1 )); done
-  _nb=$(( _nb + 1 )); _nms[$k]=$2; _nls[$k]="${_nls[$k]:+${_nls[$k]} }$1"; }
-[ -n "$five_pct" ] && _name 5h "$_sm5"
-[ -n "$week_pct" ] && _name wk "$_sm7"
-[ -n "$_fbp" ] && _name "$_fname" "$_smf"
-{ [ "${_mohead:-0}" = 1 ] || [ "${_t30:-0}" != 0 ]; } && _name mo "$_smm"
-if [ "$_nb" -gt 0 ]; then
-  if [ "${#_nms[@]}" = 1 ] && [ "$_nb" = "$_nw" ]; then _from=${_nms[0]}
-  else _from=""; for (( _k = 0; _k < ${#_nms[@]}; _k++ )); do _from="${_from:+$_from; }${_nms[$_k]}: ${_nls[$_k]}"; done; fi
-  parts=("${DIM}(${_from})${R}" ${parts[@]+"${parts[@]}"})
-fi
-
 # PASS 2 — one width for every bar: the widest figures in the render, the ctx gauge on line 2
 # included, so the two lines carry bars of the same length. +2 for a cell of air each side of the
 # centred figures; a floor of 10 keeps an all-uncalibrated row from drawing slivers.

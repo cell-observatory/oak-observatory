@@ -338,7 +338,13 @@ test('usage: a message counts toward the machine that ran its session, whichever
     assert.deepEqual(core.queryIndex('usage', { window: 'week', by: 'session', account: 'all' }).rows.map((r) => [r.machine, r.session]), [[a.host, 's-run'], ['unknown', 's-orphan']]);
     const totals = m.db((db) => core.usageTotals(db, { fiveReset: null, weekReset: null }));
     assert.equal(totals.five.tokens, 117, `${m.name}: each message once`);
-    assert.equal(core.othersMeasured(totals).machines, m === a ? 'unknown machine (copies)' : 'a, unknown machine (copies)', `${m.name}: the status line names them`);
+    // The readouts name no machine, so the copies are left out of the name list; their usage still counts in the sums.
+    const measured = core.othersMeasured(totals);
+    assert.equal(measured.machines, m === a ? '' : 'a', `${m.name}: no pseudo-machine in the name list`);
+    assert.doesNotMatch(measured.machines, /unknown|copies/, m.name);
+    assert.equal(measured.month.tok, totals.month.others.tokens, `${m.name}: the copies count in the month`);
+    assert.equal(measured.month.tok, m === a ? 7 : 117, `${m.name}: the copies count in the month`);
+    assert.match(measured.month.hosts, /(^|,)unknown(,|$)/, `${m.name}: the copies stay in the hosts the sums key on`);
   }
   // `oak usage --by machine`, as text and as JSON.
   b.use();

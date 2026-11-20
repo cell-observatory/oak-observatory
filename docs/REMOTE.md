@@ -193,16 +193,14 @@ Usage is read on each machine for itself, from its own account cache and transcr
 exceptions. Where this machine has no current reading of the Claude account's 5-hour, weekly or
 per-model weekly share (a laptop signed in to Claude Code whose agents run on another machine, so its
 own shares go out of date), the terminal app, both editors and `oak usage --json` show a saved
-machine's reading of the same account and name that machine: `✳ claude (build-box) wk: 22% · mo:
-2%`. Whether the account has a five-hour limit is decided by its usage answers alone, never by a
+machine's reading of the same account. The shares are the account's, so no readout names the machine a
+reading came from: `✳ claude wk: 22% · mo: 2%`. Whether the account has a five-hour limit is decided by its usage answers alone, never by a
 5-hour share: each machine's answer carries when its account last answered with no 5-hour window (as a
 verified Ultra account's does) and when it last answered with one, as do its records (a reading in its
 local database for each answer, which `oak sync` and the read below carry), and the newest of those answers,
 on any machine of the account, decides. While it is a no-limit answer, no 5-hour window is shown at all, whatever
-5-hour share a machine holds. The status bars name the machine only for the windows they
-show, the weekly and monthly ones; a per-model weekly share from a saved machine is named in the editors'
-tooltips and Stats panels, which show it, and a 5-hour share in the Stats panels. The tooltips and
-Stats panels also say when that machine measured the reading. OAK compares the time each answer was
+5-hour share a machine holds. The editors' tooltips and Stats panels say when a saved machine measured
+the oldest of the readings they show from it. OAK compares the time each answer was
 printed there with the time it arrived, which bounds the difference between the two clocks by the SSH
 round trip, and dates that machine's readings by this machine's clock, so a saved machine whose clock
 is fast or slow is still read correctly. At most every five minutes, a detached process runs `oak
@@ -217,9 +215,8 @@ is not asked: its usage arrives with its records. The terminal
 app, both editors, `oak usage` and the bundled status line start that process, so while any of them
 runs and herdr has a saved machine, these SSH connections run in the background every five minutes.
 Claude Code's status line shows the same readings, from the `oak usage` call it makes on every render:
-a window that call takes from a saved machine is drawn with that machine's figures, and the machine is
-named in a dim label ahead of the windows, `(build-box)`, or `(build-box: wk mo)` when only some came
-from it. The status line only draws them. Its cache, which the editors and the other machines read,
+a window that call takes from a saved machine is drawn with that machine's figures, as this machine's
+own would be, with no machine named. The status line only draws them. Its cache, which the editors and the other machines read,
 keeps this machine's own readings (the newest of its sessions' shares, each dated by its last reply or
 its newest subagent's when that is later, its read of the account's usage and its recorded shares), and
 a share it measured in the last five minutes stands by the rule below, and no saved machine's share
@@ -231,8 +228,8 @@ record logs, or by the read above), so a transcript synced between machines is c
 ran. Another machine's usage counts only for the account it was billed to. The month's tokens, cache
 reads and dollars are the same sum, for machines that bill on the same day, and the budgets come from
 that calibration, so machines of the account show the same estimates, budgets and month. The editors'
-tooltips and Stats panels name the machines whose usage the estimates include; the status line and the
-terminal app's usage bar, which have no tooltip, do not. An OAK on a saved machine from before this read
+tooltips and Stats panels, and the terminal app's usage bar on hover, say when the estimates include the
+account's usage on other machines, naming none; the status line, which has no tooltip, does not. An OAK on a saved machine from before this read
 refuses `oak __usage-records`, and is asked for its readings instead (`oak __usage-brief`, what `oak
 usage --brief --json` prints), which are shown as before; so is one whose database does not open there.
 No usage records arrive from it, so the totals and estimates add what its answer says it measured of

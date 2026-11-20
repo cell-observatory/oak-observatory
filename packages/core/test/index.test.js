@@ -2182,7 +2182,7 @@ test('index: WAL open stops at the busy timeout and releases its failed handle',
   }
 });
 
-function accountUsageFixture(t) {
+function accountUsageFixture(t, { remote: fromRemote = true } = {}) {
   const f = indexFixture(t, core);
   const now = Date.parse('2026-11-04T12:00:00Z'), weekReset = now + 4 * 86400_000;
   core.writePrefs({ gptBillDay: 14, billDay: 14 });
@@ -2198,7 +2198,7 @@ function accountUsageFixture(t) {
   ], { model_provider: 'openai' });
   const deleted = turn('account-deleted', now - 86400_000, 1_000_000, 200_000);
   turn('account-old', Date.parse('2026-10-20T12:00:00Z'), 6_000_000);
-  withIndex((db) => {
+  if (fromRemote) withIndex((db) => {
     const remote = { usageRecords: 1, host: 'bbbbbbbbbbbb', hosts: ['bbbbbbbbbbbb'], at: now, cursor: 'fixture:1:0', more: false,
       messages: [{ message_id: 'codex:account-remote', agent: 'codex', session_id: 'account-remote', model: 'gpt-5.2', provider: 'openai',
         ts: now - 3600000, input: 3_200_000, output: 0, cache_create: 0, cache_read: 0 }], readings: [], accounts: [], spend: [], purged: [] };
@@ -2217,7 +2217,16 @@ test('account usage: GPT month retains deleted rollouts and counts both machines
   assert.equal(g.monthReads, 200_000);
   assert.equal(g.monthCost, 17.535);
   assert.match(g.measuredMachines, /build-box/);
+  assert.equal(g.othersMeasured, true, 'the readouts say the estimates include another machine, naming none');
   assert.equal(g.usageSource, 'database');
+});
+
+test('account usage: GPT estimates of this machine\'s turns alone include no other machine', { skip }, (t) => {
+  const f = accountUsageFixture(t, { remote: false });
+  const g = core.gptUsagePanel(undefined, f.now);
+  assert.equal(g.usageSource, 'database');
+  assert.ok(g.measuredMachines && g.measuredMachines !== 'no machines yet', `control: the database holds this machine's turns: ${g.measuredMachines}`);
+  assert.equal(g.othersMeasured, false);
 });
 
 test('account usage: GPT calibrates its budget from the union', { skip }, (t) => {
@@ -2235,6 +2244,7 @@ test('account usage: database off explicitly labels the local fallback', { skip 
   assert.equal(g.monthTok, 6_000_000);
   assert.equal(g.usageSource, 'local');
   assert.equal(g.measuredMachines, 'this machine alone');
+  assert.equal(g.othersMeasured, false);
 });
 
 test('account usage: bill days follow usage records to a synthetic machine with no preference', { skip }, (t) => {
@@ -2347,11 +2357,16 @@ test('account usage: CLI JSON, usageBrief and breakdown use the retained databas
   assert.equal(json.gptWeekTotal, 20_000_000);
   assert.equal(json.gptMonthCost, 17.535);
   assert.match(json.gptMeasuredMachines, /build-box/);
+  assert.equal(json.gptOthersMeasured, true);
   t.mock.method(Date, 'now', () => f.now);
   const brief = core.usageBrief(f.work).gpt;
   assert.equal(brief.month.tok, json.gptMonthTok);
   assert.equal(brief.month.usd, json.gptMonthUsd);
-  assert.match(brief.measuredMachines, /build-box/);
+  assert.equal(brief.othersMeasured, true);
+  // …and names no machine, but in the stamp of whose records arrived (usageFreshness).
+  const { usageFreshness, ...readout } = brief;
+  assert.match(usageFreshness, /build-box/, 'control: the stamp names it');
+  assert.ok(!JSON.stringify(readout).includes('build-box'), `the terminal app's brief names no machine: ${JSON.stringify(readout)}`);
   const breakdown = core.codexBreakdown('month', Date.parse('2026-10-14T00:00:00Z'), f.weekReset, undefined, core.gptBillDay());
   assert.equal(breakdown.totals.tokens, 10_000_000);
   assert.equal(breakdown.buckets.length, 1);
