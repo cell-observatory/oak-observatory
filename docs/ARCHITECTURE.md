@@ -622,7 +622,7 @@ ExperimentalWarning as `node:sqlite` loads, which would land on the terminal app
 dropped while the module loads. Where the database is unavailable (no `node:sqlite`, no FTS5, or `OAK_INDEX=off`), every
 reader lists the way it did before the database existed.
 
-**Schema** (version 9, `PRAGMA user_version`). Ordinary tables are STRICT. Session records carry the source machine
+**Schema** (version 11, `PRAGMA user_version`). Ordinary tables are STRICT. Session records carry the source machine
 (machineHostTag), so a session id can repeat across machines; usage messages are deduplicated by message id. Times are epoch milliseconds; every field a query filters or
 sorts on is a typed column with an index; text is searched through FTS5, and a row's whole record rides beside its
 columns for display only.
@@ -800,7 +800,9 @@ Readings and spend reports are kept whole for 35 days; older, each machine keeps
 kind and hour (the hour's last, and of the answers the hour's last of each) and one report of each session and UTC day (the day's last, its delta what that day's
 reports added, so a span of whole days sums to the same spend), and every machine downsamples alike once a day. A day
 that took another machine's rows in the last day waits, so that a log read again is whole before it folds, and a usage
-pull leaves alone an old day this database already holds, which the sending machine may have folded already. A session deleted on purpose keeps its usage
+pull leaves alone an old day this database already holds, which the sending machine may have folded already. The demo simulator's sessions (`demo-` and eight hex digits) have
+no usage rows, as no one spent their turns: the catch-up reads none, schema 11 removed those an earlier OAK kept, and
+the transcript scans of `stats.ts`, `breakdown.ts` and the status line pass over them. A session deleted on purpose keeps its usage
 rows, without the session: the account was billed for its turns. The catch-up reads them from each transcript's own byte cursor (worker transcripts included), each Codex
 rollout's token counts and rate limits, and the status line's and Codex's usage caches. It reads no credentials: the
 account tag is the hash `claudeAccountTag` makes of the account id in `.claude.json`.

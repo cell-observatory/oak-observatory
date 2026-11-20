@@ -48,6 +48,15 @@ class DelegatedParserTest {
     }
 
     @Test
+    fun aWorkerWaitingAtItsTrustPromptCarriesWhy() {
+        val why = "Waiting for you: answer Codex's folder-trust prompt in herdr tab \"tri1: Triage the widgets\". OAK never answers it."
+        val worker = MultitaskParser.agent(com.google.gson.JsonParser.parseString(
+            """{"key":"lab:delegated:tri1","session":"","title":"Triage the widgets","kind":"codex","state":"blocked","phase":"awaiting-input","error":${com.google.gson.Gson().toJson(why)}}""").asJsonObject)
+        assertEquals(listOf("blocked", "awaiting-input", why), listOf(worker.state, worker.phase, worker.error))
+        assertNull(MultitaskParser.agent(com.google.gson.JsonParser.parseString("""{"state":"working"}""").asJsonObject).error)
+    }
+
+    @Test
     fun anOlderCliHasNone() {
         assertTrue(MultitaskParser.parse("""{"agents":[],$base}""")!!.delegated.isEmpty())
     }

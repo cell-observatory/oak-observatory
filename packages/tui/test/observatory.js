@@ -3942,6 +3942,17 @@ test('Observatory master: delegated agents with their states, since, error and w
   assert.equal(lines(render(fixture())), lines(render({ ...fixture(), views: { ...fixture().views, multitask: { agents: [], delegated: [] } } })));
 });
 
+// An agent at its folder-trust prompt, which OAK never answers: blocked, waiting for the user, with the reason naming it.
+test('Observatory master: an agent waiting at its folder-trust prompt shows blocked, with the reason', () => {
+  const state = fixture();
+  const since = Date.UTC(2026, 8, 18, 13, 58, 7);
+  const why = 'Waiting for you: answer Codex\'s folder-trust prompt in herdr tab "tri1: Triage the widgets". OAK never answers it.';
+  state.views = { ...state.views, multitask: { ...(state.views.multitask ?? {}), agents: [], delegated: [
+    { id: 'tri1', title: 'Triage the widgets', kind: 'codex', machine: null, tab: 't1', pane: 'p9', session: null, cwd: '/w/tree', state: 'blocked', since, error: why, workers: [] },
+  ] } };
+  assert.match(lines(render(state, 200)), /^  tri1 · Triage the widgets\n    \S+ blocked · since 13:58:07 · codex · tab tri1\n    Waiting for you: answer Codex's folder-trust prompt in herdr tab "tri1: Triage the widgets"\. OAK never answers it\.$/m);
+});
+
 test('Observatory findings count stays visible without delegated agents and updates on refresh', () => {
   const state = fixture();
   state.views = { ...state.views, multitask: { agents: [], findings: { count: 2, rows: [] } } };

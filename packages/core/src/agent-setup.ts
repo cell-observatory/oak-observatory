@@ -269,7 +269,7 @@ export function diagnoseAgentSetup(cwd = process.cwd()): Check {
     const bad = plans.flatMap(p => p.items).filter(e => !['current', 'kept'].includes(e.state));
     if (!plans.length && agentSetupDeclined()) return { id: 'agent-setup', label: 'Agent delegation setup', level: 'ok', detail: 'Removed with oak agent setup --remove; oak agent setup adds it back.' };
     return { id: 'agent-setup', label: 'Agent delegation setup', level: plans.length && !bad.length ? 'ok' : 'warn',
-      detail: bad.length ? bad.map(e => `${e.path}: ${e.state}`).join('; ') : plans.length ? 'Managed delegation guidance is current.' : 'Agents have no OAK delegation guidance.',
+      detail: bad.length ? [...new Set(bad.map(e => `${e.path}: ${e.state}`))].join('; ') : plans.length ? 'Managed delegation guidance is current.' : 'Agents have no OAK delegation guidance.',
       ...(!plans.length || bad.length ? { fix: 'oak agent setup --check; oak agent setup' } : {}) };
   } catch (e) { return { id: 'agent-setup', label: 'Agent delegation setup', level: 'warn', detail: String((e as Error).message), fix: 'oak agent setup --check' }; }
 }

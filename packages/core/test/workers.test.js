@@ -64,6 +64,18 @@ test('workers: herdr Codex in a sibling worktree uses its tab title, once', asyn
   assert.ok(bare.workers.some(r => r.session === f.id));
 });
 
+test('workers: an agent OAK started, waiting at its folder-trust prompt before any session, is one row, blocked, saying why', async t => {
+  const f = fixture(t);
+  const why = 'Waiting for you: answer Claude Code\'s folder-trust prompt in herdr tab "trust1: Fix the parser". OAK never answers it.';
+  const now = Date.now(), out = path.join(f.home, 'trust1-out');
+  core.writeDelegated({ id: 'trust1', title: 'Fix the parser', brief: path.join(f.home, 'trust1-brief.md'), cwd: f.cwd, out, report: path.join(out, 'report.md'), kind: 'claude',
+    agentType: null, model: null, effort: null, sandbox: null, machine: null, workspace: 'ws', tab: 'tab-2', pane: 'pane-2', herdrName: 'oak-trust1', pid: null,
+    session: null, parent: null, startedMs: now - 5000, endedMs: null, closedMs: null, state: 'blocked', since: now - 4000, error: why });
+  const pane = { pane_id: 'pane-2', tab_id: 'tab-2', workspace_id: 'ws', agent: 'claude', agent_status: 'unknown', cwd: f.cwd, agent_session: null };
+  const result = await core.readWorkerFleet(f.cwd, null, { ...f.options, snapshot: { ...f.snapshot, panes: [...f.snapshot.panes, pane] } });
+  assert.deepEqual(result.workers.filter(r => r.pane === 'pane-2').map(r => [r.title, r.state, r.phase, r.error]), [['Fix the parser', 'blocked', 'awaiting-input', why]]);
+});
+
 test('tab labels: Workers ignores placeholders at the workspace position, including after tabs move', async t => {
   const f = fixture(t);
   const tab = f.snapshot.tabs[0];

@@ -132,8 +132,10 @@ export async function readWorkerFleet(cwd: string, reviewing: string | null, opt
     if (r.id === reviewing || (now - r.lastActiveMs <= FLEET_FOLD_MS && (opts.allRecent || (launch && (repo ? commonDir(launch) === repo : launch === cwd))))) ids.add(r.id);
   }
   const workers: WorkerRow[] = await Promise.all([...ids].map(async id => {
-    const row = byId.get(id), source = found.get(id), pane = panes.get(id), rec = records.get(id);
     const session = id.startsWith('pane:') ? '' : id;
+    // A pane with no session yet is its live record's, which may be waiting on the user (a folder-trust prompt).
+    const row = byId.get(id), source = found.get(id), pane = panes.get(id),
+      rec = records.get(id) ?? (pane && !session ? delegated.find(d => !d.session && d.pane === pane.pane_id && !['done', 'gone'].includes(d.state)) : undefined);
     const kind: DelegatedKind = (pane?.agent || pane?.agent_session?.agent || rec?.kind || row?.agent || '').startsWith('codex') ? 'codex' : 'claude';
     const worktree = source?.cwd || pane?.foreground_cwd || pane?.cwd || rec?.cwd || cwd;
     const lastActiveMs = row?.lastActiveMs || rec?.since || 0;

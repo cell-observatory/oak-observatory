@@ -244,6 +244,8 @@ function transcriptFiles(claudeOnly = false): string[] {
     return out;
   }
   const claude = new Map<string, { file: string; mtime: number; duplicate: boolean }>();
+  // The demo simulator's sessions are no one's usage.
+  const { isDemoSession } = require('./demo') as typeof import('./demo');
   for (const proj of projects) {
     const dir = path.join(root, proj);
     let entries: string[];
@@ -253,7 +255,7 @@ function transcriptFiles(claudeOnly = false): string[] {
       continue;
     }
     for (const f of entries) {
-      if (!f.endsWith('.jsonl')) continue;
+      if (!f.endsWith('.jsonl') || isDemoSession(f.slice(0, -6))) continue;
       const file = path.join(dir, f);
       let mtime: number;
       try { mtime = fs.statSync(file).mtimeMs; } catch { continue; }

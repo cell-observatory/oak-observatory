@@ -35,12 +35,28 @@ the release notes.
 
 ### Fixed
 
+- `oak agent start --brief` never answers a folder-trust prompt. It used to press Enter at Claude Code's or Codex's
+  prompt every half second, and when Enter chose "No, exit", it went on pressing Enter in the shell. While a prompt
+  shows, OAK now sends no keys: the agent's row is blocked, its reason names the prompt and the herdr tab, and the
+  brief goes over once you trust the folder. If the CLI exits at the prompt, the start stops at once and the row is
+  gone, saying why. A prompt still open after two minutes leaves the tab open and the row blocked, and the reason gives
+  the `oak agent tell <id> --file <path>` command that sends the brief after you answer. `oak agent list`, the terminal
+  app's Observatory and the Workers views in VS Code and JetBrains show the reason.
+- `oak agent start --brief` and `oak agent tell` recognize Claude Code's composer as 2.1.329 draws it with auto mode
+  on, without the "? for shortcuts" footer. The start gave up with "claude's composer never appeared" and marked the
+  row gone, and `oak agent tell` refused, while Claude Code waited at its composer. A start that gives up waiting for
+  the composer now records the agent's pid. The brief and later messages wait up to 30 s for herdr to name the agent,
+  which can happen after its composer shows; the start failed with "is not an active named agent".
 - `oak usage --by machine` credits each message to the machine that ran its session, so every machine shows the
   same split. When a file sync copied transcripts between machines, each message counted toward whichever machine
   read its copy first. A machine now claims a session when Claude Code's `session-env` or `file-history` folder for
   it, or OAK's store of it, is on that machine, and the claim travels in the record log and the usage pull. A copy
   that no machine claims shows as `unknown machine (copies)` in `oak usage` and `oak query usage`.
   Totals do not change. The database moves to schema 10 and reads every session's usage once more.
+- The demo simulator's sessions (`oak demo`) count in no usage figure. Their turns, which no one spent, counted in
+  `oak usage`, `oak stats`, the status line and the editors' usage readouts, on the machine that ran the demo and on
+  any that held a copy of its transcripts. The database moves to schema 11, which removes the simulator's usage an
+  earlier OAK stored. The demo's sessions still list, replay and clean as before.
 - On Windows, `oak update` and `oak doctor --fix` upgrade herdr while its server is running. Windows does not let a
   running herdr.exe be replaced, so the old one stayed in place and the update still reported it as installed. OAK
   now moves the old herdr.exe aside and deletes it on a later run, once nothing runs it. An install that still leaves
@@ -114,6 +130,10 @@ the release notes.
   Claude Code entry carries `onFailure: "continue"`. Without Git Bash, Claude Code otherwise treats a PreToolUse hook
   that cannot find `oak` as a block. `oak init`, `oak init --repair` and `oak update` rewrite hooks that an older OAK
   wrote.
+- The "Agent delegation guidance" row of `oak update`, the matching `oak doctor` check and `oak uninstall` name
+  `prefs.json` once. They listed it once for each delegation preference OAK keeps there.
+- `oak update --check` says that everything is up to date when nothing needs updating, instead of
+  "run `oak update` to apply."
 
 ## [0.11.0] — 2026-11-07
 

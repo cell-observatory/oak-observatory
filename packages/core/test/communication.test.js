@@ -129,7 +129,7 @@ test('migration: version 7 becomes the current version (worktree state, then fin
     db.exec("PRAGMA user_version = 7; INSERT INTO machines (machine_id, label) VALUES ('synthetic', 'before');");
     migrate(db);
     assert.equal(db.prepare('PRAGMA user_version').get().user_version, MIGRATIONS.length);
-    assert.equal(MIGRATIONS.length, 10);
+    assert.equal(MIGRATIONS.length, 11);
     assert.equal(db.prepare('SELECT label FROM machines').get().label, 'before');
     assert.ok(db.prepare("SELECT 1 FROM pragma_table_info('delegated') WHERE name = 'worktree_json'").get(), 'version 8 adds worktree state');
     assert.equal(db.prepare('SELECT count(*) AS n FROM findings').get().n, 0);
