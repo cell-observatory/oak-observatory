@@ -17118,7 +17118,9 @@ test('spawn: a launched command delivers the argv a bare spawn would, spaces and
       process.execPath,
       [
         '-e',
-        `const r = require('child_process').spawnSync(${JSON.stringify(process.execPath)}, ` +
+        // node's own path is quoted, so the shell can start it even from C:\Program Files; only the spaced --root
+        // value is left for the shell form to split.
+        `const r = require('child_process').spawnSync(${JSON.stringify(`"${process.execPath}"`)}, ` +
           `${JSON.stringify([probe, ...args])}, { shell: true, encoding: 'utf8' }); ` +
           `process.stdout.write(r.stdout || '')`,
       ],
