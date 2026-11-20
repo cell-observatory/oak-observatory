@@ -2662,6 +2662,7 @@ class ChangeMapPanel(private val project: Project) : SimpleToolWindowPanel(true,
             append("  ${a.state ?: a.phase} · ${a.machine.ifBlank { "this machine" }} · ${a.kind}", attrs)
             if (a.state == "queued") append(" · waiting on ${a.after.joinToString(", ")}", SimpleTextAttributes.GRAYED_ATTRIBUTES)
             append(" · ${relTime(a.lastActiveMs)} · ${fmtTok(a.tokens)} tok", SimpleTextAttributes.GRAYED_ATTRIBUTES)
+            a.error?.let { append("  $it", SimpleTextAttributes.ERROR_ATTRIBUTES) }
             // A folded session whose map was never built has no numbers — and +0 −0 / 0 tok would read
             // as "this session did nothing", which is a different claim entirely. Say which one it is.
             if (!a.loaded) {
@@ -2693,6 +2694,7 @@ class ChangeMapPanel(private val project: Project) : SimpleToolWindowPanel(true,
             if (a.compactions > 0) append("  ⌁ ${a.compactions}", SimpleTextAttributes.GRAYED_ATTRIBUTES)
             toolTipText = buildString {
                 append(if (a.self) "This session: " else "Agent: ").append(a.session).append("\n")
+                a.error?.let { append(it).append("\n") }
                 append("phase ${a.phase}").append(if (heuristic) " (~ inferred from inactivity)" else "").append("\n")
                 append("worktree ${a.worktree}").append("  ·  branch ${a.gitBranch}").append("\n")
                 append("${fmtTok(a.tokens)} tok · ${fmtDur(a.durationMs)}")

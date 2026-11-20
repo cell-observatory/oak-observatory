@@ -211,6 +211,7 @@ ${bodyHtml}
 
 <script>window.__DOCS_INDEX__=${JSON.stringify(INDEX)};</script>
 <script>${JS}</script>
+<script src="channel.js" defer></script>
 </body>
 </html>`;
 }

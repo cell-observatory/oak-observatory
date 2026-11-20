@@ -499,7 +499,7 @@ test('oak demo --clean forgets the demo in the local index, its usage with it, a
   const word = x.read('SELECT text FROM prompts WHERE session_id = ? ORDER BY idx LIMIT 1', demo[0])[0].text.match(/[A-Za-z]{6,}/)[0];
   const hits = () => x.read('SELECT count(*) AS n FROM prompts_fts WHERE prompts_fts MATCH ?', word)[0].n;
   assert.ok(hits() > 0, `control: "${word}" is searchable while it runs`);
-  assert.ok(x.read("SELECT count(*) AS n FROM usage_messages WHERE session_id LIKE 'demo-%'")[0].n > 0, 'control: its usage is counted while it runs');
+  assert.equal(x.read("SELECT count(*) AS n FROM usage_messages WHERE session_id LIKE 'demo-%'")[0].n, 0, 'its usage counts nowhere, even while it runs (0.12.0)');
   x.compactNext();
   assert.equal(f.json(['sessions', '--json']).status, 0);
   assert.ok(x.segments().some((s) => s.endsWith('-base.jsonl')) && x.log().includes('fixture-real'), 'control: a base was written, this machine\'s session in it');
@@ -591,7 +591,7 @@ test('oak uninstall --purge-store forgets what it purges in the local index and 
   const x = indexAndLog(f);
   assert.equal(f.json(['query', 'edits']).out.rows.filter((r) => r.session.startsWith('fixture-')).length, 2, 'control: their edits are indexed');
   assert.ok(x.log().includes('fixture-purged') && x.log().includes('fixture-also'), 'control: and published');
-  assert.ok(x.read("SELECT count(*) AS n FROM usage_messages WHERE session_id LIKE 'demo-%'")[0].n > 0, 'control: the demo\'s usage is counted while it runs');
+  assert.equal(x.read("SELECT count(*) AS n FROM usage_messages WHERE session_id LIKE 'demo-%'")[0].n, 0, 'the demo\'s usage counts nowhere, even while it runs (0.12.0)');
   // An index file of the store before a move, kept until `oak clean` removes it: the purge reaches it too.
   const superseded = path.join(f.env.CLAUDE_CONFIG_DIR, 'claude-observatory-index', 'index-v1-0000000000000000.sqlite');
   x.write('VACUUM INTO ?', superseded);

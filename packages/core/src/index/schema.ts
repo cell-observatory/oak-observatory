@@ -786,7 +786,14 @@ END;
 DELETE FROM ingest_state WHERE source LIKE 'unit:usage:%' OR source LIKE 'unit:deleted-usage:%';
 `;
 
-export const MIGRATIONS: readonly string[] = [V1, V2, V3, V4, V5, V6, V7, V8, V9, V10];
+/**
+ * Schema version 11: the demo simulator's sessions (records.ts DEMO_SESSION) count in no usage, which no one spent. The
+ * messages an earlier OAK kept of them, as this machine's or as a copy's, go, and `usage_daily` with them (ingest.ts
+ * ingestUsage reads none again).
+ */
+const V11 = `DELETE FROM usage_messages WHERE session_id GLOB 'demo-${'[0-9a-f]'.repeat(8)}';`;
+
+export const MIGRATIONS: readonly string[] = [V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;
 
