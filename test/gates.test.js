@@ -995,6 +995,29 @@ function checkPages(source) {
 }
 
 test('Pages gate generates docs and rejects stale committed pages before upload', () => checkPages(read('.github/workflows/pages.yml')));
+test('Pages publishes the pre-release site under dev/ with both versions, after each successful dev pre-release (2026-11-20)', () => {
+  const src = read('.github/workflows/pages.yml');
+  assert.match(src, /workflow_run:\s*\n\s*workflows: \['Dev pre-release'\]\s*\n\s*types: \[completed\]/, 'a dev pre-release redeploys the site');
+  assert.match(src, /if: github\.event_name != 'workflow_run' \|\| github\.event\.workflow_run\.conclusion == 'success'/, 'never after a failed one');
+  assert.match(src, /ref: dev-latest\s*\n\s*path: \.pre/, 'the pre-release site is the commit dev-latest was built from');
+  assert.match(src, /node scripts\/version\.mjs "\$dev"[\s\S]*node scripts\/build-docs\.mjs/, 'its pages carry the pre-release version');
+  assert.match(src, /cp -R \.pre\/docs _site\/dev/);
+  assert.match(src, /_site\/versions\.json/);
+  assert.match(src, /content="noindex"/, 'search engines index the stable site only');
+  assert.match(src, /uses: actions\/upload-pages-artifact@v\d+\s*\n\s*with:\s*\n\s*path: _site/, 'both sites are one deployment');
+});
+test('every site page loads the channel menu, and the menu opens the same page on the other channel (2026-11-20)', () => {
+  const nav = [...read('scripts/build-docs.mjs').matchAll(/slug: '([^']+)'/g)].map(m => m[1]);
+  for (const page of ['showcase', ...nav]) assert.ok(read(`docs/${page}.html`).includes('<script src="channel.js" defer></script>'), `${page} loads channel.js`);
+  const { channelTargets } = require(path.join(root, 'docs/channel.js'));
+  assert.deepEqual(channelTargets('/oak-observatory/install.html'),
+    { channel: 'stable', root: '/oak-observatory/', page: 'install.html', stable: '/oak-observatory/install.html', dev: '/oak-observatory/dev/install.html' });
+  assert.deepEqual(channelTargets('/oak-observatory/dev/install.html'),
+    { channel: 'dev', root: '/oak-observatory/', page: 'install.html', stable: '/oak-observatory/install.html', dev: '/oak-observatory/dev/install.html' });
+  assert.deepEqual([channelTargets('/oak-observatory/').page, channelTargets('/oak-observatory/dev/').page, channelTargets('/oak-observatory/dev/').channel],
+    ['showcase.html', 'showcase.html', 'dev'], 'a channel\'s root opens its landing page');
+  assert.equal(channelTargets('/install.html').dev, '/dev/install.html', 'a site served from a domain\'s root');
+});
 test('the database explainer is included in generated navigation, search and related guides', () => {
   const slug = 'database-across-machines';
   const titles = { 'database-across-machines': 'The database across machines', 'database-and-sync': 'Database & sync' };
