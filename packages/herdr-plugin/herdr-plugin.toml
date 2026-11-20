@@ -9,7 +9,7 @@
 id = "oak.observatory"
 name = "OAK Observatory"
 version = "0.1.0"
-min_herdr_version = "0.9.1"
+min_herdr_version = "0.9.5"
 description = "Open a pane's agent conversation in the OAK observatory; restart the btop monitor when herdr starts"
 platforms = ["linux", "macos", "windows"]
 

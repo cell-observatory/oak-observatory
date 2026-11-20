@@ -114,6 +114,8 @@ the release notes.
   Claude Code entry carries `onFailure: "continue"`. Without Git Bash, Claude Code otherwise treats a PreToolUse hook
   that cannot find `oak` as a block. `oak init`, `oak init --repair` and `oak update` rewrite hooks that an older OAK
   wrote.
+- OAK's herdr plugin names herdr 0.9.5, the pinned version, as the oldest it runs on. Its manifest still said 0.9.1
+  after the pin moved.
 
 ## [0.11.0] — 2026-11-07
 
