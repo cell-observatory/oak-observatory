@@ -2638,7 +2638,11 @@ async function cmdAgentStartBrief(kind: 'claude' | 'codex', args: string[]): Pro
     return fail(String((error as Error).message || error));
   }
   if (args.includes('--json')) emitJson(rec);
-  else process.stdout.write(`Started ${rec.id} (${kind}) in herdr tab "${rec.id}: ${rec.title}", pane ${rec.pane}. Its report: ${rec.report}\n`);
+  else {
+    process.stdout.write(`Started ${rec.id} (${kind}) in herdr tab "${rec.id}: ${rec.title}", pane ${rec.pane}. Its report: ${rec.report}\n`);
+    // Still at its folder-trust prompt, which OAK never answers: the reason says how the brief gets there.
+    if (rec.state === 'blocked') process.stdout.write(c.yellow(`${rec.error}\n`));
+  }
 }
 
 /** `oak agent <argv>` run on a saved machine, as `--machine` runs a session verb there (forwardToMachine, over ssh):
@@ -2672,7 +2676,11 @@ async function cmdAgentStartRemote(label: string, args: string[]): Promise<void>
   const rec: import('@oak-observatory/core').DelegatedAgent = { ...there, id: core.delegatedIdFor(there.id), remoteId: there.id, machine: label, pid: null, herdrName: null, parent: parent ?? there.parent };
   core.writeDelegated(rec);
   if (args.includes('--json')) emitJson(rec);
-  else process.stdout.write(`Started ${rec.id} (${rec.kind}) on ${label} in herdr tab "${there.id}: ${rec.title}", pane ${rec.pane}. Its report there: ${rec.report}\n`);
+  else {
+    process.stdout.write(`Started ${rec.id} (${rec.kind}) on ${label} in herdr tab "${there.id}: ${rec.title}", pane ${rec.pane}. Its report there: ${rec.report}\n`);
+    // Still at its folder-trust prompt there; the reason names that machine's id and paths, so its command runs there.
+    if (there.state === 'blocked') process.stdout.write(c.yellow(`On ${label}: ${there.error} Run that command on ${label}.\n`));
+  }
 }
 
 /** When this machine last read each saved machine's agents, so a wait's polls ask a machine at most every

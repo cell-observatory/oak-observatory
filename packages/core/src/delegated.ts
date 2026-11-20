@@ -201,7 +201,8 @@ export function deriveDelegatedState(rec: Pick<DelegatedAgent, 'state' | 'since'
   if (e.alive === false) return keep('gone');
   if (e.hand && HAND_BLOCKS.has(e.hand.kind)) return keep('blocked', e.hand.ts);
   if (e.turnError) return { ...keep('errored', e.turnError.ts), error: e.turnError.message };
-  if (!e.session) return keep('starting', rec.startedMs);
+  // No session yet: starting, or blocked at its folder-trust prompt (startDelegatedAgent), until one links.
+  if (!e.session) return keep(rec.state === 'blocked' ? 'blocked' : 'starting', rec.startedMs);
   if (e.native === 'busy') return keep('working');
   // The Stop hook's hand: the turn ended, whatever a transcript tail still shows.
   if (e.hand?.kind === 'idle-done') return keep('waiting', e.hand.ts);
@@ -438,7 +439,7 @@ export function refreshDelegated(opts: DelegatedRefreshOptions = {}): DelegatedA
     const next = deriveDelegatedState(rec, e, now);
     if (next.state !== rec.state || next.since !== rec.since || (next.state === 'errored' && next.error !== rec.error)) {
       if (next.state === 'errored') rec.error = next.error;
-      else if (rec.state === 'errored') delete rec.error;
+      else if (rec.state === 'errored' || rec.state === 'blocked') delete rec.error;
       rec.state = next.state;
       rec.since = next.since;
       if (TERMINAL.has(next.state)) rec.endedMs = next.since;
@@ -481,7 +482,9 @@ export function delegatedArgs(kind: DelegatedKind, o: { model?: string | null; e
 
 /** Words on a pane's screen. */
 const TRUST = /Is this a project you created or one you trust|trust the (?:files|contents) (?:in|of) this|allow Codex to work in this folder/i;
-const READY: Record<DelegatedKind, RegExp> = { claude: /for shortcuts/, codex: /Ask Codex|\? for shortcuts/ };
+// Claude Code's composer: its "? for shortcuts" footer, or its prompt line framed by two rules (Claude Code 2.1.329, with
+// auto mode on, drew no such footer). A numbered choice between rules is a menu.
+const READY: Record<DelegatedKind, RegExp> = { claude: /for shortcuts|^─{8,}.*\n[❯>](?:[ \u00a0](?!\s*\d+\.).*)?\n─{8,}/m, codex: /Ask Codex|\? for shortcuts/ };
 const WORKING = /esc to interrupt/;
 
 export interface DelegatedStartOptions {
@@ -560,10 +563,18 @@ export function delegatedDependencies(rec: DelegatedAgent, records: readonly Del
   return { ready: (rec.after ?? []).every(id => records.some(r => r.id === id && (r.state === 'done' || (rec.afterAny && r.state === 'gone')))) };
 }
 
-/** Shared by the initial brief and follow-up messages: herdr pastes text, then submits the composer. */
+/** Shared by the initial brief and follow-up messages: herdr pastes text, then submits the composer. herdr names an agent
+ *  once its hooks report it, which can come after its composer shows (Claude Code 2.1.329): an agent herdr does not
+ *  name yet is asked again, for up to 30 s. */
 async function sendDelegatedPrompt(target: string, text: string, opts: HerdrOptions, sleep: (ms: number) => Promise<void>): Promise<void> {
   const herdr = require('./herdr') as typeof import('./herdr');
-  await herdr.herdrRequest('agent.prompt', { target, text }, opts);
+  for (let i = 0; ; i++) {
+    try { await herdr.herdrRequest('agent.prompt', { target, text }, opts); break; }
+    catch (error) {
+      if (i >= 60 || !/not an active named agent/i.test(String((error as Error).message || error))) throw error;
+      await sleep(500);
+    }
+  }
   await sleep(1000);
   await herdr.herdrRequest('agent.send_keys', { target, keys: ['Enter'] }, opts);
 }
@@ -573,7 +584,8 @@ export function validateDelegatedMessage(text: string): void {
   if (/[\x00-\x08\x0b-\x1f\x7f-\x9f]/.test(text)) throw new Error('agent tell: control characters are not allowed (only tabs and newlines)');
 }
 
-/** Check every recipient before touching a composer. A shell, a trust prompt or a question is never a chatbox. */
+/** Check every recipient before touching a composer. A shell, a trust prompt or a question is never a chatbox. A row
+ *  blocked with no session was waiting at its folder-trust prompt; once the user has answered it, its screen decides. */
 export async function checkDelegatedTell(ids: readonly string[], opts: HerdrOptions = {}): Promise<DelegatedAgent[]> {
   const records = ids.map(id => {
     const rec = readDelegated(id);
@@ -593,7 +605,7 @@ export async function checkDelegatedTell(ids: readonly string[], opts: HerdrOpti
     const info = await herdr.herdrRequest('pane.process_info', { pane_id: rec.pane }, opts);
     if (agentPid(info.process_info, rec.kind) === null) throw new Error(`${rec.id} is gone; ${rec.kind} no longer runs in its pane`);
     const screen = (await herdr.herdrRequest('pane.read', { pane_id: rec.pane, source: 'visible', format: 'text', strip_ansi: true }, opts)).read.text;
-    if (pane.agent_status === 'blocked' || rec.state === 'blocked' || TRUST.test(screen) || !(READY[rec.kind].test(screen) || WORKING.test(screen))) {
+    if (pane.agent_status === 'blocked' || (rec.state === 'blocked' && rec.session) || TRUST.test(screen) || !(READY[rec.kind].test(screen) || WORKING.test(screen))) {
       throw new Error(`${rec.id}: ${rec.kind}'s composer is not available; open its herdr tab`);
     }
   }
@@ -613,6 +625,8 @@ export async function tellDelegatedAgent(id: string, text: string, from: string,
   const at = Date.now();
   latest.messages = [...(latest.messages ?? []), { id: randomBytes(12).toString('hex'), from, at, text }];
   latest.lastMessageMs = at;
+  // The brief, sent after the user answered the folder-trust prompt: the wait for them is over.
+  if (latest.state === 'blocked' && !latest.session) { Object.assign(latest, { state: 'starting', since: at }); delete latest.error; }
   try { writeDelegated(latest); }
   catch (e) { throw new Error(`${id}: message sent, but its record could not be saved: ${String((e as Error).message || e)}`); }
   return latest;
@@ -624,8 +638,11 @@ export async function tellDelegatedAgent(id: string, text: string, from: string,
  *    and `OAK_DELEGATED=<id>` (the hooks' link to its session), opened without focus.
  * 2. Once its shell holds the pane idle, herdr starts the CLI. herdr's start can time out while the agent has in fact
  *    started, so a failure is checked against the pane's own processes before it is believed.
- * 3. Until the CLI's composer shows, a folder-trust prompt (Claude Code's, Codex's) is answered with Enter, which takes
- *    its first choice, to trust the folder the agent was started in.
+ * 3. The CLI's composer. OAK never answers a folder-trust prompt (Claude Code's, Codex's): while one shows, no key is
+ *    sent, and the row is blocked, waiting for the user, with a reason naming the prompt. The CLI exiting at the prompt
+ *    (declined, or ended) ends the start at once, typing nothing into the shell. A prompt still up at the deadline
+ *    leaves the tab open and the row blocked, with the brief's prompt written to `<out>/brief-prompt.md` for
+ *    `oak agent tell <id> --file` to send once the user has answered.
  * 4. The brief is handed over, and an Enter follows (the prompt sat in the composer until one was sent).
  */
 export async function startDelegatedAgent(o: DelegatedStartOptions, queued?: DelegatedAgent): Promise<DelegatedAgent> {
@@ -681,17 +698,42 @@ export async function startDelegatedAgent(o: DelegatedStartOptions, queued?: Del
     log(`herdr's start said "${String((error as Error).message || error)}", but ${o.kind} runs in the pane`);
   }
   rec.pid = agentPid(await info(), o.kind);
-  // 3. The composer, past a folder-trust prompt.
-  let ready = false;
+  // 3. The composer. A folder-trust prompt is the user's to answer: OAK sends it nothing, and waits.
+  const where = `${o.kind === 'claude' ? 'Claude Code' : 'Codex'}'s folder-trust prompt in herdr tab "${id}: ${title}"`;
+  let ready = false, trust = false, up = false;
   for (let i = 0; i < 240 * patience && !ready; i++) {
+    // herdr can answer agent.start before the CLI is in the pane's foreground (launch_pending): its pid comes later.
+    if (rec.pid === null) rec.pid = agentPid(await info(), o.kind);
     const s = await screen();
-    if (TRUST.test(s)) {
-      log('answered the folder-trust prompt');
-      await req('pane.send_keys', { pane_id: pane, keys: ['Enter'] });
-    } else if (READY[o.kind].test(s)) ready = true;
+    up = TRUST.test(s);
+    if (up && !trust) {
+      trust = true;
+      Object.assign(rec, { state: 'blocked', since: Date.now(), error: `Waiting for you: answer ${where}. OAK never answers it.` });
+      writeDelegated(rec);
+      log(`${id}: waiting for you — answer ${where}; OAK never answers it`);
+    }
+    // Declined, or ended: the pane is a shell again, and the prompt's text may still be on its screen.
+    if (trust) {
+      const fg = await info();
+      if (fg && agentPid(fg, o.kind) === null) giveUp(`${o.kind} exited at its folder-trust prompt (declined, or the CLI ended); OAK sent it no keys and no brief`);
+    }
+    if (!up && READY[o.kind].test(s)) ready = true;
     if (!ready) await sleep(500);
   }
+  if (!ready && up) {
+    const file = path.join(out, 'brief-prompt.md');
+    fs.writeFileSync(file, delegatedPrompt(rec));
+    rec.error = `Waiting for you: answer ${where}, then send the brief with: oak agent tell ${id} --file ${file}. OAK never answers the prompt, and has not sent the brief.`;
+    writeDelegated(rec);
+    log(`${id}: ${rec.error}`);
+    return rec;
+  }
   if (!ready) giveUp(`${o.kind}'s composer never appeared`);
+  if (trust) {
+    Object.assign(rec, { state: 'starting', since: Date.now() });
+    delete rec.error;
+    writeDelegated(rec);
+  }
   if (cancelled()) throw new Error(`${id}: queued start cancelled`);
   // 4. The brief.
   await sendDelegatedPrompt(rec.herdrName!, delegatedPrompt(rec), o.herdr ?? {}, sleep);

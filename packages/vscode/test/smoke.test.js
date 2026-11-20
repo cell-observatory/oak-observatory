@@ -2286,6 +2286,10 @@ test('extension: three views, click commands, inline annotations, chat, status s
       workersView.fire(doneButton, 'click');
       assert.match(workerHtml(), /Finished widget scan/);
       assert.match(workerHtml(), /Lost widget scan/);
+      // An agent OAK started, waiting at its folder-trust prompt before any session: blocked, with the reason naming the prompt.
+      workersView.post({ type: 'workers', workers: [{ key: 'test-lab:delegated:tri1', session: '', title: 'Triage the widgets', machine: 'test-lab', kind: 'codex', state: 'blocked',
+        phase: 'awaiting-input', lastActiveMs: Date.now(), subagents: [], error: 'Waiting for you: answer Codex\'s folder-trust prompt in herdr tab "tri1: Triage the widgets". OAK never answers it.' }] });
+      assert.match(workerHtml(), /Triage the widgets.*>blocked<.*Waiting for you: answer Codex's folder-trust prompt in herdr tab &quot;tri1: Triage the widgets&quot;\. OAK never answers it\./s);
       const solo = runOverview(null);
       const elFor = solo.elFor;
       solo.post({ type: 'version', v: { current: '9.9.9', channel: 'stable', stableLatest: '9.9.10', devLatest: '9.10.0-dev.3', updateAvailable: true } });

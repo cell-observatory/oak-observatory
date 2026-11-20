@@ -88,6 +88,8 @@ data class RunningAgent(
     val after: List<String> = emptyList(),
     val key: String = session,
     val lastActiveMs: Long = 0,
+    /** Why the row stopped, or what it waits for: a turn's error, or the folder-trust prompt OAK left for the user. */
+    val error: String? = null,
 
 )
 
@@ -359,7 +361,7 @@ object MultitaskParser {
             session = str(o, "session") ?: "",
             title = str(o, "title") ?: "", machine = str(o, "machine") ?: "",
             kind = str(o, "kind") ?: "claude", state = str(o, "state"), after = arr(o, "after").map { it.asString },
-            key = str(o, "key") ?: str(o, "session") ?: "", lastActiveMs = long(o, "lastActiveMs"),
+            key = str(o, "key") ?: str(o, "session") ?: "", lastActiveMs = long(o, "lastActiveMs"), error = str(o, "error"),
             worktree = str(o, "worktree") ?: "",
             gitBranch = str(o, "gitBranch") ?: "",
             self = bool(o, "self"),
