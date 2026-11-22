@@ -831,10 +831,15 @@ def ep(s):
 # sync between this account s machines, so the same file can hold turns run on a Linux box
 # (/home/<u>/...) and a Mac (/Users/<u>/...) — and a scan that counts every line makes each machine
 # report the OTHER machines work as its own, which double-counts the moment the per-machine numbers
-# are added up. Per LINE, not per file: one session resumed across machines splits correctly. A cwd
-# under no recognizable home (or an unreadable one) counts as ours — under-claiming a foreign line
-# is a smaller lie than dropping a local one. Two machines with the SAME home spelling (two Linux
-# boxes, one username) cannot be told apart this way; their overlap still double-counts.
+# are added up. Per LINE, not per file: one session resumed across machines splits correctly. The
+# home cannot place the rest: a cwd under no recognizable home (a shared folder such as a network
+# mount), or a session another machine with the SAME home spelling ran (two Linux boxes, one
+# username). There the session decides, as OAKs database does (core ranHere): a session this
+# machine ran is ours (Claude Code keeps its environment and its edit history in folders beside the
+# transcripts, which no sync copies, and OAKs capture keeps its store here), and a session OAK holds
+# as another machines (its sync replica) is that machines; counting such a copy here as well counted
+# it twice. Otherwise a line under this home, or with no session id, counts as ours, as before, and
+# one under no home does not.
 _HOMES = (re.compile(r'^(/(?:home|Users)/[^/]+)(?:/|$)'), re.compile(r'^([A-Za-z]:[\\/]Users[\\/][^\\/]+)(?:[\\/]|$)'))
 def homeroot(p):
     for rx in _HOMES:
@@ -842,9 +847,32 @@ def homeroot(p):
         if m: return m.group(1).replace('\\', '/')
     return ''
 MYROOT = homeroot(os.path.expanduser('~'))
-def own(cwd):
+_CFG = os.path.dirname(os.path.abspath(proj))
+_RAN = {}
+def ran_here(sid):
+    v = _RAN.get(sid)
+    if v is None:
+        v = _RAN[sid] = any(os.path.isdir(os.path.join(_CFG, d, sid)) for d in ('session-env', 'file-history', 'claude-observatory'))
+    return v
+_COPIES = None
+def copied_here(sid):
+    # The sessions OAK holds another machines records of: claude-observatory/sync/replicas/<machine>/<session>.
+    global _COPIES
+    if _COPIES is None:
+        _COPIES, base = set(), os.path.join(_CFG, 'claude-observatory', 'sync', 'replicas')
+        try:
+            for host in os.listdir(base):
+                try: _COPIES.update(os.listdir(os.path.join(base, host)))
+                except Exception: pass
+        except Exception: pass
+    return sid in _COPIES
+def own(cwd, sid=''):
     r = homeroot(cwd)
-    return (not r) or (not MYROOT) or (r == MYROOT)
+    if not MYROOT: return True
+    if r and r != MYROOT: return False
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,199}', sid or ''): return True
+    if ran_here(sid): return True
+    return bool(r) and not copied_here(sid)
 # API list prices per 1M tokens and the rules that pick one: a mirror of packages/core/src/pricing.ts modelRate and
 # priceUsage; keep the two in sync (a test runs the same ids through both). A rate is (input, output, 5-minute write,
 # 1-hour write, read, long tier, fast, US-only 1.1x, approx): the long tier (over, input, output, 5m write, 1h write,
@@ -1004,7 +1032,7 @@ def scan(path, since, gids=None):
             _cc = u.get('cache_creation')
             _cw1 = _cc.get('ephemeral_1h_input_tokens') if isinstance(_cc, dict) else None
             t = _i + _o + _cw
-            w = 1 if own(o.get('cwd') or '') else 0
+            w = 1 if own(o.get('cwd') or '', o.get('sessionId') or '') else 0
             mid = m.get('id') or (path + '#' + str(n))
             prev = ids.get(mid)
             if prev is None or t > prev[0] or (t == prev[0] and e < prev[2]):
@@ -1143,11 +1171,11 @@ if _due or (TOT and _hadfc):
                 ids = scan(path, ws30)
             else:                                          # colder: id map cached by (mtime, horizon)
                 c = fc.get(path)
-                if c and c.get('mtime') == m and c.get('k') == ws30 and c.get('ev') == 10 and 'ids' in c:
+                if c and c.get('mtime') == m and c.get('k') == ws30 and c.get('ev') == 11 and 'ids' in c:
                     ids = c['ids']
                 else:
                     ids = scan(path, ws30)  # horizon holds all month, so the key is month-stable
-            nfc[path] = {'mtime': m, 'k': ws30, 'ev': 10, 'ids': ids}
+            nfc[path] = {'mtime': m, 'k': ws30, 'ev': 11, 'ids': ids}
             gmerge(g, ids)
         nL5 = nL7 = nU5 = nU7 = nL30 = nU30 = nR30 = nR7 = nR5 = 0.0
         nRO5 = nRO7 = nRO30 = 0.0  # OWN reads — what this machine exports (additive across machines)

@@ -57,6 +57,10 @@ the release notes.
   `oak usage`, `oak stats`, the status line and the editors' usage readouts, on the machine that ran the demo and on
   any that held a copy of its transcripts. The database moves to schema 11, which removes the simulator's usage an
   earlier OAK stored. The demo's sessions still list, replay and clean as before.
+- The Claude status line no longer counts another machine's sessions as this machine's when it reads the
+  transcripts itself, as it does while OAK's usage totals are catching up. A copy of another machine's transcript in a
+  folder outside any home, or under the same home folder as this machine's, counted on both machines, so the account's
+  usage counted it twice. A session now counts on the machine that ran it, as in OAK's database.
 - On Windows, `oak update` and `oak doctor --fix` upgrade herdr while its server is running. Windows does not let a
   running herdr.exe be replaced, so the old one stayed in place and the update still reported it as installed. OAK
   now moves the old herdr.exe aside and deletes it on a later run, once nothing runs it. An install that still leaves

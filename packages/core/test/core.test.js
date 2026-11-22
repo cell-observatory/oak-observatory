@@ -17811,6 +17811,45 @@ test('statusline: the embedded scan dedups message lines and counts only THIS ma
   assert.equal(st.tpp5, 55.6, 'tokens-per-percent calibrates on the UNION — the account-wide-est figure this box can see');
 });
 
+test('statusline: a turn in a shared folder counts as this machine’s only when this machine ran its session (2026-11-20)', () => {
+  // A session run on another machine in a shared folder (a network mount, under no home) reached this machine as a
+  // transcript copy oak sync placed. The scan counted it as this machine's own, and the saved machine that ran it
+  // counted it too, so the account's month on this machine read $1,094 where OAK's database read $750.
+  const sh = fs.readFileSync(path.resolve(__dirname, '../../cli/statusline/install-statusline.sh'), 'utf8');
+  const lines = sh.split('\n');
+  const from = lines.findIndex((l) => l.includes("<<'PYEOF'"));
+  const py = lines.slice(from + 1, lines.indexOf('PYEOF', from + 1)).join('\n');
+  const cfg = freshHome();
+  const projects = path.join(cfg, 'projects');
+  const proj = path.join(projects, '-groups-lab-share');
+  fs.mkdirSync(proj, { recursive: true });
+  const ts = new Date().toISOString();
+  const L = (cwd, sessionId, id, tokens) =>
+    JSON.stringify({ timestamp: ts, cwd, sessionId, message: { id, usage: { input_tokens: tokens, output_tokens: 0, cache_creation_input_tokens: 0 } } }) + '\n';
+  // Ran here, each as OAK's database would know it: Claude Code's session-env or file-history folder, or OAK's store.
+  for (const [dir, sid] of [['session-env', 'sess-env'], ['file-history', 'sess-hist'], ['claude-observatory', 'sess-store']])
+    fs.mkdirSync(path.join(cfg, dir, sid), { recursive: true });
+  fs.writeFileSync(path.join(proj, 'sess-env.jsonl'), L('/groups/lab/share', 'sess-env', 'm1', 100));
+  fs.writeFileSync(path.join(proj, 'sess-hist.jsonl'), L('/groups/lab/share', 'sess-hist', 'm2', 20));
+  fs.writeFileSync(path.join(proj, 'sess-store.jsonl'), L('/groups/lab/share', 'sess-store', 'm3', 3));
+  // A copy: no folder of its session here.
+  fs.writeFileSync(path.join(proj, 'sess-copy.jsonl'), L('/groups/lab/share', 'sess-copy', 'm4', 5000));
+  // Under this machine's home, and with no session id: ours, as before, with no folder needed.
+  fs.writeFileSync(path.join(proj, 'home.jsonl'), L('/home/tester/proj', 'sess-home', 'm5', 400) + L('/groups/lab/share', '', 'm6', 7000));
+  // Under the same home spelling, run by another Linux machine: OAK holds that machine's replica of it, so it is a copy.
+  fs.mkdirSync(path.join(cfg, 'claude-observatory', 'sync', 'replicas', 'abcdef123456', 'sess-other'), { recursive: true });
+  fs.writeFileSync(path.join(proj, 'sess-other.jsonl'), L('/home/tester/proj', 'sess-other', 'm7', 900));
+  const state = path.join(cfg, 'usage-state.json');
+  const r = require('child_process').spawnSync('python3', ['-', state, projects, '10', '0', '20', '0'], {
+    input: py, encoding: 'utf8', env: { ...process.env, HOME: '/home/tester', USERPROFILE: '/home/tester', STATUSLINE_SCAN_ALARM: '30' },
+  });
+  if (r.error && r.error.code === 'ENOENT') return; // no python3 on this runner
+  assert.equal(r.status, 0, `the embedded scan must run — python said: ${(r.stderr || '').trim()}`);
+  const out = (r.stdout || '').trim().split(/\s+/);
+  assert.deepEqual([out[4], out[5]], ['7523', '7523'], `own: 100 + 20 + 3 + 400 + 7000, never the copies' 5000 and 900 (got: ${r.stdout})`);
+  assert.equal(JSON.parse(fs.readFileSync(state, 'utf8')).U5, 13423, 'the union keeps the copies');
+});
+
 test('pricing + breakdown: models are priced by rate card, buckets follow the account week (0.10.0)', () => {
   // The breakdown's ~$ figures are API list prices — the one thing that must never drift is the
   // math itself: split x rate, cache reads INCLUDED (they are the bulk of real compute value),
