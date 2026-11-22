@@ -2668,7 +2668,7 @@ export interface FailedSession {
   at: number;
 }
 
-/** Keep the failures of this catch-up, and forget those of sessions it brought up to date since, or whose files are gone
+/** Keep the failures of this catch-up, and forget those of sessions it brought or found up to date, or whose files are gone
  *  (`present`: the sessions on disk, when the catch-up looked at all of them). */
 function recordFailures(db: DatabaseSync, failed: Map<string, string>, done: Set<string>, present: Set<string> | null, now: number): void {
   let list: FailedSession[] = [];
@@ -2760,7 +2760,7 @@ export function catchUp(db: DatabaseSync, opts: CatchUpOptions = {}): CatchUpRes
   }
   result.ran = true;
   const r = newRun(db, { now, deadline: t0 + (opts.budgetMs ?? Infinity), problems: result.problems, afterBatch: opts.afterBatch });
-  // Sessions that failed (any unit: the index is then behind the files), and those brought wholly up to date.
+  // Sessions that failed (any unit: the index is then behind the files), and those brought or found wholly up to date.
   const failed = new Map<string, string>();
   const done = new Set<string>();
   try {
@@ -2864,14 +2864,22 @@ export function catchUp(db: DatabaseSync, opts: CatchUpOptions = {}): CatchUpRes
       const prev = stored.get(s.id);
       const stamp = factsStamp(s, d.codexIndex, prev?.titleInputs);
       // A copy of another machine's session, as it was (keepCopy).
-      if (!prev && states.get(`copy:${s.id}`) === stamp) continue;
+      if (!prev && states.get(`copy:${s.id}`) === stamp) {
+        done.add(s.id);
+        continue;
+      }
       const revive = prev?.archived === true;
       const facts = !prev || prev.inputs !== stamp || revive;
       const transcript = facts ? (discoverListing(s.transcripts.map((x) => x.t), []).byId.get(s.id)?.file ?? null) : prev?.transcript ?? null;
       const stamps = unitStamps(s, transcript, now);
       const machine = prev?.machine ?? r.me;
       const stale = Object.entries(stamps).some(([k, v]) => states.get(`unit:${k}:${machine}:${s.id}`) !== v);
-      if (!facts && !stale) continue;
+      // Up to date, so a failure listed for it is behind it. Kept, it stayed listed for good: nothing reads an unchanged
+      // session again, and the index never said it had caught up.
+      if (!facts && !stale) {
+        done.add(s.id);
+        continue;
+      }
       let need = 0;
       if (transcript) {
         const st = s.transcripts.find((x) => x.t.file === transcript)?.st;
