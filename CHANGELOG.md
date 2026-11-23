@@ -53,6 +53,11 @@ the release notes.
   it, or OAK's store of it, is on that machine, and the claim travels in the record log and the usage pull. A copy
   that no machine claims shows as `unknown machine (copies)` in `oak usage` and `oak query usage`.
   Totals do not change. The database moves to schema 10 and reads every session's usage once more.
+- `oak usage` no longer reports its totals as incomplete for good after a session failed to read once. A session
+  whose transcript changed while OAK read it was listed as failed, and the listing could stay after a later catch-up
+  read the session whole: a catch-up reads again only the sessions whose files changed, so nothing took it off until
+  the session was written to again. Meanwhile the Claude status line set OAK's totals aside for its own transcript
+  scan. A catch-up now takes the sessions it finds up to date off the list.
 - The demo simulator's sessions (`oak demo`) count in no usage figure. Their turns, which no one spent, counted in
   `oak usage`, `oak stats`, the status line and the editors' usage readouts, on the machine that ran the demo and on
   any that held a copy of its transcripts. The database moves to schema 11, which removes the simulator's usage an

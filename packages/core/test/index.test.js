@@ -631,6 +631,36 @@ test('index: a catch-up with nothing changed derives nothing again', { skip }, (
   third.close();
 });
 
+// A session listed as failed ("changed while reading its listing") stayed listed after a later catch-up had read it
+// whole. A catch-up reads again only the sessions whose files changed, so none took it off, and `oak usage` called its
+// totals incomplete until the session was written to again (2026-11-22).
+test('index: a catch-up takes the sessions it finds up to date off the failed list', { skip }, (t) => {
+  const f = indexFixture(t, core);
+  f.claude('fixture-failed-claude', f.work, [ask('A transcript'), reply('f1', [text('x')])]);
+  f.rollout('fixture-failed-codex', f.work, [cxUser('A rollout')]);
+  caughtUp().close();
+  const o = core.openIndex();
+  assert.ok(o.ok, o.reason);
+  try {
+    const listed = ['fixture-failed-claude', 'fixture-failed-codex'];
+    o.db.prepare("INSERT INTO meta (key, value) VALUES ('failed_sessions', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+      .run(JSON.stringify(listed.map((id) => ({ id, problem: 'Session transcript changed while reading its listing', at: Date.now() - 60_000 }))));
+    assert.deepEqual(core.failedSessions(o.db).map((x) => x.id), listed, 'positive control: the list reads back');
+    // The Claude session changes, and a catch-up out of time from the start reads it no more than before: it stays listed.
+    fs.appendFileSync(path.join(core.projectDir(f.work), 'fixture-failed-claude.jsonl'), JSON.stringify({ cwd: f.work, sessionId: 'fixture-failed-claude', ...ask('More') }) + '\n');
+    const cut = core.catchUp(o.db, { budgetMs: -1 });
+    assert.equal(cut.updated, 0);
+    assert.deepEqual(core.failedSessions(o.db).map((x) => x.id), ['fixture-failed-claude'], 'the unchanged rollout is off the list');
+    assert.equal(cut.caughtUp, false);
+    const whole = core.catchUp(o.db);
+    assert.equal(whole.updated, 1, 'the changed session is read again');
+    assert.deepEqual(core.failedSessions(o.db), []);
+    assert.equal(whole.caughtUp, true);
+  } finally {
+    o.close();
+  }
+});
+
 // A catch-up that found nothing to do still took the lease and wrote its time, so every reader's PRAGMA data_version
 // moved on every catch-up by any process, and could not say that the index had changed.
 test('index: a catch-up that finds nothing to do writes nothing, so another reader\'s data_version moves only when the index changed', { skip }, (t) => {
