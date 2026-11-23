@@ -37,7 +37,11 @@ the `statusline-last.json` it writes.
   and the last 7 days), the session title follows OAK's order, the usage
   windows count each message once, in a herdr pane a changed title starts
   OAK's tab sync (`oak __tab-sync`) in the background, the rows render intact under Git Bash on
-  Windows, and the month's dollar figure prices each model by the rules of OAK's own usage views
+  Windows, under Git Bash or Cygwin the `statusLine` command names Git Bash's `bash.exe` and the script by
+  their Windows paths, with the drive letter outside the quotes (`C:"/Program Files/Git/bin/bash.exe"
+  "C:/Users/me/.claude/statusline.sh"`), so PowerShell and Git Bash both run it and neither reaches the WSL
+  launcher, with no Python installed the Microsoft Store's `python3` stub is passed over for `py -3`, or the
+  token estimate is skipped, and the month's dollar figure prices each model by the rules of OAK's own usage views
   (`packages/core/src/pricing.ts`), so a model OAK cannot price adds nothing, and prices 5-minute and 1-hour
   cache writes each at its own rate. Where this machine has no
   current reading of a window, the line draws the saved machine's reading of the same account that OAK's

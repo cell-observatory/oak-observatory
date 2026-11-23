@@ -13,11 +13,14 @@ oak tui
 `oak machine add <label> <ssh-target>` installs the version pinned in `herdr.lock` on the target over SSH,
 verifies its checksum, starts its server, and registers the machine in herdr. Where the target has
 Node.js 24 or newer, it then copies OAK to `~/.local/lib/oak`, with a launcher at
-`~/.local/bin/oak`, and installs the capture hooks. An `oak` already on the target's PATH that it did not put there,
-installed by npm or linked to a checkout, is left as it is, and the capture hooks are installed with it. Use SSH keys or an
+`~/.local/bin/oak`, and runs `oak init` there, which installs the capture hooks and sets up the agent delegation
+guidance, as on this machine. An `oak` already on the target's PATH that it did not put there,
+installed by npm or linked to a checkout, is left as it is, and `oak init` runs with it. Use SSH keys or an
 existing SSH configuration; the operation is non-interactive. The herdr tab is its real client,
 including its machine switcher. `HERDR_REMOTE_BINARY` can select a remote binary where needed.
 A newer local herdr is left alone; an existing remote herdr at the pin or newer is accepted on every platform.
+A machine saved earlier whose herdr is older than the pin reads as incompatible, and OAK reads no panes from it,
+until `oak doctor --fix` on that machine installs the pin.
 On Windows, use Git Bash, MSYS2 or Cygwin as the SSH login shell and install herdr and OAK there first.
 OAK accepts herdr on PATH or at `~/.local/bin/herdr/herdr.exe`, finds `oak` on the login shell's PATH
 (including npm's Windows prefix), and installs its capture hooks without copying a POSIX launcher.
@@ -63,7 +66,7 @@ answered from that machine's records here instead while `oak sync` keeps them cu
 `oak diff 12 --patch --session <id> --machine build-box`. Printed to a terminal, the output is filtered as
 this machine filters its own: colour stays, and other escape sequences are removed. The remote command runs non-interactively,
 in the session's own workspace there (the directory its transcript records, not the SSH login
-directory), with `~/.local/bin`, `/opt/homebrew/bin` and `/usr/local/bin` added to its PATH, so OAK must be
+directory), with `~/.local/bin`, `~/bin`, `/opt/homebrew/bin` and `/usr/local/bin` added to its PATH, so OAK must be
 installed in one of them (`oak machine add` installs it to `~/.local/bin`). SSH connects with an
 8-second connection timeout. Stopping the command (SIGTERM, SIGINT, SIGHUP, or SIGQUIT on macOS and
 Linux) stops its SSH session too, and the command then ends by that signal. An unexpected error that
@@ -225,7 +228,9 @@ each machine calibrates its token and dollar estimates against the account's mea
 local database counts: every message of the account once, by its message id and at its largest snapshot,
 from this machine's transcripts and from every other machine's usage the database holds (by `oak sync`'s
 record logs, or by the read above), so a transcript synced between machines is counted once, wherever it
-ran. Another machine's usage counts only for the account it was billed to. The month's tokens, cache
+ran. `oak usage --by machine` credits each message to the machine that ran its session, the one that holds Claude
+Code's `session-env` or `file-history` folder for it or OAK's store of it, so every machine shows the same split; a
+copy no machine claims shows as `unknown machine (copies)`. Another machine's usage counts only for the account it was billed to. The month's tokens, cache
 reads and dollars are the same sum, for machines that bill on the same day, and the budgets come from
 that calibration, so machines of the account show the same estimates, budgets and month. The editors'
 tooltips and Stats panels, and the terminal app's usage bar on hover, say when the estimates include the

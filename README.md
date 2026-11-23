@@ -119,7 +119,8 @@ oak init --codex  # Codex alone
 
 When Codex has no model configured and local models are available, `oak init` also sets Codex to the
 newest local model, with a backup of its config; a model you chose is never changed, and
-`oak models use <name>` switches it.
+`oak models use <name>` switches it. `oak init` also sets up OAK's agent delegation guidance for your user
+(see *Your agent delegates by default* below); `oak agent setup --remove` takes it out.
 
 **3 — Start working.** Run `oak` to open the terminal app, and start Claude Code or Codex in its herdr
 tab (or with `oak agent start --kind claude|codex`); agents you launch the usual way are captured too.
@@ -193,7 +194,10 @@ command, and find anything); `?` lists every key from your own keymap.
 **herdr.** OAK uses **herdr** as its required terminal backend. **Install oak, get herdr**: the
 installers install the version pinned in `herdr.lock` (currently 0.9.5), verify its checksum, install
 the Claude and Codex integrations, and link OAK’s herdr plugin. A newer installed herdr is preserved.
-Run `oak doctor --fix` to repair the backend, native terminal helper permissions, or an outdated OAK
+A herdr server that is already running keeps its old binary until it restarts, as the warning after the
+install says (`herdr server stop`, then reopen herdr); until then OAK reports that server incompatible
+instead of reading its panes. A saved machine needs the pinned herdr or newer as well: its herdr reads as
+incompatible until `oak doctor --fix` there installs it. Run `oak doctor --fix` to repair the backend, native terminal helper permissions, or an outdated OAK
 focus server. `oak doctor` also checks forwarding latency for saved machines, says why a saved machine
 gave no Claude usage reading, and (on Linux and macOS) reports a herdr server that was started from
 inside a Claude Code session: its panes would then run Claude Code agents as child sessions with
@@ -250,7 +254,9 @@ Add `--worktree [<base>]` to create a worktree beside a clean repository, from `
 path, branch, base and bounded Git readings, and shows files, added/removed lines and merge state in agent lists and
 Workers on every surface. `--writable-root <dir>` is repeatable; Codex always receives its output folder. The parent
 reviews and merges the diff, then uses `oak agent close --remove-worktree <id>` once the worktree is clean and merged.
-`oak doctor` lists orphaned agent worktrees (ones OAK made, on an `oak/<id>` branch) without removing them.
+`oak doctor` lists orphaned agent worktrees (ones OAK made, on an `oak/<id>` branch) without removing them. Both it and
+the close wait up to 10 seconds for Git to list a repository's worktrees, and say when Git could not list them, with
+Git's reason, instead of finding none.
 
 **Agents from a brief.** `oak agent start --kind claude|codex --brief <file> [--machine <label>]` starts an agent in
 its own herdr tab, labelled from the brief's `# Title`, here or on a saved machine, and hands it the brief.
@@ -323,7 +329,7 @@ oak query edits --status pending              # pending edits, with their line c
 oak query sessions --archived                 # include sessions whose files are gone, marked with when and why
 oak query sql "SELECT workspace, count(*) AS n FROM sessions GROUP BY workspace"   # one read-only SELECT
 oak query schema                              # the tables and the named queries
-oak usage --window week --by machine          # this week's tokens per machine, each message once
+oak usage --window week --by machine          # this week's tokens per machine, each message once, where its session ran
 oak query usage --window bill --by model      # the bill cycle by model, as JSON
 oak query readings --kind five                # each machine's 5-hour shares, newest first
 ```
@@ -428,8 +434,9 @@ The one-liner in [Quickstart](#quickstart) covers most people. The details:
 from the release channel you follow. On this machine that is the CLI; the extension in every VS Code,
 VS Code Insiders, Cursor, VSCodium and Windsurf that has it, including their Remote-SSH servers
 (`~/.vscode-server`, `~/.cursor-server`); the plugin in every JetBrains IDE that has it; the Claude
-Code capture hooks in your user settings and the Codex capture hooks (an update that adds a hook event
-repairs them, as `oak init --repair` does, and a Codex hook you turned off in Codex stays off); the
+Code capture hooks in your user settings and the Codex capture hooks (an update that adds a hook event,
+or finds a hook command an older OAK wrote, repairs them, as `oak init --repair` does, and a Codex hook
+you turned off in Codex stays off); the
 bundled status line, when it is OAK's; herdr at its pinned version with its integrations and OAK's
 herdr plugin, as `oak doctor --fix` keeps them, where herdr publishes a build; and a focus server still
 running an older build, which it stops. A project's own `.claude/settings.json` is shared through its
@@ -512,13 +519,21 @@ into PowerShell is the one thing to avoid: with WSL installed it silently instal
 WSL, where Claude Code on the Windows side cannot see it. Install and update from a normal terminal, not
 from a session in the Claude desktop app: the app's MSIX package keeps what an install writes under
 `%APPDATA%` in a copy only the app's own sessions see, so `install.ps1`, `oak update` and
-`oak install-extensions` stop there and say so. The **bundled status line**
+`oak install-extensions` stop there and say so (`--check` and `--json`, which only read, still run).
+`oak doctor` warns about a copy left under `%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\npm`
+and says how to remove it. Windows does not let a running `herdr.exe` be replaced, so `oak update` and
+`oak doctor --fix` move the old one aside and delete it on a later run, once nothing runs it. `oak update`
+checks the terminal helper in a short-lived process of its own, which it ends after 15 s; over SSH, or
+without an interactive console, it skips that check and says so, and `oak doctor` in a terminal runs it.
+The **bundled status line**
 is a bash script that parses its input with `jq` (and uses `python3`, or `py -3`, for the token
 estimates, which it skips when neither runs), so the Usage bars need Git Bash and `jq`
 (`winget install jqlang.jq`) on PATH. OAK finds Git Bash as Claude Code does: `CLAUDE_CODE_GIT_BASH_PATH`,
 Git for Windows' install folder, then the `bin\bash.exe` beside the `git` on PATH. It never runs
 `System32\bash.exe`, the WSL launcher, which is the `bash` on PATH once WSL is on; `oak doctor` warns
-when it is. Inside a WSL distro, `oak install-extensions` skips the Windows editor it reaches through
+when it is, and when there is no Git Bash. The status line command it writes into Claude Code's settings
+names Git Bash and the script by their Windows paths, in a form that Git Bash and PowerShell both run.
+Inside a WSL distro, `oak install-extensions` skips the Windows editor it reaches through
 interop: install OAK on Windows for that editor, and a window connected to WSL runs the extension from
 the distro's editor server. Windows paths are canonicalized
 for drive-letter case everywhere (capture, lookups, both editors); a store written by v0.8.9 or earlier
@@ -603,7 +618,7 @@ template, and relocating `CLAUDE_CONFIG_DIR` — is in **[docs/REMOTE.md](docs/R
 
 | Piece | What it does |
 | --- | --- |
-| **Capture hook** (`capture`) | PreToolUse snapshots the file before an edit, PostToolUse commits before + after, and PostToolUseFailure does the same for a tool that failed (a Bash command that exits non-zero). Zero-dep, always `exit 0`, never writes to the model context. Captures `Edit` / `Write` / `MultiEdit` / `NotebookEdit` — and files changed by `Bash` (set `CLAUDE_OBSERVATORY_NO_BASH=1` to opt out). The same command sits on six *attention* events — `Notification`, `PermissionRequest`, `Stop`, `UserPromptSubmit`, `SessionEnd`, `SubagentStop` — recording what each session is waiting on (a permission prompt and its tool, your input, a finished turn). It clears the wait when the agent moves on (an edit or Bash call starts, or the edit or Bash call a permission prompt was for returns), when a prompt answers it, or when the session ends; a permission prompt on any other tool (a web fetch, an MCP call) stays up until one of those, or until the turn ends. A subagent shares its parent's session, so a permission prompt keeps the agent that asked for each of its calls: a call's start lowers only the calls its own agent asked for, a prompt that names no call (one raised by `Notification` alone) is lowered by any call's start, and a subagent's prompts come down when it finishes (`SubagentStop`). It never answers a permission and never writes to stdout. Inside a herdr pane, `Stop` and `UserPromptSubmit` also start a detached `oak __tab-sync`, which renames the session's herdr tab after its title. |
+| **Capture hook** (`capture`) | PreToolUse snapshots the file before an edit, PostToolUse commits before + after, and PostToolUseFailure does the same for a tool that failed (a Bash command that exits non-zero). Zero-dep, always `exit 0`, never writes to the model context. A missing `oak` never fails the tool call: on macOS and Linux the hook in your user settings does nothing when it finds no `oak` on the PATH, and each Claude Code entry carries `onFailure: "continue"`. Captures `Edit` / `Write` / `MultiEdit` / `NotebookEdit` — and files changed by `Bash` (set `CLAUDE_OBSERVATORY_NO_BASH=1` to opt out). The same command sits on six *attention* events — `Notification`, `PermissionRequest`, `Stop`, `UserPromptSubmit`, `SessionEnd`, `SubagentStop` — recording what each session is waiting on (a permission prompt and its tool, your input, a finished turn). It clears the wait when the agent moves on (an edit or Bash call starts, or the edit or Bash call a permission prompt was for returns), when a prompt answers it, or when the session ends; a permission prompt on any other tool (a web fetch, an MCP call) stays up until one of those, or until the turn ends. A subagent shares its parent's session, so a permission prompt keeps the agent that asked for each of its calls: a call's start lowers only the calls its own agent asked for, a prompt that names no call (one raised by `Notification` alone) is lowered by any call's start, and a subagent's prompts come down when it finishes (`SubagentStop`). It never answers a permission and never writes to stdout. Inside a herdr pane, `Stop` and `UserPromptSubmit` also start a detached `oak __tab-sync`, which renames the session's herdr tab after its title. |
 | **Store** | `~/.claude/claude-observatory/<session_id>/` — `log.jsonl` (append-only) + content-addressed `blobs/`. No network. |
 | **Session resolution** | The active session is the newest transcript **that holds a real conversation**. Local commands (`/effort`, `/model`), interrupted commands, and bridge records write command-only transcript stubs; those never displace the session under review (0.8.4). When the current session has no edits yet, the panels say so honestly and offer a one-click switch to the previous session's work. |
 | **Undo engine** | Position-anchored 3-way line merge (base = the file right after the edit; sides = current on-disk content and the pre-edit content). Later edits to other lines survive; a genuine overlap → clear conflict + per-file restore. Anchoring on line positions (not fuzzy text search) keeps it safe against duplicated content. |
