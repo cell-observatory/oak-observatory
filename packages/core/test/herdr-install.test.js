@@ -407,7 +407,10 @@ test('herdr: the generated pin exactly matches the checked-in root herdr.lock', 
   // OAK's own plugin ships with the lock and is what `ensureHerdr` links by default.
   const dir = C.herdrPluginDir();
   assert.ok(dir && fs.existsSync(path.join(dir, 'herdr-plugin.toml')), 'the plugin directory resolves');
-  assert.match(fs.readFileSync(path.join(dir, 'herdr-plugin.toml'), 'utf8'), /min_herdr_version = "(\d+\.\d+\.\d+)"/);
+  const min = fs.readFileSync(path.join(dir, 'herdr-plugin.toml'), 'utf8').match(/min_herdr_version = "(\d+\.\d+\.\d+)"/);
+  assert.ok(min, 'the plugin names the oldest herdr it runs on');
+  // It is the pin, as the manifest and the plugin's README say: it stayed at 0.9.1 after the pin moved to 0.9.5.
+  assert.equal(min[1], lock.version, "the plugin's min_herdr_version is herdr.lock's pin");
 });
 
 test('herdr: ensureHerdr uses the built-in pin when no herdr.lock exists beside an installed package', POSIX, async () => {
